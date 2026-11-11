@@ -59,7 +59,11 @@ fn tool_rounds(native_ids: bool) {
             None::<String>,
             calls.clone(),
         ));
-        history.push(ChatMessage::tool_result(&calls[0].id, &calls[0].name, "ok"));
+        history.push(ChatMessage::tool_result(
+            &calls[0].id,
+            &calls[0].name,
+            crate::providers::history_test_support::COMPACT_SHELL_RESULT,
+        ));
         let prepared =
             prepare_messages_for_provider(provider.name(), &provider.capabilities(), &history)
                 .unwrap();
@@ -89,7 +93,10 @@ fn tool_rounds(native_ids: bool) {
                 wire["messages"][3 + previous * 2]["tool_name"],
                 ["forecast", "clock"][previous]
             );
-            assert_eq!(wire["messages"][3 + previous * 2]["content"], "ok");
+            assert_eq!(
+                wire["messages"][3 + previous * 2]["content"],
+                crate::providers::history_test_support::COMPACT_SHELL_RESULT
+            );
             let expected_id = if native_ids {
                 ["forecast_native_1", "clock_native_2"][previous]
             } else {

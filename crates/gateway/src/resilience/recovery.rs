@@ -4722,16 +4722,17 @@ impl RecoveryCoordinator {
                     call.id == identity.provider_call_id,
                     "canonical call identity mismatch"
                 );
-                if let Some((source, message)) = crate::compaction::retained_shell_outcome(
-                    &store,
-                    &workspace,
-                    &thread,
-                    turn_id,
-                    &identity.turn_item_id,
-                    &identity.provider_call_id,
-                    &call.name,
-                )
-                .await?
+                if let Some((source, message)) =
+                    crate::compaction::recover_undelivered_shell_outcome(
+                        &store,
+                        &workspace,
+                        &thread,
+                        turn_id,
+                        &identity.turn_item_id,
+                        &identity.provider_call_id,
+                        &call.name,
+                    )
+                    .await?
                 {
                     anyhow::ensure!(
                         recovered
@@ -6209,8 +6210,8 @@ mod tests {
             display: ToolDisplayPayload::Hidden,
             storage: ToolStoragePayload::Shell {
                 stdout: Some("retained terminal output".into()),
-                stderr: None,
-                aggregated_output: None,
+                stderr: Some(String::new()),
+                aggregated_output: Some("retained terminal output".into()),
                 exit_code: Some(0),
                 duration_ms: Some(1),
                 timed_out: Some(false),
@@ -6223,6 +6224,19 @@ mod tests {
             outcome: None,
             observation: None,
         };
+        store.insert_turn_llm_context(NewTurnLlmContextEntry {
+            turn_id:turn.into(),item_id:Some(item.into()),attempt_id:None,sequence:0,
+            source:"shell_control_v1".into(),tool_name:Some("exec_command".into()),
+            payload:serde_json::to_string(&pioneer_tools::ToolResultView::Json {
+                value:serde_json::json!({"session_id":27,"output_stats":{"full_output_available":false}}),truncated:false }).unwrap(),
+            output_policy_snapshot:serde_json::to_string(&ToolOutputPolicySnapshot::for_tool_name("exec_command")).unwrap(),
+            created_at:chrono::Utc::now().fixed_offset(),expires_at:None,
+        }).await.unwrap();
+        assert_eq!(
+            store.delete_turn_llm_context_for_turn(turn).await.unwrap(),
+            0,
+            "unsettled controls survive cleanup"
+        );
         store
             .materialize_item_completed(
                 pioneer_protocol::ItemCompletedNotification {
@@ -6311,6 +6325,74 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let (old_source, old_message) = crate::compaction::retained_shell_outcome(
+            &store,
+            workspace,
+            thread,
+            turn,
+            item,
+            "provider_shell",
+            "exec_command",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(old_message.content.contains("aggregated_output"));
+        use sha2::{Digest, Sha256};
+        let mut frozen = pioneer_compaction::frozen::FrozenMessageRef {
+            logical_turn_id: None,
+            source_thread: thread.into(),
+            context_thread: None,
+            unit_id: "shell_round".into(),
+            sources: vec![old_source.clone()],
+            event_input_role: None,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            publication_aliases: None,
+            inherited: false,
+            complete: true,
+            protected_input: false,
+            wire_sha256: hex::encode(Sha256::digest(serde_json::to_vec(&old_message).unwrap())),
+            replay_source: None,
+            tool_item_id: Some(item.into()),
+            tool_call_id: Some("provider_shell".into()),
+            tool_name: Some("exec_command".into()),
+        };
+        let old_frozen =
+            crate::compaction::frozen::restore_reference_for_test(&store, workspace, &frozen)
+                .await
+                .unwrap();
+        assert_eq!(old_frozen.content, old_message.content);
+        // A stale prepared source cannot commit a result. Preparation/JSON work
+        // happened outside the writer; the revision is revalidated in the commit.
+        let mut stale_source = old_source.clone();
+        stale_source.version.push_str("-stale");
+        let rejected = pioneer_crud::NewTurnLlmContextEntry {
+            turn_id: turn.into(),
+            item_id: Some(item.into()),
+            attempt_id: None,
+            sequence: 0,
+            source: "tool_result_v2".into(),
+            tool_name: Some("exec_command".into()),
+            payload: "{}".into(),
+            output_policy_snapshot: "{}".into(),
+            created_at: chrono::Utc::now().fixed_offset(),
+            expires_at: None,
+        };
+        assert!(
+            store
+                .commit_recovered_shell_result(
+                    workspace,
+                    thread,
+                    turn,
+                    item,
+                    &stale_source,
+                    rejected
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(store.list_turn_llm_context(turn).await.unwrap().len(), 4);
         let restored = coordinator
             .retained_provider_history_for_turn(turn)
             .await
@@ -6338,8 +6420,8 @@ mod tests {
         assert_ne!(restored_source.id, completed_legacy_source.id);
         assert_eq!(
             store.list_turn_llm_context(turn).await.unwrap().len(),
-            3,
-            "reconciliation must not write a second result copy"
+            5,
+            "reconciliation must commit one exact canonical result"
         );
         assert_eq!(
             store
@@ -6349,6 +6431,77 @@ mod tests {
             Some(completed_legacy_source),
             "recovery history preparation must not reexecute the completed legacy call"
         );
+        let compact: serde_json::Value =
+            serde_json::from_str(&restored[1].message.content).unwrap();
+        assert_eq!(compact["stdout"], "retained terminal output");
+        assert_eq!(compact["session_id"], 27);
+        assert_eq!(compact["output_stats"]["full_output_available"], false);
+        assert!(compact.get("aggregated_output").is_none());
+        let persisted = store
+            .list_turn_llm_context(turn)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.source == "tool_result_v2" && row.item_id.as_deref() == Some(item))
+            .unwrap();
+        let persisted_view: pioneer_tools::ToolResultView =
+            serde_json::from_str(&persisted.payload).unwrap();
+        let pioneer_tools::ToolResultView::Json { value, .. } = persisted_view else {
+            panic!("canonical view");
+        };
+        let persisted_message: ChatMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(persisted_message.content, restored[1].message.content);
+        let again = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap();
+        assert_eq!(again.len(), restored.len());
+        for (before, after) in restored.iter().zip(&again) {
+            assert_eq!(before.message, after.message);
+        }
+        assert_eq!(store.list_turn_llm_context(turn).await.unwrap().len(), 5);
+        let (one, two) = tokio::join!(
+            crate::compaction::recover_undelivered_shell_outcome(
+                &store,
+                workspace,
+                thread,
+                turn,
+                item,
+                "provider_shell",
+                "exec_command"
+            ),
+            crate::compaction::recover_undelivered_shell_outcome(
+                &store,
+                workspace,
+                thread,
+                turn,
+                item,
+                "provider_shell",
+                "exec_command"
+            )
+        );
+        assert_eq!(one.unwrap().unwrap().1.content, persisted_message.content);
+        assert_eq!(two.unwrap().unwrap().1.content, persisted_message.content);
+        assert_eq!(store.list_turn_llm_context(turn).await.unwrap().len(), 5);
+        let old_again =
+            crate::compaction::frozen::restore_reference_for_test(&store, workspace, &frozen)
+                .await
+                .unwrap();
+        assert_eq!(old_again.content, old_frozen.content);
+        assert_eq!(old_again.provenance, old_frozen.provenance);
+        frozen.replay_source = store
+            .compaction_context_reference_for_item(workspace, thread, turn, item, "tool_result_v2")
+            .await
+            .unwrap();
+        assert!(frozen.replay_source.is_some());
+        frozen.wire_sha256 = hex::encode(Sha256::digest(
+            serde_json::to_vec(&persisted_message).unwrap(),
+        ));
+        let new_frozen =
+            crate::compaction::frozen::restore_reference_for_test(&store, workspace, &frozen)
+                .await
+                .unwrap();
+        assert_eq!(new_frozen.content, persisted_message.content);
         let legacy_row_id = store
             .list_turn_llm_context(turn)
             .await
@@ -6429,7 +6582,38 @@ mod tests {
             .retained_provider_history_for_turn(turn)
             .await
             .unwrap();
-        assert!(restored[1].message.content.contains("failed"));
+        // A later item edit cannot rewrite an already fixed canonical delivery.
+        assert_eq!(restored[1].message.content, persisted_message.content);
+        let failed_observation = crate::compaction::retained_shell_outcome(
+            &store,
+            workspace,
+            thread,
+            turn,
+            item,
+            "provider_shell",
+            "exec_command",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(failed_observation.1.content.contains("failed"));
+        assert_eq!(
+            store.delete_turn_llm_context_for_turn(turn).await.unwrap(),
+            2,
+            "settled control receipt and legacy result can be released"
+        );
+        assert!(
+            store
+                .shell_control_receipt(workspace, thread, turn, item)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let after_cleanup = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap();
+        assert_eq!(after_cleanup[1].message.content, persisted_message.content);
         assert!(
             crate::compaction::retained_shell_outcome(
                 &store,

@@ -238,6 +238,7 @@ struct ExecutedToolResult {
     request_tools_result: Option<RequestToolsResult>,
     full_message: Option<ChatMessage>,
     full_source_in_item: bool,
+    shell_model_projection: Option<pioneer_protocol::ToolOutputPolicySnapshot>,
     delivery: Option<NativeToolDelivery>,
     message: ChatMessage,
 }
@@ -276,6 +277,7 @@ fn unknown_tool_task_result(
         retained_llm_context: None,
         full_message: None,
         full_source_in_item: false,
+        shell_model_projection: None,
         delivery: None,
         request_tools_result: None,
         message: tooling::build_tool_error_message(provider_call_id, tool_name, message, outcome),
@@ -1098,6 +1100,16 @@ pub(crate) fn bounded_tool_result_message_with_budget(
     reference: &str,
     available_tokens: u64,
 ) -> Result<ChatMessage, ChatTurnError> {
+    // Only Pioneer-owned message metadata selects the shell renderer. Raw tool
+    // JSON and historical content keys cannot grant this origin.
+    if source.role == pioneer_provider::Role::Tool
+        && source.application_context.as_ref().is_some_and(|context| {
+            context.get("kind").and_then(serde_json::Value::as_str) == Some("shell_output")
+                && context.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+        })
+    {
+        return bounded_shell_result_message(source, None, available_tokens);
+    }
     if source
         .name
         .as_deref()
@@ -1178,6 +1190,60 @@ pub(crate) fn bounded_tool_result_message_with_budget(
     Ok(message)
 }
 
+fn bounded_shell_result_message(
+    source: &ChatMessage,
+    policy: Option<&pioneer_protocol::ToolOutputPolicySnapshot>,
+    available_tokens: u64,
+) -> Result<ChatMessage, ChatTurnError> {
+    let value: serde_json::Value =
+        serde_json::from_str(&source.content).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+    let mut message = source.clone();
+    let token_limit = available_tokens.min(pioneer_compaction::RESULT_TOKENS);
+    let fits = |candidate: &serde_json::Value| {
+        let Ok(content) = serde_json::to_string(candidate) else {
+            return false;
+        };
+        if let Some(policy) = policy {
+            if let pioneer_protocol::LlmOutputPolicy::Full { max_bytes }
+            | pioneer_protocol::LlmOutputPolicy::Structured { max_bytes } = policy.llm
+            {
+                let view = ToolResultView::Json {
+                    value: candidate.clone(),
+                    truncated: candidate
+                        .get("model_output_truncated")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                };
+                if content.len() > max_bytes || view.serialized_size_bytes() > max_bytes {
+                    return false;
+                }
+            }
+        }
+        let mut candidate_message = source.clone();
+        candidate_message.content = content;
+        serde_json::to_string(&candidate_message).is_ok_and(|wire| {
+            wire.len() <= pioneer_compaction::RESULT_BYTES
+                && pioneer_compaction::text_tokens(&wire) <= token_limit
+        })
+    };
+    let bounded = pioneer_tools::bound_shell_output(&value, &fits)
+        .or_else(|| {
+            // The locator is optional at every context budget, not just at first
+            // delivery. Mandatory continuation/status facts remain indivisible.
+            let mut without_source = value.clone();
+            without_source.as_object_mut()?.remove("saved_source")?;
+            pioneer_tools::bound_shell_output(&without_source, &fits)
+        })
+        .ok_or_else(|| {
+            ChatTurnError::Blocked(
+                "shell continuation metadata does not fit available context".into(),
+            )
+        })?;
+    message.content =
+        serde_json::to_string(&bounded).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+    Ok(message)
+}
+
 // Search pages can exceed the working-context budget. Publish a machine-readable
 // saved reference only after the complete raw page crossed the durable lane.
 async fn retained_search_page_message(
@@ -1201,6 +1267,61 @@ async fn retained_search_page_message(
         }).to_string();
     }
     Ok(bounded)
+}
+
+// Shell storage/UI own the raw streams. Canonical replay must instead own the
+// exact bounded projection delivered to the model, including policy filtering.
+async fn prepare_shell_tool_result(
+    event_tx: &AgentEventHub,
+    thread_id: &str,
+    turn_id: &str,
+    result: &mut ExecutedToolResult,
+    reference: &str,
+) -> Result<(), ChatTurnError> {
+    let policy = result
+        .shell_model_projection
+        .as_ref()
+        .ok_or_else(|| ChatTurnError::Blocked("missing shell output policy".into()))?;
+    result.message = prepare_shell_model_message(
+        result.message.clone(),
+        policy,
+        result.full_source_in_item,
+        reference,
+    )?;
+    result.full_message = None;
+    persist_retained_tool_result(event_tx, thread_id, turn_id, result).await
+}
+
+pub(crate) fn prepare_shell_model_message(
+    mut message: ChatMessage,
+    policy: &pioneer_protocol::ToolOutputPolicySnapshot,
+    saved_output_available: bool,
+    reference: &str,
+) -> Result<ChatMessage, ChatTurnError> {
+    if message.content.is_empty() {
+        return Err(ChatTurnError::Blocked(
+            "shell continuation metadata exceeds output policy budget".into(),
+        ));
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&message.content)
+        .map_err(|error| ChatTurnError::Blocked(error.to_string()))?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| ChatTurnError::Blocked("invalid shell model object".into()))?
+        .remove("saved_source");
+    value["shell_model_output"] = 1.into();
+    // A saved source is advertised only after its terminal item has committed.
+    // This is retained command output, not a claim that drained bytes are recoverable.
+    value["saved_output_available"] = saved_output_available.into();
+    if saved_output_available
+        && !matches!(policy.llm, pioneer_protocol::LlmOutputPolicy::SummaryOnly)
+    {
+        value["saved_source"] = serde_json::json!({"reference": serde_json::from_str::<serde_json::Value>(reference).map_err(|e| ChatTurnError::Blocked(e.to_string()))?, "read_tool":"threads_tools_result_read"});
+    }
+    message.content =
+        serde_json::to_string(&value).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+    message.application_context = Some(serde_json::json!({"kind":"shell_output","version":1}));
+    bounded_shell_result_message(&message, Some(policy), pioneer_compaction::RESULT_TOKENS)
 }
 
 async fn persist_retained_tool_result(
@@ -1236,6 +1357,7 @@ async fn persist_retained_tool_result(
                 .retained_llm_context
                 .as_ref()
                 .map(|(_, snapshot)| snapshot.clone())
+                .or_else(|| result.shell_model_projection.clone())
                 .unwrap_or_else(|| {
                     pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(&result.tool_name)
                 });
@@ -6976,6 +7098,7 @@ async fn execute_agent_provider_response(
                                 retained_llm_context: None,
             full_message: None,
         full_source_in_item: false,
+        shell_model_projection: None,
         delivery: None,
                                 request_tools_result: None,
                                 message: tooling::build_tool_error_message(
@@ -7139,6 +7262,7 @@ async fn execute_agent_provider_response(
                                     retained_llm_context: None,
             full_message: None,
         full_source_in_item: false,
+        shell_model_projection: None,
         delivery: None,
                                     request_tools_result: None,
                                     message: tooling::build_tool_error_message(
@@ -7230,6 +7354,7 @@ async fn execute_agent_provider_response(
                                     retained_llm_context: None,
             full_message: None,
         full_source_in_item: false,
+        shell_model_projection: None,
         delivery: None,
                                     request_tools_result: None,
                                     message: tooling::build_tool_error_message(
@@ -7274,6 +7399,7 @@ async fn execute_agent_provider_response(
 
                         let tool_correlation = tool_call.observation.correlation();
                         let tool_attempt_started = Instant::now();
+                        let shell_model_projection = tool_call.output_projection.is_shell(&tool_name).then(|| tool_call.output_policy.clone());
                         let dispatch_result = if runtime.router().computer_use_leaf(&tool_name).is_some() {
                             runtime.execute_tool_call_with_deferred_delivery(tool_call, attempt_token.clone()).await
                         } else {
@@ -7332,6 +7458,9 @@ async fn execute_agent_provider_response(
                                     let mut message =
                                         result.to_model_input_item().into_chat_message();
                                     message.tool_call_id = Some(provider_call_id.clone());
+                                    if shell_model_projection.is_some() && projection.is_some_and(|p| matches!(p.llm_view, ToolResultView::Empty)) {
+                                        message.content.clear();
+                                    }
                                     (
                                         result.model_visible_text(),
                                         success,
@@ -7385,6 +7514,7 @@ async fn execute_agent_provider_response(
                             request_tools_result,
                             full_message,
                             full_source_in_item,
+                            shell_model_projection,
                             delivery,
                             message,
                         })
@@ -7484,6 +7614,8 @@ async fn execute_agent_provider_response(
                             result.message = retained_search_page_message(
                                 event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result, &reference,
                             ).await?;
+                        } else if result.shell_model_projection.is_some() {
+                            prepare_shell_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &mut result, &reference).await?;
                         } else {
                             if !result.full_source_in_item {
                                 persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
@@ -7497,7 +7629,7 @@ async fn execute_agent_provider_response(
                         }
                         // The durable terminal item already owns full shell output. Retain only
                         // its bounded provider representation in canonical replay history.
-                        if result.full_source_in_item {
+                        if result.full_source_in_item && result.shell_model_projection.is_none() {
                             result.full_message = None;
                             persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
                         }
@@ -9496,6 +9628,169 @@ mod tests {
         assert_eq!(rebuilt, page);
     }
 
+    #[tokio::test]
+    async fn shell_delivery_retains_the_model_projection_instead_of_raw_history() {
+        use super::{AgentDurableEvent, AgentEventHub, prepare_shell_tool_result};
+        use std::sync::Arc;
+        let hub = Arc::new(AgentEventHub::new());
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let legacy = ChatMessage::tool_result(
+            "old",
+            "exec_command",
+            r#"{"stdout":"old","aggregated_output":"old"}"#,
+        );
+        assert_eq!(
+            crate::compaction::restored_tool_result_message(&legacy, "{}")
+                .unwrap()
+                .content,
+            legacy.content
+        );
+        let compact = r#"{"stdout":"唯一\nline\nline","stderr":"","session_id":7}"#;
+        let mut result = task_result("write_stdin", true, compact);
+        result.shell_model_projection = Some(
+            pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name("write_stdin"),
+        );
+        result.full_message = Some(ChatMessage::tool_result(
+            "provider_call_1",
+            "write_stdin",
+            r#"{"stdout":"raw","aggregated_output":"raw"}"#,
+        ));
+        let publisher = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                prepare_shell_tool_result(&hub, "thread", "turn", &mut result, "{}")
+                    .await
+                    .unwrap();
+                result.message
+            })
+        };
+        let event = receiver.recv().await.unwrap();
+        let AgentDurableEvent::TurnLlmContextAppended {
+            source,
+            payload: pioneer_protocol::ToolResultView::Json { value, truncated },
+            ..
+        } = event
+        else {
+            panic!("expected canonical tool result");
+        };
+        assert_eq!(source, "tool_result_v2");
+        assert!(!truncated);
+        // Recovery reads this same canonical ChatMessage without reprojecting it.
+        let restored: ChatMessage = serde_json::from_value(value).unwrap();
+        let restored = crate::compaction::restored_tool_result_message(&restored, "{}").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&restored.content).unwrap();
+        assert_eq!(value["stdout"], "唯一\nline\nline");
+        assert_eq!(value["session_id"], 7);
+        assert_eq!(value["saved_output_available"], false);
+        assert!(value.get("saved_source").is_none());
+        assert_eq!(restored.tool_call_id.as_deref(), Some("provider_call_1"));
+        receiver.acknowledge_last(Ok(()));
+        let delivered = publisher.await.unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(delivered).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_shell_control_fields_survive_durable_delivery_and_context_restore() {
+        use super::{
+            AgentDurableEvent, AgentEventHub, bounded_tool_result_message_with_budget,
+            prepare_shell_tool_result,
+        };
+        use std::sync::Arc;
+        for (exit, timeout, session) in [
+            (None, false, Some(19)),
+            (Some(124), true, None),
+            (Some(1), false, None),
+        ] {
+            for structured in [false, true] {
+                let mut policy =
+                    pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name("write_stdin");
+                policy.llm = if structured {
+                    pioneer_protocol::LlmOutputPolicy::Structured { max_bytes: 1024 }
+                } else {
+                    pioneer_protocol::LlmOutputPolicy::Full { max_bytes: 1024 }
+                };
+                policy.storage = pioneer_protocol::StorageOutputPolicy::None;
+                policy.llm_retention = pioneer_protocol::LlmRetentionPolicy::DoNotRetain;
+                let raw = serde_json::json!({"stdout":"日本語\n".repeat(10000),"stderr":"", "session_id":session,
+                    "exit_code":exit,"timed_out":timeout,"duration_ms":10,
+                    "truncated":{"stdout":false,"stderr":false,"aggregated_output":false}});
+                let outcome = if timeout {
+                    ToolOutcome::recoverable(ToolErrorClass::Timeout, "inspect status", true, None)
+                } else if exit.is_some() {
+                    ToolOutcome::fatal(ToolErrorClass::ExecutionFailed, None)
+                } else {
+                    ToolOutcome::partial("running", "write_stdin")
+                };
+                let success = session.is_some();
+                let envelope =
+                    pioneer_tools::project_tool_result(pioneer_tools::ToolProjectionInput {
+                        call_id: "provider_call_1",
+                        tool_name: "write_stdin",
+                        arguments: &serde_json::Value::Null,
+                        raw_output_text: "",
+                        raw_output_json: &raw,
+                        success,
+                        outcome: &outcome,
+                        output_policy: &policy,
+                        output_projection: &pioneer_tools::ToolOutputProjectionKind::Builtin,
+                    });
+                let message = envelope
+                    .to_model_input_item("provider_call_1", "write_stdin")
+                    .into_chat_message();
+                let mut result = task_result("write_stdin", success, &message.content);
+                result.outcome = outcome.clone();
+                result.message = message;
+                result.shell_model_projection = Some(policy);
+                let hub = Arc::new(AgentEventHub::new());
+                let mut receiver = hub.take_durable_receiver().await.unwrap();
+                let publisher = {
+                    let hub = hub.clone();
+                    tokio::spawn(async move {
+                        prepare_shell_tool_result(&hub, "thread", "turn", &mut result, "{}")
+                            .await
+                            .unwrap();
+                        result.message
+                    })
+                };
+                let AgentDurableEvent::TurnLlmContextAppended {
+                    payload: pioneer_protocol::ToolResultView::Json { value, .. },
+                    output_policy_snapshot,
+                    ..
+                } = receiver.recv().await.unwrap()
+                else {
+                    panic!("canonical result");
+                };
+                assert!(matches!(
+                    output_policy_snapshot.llm_retention,
+                    pioneer_protocol::LlmRetentionPolicy::DoNotRetain
+                ));
+                let persisted: ChatMessage = serde_json::from_value(value).unwrap();
+                let model: serde_json::Value = serde_json::from_str(&persisted.content).unwrap();
+                assert_eq!(model["session_id"], serde_json::json!(session));
+                assert_eq!(model["exit_code"], serde_json::json!(exit));
+                assert_eq!(model["timed_out"], timeout);
+                assert_eq!(
+                    model["tool_outcome"],
+                    serde_json::to_value(&outcome).unwrap()
+                );
+                assert_eq!(model["truncated"]["stdout"], true);
+                assert_eq!(model["saved_output_available"], false);
+                assert!(model.get("saved_source").is_none());
+                assert!(!persisted.content.contains("Full source"));
+                assert!(persisted.content.len() <= 1024);
+                let restored =
+                    crate::compaction::restored_tool_result_message(&persisted, "{}").unwrap();
+                assert_eq!(restored, persisted);
+                assert!(bounded_tool_result_message_with_budget(&persisted, "{}", 8).is_err());
+                receiver.acknowledge_last(Ok(()));
+                assert_eq!(publisher.await.unwrap(), persisted);
+            }
+        }
+    }
+
     fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {
         ExecutedToolResult {
             tool_correlation: Default::default(),
@@ -9517,6 +9812,7 @@ mod tests {
             retained_llm_context: None,
             full_message: None,
             full_source_in_item: false,
+            shell_model_projection: None,
             delivery: None,
             request_tools_result: None,
             message: ChatMessage::tool_result("provider_call_1", tool_name, text),

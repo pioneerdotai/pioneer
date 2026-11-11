@@ -198,6 +198,9 @@ pub enum ToolDeltaPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallCompletedEvent {
+    /// Trusted runtime projection origin, never copied from a tool's JSON.
+    #[serde(default)]
+    pub shell_output: bool,
     pub success: bool,
     pub outcome: ToolOutcome,
     pub llm_view: ToolResultView,
@@ -470,6 +473,7 @@ impl ToolEventTrace {
         &self,
         attempt_id: u32,
         envelope: &ToolResultEnvelope,
+        shell_output: bool,
     ) -> Result<(), ToolError> {
         self.event_bus
             .emit_durable(
@@ -477,6 +481,7 @@ impl ToolEventTrace {
                 attempt_id,
                 "runtime.call.completed",
                 ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
+                    shell_output,
                     success: envelope.success,
                     outcome: envelope.outcome.clone(),
                     llm_view: envelope.llm_view.clone(),
@@ -904,7 +909,7 @@ mod tests {
         }
         let completion_trace = trace.clone();
         let completion =
-            tokio::spawn(async move { completion_trace.emit_completed(1, &envelope).await });
+            tokio::spawn(async move { completion_trace.emit_completed(1, &envelope, false).await });
         tokio::pin!(completion);
         assert!(
             timeout(Duration::from_millis(20), &mut completion)

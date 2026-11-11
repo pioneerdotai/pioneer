@@ -554,7 +554,13 @@ impl ToolCallRuntime {
                     })),
                 );
                 if let Some(projection) = output.projection() {
-                    trace.emit_completed(1, projection).await?;
+                    trace
+                        .emit_completed(
+                            1,
+                            projection,
+                            call.output_projection.is_shell(&call.tool_name),
+                        )
+                        .await?;
                 }
                 self.event_bus.finish_trace(trace.trace_id());
                 if let Some(delivery) = delivery {

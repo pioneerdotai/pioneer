@@ -3107,6 +3107,46 @@ fn vercel_routing_outcomes_survive_json_and_sse_without_session_identifiers() {
 }
 
 #[tokio::test]
+async fn compact_shell_result_remains_one_output_part_on_responses_wire() {
+    let compact = crate::providers::history_test_support::COMPACT_SHELL_RESULT;
+    for name in ["openai", "vercel-ai-gateway"] {
+        let provider = ResponsesApiCompatibleProvider::new(
+            name,
+            "https://example.invalid/v1",
+            "fixture",
+            AuthStyle::Bearer,
+        );
+        let mut req = request();
+        req.messages = vec![
+            ChatMessage::assistant_tool_calls(
+                None::<String>,
+                vec![crate::ProviderToolCall {
+                    id: "call".into(),
+                    name: "exec_command".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            ChatMessage::tool_result("call", "exec_command", compact),
+        ];
+        let prepared = crate::attachments::runtime::with_async_authority_scope(
+            provider.authority_fingerprint().unwrap().to_owned(),
+            provider.prepare(req, &provider.capabilities()),
+        )
+        .await
+        .unwrap();
+        for stream in [false, true] {
+            let body = provider.render(&prepared, stream).unwrap();
+            assert_eq!(body["input"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                body["input"][1],
+                json!({"type":"function_call_output", "call_id":"call",
+                "output":[{"type":"input_text", "text":compact}]})
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn disclosed_tools_keep_prefix_in_serialized_payload() {
     crate::attachments::runtime::with_async_authority_scope("fixture-authority".into(), async {
         let provider = ResponsesApiCompatibleProvider::new(

@@ -9,6 +9,35 @@ use sea_orm::{ConnectionTrait, Statement};
 // Both modes require positive, consistent lineage; absence is never permission.
 pub(crate) const READY: &str = r#"
     trt.status <> 'blocked' AND trt.task_id = r.task_id
+    -- New control-only receipts keep a child capsule while its undelivered
+    -- recovery is owned. All existing receipt/lineage/candidate gates remain.
+    AND NOT EXISTS (
+        SELECT 1 FROM turn_llm_context shell_control
+        WHERE shell_control.turn_id = t.id AND shell_control.source = 'shell_control_v1'
+            AND NOT EXISTS (
+                SELECT 1 FROM turn_llm_context shell_canonical
+                WHERE shell_canonical.turn_id = shell_control.turn_id
+                    AND shell_canonical.item_id = shell_control.item_id
+                    AND shell_canonical.source = 'tool_result_v2'
+            )
+            AND (
+                EXISTS (SELECT 1 FROM recovery_job shell_recovery
+                    WHERE shell_recovery.turn_id = t.id
+                        AND (shell_recovery.status IN ('pending', 'active')
+                            -- READY already requires a definitively closed Turn.
+                            -- Ignore settled blocked audit jobs only with the
+                            -- same positive execution proof as control deletion.
+                            OR (shell_recovery.status = 'blocked' AND NOT EXISTS (
+                                SELECT 1 FROM turn_execution shell_execution
+                                WHERE shell_execution.turn_id = t.id
+                                    AND shell_execution.status IN ('completed', 'failed', 'interrupted', 'blocked')
+                                    AND shell_execution.completed_at IS NOT NULL
+                            ))
+                            OR shell_recovery.resolution_pending))
+                OR EXISTS (SELECT 1 FROM recovery_terminalization_outbox shell_outbox
+                    WHERE shell_outbox.turn_id = t.id AND shell_outbox.status NOT IN ('delivered', 'cancelled'))
+            )
+    )
     AND t.turn_kind = 'conversation'
     AND t.status IN ('completed', 'failed', 'interrupted')
     AND EXISTS (

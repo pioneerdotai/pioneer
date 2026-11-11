@@ -30,6 +30,22 @@ pub enum ToolOutputProjectionKind {
     },
 }
 
+impl ToolOutputProjectionKind {
+    /// Whether the LLM view owns the command-output representation, including proxies.
+    pub fn is_shell(&self, tool_name: &str) -> bool {
+        match self {
+            Self::Builtin => matches!(tool_name, "exec_command" | "write_stdin"),
+            Self::DynamicShell => true,
+            Self::DynamicFunctionProxy {
+                target_tool_name,
+                target_projection_kind,
+                ..
+            } => target_projection_kind.is_shell(target_tool_name),
+            _ => false,
+        }
+    }
+}
+
 impl Default for ToolOutputProjectionKind {
     fn default() -> Self {
         Self::Builtin

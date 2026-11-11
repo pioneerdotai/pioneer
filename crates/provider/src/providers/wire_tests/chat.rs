@@ -35,7 +35,7 @@ fn canonical_chat_rounds_parse_and_render_native_messages() {
             None::<String>,
             calls.clone(),
         ));
-        history.push(ChatMessage::tool_result(&calls[0].id, &calls[0].name, "ok"));
+        history.push(ChatMessage::tool_result(&calls[0].id, &calls[0].name, crate::providers::history_test_support::COMPACT_SHELL_RESULT));
         let prepared =
             prepare_messages_for_provider(provider.name(), &provider.capabilities(), &history)
                 .unwrap();
@@ -53,7 +53,7 @@ fn canonical_chat_rounds_parse_and_render_native_messages() {
             );
             assert_eq!(result["role"], "tool");
             assert_eq!(result["tool_call_id"], assistant["tool_calls"][0]["id"]);
-            assert_eq!(result["content"], "ok");
+            assert_eq!(result["content"], crate::providers::history_test_support::COMPACT_SHELL_RESULT);
         }
     }
 }
