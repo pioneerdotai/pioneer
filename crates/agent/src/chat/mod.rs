@@ -7523,22 +7523,25 @@ fn execute_agent_provider_response<'a>(
                         let native_shell_log = matches!(&tool_call.output_projection, pioneer_tools::ToolOutputProjectionKind::Builtin)
                             && matches!(&tool_call.payload, pioneer_tools::ToolPayload::LocalShell(_));
                         let native_file_page = tool_call.output_projection.is_file_page(&tool_name);
-                        let output_trace = runtime.event_bus().trace_with_id(tool_call.trace_id.clone(), turn_id.clone(), item_id.clone(), tool_name.clone());
-                        let dispatch_result = pioneer_provider::usage::scope_causal_parent(
+                        let (output_trace, dispatch_result) = pioneer_provider::usage::scope_causal_parent(
                             observation_parent,
-                            pioneer_tools::with_model_result_framing(
-                                provider_call_id.clone(),
-                                tool_name.clone(),
-                                tool_call.output_policy.clone(),
-                                tool_call.output_projection.clone(),
-                                async {
-                                    if runtime.router().computer_use_leaf(&tool_name).is_some() {
-                                        runtime.execute_tool_call_with_deferred_delivery(tool_call, attempt_token.clone()).await
-                                    } else {
-                                        runtime.execute_tool_call_with_cancellation(tool_call, attempt_token.clone()).await
-                                    }
-                                },
-                            ),
+                            Box::pin(async {
+                                let output_trace = runtime.event_bus().trace_with_id(tool_call.trace_id.clone(), turn_id.clone(), item_id.clone(), tool_name.clone());
+                                let dispatch_result = pioneer_tools::with_model_result_framing(
+                                    provider_call_id.clone(),
+                                    tool_name.clone(),
+                                    tool_call.output_policy.clone(),
+                                    tool_call.output_projection.clone(),
+                                    Box::pin(async {
+                                        if runtime.router().computer_use_leaf(&tool_name).is_some() {
+                                            runtime.execute_tool_call_with_deferred_delivery(tool_call, attempt_token.clone()).await
+                                        } else {
+                                            runtime.execute_tool_call_with_cancellation(tool_call, attempt_token.clone()).await
+                                        }
+                                    }),
+                                ).await;
+                                (output_trace, dispatch_result)
+                            }),
                         ).await;
                         let delivery = dispatch_result.as_ref().ok()
                             .and_then(|result| result.output.delivery_receipt())
