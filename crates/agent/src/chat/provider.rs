@@ -4505,7 +4505,7 @@ pub(super) async fn stream_provider_response(
                 workspace_id,
                 thread_id,
                 "main",
-                stream_provider_response_observed(
+                Box::pin(stream_provider_response_observed(
                     provider,
                     request,
                     workspace_id,
@@ -4516,7 +4516,7 @@ pub(super) async fn stream_provider_response(
                     provider_timeout_policy,
                     event_tx,
                     &observation,
-                ),
+                )),
             ),
             |fact| observation.publish_phase(event_tx, workspace_id, thread_id, turn_id, fact),
         )
@@ -4559,7 +4559,7 @@ pub(super) async fn non_stream_provider_response(
                 workspace_id,
                 thread_id,
                 "main",
-                non_stream_provider_response_observed(
+                Box::pin(non_stream_provider_response_observed(
                     provider,
                     request,
                     workspace_id,
@@ -4569,7 +4569,7 @@ pub(super) async fn non_stream_provider_response(
                     message_item_id,
                     event_tx,
                     &observation,
-                ),
+                )),
             ),
             |fact| observation.publish_phase(event_tx, workspace_id, thread_id, turn_id, fact),
         )

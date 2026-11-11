@@ -3623,9 +3623,11 @@ pub(super) async fn execute_chat_turn_flow(
     }
 }
 
+// Deadline and cancellation wrappers must carry a pointer, not replicate the
+// provider state machine in each nested poll frame. Callers box before entering.
 async fn await_context_request<T>(
     session: Option<&crate::compaction::controller::NativeContextSession>,
-    future: impl std::future::Future<Output = Result<T, ChatTurnError>>,
+    future: futures_util::future::BoxFuture<'_, Result<T, ChatTurnError>>,
 ) -> Result<T, ChatTurnError> {
     let Some(session) = session else {
         return future.await;
@@ -3649,9 +3651,9 @@ async fn await_context_request<T>(
     }
 }
 
-async fn execute_standard_provider_response(
-    context_session: Option<&crate::compaction::controller::NativeContextSession>,
-    provider: &Arc<dyn Provider>,
+fn execute_standard_provider_response<'a>(
+    context_session: Option<&'a crate::compaction::controller::NativeContextSession>,
+    provider: &'a Arc<dyn Provider>,
     model: String,
     history: Vec<ChatMessage>,
     user_message: ChatMessage,
@@ -3659,80 +3661,84 @@ async fn execute_standard_provider_response(
     compiled_prompt: Option<CompiledPromptPayload>,
     apply_chat_attachment_policy: bool,
     force_non_stream: bool,
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    thinking_item_id: &str,
-    message_item_id: &str,
+    workspace_id: &'a str,
+    thread_id: &'a str,
+    turn_id: &'a str,
+    thinking_item_id: &'a str,
+    message_item_id: &'a str,
     provider_timeout_policy: ProviderTimeoutPolicy,
     continuation: Vec<ChatMessage>,
     event_tx: Arc<AgentEventHub>,
-) -> Result<String, ChatTurnError> {
-    let mut messages = history;
+) -> futures_util::future::BoxFuture<'a, Result<String, ChatTurnError>> {
+    // Keep the provider state machine out of the outer turn poll frame.
+    // Boxing at creation bounds both its inline storage and construction copies.
+    Box::pin(async move {
+        let mut messages = history;
 
-    messages.push(user_message);
-    messages.extend(continuation);
+        messages.push(user_message);
+        messages.extend(continuation);
 
-    if apply_chat_attachment_policy {
-        retain_chat_mode_attachment_messages(&mut messages);
-    }
-
-    let request = ChatRequest {
-        model,
-        messages,
-        temperature: None,
-        max_tokens: None,
-        tools: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        reasoning,
-        compiled_prompt,
-    };
-
-    let (request, receipt, _) = prepare_request_with_inventory(
-        context_session,
-        request,
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-    )
-    .await?;
-    let work = async {
-        if provider.capabilities().streaming && !force_non_stream {
-            provider::stream_provider_response(
-                provider,
-                request,
-                workspace_id,
-                thread_id,
-                turn_id,
-                thinking_item_id,
-                message_item_id,
-                provider_timeout_policy,
-                event_tx.as_ref(),
-            )
-            .await
-        } else {
-            provider::non_stream_provider_response(
-                provider,
-                request,
-                workspace_id,
-                thread_id,
-                turn_id,
-                thinking_item_id,
-                message_item_id,
-                event_tx.as_ref(),
-            )
-            .await
+        if apply_chat_attachment_policy {
+            retain_chat_mode_attachment_messages(&mut messages);
         }
-    };
-    let (text, usage) = await_context_request(context_session, work).await?;
-    if let (Some(session), Some(receipt)) = (context_session, receipt) {
-        session
-            .record_usage(receipt, usage.as_ref())
-            .map_err(|e| ChatTurnError::Blocked(format!("context usage unavailable: {e}")))?;
-    }
-    Ok(text)
+
+        let request = ChatRequest {
+            model,
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning,
+            compiled_prompt,
+        };
+
+        let (request, receipt, _) = prepare_request_with_inventory(
+            context_session,
+            request,
+            event_tx.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+        )
+        .await?;
+        let work = async {
+            if provider.capabilities().streaming && !force_non_stream {
+                provider::stream_provider_response(
+                    provider,
+                    request,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    thinking_item_id,
+                    message_item_id,
+                    provider_timeout_policy,
+                    event_tx.as_ref(),
+                )
+                .await
+            } else {
+                provider::non_stream_provider_response(
+                    provider,
+                    request,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    thinking_item_id,
+                    message_item_id,
+                    event_tx.as_ref(),
+                )
+                .await
+            }
+        };
+        let (text, usage) = await_context_request(context_session, Box::pin(work)).await?;
+        if let (Some(session), Some(receipt)) = (context_session, receipt) {
+            session
+                .record_usage(receipt, usage.as_ref())
+                .map_err(|e| ChatTurnError::Blocked(format!("context usage unavailable: {e}")))?;
+        }
+        Ok(text)
+    })
 }
 
 async fn materialize_mcp_tooling(
@@ -4236,29 +4242,32 @@ async fn preload_agent_model(
     model: &str,
     thinking_item_id: &str,
 ) -> Result<(), ChatTurnError> {
-    await_context_request(context_session, async {
-        provider.prepare_model(model).await.map_err(|error| {
-            provider::model_preparation_error(thinking_item_id, provider, model, &error)
-        })
-    })
+    await_context_request(
+        context_session,
+        Box::pin(async {
+            provider.prepare_model(model).await.map_err(|error| {
+                provider::model_preparation_error(thinking_item_id, provider, model, &error)
+            })
+        }),
+    )
     .await?;
     Ok(())
 }
 
-async fn execute_agent_provider_response(
-    context_session: Option<&crate::compaction::controller::NativeContextSession>,
-    provider: &Arc<dyn Provider>,
+fn execute_agent_provider_response<'a>(
+    context_session: Option<&'a crate::compaction::controller::NativeContextSession>,
+    provider: &'a Arc<dyn Provider>,
     model: String,
     hook_runtime_context: AgentTurnHookRuntimeContext,
     reasoning: Option<ReasoningConfig>,
     history: Vec<ChatMessage>,
     mut user_message: ChatMessage,
-    turn_context: &str,
-    input: &[UserInput],
-    capabilities: &[TurnCapability],
-    workspace_skill_policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
-    skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
-    agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
+    turn_context: &'a str,
+    input: &'a [UserInput],
+    capabilities: &'a [TurnCapability],
+    workspace_skill_policies: &'a HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
+    skill_catalog: &'a pioneer_skills::SkillCatalogSnapshot,
+    agent_skill_overlay: &'a [pioneer_skills::AgentSkillRuntimeEntry],
     runtime_environment: HashMap<String, String>,
     retained_provider_history: Vec<RetainedProviderHistoryMessage>,
     execution_window_index: u32,
@@ -4278,104 +4287,166 @@ async fn execute_agent_provider_response(
     permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
     turn_control: TurnExecutionControl,
     mut recovery: Option<RecoveryAttemptContext>,
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
+    workspace_id: &'a str,
+    thread_id: &'a str,
+    turn_id: &'a str,
     initial_thinking_item_id: String,
-    message_item_id: &str,
+    message_item_id: &'a str,
     event_tx: Arc<AgentEventHub>,
-) -> Result<ChatTurnOutcome, ChatTurnError> {
-    let workdir = workdir_from_execution_security_snapshot(execution_security_snapshot.as_ref())?;
-    let filesystem_prompt_snapshot = execution_security_snapshot.clone();
+) -> futures_util::future::BoxFuture<'a, Result<ChatTurnOutcome, ChatTurnError>> {
+    // Keep the provider state machine out of the outer turn poll frame.
+    // Boxing at creation bounds both its inline storage and construction copies.
+    Box::pin(async move {
+        let workdir =
+            workdir_from_execution_security_snapshot(execution_security_snapshot.as_ref())?;
+        let filesystem_prompt_snapshot = execution_security_snapshot.clone();
 
-    let tool_loop_config = tool_loop_config.normalized();
-    preload_agent_model(
-        context_session,
-        provider.as_ref(),
-        &model,
-        &initial_thinking_item_id,
-    )
-    .await?;
-    let provider_tool_calling =
-        provider.model_tool_calling(model.as_str()) && !disable_tool_calling;
-    let native_file_tool_capability = if provider_tool_calling {
-        provider.native_file_tool_capability(model.as_str())
-    } else {
-        NativeFileToolCapability::unavailable(
-            provider.name(),
-            model.as_str(),
-            "provider tool calling is disabled for this turn",
+        let tool_loop_config = tool_loop_config.normalized();
+        preload_agent_model(
+            context_session,
+            provider.as_ref(),
+            &model,
+            &initial_thinking_item_id,
         )
-    };
-    let post_turn_model = model.clone();
-    let post_turn_model_provider = provider.name().to_owned();
-    let hook_context = AgentTurnHookContext::with_runtime_context(
-        workspace_id,
-        thread_id,
-        turn_id,
-        hook_runtime_context.clone(),
-    );
-    let user_input_text = user_message.text_content_lossy();
-
-    let effective_policy_set = run_agent_turn_policy_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
-        TurnPrePolicyHookInput::from_parts(
-            user_input_text.clone(),
-            Some(model.clone()),
-            Some(provider.name().to_owned()),
-        ),
-    )
-    .await
-    .map_err(|error| {
-        warn!(
+        .await?;
+        let provider_tool_calling =
+            provider.model_tool_calling(model.as_str()) && !disable_tool_calling;
+        let native_file_tool_capability = if provider_tool_calling {
+            provider.native_file_tool_capability(model.as_str())
+        } else {
+            NativeFileToolCapability::unavailable(
+                provider.name(),
+                model.as_str(),
+                "provider tool calling is disabled for this turn",
+            )
+        };
+        let post_turn_model = model.clone();
+        let post_turn_model_provider = provider.name().to_owned();
+        let hook_context = AgentTurnHookContext::with_runtime_context(
+            workspace_id,
             thread_id,
             turn_id,
-            error_kind = error.kind(),
-            "turn policy hook failed before prompt construction"
+            hook_runtime_context.clone(),
         );
-        ChatTurnError::Terminal(error.safe_message().to_owned())
-    })?;
+        let user_input_text = user_message.text_content_lossy();
 
-    let effective_prompt_context_set = run_agent_turn_prompt_context_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
-        &effective_policy_set,
-        TurnPrePromptContextHookInput::from_parts(
-            user_input_text.clone(),
-            Some(model.clone()),
-            Some(provider.name().to_owned()),
-        ),
-    )
-    .await;
-
-    let normalized_capabilities = normalize_turn_capabilities(capabilities);
-
-    let mcp_materialization = if provider_tool_calling {
-        match materialize_mcp_tooling(
-            mcp_tool_provider.as_ref(),
-            workspace_id,
-            turn_id,
-            normalized_capabilities.mcp_server_refs.as_slice(),
-            normalized_capabilities.mcp_tool_refs.as_slice(),
+        let effective_policy_set = run_agent_turn_policy_hook_phase(
+            hook_runtime.as_ref(),
+            &hook_context,
+            TurnPrePolicyHookInput::from_parts(
+                user_input_text.clone(),
+                Some(model.clone()),
+                Some(provider.name().to_owned()),
+            ),
         )
         .await
-        {
-            Ok(materialization) => materialization,
-            Err(failure) => {
-                for diagnostic in &failure.diagnostics {
-                    warn!(
+        .map_err(|error| {
+            warn!(
+                thread_id,
+                turn_id,
+                error_kind = error.kind(),
+                "turn policy hook failed before prompt construction"
+            );
+            ChatTurnError::Terminal(error.safe_message().to_owned())
+        })?;
+
+        let effective_prompt_context_set = run_agent_turn_prompt_context_hook_phase(
+            hook_runtime.as_ref(),
+            &hook_context,
+            &effective_policy_set,
+            TurnPrePromptContextHookInput::from_parts(
+                user_input_text.clone(),
+                Some(model.clone()),
+                Some(provider.name().to_owned()),
+            ),
+        )
+        .await;
+
+        let normalized_capabilities = normalize_turn_capabilities(capabilities);
+
+        let mcp_materialization = if provider_tool_calling {
+            match materialize_mcp_tooling(
+                mcp_tool_provider.as_ref(),
+                workspace_id,
+                turn_id,
+                normalized_capabilities.mcp_server_refs.as_slice(),
+                normalized_capabilities.mcp_tool_refs.as_slice(),
+            )
+            .await
+            {
+                Ok(materialization) => materialization,
+                Err(failure) => {
+                    for diagnostic in &failure.diagnostics {
+                        warn!(
+                            thread_id,
+                            turn_id,
+                            reason = ?failure.reason,
+                            code = diagnostic.code.as_str(),
+                            diagnostic = diagnostic.message.as_str(),
+                            "MCP turn projection preflight failed"
+                        );
+                    }
+                    let accepted_capabilities = failure.accepted_capabilities.clone();
+                    let mut rejected_capabilities = normalized_capabilities.rejected.clone();
+                    rejected_capabilities.extend(failure.rejected_capabilities.clone());
+                    emit_capability_resolution_events(
+                        event_tx.as_ref(),
+                        workspace_id,
                         thread_id,
                         turn_id,
-                        reason = ?failure.reason,
-                        code = diagnostic.code.as_str(),
-                        diagnostic = diagnostic.message.as_str(),
-                        "MCP turn projection preflight failed"
-                    );
+                        accepted_capabilities.as_slice(),
+                        rejected_capabilities.as_slice(),
+                        &[],
+                    )
+                    .await?;
+                    emit_mcp_resolution_diagnostics(
+                        event_tx.as_ref(),
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        failure.diagnostics.as_slice(),
+                    )
+                    .await?;
+                    return Err(ChatTurnError::Blocked(failure.message));
                 }
-                let accepted_capabilities = failure.accepted_capabilities.clone();
+            }
+        } else {
+            AgentMcpMaterialization::default()
+        };
+        for diagnostic in &mcp_materialization.diagnostics {
+            warn!(
+                thread_id,
+                turn_id,
+                code = diagnostic.code.as_str(),
+                diagnostic = diagnostic.message.as_str(),
+                "MCP dynamic tool materialization reported diagnostic"
+            );
+        }
+        let projected_mcp_availability = AgentMcpAvailability {
+            available_mcp: mcp_materialization.available_mcp.clone(),
+            blocked_mcp: mcp_materialization.blocked_mcp.clone(),
+        };
+
+        let skills_resolution = match skills::resolve_turn_skills_with_explicit_refs(
+            input,
+            normalized_capabilities.skill_refs.as_slice(),
+            skill_catalog,
+            readable_agent_skill_overlay(agent_skill_overlay, provider_tool_calling),
+            &tool_loop_config.skills,
+            workspace_skill_policies,
+            &projected_mcp_availability,
+        ) {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "combined MCP and skill preflight failed while resolving skills"
+                );
+                let accepted_capabilities = mcp_materialization.accepted_capabilities.clone();
                 let mut rejected_capabilities = normalized_capabilities.rejected.clone();
-                rejected_capabilities.extend(failure.rejected_capabilities.clone());
+                rejected_capabilities.extend(mcp_materialization.rejected_capabilities.clone());
                 emit_capability_resolution_events(
                     event_tx.as_ref(),
                     workspace_id,
@@ -4391,49 +4462,61 @@ async fn execute_agent_provider_response(
                     workspace_id,
                     thread_id,
                     turn_id,
-                    failure.diagnostics.as_slice(),
+                    mcp_materialization.diagnostics.as_slice(),
                 )
                 .await?;
-                return Err(ChatTurnError::Blocked(failure.message));
+                return Err(ChatTurnError::Blocked(format!(
+                    "combined MCP and skill preflight failed: {error:#}"
+                )));
             }
-        }
-    } else {
-        AgentMcpMaterialization::default()
-    };
-    for diagnostic in &mcp_materialization.diagnostics {
-        warn!(
-            thread_id,
-            turn_id,
-            code = diagnostic.code.as_str(),
-            diagnostic = diagnostic.message.as_str(),
-            "MCP dynamic tool materialization reported diagnostic"
-        );
-    }
-    let projected_mcp_availability = AgentMcpAvailability {
-        available_mcp: mcp_materialization.available_mcp.clone(),
-        blocked_mcp: mcp_materialization.blocked_mcp.clone(),
-    };
-
-    let skills_resolution = match skills::resolve_turn_skills_with_explicit_refs(
-        input,
-        normalized_capabilities.skill_refs.as_slice(),
-        skill_catalog,
-        readable_agent_skill_overlay(agent_skill_overlay, provider_tool_calling),
-        &tool_loop_config.skills,
-        workspace_skill_policies,
-        &projected_mcp_availability,
-    ) {
-        Ok(resolution) => resolution,
-        Err(error) => {
+        };
+        if let Some(error) = skills_resolution.agent_overlay_error.as_deref() {
             warn!(
+                workspace_id,
                 thread_id,
                 turn_id,
-                error = %format!("{error:#}"),
-                "combined MCP and skill preflight failed while resolving skills"
+                error,
+                "Agent skill overlay was rejected; continuing with ordinary skills only"
             );
-            let accepted_capabilities = mcp_materialization.accepted_capabilities.clone();
-            let mut rejected_capabilities = normalized_capabilities.rejected.clone();
-            rejected_capabilities.extend(mcp_materialization.rejected_capabilities.clone());
+        }
+
+        if !skills_resolution.audit_events.is_empty() {
+            emit_durable_event(
+                event_tx.as_ref(),
+                AgentDurableEvent::SkillAuditEvents {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    events: skills_resolution
+                        .audit_events
+                        .iter()
+                        .cloned()
+                        .map(protocol_skill_audit_event)
+                        .collect(),
+                },
+            )
+            .await?;
+        }
+
+        let skill_capability_summary = resolve_skill_capability_summary(
+            normalized_capabilities.skill_refs.as_slice(),
+            &skills_resolution,
+        );
+
+        let unsupported_mcp_summary = if provider_tool_calling {
+            TurnCapabilityResolutionSummary::default()
+        } else {
+            unsupported_mcp_capability_summary(
+                normalized_capabilities.mcp_server_refs.as_slice(),
+                normalized_capabilities.mcp_tool_refs.as_slice(),
+            )
+        };
+        let mut accepted_capabilities = skill_capability_summary.accepted.clone();
+        accepted_capabilities.extend(mcp_materialization.accepted_capabilities.clone());
+        let mut rejected_capabilities = normalized_capabilities.rejected.clone();
+        rejected_capabilities.extend(skill_capability_summary.rejected.clone());
+        rejected_capabilities.extend(mcp_materialization.rejected_capabilities.clone());
+        rejected_capabilities.extend(unsupported_mcp_summary.rejected);
+        if !rejected_capabilities.is_empty() {
             emit_capability_resolution_events(
                 event_tx.as_ref(),
                 workspace_id,
@@ -4452,58 +4535,45 @@ async fn execute_agent_provider_response(
                 mcp_materialization.diagnostics.as_slice(),
             )
             .await?;
-            return Err(ChatTurnError::Blocked(format!(
-                "combined MCP and skill preflight failed: {error:#}"
-            )));
+            return Err(ChatTurnError::Blocked(
+                "combined MCP and skill preflight rejected one or more explicit capabilities"
+                    .to_owned(),
+            ));
         }
-    };
-    if let Some(error) = skills_resolution.agent_overlay_error.as_deref() {
-        warn!(
-            workspace_id,
-            thread_id,
-            turn_id,
-            error,
-            "Agent skill overlay was rejected; continuing with ordinary skills only"
-        );
-    }
 
-    if !skills_resolution.audit_events.is_empty() {
-        emit_durable_event(
-            event_tx.as_ref(),
-            AgentDurableEvent::SkillAuditEvents {
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                events: skills_resolution
-                    .audit_events
-                    .iter()
-                    .cloned()
-                    .map(protocol_skill_audit_event)
-                    .collect(),
-            },
-        )
-        .await?;
-    }
+        if let Some(persistence_request) = mcp_materialization.persistence.clone() {
+            let Some(mcp_tool_provider) = mcp_tool_provider.as_ref() else {
+                return Err(ChatTurnError::Blocked(
+                    "resolved MCP projection has no persistence owner".to_owned(),
+                ));
+            };
+            let expected_manifest_hash = persistence_request.manifest_hash.clone();
+            let expected_tool_count = persistence_request.bindings.len();
+            let persisted = mcp_tool_provider
+                .persist_mcp_projection(persistence_request)
+                .await
+                .map_err(|error| {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        error = %error,
+                        "turn MCP projection persistence failed before provider start"
+                    );
+                    ChatTurnError::Blocked(format!(
+                        "failed to persist resolved MCP projection: {error}"
+                    ))
+                })?;
+            if persisted.turn_id != turn_id
+                || persisted.manifest_hash != expected_manifest_hash
+                || persisted.tool_count != expected_tool_count
+            {
+                return Err(ChatTurnError::Blocked(
+                "persisted MCP projection acknowledgement did not match the resolved projection"
+                    .to_owned(),
+            ));
+            }
+        }
 
-    let skill_capability_summary = resolve_skill_capability_summary(
-        normalized_capabilities.skill_refs.as_slice(),
-        &skills_resolution,
-    );
-
-    let unsupported_mcp_summary = if provider_tool_calling {
-        TurnCapabilityResolutionSummary::default()
-    } else {
-        unsupported_mcp_capability_summary(
-            normalized_capabilities.mcp_server_refs.as_slice(),
-            normalized_capabilities.mcp_tool_refs.as_slice(),
-        )
-    };
-    let mut accepted_capabilities = skill_capability_summary.accepted.clone();
-    accepted_capabilities.extend(mcp_materialization.accepted_capabilities.clone());
-    let mut rejected_capabilities = normalized_capabilities.rejected.clone();
-    rejected_capabilities.extend(skill_capability_summary.rejected.clone());
-    rejected_capabilities.extend(mcp_materialization.rejected_capabilities.clone());
-    rejected_capabilities.extend(unsupported_mcp_summary.rejected);
-    if !rejected_capabilities.is_empty() {
         emit_capability_resolution_events(
             event_tx.as_ref(),
             workspace_id,
@@ -4511,7 +4581,7 @@ async fn execute_agent_provider_response(
             turn_id,
             accepted_capabilities.as_slice(),
             rejected_capabilities.as_slice(),
-            &[],
+            mcp_materialization.mcp_bindings.as_slice(),
         )
         .await?;
         emit_mcp_resolution_diagnostics(
@@ -4522,144 +4592,357 @@ async fn execute_agent_provider_response(
             mcp_materialization.diagnostics.as_slice(),
         )
         .await?;
-        return Err(ChatTurnError::Blocked(
-            "combined MCP and skill preflight rejected one or more explicit capabilities"
-                .to_owned(),
-        ));
-    }
+        let capability_diagnostics =
+            capability_manifest_diagnostics(rejected_capabilities.as_slice());
 
-    if let Some(persistence_request) = mcp_materialization.persistence.clone() {
-        let Some(mcp_tool_provider) = mcp_tool_provider.as_ref() else {
-            return Err(ChatTurnError::Blocked(
-                "resolved MCP projection has no persistence owner".to_owned(),
-            ));
-        };
-        let expected_manifest_hash = persistence_request.manifest_hash.clone();
-        let expected_tool_count = persistence_request.bindings.len();
-        let persisted = mcp_tool_provider
-            .persist_mcp_projection(persistence_request)
+        let mut skills_prompt = normalize_optional_prompt(Some(skills_resolution.prompt.clone()));
+
+        let task_materialization = if provider_tool_calling {
+            materialize_task_tooling(
+                task_tool_provider.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+            )
             .await
-            .map_err(|error| {
-                warn!(
-                    thread_id,
-                    turn_id,
-                    error = %error,
-                    "turn MCP projection persistence failed before provider start"
-                );
-                ChatTurnError::Blocked(format!(
-                    "failed to persist resolved MCP projection: {error}"
-                ))
-            })?;
-        if persisted.turn_id != turn_id
-            || persisted.manifest_hash != expected_manifest_hash
-            || persisted.tool_count != expected_tool_count
-        {
-            return Err(ChatTurnError::Blocked(
-                "persisted MCP projection acknowledgement did not match the resolved projection"
-                    .to_owned(),
-            ));
+        } else {
+            TaskToolMaterialization::default()
+        };
+        for diagnostic in &task_materialization.diagnostics {
+            warn!(
+                thread_id,
+                turn_id,
+                diagnostic = diagnostic.as_str(),
+                "task tool materialization reported diagnostic"
+            );
         }
-    }
+        let include_task_orchestration_policy = !task_materialization.bundles.is_empty();
+        let include_html_policy = provider_tool_calling
+            && skills_resolution.result.active.iter().any(|skill| {
+                skill.definition.identity.source_kind == pioneer_skills::SkillSourceKind::System
+                    && skill.definition.identity.owner.as_deref() == Some("pioneer")
+                    && skill.definition.identity.slug == "html"
+            });
 
-    emit_capability_resolution_events(
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        accepted_capabilities.as_slice(),
-        rejected_capabilities.as_slice(),
-        mcp_materialization.mcp_bindings.as_slice(),
-    )
-    .await?;
-    emit_mcp_resolution_diagnostics(
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        mcp_materialization.diagnostics.as_slice(),
-    )
-    .await?;
-    let capability_diagnostics = capability_manifest_diagnostics(rejected_capabilities.as_slice());
-
-    let mut skills_prompt = normalize_optional_prompt(Some(skills_resolution.prompt.clone()));
-
-    let task_materialization = if provider_tool_calling {
-        materialize_task_tooling(
-            task_tool_provider.as_ref(),
+        // agent domain root execution admission is part of Agent response
+        // admission, not an optional consequence of native tool calling. The
+        // provider materializes the durable responding execution here even for a
+        // model/backend that cannot receive tools, and any admission failure must
+        // stop before the first external provider request.
+        let turn_tool_materialization = materialize_turn_tooling(
+            turn_tool_provider.as_ref(),
             workspace_id,
             thread_id,
             turn_id,
         )
         .await
-    } else {
-        TaskToolMaterialization::default()
-    };
-    for diagnostic in &task_materialization.diagnostics {
-        warn!(
-            thread_id,
-            turn_id,
-            diagnostic = diagnostic.as_str(),
-            "task tool materialization reported diagnostic"
-        );
-    }
-    let include_task_orchestration_policy = !task_materialization.bundles.is_empty();
-    let include_html_policy = provider_tool_calling
-        && skills_resolution.result.active.iter().any(|skill| {
-            skill.definition.identity.source_kind == pioneer_skills::SkillSourceKind::System
-                && skill.definition.identity.owner.as_deref() == Some("pioneer")
-                && skill.definition.identity.slug == "html"
-        });
-
-    // agent domain root execution admission is part of Agent response
-    // admission, not an optional consequence of native tool calling. The
-    // provider materializes the durable responding execution here even for a
-    // model/backend that cannot receive tools, and any admission failure must
-    // stop before the first external provider request.
-    let turn_tool_materialization = materialize_turn_tooling(
-        turn_tool_provider.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-    )
-    .await
-    .map_err(|error| {
-        ChatTurnError::Terminal(format!(
-            "failed to admit durable Agent execution before provider start: {error}"
-        ))
-    })?;
-    for diagnostic in &turn_tool_materialization.diagnostics {
-        warn!(
-            thread_id,
-            turn_id,
-            diagnostic = diagnostic.as_str(),
-            "turn tool materialization reported diagnostic"
-        );
-    }
-
-    if !provider_tool_calling {
-        if !agent_skill_overlay.is_empty() {
-            if recovery.is_some() {
-                return Err(ChatTurnError::Terminal(
-                    "pinned Agent skills cannot be recovered without native tool calling"
-                        .to_owned(),
-                ));
-            }
-            emit_turn_skills_resolved_event(
-                event_tx.as_ref(),
+        .map_err(|error| {
+            ChatTurnError::Terminal(format!(
+                "failed to admit durable Agent execution before provider start: {error}"
+            ))
+        })?;
+        for diagnostic in &turn_tool_materialization.diagnostics {
+            warn!(
                 thread_id,
                 turn_id,
-                skills::to_turn_skill_bindings(skills_resolution.result.active.as_slice(), &[]),
-                true,
-            )
-            .await?;
+                diagnostic = diagnostic.as_str(),
+                "turn tool materialization reported diagnostic"
+            );
         }
 
-        let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
+        if !provider_tool_calling {
+            if !agent_skill_overlay.is_empty() {
+                if recovery.is_some() {
+                    return Err(ChatTurnError::Terminal(
+                        "pinned Agent skills cannot be recovered without native tool calling"
+                            .to_owned(),
+                    ));
+                }
+                emit_turn_skills_resolved_event(
+                    event_tx.as_ref(),
+                    thread_id,
+                    turn_id,
+                    skills::to_turn_skill_bindings(skills_resolution.result.active.as_slice(), &[]),
+                    true,
+                )
+                .await?;
+            }
+
+            let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
+                hook_runtime.as_ref(),
+                &hook_context,
+                &effective_policy_set,
+                &effective_prompt_context_set,
+                Vec::new(),
+                tool_bundle_artifacts.as_ref(),
+                provider_tool_calling,
+            )
+            .await
+            .map_err(|error| {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error_kind = error.kind(),
+                    "turn tool materialization hook failed before prompt construction"
+                );
+                ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
+            })?;
+
+            let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
+                hook_runtime.as_ref(),
+                &hook_context,
+                &effective_policy_set,
+                &effective_prompt_context_set,
+                Vec::new(),
+                TurnPrePromptCompileHookInput::from_parts(false, Vec::new()),
+            )
+            .await
+            .map_err(|error| {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error_kind = error.kind(),
+                    "turn prompt section hook failed before prompt construction"
+                );
+                ChatTurnError::Terminal("turn prompt section hook failed".to_owned())
+            })?;
+            let prompt_sections =
+                prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
+            let prior_visible_assistant_text =
+                prior_visible_assistant_text_for_execution_continuation(history.as_slice());
+            let prompt_runtime_sections = runtime_sections_with_execution_continuation_context(
+                prompt_sections.runtime_sections.as_slice(),
+                execution_window_index,
+                execution_checkpoint_context.as_ref(),
+                prior_visible_assistant_text.as_deref(),
+                turn_tool_materialization.initiating_thread_id.as_deref(),
+            );
+            let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
+                prompt_runtime_sections,
+                history_or_prompt_context_has_artifact_refs(
+                    history.as_slice(),
+                    &effective_prompt_context_set,
+                ),
+            )?;
+            let prompt_runtime_sections = append_native_filesystem_capability_section(
+                prompt_runtime_sections,
+                &native_file_tool_capability,
+                filesystem_prompt_snapshot.as_ref(),
+            )?;
+
+            let initial_instruction_plan =
+                compile_agent_instruction_delivery_plan_with_prompt_root(
+                    tool_loop_config.computer_use.runtime_home_dir.as_path(),
+                    skills_prompt.clone(),
+                    None,
+                    prompt_runtime_sections.as_slice(),
+                    &permission_profile,
+                    include_task_orchestration_policy,
+                    false,
+                    include_html_policy,
+                    false,
+                    false,
+                    continue_generation_hint,
+                    turn_tool_materialization.initiating_thread_id.as_deref(),
+                    thread_id,
+                    turn_id,
+                )?;
+
+            let governing_sources =
+                saved_prompt_sources(&initial_instruction_plan, &retained_provider_history)?;
+            let governing_documents =
+                saved_governing_documents(&initial_instruction_plan, &retained_provider_history)?;
+            let initial_instruction_plan = freeze_governing_documents(
+                initial_instruction_plan,
+                &governing_documents,
+                &governing_sources,
+            )?;
+            run_noop_agent_turn_hook_phase(
+                hook_runtime.as_ref(),
+                &hook_context,
+                HookPhase::TurnPostPromptCompile,
+                &effective_policy_set,
+                &effective_prompt_context_set,
+            )
+            .await;
+
+            emit_durable_event(
+                event_tx.as_ref(),
+                AgentDurableEvent::PromptManifestCompiled {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    manifest: prompt_manifest_from_bundle(
+                        &initial_instruction_plan.bundle,
+                        &EffectiveTurnPromptManifestHookMetadata::combined(
+                            effective_prompt_context_set.manifest_metadata(),
+                            effective_prompt_section_set.manifest_metadata(),
+                        ),
+                        capability_diagnostics.as_slice(),
+                    ),
+                },
+            )
+            .await?;
+
+            let (context, metadata) =
+                prepare_context_metadata(&initial_instruction_plan, &history, turn_context);
+            user_message.application_context = Some(metadata);
+            prepare_turn_input_projection(
+                &mut user_message,
+                &context,
+                &retained_provider_history,
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+            )
+            .await?;
+
+            let recovered_prompt = recovered_system_snapshot(&retained_provider_history)?;
+            let compiled_prompt =
+                if saved_system_matches_schemas(&retained_provider_history, &None)? {
+                    recovered_prompt
+                } else {
+                    Some(compiled_prompt_payload_from_delivery_plan(
+                        &initial_instruction_plan,
+                    ))
+                };
+            persist_system_snapshot(
+                &compiled_prompt,
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                message_item_id,
+                &None,
+            )
+            .await?;
+            let mut continuation_history = Vec::new();
+            append_recovered_provider_history(
+                &mut continuation_history,
+                retained_provider_history.clone(),
+            );
+            // Standard execution appends current input after history; continuation
+            // observations must follow that input rather than preceding it.
+            let continuation = prepare_continuation_context(
+                &initial_instruction_plan,
+                &retained_provider_history,
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+            )
+            .await?;
+            continuation_history.extend(continuation);
+            let result = execute_standard_provider_response(
+                context_session,
+                provider,
+                model,
+                history,
+                user_message.clone(),
+                reasoning,
+                compiled_prompt,
+                false,
+                force_non_stream,
+                workspace_id,
+                thread_id,
+                turn_id,
+                initial_thinking_item_id.as_str(),
+                message_item_id,
+                tool_loop_config.provider,
+                continuation_history,
+                event_tx.clone(),
+            )
+            .await;
+
+            match result {
+                Ok(assistant_text) => {
+                    let summary = AgentTurnPostTurnSummary::succeeded_with_model(
+                        Some(post_turn_model.clone()),
+                        Some(post_turn_model_provider.clone()),
+                        extract_post_turn_user_text(input),
+                        assistant_text,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    return Ok(ChatTurnOutcome::Completed {
+                        post_turn_dispatch: Some(AgentTurnPostTurnHookDispatch::new(
+                            hook_context,
+                            effective_policy_set,
+                            effective_prompt_context_set,
+                            summary,
+                        )),
+                    });
+                }
+                Err(error) => {
+                    return Err(with_post_turn_failure_dispatch(
+                        error,
+                        hook_context,
+                        effective_policy_set,
+                        effective_prompt_context_set,
+                        extract_user_text(input),
+                        String::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                }
+            }
+        }
+
+        let skill_tool_materialization = skill_tools::materialize_skill_tooling(
+            &skills_resolution.runtime_plan,
+            &tool_loop_config.skills,
+        );
+
+        for excluded in &skill_tool_materialization.excluded_tools {
+            warn!(
+                thread_id,
+                turn_id,
+                tool_name = excluded.canonical_tool_name.as_str(),
+                reason = excluded.reason.as_str(),
+                "excluded invalid skill runtime tool; continuing turn"
+            );
+        }
+        for diagnostic in &skill_tool_materialization.policy_diagnostics {
+            warn!(
+                thread_id,
+                turn_id,
+                tool_name = diagnostic.canonical_tool_name.as_str(),
+                diagnostics = ?diagnostic.diagnostics,
+                "dynamic skill tool output policy was narrowed"
+            );
+        }
+
+        let mut tool_bundle_contributions = Vec::new();
+        tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+            "skill",
+            "skill.runtime",
+            SKILL_TOOL_BUNDLE_PRIORITY,
+            skill_tool_materialization.bundles.clone(),
+        ));
+        tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+            "mcp",
+            "mcp.runtime",
+            MCP_TOOL_BUNDLE_PRIORITY,
+            mcp_materialization.bundles.clone(),
+        ));
+        tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+            "turn",
+            "turn.runtime",
+            TURN_TOOL_BUNDLE_PRIORITY,
+            turn_tool_materialization.bundles.clone(),
+        ));
+        tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+            "task",
+            "task.runtime",
+            TASK_TOOL_BUNDLE_PRIORITY,
+            task_materialization.bundles.clone(),
+        ));
+        let effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
             hook_runtime.as_ref(),
             &hook_context,
             &effective_policy_set,
             &effective_prompt_context_set,
-            Vec::new(),
+            tool_bundle_contributions,
             tool_bundle_artifacts.as_ref(),
             provider_tool_calling,
         )
@@ -4669,18 +4952,213 @@ async fn execute_agent_provider_response(
                 thread_id,
                 turn_id,
                 error_kind = error.kind(),
-                "turn tool materialization hook failed before prompt construction"
+                "turn tool materialization hook failed before tool runtime construction"
             );
             ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
         })?;
 
-        let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
+        let extension_bundles = effective_tool_bundle_set.bundles().to_vec();
+
+        let permission_context = PermissionEvaluationContext::for_turn(
+            workspace_id,
+            thread_id,
+            turn_id,
+            permission_profile.clone(),
+        );
+        let runtime_environment = runtime_environment.into_iter().collect::<BTreeMap<_, _>>();
+        let tools = match build_tools_with_environment_and_security_snapshot(
+            workdir.clone(),
+            turn_id.to_owned(),
+            permission_context.clone(),
+            tool_loop_config.web.clone(),
+            tool_loop_config.computer_use.clone(),
+            extension_bundles,
+            runtime_environment.clone(),
+            execution_security_snapshot.clone(),
+        ) {
+            Ok(tools) => tools,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %error,
+                    "failed to build tool runtime with extensions; continuing with built-ins only"
+                );
+                build_tools_with_environment_and_security_snapshot(
+                    workdir.clone(),
+                    turn_id.to_owned(),
+                    permission_context.clone(),
+                    tool_loop_config.web.clone(),
+                    tool_loop_config.computer_use.clone(),
+                    Vec::new(),
+                    runtime_environment,
+                    execution_security_snapshot.clone(),
+                )
+                .unwrap_or_else(|_| {
+                    build_builtin_tools_with_security_snapshot(
+                        workdir.clone(),
+                        turn_id.to_owned(),
+                        permission_context.clone(),
+                        tool_loop_config.web.clone(),
+                        tool_loop_config.computer_use.clone(),
+                        execution_security_snapshot,
+                    )
+                })
+            }
+        }
+        .with_permission_approval_broker(permission_approval_broker);
+
+        // One trusted provider capability decision owns native filesystem-tool
+        // visibility for this turn.  Apply it before tool visibility so the core tools,
+        // request_tools catalog and final provider schema cannot diverge.
+        tools
+            .router
+            .set_blocked_tool_names(native_file_tool_blocked_names(&native_file_tool_capability));
+        tools
+            .router
+            .set_native_patch_wire_shape(native_file_tool_capability.patch_shape);
+
+        skill_tool_materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+
+        let runtime = tools.runtime.clone();
+        let router = tools.router.clone();
+
+        let runtime_tool_index = Arc::new(
+            skills_resolution
+                .runtime_plan
+                .tools
+                .iter()
+                .map(|descriptor| (descriptor.canonical_tool_name.clone(), descriptor.clone()))
+                .collect::<HashMap<_, _>>(),
+        );
+
+        let runtime_recheck_policy = pioneer_skills::RuntimeExecutionRecheckPolicy {
+            runtime_recheck_on_tool_call: tool_loop_config
+                .skills
+                .dependencies
+                .runtime_recheck_on_tool_call,
+            security: pioneer_skills::SkillSecurityPolicy {
+                allow_untrusted_install: tool_loop_config.skills.security.allow_untrusted_install,
+                min_trust_for_shell_tools: tool_loop_config
+                    .skills
+                    .security
+                    .min_trust_for_shell_tools
+                    .clone(),
+                min_trust_for_http_tools: tool_loop_config
+                    .skills
+                    .security
+                    .min_trust_for_http_tools
+                    .clone(),
+                min_trust_for_function_proxy_tools: tool_loop_config
+                    .skills
+                    .security
+                    .min_trust_for_function_proxy_tools
+                    .clone(),
+                max_install_archive_bytes: tool_loop_config
+                    .skills
+                    .security
+                    .max_install_archive_bytes,
+                max_install_file_bytes: tool_loop_config.skills.security.max_install_file_bytes,
+            },
+        };
+
+        let mut observation_change_reason = if execution_checkpoint_context.is_some() {
+            "restore"
+        } else {
+            "initial_runtime_selection"
+        };
+        let mut requested_tool_names = restored_requested_tool_names(
+            execution_checkpoint_context.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+        );
+        let initial_visibility =
+            router.compute_final_visible_tools(&router.core_tool_names(), &requested_tool_names);
+        requested_tool_names.retain(|name| initial_visibility.visible_tools.contains(name));
+
+        warn_final_visible_tool_diagnostics(
+            thread_id,
+            turn_id,
+            initial_visibility.diagnostics.as_slice(),
+        );
+
+        let read_skill_is_visible = initial_visibility
+            .visible_tools
+            .iter()
+            .any(|tool_name| tool_name == "read_skill");
+        let exposed_agent_overlay = if skills_resolution.agent_overlay_error.is_none()
+            && agent_skill_cards_have_read_path(agent_skill_overlay, read_skill_is_visible)
+        {
+            readable_agent_skill_overlay(agent_skill_overlay, provider_tool_calling)
+        } else {
+            if skills_resolution.agent_overlay_error.is_none() && !agent_skill_overlay.is_empty() {
+                let base_resolution = skills::resolve_turn_skills_with_explicit_refs(
+                    input,
+                    normalized_capabilities.skill_refs.as_slice(),
+                    skill_catalog,
+                    &[],
+                    &tool_loop_config.skills,
+                    workspace_skill_policies,
+                    &projected_mcp_availability,
+                )
+                .map_err(|error| {
+                    ChatTurnError::Terminal(format!(
+                        "failed to rebuild ordinary skills after Agent read_skill was unavailable: \
+                     {error:#}"
+                    ))
+                })?;
+                skills_prompt = normalize_optional_prompt(Some(base_resolution.prompt));
+                warn!(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    "read_skill was absent from the final native tool plan; Agent cards were removed"
+                );
+            }
+            &[]
+        };
+
+        if recovery.is_some() && !agent_skill_overlay.is_empty() && exposed_agent_overlay.is_empty()
+        {
+            return Err(ChatTurnError::Terminal(
+                "pinned Agent skills are unavailable in the recovered turn's final tool plan"
+                    .to_owned(),
+            ));
+        }
+
+        let include_threads_policy = native_threads_policy_available(
+            &skills_resolution,
+            skills_prompt.as_deref(),
+            &router.available_tool_names(),
+            &initial_visibility.visible_tools,
+            &permission_profile,
+        );
+
+        emit_turn_skills_resolved_event(
+            event_tx.as_ref(),
+            thread_id,
+            turn_id,
+            skills::to_turn_skill_bindings(
+                skills_resolution.result.active.as_slice(),
+                exposed_agent_overlay,
+            ),
+            !agent_skill_overlay.is_empty(),
+        )
+        .await?;
+
+        let mut effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
             hook_runtime.as_ref(),
             &hook_context,
             &effective_policy_set,
             &effective_prompt_context_set,
             Vec::new(),
-            TurnPrePromptCompileHookInput::from_parts(false, Vec::new()),
+            TurnPrePromptCompileHookInput::from_parts(
+                provider_tool_calling,
+                hook_tool_names_from_strings(initial_visibility.visible_tools.as_slice()),
+            ),
         )
         .await
         .map_err(|error| {
@@ -4692,6 +5170,7 @@ async fn execute_agent_provider_response(
             );
             ChatTurnError::Terminal("turn prompt section hook failed".to_owned())
         })?;
+
         let prompt_sections =
             prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
         let prior_visible_assistant_text =
@@ -4710,7 +5189,7 @@ async fn execute_agent_provider_response(
                 &effective_prompt_context_set,
             ),
         )?;
-        let prompt_runtime_sections = append_native_filesystem_capability_section(
+        let mut prompt_runtime_sections = append_native_filesystem_capability_section(
             prompt_runtime_sections,
             &native_file_tool_capability,
             filesystem_prompt_snapshot.as_ref(),
@@ -4723,10 +5202,10 @@ async fn execute_agent_provider_response(
             prompt_runtime_sections.as_slice(),
             &permission_profile,
             include_task_orchestration_policy,
-            false,
+            include_threads_policy,
             include_html_policy,
-            false,
-            false,
+            true,
+            router.find_spec("cua_get_window_state").is_some(),
             continue_generation_hint,
             turn_tool_materialization.initiating_thread_id.as_deref(),
             thread_id,
@@ -4768,8 +5247,98 @@ async fn execute_agent_provider_response(
         )
         .await?;
 
+        let mut visible_tool_names = initial_visibility.visible_tools;
+        let mut compiled_memory_tool_names = visible_tool_names
+            .iter()
+            .filter(|name| pioneer_tools::MEMORY_DOMAIN_TOOL_NAMES.contains(&name.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        let pending_tool_ui = Arc::new(Mutex::new(HashMap::<String, PendingToolUiState>::new()));
+
+        let mut tool_event_rx = tools
+            .event_bus
+            .take_durable_receiver()
+            .expect("native chat owns the tool lifecycle durable receiver");
+
+        let mut tool_progress_rx = tools.event_bus.subscribe();
+
+        let event_tx_for_tools = event_tx.clone();
+        let tool_ui_for_events = pending_tool_ui.clone();
+        let workspace_id_for_tools = workspace_id.to_owned();
+        let thread_id_for_tools = thread_id.to_owned();
+        let turn_id_for_tools = turn_id.to_owned();
+
+        let tool_event_forwarder = tokio::spawn(async move {
+            let mut durable_open = true;
+            while durable_open {
+                tokio::select! {
+                    biased;
+                    event = tool_event_rx.recv(), if durable_open => {
+                        match event {
+                            Some(envelope) => {
+                                let result = envelope.correlation.scope(tooling::forward_tool_event_to_agent(
+                                    envelope.event.clone(),
+                                    &event_tx_for_tools,
+                                    tool_ui_for_events.clone(),
+                                    workspace_id_for_tools.as_str(),
+                                    thread_id_for_tools.as_str(),
+                                    turn_id_for_tools.as_str(),
+                                ))
+                                .await;
+                                envelope.acknowledge(
+                                    result
+                                        .as_ref()
+                                        .map(|()| ())
+                                        .map_err(ToString::to_string),
+                                );
+                                result?;
+                            }
+                            None => durable_open = false,
+                        }
+                    }
+                    event = tool_progress_rx.recv() => {
+                        match event {
+                            Ok(event)
+                                if matches!(
+                                    &event.payload,
+                                    ToolEventPayload::Heartbeat
+                                ) =>
+                            {
+                                tooling::forward_tool_event_to_agent(
+                                    event,
+                                    &event_tx_for_tools,
+                                    tool_ui_for_events.clone(),
+                                    workspace_id_for_tools.as_str(),
+                                    thread_id_for_tools.as_str(),
+                                    turn_id_for_tools.as_str(),
+                                )
+                                .await?;
+                            }
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                        }
+                    }
+                }
+            }
+            Ok::<(), AgentEventHubError>(())
+        });
+
+        let include_artifact_reference_policy = history_or_prompt_context_has_artifact_refs(
+            history.as_slice(),
+            &effective_prompt_context_set,
+        );
+
+        let mut messages = history
+            .into_iter()
+            .filter(|message| message.role != pioneer_provider::Role::System)
+            .collect::<Vec<_>>();
+        let mut active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
+            &initial_instruction_plan,
+        ));
+
         let (context, metadata) =
-            prepare_context_metadata(&initial_instruction_plan, &history, turn_context);
+            prepare_context_metadata(&initial_instruction_plan, &messages, turn_context);
         user_message.application_context = Some(metadata);
         prepare_turn_input_projection(
             &mut user_message,
@@ -4781,623 +5350,75 @@ async fn execute_agent_provider_response(
             turn_id,
         )
         .await?;
-
-        let recovered_prompt = recovered_system_snapshot(&retained_provider_history)?;
-        let compiled_prompt = if saved_system_matches_schemas(&retained_provider_history, &None)? {
-            recovered_prompt
-        } else {
-            Some(compiled_prompt_payload_from_delivery_plan(
-                &initial_instruction_plan,
-            ))
-        };
-        persist_system_snapshot(
-            &compiled_prompt,
-            event_tx.as_ref(),
-            workspace_id,
-            thread_id,
-            turn_id,
-            message_item_id,
-            &None,
-        )
-        .await?;
-        let mut continuation_history = Vec::new();
-        append_recovered_provider_history(
-            &mut continuation_history,
-            retained_provider_history.clone(),
-        );
-        // Standard execution appends current input after history; continuation
-        // observations must follow that input rather than preceding it.
-        let continuation = prepare_continuation_context(
-            &initial_instruction_plan,
-            &retained_provider_history,
-            event_tx.as_ref(),
-            workspace_id,
-            thread_id,
-            turn_id,
-        )
-        .await?;
-        continuation_history.extend(continuation);
-        let result = execute_standard_provider_response(
-            context_session,
-            provider,
-            model,
-            history,
-            user_message.clone(),
-            reasoning,
-            compiled_prompt,
-            false,
-            force_non_stream,
-            workspace_id,
-            thread_id,
-            turn_id,
-            initial_thinking_item_id.as_str(),
-            message_item_id,
-            tool_loop_config.provider,
-            continuation_history,
-            event_tx.clone(),
-        )
-        .await;
-
-        match result {
-            Ok(assistant_text) => {
-                let summary = AgentTurnPostTurnSummary::succeeded_with_model(
-                    Some(post_turn_model.clone()),
-                    Some(post_turn_model_provider.clone()),
-                    extract_post_turn_user_text(input),
-                    assistant_text,
-                    Vec::new(),
-                    Vec::new(),
-                );
-                return Ok(ChatTurnOutcome::Completed {
-                    post_turn_dispatch: Some(AgentTurnPostTurnHookDispatch::new(
-                        hook_context,
-                        effective_policy_set,
-                        effective_prompt_context_set,
-                        summary,
-                    )),
-                });
-            }
-            Err(error) => {
-                return Err(with_post_turn_failure_dispatch(
-                    error,
-                    hook_context,
-                    effective_policy_set,
-                    effective_prompt_context_set,
-                    extract_user_text(input),
-                    String::new(),
-                    Vec::new(),
-                    Vec::new(),
-                ));
-            }
-        }
-    }
-
-    let skill_tool_materialization = skill_tools::materialize_skill_tooling(
-        &skills_resolution.runtime_plan,
-        &tool_loop_config.skills,
-    );
-
-    for excluded in &skill_tool_materialization.excluded_tools {
-        warn!(
-            thread_id,
-            turn_id,
-            tool_name = excluded.canonical_tool_name.as_str(),
-            reason = excluded.reason.as_str(),
-            "excluded invalid skill runtime tool; continuing turn"
-        );
-    }
-    for diagnostic in &skill_tool_materialization.policy_diagnostics {
-        warn!(
-            thread_id,
-            turn_id,
-            tool_name = diagnostic.canonical_tool_name.as_str(),
-            diagnostics = ?diagnostic.diagnostics,
-            "dynamic skill tool output policy was narrowed"
-        );
-    }
-
-    let mut tool_bundle_contributions = Vec::new();
-    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
-        "skill",
-        "skill.runtime",
-        SKILL_TOOL_BUNDLE_PRIORITY,
-        skill_tool_materialization.bundles.clone(),
-    ));
-    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
-        "mcp",
-        "mcp.runtime",
-        MCP_TOOL_BUNDLE_PRIORITY,
-        mcp_materialization.bundles.clone(),
-    ));
-    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
-        "turn",
-        "turn.runtime",
-        TURN_TOOL_BUNDLE_PRIORITY,
-        turn_tool_materialization.bundles.clone(),
-    ));
-    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
-        "task",
-        "task.runtime",
-        TASK_TOOL_BUNDLE_PRIORITY,
-        task_materialization.bundles.clone(),
-    ));
-    let effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
-        &effective_policy_set,
-        &effective_prompt_context_set,
-        tool_bundle_contributions,
-        tool_bundle_artifacts.as_ref(),
-        provider_tool_calling,
-    )
-    .await
-    .map_err(|error| {
-        warn!(
-            thread_id,
-            turn_id,
-            error_kind = error.kind(),
-            "turn tool materialization hook failed before tool runtime construction"
-        );
-        ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
-    })?;
-
-    let extension_bundles = effective_tool_bundle_set.bundles().to_vec();
-
-    let permission_context = PermissionEvaluationContext::for_turn(
-        workspace_id,
-        thread_id,
-        turn_id,
-        permission_profile.clone(),
-    );
-    let runtime_environment = runtime_environment.into_iter().collect::<BTreeMap<_, _>>();
-    let tools = match build_tools_with_environment_and_security_snapshot(
-        workdir.clone(),
-        turn_id.to_owned(),
-        permission_context.clone(),
-        tool_loop_config.web.clone(),
-        tool_loop_config.computer_use.clone(),
-        extension_bundles,
-        runtime_environment.clone(),
-        execution_security_snapshot.clone(),
-    ) {
-        Ok(tools) => tools,
-        Err(error) => {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %error,
-                "failed to build tool runtime with extensions; continuing with built-ins only"
-            );
-            build_tools_with_environment_and_security_snapshot(
-                workdir.clone(),
-                turn_id.to_owned(),
-                permission_context.clone(),
-                tool_loop_config.web.clone(),
-                tool_loop_config.computer_use.clone(),
-                Vec::new(),
-                runtime_environment,
-                execution_security_snapshot.clone(),
-            )
-            .unwrap_or_else(|_| {
-                build_builtin_tools_with_security_snapshot(
-                    workdir.clone(),
-                    turn_id.to_owned(),
-                    permission_context.clone(),
-                    tool_loop_config.web.clone(),
-                    tool_loop_config.computer_use.clone(),
-                    execution_security_snapshot,
-                )
-            })
-        }
-    }
-    .with_permission_approval_broker(permission_approval_broker);
-
-    // One trusted provider capability decision owns native filesystem-tool
-    // visibility for this turn.  Apply it before tool visibility so the core tools,
-    // request_tools catalog and final provider schema cannot diverge.
-    tools
-        .router
-        .set_blocked_tool_names(native_file_tool_blocked_names(&native_file_tool_capability));
-    tools
-        .router
-        .set_native_patch_wire_shape(native_file_tool_capability.patch_shape);
-
-    skill_tool_materialization
-        .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
-        .await;
-
-    let runtime = tools.runtime.clone();
-    let router = tools.router.clone();
-
-    let runtime_tool_index = Arc::new(
-        skills_resolution
-            .runtime_plan
-            .tools
+        let mut continuation_provider_history = retained_provider_history;
+        if !continuation_provider_history
             .iter()
-            .map(|descriptor| (descriptor.canonical_tool_name.clone(), descriptor.clone()))
-            .collect::<HashMap<_, _>>(),
-    );
-
-    let runtime_recheck_policy = pioneer_skills::RuntimeExecutionRecheckPolicy {
-        runtime_recheck_on_tool_call: tool_loop_config
-            .skills
-            .dependencies
-            .runtime_recheck_on_tool_call,
-        security: pioneer_skills::SkillSecurityPolicy {
-            allow_untrusted_install: tool_loop_config.skills.security.allow_untrusted_install,
-            min_trust_for_shell_tools: tool_loop_config
-                .skills
-                .security
-                .min_trust_for_shell_tools
-                .clone(),
-            min_trust_for_http_tools: tool_loop_config
-                .skills
-                .security
-                .min_trust_for_http_tools
-                .clone(),
-            min_trust_for_function_proxy_tools: tool_loop_config
-                .skills
-                .security
-                .min_trust_for_function_proxy_tools
-                .clone(),
-            max_install_archive_bytes: tool_loop_config.skills.security.max_install_archive_bytes,
-            max_install_file_bytes: tool_loop_config.skills.security.max_install_file_bytes,
-        },
-    };
-
-    let mut observation_change_reason = if execution_checkpoint_context.is_some() {
-        "restore"
-    } else {
-        "initial_runtime_selection"
-    };
-    let mut requested_tool_names = restored_requested_tool_names(
-        execution_checkpoint_context.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-    );
-    let initial_visibility =
-        router.compute_final_visible_tools(&router.core_tool_names(), &requested_tool_names);
-    requested_tool_names.retain(|name| initial_visibility.visible_tools.contains(name));
-
-    warn_final_visible_tool_diagnostics(
-        thread_id,
-        turn_id,
-        initial_visibility.diagnostics.as_slice(),
-    );
-
-    let read_skill_is_visible = initial_visibility
-        .visible_tools
-        .iter()
-        .any(|tool_name| tool_name == "read_skill");
-    let exposed_agent_overlay = if skills_resolution.agent_overlay_error.is_none()
-        && agent_skill_cards_have_read_path(agent_skill_overlay, read_skill_is_visible)
-    {
-        readable_agent_skill_overlay(agent_skill_overlay, provider_tool_calling)
-    } else {
-        if skills_resolution.agent_overlay_error.is_none() && !agent_skill_overlay.is_empty() {
-            let base_resolution = skills::resolve_turn_skills_with_explicit_refs(
-                input,
-                normalized_capabilities.skill_refs.as_slice(),
-                skill_catalog,
-                &[],
-                &tool_loop_config.skills,
-                workspace_skill_policies,
-                &projected_mcp_availability,
-            )
-            .map_err(|error| {
-                ChatTurnError::Terminal(format!(
-                    "failed to rebuild ordinary skills after Agent read_skill was unavailable: \
-                     {error:#}"
-                ))
-            })?;
-            skills_prompt = normalize_optional_prompt(Some(base_resolution.prompt));
-            warn!(
-                workspace_id,
-                thread_id,
-                turn_id,
-                "read_skill was absent from the final native tool plan; Agent cards were removed"
-            );
+            .any(|entry| is_turn_input_projection(&entry.message))
+        {
+            continuation_provider_history.push(RetainedProviderHistoryMessage {
+                sequence: 0,
+                message: user_message.clone(),
+            });
         }
-        &[]
-    };
-
-    if recovery.is_some() && !agent_skill_overlay.is_empty() && exposed_agent_overlay.is_empty() {
-        return Err(ChatTurnError::Terminal(
-            "pinned Agent skills are unavailable in the recovered turn's final tool plan"
-                .to_owned(),
-        ));
-    }
-
-    let include_threads_policy = native_threads_policy_available(
-        &skills_resolution,
-        skills_prompt.as_deref(),
-        &router.available_tool_names(),
-        &initial_visibility.visible_tools,
-        &permission_profile,
-    );
-
-    emit_turn_skills_resolved_event(
-        event_tx.as_ref(),
-        thread_id,
-        turn_id,
-        skills::to_turn_skill_bindings(
-            skills_resolution.result.active.as_slice(),
-            exposed_agent_overlay,
-        ),
-        !agent_skill_overlay.is_empty(),
-    )
-    .await?;
-
-    let mut effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
-        &effective_policy_set,
-        &effective_prompt_context_set,
-        Vec::new(),
-        TurnPrePromptCompileHookInput::from_parts(
-            provider_tool_calling,
-            hook_tool_names_from_strings(initial_visibility.visible_tools.as_slice()),
-        ),
-    )
-    .await
-    .map_err(|error| {
-        warn!(
+        messages.push(user_message);
+        let mut next_provider_history_sequence =
+            next_retained_provider_history_sequence(&continuation_provider_history);
+        append_recovered_provider_history(&mut messages, continuation_provider_history.clone());
+        if let Some(continuation) = prepare_continuation_context(
+            &initial_instruction_plan,
+            &continuation_provider_history,
+            event_tx.as_ref(),
+            workspace_id,
             thread_id,
             turn_id,
-            error_kind = error.kind(),
-            "turn prompt section hook failed before prompt construction"
-        );
-        ChatTurnError::Terminal("turn prompt section hook failed".to_owned())
-    })?;
-
-    let prompt_sections =
-        prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
-    let prior_visible_assistant_text =
-        prior_visible_assistant_text_for_execution_continuation(history.as_slice());
-    let prompt_runtime_sections = runtime_sections_with_execution_continuation_context(
-        prompt_sections.runtime_sections.as_slice(),
-        execution_window_index,
-        execution_checkpoint_context.as_ref(),
-        prior_visible_assistant_text.as_deref(),
-        turn_tool_materialization.initiating_thread_id.as_deref(),
-    );
-    let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
-        prompt_runtime_sections,
-        history_or_prompt_context_has_artifact_refs(
-            history.as_slice(),
-            &effective_prompt_context_set,
-        ),
-    )?;
-    let mut prompt_runtime_sections = append_native_filesystem_capability_section(
-        prompt_runtime_sections,
-        &native_file_tool_capability,
-        filesystem_prompt_snapshot.as_ref(),
-    )?;
-
-    let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-        tool_loop_config.computer_use.runtime_home_dir.as_path(),
-        skills_prompt.clone(),
-        None,
-        prompt_runtime_sections.as_slice(),
-        &permission_profile,
-        include_task_orchestration_policy,
-        include_threads_policy,
-        include_html_policy,
-        true,
-        router.find_spec("cua_get_window_state").is_some(),
-        continue_generation_hint,
-        turn_tool_materialization.initiating_thread_id.as_deref(),
-        thread_id,
-        turn_id,
-    )?;
-
-    let governing_sources =
-        saved_prompt_sources(&initial_instruction_plan, &retained_provider_history)?;
-    let governing_documents =
-        saved_governing_documents(&initial_instruction_plan, &retained_provider_history)?;
-    let initial_instruction_plan = freeze_governing_documents(
-        initial_instruction_plan,
-        &governing_documents,
-        &governing_sources,
-    )?;
-    run_noop_agent_turn_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
-        HookPhase::TurnPostPromptCompile,
-        &effective_policy_set,
-        &effective_prompt_context_set,
-    )
-    .await;
-
-    emit_durable_event(
-        event_tx.as_ref(),
-        AgentDurableEvent::PromptManifestCompiled {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            manifest: prompt_manifest_from_bundle(
-                &initial_instruction_plan.bundle,
-                &EffectiveTurnPromptManifestHookMetadata::combined(
-                    effective_prompt_context_set.manifest_metadata(),
-                    effective_prompt_section_set.manifest_metadata(),
-                ),
-                capability_diagnostics.as_slice(),
-            ),
-        },
-    )
-    .await?;
-
-    let mut visible_tool_names = initial_visibility.visible_tools;
-    let mut compiled_memory_tool_names = visible_tool_names
-        .iter()
-        .filter(|name| pioneer_tools::MEMORY_DOMAIN_TOOL_NAMES.contains(&name.as_str()))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-
-    let pending_tool_ui = Arc::new(Mutex::new(HashMap::<String, PendingToolUiState>::new()));
-
-    let mut tool_event_rx = tools
-        .event_bus
-        .take_durable_receiver()
-        .expect("native chat owns the tool lifecycle durable receiver");
-
-    let mut tool_progress_rx = tools.event_bus.subscribe();
-
-    let event_tx_for_tools = event_tx.clone();
-    let tool_ui_for_events = pending_tool_ui.clone();
-    let workspace_id_for_tools = workspace_id.to_owned();
-    let thread_id_for_tools = thread_id.to_owned();
-    let turn_id_for_tools = turn_id.to_owned();
-
-    let tool_event_forwarder = tokio::spawn(async move {
-        let mut durable_open = true;
-        while durable_open {
-            tokio::select! {
-                biased;
-                event = tool_event_rx.recv(), if durable_open => {
-                    match event {
-                        Some(envelope) => {
-                            let result = envelope.correlation.scope(tooling::forward_tool_event_to_agent(
-                                envelope.event.clone(),
-                                &event_tx_for_tools,
-                                tool_ui_for_events.clone(),
-                                workspace_id_for_tools.as_str(),
-                                thread_id_for_tools.as_str(),
-                                turn_id_for_tools.as_str(),
-                            ))
-                            .await;
-                            envelope.acknowledge(
-                                result
-                                    .as_ref()
-                                    .map(|()| ())
-                                    .map_err(ToString::to_string),
-                            );
-                            result?;
-                        }
-                        None => durable_open = false,
-                    }
-                }
-                event = tool_progress_rx.recv() => {
-                    match event {
-                        Ok(event)
-                            if matches!(
-                                &event.payload,
-                                ToolEventPayload::Heartbeat
-                            ) =>
-                        {
-                            tooling::forward_tool_event_to_agent(
-                                event,
-                                &event_tx_for_tools,
-                                tool_ui_for_events.clone(),
-                                workspace_id_for_tools.as_str(),
-                                thread_id_for_tools.as_str(),
-                                turn_id_for_tools.as_str(),
-                            )
-                            .await?;
-                        }
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
-                    }
-                }
-            }
+        )
+        .await?
+        {
+            retain_provider_history_message(
+                &mut continuation_provider_history,
+                &mut next_provider_history_sequence,
+                &continuation,
+            );
+            messages.push(continuation);
         }
-        Ok::<(), AgentEventHubError>(())
-    });
 
-    let include_artifact_reference_policy = history_or_prompt_context_has_artifact_refs(
-        history.as_slice(),
-        &effective_prompt_context_set,
-    );
-
-    let mut messages = history
-        .into_iter()
-        .filter(|message| message.role != pioneer_provider::Role::System)
-        .collect::<Vec<_>>();
-    let mut active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
-        &initial_instruction_plan,
-    ));
-
-    let (context, metadata) =
-        prepare_context_metadata(&initial_instruction_plan, &messages, turn_context);
-    user_message.application_context = Some(metadata);
-    prepare_turn_input_projection(
-        &mut user_message,
-        &context,
-        &retained_provider_history,
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-    )
-    .await?;
-    let mut continuation_provider_history = retained_provider_history;
-    if !continuation_provider_history
-        .iter()
-        .any(|entry| is_turn_input_projection(&entry.message))
-    {
-        continuation_provider_history.push(RetainedProviderHistoryMessage {
-            sequence: 0,
-            message: user_message.clone(),
-        });
-    }
-    messages.push(user_message);
-    let mut next_provider_history_sequence =
-        next_retained_provider_history_sequence(&continuation_provider_history);
-    append_recovered_provider_history(&mut messages, continuation_provider_history.clone());
-    if let Some(continuation) = prepare_continuation_context(
-        &initial_instruction_plan,
-        &continuation_provider_history,
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-    )
-    .await?
-    {
-        retain_provider_history_message(
-            &mut continuation_provider_history,
-            &mut next_provider_history_sequence,
-            &continuation,
+        let mut recovered_system_pending =
+            recovered_system_snapshot(&continuation_provider_history)?;
+        let mut pending_retry_instruction: Option<String> = None;
+        let mut applied_retry_instruction: Option<String> = None;
+        let mut observed_review_required_signatures = BTreeSet::<String>::new();
+        let mut observed_terminal_task_outcomes = BTreeSet::<crate::ObservedTaskOutcome>::new();
+        let window_budget = &tool_loop_config.execution_windows.window;
+        let mut tool_loop_guard = ToolLoopGuard::new_execution_window(
+            window_budget.clone(),
+            tool_loop_final_answer_instruction(),
         );
-        messages.push(continuation);
-    }
+        let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
+        let restored_no_progress_state = execution_checkpoint_context
+            .as_ref()
+            .map(|context| context.payload.tool_no_progress.clone())
+            .unwrap_or_default();
+        let mut tool_no_progress_guard = ToolNoProgressGuard::from_checkpoint(
+            ToolNoProgressGuardConfig::default(),
+            restored_no_progress_state,
+        );
+        let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::default();
+        let mut task_mutation_finalization_guard = TaskMutationFinalizationGuard::default();
+        let mut post_turn_assistant_text = String::new();
+        let mut post_turn_tool_events = Vec::new();
+        let mut post_turn_domain_events = Vec::new();
+        let mut window_stats = ChatExecutionWindowStats::new(execution_window_index);
+        emit_execution_window_started(
+            workspace_id,
+            thread_id,
+            turn_id,
+            &window_stats,
+            event_tx.as_ref(),
+        )
+        .await?;
 
-    let mut recovered_system_pending = recovered_system_snapshot(&continuation_provider_history)?;
-    let mut pending_retry_instruction: Option<String> = None;
-    let mut applied_retry_instruction: Option<String> = None;
-    let mut observed_review_required_signatures = BTreeSet::<String>::new();
-    let mut observed_terminal_task_outcomes = BTreeSet::<crate::ObservedTaskOutcome>::new();
-    let window_budget = &tool_loop_config.execution_windows.window;
-    let mut tool_loop_guard = ToolLoopGuard::new_execution_window(
-        window_budget.clone(),
-        tool_loop_final_answer_instruction(),
-    );
-    let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
-    let restored_no_progress_state = execution_checkpoint_context
-        .as_ref()
-        .map(|context| context.payload.tool_no_progress.clone())
-        .unwrap_or_default();
-    let mut tool_no_progress_guard = ToolNoProgressGuard::from_checkpoint(
-        ToolNoProgressGuardConfig::default(),
-        restored_no_progress_state,
-    );
-    let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::default();
-    let mut task_mutation_finalization_guard = TaskMutationFinalizationGuard::default();
-    let mut post_turn_assistant_text = String::new();
-    let mut post_turn_tool_events = Vec::new();
-    let mut post_turn_domain_events = Vec::new();
-    let mut window_stats = ChatExecutionWindowStats::new(execution_window_index);
-    emit_execution_window_started(
-        workspace_id,
-        thread_id,
-        turn_id,
-        &window_stats,
-        event_tx.as_ref(),
-    )
-    .await?;
-
-    let mut pending_completed: Option<CanonicalProviderRoundEnvelope> = None;
-    let turn_result: Result<AgentProviderLoopOutcome, (ChatTurnError, String)> = async {
+        let mut pending_completed: Option<CanonicalProviderRoundEnvelope> = None;
+        let turn_result: Result<AgentProviderLoopOutcome, (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
         let mut last_provider_reasoning_id: Option<String> = None;
         let mut consecutive_rejected_no_tool_rounds = 0usize;
@@ -7548,115 +7569,116 @@ async fn execute_agent_provider_response(
         }
     }
     .await;
-    skill_tool_materialization
-        .clear_function_proxy_runtime()
-        .await;
-    tools.event_bus.close_durable_lane();
-    drop(runtime);
-    drop(router);
-    drop(tools);
+        skill_tool_materialization
+            .clear_function_proxy_runtime()
+            .await;
+        tools.event_bus.close_durable_lane();
+        drop(runtime);
+        drop(router);
+        drop(tools);
 
-    finish_tool_event_forwarder(tool_event_forwarder).await?;
+        finish_tool_event_forwarder(tool_event_forwarder).await?;
 
-    if let Some(envelope) = pending_completed.take() {
-        provider::persist_completed_response(event_tx.as_ref(), thread_id, turn_id, &envelope)
-            .await?;
-        retain_provider_history_message(
-            &mut continuation_provider_history,
-            &mut next_provider_history_sequence,
-            &envelope.message,
-        );
-    }
-    match turn_result {
-        Ok(AgentProviderLoopOutcome::Completed) => {
-            let summary = AgentTurnPostTurnSummary::succeeded_with_model(
-                Some(post_turn_model.clone()),
-                Some(post_turn_model_provider.clone()),
-                extract_post_turn_user_text(input),
-                post_turn_assistant_text,
-                post_turn_tool_events,
-                post_turn_domain_events,
+        if let Some(envelope) = pending_completed.take() {
+            provider::persist_completed_response(event_tx.as_ref(), thread_id, turn_id, &envelope)
+                .await?;
+            retain_provider_history_message(
+                &mut continuation_provider_history,
+                &mut next_provider_history_sequence,
+                &envelope.message,
             );
-            Ok(ChatTurnOutcome::Completed {
-                post_turn_dispatch: Some(AgentTurnPostTurnHookDispatch::new(
-                    hook_context,
-                    effective_policy_set,
-                    effective_prompt_context_set,
-                    summary,
-                )),
-            })
         }
-        Ok(AgentProviderLoopOutcome::NeedsContinuation(mut continuation)) => {
-            continuation.provider_history = continuation_provider_history;
-            Ok(ChatTurnOutcome::NeedsContinuation(continuation))
-        }
-        Err((error, thinking_id)) => {
-            emit_durable_event(
-                event_tx.as_ref(),
-                AgentDurableEvent::ItemCompleted {
-                    notification: ItemCompletedNotification {
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        item: TurnItem::Reasoning {
-                            id: thinking_id.clone(),
-                            summary: Vec::new(),
-                            content: Vec::new(),
+        match turn_result {
+            Ok(AgentProviderLoopOutcome::Completed) => {
+                let summary = AgentTurnPostTurnSummary::succeeded_with_model(
+                    Some(post_turn_model.clone()),
+                    Some(post_turn_model_provider.clone()),
+                    extract_post_turn_user_text(input),
+                    post_turn_assistant_text,
+                    post_turn_tool_events,
+                    post_turn_domain_events,
+                );
+                Ok(ChatTurnOutcome::Completed {
+                    post_turn_dispatch: Some(AgentTurnPostTurnHookDispatch::new(
+                        hook_context,
+                        effective_policy_set,
+                        effective_prompt_context_set,
+                        summary,
+                    )),
+                })
+            }
+            Ok(AgentProviderLoopOutcome::NeedsContinuation(mut continuation)) => {
+                continuation.provider_history = continuation_provider_history;
+                Ok(ChatTurnOutcome::NeedsContinuation(continuation))
+            }
+            Err((error, thinking_id)) => {
+                emit_durable_event(
+                    event_tx.as_ref(),
+                    AgentDurableEvent::ItemCompleted {
+                        notification: ItemCompletedNotification {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            item: TurnItem::Reasoning {
+                                id: thinking_id.clone(),
+                                summary: Vec::new(),
+                                content: Vec::new(),
+                            },
                         },
                     },
-                },
-            )
-            .await?;
-            let error = match error {
-                ChatTurnError::ProviderFailure {
-                    item_id,
-                    item_type,
-                    failure,
-                } => ChatTurnError::ProviderFailure {
-                    item_id: if item_id.is_empty() {
-                        thinking_id
-                    } else {
-                        item_id
+                )
+                .await?;
+                let error = match error {
+                    ChatTurnError::ProviderFailure {
+                        item_id,
+                        item_type,
+                        failure,
+                    } => ChatTurnError::ProviderFailure {
+                        item_id: if item_id.is_empty() {
+                            thinking_id
+                        } else {
+                            item_id
+                        },
+                        item_type,
+                        failure,
                     },
-                    item_type,
-                    failure,
-                },
-                other => other,
-            };
-            if let Some(continuation) = build_failure_execution_window_continuation(
-                workspace_id,
-                thread_id,
-                turn_id,
-                input,
-                post_turn_model.as_str(),
-                post_turn_model_provider.as_str(),
-                &window_stats,
-                &error,
-                tool_no_progress_guard.checkpoint_state(),
-                &requested_tool_names,
-            ) {
-                emit_execution_window_exhausted_and_checkpointed(
+                    other => other,
+                };
+                if let Some(continuation) = build_failure_execution_window_continuation(
                     workspace_id,
                     thread_id,
                     turn_id,
+                    input,
+                    post_turn_model.as_str(),
+                    post_turn_model_provider.as_str(),
                     &window_stats,
-                    &continuation,
-                    event_tx.as_ref(),
-                )
-                .await?;
+                    &error,
+                    tool_no_progress_guard.checkpoint_state(),
+                    &requested_tool_names,
+                ) {
+                    emit_execution_window_exhausted_and_checkpointed(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        &window_stats,
+                        &continuation,
+                        event_tx.as_ref(),
+                    )
+                    .await?;
+                }
+                Err(with_post_turn_failure_dispatch(
+                    error,
+                    hook_context,
+                    effective_policy_set,
+                    effective_prompt_context_set,
+                    extract_user_text(input),
+                    post_turn_assistant_text,
+                    post_turn_tool_events,
+                    post_turn_domain_events,
+                ))
             }
-            Err(with_post_turn_failure_dispatch(
-                error,
-                hook_context,
-                effective_policy_set,
-                effective_prompt_context_set,
-                extract_user_text(input),
-                post_turn_assistant_text,
-                post_turn_tool_events,
-                post_turn_domain_events,
-            ))
         }
-    }
+    })
 }
 
 // Post-turn evidence preserves canonical text whitespace independently of main prompt rendering.
@@ -10602,6 +10624,17 @@ mod tests {
         use pioneer_provider::{ChatRequest, ChatResponse, Provider, StreamChunk};
         use std::sync::{Arc, Mutex};
 
+        fn is_preparation_event(event: &AgentDurableEvent) -> bool {
+            let item = match event {
+                AgentDurableEvent::ItemStarted { notification } => Some(&notification.item),
+                AgentDurableEvent::ItemCompleted { notification } => Some(&notification.item),
+                _ => None,
+            };
+            matches!(item,
+                Some(pioneer_protocol::TurnItem::SystemEvent { code: Some(code), .. })
+                    if code == "runtime_operation")
+        }
+
         #[derive(Default)]
         struct Capture(Mutex<Vec<ChatRequest>>);
         #[async_trait::async_trait]
@@ -10823,15 +10856,7 @@ mod tests {
                 result = &mut work => panic!("dispatch before restoration ACK: {result:?}"),
                 event = durable.recv() => event.unwrap(),
             };
-            let preparation_item = match &event {
-                AgentDurableEvent::ItemStarted { notification } => Some(&notification.item),
-                AgentDurableEvent::ItemCompleted { notification } => Some(&notification.item),
-                _ => None,
-            };
-            if matches!(preparation_item,
-                Some(pioneer_protocol::TurnItem::SystemEvent { code: Some(code), .. })
-                    if code == "runtime_operation")
-            {
+            if is_preparation_event(&event) {
                 durable.acknowledge_last(Ok(()));
                 continue;
             }
@@ -10923,16 +10948,25 @@ mod tests {
             request
                 .messages
                 .push(ChatMessage::tool_result("call", "read_file", "result"));
-            let (request, _, _) = super::prepare_request_with_inventory(
+            let work = super::prepare_request_with_inventory(
                 Some(&session),
                 request,
                 hub.as_ref(),
                 "workspace",
                 "thread",
                 "turn",
-            )
-            .await
-            .unwrap();
+            );
+            tokio::pin!(work);
+            let (request, _, _) = loop {
+                tokio::select! {
+                    result = &mut work => break result.unwrap(),
+                    event = durable.recv() => {
+                        let event = event.expect("preparation event");
+                        assert!(is_preparation_event(&event), "retained inventory must not be persisted again: {event:?}");
+                        durable.acknowledge_last(Ok(()));
+                    }
+                }
+            };
             assert_eq!(
                 request
                     .messages
@@ -10979,11 +11013,36 @@ mod tests {
             "turn",
         );
         tokio::pin!(work);
-        tokio::select! {
-            _ = &mut work => panic!("must await baseline persistence"),
-            event = durable.recv() => { event.unwrap(); durable.acknowledge_last(Ok(())); }
+        loop {
+            let event = tokio::select! {
+                _ = &mut work => panic!("must await baseline persistence"),
+                event = durable.recv() => event.expect("baseline or preparation event"),
+            };
+            if is_preparation_event(&event) {
+                durable.acknowledge_last(Ok(()));
+                continue;
+            }
+            assert!(matches!(event,
+                AgentDurableEvent::TurnLlmContextAppended { ref source, .. }
+                    if source == super::RUNTIME_CONTEXT));
+            assert!(matches!(
+                futures_util::poll!(work.as_mut()),
+                std::task::Poll::Pending
+            ));
+            durable.acknowledge_last(Ok(()));
+            break;
         }
-        match work.await {
+        let result = loop {
+            tokio::select! {
+                result = &mut work => break result,
+                event = durable.recv() => {
+                    let event = event.expect("preparation event after baseline ACK");
+                    assert!(is_preparation_event(&event), "unexpected event after baseline ACK: {event:?}");
+                    durable.acknowledge_last(Ok(()));
+                }
+            }
+        };
+        match result {
             Err(super::ChatTurnError::Blocked(message)) => {
                 assert!(message.contains("removed required inventory"));
             }

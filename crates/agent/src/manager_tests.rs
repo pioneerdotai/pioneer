@@ -4149,12 +4149,11 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()>,
 {
-    // These fixtures compose startup, prompt capture and terminal-event assertions.
-    // Give their debug poll frames a bounded stack, as large Gateway fixtures do.
-    // Construct the future inside the thread so construction uses that stack too.
+    // Exercise composed startup on the original Gateway-sized stack. Construct
+    // the fixture inside the thread so construction obeys the same bound.
     std::thread::Builder::new()
         .name(name.to_owned())
-        .stack_size(32 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

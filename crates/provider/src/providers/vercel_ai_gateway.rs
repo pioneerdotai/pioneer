@@ -38,8 +38,11 @@ struct ModelSnapshot {
 struct SafeFailure(ProviderFailureClassification);
 #[derive(serde::Deserialize)]
 struct EmbeddingWireResponse {
-    #[serde(flatten)]
-    indexed: super::embedding::IndexedEmbeddingResponse,
+    // Decode float vectors directly: flatten buffers arbitrary-precision JSON
+    // numbers as maps, which cannot then be deserialized into f32 coordinates.
+    data: Vec<super::embedding::ApiEmbeddingData>,
+    #[serde(default)]
+    usage: Option<super::embedding::ApiEmbeddingUsage>,
     model: Option<String>,
     #[serde(default, rename = "providerMetadata")]
     provider_metadata: Value,
@@ -821,7 +824,13 @@ impl Provider for VercelAiGatewayProvider {
         let reported_decimal = reported_cost
             .as_ref()
             .and_then(|value| crate::usage::add_decimal_amounts("0", &value.to_string()));
-        let result = parsed.indexed.into_response(count).map_err(safe_decode);
+        let result = super::embedding::IndexedEmbeddingResponse {
+            data: parsed.data,
+            usage: parsed.usage,
+            model: parsed.model.clone(),
+        }
+        .into_response(count)
+        .map_err(safe_decode);
         let mut usage = match &result {
             Ok(response) => response.usage.clone(),
             Err(error) => crate::usage::error_usage(error).cloned(),
