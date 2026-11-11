@@ -990,6 +990,9 @@ mod publication_tests {
                 .accept_identity_for_test(core, auth.clone())
                 .unwrap();
             core.upsert_thread(Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
                 workspace_id: "ws".into(),
                 id: "a".into(),
                 name: None,

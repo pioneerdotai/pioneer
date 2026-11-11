@@ -369,6 +369,9 @@ fn billing_context(
     catalog: std::sync::Arc<crate::catalog::ModelCatalog>,
 ) -> UsageContext {
     UsageContext {
+        service_mode: None,
+        service_fields: None,
+        captured_at_ms: 1700000000000,
         provider: provider.into(),
         model: model.into(),
         api: "chat_completions".into(),
@@ -810,6 +813,9 @@ fn chat_cached_aliases_preserve_inclusive_input_and_explicit_zero() {
 
 fn native_chat_context(provider: &str, base: &str) -> UsageContext {
     UsageContext {
+        service_mode: None,
+        service_fields: None,
+        captured_at_ms: 1700000000000,
         provider: provider.into(),
         model: "fixture".into(),
         api: "chat_completions".into(),
@@ -1225,4 +1231,142 @@ fn cli_evidence_is_bounded_through_update_without_widening_api_usage() {
             .get("cli_statistics")
             .is_none()
     );
+}
+
+#[test]
+fn native_service_facts_keep_reports_separate_and_hold_request_price_evidence() {
+    use pioneer_protocol::{NativeServiceModePlan, OpenAiTier, ServiceModeParameters as P};
+    let source = billing_catalog_configured("openai", 2., |entry| {
+        entry["sourceMetadata"] = json!({"experimental":{"modes":{"fast":{"provider":{"body":{"service_tier":"priority"}},"cost":{"input":4,"output":20}}}}});
+        entry["pricingSource"] = json!({"url":"https://models.dev/api.json"});
+    });
+    let mut context = billing_context("openai", "A", source);
+    context.service_mode = Some(NativeServiceModePlan {
+        id: "fast".into(),
+        parameters: P::OpenAiTier {
+            tier: OpenAiTier::Priority,
+        },
+    });
+    let mut downgrade = billing_usage().with_service_tier(Some("default"));
+    context.enrich(&mut downgrade);
+    let facts = &downgrade.accounting.as_ref().unwrap()["service_mode"];
+    assert_eq!(facts["requested"], "fast");
+    assert_eq!(facts["reported_service_tier"], "default");
+    assert_eq!(facts["source"]["cost"]["input"], 4);
+    let frozen = downgrade.accounting.clone();
+    let _new_snapshot = billing_catalog("openai", 1000.);
+    let mut another = billing_usage().with_service_tier(Some("fast"));
+    context.enrich(&mut another);
+    assert_eq!(another.service_tier.as_deref(), Some("fast"));
+    let amount = another.accounting.as_ref().unwrap()["estimated_cost"]["amount"]
+        .as_f64()
+        .unwrap();
+    assert!((amount - 0.0006).abs() < 1e-12);
+
+    assert_eq!(
+        another.accounting.as_ref().unwrap()["service_mode"]["source"]["cost"]["input"],
+        4
+    );
+    assert_eq!(downgrade.accounting, frozen);
+    let joint_unknown = billing_catalog_configured("openai", 2., |entry| {
+        entry["sourceMetadata"] = json!({"experimental":{"modes":{"fast":{"provider":{"body":{"service_tier":"priority"}},"cost":{"input":4,"output":20}}}}});
+        entry["pricingSource"] = json!({"url":"https://models.dev/api.json"});
+        entry["cost"]["tiers"] =
+            json!([{"inputTokensAbove":50,"input":4,"output":4,"cacheRead":4,"cacheWrite":4}]);
+    });
+    let mut joint_context = billing_context("openai", "A", joint_unknown);
+    joint_context.service_mode = context.service_mode.clone();
+    let mut long = billing_usage().with_service_tier(Some("fast"));
+    joint_context.enrich(&mut long);
+    assert!(
+        long.accounting.as_ref().unwrap()["estimated_cost"].is_null(),
+        "flat mode prices cannot invent the long-context combination"
+    );
+
+    context.service_mode = Some(NativeServiceModePlan {
+        id: "pro".into(),
+        parameters: P::OpenAiPro,
+    });
+    let mut pro = billing_usage().with_service_tier(Some("default"));
+    context.enrich(&mut pro);
+    assert_eq!(
+        pro.accounting.as_ref().unwrap()["service_mode"]["parameters"]["kind"],
+        "open_ai_pro"
+    );
+    assert_eq!(pro.service_tier.as_deref(), Some("default"));
+    assert!(pro.accounting.as_ref().unwrap()["estimated_cost"].is_null());
+    let error = context.enrich_error(anyhow::anyhow!("provider denied mode"));
+    let failed = error_usage(&error).unwrap();
+    assert_eq!(failed.input_tokens, None);
+    assert_eq!(
+        failed.accounting.as_ref().unwrap()["service_mode"]["requested"],
+        "pro"
+    );
+    assert_eq!(
+        bounded_usage(&json!({"service_tier":"ultrafast","speed":"fast","secret":"discard"})),
+        json!({"service_tier":"ultrafast","speed":"fast"})
+    );
+    assert_eq!(
+        TokenUsage::default()
+            .with_service_tier(Some("future-value"))
+            .service_tier
+            .as_deref(),
+        Some("unknown")
+    );
+}
+
+#[test]
+fn anthropic_fast_pricing_uses_speed_independently_of_capacity_tier() {
+    use pioneer_protocol::{NativeServiceModePlan, ServiceModeParameters as P};
+    let source = billing_catalog_configured("anthropic", 2., |entry| {
+        entry["api"] = json!("anthropic-messages");
+        entry["baseUrl"] = json!("https://api.anthropic.com");
+        entry["sourceMetadata"] = json!({"experimental":{"modes":{"fast":{
+            "provider":{"body":{"speed":"fast"}},"cost":{"input":4,"output":20}
+        }}}});
+        entry["pricingSource"] = json!({"url":"https://models.dev/api.json"});
+    });
+    let snapshot_id = source.snapshot_id().to_owned();
+    let mut context = billing_context("anthropic", "A", source);
+    context.api = "messages".into();
+    context.route = route("https://api.anthropic.com", "/v1/messages");
+    context.service_mode = Some(NativeServiceModePlan {
+        id: "fast".into(),
+        parameters: P::AnthropicFast { beta: None },
+    });
+    for (speed, expected_amount) in [
+        (Some("fast"), Some(0.0006_f64)),  // 100 * 4 + 10 * 20, per million
+        (Some("standard"), Some(0.00022)), // 100 * 2 + 10 * 2, per million
+        (None, None),
+        (Some("unknown"), None),
+    ] {
+        let mut raw = json!({"input_tokens":100,"output_tokens":10,
+            "cache_read_input_tokens":0,"cache_creation_input_tokens":0,
+            "service_tier":"standard","cost":0.4});
+        if let Some(speed) = speed {
+            raw["speed"] = json!(speed);
+        }
+        let mut usage = decode::<1>(raw);
+        context.enrich(&mut usage);
+        let accounting = usage.accounting.as_ref().unwrap();
+        assert_eq!(accounting["pricing_eligibility"]["eligible"], true);
+        match expected_amount {
+            Some(expected) => assert!(
+                (accounting["estimated_cost"]["amount"].as_f64().unwrap() - expected).abs() < 1e-12
+            ),
+            None => assert!(accounting["estimated_cost"].is_null()),
+        }
+        assert_eq!(accounting["reported_cost"]["amount"], 0.4);
+        let facts = &accounting["service_mode"];
+        assert_eq!(facts["reported_service_tier"], "standard");
+        assert_eq!(facts["reported_speed"], json!(speed));
+        assert_eq!(facts["catalog_snapshot"], snapshot_id);
+        assert_eq!(facts["captured_at_ms"], 1700000000000_i64);
+        assert_eq!(facts["source"]["cost"], json!({"input":4,"output":20}));
+        assert_eq!(usage.service_tier.as_deref(), Some("standard"));
+        assert_eq!(
+            usage.raw_usage.as_ref().unwrap().get("speed"),
+            speed.map(|s| json!(s)).as_ref()
+        );
+    }
 }

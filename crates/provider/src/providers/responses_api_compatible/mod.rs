@@ -345,10 +345,19 @@ impl ResponsesApiCompatibleProvider {
         stream: bool,
         comparison: Option<&crate::prompt_cache::Comparison>,
     ) -> Result<reqwest::Response> {
+        let flex_plan = pioneer_protocol::NativeServiceModePlan {
+            id: "flex".into(),
+            parameters: pioneer_protocol::ServiceModeParameters::OpenAiTier {
+                tier: pioneer_protocol::OpenAiTier::Flex,
+            },
+        };
+        let policy = self
+            .policy
+            .for_service_mode((body["service_tier"] == "flex").then_some(&flex_plan));
         let result = if stream {
-            crate::http::send_stream_request(self.builder(body, comparison), self.policy).await
+            crate::http::send_stream_request(self.builder(body, comparison), policy).await
         } else {
-            crate::http::non_stream_request(self.builder(body, comparison), self.policy)
+            crate::http::non_stream_request(self.builder(body, comparison), policy)
                 .send()
                 .await
                 .map_err(Into::into)

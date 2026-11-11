@@ -105,6 +105,7 @@ pub(crate) fn request(model: &str, parts: Vec<MessageContentPart>) -> ChatReques
     message.content = "analyze".into();
     ChatRequest {
         tool_declarations: None,
+        service_mode: None,
         model: model.into(),
         messages: vec![message],
         temperature: None,

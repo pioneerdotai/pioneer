@@ -1074,6 +1074,7 @@ mod tests {
             "deepseek",
             pioneer_provider::ChatRequest {
                 tool_declarations: None,
+                service_mode: None,
                 model: "deepseek-chat".into(),
                 messages: vec![
                     history[0].clone(),

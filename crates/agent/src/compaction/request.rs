@@ -169,6 +169,9 @@ impl NativeRequestProjection {
         if let Some(declarations) = &request.tool_declarations {
             envelope["tools"] = declarations.budget_tools();
         }
+        if let Some(plan) = &request.service_mode {
+            envelope["service_mode"] = serde_json::to_value(plan)?;
+        }
         if let Some(context) = native_prefix_context {
             envelope["native_prefix_context"] = context.clone();
         }
@@ -532,6 +535,7 @@ mod tests {
     fn request() -> ChatRequest {
         ChatRequest {
             tool_declarations: None,
+            service_mode: None,
             model: "fixture".into(),
             messages: vec![
                 ChatMessage::user("old history"),

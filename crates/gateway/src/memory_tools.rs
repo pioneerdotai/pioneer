@@ -1420,6 +1420,7 @@ fn post_turn_extractor_chat_request(
         .unwrap_or(8) as usize;
     ChatRequest {
         tool_declarations: None,
+        service_mode: None,
         model: model.to_owned(),
         messages: vec![
             ChatMessage::system(

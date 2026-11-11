@@ -805,6 +805,7 @@ mod tests {
             )));
         let request = ChatRequest {
             tool_declarations: None,
+            service_mode: None,
             model: "gpt-4o".into(),
             messages: vec![message],
             temperature: None,

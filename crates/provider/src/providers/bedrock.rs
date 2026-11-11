@@ -1290,6 +1290,9 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
     };
 
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: model_id,
         name: m.model_name,
         description: None,
@@ -1312,6 +1315,33 @@ mod signing_tests;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn native_service_tier_is_nested_without_modifying_inference_config() {
+        use pioneer_protocol::{NativeServiceModePlan, ServiceModeParameters as P};
+        let mut req = crate::generation::test_request("openai.service-fixture");
+        req.service_mode = Some(NativeServiceModePlan {
+            id: "ultrafast".into(),
+            parameters: P::BedrockNestedUltrafast,
+        });
+        let prepared = prepared_for(&req.messages);
+        let body = serde_json::to_value(
+            BedrockProvider::build_request_with_catalog(&req, &prepared, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["additionalModelRequestFields"]["service_tier"],
+            "ultrafast"
+        );
+        assert!(body.get("service_tier").is_none());
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+        req.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        assert!(BedrockProvider::build_request_with_catalog(&req, &prepared, None).is_err());
+        assert_eq!(
+            req.reasoning,
+            Some(ReasoningConfig::Effort(ReasoningEffort::High))
+        );
+    }
     #[test]
     fn disclosed_tools_keep_prefix_in_serialized_payload() {
         let render = |request: ChatRequest| {
@@ -1747,6 +1777,7 @@ mod tests {
             let provider = BedrockProvider::new("dummy-access", "dummy-secret", region);
             let request = ChatRequest {
                 tool_declarations: None,
+                service_mode: None,
                 model: "model:0".into(),
                 messages: vec![ChatMessage::user("dummy")],
                 temperature: None,
@@ -1872,6 +1903,7 @@ mod tests {
         });
         let request = ChatRequest {
             tool_declarations: None,
+            service_mode: None,
             model: "anthropic.claude-target".into(),
             messages: vec![message],
             temperature: None,
@@ -1928,6 +1960,7 @@ mod tests {
         });
         let request = ChatRequest {
             tool_declarations: None,
+            service_mode: None,
             model: "different-model".into(),
             messages: vec![canonical.clone()],
             temperature: None,
@@ -2170,6 +2203,7 @@ mod tests {
     fn convert_messages_uses_compiled_prompt_sections_in_order() {
         let request = ChatRequest {
             tool_declarations: None,
+            service_mode: None,
             model: "anthropic.claude-3-sonnet-20240229-v1:0".to_owned(),
             messages: vec![
                 ChatMessage::system("legacy prompt should be ignored"),
@@ -2279,6 +2313,7 @@ mod tests {
     fn bedrock_non_claude_rejects_unimplemented_reasoning_setting() {
         let request = ChatRequest {
             tool_declarations: None,
+            service_mode: None,
             model: "amazon.nova-pro-v1:0".to_owned(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,

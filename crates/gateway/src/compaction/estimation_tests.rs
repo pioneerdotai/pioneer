@@ -129,6 +129,7 @@ fn cli_summary_replacement_size_covers_nested_escaping_and_retained_media() {
     let projection = NativeRequestProjection::new(
         ChatRequest {
             tool_declarations: None,
+            service_mode: None,
             model: "fixture".into(),
             messages: vec![ChatMessage::user("old history"), retained],
             temperature: None,

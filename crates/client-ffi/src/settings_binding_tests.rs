@@ -132,6 +132,9 @@ fn independent_direct_and_ffi_profile_replay_preserves_owner_and_page_isolation(
                     provider: None,
                     model: None,
                     selected_reasoning_effort: None,
+                    selected_context_window: None,
+                    selected_service_mode: None,
+                    selected_context_authority: None,
                 },
             },
         });

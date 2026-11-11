@@ -895,6 +895,7 @@ mod tests {
             };
             let request = || ChatRequest {
                 tool_declarations: None,
+                service_mode: None,
                 model: "fixture".to_owned(),
                 messages: vec![ChatMessage::user("hello")],
                 temperature: None,

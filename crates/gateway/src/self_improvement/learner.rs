@@ -1123,6 +1123,7 @@ impl<'a> LearnerReviewerClient<'a> {
         let response = provider
             .chat(ChatRequest {
                 tool_declarations: None,
+                service_mode: None,
                 model: selection.model.clone(),
                 messages: vec![
                     ChatMessage::system(system_prompt),

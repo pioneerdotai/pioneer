@@ -258,6 +258,7 @@ pub struct ProviderInputCapabilities {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderTimeoutPolicy {
+    pub use_default_flex_timeouts: bool,
     pub connect_timeout: Duration,
     pub first_chunk_timeout: Duration,
     pub inter_chunk_idle_timeout: Duration,
@@ -266,6 +267,37 @@ pub struct ProviderTimeoutPolicy {
 }
 
 impl ProviderTimeoutPolicy {
+    /// Flex extends only the built-in defaults. Explicit non-default limits and
+    /// the operation's end-to-end deadline remain authoritative.
+    pub fn for_service_mode(
+        mut self,
+        plan: Option<&pioneer_protocol::NativeServiceModePlan>,
+    ) -> Self {
+        if self.use_default_flex_timeouts
+            && plan.is_some_and(|plan| {
+                matches!(
+                    plan.parameters,
+                    pioneer_protocol::ServiceModeParameters::OpenAiTier {
+                        tier: pioneer_protocol::OpenAiTier::Flex
+                    }
+                )
+            })
+        {
+            let defaults = Self::default();
+            let flex = Duration::from_secs(600);
+            if self.first_chunk_timeout == defaults.first_chunk_timeout {
+                self.first_chunk_timeout = flex;
+            }
+            if self.inter_chunk_idle_timeout == defaults.inter_chunk_idle_timeout {
+                self.inter_chunk_idle_timeout = flex;
+            }
+            if self.non_stream_request_timeout == defaults.non_stream_request_timeout {
+                self.non_stream_request_timeout = flex;
+            }
+        }
+        self
+    }
+
     pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
     pub const DEFAULT_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
     pub const DEFAULT_INTER_CHUNK_IDLE_TIMEOUT_SECS: u64 = 180;
@@ -279,6 +311,7 @@ impl ProviderTimeoutPolicy {
         max_stream_duration_secs: Option<u64>,
     ) -> Self {
         Self {
+            use_default_flex_timeouts: false,
             connect_timeout: Duration::from_secs(connect_timeout_secs.max(1)),
             first_chunk_timeout: Duration::from_secs(first_chunk_timeout_secs.max(1)),
             inter_chunk_idle_timeout: Duration::from_secs(inter_chunk_idle_timeout_secs.max(1)),
@@ -291,13 +324,15 @@ impl ProviderTimeoutPolicy {
 
 impl Default for ProviderTimeoutPolicy {
     fn default() -> Self {
-        Self::from_secs(
+        let mut policy = Self::from_secs(
             Self::DEFAULT_CONNECT_TIMEOUT_SECS,
             Self::DEFAULT_FIRST_CHUNK_TIMEOUT_SECS,
             Self::DEFAULT_INTER_CHUNK_IDLE_TIMEOUT_SECS,
             Self::DEFAULT_NON_STREAM_REQUEST_TIMEOUT_SECS,
             None,
-        )
+        );
+        policy.use_default_flex_timeouts = true;
+        policy
     }
 }
 
@@ -891,6 +926,7 @@ pub struct ChatRequest {
     /// Host-owned positional proposal. Never an execution grant or delivery ACK.
     /// Not part of canonical messages or public protocol contracts.
     pub tool_declarations: Option<crate::tool_declarations::ToolDeclarations>,
+    pub service_mode: Option<pioneer_protocol::NativeServiceModePlan>,
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f32>,
@@ -1607,6 +1643,25 @@ pub struct ProviderCapabilities {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn flex_profile_is_request_local_and_preserves_explicit_limits() {
+        use pioneer_protocol::{NativeServiceModePlan, OpenAiTier, ServiceModeParameters as P};
+        let plan = NativeServiceModePlan {
+            id: "flex".into(),
+            parameters: P::OpenAiTier {
+                tier: OpenAiTier::Flex,
+            },
+        };
+        let defaults = ProviderTimeoutPolicy::default();
+        assert_eq!(defaults.for_service_mode(None), defaults);
+        let flex = defaults.for_service_mode(Some(&plan));
+        assert_eq!(flex.first_chunk_timeout, Duration::from_secs(600));
+        assert_eq!(flex.non_stream_request_timeout, Duration::from_secs(600));
+        let explicit = ProviderTimeoutPolicy::from_secs(12, 13, 14, 15, Some(16));
+        assert_eq!(explicit.for_service_mode(Some(&plan)), explicit);
+        assert_eq!(defaults.first_chunk_timeout, Duration::from_secs(180));
+    }
     use super::*;
 
     #[test]
@@ -1869,6 +1924,7 @@ mod tests {
     fn rendered_messages_with_compiled_prompt_uses_canonical_full_text() {
         let request = ChatRequest {
             tool_declarations: None,
+            service_mode: None,
             model: "test-model".to_owned(),
             messages: vec![
                 ChatMessage::system("legacy prompt"),

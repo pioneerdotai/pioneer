@@ -1856,6 +1856,9 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
     }
 
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: m.id.clone(),
         name: m.name,
         description: m.description,
@@ -3012,6 +3015,7 @@ mod tests {
         let response = provider
             .chat(ChatRequest {
                 tool_declarations: None,
+                service_mode: None,
                 model: "fixture".into(),
                 messages: vec![ChatMessage::user("hello")],
                 temperature: None,

@@ -6,6 +6,7 @@ use crate::types::{AttachmentDataSource, ChatMessage, MessageAttachment, Message
 fn request(messages: Vec<ChatMessage>) -> ChatRequest {
     ChatRequest {
         tool_declarations: None,
+        service_mode: None,
         model: "anthropic.claude-sonnet-4-5".into(),
         messages,
         temperature: None,

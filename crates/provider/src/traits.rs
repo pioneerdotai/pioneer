@@ -74,6 +74,34 @@ pub trait Provider: Send + Sync {
         Ok(crate::catalog::model_catalog()?.limits(self.name(), model))
     }
 
+    /// Context pricing metadata for the selected authority; never technical limits.
+    async fn model_context_tiers(
+        &self,
+        model: &str,
+    ) -> Result<Option<pioneer_protocol::ProviderContextTiers>> {
+        if let Some(entry) = self.model_catalog_entry(model) {
+            return Ok(Some(crate::catalog::context_tiers_for_model(&entry)));
+        }
+        Ok(crate::catalog::model_catalog()?
+            .context_tiers(self.name(), model)
+            .cloned())
+    }
+
+    /// Normalized source facts. Registry wrappers enforce endpoint authority.
+    async fn model_service_modes(
+        &self,
+        model: &str,
+    ) -> Result<Option<pioneer_protocol::SourceServiceModes>> {
+        Ok(crate::catalog::model_catalog()?
+            .source_service_modes(self.name(), model)
+            .cloned())
+    }
+
+    /// Neutral mapping is authority-owned; arbitrary compatible endpoints omit it.
+    fn standard_service_mode(&self, _model: &str) -> pioneer_protocol::ServiceModeParameters {
+        pioneer_protocol::ServiceModeParameters::Neutral
+    }
+
     /// Optional authority-owned model facts, including usage accounting evidence.
     /// When present, the owning provider also decides `model_tool_calling`;
     /// wrappers must not substitute public facts for that model decision.
@@ -279,6 +307,7 @@ mod tests {
         provider.prepare_model("test-model").await.unwrap();
         let request = ChatRequest {
             tool_declarations: None,
+            service_mode: None,
             model: "test-model".into(),
             messages: vec![ChatMessage::user("hello")],
             temperature: None,
@@ -353,6 +382,7 @@ mod tests {
         });
         let request = ChatRequest {
             tool_declarations: None,
+            service_mode: None,
             model: "target-model".into(),
             messages: vec![message.clone()],
             temperature: None,

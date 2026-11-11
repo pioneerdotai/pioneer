@@ -9,6 +9,7 @@ use serde_json::json;
 fn request() -> ChatRequest {
     ChatRequest {
         tool_declarations: None,
+        service_mode: None,
         model: "gpt-6.1-sol".into(),
         messages: vec![ChatMessage::user("test")],
         temperature: None,
@@ -3446,6 +3447,104 @@ async fn positional_declarations_preserve_wire_prefix_and_restore_without_delive
             )
             .unwrap();
         assert_eq!(legacy["tools"][0]["name"], "alpha");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn admitted_service_presets_survive_production_preparation_without_leakage() {
+    use crate::attachments::{admission::AdmissionState, regression::scoped};
+    use pioneer_protocol::{NativeServiceModePlan, OpenAiTier, ServiceModeParameters as P};
+    use std::sync::Arc;
+    let provider = ResponsesApiCompatibleProvider::new(
+        "openai",
+        "https://api.openai.com/v1",
+        "fixture",
+        AuthStyle::Bearer,
+    );
+    let state = Arc::new(AdmissionState::for_test(Arc::new(compatible_catalog(
+        "openai",
+        "gpt-6.1-sol",
+        json!({}),
+    ))));
+    scoped(state, async {
+        let mut req = request();
+        req.reasoning = Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::High));
+        for (id, parameters, expected_tier, pro) in [
+            ("pro", P::OpenAiPro, "default", true),
+            (
+                "fast",
+                P::OpenAiTier {
+                    tier: OpenAiTier::Priority,
+                },
+                "priority",
+                false,
+            ),
+            ("standard", P::OpenAiStandard, "default", false),
+            (
+                "flex",
+                P::OpenAiTier {
+                    tier: OpenAiTier::Flex,
+                },
+                "flex",
+                false,
+            ),
+            (
+                "ultrafast",
+                P::OpenAiTier {
+                    tier: OpenAiTier::Ultrafast,
+                },
+                "ultrafast",
+                false,
+            ),
+        ] {
+            req.service_mode = Some(NativeServiceModePlan {
+                id: id.into(),
+                parameters,
+            });
+            let budget = provider.prepare_input_budget(req.clone()).await.unwrap();
+            let prepared = provider
+                .prepare(budget.request, &provider.capabilities())
+                .await
+                .unwrap();
+            for stream in [false, true] {
+                let body = provider.render(&prepared, stream).unwrap();
+                assert_eq!(body["service_tier"], expected_tier);
+                assert_eq!(body["reasoning"]["effort"], "high");
+                if pro {
+                    assert_eq!(body["reasoning"]["mode"], "pro");
+                } else {
+                    assert!(body["reasoning"].get("mode").is_none());
+                }
+                assert_eq!(body["model"], "gpt-6.1-sol");
+                assert_eq!(body["max_output_tokens"], 100);
+                assert_eq!(body["parallel_tool_calls"], false);
+            }
+        }
+        req.service_mode = Some(NativeServiceModePlan {
+            id: "pro".into(),
+            parameters: P::OpenAiPro,
+        });
+        req.reasoning = Some(crate::ReasoningConfig::Disabled);
+        let error = provider
+            .prepare_input_budget(req.clone())
+            .await
+            .err()
+            .expect("disabled Pro must fail before network");
+        assert!(error.to_string().contains("Pro"));
+        req.reasoning = None;
+        req.service_mode = None; // Legacy/CLI-owned API request keeps omission.
+        let prepared = provider
+            .prepare(req, &provider.capabilities())
+            .await
+            .unwrap();
+        assert!(
+            provider
+                .render(&prepared, false)
+                .unwrap()
+                .get("service_tier")
+                .is_none()
+        );
     })
     .await;
 }

@@ -15551,6 +15551,7 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
     use crate::compaction::controller::{NativeContext, NativeContextSession};
     let request = || ChatRequest {
         tool_declarations: None,
+        service_mode: None,
         model: "fixture".into(),
         messages: vec![ChatMessage::user("request")],
         temperature: None,
@@ -15562,6 +15563,8 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         compiled_prompt: None,
     };
     let context = || NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: true,
         recovery_deadline_ms: Some(
             std::time::SystemTime::now()

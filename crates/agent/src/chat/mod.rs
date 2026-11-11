@@ -3796,6 +3796,7 @@ async fn execute_standard_provider_response(
 
     let request = ChatRequest {
         tool_declarations: None,
+        service_mode: None,
         model,
         messages,
         temperature: None,
@@ -5947,6 +5948,7 @@ async fn execute_agent_provider_response(
             let post_turn_assistant_text_len_before_round = post_turn_assistant_text.len();
             let request = ChatRequest {
                     tool_declarations: tool_declarations.clone(),
+                service_mode: None,
                     model: model.clone(),
                     messages: messages.clone(),
                     temperature: None,
@@ -8200,6 +8202,8 @@ mod tests {
                 .as_millis() as u64;
             let session = NativeContextSession::new(
                 NativeContext {
+                    context_budget: None,
+                    summary_context: None,
                     overflow_recovery: true,
                     recovery_deadline_ms: Some(now_ms + 60_000),
                     workspace_id: "workspace".into(),
@@ -8228,6 +8232,7 @@ mod tests {
                     .prepare(
                         ChatRequest {
                             tool_declarations: None,
+                            service_mode: None,
                             model: "private/model".into(),
                             messages: vec![],
                             temperature: None,
@@ -11255,6 +11260,8 @@ mod tests {
         let mut durable = hub.take_durable_receiver().await.unwrap();
         let session = NativeContextSession::new(
             NativeContext {
+                context_budget: None,
+                summary_context: None,
                 overflow_recovery: false,
                 recovery_deadline_ms: None,
                 workspace_id: "workspace".into(),
