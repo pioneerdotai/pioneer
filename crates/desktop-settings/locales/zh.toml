@@ -355,6 +355,13 @@ reason_cancelled = "运行已取消。"
 reason_unknown = "操作未按预期完成。请检查 Gateway 日志。"
 
 [chat.composer.model]
+service_label = "服务级别"
+service_standard = "标准"
+service_invalid = "已保存的服务级别不可用。请选择标准或其他模式。"
+context_label = "上下文窗口"
+context_auto = "自动 — 最多 %{tokens} 个令牌"
+context_up_to = "最多 %{tokens} 个令牌"
+context_invalid = "已保存的选项不可用。请选择自动或其他窗口。"
 select_label = "选择模型"
 dialog_title = "选择模型"
 provider_label = "提供商"

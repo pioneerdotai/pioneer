@@ -638,6 +638,9 @@ async fn candidate_admission_fixture(
     prepare_manifest: bool,
 ) -> Checkpoint {
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "p".into(),
         model: "m".into(),
@@ -1377,6 +1380,9 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
         admission: CompactionSettings::default()
             .admit(
                 &ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: Transport::Api,
                     instance: "p".into(),
                     model: "m".into(),
@@ -6246,6 +6252,9 @@ async fn admit_import_operation(
         admission: CompactionSettings::default()
             .admit(
                 &ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: Transport::Api,
                     instance: "p".into(),
                     model: "m".into(),
@@ -7622,6 +7631,9 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
             db.execute_unprepared(sql).await.unwrap();
         }
         let selection = serde_json::to_string(&ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "upgrade-instance".into(),
             model: "upgrade-model".into(),
@@ -7647,6 +7659,9 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
             admission: CompactionSettings::default()
                 .admit(
                     &ModelSelection {
+                        service_mode: None,
+                        context_authority: None,
+                        context_window: None,
                         transport: Transport::Api,
                         instance: "upgrade-instance".into(),
                         model: "upgrade-model".into(),
@@ -8941,6 +8956,9 @@ async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publish
     let a = source(&store, "A", 1, "original A").await;
     let b = source(&store, "B", 2, "original B").await;
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "p".into(),
         model: "m".into(),
@@ -9268,6 +9286,9 @@ async fn raw_assertion_api_saves_permuted_prebuilt_manifest_and_publishes_exactl
     let b1 = source(&store, "B1", 2, "only B").await;
     let a2 = source(&store, "A2", 3, "second A").await;
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "p".into(),
         model: "m".into(),

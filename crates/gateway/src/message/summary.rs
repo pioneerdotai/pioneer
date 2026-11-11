@@ -229,6 +229,8 @@ fn title_instructions() -> &'static str {
 
 fn title_generation_chat_request(model: &str, prompt: String) -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: model.to_owned(),
         messages: vec![ChatMessage::user(prompt)],
         temperature: None,

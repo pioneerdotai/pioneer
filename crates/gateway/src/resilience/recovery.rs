@@ -7827,6 +7827,9 @@ mod tests {
             .expect("recovery test workspace should materialize");
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -11088,6 +11091,9 @@ mod tests {
         .await
         .expect("workspace should persist");
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_terminal_backfill".to_owned(),
             id: "thr_terminal_backfill".to_owned(),
             name: None,
@@ -11234,6 +11240,9 @@ mod tests {
         let (crud_store, coordinator) = setup_coordinator().await;
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_timeout_liveness".to_owned(),
             id: "thr_timeout_liveness".to_owned(),
             name: None,

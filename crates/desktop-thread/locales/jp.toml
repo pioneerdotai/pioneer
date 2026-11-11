@@ -335,3 +335,14 @@
 "timeline.web_search.running" = "Web を検索中"
 "timeline.work_group.completed" = "作業済み"
 "chat.composer.preparing_send" = "メッセージを準備中"
+
+"chat.composer.model.context_label" = "コンテキストウィンドウ"
+"chat.composer.model.context_auto" = "自動 — 最大 %{tokens} トークン"
+"chat.composer.model.context_up_to" = "最大 %{tokens} トークン"
+"chat.composer.model.context_invalid" = "保存された選択は利用できません。自動または別のウィンドウを選択してください。"
+
+"chat.composer.model.service_label" = "サービス階層"
+
+"chat.composer.model.service_standard" = "標準"
+
+"chat.composer.model.service_invalid" = "保存されたサービス階層は利用できません。標準または別のモードを選択してください。"

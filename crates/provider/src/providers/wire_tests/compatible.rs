@@ -68,6 +68,8 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                 crate::providers::history_test_support::COMPACT_SHELL_RESULT,
             ));
             let request = ChatRequest {
+                tool_declarations: None,
+                service_mode: None,
                 model: "fixture-model".into(),
                 messages: history.clone(),
                 temperature: None,
