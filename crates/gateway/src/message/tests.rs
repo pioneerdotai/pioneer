@@ -5030,9 +5030,12 @@ impl Provider for GuardAwareProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if let Some(response) =
-            request_optional_fixture_tools(&request, &["task_create", "task_wait"])
-        {
+        let next_tools: &[&str] = match self.next_index.load(Ordering::SeqCst) {
+            0 => &["task_create"],
+            2 => &["task_detach"],
+            _ => &[],
+        };
+        if let Some(response) = request_optional_fixture_tools(&request, next_tools) {
             return Ok(response);
         }
         if request.messages.iter().any(|message| {
@@ -42593,7 +42596,8 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let (_database_dir, workspace_manager, crud_store, workspace_id) =
+            setup_pooled_file_workspace_manager().await;
         let provider = Arc::new(GuardAwareProvider::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
