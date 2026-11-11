@@ -60,6 +60,10 @@ pub struct PluginItem {
     pub id: String,
     pub name: String,
     pub version: Option<String>,
+    /// Authored package description, bounded by the Gateway; absent for old peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 2048))]
+    pub description: Option<String>,
     pub enabled: bool,
     pub state: String,
     pub revision: i64,
@@ -75,6 +79,10 @@ pub struct PluginsListResponse {
 pub struct PluginsPreviewResponse {
     pub name: String,
     pub version: Option<String>,
+    /// Authored package description, bounded by the Gateway; absent for old peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 2048))]
+    pub description: Option<String>,
     pub fingerprint: String,
     pub components: Vec<PluginComponentItem>,
     pub diagnostics: Vec<PluginDiagnostic>,
@@ -118,6 +126,21 @@ mod tests {
             assert!(serde_json::from_value::<super::PluginsInstallParams>(forged).is_err());
         }
     }
+    #[test]
+    fn previous_plugin_inventory_and_preview_keep_optional_metadata_defaults() {
+        let item: super::PluginItem = serde_json::from_value(serde_json::json!({
+            "id":"parent","name":"tools","enabled":true,"state":"installed","revision":1,"status":"installed","components":[],"diagnostics":[]
+        })).unwrap();
+        assert!(item.description.is_none());
+        let preview: super::PluginsUpdatePreviewResponse =
+            serde_json::from_value(serde_json::json!({
+                "package":{"name":"tools","fingerprint":"digest","components":[],"diagnostics":[]},
+                "added":[],"updated":[],"removed":[],"authorization_changes":[],"identity_resets":[]
+            }))
+            .unwrap();
+        assert!(preview.package.description.is_none());
+        assert!(!preview.supporting_files_changed);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -146,6 +169,9 @@ pub struct PluginsUpdatePreviewParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct PluginsUpdatePreviewResponse {
     pub package: PluginsPreviewResponse,
+    /// Package bytes changed outside a changed member (for example shared assets).
+    #[serde(default)]
+    pub supporting_files_changed: bool,
     pub added: Vec<PluginComponentKey>,
     pub updated: Vec<PluginComponentKey>,
     pub identity_resets: Vec<PluginComponentKey>,

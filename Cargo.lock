@@ -7941,9 +7941,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -10967,6 +10967,7 @@ version = "0.69.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
+ "tokio",
 ]
 
 [[package]]
@@ -11001,8 +11002,8 @@ dependencies = [
  "gpui-kit",
  "pioneer-client",
  "pioneer-desktop-foundation",
+ "pioneer-protocol",
  "rust-i18n",
- "tokio",
 ]
 
 [[package]]
@@ -11245,6 +11246,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "libc",
  "pioneer-observability",
  "process-wrap",
  "reqwest",
@@ -11363,7 +11365,6 @@ dependencies = [
  "pioneer-skills",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.1",
  "tempfile",
  "url",
@@ -11544,6 +11545,7 @@ dependencies = [
  "pioneer-provider",
  "pioneer-skills",
  "pioneer-sqlite",
+ "process-wrap",
  "regex",
  "reqwest",
  "scraper 0.27.0",

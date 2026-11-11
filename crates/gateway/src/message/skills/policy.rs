@@ -144,7 +144,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: SkillsPolicySetParams,
     ) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = self.agent_manager.control_operation_deadline();
         let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_skills_workspace(
@@ -270,14 +270,7 @@ impl MessageProcessor {
                     &params.skill_id,
                     native.as_ref().map(|change| &change.write),
                 );
-            let written = if native.is_some() {
-                tokio::time::timeout_at(deadline, write)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("plugins.outcome_unconfirmed"))
-                    .and_then(|result| result)
-            } else {
-                write.await
-            };
+            let written = write.await;
             if let Err(error) = written {
                 if let Some(change) = &native {
                     let _ = self
@@ -413,14 +406,7 @@ impl MessageProcessor {
                 native.as_ref().map(|change| &change.write),
                 now,
             );
-        let written = if native.is_some() {
-            tokio::time::timeout_at(deadline, write)
-                .await
-                .map_err(|_| anyhow::anyhow!("plugins.outcome_unconfirmed"))
-                .and_then(|result| result)
-        } else {
-            write.await
-        };
+        let written = write.await;
         if let Err(error) = written {
             if let Some(change) = &native {
                 let _ = self

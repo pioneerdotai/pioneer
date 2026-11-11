@@ -1,3 +1,8 @@
+fn snapshot_limits() -> pioneer_plugins::Limits {
+    pioneer_plugins::Limits { expanded_bytes: 50 * 1024 * 1024, entry_bytes: 1024 * 1024,
+        entries: 2048, depth: 2048, components: 2048 }
+}
+
 //! Stage A coverage, NOT_RUN (test targets have not been compiled).
 use pioneer_plugins::*;
 use serde_json::{Value, json};
@@ -5,6 +10,183 @@ use std::{collections::BTreeMap, fs};
 
 const SKILL: &str =
     "---\nname: good\ndescription: Inspect bundled data.\n---\nRead assets/data.json.\n";
+
+#[test]
+fn zenmoney_host_manifests_import_both_skill_and_http_connector() {
+    let package = package(
+        manifest(),
+        &[
+            (
+                ".codex-plugin/plugin.json",
+                r#"{"name":"zenmoney","version":"0.1.0","skills":"./skills/","mcpServers":"./.mcp.json","interface":{"displayName":"Zenmoney"},"hooks":"../outside"}"#,
+            ),
+            (
+                ".claude-plugin/plugin.json",
+                r#"{"name":"zenmoney","version":"0.1.0"}"#,
+            ),
+            (
+                ".mcp.json",
+                r#"{"mcpServers":{"zenmoney":{"type":"http","url":"https://api.zenmoney.app/mcp"}}}"#,
+            ),
+            (
+                "skills/financial-brief/SKILL.md",
+                "---\nname: financial-brief\ndescription: Summarise finances.\n---\nRead financial data.\n",
+            ),
+        ],
+    );
+    let mut entries = package.entries().clone();
+    entries.remove("plugin.json");
+    let source = Snapshot::from_entries(entries, snapshot_limits()).unwrap();
+    let plan = load(&source).unwrap();
+    assert_eq!(plan.manifest.name, "zenmoney");
+    assert_eq!(plan.manifest.version.as_deref(), Some("0.1.0"));
+    for (code, pointer) in [
+        ("vendor_subset_import", ".codex-plugin/plugin.json"),
+        ("ignored_vendor_manifest", ".claude-plugin/plugin.json"),
+        ("ignored_vendor_feature", ".codex-plugin/plugin.json/hooks"),
+        ("ignored_vendor_feature", ".codex-plugin/plugin.json/interface"),
+    ] {
+        assert!(
+            plan.diagnostics
+                .iter()
+                .any(|d| d.code == code && d.pointer == pointer)
+        );
+    }
+    assert_eq!(plan.components.len(), 2);
+    assert!(plan.components.iter().any(|component| matches!(component,
+        ComponentPlan::Skill { member_key, member_path, .. }
+        if member_key == "financial-brief" && member_path == "skills/financial-brief"
+    )));
+    assert!(plan.components.iter().any(|component| matches!(component,
+        ComponentPlan::Mcp { member_key, server: PortableServer::StreamableHttp { url, headers } }
+        if member_key == "zenmoney" && url == "https://api.zenmoney.app/mcp" && headers.is_empty()
+    )));
+}
+
+#[test]
+fn host_import_never_overrides_a_canonical_manifest_or_reads_external_component_paths() {
+    let source = package(
+        json!({"name":"invalid-canonical"}),
+        &[(".codex-plugin/plugin.json", r#"{"name":"valid-host"}"#)],
+    );
+    assert_eq!(
+        load(&source).unwrap_err().code,
+        "unsupported_schema_version"
+    );
+    for declaration in [
+        r#"{"skills":"../outside"}"#,
+        r#"{"mcpServers":"/tmp/secret.json"}"#,
+    ] {
+        let mut raw: Value = serde_json::from_str(declaration).unwrap();
+        raw["name"] = json!("host-plugin");
+        let source = package(
+            manifest(),
+            &[(".codex-plugin/plugin.json", &raw.to_string())],
+        );
+        let mut entries = source.entries().clone();
+        entries.remove("plugin.json");
+        let source = Snapshot::from_entries(entries, snapshot_limits()).unwrap();
+        assert_eq!(load(&source).unwrap_err().code, "unsupported_plugin_layout");
+    }
+}
+
+#[test]
+fn vendor_subsets_report_ignored_components_without_following_them() {
+    for vendor in [".codex-plugin", ".claude-plugin", ".cursor-plugin"] {
+        let path = format!("{vendor}/plugin.json");
+        let source = package(
+            manifest(),
+            &[
+                (
+                    &path,
+                    r#"{"name":"vendor-subset","foreign/key~":"/secret"}"#,
+                ),
+                ("skills/good/SKILL.md", SKILL),
+                ("commands/run.md", "Never execute this command."),
+            ],
+        );
+        let mut entries = source.entries().clone();
+        entries.remove("plugin.json");
+        let plan = load(&Snapshot::from_entries(entries, snapshot_limits()).unwrap()).unwrap();
+        assert_eq!(plan.manifest.name, "vendor-subset");
+        assert_eq!(plan.components.len(), 1);
+        for (code, pointer) in [
+            ("vendor_subset_import", path.clone()),
+            ("ignored_vendor_feature", format!("{path}/foreign~1key~0")),
+            ("ignored_vendor_feature", "commands".into()),
+        ] {
+            assert!(
+                plan.diagnostics
+                    .iter()
+                    .any(|d| d.code == code && d.pointer == pointer)
+            );
+        }
+        assert!(
+            plan.diagnostics
+                .iter()
+                .all(|d| !d.message.contains("/secret"))
+        );
+    }
+}
+
+#[test]
+fn manifest_priority_is_deterministic_and_selected_errors_do_not_fall_back() {
+    let source = package(
+        manifest(),
+        &[
+            (".codex-plugin/plugin.json", "not JSON"),
+            (".claude-plugin/plugin.json", r#"{"name":"claude"}"#),
+            (".cursor-plugin/plugin.json", r#"{"name":"cursor"}"#),
+        ],
+    );
+    let plan = load(&source).unwrap();
+    assert_eq!(plan.manifest.name, "fixture.tools");
+    assert!(plan.diagnostics.is_empty());
+    let mut entries = source.entries().clone();
+    entries.remove("plugin.json");
+    let error =
+        load(&Snapshot::from_entries(entries.clone(), snapshot_limits()).unwrap()).unwrap_err();
+    assert_eq!(error.code, "fatal_manifest");
+    assert_eq!(error.pointer, ".codex-plugin/plugin.json");
+    entries.remove(".codex-plugin/plugin.json");
+    let plan = load(&Snapshot::from_entries(entries, snapshot_limits()).unwrap()).unwrap();
+    assert_eq!(plan.manifest.name, "claude");
+    assert!(plan.diagnostics.iter().any(|d| {
+        d.code == "ignored_vendor_manifest" && d.pointer == ".cursor-plugin/plugin.json"
+    }));
+}
+
+#[test]
+fn bundled_skills_require_authored_fields_with_native_frontmatter_parsing() {
+    for fields in [
+        "description: Inspect data.",
+        "name: good",
+        "name: ''\ndescription: Inspect data.",
+        "name: good\ndescription: ' '",
+        "name: 123\ndescription: Inspect data.",
+        "name: good\ndescription: 123",
+        "name: ' good '\ndescription: Inspect data.",
+        "name: other\ndescription: Inspect data.",
+        "name: good\ndescription: Inspect data.\nallowed-tools: [Read]",
+    ] {
+        let markdown = format!("---\n{fields}\n---\nRead bundled data.");
+        let plan = load(&package(manifest(), &[("skills/good/SKILL.md", &markdown)])).unwrap();
+        assert!(plan.components.is_empty(), "{fields}");
+        assert!(plan.diagnostics.iter().any(|d| {
+            d.code == "invalid_skill" && d.pointer == "skills/good/SKILL.md"
+        }));
+    }
+    for markdown in [
+        SKILL.to_owned(),
+        SKILL.replace('\n', "\r\n"),
+        format!("\u{feff}{SKILL}"),
+        "---\nname: good\ndescription: |\n  Inspect data.\n  Keep context.\n---\nRead assets.\n".into(),
+    ] {
+        let plan = load(&package(manifest(), &[("skills/good/SKILL.md", &markdown)])).unwrap();
+        assert_eq!(plan.components.len(), 1, "{markdown}");
+        assert!(plan.diagnostics.is_empty(), "{:?}", plan.diagnostics);
+    }
+}
 fn manifest() -> Value {
     json!({"$schema":PLUGIN_SCHEMA,"name":"fixture.tools"})
 }
@@ -34,7 +216,7 @@ fn package(value: Value, files: &[(&str, &str)]) -> Snapshot {
             },
         );
     }
-    Snapshot::from_entries(entries, Default::default()).unwrap()
+    Snapshot::from_entries(entries, snapshot_limits()).unwrap()
 }
 #[test]
 fn canonical_schemas_are_selected_offline_and_pinned() {
@@ -257,7 +439,7 @@ fn asset_bytes_and_modes_affect_tree_identity() {
     if let Entry::File { mode, .. } = entries.get_mut("skills/good/assets/data.json").unwrap() {
         *mode = 0o755;
     }
-    let c = Snapshot::from_entries(entries, Default::default()).unwrap();
+    let c = Snapshot::from_entries(entries, snapshot_limits()).unwrap();
     assert_ne!(a.tree_digest(), c.tree_digest());
 }
 #[cfg(unix)]
@@ -281,7 +463,7 @@ fn denied_asset_keeps_valid_skill_but_native_copy_still_rejects_it() {
         source.path().join("skills/good/assets/escape"),
     )
     .unwrap();
-    let snapshot = Snapshot::capture(source.path(), Default::default(), || false).unwrap();
+    let snapshot = Snapshot::capture(source.path(), snapshot_limits(), || false).unwrap();
     assert_eq!(snapshot.file("alias"), Some(b"public".as_slice()));
     let plan = load(&snapshot).unwrap();
     assert!(
@@ -301,7 +483,7 @@ fn denied_asset_keeps_valid_skill_but_native_copy_still_rejects_it() {
         source.path().join("skills/escaped/SKILL.md"),
     )
     .unwrap();
-    let escaped_snapshot = Snapshot::capture(source.path(), Default::default(), || false).unwrap();
+    let escaped_snapshot = Snapshot::capture(source.path(), snapshot_limits(), || false).unwrap();
     let escaped_plan = load(&escaped_snapshot).unwrap();
     assert_eq!(escaped_plan.components.len(), 1);
     assert!(
@@ -330,13 +512,13 @@ fn denied_asset_keeps_valid_skill_but_native_copy_still_rejects_it() {
 fn bounded_capture_can_be_cancelled_without_materialization() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("plugin.json"), "{}").unwrap();
-    assert!(Snapshot::capture(root.path(), Default::default(), || true).is_err());
+    assert!(Snapshot::capture(root.path(), snapshot_limits(), || true).is_err());
     assert!(
         Snapshot::capture(
             root.path(),
             Limits {
                 entries: 0,
-                ..Default::default()
+                ..snapshot_limits()
             },
             || false
         )
@@ -374,7 +556,7 @@ fn spaced_executable_is_one_literal_path_and_args_remain_separate() {
         serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
-    let snapshot = Snapshot::capture(root.path(), Default::default(), || false).unwrap();
+    let snapshot = Snapshot::capture(root.path(), snapshot_limits(), || false).unwrap();
     assert_eq!(load(&snapshot).unwrap().components.len(), 1);
     let ResolvedServer::Stdio { command, args, .. } =
         portable_mcp::resolve(server, root.path(), data.path()).unwrap()
@@ -412,7 +594,7 @@ fn spaced_executable_is_one_literal_path_and_args_remain_separate() {
             env: BTreeMap::new(),
             cwd: None,
         };
-        let captured = Snapshot::capture(root.path(), Default::default(), || false).unwrap();
+        let captured = Snapshot::capture(root.path(), snapshot_limits(), || false).unwrap();
         assert!(captured.file("bin/escape server").is_none());
         fs::write(
             root.path().join("mcp.json"),
@@ -420,7 +602,7 @@ fn spaced_executable_is_one_literal_path_and_args_remain_separate() {
                 .unwrap(),
         )
         .unwrap();
-        let captured = Snapshot::capture(root.path(), Default::default(), || false).unwrap();
+        let captured = Snapshot::capture(root.path(), snapshot_limits(), || false).unwrap();
         let plan = load(&captured).unwrap();
         assert!(plan.components.is_empty());
         assert!(
@@ -457,7 +639,7 @@ fn invalid_or_denied_skill_markdown_still_skips_only_that_skill() {
     );
     let mut entries = snapshot.entries().clone();
     entries.insert("skills/escaped/SKILL.md".into(), Entry::Denied);
-    let snapshot = Snapshot::from_entries(entries, Default::default()).unwrap();
+    let snapshot = Snapshot::from_entries(entries, snapshot_limits()).unwrap();
     let plan = load(&snapshot).unwrap();
     assert_eq!(plan.components.len(), 1);
     assert!(

@@ -4,7 +4,7 @@ use crate::composer::ComposerCapability;
 use crate::composer::ComposerView;
 use gpui_kit::component::WindowExt;
 use gpui_kit::component::button::*;
-use gpui_kit::component::dialog::DialogFooter;
+use gpui_kit::component::dialog::{Dialog, DialogFooter};
 use gpui_kit::component::form::field;
 use gpui_kit::component::form::v_form;
 use gpui_kit::component::input::Input;
@@ -175,7 +175,11 @@ impl CapabilityPickerState {
             },
             cx,
         );
-        self.close(window, cx);
+        // A rejected commit (for example after a provider change) keeps the
+        // session open so the user can remove the unsupported additions.
+        if self.input().is_none_or(|p| p.session.is_none()) {
+            self.close(window, cx);
+        }
     }
     fn query(&self, cx: &App) -> String {
         self.search.read(cx).value().to_string()
@@ -359,8 +363,10 @@ impl ComposerView {
                 capabilities.can_use_mcp,
                 t!("chat.composer.capability_picker.search_mcp").to_string(),
             ),
-            // Plugins use their own parent-only picker in open_composer_plugins_picker.
-            ComposerPickerKind::Plugins => return None,
+            ComposerPickerKind::Plugins => (
+                capabilities.can_use_skills && capabilities.can_use_mcp,
+                t!("plugins.search").to_string(),
+            ),
         };
         if !self.can_start_active_thread_agent_presentation() || !allowed {
             return None;
@@ -405,7 +411,7 @@ impl ComposerView {
             return;
         };
         let weak = picker_state.downgrade();
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let Some(picker_state) = weak.upgrade() else {
                 return dialog;
             };
@@ -421,50 +427,13 @@ impl ComposerView {
                 )
             };
 
-            dialog
-                .w(px(520.))
-                .gap_1()
-                .rounded_2xl()
-                .close_button(true)
-                .overlay_closable(true)
-                .keyboard(true)
-                .title(
-                    div()
-                        .text_base()
-                        .font_semibold()
-                        .child(t!("chat.composer.add_menu.skills").to_string()),
-                )
-                .on_close({
-                    let weak = picker_state.downgrade();
-                    move |_, _, cx| {
-                        let _ = weak.update(cx, |state, _| {
-                            state.dialog_open.set(false);
-                            state.retire();
-                        });
-                    }
-                })
-                .footer(DialogFooter::new().children(vec![
-                        default_outline_button("composer-skills-cancel")
-                            .label(t!("buttons.cancel").to_string())
-                            .outline()
-                            .on_click({
-                                let weak = picker_state.downgrade();
-                                move |_, window, cx| {
-                                    let _ = weak.update(cx, |state, cx| state.close(window, cx));
-                                }
-                            })
-                            .into_any_element(),
-                        default_primary_button("composer-skills-save")
-                            .label(t!("buttons.add").to_string())
-                            .disabled(picker_state.read(cx).skill_selections().is_empty())
-                            .on_click({
-                                let weak = picker_state.downgrade();
-                                move |_, window, cx| {
-                                    let _ = weak.update(cx, |state, cx| state.commit(window, cx));
-                                }
-                            })
-                            .into_any_element(),
-                    ]))
+            capability_picker_dialog(
+                dialog,
+                window.rem_size() * 32.5,
+                t!("chat.composer.add_menu.skills").to_string(),
+                picker_state.downgrade(),
+            )
+                .footer(capability_picker_footer(picker_state.downgrade(), picker_state.read(cx).skill_selections().is_empty()))
                 .child(
                     v_flex()
                         .w_full()
@@ -494,7 +463,7 @@ impl ComposerView {
             return;
         };
         let weak = picker_state.downgrade();
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let Some(picker_state) = weak.upgrade() else {
                 return dialog;
             };
@@ -555,53 +524,13 @@ impl ComposerView {
                 )
             };
 
-            dialog
-                .w(px(600.))
-                .gap_1()
-                .rounded_2xl()
-                .close_button(true)
-                .overlay_closable(true)
-                .keyboard(true)
-                .title(
-                    div()
-                        .text_base()
-                        .font_semibold()
-                        .child(t!("chat.composer.add_menu.mcp").to_string()),
-                )
-                .on_close({
-                    let weak = picker_state.downgrade();
-                    move |_, _, cx| {
-                        let _ = weak.update(cx, |state, _| {
-                            state.dialog_open.set(false);
-                            state.retire();
-                        });
-                    }
-                })
-                .footer(DialogFooter::new().children(vec![
-                        default_outline_button("composer-mcp-cancel")
-                            .label(t!("buttons.cancel").to_string())
-                            .outline()
-                            .on_click({
-                                let weak = picker_state.downgrade();
-                                move |_, window, cx| {
-                                    let _ = weak.update(cx, |state, cx| state.close(window, cx));
-                                }
-                            })
-                            .into_any_element(),
-                        default_primary_button("composer-mcp-save")
-                            .label(t!("buttons.add").to_string())
-                            .disabled(
-                                selected_mcp_composer_capabilities(&picker_state.read(cx))
-                                    .is_empty(),
-                            )
-                            .on_click({
-                                let weak = picker_state.downgrade();
-                                move |_, window, cx| {
-                                    let _ = weak.update(cx, |state, cx| state.commit(window, cx));
-                                }
-                            })
-                            .into_any_element(),
-                    ]))
+            capability_picker_dialog(
+                dialog,
+                window.rem_size() * 37.5,
+                t!("chat.composer.add_menu.mcp").to_string(),
+                picker_state.downgrade(),
+            )
+                .footer(capability_picker_footer(picker_state.downgrade(), selected_mcp_composer_capabilities(&picker_state.read(cx)).is_empty()))
                 .child(
                     v_flex()
                         .w_full()
@@ -770,6 +699,19 @@ fn render_packed_skill_picker_row(
     render_skill_picker_leaf_row(child.skill, selection, selections, picker, picker_state, cx)
 }
 
+fn picker_leaf_frame(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .w_full()
+        .items_center()
+        .gap_3()
+        .rounded_md()
+        .border_1()
+        .border_color(if selected { cx.theme().blue } else { cx.theme().border })
+        .bg(cx.theme().background)
+        .p_2()
+}
+
 fn render_skill_picker_leaf_row(
     row: SelectableSkillCapability,
     selection: ComposerSkillSelection,
@@ -788,20 +730,7 @@ fn render_skill_picker_leaf_row(
     let picker_state_for_row = picker_state.clone();
     let picker_state_for_toggle = picker_state.clone();
 
-    h_flex()
-        .id(("composer-skill-picker-row", key_id))
-        .w_full()
-        .items_center()
-        .gap_3()
-        .rounded_md()
-        .border_1()
-        .border_color(if is_selected {
-            cx.theme().blue
-        } else {
-            cx.theme().border
-        })
-        .bg(cx.theme().background)
-        .p_2()
+    picker_leaf_frame(("composer-skill-picker-row", key_id), is_selected, cx)
         .when(row.selectable, |this| {
             this.cursor_pointer().on_click(move |_, _, cx| {
                 cx.stop_propagation();
@@ -1504,63 +1433,200 @@ mod lifecycle_tests {
     }
 }
 
+fn capability_picker_dialog(
+    dialog: Dialog,
+    width: Pixels,
+    title: String,
+    picker: WeakEntity<CapabilityPickerState>,
+) -> Dialog {
+    dialog
+        .w(width)
+        .gap_1()
+        .rounded_2xl()
+        .close_button(true)
+        .overlay_closable(true)
+        .keyboard(true)
+        .title(div().text_base().font_semibold().child(title))
+        .on_close(move |_, _, cx| {
+            let _ = picker.update(cx, |state, _| {
+                state.dialog_open.set(false);
+                state.retire();
+            });
+        })
+}
+
+fn capability_picker_footer(
+    picker: WeakEntity<CapabilityPickerState>,
+    disabled: bool,
+) -> DialogFooter {
+    let cancel = picker.clone();
+    DialogFooter::new().children(vec![
+        default_outline_button("composer-picker-cancel")
+            .label(t!("buttons.cancel").to_string())
+            .on_click(move |_, window, cx| {
+                let _ = cancel.update(cx, |state, cx| state.close(window, cx));
+            })
+            .into_any_element(),
+        default_primary_button("composer-picker-save")
+            .label(t!("buttons.add").to_string())
+            .disabled(disabled)
+            .on_click(move |_, window, cx| {
+                let _ = picker.update(cx, |state, cx| state.commit(window, cx));
+            })
+            .into_any_element(),
+    ])
+}
+
+impl CapabilityPickerState {
+    fn toggle_plugin(&mut self, plugin_id: &str, cx: &mut Context<Self>) {
+        self.send(
+            ComposerCatalogIntent::TogglePlugin {
+                identity: self.identity.clone(),
+                plugin_id: plugin_id.into(),
+            },
+            cx,
+        );
+    }
+}
+
+fn render_plugin_picker_row(
+    row: pioneer_client::plugins::PluginPickerRow,
+    picker: WeakEntity<CapabilityPickerState>,
+    cx: &mut App,
+) -> AnyElement {
+    let toggle = picker.clone();
+    let plugin_id = row.plugin_id.clone();
+    let disabled = !row.selected && !row.selectable;
+    Button::new(SharedString::from(format!("composer-plugin-{}", row.plugin_id)))
+        .ghost()
+        .w_full()
+        .h_auto()
+        .justify_start()
+        .p_0()
+        .disabled(disabled)
+        .accessibility_label(row.label.clone())
+        .child(
+            picker_leaf_frame(
+                ("composer-plugin-row", stable_picker_row_id(&row.key)),
+                row.selected,
+                cx,
+            )
+            .min_w_0()
+            .child(Icon::new(crate::assets::PioneerIconName::Plugin).size_4())
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_sm().font_medium().child(row.label))
+                    .when_some(row.description, |view, description| {
+                        view.child(div().text_xs().text_color(cx.theme().muted_foreground).child(description))
+                    })
+                    .when(row.stale, |view| {
+                        view.child(div().text_xs().text_color(cx.theme().muted_foreground)
+                            .child(t!("plugins.stale").to_string()))
+                    })
+                    .when(!row.selectable, |view| {
+                        view.child(div().text_xs().text_color(cx.theme().muted_foreground)
+                            .child(t!("plugins.unavailable").to_string()))
+                    }),
+            )
+            .child(render_picker_select_control(
+                ("composer-plugin-toggle", stable_picker_row_id(&row.key)),
+                row.selected,
+                disabled,
+                move |_, _, cx| {
+                    let _ = toggle.update(cx, |state, cx| state.toggle_plugin(&plugin_id, cx));
+                },
+                cx,
+            )),
+        )
+        .on_click(move |_, _, cx| {
+            let _ = picker.update(cx, |state, cx| state.toggle_plugin(&row.plugin_id, cx));
+        })
+        .into_any_element()
+}
+
 impl ComposerView {
     pub(super) fn open_composer_plugins_picker(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let permissions = self.principal_presentation_capabilities();
-        if !self.can_start_active_thread_agent_presentation()
-            || !permissions.can_use_skills
-            || !permissions.can_use_mcp
-        {
-            return;
-        }
-        let Some(input) = &self.composer_input else {
-            return;
-        };
-        let thread = input.thread_id().to_owned();
-        let draft = input.draft_id();
-        let Some(workspace) = self
-            .client
-            .navigation_snapshot()
-            .workspace_id()
-            .map(str::to_owned)
+        let Some(picker) = self.new_capability_picker(ComposerPickerKind::Plugins, window, cx)
         else {
             return;
         };
-        let generation = self.client.authorization_connection_generation();
-        let selected = self
-            .composer_domain()
-            .capabilities
-            .iter()
-            .filter_map(|capability| match &capability.kind {
-                pioneer_client::composer::capabilities::ComposerCapabilityKind::Plugin {
-                    plugin_id,
-                    ..
-                } => Some(plugin_id.clone()),
-                _ => None,
-            })
-            .collect();
-        let view = cx.entity().downgrade();
-        super::plugin_picker::open_plugin_picker(
-            self.client.clone(),
-            workspace,
-            selected,
-            window,
-            cx,
-            move |result, window, cx| {
-                let _ = view.update(cx, |view, cx| {
-                if view.client.authorization_connection_generation() != generation || view.composer_input.as_ref().is_none_or(|input| input.thread_id() != thread || input.draft_id() != draft) { return; }
-                if let Some(selected) = result {
-                    let mut capabilities: Vec<_> = view.composer_domain().capabilities.iter().filter(|c| !matches!(c.kind, pioneer_client::composer::capabilities::ComposerCapabilityKind::Plugin { .. })).cloned().collect();
-                    capabilities.extend(selected);
-                    view.composer_domain_intent(pioneer_client::composer::state_machine::ComposerDomainAction::SetCapabilities { capabilities });
-                }
-                view.focus(window, cx); cx.notify();
+        let weak = picker.downgrade();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let Some(picker) = weak.upgrade() else {
+                return dialog;
+            };
+            let state = picker.read(cx);
+            let rows = state.client.composer_catalog_plugin_picker(
+                &state.identity.thread_id,
+                state.identity.draft_id,
+                &state.query(cx),
+            );
+            let input = state.input();
+            let search = state.search.clone();
+            let loading = input.as_ref().is_some_and(|p| {
+                p.plugin_request.state == ComposerCatalogRequestState::Loading
             });
-            },
-        );
+            let failed = input.as_ref().is_some_and(|p| {
+                matches!(p.plugin_request.state, ComposerCatalogRequestState::Failed { .. })
+            });
+            let mut list = v_flex()
+                .w_full()
+                .min_h_0()
+                .max_h(rems(22.))
+                .gap_1p5()
+                .overflow_y_scrollbar();
+            if loading {
+                list = list.child(picker_status_banner(t!("plugins.loading").to_string(), cx));
+            }
+            if failed {
+                let retry = picker.downgrade();
+                list = list
+                    .child(picker_error_banner(t!("plugins.error").to_string(), cx))
+                    .child(default_outline_button("composer-plugin-retry")
+                        .label(t!("plugins.retry").to_string())
+                        .on_click(move |_, _, cx| {
+                            let _ = retry.update(cx, |state, cx| {
+                                state.send(ComposerCatalogIntent::Retry {
+                                    thread_id: state.identity.thread_id.clone(),
+                                    draft_id: state.identity.draft_id,
+                                    catalog: ComposerCatalogKind::Plugins,
+                                }, cx);
+                            });
+                        }));
+            }
+            if rows.is_empty() && !loading && !failed {
+                list = list.child(empty_picker_state(t!("plugins.empty").to_string(), cx));
+            }
+            list = list.children(rows.into_iter().map(|row| {
+                render_plugin_picker_row(row, picker.downgrade(), cx)
+            }));
+            capability_picker_dialog(
+                dialog,
+                window.rem_size() * 32.5,
+                t!("plugins.select").to_string(),
+                picker.downgrade(),
+            )
+            .on_ok({
+                let confirm = picker.downgrade();
+                move |_, window, cx| {
+                    let _ = confirm.update(cx, |state, cx| state.commit(window, cx));
+                    false // commit owns dismissal, including a rejected target gate.
+                }
+            })
+            .footer(capability_picker_footer(picker.downgrade(), false))
+            .child(v_flex().w_full().gap_1p5().py_4()
+                .child(render_picker_filter_form(&search))
+                .child(list))
+        });
+        picker.update(cx, |state, cx| {
+            state.dialog_open.set(true);
+            state.search.update(cx, |input, cx| input.focus(window, cx));
+        });
     }
 }

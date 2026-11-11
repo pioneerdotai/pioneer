@@ -48,18 +48,6 @@ pub(crate) fn skills_runtime_context_from_config(
         registry_root,
         upload_root: skill_runtime_root.join("uploads"),
         materialized_root: skill_runtime_root.join(".materialized"),
-        upload_ttl_secs: skills.security.upload_ttl_secs.max(60),
-        upload_recommended_chunk_size_bytes: skills
-            .security
-            .upload_recommended_chunk_size_bytes
-            .max(1),
-        upload_max_chunk_size_bytes: skills.security.upload_max_chunk_size_bytes.max(1),
-        max_upload_compressed_bytes: skills.security.max_install_archive_compressed_bytes.max(1),
-        max_upload_uncompressed_bytes: skills
-            .security
-            .max_install_archive_uncompressed_bytes
-            .max(1),
-        max_upload_archive_entries: skills.security.max_install_archive_entries.max(1),
         catalog_params,
         validation_policy: SkillValidationPolicy {
             strict_agentskills: skills.validation.strict_agentskills,
@@ -127,53 +115,27 @@ pub(crate) async fn load_skills_catalog_from_store(
     let mut params = context.catalog_params.clone();
     params.installations = installations;
     let mut catalog = load_catalog(&params)?;
+    let ids = catalog
+        .skills
+        .iter()
+        .map(|s| s.identity.skill_id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let owners = crud_store
+        .skill_plugin_owners(&ids)
+        .await?
+        .into_iter()
+        .filter_map(|(owner, parent)| owner.skill_id.clone().map(|id| (id, (owner, parent))))
+        .collect::<std::collections::HashMap<_, _>>();
     for skill in &mut catalog.skills {
-        if let Some(owner) = crud_store
-            .find_skill_plugin_owner(&skill.identity.skill_id)
-            .await?
-        {
+        if let Some((owner, parent)) = owners.get(skill.identity.skill_id.as_str()) {
             skill.host_explicit_only = true;
-            let overrides: std::collections::BTreeSet<String> =
-                serde_json::from_str(&owner.override_fields_json)?;
-            // load_catalog already supplies the genuine native definition, file
-            // and assets. A source override must retain that complete context,
-            // including its native unavailable state, without bundled fallback.
-            let asset_context_available = if overrides.contains("skill_source") {
-                true
-            } else {
-                let parent = crud_store
-                    .find_plugin_installation(&owner.plugin_id)
-                    .await?;
-                let asset_root = parent.as_ref().and_then(|parent| {
-                    let expected = format!("skills/{}", owner.member_key);
-                    if owner.member_path.as_deref() != Some(expected.as_str()) {
-                        return None;
-                    }
-                    let package = Path::new(&parent.package_path);
-                    let root = pioneer_plugins::containment::resolve_contained(
-                        package,
-                        &package.join(expected),
-                    )
-                    .ok()?;
-                    pioneer_plugins::containment::resolve_contained(
-                        package,
-                        &root.join("SKILL.md"),
-                    )
-                    .ok()?;
-                    Some(root)
-                });
-                if let Some(root) = &asset_root {
-                    // Definition/policy remain the native installation's. Only the
-                    // runtime asset context uses the verified immutable package.
-                    skill.identity.skill_dir = root.to_string_lossy().into();
-                    skill.identity.skill_file = root.join("SKILL.md").to_string_lossy().into();
-                }
-                asset_root.is_some()
-            };
-            if !asset_context_available
-                || !crud_store
-                    .plugin_child_available("skill", skill.identity.skill_id.as_str(), workspace_id)
-                    .await?
+            if !parent.as_ref().is_some_and(|p| {
+                p.workspace_id == workspace_id
+                    && p.enabled
+                    && p.state == "installed"
+                    && p.pending_json.is_none()
+                    && owner.status == "installed"
+            })
             {
                 skill.availability = pioneer_skills::SkillAvailability::Unavailable {
                     reason: pioneer_skills::SkillUnavailableReason::HostPolicy,
@@ -185,7 +147,7 @@ pub(crate) async fn load_skills_catalog_from_store(
 }
 
 impl MessageProcessor {
-    pub(super) async fn validate_skills_workspace(
+    pub(in crate::message) async fn validate_skills_workspace(
         &self,
         connection_id: ConnectionId,
         request_id: RequestId,
@@ -477,6 +439,12 @@ impl MessageProcessor {
             created_at,
         );
 
+        // Owned native edits already publish their exact parent under admission.
+        // Only an identity-free watcher invalidation needs a conservative refresh;
+        // a known standalone Skill/Pack change must not invalidate every Plugin.
+        if notification.changes.is_empty() && notification.pack_changes.is_empty() {
+            self.notify_plugin_native_changed(workspace_id).await;
+        }
         self.send_gateway_management_notification(events::SKILLS_CHANGED, &notification)
             .await;
     }

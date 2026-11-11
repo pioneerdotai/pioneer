@@ -11,7 +11,10 @@ pub(crate) struct SkillUpdateInput {
 }
 pub(crate) enum SkillInstallSource {
     UploadedSkill(SkillLifecycleSource),
-    PackageMember(PluginOwnershipWrite),
+    PackageMember(
+        PluginOwnershipWrite,
+        std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ),
     OwnedUpload(SkillLifecycleSource, pioneer_crud::PluginNativeWrite),
 }
 pub(super) enum PreparedInstallSource {
@@ -19,11 +22,23 @@ pub(super) enum PreparedInstallSource {
     OwnedUpload(MaterializedSkillSource, pioneer_crud::PluginNativeWrite),
     Package {
         source_dir: PathBuf,
-        cleanup_root: PathBuf,
+        _cleanup: crate::message::package_delivery::TemporaryDirectory,
         ownership: PluginOwnershipWrite,
+        _admission: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
     },
 }
 impl PreparedInstallSource {
+    pub async fn prepare(
+        self,
+        request: pioneer_skills::PrepareMaterializedSkillRequest,
+    ) -> Result<(Self, Result<pioneer_skills::PreparedMaterializedSkill>)> {
+        crate::message::package_delivery::prepare_cancellable(move |cancellation| {
+            let prepared = pioneer_skills::prepare_materialized_skill(request);
+            crate::message::package_delivery::check_preparation(cancellation)?;
+            Ok((self, prepared))
+        })
+        .await
+    }
     pub fn uploaded(&self) -> Option<&MaterializedSkillSource> {
         match self {
             Self::Uploaded(upload) | Self::OwnedUpload(upload, _) => Some(upload),
@@ -62,17 +77,8 @@ impl PreparedInstallSource {
             }
         }
     }
-    pub fn cleanup_failure(&self) {
-        match self {
-            Self::Uploaded(source) | Self::OwnedUpload(source, _) => {
-                let _ = std::fs::remove_dir_all(&source.cleanup_root);
-            }
-            Self::Package { cleanup_root, .. } => {
-                let _ = std::fs::remove_dir_all(cleanup_root);
-            }
-        }
-    }
 }
+
 impl MessageProcessor {
     pub(super) async fn materialize_install_source(
         &self,
@@ -92,6 +98,7 @@ impl MessageProcessor {
                 json!({}),
             )
         };
+        let authenticated_owner = AuthenticatedTransferOwner::from_request_context(request_context);
         match source {
             SkillInstallSource::UploadedSkill(source) => {
                 let upload_id = parse_lifecycle_upload_id(source).map_err(|error| {
@@ -104,10 +111,9 @@ impl MessageProcessor {
                     )
                 })?;
                 self.materialize_uploaded_skill_source(
-                    request_context.connection_id(),
+                    &authenticated_owner,
                     workspace,
                     &upload_id,
-                    context,
                     request_id,
                 )
                 .await
@@ -117,16 +123,15 @@ impl MessageProcessor {
                 let upload_id = parse_lifecycle_upload_id(source).map_err(|_| invalid())?;
                 let upload = self
                     .materialize_uploaded_skill_source(
-                        request_context.connection_id(),
+                        &authenticated_owner,
                         workspace,
                         &upload_id,
-                        context,
                         request_id,
                     )
                     .await?;
                 Ok(PreparedInstallSource::OwnedUpload(upload, native))
             }
-            SkillInstallSource::PackageMember(ownership) => {
+            SkillInstallSource::PackageMember(ownership, admission) => {
                 let parent = self
                     .crud_store
                     .find_plugin_installation(&ownership.plugin_id)
@@ -154,42 +159,50 @@ impl MessageProcessor {
                 {
                     return Err(invalid());
                 }
-                let source_dir = pioneer_plugins::containment::resolve_contained(
-                    Path::new(&parent.package_path),
-                    &Path::new(&parent.package_path).join(path),
-                )
-                .map_err(|_| invalid())?;
                 let location =
                     install_location_for_source_kind(context, &source_kind).ok_or_else(invalid)?;
-                let staged = pioneer_skills::stage_skill_folder(
-                    &source_dir,
-                    &location.install_root,
-                    &installer_policy(context),
-                    true,
+                let policy = installer_policy(context);
+                let package_limits = self.package_delivery_context().plugin_limits();
+                crate::message::package_delivery::prepare_cancellable(
+                    move |cancellation| -> Result<PreparedInstallSource> {
+                        let mut cleanup =
+                            crate::message::package_delivery::TemporaryDirectory::new()?;
+                        let package = Path::new(&parent.package_path);
+                        let source_dir = pioneer_plugins::containment::resolve_contained(
+                            package,
+                            &package.join(path),
+                        )?;
+                        crate::message::package_delivery::check_preparation(cancellation)?;
+                        let staged = pioneer_skills::stage_skill_folder(
+                            &source_dir,
+                            &location.install_root,
+                            &policy,
+                            true,
+                        )?;
+                        cleanup.remove_on_drop(staged.cleanup_root);
+                        let prepared = PreparedInstallSource::Package {
+                            source_dir: staged.source_dir,
+                            _cleanup: cleanup,
+                            ownership,
+                            _admission: admission,
+                        };
+                        let expected = prepared
+                            .ownership()
+                            .expect("package source")
+                            .package_fingerprint
+                            .as_str();
+                        let copy = pioneer_plugins::Snapshot::capture(
+                            prepared.source_dir(),
+                            package_limits,
+                            || cancellation.is_cancelled(),
+                        )?;
+                        anyhow::ensure!(copy.tree_digest() == expected, "plugins.package_changed");
+                        Ok(prepared)
+                    },
                 )
-                .map_err(|_| invalid())?;
-                let verified = pioneer_plugins::Snapshot::capture(
-                    &staged.source_dir,
-                    Default::default(),
-                    || false,
-                )
-                .is_ok_and(|copy| copy.tree_digest() == ownership.package_fingerprint);
-                if !verified {
-                    let _ = std::fs::remove_dir_all(&staged.cleanup_root);
-                    return Err(invalid());
-                }
-                Ok(PreparedInstallSource::Package {
-                    source_dir: staged.source_dir,
-                    cleanup_root: staged.cleanup_root,
-                    ownership,
-                })
+                .await
+                .map_err(|_| invalid())
             }
         }
-    }
-}
-
-impl Drop for PreparedInstallSource {
-    fn drop(&mut self) {
-        self.cleanup_failure();
     }
 }

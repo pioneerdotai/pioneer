@@ -8,7 +8,6 @@ use pioneer_observability::work::{Boundary, ExecutorRole, WorkKind};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -58,7 +57,7 @@ impl CLIAgentRuntimeSessionStartup {
     pub(crate) fn retain_session(&self, session: Arc<dyn CLIAgentRuntimeSession>) {
         *self.session.lock().expect("CLI startup ownership poisoned") = Some(session);
     }
-    pub(super) fn session(&self) -> Option<Arc<dyn CLIAgentRuntimeSession>> {
+    pub(crate) fn session(&self) -> Option<Arc<dyn CLIAgentRuntimeSession>> {
         self.session
             .lock()
             .expect("CLI startup ownership poisoned")
@@ -80,7 +79,7 @@ impl CLIAgentRuntimeSession for StartupProcessSession {
             process
                 .lock()
                 .await
-                .terminate_with_grace(Duration::from_secs(2))
+                .terminate_with_grace(pioneer_cli_agent_runtime::process::DEFAULT_SHUTDOWN_GRACE)
                 .await?;
         }
         Ok(())
@@ -142,10 +141,6 @@ impl CliSessionOwner {
             .expect("CLI turn ownership poisoned");
         // Retain history until this actual process/workers have stopped: a
         // terminal row does not prove that its callbacks have drained.
-        anyhow::ensure!(
-            turns.len() < 65_536 || turns.contains(turn),
-            "CLI turn ownership inventory full; close session and retry"
-        );
         turns.insert(turn.to_owned());
         Ok(())
     }
@@ -248,14 +243,6 @@ impl CliSessionOwner {
         });
         if let Some(error) = consumed_failure {
             callbacks.failure.get_or_insert(error);
-        }
-        // Existing pumps/listeners per session are small and bounded. A poisoned
-        // or overflowing owner fails closed instead of dropping a live handle.
-        if callbacks.tasks.len() >= 32 {
-            callbacks.failure = Some("CLI callback ownership limit exceeded".into());
-            self.closing.store(true, Ordering::Release);
-            self.cancellation.cancel();
-            return false;
         }
         callbacks
             .tasks

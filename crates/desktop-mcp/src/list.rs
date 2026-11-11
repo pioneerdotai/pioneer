@@ -25,21 +25,11 @@ impl McpCatalogView {
                     .gap_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(
-                        v_flex()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_semibold()
-                                    .child(t!("mcp.screen.title").to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .opacity(0.6)
-                                    .child(t!("mcp.screen.description").to_string()),
-                            ),
-                    )
+                    .child(pioneer_desktop_foundation::catalog_heading(
+                        t!("mcp.screen.title").to_string(),
+                        t!("mcp.screen.description").to_string(),
+                        cx,
+                    ))
                     .child(h_flex().items_center().gap_2().child(
                         div().text_xs().opacity(0.6).child(format!(
                             "{} {}",
@@ -201,17 +191,8 @@ impl McpCatalogView {
                             ),
                     )
                     .child(
-                        div()
-                            .mt_1p5()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(status_color)
-                            .text_xs()
-                            .text_color(status_color)
-                            .font_medium()
-                            .child(status_label),
+                        pioneer_desktop_foundation::catalog_status_badge(status_label, status_color)
+                            .mt_1p5(),
                     ),
             )
             .into_any_element()

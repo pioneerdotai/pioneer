@@ -80,14 +80,8 @@ impl McpServerInstallation {
         self.transport.kind()
     }
 
-    /// Server-derived portable origin; configured headers remain fallback
-    /// values rather than disabling the existing managed OAuth subsystem.
-    pub fn is_portable_plugin(&self) -> bool {
-        self.source_ref.get("plugin_id").is_some()
-    }
-
     pub fn explicit_authorization_overrides_oauth(&self) -> bool {
-        !self.is_portable_plugin() && self.transport.has_authorization_header()
+        self.transport.has_authorization_header()
     }
 }
 

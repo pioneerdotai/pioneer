@@ -196,7 +196,6 @@ impl MessageProcessor {
                 )
                 .await
                 .map_err(|error| {
-                    materialized.cleanup_failure();
                     skills_error(
                         Some(request_id.clone()),
                         INVALID_REQUEST_CODE,
@@ -207,21 +206,33 @@ impl MessageProcessor {
                 })?,
         };
         let source_ref = materialized.source_ref();
-        let prepared = match pioneer_skills::prepare_materialized_skill(
-            pioneer_skills::PrepareMaterializedSkillRequest {
-                skill_id: skill_id.clone(),
-                source_kind: target_source_kind,
-                source_ref: source_ref.clone(),
-                materialized_source_path: materialized.source_dir().to_path_buf(),
-                policy: installer_policy(&context),
-            },
-        ) {
+        let prepare_request = pioneer_skills::PrepareMaterializedSkillRequest {
+            skill_id: skill_id.clone(),
+            source_kind: target_source_kind,
+            source_ref: source_ref.clone(),
+            materialized_source_path: materialized.source_dir().to_path_buf(),
+            policy: installer_policy(&context),
+        };
+        let (materialized, prepared) =
+            materialized
+                .prepare(prepare_request)
+                .await
+                .map_err(|error| {
+                    skills_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "package preparation unavailable",
+                        json!({"error":format!("{error:#}")}),
+                    )
+                })?;
+        let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 let mapped = map_lifecycle_error(&error, methods::SKILLS_INSTALL);
                 let (message, details) =
                     lifecycle_error_payload(&error, &mapped, None, &context.validation_policy);
-                materialized.cleanup_failure();
+
                 return Err(skills_error(
                     Some(request_id),
                     mapped.jsonrpc_code,
@@ -232,7 +243,6 @@ impl MessageProcessor {
             }
         };
         let Some(location) = install_location_for_source_kind(&context, &target_source_kind) else {
-            materialized.cleanup_failure();
             return Err(skills_error(
                 Some(request_id),
                 INVALID_REQUEST_CODE,
@@ -268,7 +278,6 @@ impl MessageProcessor {
                 )
                 .await
             {
-                materialized.cleanup_failure();
                 drop(write_guard);
                 drop(upload_guard);
                 return Err(error);
@@ -282,7 +291,6 @@ impl MessageProcessor {
             )
             .await
         {
-            materialized.cleanup_failure();
             return Err(skills_error(
                 Some(request_id),
                 INVALID_REQUEST_CODE,
@@ -299,7 +307,6 @@ impl MessageProcessor {
             || match self.crud_store.find_skill_installation(&skill_id).await {
                 Ok(existing) => existing.is_some(),
                 Err(error) => {
-                    materialized.cleanup_failure();
                     return Err(skills_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
@@ -310,7 +317,6 @@ impl MessageProcessor {
                 }
             };
         if identity_collision {
-            materialized.cleanup_failure();
             return Err(skills_error(
                 Some(request_id),
                 INVALID_REQUEST_CODE,
@@ -336,7 +342,7 @@ impl MessageProcessor {
                 let mapped = map_lifecycle_error(&error, methods::SKILLS_INSTALL);
                 let (message, details) =
                     lifecycle_error_payload(&error, &mapped, None, &context.validation_policy);
-                materialized.cleanup_failure();
+
                 return Err(skills_error(
                     Some(request_id),
                     mapped.jsonrpc_code,
@@ -384,7 +390,7 @@ impl MessageProcessor {
             .await;
         if !matches!(persisted, Ok(true)) {
             rollback_committed_install(&install_result, &location);
-            materialized.cleanup_failure();
+
             let error = match persisted {
                 Ok(false) => anyhow::anyhow!(
                     "upload `{}` changed state before skill publication",
@@ -404,7 +410,7 @@ impl MessageProcessor {
 
         pioneer_skills::finalize_prepared_skill_commit(&install_result);
         if let Some(upload) = materialized.uploaded() {
-            self.cleanup_upload_artifacts(&upload.upload, upload.cleanup_root.as_path());
+            let _ = self.cleanup_upload_artifacts(&upload.upload).await;
         }
         drop(write_guard);
         drop(upload_guard);

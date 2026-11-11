@@ -50,6 +50,17 @@
         "null"
       ]
     },
+    "plugin_return": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SemanticDestination"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "providers": {
       "anyOf": [
         {
@@ -134,6 +145,22 @@
             "folder_id"
           ]
         }
+      ]
+    },
+    "PluginComponentKey": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "member_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "member_key"
       ]
     },
     "ProviderFilter": {
@@ -268,6 +295,32 @@
           "required": [
             "kind",
             "route"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "component": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PluginComponentKey"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "plugin"
+            },
+            "plugin_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "plugin_id"
           ]
         }
       ]

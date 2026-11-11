@@ -79,7 +79,7 @@ async fn published_owner(manager: &AgentManager, thread: &str, turn: &str) -> Na
     timeout(Duration::from_secs(3), async {
         loop {
             if let Ok(owners) = manager
-                .capture_native_stop_owners(&[thread.into()], 8)
+                .capture_native_stop_owners(&[thread.into()])
                 .await
             {
                 if let Some(owner) = owners
@@ -101,7 +101,7 @@ async fn cleared(manager: &AgentManager, thread: &str) {
         loop {
             if manager.active_turn_id(thread).await.is_none()
                 && manager
-                    .capture_native_stop_owners(&[thread.into()], 8)
+                    .capture_native_stop_owners(&[thread.into()])
                     .await
                     .is_ok()
             {
@@ -149,7 +149,7 @@ async fn accepted_start_with_cancelled_expired_ack_waiter_is_unknown_until_actua
 
     assert!(matches!(
         manager
-            .capture_native_stop_owners(&["admission".into()], 8)
+            .capture_native_stop_owners(&["admission".into()])
             .await,
         Err(StopError::UnknownOwner)
     ));
@@ -171,7 +171,7 @@ async fn accepted_start_with_cancelled_expired_ack_waiter_is_unknown_until_actua
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(matches!(
         manager
-            .capture_native_stop_owners(&["admission".into()], 8)
+            .capture_native_stop_owners(&["admission".into()])
             .await,
         Err(StopError::UnknownOwner)
     ));
@@ -199,7 +199,7 @@ async fn accepted_start_with_cancelled_expired_ack_waiter_is_unknown_until_actua
         .unwrap();
     cleared(&manager, "admission").await;
     let historical = manager
-        .capture_native_stop_owners(&["admission".into()], 8)
+        .capture_native_stop_owners(&["admission".into()])
         .await
         .unwrap();
     assert!(historical.iter().all(NativeTurnStopOwner::is_quiescent));
@@ -262,7 +262,7 @@ async fn applied_recovery_ack_is_not_replacement_publication_or_quiescence() {
     ));
     assert!(matches!(
         manager
-            .capture_native_stop_owners(&["recovery".into()], 8)
+            .capture_native_stop_owners(&["recovery".into()])
             .await,
         Err(StopError::UnknownOwner)
     ));
@@ -333,7 +333,7 @@ async fn drained_finish_is_unknown_until_real_actor_terminal_clear() {
     );
     assert!(matches!(
         manager
-            .capture_native_stop_owners(&["finish".into()], 8)
+            .capture_native_stop_owners(&["finish".into()])
             .await,
         Err(StopError::UnknownOwner)
     ));
@@ -341,7 +341,7 @@ async fn drained_finish_is_unknown_until_real_actor_terminal_clear() {
     cleared(&manager, "finish").await;
     assert!(
         manager
-            .capture_native_stop_owners(&["finish".into()], 8)
+            .capture_native_stop_owners(&["finish".into()])
             .await
             .unwrap()
             .iter()
@@ -403,7 +403,7 @@ async fn continuation_of_drained_run_is_unknown_until_next_actual_run_is_publish
     assert!(old.is_quiescent());
     assert!(matches!(
         manager
-            .capture_native_stop_owners(&["continuation".into()], 8)
+            .capture_native_stop_owners(&["continuation".into()])
             .await,
         Err(StopError::UnknownOwner)
     ));
@@ -452,14 +452,14 @@ async fn unrelated_pending_start_is_not_cancelled_by_an_exact_other_thread_snaps
     enqueued_registry(&manager, "unrelated", "foreign-turn").await;
     assert!(
         manager
-            .capture_native_stop_owners(&["selected".into()], 8)
+            .capture_native_stop_owners(&["selected".into()])
             .await
             .unwrap()
             .is_empty()
     );
     assert!(matches!(
         manager
-            .capture_native_stop_owners(&["unrelated".into()], 8)
+            .capture_native_stop_owners(&["unrelated".into()])
             .await,
         Err(StopError::UnknownOwner)
     ));
@@ -569,7 +569,7 @@ async fn restored_checkpoint_start_is_unknown_before_actor_publication_despite_c
     .await;
     assert!(matches!(
         manager
-            .capture_native_stop_owners(&["restored".into()], 8)
+            .capture_native_stop_owners(&["restored".into()])
             .await,
         Err(StopError::UnknownOwner)
     ));
@@ -586,7 +586,7 @@ async fn restored_checkpoint_start_is_unknown_before_actor_publication_despite_c
     ));
     assert!(matches!(
         manager
-            .capture_native_stop_owners(&["restored".into()], 8)
+            .capture_native_stop_owners(&["restored".into()])
             .await,
         Err(StopError::UnknownOwner)
     ));
@@ -622,7 +622,7 @@ async fn actual_typed_start_rejection_closes_admission_without_inventing_a_run()
     enqueued_registry(&manager, "rejected", "turn").await;
     assert!(matches!(
         manager
-            .capture_native_stop_owners(&["rejected".into()], 8)
+            .capture_native_stop_owners(&["rejected".into()])
             .await,
         Err(StopError::UnknownOwner)
     ));
@@ -631,7 +631,7 @@ async fn actual_typed_start_rejection_closes_admission_without_inventing_a_run()
     timeout(Duration::from_secs(1), async {
         loop {
             if let Ok(owners) = manager
-                .capture_native_stop_owners(&["rejected".into()], 8)
+                .capture_native_stop_owners(&["rejected".into()])
                 .await
             {
                 assert!(owners.is_empty());

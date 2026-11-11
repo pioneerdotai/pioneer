@@ -121,7 +121,7 @@ pub(crate) fn codex_account_probe_config_from_instance_with_proxy(
         env: proxy_env(proxy_url),
         initialize_timeout: Duration::from_millis(instance.startup_probe_timeout_ms),
         request_timeout: Duration::from_millis(instance.request_timeout_ms),
-        shutdown_grace: Duration::from_secs(2),
+        shutdown_grace: pioneer_cli_agent_runtime::process::DEFAULT_SHUTDOWN_GRACE,
         stderr_ring_lines: instance.stderr_ring_lines,
     }
 }

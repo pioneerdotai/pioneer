@@ -20,8 +20,11 @@ ui_cases = [
 # No optional scene cache has accepted external benefit evidence.
 scene_caches = []
 custom_elements = ["desktop-thread/src/timeline/markdown.rs:MarkdownLinkText"]
-foundation_modules = ["avatar", "binding", "identity"]
-foundation_sources = ["avatar.rs", "binding.rs", "identity.rs", "lib.rs"]
+# CatalogBinding: MCP / Skills / Plugins scoped wakeups. PackageUploadView:
+# Skills / Plugins retained delivery presentation; domain decisions stay Client.
+# Catalog presentation: native MCP / Plugins headers and sidebar slots.
+foundation_modules = ["avatar", "binding", "catalog_binding", "identity", "package_upload", "catalog_presentation"]
+foundation_sources = ["avatar.rs", "binding.rs", "catalog_binding.rs", "catalog_presentation.rs", "identity.rs", "lib.rs", "package_upload.rs"]
 # Framework creates this transient host through on_drag's Entity<W: Render> API.
 # Its value preview has no retained UI behavior or cache.
 framework_hosts = ["desktop-workspaces/src/drag_preview.rs:SidebarDragSession"]
@@ -206,7 +209,9 @@ artifact_preview = { owner = "Client ArtifactRegistry", source = "client/src/art
 "desktop-mcp:McpServerRow" = ["Render", "McpCatalogView", "TUI-37"]
 "desktop-skills:CatalogSidebar" = ["Render", "SkillsCatalogView", "TUI-38"]
 "desktop-skills:SkillManagementRowView" = ["Render", "SkillsCatalogView", "TUI-38"]
-"desktop-skills:UploadView" = ["Render", "SkillsCatalogView", "TUI-38"]
+# One generic delivery view, mounted by both independent features.
+"desktop-foundation:UploadView" = ["Render", "SkillsCatalogView / PluginsView", "TUI-38"]
+"desktop-plugins:PluginsSidebar" = ["Render", "PluginsView", "TUI-48"]
 "desktop-settings:ActivationView" = ["Render", "SettingsView", "TUI-40"]
 "desktop-settings:ProfileEditor" = ["Render", "SettingsView", "TUI-39"]
 "desktop-settings:SettingsScreenView" = ["Render", "SettingsView", "TUI-39"]

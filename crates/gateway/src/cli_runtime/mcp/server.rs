@@ -87,7 +87,6 @@ pub(crate) struct CliMcpBridgeFacadeServer {
     max_pending_bytes: usize,
     max_call_tasks: usize,
     shutdown: CancellationToken,
-    retained_cleanup: bool,
 }
 
 impl CliMcpBridgeFacadeServer {
@@ -99,47 +98,6 @@ impl CliMcpBridgeFacadeServer {
         projection: CliMcpFacadeProjection,
         limits: CliMcpFacadeLimits,
         call_contract: super::facade::CliMcpCallContract,
-    ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
-        Self::build_with_cleanup_owner(
-            transport,
-            coordinator,
-            invoker,
-            projection_generation,
-            projection,
-            limits,
-            call_contract,
-            false,
-        )
-    }
-    pub(crate) fn build_owned(
-        transport: CliMcpBridgeTransport,
-        coordinator: Arc<super::coordinator::CliMcpCoordinator>,
-        invoker: Arc<dyn TurnMcpInvoker>,
-        projection_generation: CliMcpProjectionGeneration,
-        projection: CliMcpFacadeProjection,
-        limits: CliMcpFacadeLimits,
-        call_contract: super::facade::CliMcpCallContract,
-    ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
-        Self::build_with_cleanup_owner(
-            transport,
-            coordinator,
-            invoker,
-            projection_generation,
-            projection,
-            limits,
-            call_contract,
-            true,
-        )
-    }
-    fn build_with_cleanup_owner(
-        mut transport: CliMcpBridgeTransport,
-        coordinator: Arc<super::coordinator::CliMcpCoordinator>,
-        invoker: Arc<dyn TurnMcpInvoker>,
-        projection_generation: CliMcpProjectionGeneration,
-        projection: CliMcpFacadeProjection,
-        limits: CliMcpFacadeLimits,
-        call_contract: super::facade::CliMcpCallContract,
-        retained_cleanup: bool,
     ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
         let channel_capacity = limits
             .max_ledger_entries
@@ -155,9 +113,6 @@ impl CliMcpBridgeFacadeServer {
             limits.clone(),
             call_contract,
         )?;
-        if retained_cleanup {
-            transport.defer_cleanup_until_join();
-        }
         let context = Arc::new(CliMcpBridgeFacadeContext {
             bound_grant: transport.bound_grant().clone(),
             projection_generation,
@@ -178,7 +133,6 @@ impl CliMcpBridgeFacadeServer {
             max_pending_bytes: limits.max_frame_bytes,
             max_call_tasks: limits.max_ledger_entries,
             shutdown,
-            retained_cleanup,
         };
         Ok((handle, server))
     }
@@ -198,11 +152,7 @@ impl CliMcpBridgeFacadeServer {
         let facade_shutdown = self.facade.shutdown().await;
         // Return the connection to its existing supervisor entry. Grant and
         // artifact cleanup happens only after this actual server has joined.
-        if self.retained_cleanup {
-            self.transport.retire_connection().await?;
-        } else {
-            self.transport.terminate().await;
-        }
+        self.transport.retire_connection().await?;
         pending.fill(0);
         if failed_call {
             return Err(CliMcpBridgeServerError::CallTaskFailed);
@@ -531,11 +481,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_drop_and_builder_failure_retire_legacy_owner_but_owned_server_requires_join()
+    async fn transport_return_and_facade_join_precede_supervisor_cleanup()
     {
         use super::super::supervisor::{CliMcpBridgeSessionState, CliMcpBridgeSupervisor};
 
-        for mode in ["drop", "invalid-legacy", "invalid-owned", "joined-owned"] {
+        for mode in ["drop", "invalid", "joined-owned"] {
             #[cfg(unix)]
             let root = tempfile::tempdir_in("/tmp").unwrap();
             #[cfg(windows)]
@@ -609,11 +559,7 @@ mod tests {
                 if mode != "joined-owned" {
                     limits.max_active_calls = 0;
                 }
-                let build = if mode == "invalid-legacy" {
-                    CliMcpBridgeFacadeServer::build
-                } else {
-                    CliMcpBridgeFacadeServer::build_owned
-                };
+                let build = CliMcpBridgeFacadeServer::build;
                 let result = build(
                     transport,
                     supervisor.coordinator(),
@@ -627,7 +573,7 @@ mod tests {
                     let (handle, server) = result.unwrap();
                     assert!(supervisor.revoke_session_result(&old).await.is_err());
                     handle.request_shutdown();
-                    let mut server = tokio::spawn(server.run());
+                    let server = tokio::spawn(server.run());
                     timeout(Duration::from_secs(2), server)
                         .await
                         .unwrap()
@@ -647,12 +593,13 @@ mod tests {
                 }
             }
             timeout(Duration::from_secs(2), async {
-                while supervisor.state(&old).await.is_some() {
+                while supervisor.state(&old).await == Some(CliMcpBridgeSessionState::TransportOwned) {
                     tokio::task::yield_now().await;
                 }
+                supervisor.revoke_session_result(&old).await.unwrap();
             })
             .await
-            .expect("legacy Drop must actually retire and clean up");
+            .expect("transport return must permit supervisor cleanup after join");
             assert!(!bootstrap_directory.exists());
             assert!(
                 supervisor
@@ -739,7 +686,7 @@ mod tests {
                 after_cancel_entered: tokio::sync::Notify::new(),
                 after_cancel_release: tokio::sync::Notify::new(),
             });
-            let (handle, server) = CliMcpBridgeFacadeServer::build_owned(
+            let (handle, server) = CliMcpBridgeFacadeServer::build(
                 transport,
                 supervisor.coordinator(),
                 invoker.clone(),

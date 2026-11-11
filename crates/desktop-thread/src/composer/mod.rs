@@ -6,7 +6,6 @@ pub(crate) use crate::model_picker::ComposerModelPickerView;
 mod commands;
 mod owner;
 mod permission_selector;
-mod plugin_picker;
 mod queries;
 mod startup;
 mod view;

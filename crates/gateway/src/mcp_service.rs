@@ -1106,8 +1106,13 @@ impl McpService {
         }
         match event.state {
             pioneer_mcp_oauth::OAuthState::Authorized => {
-                self.stop_task(&event.installation_id, DomainRuntimeState::Stopped)
-                    .await;
+                // A never-started installation has no predecessor obligation.
+                // Once present, retain its exact owner and sticky failure: a
+                // failed/cancelled drain must not be hidden by a new generation.
+                if self.task_exists(&event.installation_id).await {
+                    self.stop_task_result(&event.installation_id, DomainRuntimeState::Stopped)
+                        .await?;
+                }
                 // Recheck operation generation after joining the retired actor.
                 // The admission guard excludes durable resource/UUID replacement.
                 if row.enabled && self.oauth().event_is_current(event, &installation).await {
@@ -2801,6 +2806,8 @@ impl McpService {
                 status: McpServerStatus::from(protocol_runtime_state(snapshot.state)),
             },
         };
+        self.notify_plugin_runtime_changed(&notification.workspace_id, &notification.server.id)
+            .await;
         self.send_management_notification(events::MCP_SERVER_STATUS_CHANGED, &notification)
             .await;
     }
@@ -2959,6 +2966,22 @@ impl McpService {
             .runtime_generation_counter
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1)
+    }
+
+    /// Reuse the processor's authorized, locator-only Plugins invalidation.
+    /// Runtime/OAuth administrative payloads remain on their original stream.
+    pub(crate) async fn notify_plugin_runtime_changed(&self, workspace: &str, installation: &str) {
+        let processor = self
+            .inner
+            .native_tool_processor
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade();
+        if let Some(processor) = processor {
+            processor
+                .notify_plugin_mcp_runtime_changed(workspace, installation)
+                .await;
+        }
     }
 
     pub(crate) async fn send_management_notification<T: Serialize>(
@@ -8541,7 +8564,7 @@ mod tests {
             Json, Router,
             routing::{get, post},
         };
-        for unrelated in [false, true] {
+        for (unrelated, failed_predecessor) in [(false, false), (true, false), (false, true)] {
             let (old, store, workspace, secrets) = test_mcp_service_with_secrets().await;
             old.shutdown().await;
             let sessions = Arc::new(SessionManager::new());
@@ -8581,7 +8604,7 @@ mod tests {
                 }
             }
             let _server = Server(server);
-            let id = seed_mcp_installation(&store, &workspace, "real-recovery", true, false).await;
+            let mut id = seed_mcp_installation(&store, &workspace, "real-recovery", true, false).await;
             let mut row = store
                 .find_mcp_server_installation("workspace", &workspace, "real-recovery")
                 .await
@@ -8599,6 +8622,35 @@ mod tests {
                 .upsert_mcp_server_installation(&row, now_timestamp_secs())
                 .await
                 .unwrap();
+            if failed_predecessor {
+                // Publish a fresh reserved child, never adopt the seeded standalone row.
+                id = "S".repeat(21);
+                row.id = Some(id.clone());
+                row.name = "pplugin_retained_failure".into();
+                let now = chrono::Utc::now().fixed_offset();
+                let parent = "P".repeat(21);
+                store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+                    id: parent.clone(), workspace_id: workspace.clone(), name: "oauth-parent".into(),
+                    version: None, source_upload_id: "oauth-source".into(),
+                    package_path: "/unused/package".into(), data_path: "/unused/data".into(),
+                    package_fingerprint: "tree".into(), enabled: true, state: "installing".into(),
+                    revision: 1, pending_json: Some("{}".into()), last_error: None,
+                    created_at: now, updated_at: now,
+                }).await.unwrap();
+                let write = pioneer_crud::PluginOwnershipWrite {
+                    plugin_id: parent.clone(), expected_revision: 1, member_key: "one".into(),
+                    member_path: None, package_fingerprint: "tree".into(), child_id: id.clone(),
+                };
+                let audit = pioneer_crud::McpAuditEventRecord {
+                    turn_id: None, server_installation_id: Some(id.clone()), server_name: row.name.clone(),
+                    raw_tool_name: None, callable_name: None, catalog_version: None,
+                    action: "install".into(), decision: "allowed".into(), reason_code: None,
+                    details_json: "{}".into(), created_at_unix: 1,
+                };
+                store.upsert_mcp_server_installation_with_audit_and_ownership(&row, &audit, Some(&write), 1).await.unwrap();
+                store.settle_plugin_installation(&parent, 1, "installed", None).await.unwrap();
+                assert!(service.plugin_start_available(&store, &row, None).await.unwrap());
+            }
             let installation = installation_from_record(&row).unwrap();
             let entered = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Notify::new());
@@ -8650,6 +8702,14 @@ mod tests {
                 .unwrap()
                 .1
                 .into_owned();
+            let effect_entered = Arc::new(tokio::sync::Notify::new());
+            let effect_release = Arc::new(tokio::sync::Notify::new());
+            let effect_completed = Arc::new(tokio::sync::Notify::new());
+            if failed_predecessor {
+                *service.inner.oauth_effect_barrier.lock().unwrap() = Some((
+                    effect_entered.clone(), effect_release.clone(), effect_completed.clone(),
+                ));
+            }
             service
                 .oauth()
                 .callback(
@@ -8665,6 +8725,39 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            if failed_predecessor {
+                // The real callback emitted current Authorized. Hold its existing
+                // Gateway effect boundary, then install an actual failed actor join.
+                tokio::time::timeout(Duration::from_secs(5), effect_entered.notified()).await.unwrap();
+                assert_eq!(service.oauth().state(&id).await, Some(pioneer_mcp_oauth::OAuthState::Authorized));
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                let (call_tx, _call_rx) = mpsc::channel(1);
+                let completed = Arc::new(CancellationToken::new());
+                let completion = McpTaskCompletion(completed.clone());
+                let join = McpTaskJoin::new(tokio::spawn(async move {
+                    let _completion = completion;
+                    shutdown_rx.await.expect("Authorized must request predecessor drain");
+                    anyhow::bail!("retained predecessor cleanup failed")
+                }));
+                service.inner.tasks.lock().await.insert(id.clone(), McpServerTaskHandle {
+                    name: row.name.clone(), scope_kind: row.scope_kind.clone(), scope_key: row.scope_key.clone(),
+                    fingerprint: row.fingerprint.clone(), effective_secret_fingerprint: "old".into(),
+                    call_tx, oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                    recovery: Arc::new(OAuthRecoveryMailbox::default()), shutdown_tx: Some(shutdown_tx),
+                    completed: completed.clone(), join, session: Arc::new(Mutex::new(None)),
+                });
+                service.inner.runtime_generations.lock().await.insert(id.clone(), 42);
+                effect_release.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), effect_completed.notified()).await.unwrap();
+                assert!(completed.is_cancelled(), "real actor must have finished its failed drain");
+                assert!(Arc::ptr_eq(&service.inner.tasks.lock().await[&id].completed, &completed));
+                assert_eq!(service.inner.runtime_generations.lock().await[&id], 42);
+                assert_eq!(connects.load(Ordering::SeqCst), 0);
+                assert!(service.stop_task_result(&id, DomainRuntimeState::Stopped).await.is_err());
+                *service.inner.oauth_effect_barrier.lock().unwrap() = None;
+                service.shutdown().await;
+                continue;
+            }
             let expected = if unrelated {
                 DomainRuntimeState::Degraded
             } else {

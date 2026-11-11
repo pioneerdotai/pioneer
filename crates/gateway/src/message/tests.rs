@@ -55777,7 +55777,7 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
         .await
         .expect("recording CLI session should own the replacement listener");
     let instance = handle.instance().clone();
-    let poisoned = Arc::new(pioneer_runtime_events::ExecutionEventHub::new_with_owned_progress());
+    let poisoned = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
     let receiver = poisoned
         .take_durable_receiver()
         .await
@@ -89864,7 +89864,7 @@ async fn persisted_interrupted_turn_cannot_hide_accepted_direct_checkpoint_start
     };
     let stopped = processor
         .agent_manager
-        .capture_native_stop_owners(&[thread.into()], 8)
+        .capture_native_stop_owners(&[thread.into()])
         .await
         .map_err(anyhow::Error::new)
         .and_then(|owners| {
@@ -89874,6 +89874,10 @@ async fn persisted_interrupted_turn_cannot_hide_accepted_direct_checkpoint_start
         stopped.is_err(),
         "persisted Interrupted cannot acknowledge accepted unpublished startup"
     );
+    assert!(processor.cancel_root_agent_work_graph_for_turn_and_wait(
+        thread, &persisted, "new Plugin stop during accepted unpublished startup",
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    ).await.is_err(), "the Gateway no-root consumer must retain the same UnknownOwner refusal");
     assert!(matches!(
         processor
             .agent_manager
@@ -89892,7 +89896,7 @@ async fn persisted_interrupted_turn_cannot_hide_accepted_direct_checkpoint_start
         loop {
             if let Ok(owners) = processor
                 .agent_manager
-                .capture_native_stop_owners(&[thread.into()], 8)
+                .capture_native_stop_owners(&[thread.into()])
                 .await
             {
                 if let Some(owner) = owners
@@ -89926,7 +89930,7 @@ async fn native_snapshot_after_publication(
 ) -> Vec<pioneer_agent::NativeTurnStopOwner> {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            match manager.capture_native_stop_owners(threads, 8).await {
+            match manager.capture_native_stop_owners(threads).await {
                 Ok(owners) => return owners,
                 Err(pioneer_agent::StopError::UnknownOwner) => tokio::task::yield_now().await,
                 Err(error) => panic!("unexpected native snapshot error: {error}"),
@@ -89938,9 +89942,113 @@ async fn native_snapshot_after_publication(
 }
 
 #[tokio::test]
+async fn failed_drained_selected_plugin_task_child_does_not_block_a_new_mutation() {
+    struct PanicChild {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for PanicChild {
+        fn name(&self) -> &str { "openai" }
+        fn capabilities(&self) -> ProviderCapabilities {
+            DelayedProvider { delay: Duration::ZERO, text: String::new() }.capabilities()
+        }
+        async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+            DelayedProvider { delay: Duration::ZERO, text: String::new() }.list_models().await
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            panic!("actual native Task provider panic");
+        }
+        async fn stream_chat(&self, request: ChatRequest) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+            let _ = self.chat(request).await?;
+            unreachable!("provider always panics after its release gate")
+        }
+    }
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider("openai", Arc::new(PanicChild {
+        entered: entered.clone(), release: release.clone(),
+    })));
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "openai")), registry,
+        Arc::new(SessionManager::new()), workspaces, store.clone(), test_gateway_secrets(),
+        test_summary_config(), test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+    let temporary = tempfile::tempdir().unwrap();
+    let package = temporary.path().join("package");
+    std::fs::create_dir(&package).unwrap();
+    let parent = "P".repeat(21);
+    let now = chrono::Utc::now().fixed_offset();
+    store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        id: parent.clone(), workspace_id: workspace.clone(), name: "empty-selected".into(),
+        version: None, source_upload_id: "failed-child-source".into(),
+        package_path: package.to_string_lossy().into(), data_path: temporary.path().join("data").to_string_lossy().into(),
+        package_fingerprint: "empty-tree".into(), enabled: true, state: "installing".into(),
+        revision: 1, pending_json: None, last_error: None, created_at: now, updated_at: now,
+    }).await.unwrap();
+    store.settle_plugin_installation(&parent, 1, "installed", None).await.unwrap();
+    let mut params = test_task_create_params(&workspace, "failed-child-parent", "failed-child-parent-turn", "Fail after native publication", 3);
+    ensure_task_create_parent_turn_for_test(&processor, &params).await.unwrap();
+    let (mut launch, _) = super::agent_action_tools::resolve_workspace_task_launch(
+        &processor, &workspace, "openai", "test-model", None, None, "failed-child-parent-turn",
+    ).await.unwrap();
+    launch.execution.selected_capabilities = vec![pioneer_protocol::TurnCapability {
+        id: pioneer_protocol::plugin_capability_key(&parent), label: Some("empty-selected".into()),
+        kind: pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent.clone(), expected_revision: 1 },
+    }];
+    processor.normalize_new_task_launch_capabilities(&workspace, &mut launch).await.unwrap();
+    params.launch = Some(launch);
+    let task = create_task_for_test(&processor, params).await.unwrap();
+    let run = task.run.unwrap();
+    let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified()).await.unwrap();
+    let selection = store.get_plugin_selection(&lineage.child_turn_id).await.unwrap().expect("real Task launch must persist Selected Plugin");
+    assert_eq!(selection.phase, "ready");
+    assert_eq!(selection.parents[0].id, parent);
+    let response = pioneer_crud::load_agent_turn_response(&store.database_connection(), &lineage.child_turn_id).await.unwrap().unwrap();
+    let execution = pioneer_crud::load_agent_execution(&store.database_connection(), &response.execution_id).await.unwrap().unwrap();
+    assert!(execution.parent_execution_id.is_some());
+    assert_ne!(execution.id, execution.work_graph_root_execution_id, "must exercise the legitimate nonroot fallback");
+    let owner = processor.agent_manager.capture_turn_stop_owner(&lineage.child_thread_id, &lineage.child_turn_id).await.unwrap();
+    assert!(!owner.is_quiescent());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if store.get_turn(&lineage.child_thread_id, &lineage.child_turn_id).await.unwrap().unwrap().1.status == TurnStatus::Failed { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    assert!(processor.await_native_graph_owner(&owner, "initial captured failed run", deadline).await.is_err());
+    assert!(owner.is_quiescent(), "only actual finish/join can establish the historical proof");
+    assert!(processor.await_native_graph_owner(&owner, "same captured run remains sticky", deadline).await.is_err());
+    assert!(processor.agent_manager.native_stop_turn_candidates(&[lineage.child_thread_id.clone()]).await.unwrap()
+        .contains(&(lineage.child_thread_id.clone(), lineage.child_turn_id.clone())), "real Plugin stop inventory must include this historical child");
+    let inventory = processor.agent_manager.capture_native_stop_owners(&[lineage.child_thread_id.clone()]).await.unwrap();
+    assert!(inventory.iter().any(|run| run.turn_id() == lineage.child_turn_id && run.run_id() == owner.run_id() && run.is_quiescent()));
+    let mutation = processor.acquire_plugin_mutation(&workspace, &parent, 1).await.unwrap();
+    processor.stop_plugin_execution(&mutation, deadline).await.expect("a new mutation must not replay the drained child's historical error");
+    let disabled = store.begin_plugin_mutation(&workspace, &parent, 1, "updating", false,
+        "{\"kind\":\"set_enabled\",\"enabled\":false}").await.unwrap();
+    assert!(!disabled.enabled);
+    assert!(owner.is_quiescent());
+    drop(mutation);
+    processor.agent_manager.remove_thread(&lineage.child_thread_id).await;
+}
+
+#[tokio::test]
 async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barrier() {
     use sea_orm::ConnectionTrait;
     let (processor, _, _, _rx, _, workspace) = setup_workspace_message_processor().await;
+    let temporary = tempfile::tempdir().unwrap();
+    let package = temporary.path().join("selected-package");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::create_dir(temporary.path().join("unselected-package")).unwrap();
+    std::fs::create_dir(temporary.path().join("data")).unwrap();
     let id = "P".repeat(21);
     let now = chrono::Utc::now().fixed_offset();
     let parent = pioneer_entity::plugin_installation::Model {
@@ -89949,8 +90057,8 @@ async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barri
         name: "empty".into(),
         version: None,
         source_upload_id: "admission-upload".into(),
-        package_path: "/managed/package".into(),
-        data_path: "/managed/data".into(),
+        package_path: package.to_string_lossy().into(),
+        data_path: temporary.path().join("data").to_string_lossy().into(),
         package_fingerprint: "empty-tree".into(),
         enabled: true,
         state: "installing".into(),
@@ -89993,6 +90101,7 @@ async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barri
         .await
         .unwrap();
     assert_eq!(admitted.len(), 1);
+
     assert!(
         processor
             .recovery_coordinator

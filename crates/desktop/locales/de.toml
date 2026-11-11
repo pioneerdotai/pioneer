@@ -1751,3 +1751,6 @@ reason_unknown = "Der Vorgang wurde nicht wie erwartet abgeschlossen. Gateway-Pr
 [mcp.oauth]
 callback_received = "Antwort angenommen. Prüfen Sie das Anmeldeergebnis in Pioneer."
 callback_rejected = "Anmeldung abgelehnt. Kehren Sie zu Pioneer zurück und melden Sie sich erneut an."
+
+[plugins]
+title = "Plugins"

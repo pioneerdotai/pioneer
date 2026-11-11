@@ -376,6 +376,8 @@ impl MessageProcessor {
             snapshot_version,
             changed,
         };
+        // Owned configuration/policy/removal already publishes its exact parent
+        // under native parent admission. Standalone changes affect no parent.
         self.send_gateway_management_notification(events::MCP_CHANGED, &notification)
             .await;
     }

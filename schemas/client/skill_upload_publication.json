@@ -1,12 +1,23 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "SkillUploadPublication",
   "type": "object",
   "properties": {
+    "failure": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SkillUploadFailure"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "generation": {
       "type": "integer",
       "format": "uint64",
       "minimum": 0
+    },
+    "mutation_uncertain": {
+      "type": "boolean"
     },
     "operation_id": {
       "type": "integer",
@@ -16,10 +27,30 @@
     "pack": {
       "type": "boolean"
     },
+    "plugin_preview": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PluginPreviewPublication"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "plugin_result": {
       "anyOf": [
         {
           "$ref": "#/$defs/PluginItem"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "plugin_update_preview": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PluginUpdatePreviewPublication"
         },
         {
           "type": "null"
@@ -56,7 +87,8 @@
     "sent_bytes",
     "total_bytes",
     "target",
-    "pack"
+    "pack",
+    "mutation_uncertain"
   ],
   "$defs": {
     "PluginComponentItem": {
@@ -106,6 +138,22 @@
         "status"
       ]
     },
+    "PluginComponentKey": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "member_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "member_key"
+      ]
+    },
     "PluginDiagnostic": {
       "type": "object",
       "properties": {
@@ -133,6 +181,14 @@
           "items": {
             "$ref": "#/$defs/PluginComponentItem"
           }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2048,
+          "default": null
         },
         "diagnostics": {
           "type": "array",
@@ -177,6 +233,130 @@
         "diagnostics"
       ]
     },
+    "PluginPreviewPublication": {
+      "type": "object",
+      "properties": {
+        "package": {
+          "$ref": "#/$defs/PluginsPreviewResponse"
+        },
+        "upload_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "upload_id",
+        "package"
+      ]
+    },
+    "PluginUpdatePreviewPublication": {
+      "type": "object",
+      "properties": {
+        "preview": {
+          "$ref": "#/$defs/PluginsUpdatePreviewResponse"
+        },
+        "upload_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "upload_id",
+        "preview"
+      ]
+    },
+    "PluginsPreviewResponse": {
+      "type": "object",
+      "properties": {
+        "components": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginComponentItem"
+          }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2048,
+          "default": null
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginDiagnostic"
+          }
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "fingerprint",
+        "components",
+        "diagnostics"
+      ]
+    },
+    "PluginsUpdatePreviewResponse": {
+      "type": "object",
+      "properties": {
+        "added": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginComponentKey"
+          }
+        },
+        "authorization_changes": {
+          "description": "Conservative disclosure of changed MCP configurations that may need sign-in.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginComponentKey"
+          }
+        },
+        "identity_resets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginComponentKey"
+          }
+        },
+        "package": {
+          "$ref": "#/$defs/PluginsPreviewResponse"
+        },
+        "removed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginComponentKey"
+          }
+        },
+        "supporting_files_changed": {
+          "type": "boolean",
+          "default": false
+        },
+        "updated": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginComponentKey"
+          }
+        }
+      },
+      "required": [
+        "package",
+        "added",
+        "updated",
+        "identity_resets",
+        "removed",
+        "authorization_changes"
+      ]
+    },
     "SkillId": {
       "type": "string",
       "maxLength": 21,
@@ -188,6 +368,19 @@
       "maxLength": 21,
       "minLength": 21,
       "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillUploadFailure": {
+      "type": "string",
+      "enum": [
+        "source_unavailable",
+        "source_changed",
+        "source_too_large",
+        "invalid_package",
+        "gateway_unavailable",
+        "access_denied",
+        "busy",
+        "unknown"
+      ]
     },
     "SkillUploadState": {
       "type": "string",
@@ -258,6 +451,39 @@
           "required": [
             "kind",
             "pack_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "plugin_preview"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expected_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "plugin_update_preview"
+            },
+            "plugin_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "plugin_id",
+            "expected_revision"
           ]
         }
       ]

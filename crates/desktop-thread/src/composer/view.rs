@@ -614,7 +614,7 @@ impl ComposerView {
                 let menu = if can_use_skills && can_use_mcp {
                     menu.item(Self::composer_add_menu_item(
                         t!("chat.composer.add_menu.plugins").to_string().into(),
-                        PioneerIconName::Mcp,
+                        PioneerIconName::Plugin,
                         {
                             let entity = desktop_entity.clone();
                             move |window, cx| {
@@ -808,7 +808,7 @@ impl ComposerView {
         let identity = capability.id.clone();
         let group_id = format!("composer-capability-chip-{identity}");
         let icon = match capability.kind {
-            ComposerCapabilityKind::Plugin { .. } => PioneerIconName::Mcp,
+            ComposerCapabilityKind::Plugin { .. } => PioneerIconName::Plugin,
             ComposerCapabilityKind::Skill { .. } => PioneerIconName::Zap,
             ComposerCapabilityKind::McpServer { .. } | ComposerCapabilityKind::McpTool { .. } => {
                 PioneerIconName::Mcp

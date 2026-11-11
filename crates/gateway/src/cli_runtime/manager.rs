@@ -813,14 +813,12 @@ impl CLIAgentRuntimeManager {
             if handle.session().is_usable() {
                 return Ok(handle);
             }
-            // A generation already closed by its adapter has no active turn to
-            // preserve. Management still never replaces a usable turn process.
-            if let Some(stale) = self
-                .cached(&key)
-                .filter(|entry| entry.instance == *handle.instance())
-            {
-                self.close_cached(&stale).await?;
-            }
+        }
+        // Closing/not-ready owners have no ready handle, but still own native
+        // cleanup. Under the key gate, drain and release that exact generation
+        // before publishing a replacement. Usable turn processes returned above.
+        if let Some(stale) = self.cached(&key) {
+            self.close_cached(&stale).await?;
         }
         self.start_and_publish_locked(key, launch_spec, now_ms)
             .await
@@ -2061,6 +2059,74 @@ mod tests {
             assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
             assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
         }
+
+        // EOF retains its owner without a ready handle. Management must drain
+        // it both while cleanup is delayed and after cleanup already completed.
+        for drain_before_acquire in [false, true] {
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let factory = Arc::new(FakeFactory {
+                close_started: Some(entered.clone()),
+                close_release: Some(release.clone()),
+                ..Default::default()
+            });
+            let manager = manager_with_factory(factory.clone());
+            let key = key("management-after-eof");
+            let active = manager.get_or_start(key.clone()).await.unwrap();
+            let old_instance = active.instance().clone();
+            let captured = manager.capture_stop_owner(&old_instance).unwrap();
+            assert!(manager.remove_if_generation(&old_instance).await);
+            entered.notified().await;
+            assert!(manager.existing_session(&key).await.is_none());
+            assert_eq!(manager.stop_inventory("ws").len(), 1);
+            assert!(!captured.0.stopped.load(Ordering::Acquire));
+            if drain_before_acquire {
+                release.notify_one();
+                // Actual completion, without manager release, models EOF drain
+                // finishing before the next management request arrives.
+                captured
+                    .0
+                    .close_and_wait(manager.lifecycle.clone())
+                    .await
+                    .unwrap();
+                assert!(captured.0.stopped.load(Ordering::Acquire));
+                assert_eq!(manager.stop_inventory("ws").len(), 1);
+            }
+            let mut acquisition = Box::pin(manager.existing_or_start_management(
+                key.clone(),
+                CliSessionLaunchSpec::codex_management(Default::default()),
+            ));
+            let replacement = if drain_before_acquire {
+                acquisition.await.unwrap()
+            } else {
+                assert!(futures_util::poll!(&mut acquisition).is_pending());
+                assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+                assert_eq!(manager.stop_inventory("ws")[0].instance(), &old_instance);
+                // Cancelling this observer must not cancel the owned drain or
+                // acknowledge completion. The next acquisition joins it again.
+                drop(acquisition);
+                let mut retry = Box::pin(manager.existing_or_start_management(
+                    key.clone(),
+                    CliSessionLaunchSpec::codex_management(Default::default()),
+                ));
+                assert!(futures_util::poll!(&mut retry).is_pending());
+                assert!(!captured.0.stopped.load(Ordering::Acquire));
+                assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+                release.notify_one();
+                retry.await.unwrap()
+            };
+            assert!(captured.0.stopped.load(Ordering::Acquire));
+            assert_ne!(replacement.instance(), &old_instance);
+            assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
+            assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+            assert_eq!(manager.stop_inventory("ws").len(), 1);
+            assert_eq!(
+                manager.stop_inventory("ws")[0].instance(),
+                replacement.instance()
+            );
+            assert!(!manager.remove_if_generation(&old_instance).await);
+            assert!(manager.is_current_instance(replacement.instance()).await);
+        }
     }
 
     #[tokio::test]
@@ -2448,7 +2514,6 @@ mod tests {
         let skill_enabled = CLIAgentRuntimeSessionStartOptions {
             selected_skills: vec![crate::cli_runtime::skills::CliRuntimeSelectedSkill {
                 plugin_id: None,
-                skill_relative_path: None,
                 install_name: "selected".to_owned(),
                 installed_path: std::path::PathBuf::from("/tmp/selected"),
                 source_folder_hash: "selected-hash".to_owned(),
@@ -2486,7 +2551,6 @@ mod tests {
             ]
             .map(|name| CliRuntimeSelectedSkill {
                 plugin_id: None,
-                skill_relative_path: None,
                 install_name: name.to_owned(),
                 installed_path: std::path::PathBuf::from("/native/skills").join(name),
                 source_folder_hash: format!("hash-{name}"),

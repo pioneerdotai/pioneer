@@ -15,6 +15,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument::WithSubscriber;
 use url::Url;
 
+// Hosted by pioneer-site; shared by local and remote Gateway flows. The native
+// shell still receives the callback and relays it to the initiating Gateway.
+const CLIENT_METADATA_URL: &str = "https://getpioneer.dev/oauth/client-metadata.json";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OAuthState {
     Idle,
@@ -1130,6 +1134,17 @@ impl McpOAuthService {
             let mut registration = Registration::from(client);
             registration.token_endpoint_auth_method = config.token_endpoint_auth_method.clone();
             registration
+        } else if metadata
+            .additional_fields
+            .get("client_id_metadata_document_supported")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            // CIMD uses the hosted document URL as the public client ID. The
+            // existing SDK manager owns PKCE, consent, exchange and refresh.
+            Registration::from(
+                OAuthClientConfig::new(CLIENT_METADATA_URL, redirect).with_scopes(scopes.clone()),
+            )
         } else {
             entry.oauth_http.reset_registration_failure();
             let mut registration = Registration::from(

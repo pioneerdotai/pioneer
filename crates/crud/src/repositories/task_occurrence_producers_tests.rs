@@ -1,7 +1,7 @@
 //! Primary adapter regressions for the occurrence producer cutover. NOT RUN.
 use super::*;
 use crate::CrudStore;
-use migration::{Migrator, MigratorTrait};
+use migration::Migrator;
 use pioneer_entity::{
     task_occurrence_reconcile_pending as pending, task_occurrence_reconcile_sequence as sequence,
 };

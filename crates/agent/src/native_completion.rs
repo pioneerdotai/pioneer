@@ -110,10 +110,31 @@ impl NativeRunCompletion {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root);
     }
     pub(crate) fn retain_tool(&self, tool: Arc<NativeTask>) {
-        self.tools
+        let mut tools = self
+            .tools
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(tool);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tools.retain(|prior| {
+            // Only join publishes this flag, after saving its sticky result.
+            // Finished tasks and cancellation ACKs still own their join.
+            if !prior.is_joined() {
+                return true;
+            }
+            let Ok(state) = prior.state.try_lock() else {
+                return true;
+            };
+            let Some(result) = &state.result else {
+                return true;
+            };
+            if let Err(error) = result {
+                *self
+                    .result
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Err(error.clone()));
+            }
+            false
+        });
+        tools.push(tool);
     }
     pub(crate) fn retain_shell(&self, shell: Arc<pioneer_tools::handlers::UnifiedExecHandler>) {
         self.shells
@@ -141,7 +162,7 @@ impl NativeRunCompletion {
             .clone()
             .ok_or(StopError::UnknownOwner)?;
         let root_result = if cancel {
-            match tokio::time::timeout(Duration::from_secs(2), root.join()).await {
+            match tokio::time::timeout(DEFAULT_CONTROL_ACK_TIMEOUT, root.join()).await {
                 Ok(result) => result,
                 Err(_) => {
                     root.abort();
@@ -494,7 +515,7 @@ mod tests {
             .insert("thread".into(), vec![plane.clone()]);
         let threads = vec!["thread".into()];
         let owners = manager
-            .capture_native_stop_owners(&threads, 8)
+            .capture_native_stop_owners(&threads)
             .await
             .unwrap();
         let keys = owners
@@ -517,7 +538,7 @@ mod tests {
         );
         assert_eq!(
             manager
-                .capture_native_stop_owners(&threads, 8)
+                .capture_native_stop_owners(&threads)
                 .await
                 .unwrap()
                 .len(),
@@ -536,7 +557,7 @@ mod tests {
         }
         assert!(
             manager
-                .capture_native_stop_owners(&threads, 8)
+                .capture_native_stop_owners(&threads)
                 .await
                 .unwrap()
                 .is_empty()
@@ -569,7 +590,7 @@ mod tests {
         );
         assert!(matches!(
             manager
-                .capture_native_stop_owners(&["thread".into()], 8)
+                .capture_native_stop_owners(&["thread".into()])
                 .await,
             Err(StopError::UnknownOwner)
         ));
@@ -578,7 +599,7 @@ mod tests {
         actor.join().await.unwrap();
         assert!(
             manager
-                .capture_native_stop_owners(&["thread".into()], 8)
+                .capture_native_stop_owners(&["thread".into()])
                 .await
                 .unwrap()
                 .is_empty()
@@ -645,5 +666,33 @@ mod tests {
                 .await,
             Err(error)
         );
+    }
+    #[tokio::test]
+    async fn joined_tool_records_are_released_with_failure_still_sticky() {
+        let owner = NativeRunCompletion::default();
+        completed_root(&owner);
+        let mut prior = None;
+        for fail in [false, true, false] {
+            let task = NativeTask::new(tokio::spawn(async move {
+                if fail {
+                    panic!("joined tool failure");
+                }
+            }));
+            owner.retain_tool(task.clone());
+            if let Some(weak) = prior.take() {
+                let weak: std::sync::Weak<NativeTask> = weak;
+                assert!(weak.upgrade().is_none());
+            }
+            assert_eq!(task.join().await.is_err(), fail);
+            prior = Some(Arc::downgrade(&task));
+        }
+        assert!(!owner.is_quiescent());
+        assert!(matches!(
+            owner.finish(false).await,
+            Err(StopError::Cleanup(_))
+        ));
+        assert!(owner.is_quiescent());
+        assert!(prior.unwrap().upgrade().is_none());
+        assert_eq!(owner.finish(true).await, owner.outcome().unwrap());
     }
 }

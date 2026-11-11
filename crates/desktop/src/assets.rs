@@ -47,6 +47,7 @@ pub enum PioneerIconName {
     Bolt,
     FolderTree,
     Mcp,
+    Plugin,
     Users,
     Zap,
 }
@@ -57,6 +58,7 @@ impl IconNamed for PioneerIconName {
             Self::Bolt => "icons/bolt.svg",
             Self::FolderTree => "icons/folder-tree.svg",
             Self::Mcp => "icons/mcp.svg",
+            Self::Plugin => "icons/plugin.svg",
             Self::Users => "icons/users.svg",
             Self::Zap => "icons/zap.svg",
         }

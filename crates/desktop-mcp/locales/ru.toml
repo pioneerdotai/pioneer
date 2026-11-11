@@ -15,6 +15,7 @@ title = "Нет установленных MCP серверов"
 description = "Установите новые MCP серверы и расширьте возможности агентов."
 
 [mcp.dialog]
+replace_owned = "Заменить конфигурацию этого сервера"
 install_title = "Установка MCP сервера"
 install = "Установить"
 uninstall_title = "Удалить %{name}?"
@@ -136,6 +137,9 @@ items_count = "Элементов: %{count}"
 keys_count = "Ключей: %{count}"
 
 [mcp.error]
+plugin_submitted = "Изменение отправлено. Перед повтором проверьте состояние сервера."
+plugin_uncertain = "Исход неизвестен. Обновите данные перед следующим действием."
+plugin_change_failed = "Изменение не удалось подтвердить. Обновите карточку перед повторной попыткой."
 server_name_required = "Имя MCP сервера обязательно"
 gateway_not_connected = "Шлюз не подключен"
 workspace_not_selected = "Пространство не выбрано"

@@ -4256,7 +4256,7 @@ impl AgentManager {
             // recovery before/after joining the exact requested Turn's run.
             let threads = [thread_id.to_owned()];
             let captured = self
-                .capture_native_stop_owners(&threads, 65_536)
+                .capture_native_stop_owners(&threads)
                 .await?
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>();
@@ -4266,7 +4266,7 @@ impl AgentManager {
             }
             self.cancel_captured_turn_and_wait(&owner, reason, request_deadline)
                 .await?;
-            let remaining = self.capture_native_stop_owners(&threads, 65_536).await?;
+            let remaining = self.capture_native_stop_owners(&threads).await?;
             if remaining.iter().any(|run| {
                 run.turn_id() == turn_id && (!run.is_quiescent() || !captured.contains(run))
             }) {
@@ -4320,8 +4320,13 @@ impl AgentManager {
         })
     }
 
-    /// Existing native actor/retirement inventory, bounded for Gateway scope
-    /// filtering before stop. This observation grants no cancellation authority.
+    /// Share the configured native control budget across management operations.
+    pub fn control_operation_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.control_plane_config.enqueue_timeout
+            + self.control_plane_config.acknowledgement_timeout
+    }
+
+    /// Existing native actor/retirement inventory. This grants no cancellation authority.
     pub async fn native_stop_thread_ids(&self) -> Result<Vec<String>, StopError> {
         let state = self.state.read().await;
         let ids = state
@@ -4330,9 +4335,6 @@ impl AgentManager {
             .chain(state.retiring_executions.keys())
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        if ids.len() > 65536 {
-            return Err(StopError::UnknownOwner);
-        }
         Ok(ids.into_iter().collect())
     }
 
@@ -4343,9 +4345,6 @@ impl AgentManager {
         &self,
         threads: &[String],
     ) -> Result<Vec<(String, String)>, StopError> {
-        if threads.len() > 65536 {
-            return Err(StopError::UnknownOwner);
-        }
         let state = self.state.read().await;
         let mut candidates = std::collections::BTreeSet::new();
         for id in threads {
@@ -4378,9 +4377,6 @@ impl AgentManager {
                     if let Some(turn) = turn {
                         candidates.insert((id.clone(), turn.to_owned()));
                     }
-                    if candidates.len() > 65536 {
-                        return Err(StopError::UnknownOwner);
-                    }
                 }
             }
             let planes = state
@@ -4397,17 +4393,9 @@ impl AgentManager {
                     .iter()
                     .cloned()
                     .collect::<Vec<_>>();
-                let mut count = 0;
                 while let Some((turn, control)) = runs.pop() {
-                    count += 1;
-                    if count > 65536 {
-                        return Err(StopError::UnknownOwner);
-                    }
                     runs.extend(control.completion.predecessors());
                     candidates.insert((id.clone(), turn));
-                    if candidates.len() > 65536 {
-                        return Err(StopError::UnknownOwner);
-                    }
                 }
             }
         }
@@ -4426,11 +4414,7 @@ impl AgentManager {
     pub async fn capture_native_stop_owners(
         &self,
         thread_ids: &[String],
-        max_owners: usize,
     ) -> Result<Vec<NativeTurnStopOwner>, StopError> {
-        if thread_ids.len() > 65536 || max_owners > 65536 {
-            return Err(StopError::UnknownOwner);
-        }
         let _retirement_guard = self.thread_creation_lock.lock().await;
         // A cancelled retirement waiter retains its actor join in the plane.
         // An unfinished actor could still admit a queued command: fail closed.
@@ -4447,12 +4431,8 @@ impl AgentManager {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone()
                 })
-                .take(max_owners.saturating_add(1))
                 .collect::<Vec<_>>()
         };
-        if actors.len() > max_owners {
-            return Err(StopError::UnknownOwner);
-        }
         for actor in actors {
             if actor.is_joined() {
                 continue;
@@ -4488,9 +4468,6 @@ impl AgentManager {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut pending = last.iter().cloned().collect::<Vec<_>>();
                 while let Some((turn_id, control)) = pending.pop() {
-                    if owners.len() >= max_owners {
-                        return Err(StopError::UnknownOwner);
-                    }
                     pending.extend(control.completion.predecessors());
                     let mailbox = live
                         .filter(|thread| {

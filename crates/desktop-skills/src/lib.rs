@@ -4,7 +4,6 @@ extern crate rust_i18n;
 rust_i18n::i18n!("locales", fallback = "en");
 mod actions;
 mod assets;
-mod binding;
 mod catalog;
 mod details;
 mod dialogs;
@@ -14,5 +13,6 @@ mod table;
 pub use catalog::{SkillsCatalogConfig, SkillsCatalogView};
 
 mod upload;
+pub use upload::{UploadView as SkillsUploadView, UploadVisibility as SkillsUploadVisibility};
 
 mod identity;

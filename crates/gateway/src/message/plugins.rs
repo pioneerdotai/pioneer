@@ -10,12 +10,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
 
+// Request-local native disclosure/status projection. List and detail share the
+// same projector; a list prepares each native inventory at most once.
+#[derive(Default)]
+struct PluginNativeInventory {
+    links: Option<std::collections::HashMap<String, Vec<pioneer_entity::plugin_component::Model>>>,
+    skills: Option<std::collections::HashMap<String, (bool, String)>>,
+    mcp: Option<std::collections::HashMap<String, (bool, Option<String>)>>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct PendingInstall {
     children: Vec<ReservedChild>,
-    published_fingerprint: String,
     target_fingerprint: String,
-    denied: Vec<PluginComponentKey>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct ReservedChild {
@@ -47,6 +54,33 @@ fn public_diagnostics(plan: &LoadedPluginPlan) -> Vec<PluginDiagnostic> {
     }
     diagnostics
 }
+// Description is authored public text, not arbitrary metadata. Keep the same
+// bound for installed inventory, preview and vendor-adapted manifests.
+fn public_description(plan: &LoadedPluginPlan) -> Option<String> {
+    plan.manifest
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| {
+            text.chars()
+                .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                .take(2048)
+                .collect::<String>()
+        })
+        .filter(|text| !text.trim().is_empty())
+}
+fn diagnostic_affects_status(diagnostic: &PluginDiagnostic) -> bool {
+    !matches!(
+        diagnostic.code.as_str(),
+        "unknown_manifest_field"
+            | "invalid_extensions_container"
+            | "vendor_subset_import"
+            | "ignored_vendor_manifest"
+            | "ignored_vendor_feature"
+    )
+}
+
 fn component_preview(component: &ComponentPlan) -> PluginComponentItem {
     let (kind, key) = match component {
         ComponentPlan::Skill { member_key, .. } => ("skill", member_key),
@@ -63,26 +97,69 @@ fn component_preview(component: &ComponentPlan) -> PluginComponentItem {
     }
 }
 
-// Snapshot has already normalized contained links. Only immutable regular data
-// is published; denied assets cause a component failure, never a security bypass.
+async fn load_uploaded_plugin(
+    source: super::package_delivery::upload::MaterializedSkillSource,
+) -> anyhow::Result<(
+    super::package_delivery::upload::MaterializedSkillSource,
+    Snapshot,
+    LoadedPluginPlan,
+)> {
+    super::package_delivery::prepare_cancellable(move |cancellation| {
+        anyhow::ensure!(
+            source.upload.purpose == "plugin",
+            "plugins.upload_purpose_mismatch"
+        );
+        let snapshot = Snapshot::capture(&source.source_dir, source.package_limits, || {
+            cancellation.is_cancelled()
+        })?;
+        super::package_delivery::check_preparation(cancellation)?;
+        anyhow::ensure!(!snapshot.entries().values().any(|entry| matches!(entry, Entry::Denied)),
+            "plugins.package_rejected");
+        let plan = pioneer_plugins::load(&snapshot)
+            .map_err(|_| anyhow::anyhow!("plugins.package_rejected"))?;
+        Ok((source, snapshot, plan))
+    })
+    .await
+}
+
+// Publish the validated regular-file snapshot without changing bytes or modes.
 fn publish_package(snapshot: &Snapshot, root: &Path) -> anyhow::Result<()> {
+    publish_package_cancellable(snapshot, root, &tokio_util::sync::CancellationToken::new())
+}
+fn publish_package_cancellable(
+    snapshot: &Snapshot,
+    root: &Path,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    super::package_delivery::check_preparation(cancellation)?;
+    anyhow::ensure!(!snapshot.entries().values().any(|entry| matches!(entry, Entry::Denied)),
+        "plugins.package_rejected");
     std::fs::create_dir(root)?;
     let result = (|| {
         for (key, entry) in snapshot.entries() {
+            super::package_delivery::check_preparation(cancellation)?;
             let path = root.join(key);
             match entry {
                 Entry::Directory { .. } => std::fs::create_dir_all(&path)?,
-                Entry::File { bytes, .. } => std::fs::write(&path, bytes)?,
-                Entry::Denied => continue,
+                Entry::File { bytes, .. } => {
+                    use std::io::Write;
+                    let mut file = std::fs::File::create(&path)?;
+                    for chunk in bytes.chunks(64 * 1024) {
+                        super::package_delivery::check_preparation(cancellation)?;
+                        file.write_all(chunk)?;
+                    }
+                }
+                Entry::Denied => unreachable!("validated package"),
             }
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             for (key, entry) in snapshot.entries().iter().rev() {
+                super::package_delivery::check_preparation(cancellation)?;
                 let mode = match entry {
                     Entry::Directory { mode } | Entry::File { mode, .. } => *mode,
-                    Entry::Denied => continue,
+                    Entry::Denied => unreachable!("validated package"),
                 };
                 std::fs::set_permissions(
                     root.join(key),
@@ -90,6 +167,23 @@ fn publish_package(snapshot: &Snapshot, root: &Path) -> anyhow::Result<()> {
                 )?;
             }
             std::fs::set_permissions(root, std::fs::Permissions::from_mode(snapshot.root_mode()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            for (key, entry) in snapshot.entries().iter().rev() {
+                super::package_delivery::check_preparation(cancellation)?;
+                let mode = match entry {
+                    Entry::Directory { mode } | Entry::File { mode, .. } => *mode,
+                    Entry::Denied => unreachable!("validated package"),
+                };
+                let path = root.join(key);
+                let mut permissions = std::fs::metadata(&path)?.permissions();
+                permissions.set_readonly(mode & 0o222 == 0);
+                std::fs::set_permissions(path, permissions)?;
+            }
+            let mut permissions = std::fs::metadata(root)?.permissions();
+            permissions.set_readonly(snapshot.root_mode() & 0o222 == 0);
+            std::fs::set_permissions(root, permissions)?;
         }
         Ok(())
     })();
@@ -152,7 +246,6 @@ impl MessageProcessor {
         context: &RequestContext,
         request: JsonRpcRequest,
     ) -> Result<serde_json::Value, JsonRpcErrorResponse> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         let id = &request.id;
         let params = request.params.unwrap_or_else(|| json!({}));
         let invalid = || plugin_error(id, "plugins.invalid_request");
@@ -187,9 +280,23 @@ impl MessageProcessor {
                     .await
                     .map_err(|_| plugin_error(id, "plugins.inventory_failed"))?;
                 let mut plugins = Vec::with_capacity(parents.len());
+                let ids = parents.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+                let mut links = std::collections::HashMap::<String, Vec<_>>::new();
+                for link in self
+                    .crud_store
+                    .plugin_components_inventory(&ids)
+                    .await
+                    .map_err(|_| plugin_error(id, "plugins.inventory_failed"))?
+                {
+                    links.entry(link.plugin_id.clone()).or_default().push(link);
+                }
+                let mut inventory = PluginNativeInventory {
+                    links: Some(links),
+                    ..Default::default()
+                };
                 for parent in parents {
                     plugins.push(
-                        self.plugin_item(context, &parent)
+                        self.plugin_item_with_inventory(context, &parent, &mut inventory)
                             .await
                             .map_err(|_| plugin_error(id, "plugins.inventory_failed"))?,
                     );
@@ -215,7 +322,7 @@ impl MessageProcessor {
             methods::PLUGINS_SET_ENABLED => {
                 let params: PluginsSetEnabledParams =
                     serde_json::from_value(params).map_err(|_| invalid())?;
-                self.set_plugin_enabled(context, id, params, deadline)
+                self.set_plugin_enabled(context, id, params)
                     .await
                     .map(|item| json!(item))
             }
@@ -274,7 +381,7 @@ impl MessageProcessor {
                         }
                     }
                 };
-                self.mutate_plugin(context, id, params, deadline)
+                self.mutate_plugin(context, id, params)
                     .await
                     .map(|result| json!(result))
             }
@@ -321,41 +428,34 @@ impl MessageProcessor {
                             .map_err(|_| invalid())?
                     ));
                 }
-                let runtime = self
-                    .skills_runtime_context(&workspace)
-                    .map_err(|_| invalid())?;
+                let owner = AuthenticatedTransferOwner::from_request_context(context);
+                {
+                    let _upload_guard = self.acquire_skill_upload_lock(&upload_id).await;
+                    self.revalidate_plugin_upload(&owner, &workspace, &upload_id, id).await?;
+                }
+                let runtime = self.package_delivery_context();
                 let source = self
                     .materialize_uploaded_archive_source(
-                        context.connection_id(),
+                        &owner,
                         &workspace,
                         &upload_id,
                         &runtime,
                         id,
+                        "plugin",
                     )
                     .await
-                    .map_err(|_| {
-                        plugin_error(id, "plugins.upload_unavailable_or_invalid_archive")
+                    .map_err(|error| {
+                        if error.error.message == "package_delivery.busy" {
+                            plugin_error(id, "plugins.busy")
+                        } else {
+                            plugin_error(id, "plugins.upload_unavailable_or_invalid_archive")
+                        }
                     })?;
-                let loaded = (|| {
-                    if source.upload.purpose != "plugin" {
-                        anyhow::bail!("purpose mismatch");
-                    }
-                    let snapshot =
-                        Snapshot::capture(&source.source_dir, Default::default(), || false)?;
-                    let plan = pioneer_plugins::load(&snapshot)
-                        .map_err(|_| anyhow::anyhow!("package rejected"))?;
-                    Ok::<_, anyhow::Error>((snapshot, plan))
-                })();
-                let (snapshot, plan) = match loaded {
-                    Ok(v) => v,
-                    Err(_) => {
-                        let _ = std::fs::remove_dir_all(&source.cleanup_root);
-                        return Err(plugin_error(id, "plugins.package_rejected"));
-                    }
-                };
+                let (source, snapshot, plan) = load_uploaded_plugin(source)
+                    .await
+                    .map_err(|_| plugin_error(id, "plugins.package_rejected"))?;
                 if let Some(expected) = expected {
                     if expected != plan.tree_digest {
-                        let _ = std::fs::remove_dir_all(&source.cleanup_root);
                         return Err(plugin_error(id, "plugins.fingerprint_changed"));
                     }
                     let _upload_guard = self.acquire_skill_upload_lock(&upload_id).await;
@@ -380,7 +480,7 @@ impl MessageProcessor {
                             id,
                             &workspace,
                             &source.upload,
-                            &runtime.plugin_root(),
+                            &self.plugin_storage_root(&workspace),
                             snapshot,
                             plan,
                         )
@@ -394,16 +494,22 @@ impl MessageProcessor {
                         .flatten()
                         .is_some()
                     {
-                        self.cleanup_upload_artifacts(&source.upload, &source.cleanup_root);
-                    } else {
-                        let _ = std::fs::remove_dir_all(&source.cleanup_root);
+                        let payload = source.upload.clone();
+                        let _ = super::package_delivery::prepare(move || {
+                            super::package_delivery::upload::cleanup_consumed_payload(&payload)
+                        })
+                        .await; // Best-effort cleanup cannot replace the committed result.
                     }
                     outcome.map(|item| json!(item))
                 } else {
-                    let _ = std::fs::remove_dir_all(&source.cleanup_root);
+                    // Revalidate after preparation too: a concurrent abort/consume
+                    // must not return a preview for a no-longer-owned transfer.
+                    let _upload_guard = self.acquire_skill_upload_lock(&upload_id).await;
+                    self.revalidate_plugin_upload(&owner, &workspace, &upload_id, id).await?;
                     Ok(json!(PluginsPreviewResponse {
                         name: plan.manifest.name.clone(),
                         version: plan.manifest.version.clone(),
+                        description: public_description(&plan),
                         fingerprint: plan.tree_digest.clone(),
                         components: plan.components.iter().map(component_preview).collect(),
                         diagnostics: public_diagnostics(&plan)
@@ -429,33 +535,38 @@ impl MessageProcessor {
         let root = runtime_root.join(&plugin_id);
         let package = root.join("package");
         let data = root.join("data");
-        std::fs::create_dir_all(&root).map_err(|_| error())?;
-        if publish_package(&snapshot, &package).is_err() || std::fs::create_dir(&data).is_err() {
-            let _ = std::fs::remove_dir_all(&root);
-            return Err(error());
-        }
-        let pending = PendingInstall {
-            children: plan
-                .components
-                .iter()
-                .map(|c| {
-                    let item = component_preview(c);
-                    ReservedChild {
-                        kind: item.kind,
-                        key: item.member_key,
-                        id: pioneer_protocol::generate_id(21),
-                    }
-                })
-                .collect(),
-            published_fingerprint: Snapshot::capture(&package, Default::default(), || false)
-                .map_err(|_| error())?
-                .tree_digest(),
-            target_fingerprint: plan.tree_digest.clone(),
-            denied: lifecycle::denied_keys(&snapshot, &plan),
-        };
+        let new_root = root.clone();
+        let (mut staging, plan, pending) = super::package_delivery::prepare_cancellable(
+            move |cancellation| -> anyhow::Result<_> {
+                let mut staging = super::package_delivery::TemporaryDirectory::new()?;
+                std::fs::create_dir_all(new_root.parent().context("plugins.root_invalid")?)?;
+                std::fs::create_dir(&new_root)?;
+                staging.remove_on_drop(new_root.clone());
+                let package = new_root.join("package");
+                publish_package_cancellable(&snapshot, &package, cancellation)?;
+                std::fs::create_dir(new_root.join("data"))?;
+                let pending = PendingInstall {
+                    children: plan
+                        .components
+                        .iter()
+                        .map(|c| {
+                            let item = component_preview(c);
+                            ReservedChild {
+                                kind: item.kind,
+                                key: item.member_key,
+                                id: pioneer_protocol::generate_id(21),
+                            }
+                        })
+                        .collect(),
+                    target_fingerprint: plan.tree_digest.clone(),
+                };
+                Ok((staging, plan, pending))
+            },
+        )
+        .await
+        .map_err(|_| plugin_error(request_id, "plugins.install_failed"))?;
         let pending_json = serde_json::to_string(&pending).map_err(|_| error())?;
         if pending_json.len() > 65536 {
-            let _ = std::fs::remove_dir_all(&root);
             return Err(error());
         }
         let now = chrono::Utc::now().fixed_offset();
@@ -488,21 +599,37 @@ impl MessageProcessor {
             .revalidate_plugin_upload(&owner, workspace, &upload.upload_id, request_id)
             .await
         {
-            let _ = std::fs::remove_dir_all(&root);
             return Err(error);
         }
+        // From dispatch onward cancellation/returned Err cannot establish rollback.
+        staging.preserve();
         if self
             .crud_store
             .reserve_plugin_installation(&parent, context.connection_id(), now.timestamp())
             .await
             .is_err()
         {
-            let _ = std::fs::remove_dir_all(&root);
+            // A failed reserve response does not prove rollback. Match update's
+            // conservative reconciliation: delete only after a successful read
+            // proves that this upload has no durable parent. Read failure keeps
+            // staging for recovery instead of deleting possibly committed bytes.
+            if matches!(
+                self.crud_store
+                    .find_plugin_by_upload(&upload.upload_id)
+                    .await,
+                Ok(None)
+            ) {
+                staging.remove_on_drop(root.clone());
+            }
             return Err(error());
         }
+        // The durable parent now owns package/data. Release the unused cleanup
+        // reservation before native member staging needs its own scratch owner.
+        drop(staging);
         let parent_guard = PluginMutationGuard {
             parent: parent.clone(),
-            _lock: _parent_guard,
+            limits: self.package_delivery_context().plugin_limits(),
+            _lock: Arc::new(_parent_guard),
         };
         self.skill_upload_owners
             .lock()
@@ -526,23 +653,18 @@ impl MessageProcessor {
                 } => {
                     ownership.member_path = Some(member_path.clone());
                     ownership.package_fingerprint = tree_digest.clone();
-                    let denied = snapshot.entries().iter().any(|(key, entry)| {
-                        matches!(entry, Entry::Denied)
-                            && (key == member_path || key.starts_with(&format!("{member_path}/")))
-                    });
-                    if denied {
-                        Err(error())
-                    } else {
                         self.install_skill_source(
                             context,
                             request_id.clone(),
                             workspace.into(),
                             "user".into(),
-                            skills::SkillInstallSource::PackageMember(ownership.clone()),
+                            skills::SkillInstallSource::PackageMember(
+                                ownership.clone(),
+                                parent_guard._lock.clone(),
+                            ),
                         )
                         .await
                         .map(|_| ())
-                    }
                 }
                 ComponentPlan::Mcp { server, .. } => {
                     match mcp::portable::portable_install_plan(
@@ -584,32 +706,13 @@ impl MessageProcessor {
                     .record_plugin_component_failure(
                         &ownership,
                         &reserved.kind,
-                        if let ComponentPlan::Skill { member_path, .. } = component {
-                            if snapshot.entries().iter().any(|(path, entry)| {
-                                matches!(entry, Entry::Denied)
-                                    && (path == member_path
-                                        || path.starts_with(&format!("{member_path}/")))
-                            }) {
-                                "component_path_denied"
-                            } else {
-                                "component_install_failed"
-                            }
-                        } else {
-                            "component_install_failed"
-                        },
+                        "component_install_failed",
                     )
                     .await
                     .map_err(|_| error())?;
             }
         }
         let diagnostics = serde_json::to_string(&public_diagnostics(&plan)).map_err(|_| error())?;
-        lifecycle::save_package_integrity(
-            &package,
-            &Snapshot::capture(&package, Default::default(), || false)
-                .map_err(|_| error())?
-                .tree_digest(),
-        )
-        .map_err(|_| error())?;
         self.crud_store
             .prepare_plugin_reload(&plugin_id, 1)
             .await
@@ -645,30 +748,68 @@ impl MessageProcessor {
             .plugin_item(context, &parent)
             .await
             .map_err(|_| error())?;
-        self.send_gateway_management_notification(
-            methods::PLUGINS_CHANGED,
-            &PluginsChangedNotification {
-                workspace_id: workspace.into(),
-                plugin_id,
-                revision: 1,
-            },
-        )
+        self.send_plugin_changed_notification(&PluginsChangedNotification {
+            workspace_id: workspace.into(),
+            plugin_id,
+            revision: 1,
+        })
         .await;
         Ok(item)
     }
 
+    async fn plugin_description(
+        &self,
+        parent: &pioneer_entity::plugin_installation::Model,
+    ) -> Option<String> {
+        // Metadata is optional. Never disclose a candidate while publication is
+        // pending, or fail an otherwise useful inventory on unavailable bytes.
+        if parent.pending_json.is_some() || parent.state != "installed" {
+            return None;
+        }
+        let captured = parent.clone();
+        let limits = self.package_delivery_context().plugin_limits();
+        let description = super::package_delivery::prepare_cancellable(move |cancellation| {
+            let (_, plan) = lifecycle::verified_package(&captured, cancellation, limits)?;
+            Ok(public_description(&plan))
+        })
+        .await
+        .ok()
+        .flatten()?;
+        // A concurrent publication cannot attach candidate metadata to an older
+        // inventory revision. This is a read, with no retained DB capacity.
+        let current = self
+            .crud_store
+            .find_plugin_installation(&parent.id)
+            .await
+            .ok()??;
+        (current.revision == parent.revision && current.pending_json.is_none())
+            .then_some(description)
+    }
     async fn plugin_item(
         &self,
         context: &RequestContext,
         parent: &pioneer_entity::plugin_installation::Model,
     ) -> anyhow::Result<PluginItem> {
-        let links = self.crud_store.list_plugin_components(&parent.id).await?;
+        self.plugin_item_with_inventory(context, parent, &mut PluginNativeInventory::default())
+            .await
+    }
+
+    async fn plugin_item_with_inventory(
+        &self,
+        context: &RequestContext,
+        parent: &pioneer_entity::plugin_installation::Model,
+        inventory: &mut PluginNativeInventory,
+    ) -> anyhow::Result<PluginItem> {
+        let links = match inventory.links.as_mut() {
+            Some(links) => links.remove(&parent.id).unwrap_or_default(),
+            None => self.crud_store.list_plugin_components(&parent.id).await?,
+        };
         let member = crate::authorization::AuthorizationService::new().role_disclosure_policy(
             context.principal().kind,
             context.principal().role_key.as_ref(),
         ) != Some(crate::authorization::RoleDisclosurePolicy::Administrative);
-        let mut skills = std::collections::HashMap::new();
-        if links.iter().any(|l| l.kind == "skill") {
+        if inventory.skills.is_none() && links.iter().any(|l| l.kind == "skill") {
+            let mut skills = std::collections::HashMap::new();
             let runtime = self.skills_runtime_context(&parent.workspace_id)?;
             let catalog = self
                 .load_skills_catalog(&parent.workspace_id, &runtime)
@@ -724,15 +865,41 @@ impl MessageProcessor {
                     (visible, status.to_owned()),
                 );
             }
+            inventory.skills = Some(skills);
         }
-        let mcp = self
-            .crud_store
-            .list_mcp_server_installations("workspace", &parent.workspace_id)
-            .await?;
-        let runtime = self
-            .mcp_service
-            .runtime_snapshot("workspace", &parent.workspace_id)
-            .await;
+        let empty_skills = std::collections::HashMap::new();
+        let skills = inventory.skills.as_ref().unwrap_or(&empty_skills);
+        if inventory.mcp.is_none() {
+            let mcp = self
+                .crud_store
+                .list_mcp_server_installations("workspace", &parent.workspace_id)
+                .await?;
+            let runtime = self
+                .mcp_service
+                .runtime_snapshot("workspace", &parent.workspace_id)
+                .await;
+            let projection: std::collections::HashMap<String, (bool, Option<String>)> = mcp
+                .into_iter()
+                .filter_map(|row| {
+                    let id = row.id.as_ref()?;
+                    let visible = super::mcp::mcp_installation_is_disclosed(
+                        context.principal(),
+                        id,
+                        row.enabled,
+                    );
+                    let status = if !row.enabled {
+                        Some("disabled".into())
+                    } else {
+                        runtime
+                            .get(id)
+                            .map(|state| format!("{:?}", state.state).to_ascii_lowercase())
+                    };
+                    Some((id.clone(), (visible, status)))
+                })
+                .collect();
+            inventory.mcp = Some(projection);
+        }
+        let mcp = inventory.mcp.as_ref().expect("native inventory prepared");
         let mut components = Vec::with_capacity(links.len());
         let mut hidden = false;
         for link in links {
@@ -746,14 +913,8 @@ impl MessageProcessor {
                 "mcp" => link
                     .mcp_installation_id
                     .as_ref()
-                    .and_then(|id| mcp.iter().find(|r| r.id.as_ref() == Some(id)))
-                    .map(|row| {
-                        super::mcp::mcp_installation_is_disclosed(
-                            context.principal(),
-                            row.id.as_deref().unwrap(),
-                            row.enabled,
-                        )
-                    })
+                    .and_then(|id| mcp.get(id))
+                    .map(|row| row.0)
                     .unwrap_or(!member),
                 _ => !member,
             };
@@ -762,13 +923,7 @@ impl MessageProcessor {
                 continue;
             }
             let runtime_status = if let Some(id) = &link.mcp_installation_id {
-                if mcp.iter().any(|r| r.id.as_ref() == Some(id) && !r.enabled) {
-                    Some("disabled".into())
-                } else {
-                    runtime
-                        .get(id)
-                        .map(|state| format!("{:?}", state.state).to_ascii_lowercase())
-                }
+                mcp.get(id).and_then(|row| row.1.clone())
             } else {
                 link.skill_id
                     .as_ref()
@@ -815,7 +970,7 @@ impl MessageProcessor {
         // Members receive only a neutral parent notice; management retains the
         // complete authored inventory and package diagnostics.
         if member {
-            let unavailable = hidden || !diagnostics.is_empty();
+            let unavailable = hidden || diagnostics.iter().any(diagnostic_affects_status);
             diagnostics.clear();
             if unavailable {
                 diagnostics.push(PluginDiagnostic {
@@ -825,24 +980,25 @@ impl MessageProcessor {
                 });
             }
         }
-        let partial = diagnostics.iter().any(|d| {
-            !matches!(
-                d.code.as_str(),
-                "unknown_manifest_field" | "invalid_extensions_container"
-            )
-        }) || components.iter().any(|c| c.status != "installed");
+        let partial = diagnostics.iter().any(diagnostic_affects_status)
+            || components.iter().any(|c| c.status != "installed");
         Ok(PluginItem {
             id: parent.id.clone(),
             name: parent.name.clone(),
             version: parent.version.clone(),
+            description: self.plugin_description(parent).await,
             enabled: parent.enabled,
-            state: if parent.pending_json.is_some() && parent.state == "installed" {
+            state: if parent.last_error.as_deref() == Some("plugins.data_retained") {
+                "retained".into()
+            } else if parent.pending_json.is_some() && parent.state == "installed" {
                 "updating".into()
             } else {
                 parent.state.clone()
             },
             revision: parent.revision,
-            status: if parent.state == "installed" && parent.pending_json.is_some() {
+            status: if parent.last_error.as_deref() == Some("plugins.data_retained") {
+                "retained".into()
+            } else if parent.state == "installed" && parent.pending_json.is_some() {
                 "updating".into()
             } else if parent.state != "installed" {
                 parent.state.clone()
@@ -861,10 +1017,47 @@ impl MessageProcessor {
 /// context instead of reacquiring the parent before their native lifecycle lock.
 pub(crate) struct PluginMutationGuard {
     pub(super) parent: pioneer_entity::plugin_installation::Model,
-    _lock: tokio::sync::OwnedMutexGuard<()>,
+    limits: pioneer_plugins::Limits,
+    _lock: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl PluginMutationGuard {
+    /// Read-only preparation can stop cooperatively; the captured admission
+    /// still outlives the waiter until the worker leaves its last checkpoint.
+    pub(super) async fn fs_prepare<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(
+            &pioneer_entity::plugin_installation::Model,
+            &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<T>
+        + Send
+        + 'static,
+    ) -> anyhow::Result<T> {
+        let hold = self._lock.clone();
+        let parent = self.parent.clone();
+        super::package_delivery::prepare_cancellable(move |cancellation| {
+            let _hold = hold;
+            work(&parent, cancellation)
+        })
+        .await
+    }
+    /// A blocking FS phase retains this exact parent admission even if its
+    /// request waiter is dropped. Only FS work runs here; DB/native publication
+    /// remains in the async request and its durable pending plan.
+    pub(super) async fn fs<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&pioneer_entity::plugin_installation::Model) -> anyhow::Result<T>
+        + Send
+        + 'static,
+    ) -> anyhow::Result<T> {
+        let hold = self._lock.clone();
+        let parent = self.parent.clone();
+        super::package_delivery::prepare(move || {
+            let _hold = hold;
+            work(&parent)
+        })
+        .await?
+    }
     pub(crate) fn parent(&self) -> &pioneer_entity::plugin_installation::Model {
         &self.parent
     }
@@ -904,7 +1097,8 @@ impl MessageProcessor {
         anyhow::ensure!(parent.revision == revision, "plugins.stale");
         Ok(PluginMutationGuard {
             parent,
-            _lock: lock,
+            limits: self.package_delivery_context().plugin_limits(),
+            _lock: Arc::new(lock),
         })
     }
 
@@ -1063,14 +1257,14 @@ impl MessageProcessor {
             let Some(id) = child.mcp_installation_id else {
                 continue;
             };
-            let name = mcp::portable::internal_mcp_name(&parent.id, &child.member_key);
+            let name = &child.member_key;
             let _native = self
                 .mcp_service
-                .installation_lifecycle_guard("workspace", &parent.workspace_id, &name)
+                .installation_lifecycle_guard("workspace", &parent.workspace_id, name)
                 .await;
             let row = self
                 .crud_store
-                .find_mcp_server_installation("workspace", &parent.workspace_id, &name)
+                .find_mcp_server_installation("workspace", &parent.workspace_id, name)
                 .await?
                 .filter(|row| row.id.as_deref() == Some(id.as_str()))
                 .ok_or_else(|| anyhow::anyhow!("plugins.component_owner_changed"))?;
@@ -1090,15 +1284,103 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn publish_plugin_changed(&self, parent: &pioneer_entity::plugin_installation::Model) {
-        self.send_gateway_management_notification(
+    async fn plugin_notification_recipients(
+        &self,
+        workspace: &str,
+        candidates: Vec<crate::session::ConnectionId>,
+    ) -> Vec<crate::session::ConnectionId> {
+        let candidates = self
+            .authorized_workspace_notification_recipients(workspace, candidates)
+            .await;
+        let mut recipients = Vec::new();
+        for connection_id in candidates {
+            let Ok(connection) = self.session_manager.connection_context(connection_id).await
+            else {
+                continue;
+            };
+            let context = RequestContext::new(
+                &connection,
+                None,
+                crate::request_context::CanonicalMethod::rpc(methods::PLUGINS_LIST),
+            );
+            let request = RequestId::new(pioneer_protocol::generate_id(21))
+                .expect("generated request identity");
+            if self
+                .plugin_admit(&context, &request, workspace, false)
+                .await
+                .is_ok()
+            {
+                recipients.push(connection_id);
+            }
+        }
+        recipients
+    }
+
+    async fn send_plugin_changed_notification(&self, notification: &PluginsChangedNotification) {
+        // Only the invalidation locator is sent. Administrative inventory and
+        // diagnostics still require a newly authorized read with role disclosure.
+        let candidates = self.session_manager.connection_ids().await;
+        let recipients = self
+            .plugin_notification_recipients(&notification.workspace_id, candidates)
+            .await;
+        if recipients.is_empty() {
+            return;
+        }
+        let recipients = self
+            .plugin_notification_recipients(&notification.workspace_id, recipients)
+            .await;
+        if recipients.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(methods::PLUGINS_CHANGED, notification)
+        else {
+            return;
+        };
+        let recipients = self
+            .plugin_notification_recipients(&notification.workspace_id, recipients)
+            .await;
+        self.send_serialized_notification_to_connections(
             methods::PLUGINS_CHANGED,
-            &PluginsChangedNotification {
-                workspace_id: parent.workspace_id.clone(),
-                plugin_id: parent.id.clone(),
-                revision: parent.revision,
-            },
+            &serialized,
+            recipients,
         )
+        .await;
+    }
+
+    /// Native configuration/policy publication also invalidates member parent
+    /// inventories. Only locators cross the role boundary; reads reauthorize.
+    pub(crate) async fn notify_plugin_mcp_runtime_changed(
+        &self,
+        workspace: &str,
+        installation: &str,
+    ) {
+        let maintenance = self.scoped_with_database_class(SqliteWriteClass::Maintenance);
+        let store = &maintenance.crud_store;
+        let Ok(Some(owner)) = store.find_mcp_plugin_owner(installation).await else {
+            return;
+        };
+        let Ok(Some(parent)) = store.find_plugin_installation(&owner.plugin_id).await else {
+            return;
+        };
+        if parent.workspace_id == workspace {
+            maintenance.publish_plugin_changed(&parent).await;
+        }
+    }
+
+    pub(super) async fn notify_plugin_native_changed(&self, workspace: &str) {
+        if let Ok(parents) = self.crud_store.list_plugin_installations(workspace).await {
+            for parent in parents {
+                self.publish_plugin_changed(&parent).await;
+            }
+        }
+    }
+
+    async fn publish_plugin_changed(&self, parent: &pioneer_entity::plugin_installation::Model) {
+        self.send_plugin_changed_notification(&PluginsChangedNotification {
+            workspace_id: parent.workspace_id.clone(),
+            plugin_id: parent.id.clone(),
+            revision: parent.revision,
+        })
         .await;
     }
 
@@ -1107,7 +1389,6 @@ impl MessageProcessor {
         context: &RequestContext,
         request: &RequestId,
         params: PluginsSetEnabledParams,
-        deadline: tokio::time::Instant,
     ) -> Result<PluginItem, JsonRpcErrorResponse> {
         let mut guard = self
             .acquire_plugin_mutation(
@@ -1152,9 +1433,10 @@ impl MessageProcessor {
             .await
             .map_err(|_| plugin_error(request, "plugins.stale"))?;
         self.publish_plugin_changed(&guard.parent).await;
-        // One budget spans stop and reload, matching the ordinary RPC budget.
+        // Stop uses the native control budget; reload uses its own native lifecycle.
         // Cancellation leaves this durable closed plan available for Continue.
-        let work = tokio::time::timeout_at(deadline, async {
+        let deadline = self.agent_manager.control_operation_deadline();
+        let work = async {
             self.stop_plugin_execution(&guard, deadline).await?;
             self.crud_store
                 .prepare_plugin_reload(&guard.parent.id, guard.parent.revision)
@@ -1164,9 +1446,9 @@ impl MessageProcessor {
                 .finish_plugin_mutation(&guard.parent.id, guard.parent.revision, "installed", None)
                 .await?;
             Ok::<_, anyhow::Error>(())
-        })
+        }
         .await;
-        if !matches!(work, Ok(Ok(()))) {
+        if !matches!(work, Ok(())) {
             // A cancelled acknowledgement may follow a committed final writer.
             // Re-read it instead of reopening a completed action with stale data.
             if let Some(current) = self
@@ -1207,7 +1489,6 @@ impl MessageProcessor {
 pub(super) struct NativePluginMutation {
     pub(super) guard: PluginMutationGuard,
     pub(super) write: pioneer_crud::PluginNativeWrite,
-    pub(super) deadline: tokio::time::Instant,
 }
 impl MessageProcessor {
     pub(super) async fn begin_native_plugin_change(
@@ -1340,7 +1621,6 @@ impl MessageProcessor {
         Ok(Some(NativePluginMutation {
             guard,
             write,
-            deadline,
         }))
     }
     pub(super) async fn finish_native_plugin_change(
@@ -1348,7 +1628,7 @@ impl MessageProcessor {
         change: NativePluginMutation,
     ) -> anyhow::Result<()> {
         let parent = &change.guard.parent;
-        let result = tokio::time::timeout_at(change.deadline, async {
+        let result = async {
             self.cleanup_pending_refs(&change.guard).await?;
             self.crud_store
                 .prepare_plugin_reload(&parent.id, parent.revision)
@@ -1359,11 +1639,11 @@ impl MessageProcessor {
             self.crud_store
                 .finish_plugin_mutation(&parent.id, parent.revision, "installed", None)
                 .await
-        })
+        }
         .await;
-        if !matches!(result, Ok(Ok(()))) {
+        if !matches!(result, Ok(())) {
             // Read the current DB outcome, including its atomic native commit
-            // marker. Do not replace it with pre-commit pending after timeout.
+            // marker. Do not replace it with pre-commit pending after a failed effect.
             let current = self
                 .crud_store
                 .find_plugin_installation(&parent.id)
@@ -1373,8 +1653,8 @@ impl MessageProcessor {
                 && current.state == "installed"
                 && current.pending_json.is_none()
             {
-                // Deadline can expire just after the final DB commit. That
-                // commit only follows confirmed reload under this same guard.
+                // Reconcile an acknowledgement lost after the final DB commit.
+                // That commit follows confirmed reload under this same guard.
                 self.publish_plugin_changed(&current).await;
                 return Ok(());
             }

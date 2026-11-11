@@ -1,7 +1,6 @@
-use crate::{
-    Boundary, Diagnostic, Entry, Manifest, PortableServer, Snapshot, parse_manifest, parse_mcp,
-};
-use pioneer_skills::{SkillId, SkillMarkdownParseContext, SkillSourceKind, parse_skill_markdown};
+use crate::{Boundary, Diagnostic, Entry, Manifest, PortableServer, Snapshot, parse_mcp};
+use pioneer_skills::contract::parse_skill_markdown_with_authored_fields;
+use pioneer_skills::{SkillId, SkillMarkdownParseContext, SkillSourceKind};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,15 +26,7 @@ pub struct LoadedPluginPlan {
 }
 
 pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
-    let bytes = snapshot.file("plugin.json").ok_or_else(|| {
-        Diagnostic::new(
-            "fatal_manifest",
-            Boundary::Package,
-            "plugin.json",
-            "Manifest must resolve to a contained regular file",
-        )
-    })?;
-    let (manifest, mut diagnostics) = parse_manifest(bytes)?;
+    let (manifest, mut diagnostics, imported) = crate::source::manifest(snapshot)?;
     let mut components = Vec::new();
     let mut examined = 0;
     match snapshot.entries().get("skills") {
@@ -53,7 +44,7 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
                     continue;
                 }
                 examined += 1;
-                if examined > snapshot.limits().components.min(256) {
+                if examined > snapshot.limits().components {
                     return Err(limit());
                 }
                 match snapshot
@@ -83,15 +74,14 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
             "Skills location must be a contained directory",
         )),
     }
-    match snapshot.entries().get("mcp.json") {
-        None => {}
-        Some(Entry::File { bytes, .. }) => {
+    match crate::source::mcp(snapshot, &manifest, imported) {
+        Ok(None) => {}
+        Ok(Some(bytes)) => {
             match parse_mcp(
-                bytes,
+                &bytes,
                 snapshot
                     .limits()
                     .components
-                    .min(256)
                     .saturating_sub(examined),
             ) {
                 Ok(servers) => {
@@ -121,12 +111,7 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
         }
-        _ => diagnostics.push(Diagnostic::new(
-            "invalid_mcp_location",
-            Boundary::Mcp,
-            "mcp.json",
-            "MCP location must be a contained regular file",
-        )),
+        Err(diagnostic) => diagnostics.push(diagnostic),
     }
     // Access failures on ancillary paths do not change SKILL.md conformance.
     // Native folder installation still applies its existing security policy.
@@ -157,30 +142,10 @@ fn limit() -> Diagnostic {
     )
 }
 fn valid_skill(text: &str, name: &str) -> bool {
-    // Existing parser supplies the native contract and strict conformance. Its
-    // fallback display name/description must not replace required frontmatter.
-    let normalized = text.replace("\r\n", "\n");
-    let Some(rest) = normalized.strip_prefix("---\n") else {
-        return false;
-    };
-    let Some(end) = rest.find("\n---") else {
-        return false;
-    };
-    let Ok(frontmatter) = serde_yaml::from_str::<serde_yaml::Value>(&rest[..end]) else {
-        return false;
-    };
-    if frontmatter.get("name").and_then(serde_yaml::Value::as_str) != Some(name)
-        || frontmatter
-            .get("description")
-            .and_then(serde_yaml::Value::as_str)
-            .is_none_or(|s| s.trim().is_empty())
-    {
-        return false;
-    }
     let Ok(skill_id) = SkillId::new("000000000000000000000") else {
         return false;
     };
-    parse_skill_markdown(
+    parse_skill_markdown_with_authored_fields(
         text,
         SkillMarkdownParseContext {
             skill_id,
@@ -195,5 +160,9 @@ fn valid_skill(text: &str, name: &str) -> bool {
             display_name_override: None,
         },
     )
-    .is_ok_and(|s| s.conformance.agentskills_strict.compliant)
+    .is_ok_and(|(skill, authored)| {
+        authored.name.as_deref() == Some(name)
+            && authored.description.is_some()
+            && skill.conformance.agentskills_strict.compliant
+    })
 }

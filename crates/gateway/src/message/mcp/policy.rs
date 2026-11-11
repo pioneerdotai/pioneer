@@ -86,6 +86,7 @@ impl MessageProcessor {
 
     /// Runs the same admitted native mutation and its existing post-commit
     /// publications/reload without requiring a websocket reply.
+    #[cfg(test)]
     pub(crate) async fn set_mcp_policy(
         &self,
         request_context: &RequestContext,
@@ -104,7 +105,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: McpPolicySetParams,
     ) -> std::result::Result<McpPolicyChange, JsonRpcErrorResponse> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = self.agent_manager.control_operation_deadline();
         let connection_id = request_context.connection_id();
         let workspace_id = match self
             .validate_mcp_workspace(
@@ -287,13 +288,7 @@ impl MessageProcessor {
                 plugin.as_ref().map(|change| &change.write),
                 now,
             );
-        let outcome = if plugin.is_some() {
-            tokio::time::timeout_at(deadline, write)
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("plugins.native_commit_unconfirmed")))
-        } else {
-            write.await
-        };
+        let outcome = write.await;
         let installation_id = match outcome {
             Ok(id) => id,
             Err(error) => {

@@ -402,7 +402,7 @@ impl ClaudeRequiredMcpBridge {
                         .map_err(|error| {
                             anyhow!("Claude required MCP transport failed: {error}")
                         })?;
-                    let (handle, server) = CliMcpBridgeFacadeServer::build_owned(
+                    let (handle, server) = CliMcpBridgeFacadeServer::build(
                         transport,
                         self.supervisor.coordinator(),
                         Arc::new(ClaudeCorrelatingTurnMcpInvoker {
@@ -828,7 +828,9 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
                 {
                     Ok(reservation) => reservation,
                     Err(error) => {
-                        supervisor.revoke_session(process_instance).await;
+                        if let Err(error) = supervisor.revoke_session_result(process_instance).await {
+                            tracing::warn!(error = %error, "CLI MCP cleanup retained");
+                        }
                         return Err(anyhow!(
                             "failed to stage Claude MCP list identity: {error:?}"
                         ));
@@ -869,7 +871,9 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
             Ok(config) => config,
             Err(error) => {
                 if let Some(supervisor) = self.bridge_supervisor.as_ref() {
-                    supervisor.revoke_session(process_instance).await;
+                    if let Err(error) = supervisor.revoke_session_result(process_instance).await {
+                        tracing::warn!(error = %error, "CLI MCP cleanup retained");
+                    }
                 }
                 return Err(error);
             }
@@ -1136,31 +1140,12 @@ fn materialize_claude_selected_skill_plugins(
         // contain characters that are not accepted by Claude's plugin-name
         // grammar. The manifest still points to the exact canonical skill
         // directory below this generation-scoped plugin root.
-        let plugin_name = if selected.plugin_id.is_some() {
-            install_name.clone()
-        } else {
-            format!("pioneer-selected-skill-{index}")
-        };
+        let plugin_name = format!("pioneer-selected-skill-{index}");
         let plugin_root = plugins_root.join(plugin_name.as_str());
-        let context_destination = if selected.plugin_id.is_some() {
-            plugin_root.join("context")
-        } else {
-            plugin_root.join("skills").join(install_name.as_str())
-        };
-        let skill_destination =
-            context_destination.join(selected.skill_relative_path.as_deref().unwrap_or(""));
-        if let Some(relative) = &selected.skill_relative_path {
-            anyhow::ensure!(
-                !relative.is_empty()
-                    && Path::new(relative)
-                        .components()
-                        .all(|part| matches!(part, std::path::Component::Normal(_))),
-                "selected skill context escapes projection"
-            );
-        }
+        let skill_destination = plugin_root.join("skills").join(install_name.as_str());
         replace_external_runtime_skill(
             selected.installed_path.as_path(),
-            context_destination.as_path(),
+            skill_destination.as_path(),
         )
         .with_context(|| {
             format!(
@@ -1169,7 +1154,7 @@ fn materialize_claude_selected_skill_plugins(
             )
         })?;
         let copied_hash =
-            compute_skill_folder_hash(context_destination.as_path()).with_context(|| {
+            compute_skill_folder_hash(skill_destination.as_path()).with_context(|| {
                 format!(
                     "failed to fingerprint managed Claude skill snapshot `{}`",
                     selected.install_name
@@ -1206,7 +1191,7 @@ fn materialize_claude_selected_skill_plugins(
             "name": plugin_name,
             "version": "1.0.0",
             "description": format!("Pioneer-selected skill {}", selected.install_name),
-            "skills": [format!("./{}", skill_destination.strip_prefix(&plugin_root)?.to_string_lossy())]
+            "skills": [format!("./skills/{install_name}")]
         }))
         .context("failed to serialize managed Claude skill plugin manifest")?;
         let mut manifest_file = std::fs::OpenOptions::new()
@@ -2354,15 +2339,15 @@ impl ClaudeStreamClient {
     }
 
     fn spawn_reader(self: &Arc<Self>, stdout: ChildStdout) {
+        let mut workers = self
+            .workers
+            .try_lock()
+            .expect("Claude reader registration is synchronous");
         let client = self.clone();
         let task = tokio::spawn(async move {
             client.read_loop(stdout).await;
         });
-        self.workers
-            .try_lock()
-            .expect("Claude reader registration is synchronous")
-            .tasks
-            .push(task);
+        workers.tasks.push(task);
     }
 
     async fn stop_workers(&self) -> Result<()> {
@@ -4767,7 +4752,7 @@ pub(crate) mod tests {
         required.fail_closed().await;
         drop(provider_writer);
         let _ = tokio_timeout(Duration::from_secs(1), helper).await;
-        assert!(!supervisor.revoke_session(&process_instance).await);
+        assert!(!supervisor.revoke_session_result(&process_instance).await.unwrap());
     }
 
     #[tokio::test]
@@ -5669,7 +5654,6 @@ done
     fn selected_skill_fixture(path: &Path, install_name: &str) -> CliRuntimeSelectedSkill {
         CliRuntimeSelectedSkill {
             plugin_id: None,
-            skill_relative_path: None,
             install_name: install_name.to_owned(),
             installed_path: path.to_path_buf(),
             source_folder_hash: compute_skill_folder_hash(path).expect("skill fixture hash"),
@@ -6606,89 +6590,5 @@ done
         let _ = child.kill().await;
     }
 
-    // C2 source regression: NOT_RUN / NOT_COMPILED. Materializes argv/files only.
-    #[test]
-    fn owned_claude_manifests_select_exact_member_with_full_context_and_no_native_autoload() {
-        for native_override in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
-            let source = temp.path().join("context-source");
-            let relative = if native_override { "" } else { "skills/member" };
-            for (path, bytes) in [
-                (
-                    format!("{relative}/SKILL.md")
-                        .trim_start_matches('/')
-                        .to_owned(),
-                    "---\nname: same-name\ndescription: member\n---\nBody unchanged\n",
-                ),
-                ("skills/unselected/SKILL.md".into(), "Unselected definition"),
-                ("scripts/run.sh".into(), "package sibling"),
-                ("references/root.txt".into(), "full native context"),
-                ("hooks/hooks.json".into(), "{}"),
-                ("commands/unselected.md".into(), "unmanaged command"),
-            ] {
-                let path = source.join(path);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, bytes).unwrap();
-            }
-            let id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
-            let alias = crate::cli_runtime::skills::plugin_skill_alias("parent", &id);
-            let mut selected = selected_skill_fixture(&source, &alias);
-            selected.plugin_id = Some("parent".into());
-            selected.skill_relative_path = (!native_override).then(|| relative.into());
-            let instance = claude_instance(temp.path().join("home").to_string_lossy().into_owned());
-            let config = claude_process_config_from_instance(
-                &instance,
-                &CLIAgentRuntimeSessionStartOptions {
-                    selected_skills: vec![selected],
-                    approval_policy: Some("default".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            let roots = config
-                .args
-                .windows(2)
-                .filter(|pair| pair[0] == "--plugin-dir")
-                .map(|pair| PathBuf::from(&pair[1]))
-                .collect::<Vec<_>>();
-            assert_eq!(roots.len(), 1);
-            let root = &roots[0];
-            assert_eq!(root.file_name().unwrap().to_string_lossy(), alias);
-            let manifest: JsonValue = serde_json::from_slice(
-                &std::fs::read(root.join(".claude-plugin/plugin.json")).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(manifest["name"], alias);
-            assert_eq!(
-                manifest["skills"],
-                json!([if native_override {
-                    "./context".to_owned()
-                } else {
-                    "./context/skills/member".to_owned()
-                }])
-            );
-            assert_eq!(
-                std::fs::read(root.join("context/scripts/run.sh")).unwrap(),
-                b"package sibling"
-            );
-            assert_eq!(
-                std::fs::read(root.join("context/references/root.txt")).unwrap(),
-                b"full native context"
-            );
-            assert_eq!(
-                std::fs::read(root.join("context").join(relative).join("SKILL.md")).unwrap(),
-                std::fs::read(source.join(relative).join("SKILL.md")).unwrap()
-            );
-            assert!(!root.join("hooks").exists());
-            assert!(!root.join("commands").exists());
-            assert!(manifest.get("hooks").is_none());
-            assert!(manifest.get("commands").is_none());
-            assert!(has_arg(&config.args, "--setting-sources="));
-            assert!(!has_arg(&config.args, "--setting-sources=user"));
-            assert_eq!(
-                arg_value_after(&config.args, "--permission-mode").as_deref(),
-                Some("default")
-            );
-        }
-    }
+
 }

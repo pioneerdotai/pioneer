@@ -2201,7 +2201,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn send_serialized_notification_to_connections(
+    pub(super) async fn send_serialized_notification_to_connections(
         &self,
         method: &str,
         serialized: &str,

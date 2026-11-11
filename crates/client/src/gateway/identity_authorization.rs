@@ -1180,6 +1180,7 @@ impl ClientCore {
         self.resume_provider_runtime_demand();
         self.resume_mcp_demand();
         self.resume_skills_demand();
+        self.resume_plugin_publications();
         self.resume_current_settings_demand();
     }
 

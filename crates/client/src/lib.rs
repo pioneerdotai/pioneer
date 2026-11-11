@@ -110,3 +110,6 @@ pub mod catalog_test_support;
 
 #[cfg(test)]
 pub(crate) static OBSERVABILITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Shared package delivery for Skills and Plugins.
+pub mod package_delivery;

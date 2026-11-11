@@ -34,7 +34,6 @@ use pioneer_protocol::{
 };
 use sea_orm::{
     ActiveValue::Set, ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement,
-    TransactionTrait,
 };
 use std::collections::BTreeMap;
 use std::sync::{

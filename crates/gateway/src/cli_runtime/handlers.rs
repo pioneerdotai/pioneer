@@ -3575,7 +3575,7 @@ impl MessageProcessor {
         }
         let poisoned_hub = hubs.remove(instance);
 
-        let hub = Arc::new(ExecutionEventHub::new_with_owned_progress());
+        let hub = Arc::new(ExecutionEventHub::new());
         let durable_receiver = hub
             .take_durable_receiver()
             .await

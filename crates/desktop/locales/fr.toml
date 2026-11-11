@@ -1751,3 +1751,6 @@ reason_unknown = "L’opération ne s’est pas terminée comme prévu. Consulte
 [mcp.oauth]
 callback_received = "Réponse acceptée. Consultez le résultat de la connexion dans Pioneer."
 callback_rejected = "Connexion refusée. Revenez à Pioneer pour réessayer."
+
+[plugins]
+title = "Plugins"

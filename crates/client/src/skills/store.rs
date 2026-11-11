@@ -111,18 +111,8 @@ impl Drop for SkillsStore {
     }
 }
 /// Active route/picker demand; a retained warm view holds no lease.
-pub struct SkillsDemand {
-    core: Weak<ClientCore>,
-    workspace: String,
-    identity: u64,
-}
-impl Drop for SkillsDemand {
-    fn drop(&mut self) {
-        if let Some(core) = self.core.upgrade() {
-            core.release_skills_demand(&self.workspace, self.identity);
-        }
-    }
-}
+pub type SkillsDemand = crate::request_state::CatalogDemand;
+
 pub struct SkillsRead {
     _demand: SkillsDemand,
     receiver: mpsc::Receiver<Arc<SkillsCatalogPublication>>,
@@ -198,7 +188,7 @@ impl ClientCore {
             .lock()
             .expect("Skills store poisoned")
             .binding_demands
-            .insert(scope.clone(), lease.identity);
+            .insert(scope.clone(), lease.identity());
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -235,7 +225,7 @@ impl ClientCore {
         }
         let mut owner = self.skills_store.lock().expect("Skills store poisoned");
         let catalog = owner.catalogs.get_mut(workspace).unwrap();
-        catalog.waiters.insert(demand.identity, sender);
+        catalog.waiters.insert(demand.identity(), sender);
         catalog.poll.refresh(self.timeline_started.elapsed());
         owner.wake();
         SkillsRead {
@@ -267,8 +257,7 @@ impl ClientCore {
     pub(crate) fn skills_allowed(&self, workspace: &str) -> bool {
         !self.is_stopped()
             && self
-                .authorization_snapshot(Some(workspace), None)
-                .or_else(|| self.authorization_snapshot(None, None))
+                .committed_capability_snapshot(workspace)
                 .is_some_and(|p| {
                     let c = crate::authorization::principal_presentation_capabilities(&p);
                     c.can_use_skills || c.can_manage_capabilities
@@ -288,6 +277,9 @@ impl ClientCore {
         management: bool,
         core: Weak<ClientCore>,
     ) -> SkillsDemand {
+        // Identity transaction precedes every domain guard. A previous resume
+        // or response cannot cross a later fence/commit/protected eviction.
+        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
         let epoch = self.provider_runtime_epoch();
         let now = self.timeline_started.elapsed();
         let mut owner = self.skills_store.lock().expect("Skills store poisoned");
@@ -339,11 +331,12 @@ impl ClientCore {
             self.project_skills_details(catalog);
         }
         owner.wake();
-        SkillsDemand {
-            core,
-            workspace: workspace.into(),
-            identity,
-        }
+        let workspace = workspace.to_owned();
+        crate::request_state::CatalogDemand::new(identity, move || {
+            if let Some(core) = core.upgrade() {
+                core.release_skills_demand(&workspace, identity);
+            }
+        })
     }
     fn release_skills_demand(&self, workspace: &str, identity: u64) {
         let mut owner = self
@@ -515,7 +508,10 @@ impl ClientCore {
         owner.wake();
     }
     pub(crate) fn resume_skills_demand(&self) {
-        self.skills_controller
+        // Identity transaction precedes every domain guard. A previous resume
+        // or response cannot cross a later fence/commit/protected eviction.
+        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
+        self.capability_operations
             .lock()
             .expect("Skills controller poisoned")
             .fenced = false;
@@ -536,6 +532,9 @@ impl ClientCore {
         owner.wake();
     }
     fn next_skills_read(&self) -> Option<ReadRequest> {
+        // Identity transaction precedes every domain guard. A previous resume
+        // or response cannot cross a later fence/commit/protected eviction.
+        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
         let epoch = self.provider_runtime_epoch();
         let now = self.timeline_started.elapsed();
         let mut owner = self.skills_store.lock().expect("Skills store poisoned");
@@ -556,8 +555,7 @@ impl ClientCore {
             };
             let management = !catalog.management_consumers.is_empty()
                 && self
-                    .authorization_snapshot(Some(workspace), None)
-                    .or_else(|| self.authorization_snapshot(None, None))
+                    .committed_capability_snapshot(workspace)
                     .is_some_and(|p| {
                         crate::authorization::principal_presentation_capabilities(&p)
                             .can_manage_capabilities
@@ -586,6 +584,9 @@ impl ClientCore {
         request: ReadRequest,
         response: anyhow::Result<SkillsCatalogSnapshot>,
     ) {
+        // Identity transaction precedes every domain guard. A previous resume
+        // or response cannot cross a later fence/commit/protected eviction.
+        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
         if self.provider_runtime_epoch() != request.epoch
             || !self.skills_allowed(&request.workspace)
         {
@@ -716,6 +717,7 @@ impl ClientCore {
                         .any(|s| &s.skill_id == id)
             });
         drop(owner);
+        drop(_identity);
         if removed {
             self.navigate_skills(super::route::SkillsRoute::List);
         }
@@ -833,6 +835,76 @@ mod tests {
     use crate::catalog_test_support::{client, skill};
     fn response() -> SkillsCatalogSnapshot {
         super::super::catalog::project_skills_snapshot(vec![skill('A'), skill('B')], vec![])
+    }
+    #[test]
+    fn previous_resume_cannot_publish_a_post_fence_read_after_identity_commit() {
+        let core = crate::catalog_test_support::client();
+        let _lease = core.acquire_skills_demand("workspace", None);
+        let before = core.next_skills_read().unwrap();
+        let old_epoch = before.epoch;
+        let old_generation = before.generation;
+        let scope = ClientScope::Skills { workspace_id: Some("workspace".into()) };
+        let subscription = core.subscribe(scope.clone(), std::num::NonZeroUsize::new(64).unwrap());
+        let original = (*core.snapshot(&ClientScope::Administration { workspace_id: None }).unwrap()
+            .snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
+        let mut denied = original.clone();
+        denied.authorization_change_sequence += 1;
+        denied.capabilities.clear_epoch();
+        let (paused, pause) = std::sync::mpsc::channel();
+        let (commit, committed) = std::sync::mpsc::channel();
+        let publisher_core = core.clone();
+        let publisher = std::thread::spawn(move || {
+            crate::core::IDENTITY_BEFORE_COMMIT.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || { paused.send(()).unwrap(); committed.recv_timeout(Duration::from_secs(5)).unwrap(); }));
+            });
+            let _identity = publisher_core.identity_authorization.lock().unwrap();
+            publisher_core.publish_identity_authorization(&denied,
+                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate);
+        });
+        pause.recv_timeout(Duration::from_secs(5)).unwrap(); // All domain fences ran, Q is still A0.
+        let (started, starting) = std::sync::mpsc::channel();
+        let (claimed, claim) = std::sync::mpsc::channel();
+        let (respond, response_ready) = std::sync::mpsc::channel();
+        let reader_core = core.clone();
+        let reader = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            reader_core.resume_skills_demand(); // A delayed resume belonging to the previous acceptance.
+            let next = reader_core.next_skills_read();
+            claimed.send(next.as_ref().map(|r| (r.epoch, r.generation))).unwrap();
+            response_ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            if let Some(request) = next { reader_core.complete_skills_catalog(request, Ok(response())); }
+        });
+        starting.recv_timeout(Duration::from_secs(5)).unwrap();
+        // An implementation may block on I without holding a domain guard.
+        // If it claims before commit, this must be a NEW post-fence request.
+        if let Ok(Some((epoch, generation))) = claim.recv_timeout(Duration::from_millis(100)) {
+            assert_eq!(epoch, old_epoch);
+            assert_ne!(generation, old_generation);
+        }
+        commit.send(()).unwrap();
+        publisher.join().unwrap();
+        while subscription.try_next().is_some() {} // Begin the post-eviction event interval.
+        respond.send(()).unwrap();
+        reader.join().unwrap();
+        if let Some(value) = core.skills_catalog_snapshot("workspace") { assert!(value.catalog.is_empty() && value.installed.is_empty()); }
+        while let Some(event) = subscription.try_next() {
+            if let ClientSubscriptionEvent::Publication { publication, .. } = event {
+                if let Some(value) = publication.snapshot().payload::<SkillsCatalogPublication>() { assert!(value.catalog.is_empty() && value.installed.is_empty()); }
+            }
+        }
+        assert!(core.next_skills_read().is_none());
+        let mut granted = original;
+        granted.authorization_change_sequence += 2;
+        {
+            let _identity = core.identity_authorization.lock().unwrap();
+            core.publish_identity_authorization(&granted,
+                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate);
+        }
+        core.resume_skills_demand();
+        let fresh = core.next_skills_read().expect("real regrant must admit a fresh read");
+        assert_ne!(fresh.epoch, old_epoch);
+        core.complete_skills_catalog(fresh, Ok(response()));
+        assert!(!core.skills_catalog_snapshot("workspace").unwrap().catalog.is_empty());
     }
     #[test]
     fn equality_scoped_details_and_unchanged_rows_survive_reorder() {
@@ -995,6 +1067,50 @@ mod tests {
             &core.skills_catalog_snapshot("workspace").unwrap()
         ));
         assert!(core.next_skills_read().is_some());
+        // A real Pending read precedes a concurrent publisher and native read
+        // owner pass. Cover demand, resume, wait and management classification.
+        for _ in 0..32 {
+            let core = crate::catalog_test_support::client();
+            let _lease = core.acquire_skills_demand("workspace", None);
+            let stale = core.next_skills_read().unwrap();
+            assert!(stale.management, "active native management demand must reach inline policy");
+            let publication = core.snapshot(&ClientScope::Administration { workspace_id: None }).unwrap();
+            let mut revoked = (*publication.snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
+            revoked.authorization_change_sequence += 1;
+            revoked.capabilities.clear_epoch();
+            let start = Arc::new(std::sync::Barrier::new(3));
+            let (finished, observed) = std::sync::mpsc::channel();
+            let publisher_core = core.clone();
+            let publisher_start = start.clone();
+            let publisher_finished = finished.clone();
+            let publisher = std::thread::spawn(move || {
+                let _identity = publisher_core.identity_authorization.lock().unwrap();
+                publisher_start.wait();
+                publisher_core.publish_identity_authorization(
+                    &revoked, crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
+                );
+                publisher_finished.send(()).unwrap();
+            });
+            let worker_core = core.clone();
+            let worker_start = start.clone();
+            let worker = std::thread::spawn(move || {
+                worker_start.wait();
+                let _manager = worker_core.acquire_skills_demand("workspace", None);
+                worker_core.resume_skills_demand();
+                worker_core.refresh_skills("workspace");
+                let _ = worker_core.next_skills_read();
+                let _ = worker_core.skills_wait_duration();
+                worker_core.complete_skills_catalog(stale, Ok(response()));
+                finished.send(()).unwrap();
+            });
+            start.wait();
+            for _ in 0..2 { observed.recv_timeout(Duration::from_secs(5)).expect("publisher/read-owner cycle"); }
+            worker.join().unwrap();
+            publisher.join().unwrap();
+            assert!(core.next_skills_read().is_none());
+            assert!(!core.skills_allowed("workspace"));
+        }
+
     }
     #[test]
     fn composer_read_does_not_request_management_health_and_active_management_can_upgrade_it() {

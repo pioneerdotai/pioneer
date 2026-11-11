@@ -1,0 +1,568 @@
+//! One upload state machine; shells consume progress and submit typed effect results.
+use super::archive::SkillUploadArchive;
+use pioneer_protocol::*;
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUploadState {
+    Preparing,
+    Starting,
+    Uploading,
+    Finishing,
+    Applying,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+impl SkillUploadState {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+/// Stable, secret-free upload failures shared by all shells.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUploadFailure {
+    SourceUnavailable,
+    SourceChanged,
+    SourceTooLarge,
+    InvalidPackage,
+    GatewayUnavailable,
+    AccessDenied,
+    Busy,
+    Unknown,
+}
+impl SkillUploadFailure {
+    pub fn from_error(error: &anyhow::Error) -> Self {
+        use crate::rpc::request::{
+            JsonRpcResponseError, json_rpc_authorization_failure, json_rpc_response_error,
+        };
+        if json_rpc_authorization_failure(error).is_some() {
+            return Self::AccessDenied;
+        }
+        if let Some(error) = json_rpc_response_error(error) {
+            return match error {
+                JsonRpcResponseError::Transport { .. } | JsonRpcResponseError::DeadlineExceeded => {
+                    Self::GatewayUnavailable
+                }
+                JsonRpcResponseError::Server {
+                    message,
+                    machine_code,
+                    ..
+                } => match machine_code.as_deref().unwrap_or(message) {
+                    "plugins.package_rejected"
+                    | "plugins.upload_unavailable_or_invalid_archive" => Self::InvalidPackage,
+                    "plugins.busy" | "package_delivery.busy" => Self::Busy,
+                    _ => Self::Unknown,
+                },
+                _ => Self::Unknown,
+            };
+        }
+        for cause in error.chain() {
+            if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) {
+                    return Self::SourceUnavailable;
+                }
+            }
+            match cause.to_string().as_str() {
+                "source_unavailable" | "source_kind" => return Self::SourceUnavailable,
+                "source_changed" => return Self::SourceChanged,
+                "invalid_upload_archive" => return Self::InvalidPackage,
+                "entry_limit" | "entry_size_limit" | "expanded_limit" => return Self::SourceTooLarge,
+                "gateway_not_connected" | "client_stopped" => return Self::GatewayUnavailable,
+                "capability_access_denied" | "capability_read_denied" => return Self::AccessDenied,
+                "skill_upload_pending" | "skills_upload_backpressure" => return Self::Busy,
+                _ => {}
+            }
+        }
+        Self::Unknown
+    }
+}
+// Named DTOs are consumed by both desktop upload state and mobile generated
+// contracts. Their wire shape is generated directly (no tuple-schema override).
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PluginPreviewPublication {
+    pub upload_id: String,
+    pub package: PluginsPreviewResponse,
+}
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PluginUpdatePreviewPublication {
+    pub upload_id: String,
+    pub preview: PluginsUpdatePreviewResponse,
+}
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SkillUploadPublication {
+    /// Apply was dispatched without an authoritative result; retained identity is retryable.
+    pub mutation_uncertain: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<SkillUploadFailure>,
+    pub plugin_preview: Option<PluginPreviewPublication>,
+    pub plugin_result: Option<PluginItem>,
+    pub plugin_update_preview: Option<PluginUpdatePreviewPublication>,
+    pub operation_id: u64,
+    pub generation: u64,
+    pub revision: u64,
+    pub state: SkillUploadState,
+    pub sent_bytes: u64,
+    pub total_bytes: u64,
+    pub target: super::operations::SkillUploadTarget,
+    pub pack: bool,
+}
+pub(crate) enum UploadEffect {
+    Start(SkillsUploadStartParams),
+    Chunk {
+        upload_id: String,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    Finish(SkillsUploadFinishParams),
+    Apply {
+        upload_id: String,
+    },
+}
+pub(crate) enum UploadCompletion {
+    Start(SkillsUploadStartResponse),
+    Chunk(SkillsUploadChunkAckNotification),
+    Finish(SkillsUploadFinishResponse),
+    Applied,
+    PluginApplied(PluginItem),
+    PluginPreviewed(String, PluginsPreviewResponse),
+    PluginUpdatePreviewed(String, PluginsUpdatePreviewResponse),
+}
+pub(crate) struct SkillUploadFlow {
+    pub publication: SkillUploadPublication,
+    workspace: String,
+    archive: Option<SkillUploadArchive>,
+    upload_id: Option<String>,
+    chunk_size: usize,
+    expected_end: u64,
+    in_flight: bool,
+    effect_generation: u64,
+    cleanup_upload: Option<String>,
+}
+impl SkillUploadFlow {
+    pub fn new(operation: u64, workspace: String) -> Self {
+        Self {
+            publication: SkillUploadPublication {
+                mutation_uncertain: false,
+                failure: None,
+                plugin_preview: None,
+                plugin_result: None,
+                plugin_update_preview: None,
+                operation_id: operation,
+                generation: operation,
+                revision: 0,
+                state: SkillUploadState::Preparing,
+                sent_bytes: 0,
+                total_bytes: 0,
+                target: super::operations::SkillUploadTarget::Install,
+                pack: false,
+            },
+            workspace,
+            archive: None,
+            upload_id: None,
+            chunk_size: 0,
+            expected_end: 0,
+            in_flight: false,
+            effect_generation: 0,
+            cleanup_upload: None,
+        }
+    }
+    pub fn prepare(&mut self, archive: SkillUploadArchive) -> bool {
+        if self.publication.state != SkillUploadState::Preparing {
+            return false;
+        }
+        if super::upload::skills_upload_start_params(&self.workspace, &archive).is_err() {
+            self.terminate(SkillUploadState::Failed);
+            return true;
+        }
+        self.publication.total_bytes = archive.bytes.len() as u64;
+        self.archive = Some(archive);
+        self.publication.state = SkillUploadState::Starting;
+        true
+    }
+    pub fn effect(&mut self) -> Option<UploadEffect> {
+        if self.in_flight || self.publication.state.is_terminal() {
+            return None;
+        }
+        let archive = self.archive.as_ref()?;
+        let effect = match self.publication.state {
+            SkillUploadState::Starting => UploadEffect::Start(
+                super::upload::skills_upload_start_params(&self.workspace, archive).ok()?,
+            ),
+            SkillUploadState::Uploading => {
+                let chunk = super::upload::next_skill_upload_chunk(
+                    &archive.bytes,
+                    self.publication.sent_bytes as usize,
+                    self.chunk_size,
+                )
+                .ok()??;
+                self.expected_end = chunk.next_offset_bytes;
+                UploadEffect::Chunk {
+                    upload_id: self.upload_id.clone()?,
+                    offset: chunk.offset_bytes,
+                    bytes: chunk.bytes,
+                }
+            }
+            SkillUploadState::Finishing => {
+                UploadEffect::Finish(super::upload::skills_upload_finish_params(
+                    &self.workspace,
+                    self.upload_id.clone()?,
+                ))
+            }
+            SkillUploadState::Applying => UploadEffect::Apply {
+                upload_id: self.upload_id.clone()?,
+            },
+            _ => return None,
+        };
+        self.in_flight = true;
+        self.effect_generation = self
+            .effect_generation
+            .checked_add(1)
+            .expect("upload effect generation exhausted");
+        Some(effect)
+    }
+    pub fn complete(&mut self, generation: u64, completion: UploadCompletion) -> bool {
+        if generation != self.effect_generation
+            || !self.in_flight
+            || self.publication.state.is_terminal()
+        {
+            return false;
+        }
+        let valid = match (&completion, self.publication.state) {
+            (UploadCompletion::Start(start), SkillUploadState::Starting) => {
+                !start.upload_id.is_empty()
+                    && start.max_chunk_size_bytes > 0
+                    && start.recommended_chunk_size_bytes > 0
+                    && self.publication.total_bytes <= start.max_compressed_size_bytes
+                    && self.archive.as_ref().is_some_and(|a| {
+                        a.uncompressed_size_bytes <= start.max_uncompressed_size_bytes
+                    })
+            }
+            (UploadCompletion::Chunk(ack), SkillUploadState::Uploading) => {
+                Some(&ack.upload_id) == self.upload_id.as_ref()
+                    && ack.offset == self.publication.sent_bytes
+                    && ack.len == self.expected_end - self.publication.sent_bytes
+                    && ack.next_offset == self.expected_end
+                    && ack.received_bytes == self.expected_end
+            }
+            (UploadCompletion::Finish(finish), SkillUploadState::Finishing) => {
+                Some(&finish.upload_id) == self.upload_id.as_ref()
+                    && finish.status == "finalized"
+                    && finish.compressed_size_bytes == self.publication.total_bytes
+                    && self
+                        .archive
+                        .as_ref()
+                        .is_some_and(|a| a.sha256 == finish.sha256)
+            }
+            (
+                UploadCompletion::Applied
+                | UploadCompletion::PluginApplied(_)
+                | UploadCompletion::PluginUpdatePreviewed(_, _)
+                | UploadCompletion::PluginPreviewed(_, _),
+                SkillUploadState::Applying,
+            ) => true,
+            _ => return false,
+        };
+        if !valid {
+            if let UploadCompletion::Start(start) = &completion
+                && !start.upload_id.is_empty()
+            {
+                self.upload_id = Some(start.upload_id.clone());
+            }
+            self.terminate(SkillUploadState::Failed);
+            return true;
+        }
+        self.in_flight = false;
+        match completion {
+            UploadCompletion::Start(start) => {
+                self.chunk_size = start
+                    .recommended_chunk_size_bytes
+                    .min(start.max_chunk_size_bytes)
+                    .min(usize::MAX as u64) as usize;
+                self.upload_id = Some(start.upload_id);
+                self.publication.state = if self.publication.total_bytes == 0 {
+                    SkillUploadState::Finishing
+                } else {
+                    SkillUploadState::Uploading
+                };
+            }
+            UploadCompletion::Chunk(_) => {
+                self.publication.sent_bytes = self.expected_end;
+                if self.publication.sent_bytes == self.publication.total_bytes {
+                    self.publication.state = SkillUploadState::Finishing;
+                }
+            }
+            UploadCompletion::Finish(_) => {
+                self.publication.state = SkillUploadState::Applying;
+            }
+            UploadCompletion::PluginPreviewed(upload_id, preview) => {
+                self.publication.plugin_preview = Some(PluginPreviewPublication {
+                    upload_id,
+                    package: preview,
+                });
+                self.terminate(SkillUploadState::Succeeded);
+                self.cleanup_upload = None;
+            }
+            UploadCompletion::PluginApplied(item) => {
+                self.publication.plugin_preview = None;
+                self.publication.plugin_update_preview = None;
+                self.publication.mutation_uncertain = false;
+                self.publication.plugin_result = Some(item);
+                self.terminate(SkillUploadState::Succeeded);
+                self.cleanup_upload = None;
+            }
+            UploadCompletion::PluginUpdatePreviewed(upload_id, preview) => {
+                self.publication.plugin_update_preview =
+                    Some(PluginUpdatePreviewPublication { upload_id, preview });
+                self.terminate(SkillUploadState::Succeeded);
+                self.cleanup_upload = None; // Finalized upload is retained for explicit confirmation/expiry.
+            }
+            UploadCompletion::Applied => {
+                self.terminate(SkillUploadState::Succeeded);
+            }
+        }
+        true
+    }
+    pub fn fail_uncertain(&mut self, failure: SkillUploadFailure) {
+        self.publication.mutation_uncertain = true;
+        self.publication.failure = Some(failure);
+        self.terminate(SkillUploadState::Failed);
+        // The server may own a committed package. Expiry/reconciliation owns
+        // remote cleanup; abort would confuse unknown outcome with rollback.
+        self.cleanup_upload = None;
+    }
+    pub fn fail(&mut self, failure: SkillUploadFailure) {
+        if self.publication.state.is_terminal() {
+            return;
+        }
+        self.publication.failure = Some(failure);
+        self.terminate(SkillUploadState::Failed);
+    }
+    pub fn terminate(&mut self, state: SkillUploadState) -> Option<String> {
+        if self.publication.state.is_terminal() {
+            return None;
+        }
+        if state == SkillUploadState::Failed && self.publication.failure.is_none() {
+            self.publication.failure = Some(SkillUploadFailure::Unknown);
+        }
+        self.publication.state = state;
+        self.in_flight = false;
+        self.archive.take();
+        let remote = self.upload_id.take();
+        if state != SkillUploadState::Succeeded {
+            self.cleanup_upload = remote.clone();
+        }
+        remote
+    }
+    pub fn accepts_effect(&self, generation: u64) -> bool {
+        generation == self.effect_generation
+            && self.in_flight
+            && !self.publication.state.is_terminal()
+    }
+    pub fn effect_generation(&self) -> u64 {
+        self.effect_generation
+    }
+    pub fn take_cleanup(&mut self) -> Option<String> {
+        self.cleanup_upload.take()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn prepared() -> SkillUploadFlow {
+        let mut f = SkillUploadFlow::new(7, "workspace".into());
+        f.prepare(SkillUploadArchive {
+            file_name: "skill.tar.gz".into(),
+            bytes: vec![1, 2, 3],
+            sha256: "digest".into(),
+            uncompressed_size_bytes: 3,
+        });
+        f
+    }
+    fn start() -> UploadCompletion {
+        UploadCompletion::Start(SkillsUploadStartResponse {
+            upload_id: "upload".into(),
+            recommended_chunk_size_bytes: 2,
+            max_chunk_size_bytes: 2,
+            max_compressed_size_bytes: 10,
+            max_uncompressed_size_bytes: 10,
+            expires_at_unix: 1,
+        })
+    }
+    #[test]
+    fn ordered_upload_validates_identity_offsets_finish_and_terminal_once() {
+        let mut f = prepared();
+        assert!(matches!(f.effect(), Some(UploadEffect::Start(_))));
+        assert!(f.effect().is_none());
+        assert!(!f.complete(8, start()));
+        assert!(f.complete(1, start()));
+        assert!(
+            matches!(f.effect(),Some(UploadEffect::Chunk{offset:0,bytes,..}) if bytes==vec![1,2])
+        );
+        assert!(f.complete(
+            2,
+            UploadCompletion::Chunk(SkillsUploadChunkAckNotification {
+                upload_id: "upload".into(),
+                offset: 0,
+                len: 2,
+                received_bytes: 2,
+                next_offset: 2
+            })
+        ));
+        assert!(!f.complete(1, start()));
+        assert!(
+            matches!(f.effect(),Some(UploadEffect::Chunk{offset:2,bytes,..}) if bytes==vec![3])
+        );
+        assert!(!f.complete(
+            2,
+            UploadCompletion::Chunk(SkillsUploadChunkAckNotification {
+                upload_id: "upload".into(),
+                offset: 0,
+                len: 2,
+                received_bytes: 2,
+                next_offset: 2
+            })
+        ));
+        f.complete(
+            3,
+            UploadCompletion::Chunk(SkillsUploadChunkAckNotification {
+                upload_id: "upload".into(),
+                offset: 2,
+                len: 1,
+                received_bytes: 3,
+                next_offset: 3,
+            }),
+        );
+        assert!(matches!(f.effect(), Some(UploadEffect::Finish(_))));
+        f.complete(
+            4,
+            UploadCompletion::Finish(SkillsUploadFinishResponse {
+                upload_id: "upload".into(),
+                status: "finalized".into(),
+                sha256: "digest".into(),
+                compressed_size_bytes: 3,
+            }),
+        );
+        assert!(matches!(f.effect(), Some(UploadEffect::Apply { .. })));
+        assert!(f.complete(5, UploadCompletion::Applied));
+        assert_eq!(f.publication.state, SkillUploadState::Succeeded);
+        assert!(f.archive.is_none());
+        assert!(!f.complete(5, UploadCompletion::Applied));
+    }
+    #[test]
+    fn cancellation_and_invalid_ack_release_bytes_and_ignore_late_results() {
+        let mut f = prepared();
+        f.effect();
+        f.complete(1, start());
+        f.effect();
+        f.complete(
+            2,
+            UploadCompletion::Chunk(SkillsUploadChunkAckNotification {
+                upload_id: "wrong".into(),
+                offset: 0,
+                len: 2,
+                received_bytes: 2,
+                next_offset: 2,
+            }),
+        );
+        assert_eq!(f.publication.state, SkillUploadState::Failed);
+        assert!(f.archive.is_none());
+        let mut f = prepared();
+        f.effect();
+        f.terminate(SkillUploadState::Cancelled);
+        assert!(!f.complete(1, start()));
+        assert!(f.effect().is_none());
+        assert!(f.archive.is_none());
+    }
+}
+
+#[cfg(test)]
+mod plugin_preview_regressions {
+    use super::*;
+    // NOT_RUN / NOT_COMPILED. A preview completes delivery, never installation.
+    #[test]
+    fn explicit_preview_retains_only_finalized_upload_for_confirmation() {
+        let mut flow = SkillUploadFlow::new(1, "workspace".into());
+        assert!(flow.prepare(SkillUploadArchive {
+            file_name: "mixed.zip".into(),
+            bytes: vec![1, 2, 3],
+            sha256: "digest".into(),
+            uncompressed_size_bytes: 0
+        }));
+        flow.publication.state = SkillUploadState::Applying;
+        flow.upload_id = Some("finalized".into());
+        let _ = flow.effect().unwrap();
+        let generation = flow.effect_generation();
+        assert!(flow.complete(
+            generation,
+            UploadCompletion::PluginPreviewed(
+                "finalized".into(),
+                PluginsPreviewResponse {
+                    name: "mixed".into(),
+                    version: None,
+                    description: None,
+                    fingerprint: "fingerprint".into(),
+                    components: vec![],
+                    diagnostics: vec![]
+                }
+            )
+        ));
+        assert_eq!(flow.publication.state, SkillUploadState::Succeeded);
+        assert!(flow.publication.plugin_result.is_none());
+        assert_eq!(
+            flow.publication.plugin_preview.as_ref().unwrap().upload_id,
+            "finalized"
+        );
+        assert!(flow.effect().is_none());
+        assert!(flow.take_cleanup().is_none());
+        assert!(!flow.complete(generation, UploadCompletion::Applied));
+    }
+
+    #[test]
+    fn failed_upload_publications_keep_safe_causes_without_external_error_text() {
+        use crate::rpc::request::JsonRpcResponseError;
+        let cases = [
+            (
+                anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                SkillUploadFailure::SourceUnavailable,
+            ),
+            (
+                anyhow::Error::from(JsonRpcResponseError::server(
+                    Some(-32600),
+                    "plugins.package_rejected",
+                    None,
+                )),
+                SkillUploadFailure::InvalidPackage,
+            ),
+            (
+                anyhow::Error::from(JsonRpcResponseError::DeadlineExceeded),
+                SkillUploadFailure::GatewayUnavailable,
+            ),
+            (
+                anyhow::Error::from(JsonRpcResponseError::server(
+                    None,
+                    "private-path-and-token",
+                    None,
+                )),
+                SkillUploadFailure::Unknown,
+            ),
+        ];
+        for (error, expected) in cases {
+            let mut flow = SkillUploadFlow::new(1, "workspace".into());
+            flow.fail(SkillUploadFailure::from_error(&error));
+            assert_eq!(flow.publication.state, SkillUploadState::Failed);
+            assert_eq!(flow.publication.failure, Some(expected));
+            let publication = serde_json::to_string(&flow.publication).unwrap();
+            assert!(!publication.contains("private-path-and-token"));
+        }
+    }
+}

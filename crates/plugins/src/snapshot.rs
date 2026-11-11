@@ -15,17 +15,6 @@ pub struct Limits {
     pub depth: usize,
     pub components: usize,
 }
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            expanded_bytes: 256 * 1024 * 1024,
-            entry_bytes: 32 * 1024 * 1024,
-            entries: 10_000,
-            depth: 32,
-            components: 256,
-        }
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
     Directory { mode: u32 },
@@ -41,18 +30,13 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Blocking bounded filesystem work, intended for a delivery worker outside
-    /// database capacity. Two independently verified scans reject mixed trees.
+    /// database capacity. Each file is verified while capturing its bytes.
     pub fn capture(root: &Path, limits: Limits, cancelled: impl Fn() -> bool) -> Result<Self> {
         let root = root.canonicalize().context("source_unavailable")?;
         if !root.is_dir() {
             bail!("source_kind");
         }
-        let first = capture_once(&root, limits, &cancelled)?;
-        let second = capture_once(&root, limits, &cancelled)?;
-        if first.entries != second.entries || first.root_mode != second.root_mode {
-            bail!("source_changed");
-        }
-        Ok(first)
+        capture_once(&root, limits, &cancelled)
     }
     pub fn from_entries(entries: BTreeMap<String, Entry>, limits: Limits) -> Result<Self> {
         if entries.len() > limits.entries {

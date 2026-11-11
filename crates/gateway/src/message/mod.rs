@@ -24,6 +24,7 @@ mod message_mutations;
 mod message_turn;
 mod native_health;
 mod notifications;
+mod package_delivery;
 mod patch_history_handlers;
 mod permission_handlers;
 pub(crate) mod plugins;
@@ -4543,9 +4544,10 @@ impl MessageProcessor {
         self.skills_write_lock.clone().lock_owned().await
     }
 
-    pub(crate) async fn install_one_cli_runtime_skill(
+    pub(crate) async fn install_one_cli_runtime_skill<F: std::future::Future<Output = anyhow::Result<()>>>(
         &self,
         plan: &crate::cli_runtime::skills::CliRuntimeSkillInstallPlan,
+        before_replace: F,
     ) -> anyhow::Result<crate::cli_runtime::skills::CliRuntimeSkillInstallResult> {
         let candidates = self
             .external_runtime_receipt_conversion_candidates()
@@ -4555,6 +4557,7 @@ impl MessageProcessor {
             &self.skills_write_lock,
             candidates.as_slice(),
             plan,
+            before_replace,
         )
         .await
     }

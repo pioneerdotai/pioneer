@@ -152,11 +152,8 @@ impl ManagedHttpClient {
         auth_token: Option<&str>,
         mut headers: HashMap<HeaderName, HeaderValue>,
     ) -> HashMap<HeaderName, HeaderValue> {
-        // Only discard a portable fallback when this request will use generated
-        // authorization. Keep it for anonymous requests, and keep legacy rules.
-        if self.installation.is_portable_plugin()
-            && (self.authorized.is_some() || auth_token.is_some())
-        {
+        // Managed authorization wins when it is present, for every MCP server.
+        if self.authorized.is_some() || auth_token.is_some() {
             headers.remove(&http::header::AUTHORIZATION);
         }
         headers
@@ -439,7 +436,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn portable_authorization_fallback_is_kept_until_a_request_has_generated_auth() {
+    fn authorization_uses_one_policy_for_every_installation_origin() {
         let installation = crate::parse_install_config(
             r#"{"mcpServers":{"http":{"url":"https://example.org/mcp","headers":{"Authorization":"Bearer fallback"}}}}"#,
             crate::InstallParseContext {
@@ -466,18 +463,14 @@ mod tests {
                 HeaderValue::from_static("keep"),
             ),
         ]);
-        // Legacy custom Authorization still reaches the native HTTP implementation.
-        assert_eq!(
-            client.request_headers(Some("generated"), headers.clone()),
-            headers
-        );
-        assert!(client.installation.explicit_authorization_overrides_oauth());
-        client.installation.source_ref = serde_json::json!({"plugin_id":"parent"});
-        assert!(!client.installation.explicit_authorization_overrides_oauth());
-        assert_eq!(client.request_headers(None, headers.clone()), headers);
-        let generated = client.request_headers(Some("generated"), headers);
-        assert!(!generated.contains_key(&http::header::AUTHORIZATION));
-        assert_eq!(generated[&HeaderName::from_static("x-context")], "keep");
+        for source in [serde_json::json!({}), serde_json::json!({"plugin_id":"parent"})] {
+            client.installation.source_ref = source;
+            assert!(client.installation.explicit_authorization_overrides_oauth());
+            assert_eq!(client.request_headers(None, headers.clone()), headers);
+            let generated = client.request_headers(Some("generated"), headers.clone());
+            assert!(!generated.contains_key(&http::header::AUTHORIZATION));
+            assert_eq!(generated[&HeaderName::from_static("x-context")], "keep");
+        }
     }
 
     struct CauseProvider {

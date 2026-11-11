@@ -1,4 +1,4 @@
-use crate::{binding::CatalogBinding, sidebar::CatalogSidebar, table::*};
+use crate::{sidebar::CatalogSidebar, table::*};
 use gpui_kit::component::VirtualListScrollHandle;
 use gpui_kit::component::table::TableState;
 use gpui_kit::{prelude::*, *};
@@ -9,6 +9,7 @@ use pioneer_client::{
     mcp::{operations::*, store::*, types::*},
     navigation::{ClientNavigationState, SemanticDestination},
 };
+use pioneer_desktop_foundation::CatalogBinding;
 use pioneer_desktop_foundation::ClientBindingRegistrar;
 use std::sync::{
     Arc,
@@ -125,6 +126,7 @@ pub struct McpCatalogView {
     pub(crate) sidebar_width: Pixels,
     pub(crate) mount: u64,
     pub(crate) window_active: bool,
+    embedded_active: bool,
     pub(crate) presentation_error: Option<String>,
     pub(crate) native_task: Option<Task<()>>,
     pub(crate) parent_generation: u64,
@@ -167,7 +169,7 @@ impl McpCatalogView {
         let mount = NEXT_MOUNT.fetch_add(1, Ordering::Relaxed);
         cx.new(|cx| {
             let binding = CatalogBinding::new(config.registrar);
-            let mut changed = binding.changed.subscribe();
+            let mut changed = binding.watch();
             let handle = window.window_handle();
             let task = cx.spawn(async move |view: WeakEntity<Self>, cx| {
                 while changed.changed().await.is_ok() {
@@ -228,6 +230,7 @@ impl McpCatalogView {
                 sidebar_width: px(320.),
                 mount,
                 window_active: window.is_window_active(),
+                embedded_active: false,
                 presentation_error: None,
                 native_task: None,
                 parent_generation: 0,
@@ -237,8 +240,19 @@ impl McpCatalogView {
             view
         })
     }
+    pub(crate) fn is_plugin_component(&self) -> bool {
+        self.plugin_component.is_some()
+    }
     pub fn sidebar(&self) -> AnyView {
         self.sidebar.clone().into()
+    }
+    pub fn set_embedded_context(&mut self, width: Pixels, active: bool, cx: &mut Context<Self>) {
+        self.set_sidebar_width(width, cx);
+        if self.embedded_active != active {
+            self.embedded_active = active;
+            self.sync_demand();
+            cx.notify();
+        }
     }
     pub fn set_sidebar_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
         if self.sidebar_width != width {
@@ -265,6 +279,16 @@ impl McpCatalogView {
         .into()
     }
     fn visible(&self) -> bool {
+        if let Some((workspace, parent, child)) = &self.plugin_component {
+            let navigation = self.client.navigation_snapshot();
+            return self.embedded_active
+                && navigation.workspace_id() == Some(workspace.as_str())
+                && matches!(navigation.destination(), SemanticDestination::Plugin { plugin_id, component: Some(key) }
+                    if plugin_id == parent && self.client.plugin_details_publication(workspace, parent)
+                        .and_then(|p| p.details).is_some_and(|p| p.components.iter().any(|c|
+                            c.kind == key.kind && c.member_key == key.member_key && c.mcp_installation_id.as_ref() == Some(child))));
+        }
+
         matches!(
             self.input.navigation_input.destination(),
             SemanticDestination::Mcp { .. }
@@ -336,6 +360,25 @@ impl McpCatalogView {
             });
             let catalog = self.client.mcp_catalog_snapshot(&workspace);
             if let Some(catalog) = catalog {
+                if self.plugin_component.is_none() {
+                    if let SemanticDestination::Mcp {
+                        server_id: Some(id),
+                    } = next.navigation_input.destination()
+                    {
+                        let destination = self.client.mcp_destination(&workspace, id);
+                        if matches!(destination, SemanticDestination::Plugin { .. })
+                            && self.client.navigation_snapshot().as_ref()
+                                == next.navigation_input.as_ref()
+                        {
+                            self.client.navigate(
+                                pioneer_client::navigation::NavigationIntent::Navigate {
+                                    destination,
+                                },
+                                None,
+                            );
+                        }
+                    }
+                }
                 next.mcp_servers = catalog
                     .servers()
                     .iter()
@@ -446,6 +489,30 @@ impl McpCatalogView {
             self.native_task = None;
             self.presentation_error = None;
         }
+        if let Some((workspace, parent, child)) = &self.plugin_component {
+            scopes.push(ClientScope::Plugins {
+                workspace_id: workspace.clone(),
+            });
+            if let Some(publication) = self.client.plugin_details_publication(workspace, parent) {
+                if let Some(operation) = publication.operations.get(parent) {
+                    if operation.busy || (operation.uncertain && !self.client.plugin_parent_recovery_available(workspace, parent)) {
+                        next.pending.insert(child.clone());
+                    }
+                    let error = if operation.uncertain {
+                        Some(t!("mcp.error.plugin_uncertain").to_string())
+                    } else {
+                        operation
+                            .error
+                            .as_ref()
+                            .map(|_| t!("mcp.error.plugin_change_failed").to_string())
+                    };
+                    if self.presentation_error != error {
+                        self.presentation_error = error;
+                        cx.notify();
+                    }
+                }
+            }
+        }
         let changed = *self.input != next;
         let screen_changed = !self.input.same_screen(&next);
         let sidebar_changed = !self.input.same_sidebar(&next);
@@ -543,6 +610,130 @@ mod tests {
         ) -> ClientBindingRegistration {
             ClientBindingRegistration::new(|| {})
         }
+    }
+    #[gpui_kit::test]
+    fn late_owner_redirect_only_follows_current_exact_mcp_route(cx: &mut TestAppContext) {
+        use pioneer_client::{
+            core::*,
+            navigation::{SemanticDestination, SettingsRoute},
+            plugins::runtime::PluginPublication,
+            plugins::{PluginComponentItem, PluginItem},
+        };
+        cx.update(gpui_kit::init);
+        let client = pioneer_client::catalog_test_support::client();
+        client.navigate(
+            NavigationIntent::SelectWorkspace {
+                workspace_id: Some("workspace".into()),
+            },
+            None,
+        );
+        client.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Mcp {
+                    server_id: Some("server".into()),
+                },
+            },
+            None,
+        );
+        client.accept_mcp_catalog_for_test(
+            "workspace",
+            pioneer_client::catalog_test_support::mcp(&["server"]),
+        );
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let view = McpCatalogView::new(
+                McpCatalogConfig::new(client.clone(), Arc::new(Registrar)),
+                window,
+                cx,
+            );
+            gpui_kit::component::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<McpCatalogView>().unwrap()
+        });
+        // The owner becomes known after the user has already left the native route.
+        client.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Threads,
+            },
+            None,
+        );
+        let publication = PluginPublication {
+            plugins: vec![PluginItem {
+                id: "parent".into(),
+                name: "Parent".into(),
+                version: None,
+                description: None,
+                enabled: true,
+                state: "installed".into(),
+                revision: 1,
+                status: "installed".into(),
+                diagnostics: vec![],
+                components: vec![PluginComponentItem {
+                    kind: "mcp".into(),
+                    member_key: "member".into(),
+                    status: "installed".into(),
+                    diagnostic: None,
+                    skill_id: None,
+                    mcp_installation_id: Some("server".into()),
+                    runtime_status: None,
+                }],
+            }],
+            ..Default::default()
+        };
+        client.publish(
+            &ClientMutationAuthority::for_test(),
+            ClientScope::Plugins {
+                workspace_id: "workspace".into(),
+            },
+            ClientRevisions::new(
+                DomainRevision::new(1),
+                PresentationRevision::new(1),
+                ContentRevision::new(1),
+                ScopedRevision::new(1),
+            ),
+            Arc::new(publication),
+            vec![],
+        );
+        for destination in [
+            SemanticDestination::Threads,
+            SemanticDestination::Settings {
+                route: SettingsRoute::Account,
+            },
+        ] {
+            client.navigate(
+                NavigationIntent::Navigate {
+                    destination: destination.clone(),
+                },
+                None,
+            );
+            cx.update(|window, cx| view.update(cx, |v, cx| v.sync_publications(window, cx)));
+            assert_eq!(client.navigation_snapshot().destination(), &destination);
+        }
+        client.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Threads,
+            },
+            None,
+        );
+        client.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Mcp {
+                    server_id: Some("server".into()),
+                },
+            },
+            None,
+        );
+        cx.update(|window, cx| view.update(cx, |v, cx| v.sync_publications(window, cx)));
+        assert!(
+            matches!(client.navigation_snapshot().destination(),SemanticDestination::Plugin {plugin_id,component:Some(_)} if plugin_id=="parent")
+        );
+        client.navigate(NavigationIntent::BackFromPlugin, None);
+        client.navigate(NavigationIntent::BackFromPlugin, None);
+        cx.update(|window, cx| view.update(cx, |v, cx| v.sync_publications(window, cx)));
+        assert_eq!(
+            client.navigation_snapshot().destination(),
+            &SemanticDestination::Threads
+        );
     }
     #[gpui_kit::test]
     fn changed_server_updates_only_its_retained_row_and_reorder_keeps_other_identity(

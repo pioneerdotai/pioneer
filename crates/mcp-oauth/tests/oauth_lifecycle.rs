@@ -205,12 +205,24 @@ async fn resource_metadata(State(s): State<Arc<Fake>>) -> Json<Value> {
 }
 async fn as_metadata(State(s): State<Arc<Fake>>, headers: HeaderMap) -> Response {
     s.discovery_headers.lock().unwrap().push(headers);
-    match s.discovery_mode.load(Ordering::SeqCst) {
+    let mode = s.discovery_mode.load(Ordering::SeqCst);
+    match mode {
         1 => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         2 => return StatusCode::NOT_FOUND.into_response(),
         _ => {}
     }
-    Json(json!({"issuer":s.base,"authorization_endpoint":format!("{}/authorize",s.base),"token_endpoint":format!("{}/token",s.base),"registration_endpoint":format!("{}/register",s.base),"token_endpoint_auth_methods_supported":["client_secret_basic","client_secret_post","none"],"response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true,"scopes_supported":["read","write","offline_access"]})).into_response()
+    let mut metadata = json!({"issuer":s.base,"authorization_endpoint":format!("{}/authorize",s.base),"token_endpoint":format!("{}/token",s.base),"registration_endpoint":format!("{}/register",s.base),"token_endpoint_auth_methods_supported":["client_secret_basic","client_secret_post","none"],"response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true,"scopes_supported":["read","write","offline_access"]});
+    // CIMD-only provider, or a provider supporting both CIMD and DCR.
+    if matches!(mode, 3 | 4) {
+        metadata["client_id_metadata_document_supported"] = json!(true);
+        if mode == 3 {
+            metadata
+                .as_object_mut()
+                .unwrap()
+                .remove("registration_endpoint");
+        }
+    }
+    Json(metadata).into_response()
 }
 async fn register(State(s): State<Arc<Fake>>, Json(body): Json<Value>) -> Response {
     s.registrations.fetch_add(1, Ordering::SeqCst);
@@ -240,6 +252,12 @@ async fn token(
             fields.get("client_secret").map(String::as_str),
             Some("client-secret-canary")
         );
+    } else if fields.get("client_id").map(String::as_str)
+        == Some("https://getpioneer.dev/oauth/client-metadata.json")
+    {
+        assert!(matches!(s.discovery_mode.load(Ordering::SeqCst), 3 | 4));
+        assert!(headers.get("authorization").is_none());
+        assert!(!fields.contains_key("client_secret"));
     } else if s.preregistered_post.load(Ordering::SeqCst) {
         assert!(headers.get("authorization").is_none());
         assert_eq!(
@@ -664,6 +682,55 @@ async fn protected_install_starts_one_browser_flow_and_callback_connects() {
     session.shutdown().await;
     h.service.shutdown().await;
 }
+#[tokio::test]
+async fn cimd_login_restores_and_refreshes_without_dynamic_registration() {
+    for discovery_mode in [3, 4] {
+        let h = Harness::new(true).await;
+        h.server
+            .data
+            .discovery_mode
+            .store(discovery_mode, Ordering::SeqCst);
+        let event = h.login().await;
+        let url = url::Url::parse(event.authorization_url.as_ref().unwrap()).unwrap();
+        let query = url.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            query["client_id"],
+            "https://getpioneer.dev/oauth/client-metadata.json"
+        );
+        assert_eq!(query["code_challenge_method"], "S256");
+        let record = h.persistence.read("installation").await.unwrap().unwrap();
+        assert_eq!(
+            record.registration.client_id.as_str(),
+            query["client_id"].as_ref()
+        );
+        assert!(record.registration.client_secret.is_none());
+        assert!(record.registration.registration_response.is_none());
+        let mut session = h.connect().await.unwrap();
+        assert_eq!(session.initial_catalog().tools_count(), 1);
+        session.shutdown().await;
+        h.service.shutdown().await;
+
+        let restored = McpOAuthService::new(h.persistence.clone(), h.sink.clone()).unwrap();
+        let client = restored
+            .client("installation", &h.server.installation())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.get_access_token().await.unwrap(), "access-0");
+        client
+            .auth_manager
+            .lock()
+            .await
+            .refresh_token()
+            .await
+            .unwrap();
+        assert_eq!(h.server.data.exchanges.load(Ordering::SeqCst), 1);
+        assert_eq!(h.server.data.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(h.server.data.registrations.load(Ordering::SeqCst), 0);
+        restored.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn wrong_state_or_issuer_does_not_consume_valid_callback() {
     let h = Harness::new(true).await;
@@ -1362,6 +1429,7 @@ async fn expired_credentials_survive_resave_and_refresh_before_first_connection(
 #[tokio::test]
 async fn pre_registered_secret_scopes_and_s256_are_used_without_dcr() {
     let h = Harness::new(true).await;
+    h.server.data.discovery_mode.store(3, Ordering::SeqCst);
     let mut installation = h.server.installation();
     h.store
         .put_string(

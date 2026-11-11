@@ -10397,7 +10397,7 @@ impl MessageProcessor {
             let threads = threads.into_iter().collect::<Vec<_>>();
             let owners = self
                 .agent_manager
-                .capture_native_stop_owners(&threads, 65_536)
+                .capture_native_stop_owners(&threads)
                 .await?;
             // Include proven historical runs omitted from cancellation selection.
             let captured_runs = owners
@@ -10568,7 +10568,7 @@ impl MessageProcessor {
             // the success boundary; do not cancel a replacement by old run ID.
             let remaining = self
                 .agent_manager
-                .capture_native_stop_owners(&native_threads, 65_536)
+                .capture_native_stop_owners(&native_threads)
                 .await?;
             validate_native_graph_stop_snapshot(&captured_runs, &remaining)?;
             if let Some(manager) = &self.cli_runtime_manager {
@@ -10630,10 +10630,40 @@ impl MessageProcessor {
             );
             return Ok(());
         }
-        self.agent_manager
-            .cancel_turn_and_wait(thread, &turn.id, reason, deadline)
-            .await?;
-        Ok(())
+        tokio::time::timeout_at(deadline, async {
+            let threads = [thread.to_owned()];
+            // Inventory rejects accepted/unpublished starts and unresolved
+            // recovery. Terminal DB state or a missing owner is never proof.
+            let captured = self.agent_manager.capture_native_stop_owners(&threads)
+                .await?.into_iter().collect::<std::collections::HashSet<_>>();
+            let exact = self.agent_manager.capture_turn_stop_owner(thread, &turn.id).await?;
+            anyhow::ensure!(captured.contains(&exact), "native fallback owner changed before stop");
+            let pending = turn.status == pioneer_protocol::TurnStatus::InProgress;
+            // Its normal completion path drains its captured predecessors;
+            // do that before examining the rest of the unordered inventory.
+            if pending || !exact.is_quiescent() {
+                self.await_native_graph_owner(&exact, reason, deadline).await?;
+            }
+            for owner in &captured {
+                if owner == &exact {
+                    continue;
+                }
+                if owner.turn_id() != turn.id {
+                    anyhow::ensure!(owner.is_quiescent(), "outstanding native fallback predecessor or replacement");
+                    continue;
+                }
+                // Preserve the outcome of an outstanding or pending run. A
+                // later independent mutation needs only a historical run's
+                // actual quiescence, not replay of its command failure.
+                if pending || !owner.is_quiescent() {
+                    self.await_native_graph_owner(owner, reason, deadline).await?;
+                }
+            }
+            let remaining = self.agent_manager.capture_native_stop_owners(&threads).await?;
+            validate_native_graph_stop_snapshot(&captured, &remaining)?;
+            Ok::<(), anyhow::Error>(())
+        }).await.map_err(|_| anyhow::anyhow!("native fallback stop deadline expired; cleanup unconfirmed"))?
+
     }
 
     pub(super) async fn await_native_graph_owner(

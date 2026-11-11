@@ -10354,17 +10354,17 @@ async fn resolve_task_child_execution_security_snapshot(
             child_turn_id.to_owned(),
             now_timestamp_secs().saturating_mul(1000),
         )?;
-        processor.add_native_turn_runtime_sandbox_roots(
-            &mut snapshot,
-            workspace_id,
-            child_thread_id,
-            child_turn_id,
-        )?;
+        processor
+            .add_native_turn_runtime_sandbox_roots(
+                &mut snapshot,
+                workspace_id,
+                child_thread_id,
+                child_turn_id,
+            )?;
         Ok(snapshot)
     })
     .await
 }
-
 async fn resolve_task_child_cli_execution_security_snapshot(
     processor: &Arc<MessageProcessor>,
     workspace_id: &str,

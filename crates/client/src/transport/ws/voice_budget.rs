@@ -18,12 +18,6 @@ pub struct QueuedVoiceAudio {
     pub(super) reservation: VoiceReservation,
 }
 
-impl QueuedVoiceAudio {
-    pub(super) fn len(&self) -> usize {
-        self.bytes.len()
-    }
-}
-
 impl VoiceTransportBudget {
     pub(super) fn admit(self: &Arc<Self>, bytes: Vec<u8>) -> anyhow::Result<QueuedVoiceAudio> {
         let mut used = self

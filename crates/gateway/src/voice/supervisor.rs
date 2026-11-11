@@ -1987,7 +1987,7 @@ mod tests {
                 selected("small").selected_identity().unwrap(),
                 LoadedVoiceEngine::TestHypothesis(VoiceSpeechHypothesis {
                     text: "да, да".to_owned(),
-                    segments: Some(vec![transcribe_rs::TranscriptionSegment {
+                    _segments: Some(vec![transcribe_rs::TranscriptionSegment {
                         start: 0.01,
                         end: 0.05,
                         text: "да, да".to_owned(),
@@ -2014,7 +2014,7 @@ mod tests {
             .transcribe_for_session(&buffer, applied.generation, &token)
             .unwrap();
         assert_eq!(result.text, "да, да");
-        let segments = result.segments.unwrap();
+        let segments = result._segments.unwrap();
         assert_eq!(segments[0].start, 0.01);
         assert_eq!(segments[0].end, 0.05);
         assert_eq!(segments[0].text, "да, да");

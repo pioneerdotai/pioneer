@@ -15,6 +15,7 @@ title = "Keine MCP-Server installiert"
 description = "Installieren Sie neue MCP-Server und erweitern Sie die Möglichkeiten Ihrer Agenten."
 
 [mcp.dialog]
+replace_owned = "Konfiguration dieses Servers ersetzen"
 install_title = "MCP-Server installieren"
 install = "Installieren"
 uninstall_title = "%{name} deinstallieren?"
@@ -134,6 +135,9 @@ items_count = "Elemente: %{count}"
 keys_count = "Schlüssel: %{count}"
 
 [mcp.error]
+plugin_submitted = "Änderung gesendet. Vor erneutem Versuch den Serverstatus prüfen."
+plugin_uncertain = "Ergebnis unbekannt. Vor der nächsten Aktion aktualisieren."
+plugin_change_failed = "Änderung nicht bestätigt. Vor erneutem Versuch aktualisieren."
 server_name_required = "MCP-Servername ist erforderlich"
 gateway_not_connected = "Gateway ist nicht verbunden"
 workspace_not_selected = "Arbeitsbereich ist nicht ausgewählt"

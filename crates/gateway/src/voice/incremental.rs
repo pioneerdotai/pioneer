@@ -1448,8 +1448,8 @@ mod tests {
 
     #[test]
     fn voice_incremental_packet_boundaries_do_not_repeat_prefix_or_drop_tail() {
-        let mut audio = vec![12000; (3 * RATE)];
-        audio.extend(vec![6000; (3 * RATE)]);
+        let mut audio = vec![12000; 3 * RATE];
+        audio.extend(vec![6000; 3 * RATE]);
         audio.extend([3000; 7]);
         let (_, baseline) = partitioned(&audio, 1600);
         assert_eq!(

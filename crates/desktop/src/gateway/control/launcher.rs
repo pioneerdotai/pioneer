@@ -169,6 +169,13 @@ fn update_gateway_service_from_desktop_binary_inner(
 pub(crate) fn create_local_pending_device_session() -> Result<Zeroizing<String>> {
     ensure_desktop_command_config_is_safe()?;
 
+    if let Some(command) = make_managed_pioneer_device_create_command()
+        && let Some(activation_code) =
+            try_create_pending_device_session_with_launcher("managed pioneer binary", command)?
+    {
+        return Ok(activation_code);
+    }
+
     if let Some(command) =
         make_development_pioneer_device_create_command(&development_workspace_root())?
     {
@@ -183,13 +190,6 @@ pub(crate) fn create_local_pending_device_session() -> Result<Zeroizing<String>>
             )
             .to_string()
         });
-    }
-
-    if let Some(command) = make_managed_pioneer_device_create_command()
-        && let Some(activation_code) =
-            try_create_pending_device_session_with_launcher("managed pioneer binary", command)?
-    {
-        return Ok(activation_code);
     }
 
     if let Some(activation_code) = try_create_pending_device_session_with_launcher(

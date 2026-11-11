@@ -177,19 +177,11 @@ impl SkillsCatalogView {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
-                        v_flex()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_semibold()
-                                    .child(t!("skills.screen.title").to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .opacity(0.6)
-                                    .child(t!("skills.screen.description").to_string()),
-                            ),
+                        pioneer_desktop_foundation::catalog_heading(
+                            t!("skills.screen.title").to_string(),
+                            t!("skills.screen.description").to_string(),
+                            cx,
+                        ),
                     )
                     .child(h_flex().items_center().gap_2().child(
                         div().text_xs().opacity(0.6).child(format!(
@@ -506,18 +498,9 @@ impl SkillsCatalogView {
                             ),
                     )
                     .child(
-                        div()
+                        pioneer_desktop_foundation::catalog_status_badge(status_label, status_color)
                             .flex_none()
-                            .mt_1p5()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(status_color)
-                            .text_xs()
-                            .text_color(status_color)
-                            .font_medium()
-                            .child(status_label),
+                            .mt_1p5(),
                     ),
             )
             .into_any_element()

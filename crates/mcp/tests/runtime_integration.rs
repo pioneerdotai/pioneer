@@ -2,6 +2,7 @@ use axum::extract::{Json, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use futures_util::StreamExt;
 use pioneer_mcp::{
     McpAuthConfig, McpInvocationBudget, McpRuntimeConnector, McpRuntimeErrorKind, McpRuntimeState,
     McpScopeKind, McpSecretResolver, McpServerInstallation, McpSourceKind, McpTransportConfig,
@@ -17,6 +18,43 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 struct EmptyResolver;
+
+struct HttpSessionFixture {
+    deleting: tokio::sync::Notify,
+    release_delete: tokio::sync::Notify,
+    deleted: std::sync::atomic::AtomicBool,
+    sse_opened: tokio::sync::Notify,
+    sse_seen: std::sync::atomic::AtomicBool,
+}
+impl HttpSessionFixture {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { deleting: Default::default(), release_delete: Default::default(), deleted: false.into(), sse_opened: Default::default(), sse_seen: false.into() })
+    }
+}
+async fn startup_http(State(state): State<Arc<HttpSessionFixture>>, Json(body): Json<Value>) -> Response {
+    let method = body["method"].as_str().unwrap_or_default();
+    if method == "tools/list" && !state.sse_seen.load(std::sync::atomic::Ordering::SeqCst) {
+        state.sse_opened.notified().await;
+    }
+    let initializing = method == "initialize";
+    let mut response = mcp_http_handler(Json(body)).await;
+    if initializing { response.headers_mut().insert("mcp-session-id", "startup-fixture".parse().unwrap()); }
+    response
+}
+async fn startup_sse(State(state): State<Arc<HttpSessionFixture>>) -> impl IntoResponse {
+    let opened = futures_util::stream::once(async move {
+        state.sse_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        state.sse_opened.notify_one();
+        Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().comment("open"))
+    });
+    axum::response::Sse::new(opened.chain(futures_util::stream::pending()))
+}
+async fn startup_delete(State(state): State<Arc<HttpSessionFixture>>) -> StatusCode {
+    state.deleting.notify_one();
+    state.release_delete.notified().await;
+    state.deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+    StatusCode::NO_CONTENT
+}
 
 #[derive(Default)]
 struct CancellationFixture {
@@ -39,7 +77,7 @@ async fn stdio_server_reaches_ready_and_cleans_up() -> anyhow::Result<()> {
     };
     let script = write_stdio_fixture()?;
     let installation = installation(McpTransportConfig::Stdio {
-        command: python,
+        command: python.clone(),
         args: vec![script.display().to_string()],
         cwd: None,
         env: BTreeMap::new(),
@@ -75,7 +113,19 @@ async fn stdio_server_reaches_ready_and_cleans_up() -> anyhow::Result<()> {
             .and_then(|value| value.get("ok")),
         Some(&json!(true))
     );
-    session.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), session.shutdown_result()).await??;
+    session.shutdown_result().await?;
+    for exit in ["initialize", "catalog"] {
+        let installation = crate::installation(McpTransportConfig::Stdio {
+            command: python.clone(), args: vec![script.display().to_string()], cwd: None,
+            env: BTreeMap::from([("MCP_STARTUP_EXIT".into(), pioneer_mcp::McpConfigValue::Literal { value: exit.into() })]),
+            startup_timeout_ms: 5_000, tool_timeout_ms: 1_000,
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5),
+            RmcpRuntimeConnector::new().connect(installation, "startup-error".into(),
+                Arc::new(EmptyResolver), unix_timestamp_secs())).await?;
+        assert!(result.is_err(), "completed native cleanup preserves the startup error");
+    }
     let _ = fs::remove_file(script);
     Ok(())
 }
@@ -84,8 +134,10 @@ async fn stdio_server_reaches_ready_and_cleans_up() -> anyhow::Result<()> {
 async fn streamable_http_server_reaches_ready() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    let state = HttpSessionFixture::new();
+    let serving = state.clone();
     let server = tokio::spawn(async move {
-        let app = axum::Router::new().route("/mcp", post(mcp_http_handler));
+        let app = axum::Router::new().route("/mcp", post(startup_http).get(startup_sse).delete(startup_delete)).with_state(serving);
         let _ = axum::serve(listener, app).await;
     });
     let installation = installation(McpTransportConfig::StreamableHttp {
@@ -123,8 +175,21 @@ async fn streamable_http_server_reaches_ready() -> anyhow::Result<()> {
             .and_then(|value| value.get("ok")),
         Some(&json!(true))
     );
-    session.shutdown().await;
+    let mut first_stop = Box::pin(session.shutdown_result());
+    tokio::select! {
+        _ = state.deleting.notified() => {},
+        _ = &mut first_stop => panic!("stop acknowledged before actual DELETE cleanup"),
+        _ = tokio::time::sleep(Duration::from_secs(3)) => panic!("DELETE did not start"),
+    }
+    drop(first_stop); // Cancel this observer, retaining the real session owner.
+    let mut retry_stop = Box::pin(session.shutdown_result());
+    assert!(futures_util::poll!(retry_stop.as_mut()).is_pending());
+    state.release_delete.notify_one();
+    retry_stop.await?;
+    assert!(state.deleted.load(std::sync::atomic::Ordering::SeqCst));
+    session.shutdown_result().await?;
     server.abort();
+    let _ = server.await;
     Ok(())
 }
 
@@ -327,6 +392,7 @@ async fn streamable_http_auth_failure_is_auth_required() -> anyhow::Result<()> {
         error.message
     );
     server.abort();
+    let _ = server.await;
     Ok(())
 }
 
@@ -630,6 +696,9 @@ fn write_stdio_fixture() -> anyhow::Result<PathBuf> {
         r#"
 import json
 import sys
+import os
+
+startup_exit = os.environ.get("MCP_STARTUP_EXIT")
 
 def send(value):
     sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
@@ -641,6 +710,9 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
     request_id = request.get("id")
+    if (method == "initialize" and startup_exit == "initialize") or (method == "tools/list" and startup_exit == "catalog"):
+        send({"jsonrpc":"2.0","id":request_id,"error":{"code":-32603,"message":"startup fixture failure"}})
+        break
     if method == "initialize":
         send({"jsonrpc":"2.0","id":request_id,"result":{
             "protocolVersion":"2024-11-05",
@@ -670,6 +742,8 @@ for line in sys.stdin:
             "structuredContent":{"ok":True,"tool":name},
             "isError":False
         }})
+        if directory:
+            break
     else:
         send({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"method not found"}})
 "#,

@@ -179,12 +179,13 @@ impl ClientCore {
         workspace: &str,
         server: &str,
     ) -> Option<(OAuthPresentation, bool)> {
-        self.mcp_oauth
-            .lock()
-            .expect("MCP OAuth owner poisoned")
-            .presentations
-            .get(&(workspace.into(), server.into()))
-            .cloned()
+        // Also used by parent projection under I/P: never acquire I here.
+        // Every creator/reducer uses I -> O; identity fence clears O before
+        // deny commits. Check the committed permission while holding O.
+        let owner = self.mcp_oauth.lock().expect("MCP OAuth owner poisoned");
+        self.capability_management_allowed(workspace)
+            .then(|| owner.presentations.get(&(workspace.into(), server.into())).cloned())
+            .flatten()
     }
     /// Shell browser dismissal uses the same native Cancel action, bound to
     /// the originating transport. Mobile consumes this relay; desktop browser
@@ -224,6 +225,7 @@ impl ClientCore {
             .is_ok()
         })
     }
+    #[cfg(test)]
     pub(crate) fn retry_mcp_oauth_browser(
         &self,
         workspace: &str,
@@ -239,6 +241,8 @@ impl ClientCore {
     ) -> anyhow::Result<()> {
         let key = (workspace.to_owned(), server.to_owned());
         let (shell, event, admission) = {
+            let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
+            anyhow::ensure!(self.capability_management_allowed(workspace), "capability_access_denied");
             let owner = self.mcp_oauth.lock().expect("MCP OAuth owner poisoned");
             anyhow::ensure!(self.provider_runtime_epoch() == epoch, "connection_changed");
             let shell = owner
@@ -347,16 +351,19 @@ impl ClientCore {
         effect: OAuthBrowserEffectResult,
         flow: &str,
     ) {
+        let identity = self.identity_authorization.lock().expect("identity owner poisoned");
         let key = (event.workspace_id.clone(), event.server_id.clone());
         let mut owner = self.mcp_oauth.lock().expect("MCP OAuth owner poisoned");
         owner.browser_busy.remove(flow);
-        if !admission.is_current()
+        if !self.capability_management_allowed(&event.workspace_id)
+            || !admission.is_current()
             || epoch != self.provider_runtime_epoch()
             || !owner.presentations.get(&key).is_some_and(|(current, _)| {
                 current.flow_id == event.flow_id && current.state == McpOAuthState::AwaitingCallback
             })
         {
             drop(owner);
+            drop(identity);
             shell.release(flow);
             return;
         }
@@ -375,12 +382,12 @@ impl ClientCore {
             ),
         );
         drop(owner);
+        drop(identity);
         if effect == OAuthBrowserEffectResult::CallbackUnavailable {
             shell.release(flow);
         }
         self.publish_mcp_oauth_revision(&event);
         self.refresh_mcp(&event.workspace_id);
-        self.refresh_plugin_publication(&event.workspace_id);
     }
     pub(crate) fn forget_mcp_oauth(&self, workspace: &str, server: &str) {
         let mut owner = self.mcp_oauth.lock().expect("MCP OAuth owner poisoned");
@@ -429,6 +436,16 @@ impl ClientCore {
         }
     }
     fn publish_mcp_oauth_revision(&self, event: &OAuthPresentation) {
+        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
+        let owner = self.mcp_oauth.lock().expect("MCP OAuth owner poisoned");
+        if !self.capability_management_allowed(&event.workspace_id)
+            || !(owner.presentations.get(&(event.workspace_id.clone(), event.server_id.clone()))
+                .is_some_and(|(current, _)| current.flow_id == event.flow_id)
+                || (event.state == McpOAuthState::Retired
+                    && event.flow_id.as_ref().is_some_and(|flow| owner.retired_presentations.contains(flow))))
+        {
+            return;
+        }
         let scope = ClientScope::McpAction {
             workspace_id: event.workspace_id.clone(),
             target: event.server_id.clone(),
@@ -441,6 +458,7 @@ impl ClientCore {
             .mcp_action_snapshot(&event.workspace_id, &event.server_id)
             .map(|current| (*current).clone())
             .unwrap_or(super::operations::McpActionPublication {
+                uncertain: false,
                 operation_id: 0,
                 revision,
                 state: super::operations::McpActionState::Succeeded,
@@ -500,6 +518,7 @@ impl ClientCore {
         let GatewayNotification::McpOAuthChanged(event) = notification else {
             return false;
         };
+        let identity = self.identity_authorization.lock().expect("identity owner poisoned");
         if !self.capability_management_allowed(&event.workspace_id) {
             return true;
         }
@@ -548,6 +567,7 @@ impl ClientCore {
             }
             let shell = owner.shell.clone();
             drop(owner);
+            drop(identity);
             if let Some(shell) = shell {
                 shell.release(flow);
             }
@@ -633,6 +653,7 @@ impl ClientCore {
             .insert(key.clone(), (event.clone(), false));
         let Some(flow) = event.flow_id.clone() else {
             drop(owner);
+            drop(identity);
             self.publish_mcp_oauth_revision(event);
             self.refresh_mcp(&event.workspace_id);
             return true;
@@ -641,6 +662,7 @@ impl ClientCore {
             // Management cleanup has no browser/listener ownership of its own.
             // Reduce and refresh even in a shell without an OAuth launcher.
             drop(owner);
+            drop(identity);
             self.publish_mcp_oauth_revision(event);
             self.refresh_mcp(&event.workspace_id);
             return true;
@@ -662,9 +684,11 @@ impl ClientCore {
                     admission.retire();
                 }
                 drop(owner);
+                drop(identity);
                 shell.release(&flow);
             } else {
                 drop(owner);
+                drop(identity);
             }
             self.publish_mcp_oauth_revision(event);
             self.refresh_mcp(&event.workspace_id);
@@ -685,6 +709,7 @@ impl ClientCore {
         let sender = self.transport_runtime().ws_command_sender();
         let event_for_callback = event.clone();
         drop(owner);
+        drop(identity);
         let callback_admission = admission.clone();
         let relay: OAuthCallbackRelay = Arc::new(move |callback| {
             if !callback_admission.is_current() {
@@ -813,6 +838,76 @@ mod tests {
             )),
             diagnostic: None,
         }
+    }
+    #[test]
+    fn notification_after_oauth_fence_cannot_survive_deny_commit() {
+        let core = crate::catalog_test_support::client();
+        let shell = Arc::new(Shell::default());
+        core.set_mcp_oauth_shell(shell.clone());
+        let original = (*core.snapshot(&ClientScope::Administration { workspace_id: None }).unwrap()
+            .snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
+        let mut denied = original.clone();
+        denied.authorization_change_sequence += 1;
+        denied.capabilities.clear_epoch();
+        let subscription = core.subscribe(ClientScope::McpAction {
+            workspace_id: "workspace".into(), target: "server".into(),
+        }, std::num::NonZeroUsize::new(64).unwrap());
+        let (paused, pause) = std::sync::mpsc::channel();
+        let (commit, committed) = std::sync::mpsc::channel();
+        let publisher_core = core.clone();
+        let publisher = std::thread::spawn(move || {
+            crate::core::IDENTITY_BEFORE_COMMIT.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || { paused.send(()).unwrap(); committed.recv_timeout(std::time::Duration::from_secs(5)).unwrap(); }));
+            });
+            let _identity = publisher_core.identity_authorization.lock().unwrap();
+            publisher_core.publish_identity_authorization(&denied,
+                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate);
+        });
+        pause.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(core.capability_management_allowed("workspace"), "Q must still be A0 after the OAuth fence");
+        assert!(core.mcp_oauth.lock().unwrap().flows.is_empty());
+        let (started, starting) = std::sync::mpsc::channel();
+        let (returned, returning) = std::sync::mpsc::channel();
+        let notification_core = core.clone();
+        let notification = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let handled = notification_core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(event(McpOAuthState::AwaitingCallback)));
+            returned.send(()).unwrap();
+            handled
+        });
+        starting.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // Old Q-only admission can return inside this window. Correct I-first
+        // admission may wait; timing is not the post-deny correctness assertion.
+        let _ = returning.recv_timeout(std::time::Duration::from_millis(100));
+        commit.send(()).unwrap();
+        publisher.join().unwrap();
+        while subscription.try_next().is_some() {}
+        assert!(notification.join().unwrap());
+        wait_browser(&core);
+        assert!(core.mcp_oauth_presentation("workspace", "server").is_none());
+        assert!(core.mcp_action_snapshot("workspace", "server").is_none());
+        assert_eq!(shell.open.load(Ordering::SeqCst), 0);
+        {
+            let owner = core.mcp_oauth.lock().unwrap();
+            assert!(owner.flows.is_empty() && owner.presentations.is_empty());
+        }
+        while let Some(update) = subscription.try_next() {
+            if let ClientSubscriptionEvent::Publication { publication, .. } = update {
+                assert!(publication.snapshot().payload::<crate::mcp::operations::McpActionPublication>().is_none());
+            }
+        }
+        let mut granted = original;
+        granted.authorization_change_sequence += 2;
+        {
+            let _identity = core.identity_authorization.lock().unwrap();
+            core.publish_identity_authorization(&granted,
+                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate);
+        }
+        assert!(core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(event(McpOAuthState::AwaitingCallback))));
+        wait_browser(&core);
+        assert_eq!(shell.open.load(Ordering::SeqCst), 1);
+        assert!(core.mcp_oauth_presentation("workspace", "server").unwrap().0.authorization_url.is_some());
+        assert!(core.mcp_action_snapshot("workspace", "server").is_some());
     }
     #[test]
     fn blocked_browser_does_not_block_projection_or_epoch_retirement() {
@@ -1246,6 +1341,7 @@ mod tests {
     #[test]
     fn manual_browser_retry_requires_live_operation_and_updates_failure_projection() {
         let core = crate::catalog_test_support::client();
+        let (_plugins, assert_plugins_quiet) = crate::plugins::runtime::tests::watch_plugin_reads(&core);
         let shell = Arc::new(Shell::default());
         core.set_mcp_oauth_shell(shell.clone());
         core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(event(
@@ -1274,6 +1370,7 @@ mod tests {
         wait_browser(&core);
         assert_eq!(shell.open.load(Ordering::SeqCst), 2);
         core.stop_mcp_oauth();
+        assert_plugins_quiet();
     }
 
     #[test]

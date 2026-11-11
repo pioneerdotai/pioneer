@@ -951,12 +951,81 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
                 .len(),
         1
     );
+    // Same physical writer, independent query-only reader: B can observe r1
+    // while A's accepted r2 is not committed yet. An app mutex is not involved.
+    use pioneer_sqlite::{SqliteDatabase, SqliteWriteEvent, SqliteWriteObserver};
+    use sea_orm::{ConnectOptions, Database, Set, TransactionTrait};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    #[derive(Default)]
+    struct QueueBoundary { armed: AtomicBool, enqueued: tokio::sync::Notify }
+    impl SqliteWriteObserver for QueueBoundary {
+        fn observe(&self, event: SqliteWriteEvent) {
+            if matches!(event, SqliteWriteEvent::Enqueued { .. })
+                && self.armed.swap(false, Ordering::SeqCst) {
+                self.enqueued.notify_one();
+            }
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("parent-cas.sqlite");
+    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+    options.max_connections(1);
+    let writer = Database::connect(options).await.unwrap();
+    let boundary = Arc::new(QueueBoundary::default());
+    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer.clone(), boundary.clone());
+    executor.run_migrations::<migration::Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None).await.unwrap();
+    // Runtime settings, applied only to this disposable fixture database.
+    writer.execute_unprepared("PRAGMA journal_mode=WAL").await.unwrap();
+    writer.execute_unprepared("PRAGMA foreign_keys=OFF").await.unwrap();
+    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
+    options.max_connections(2).map_sqlx_sqlite_opts(|options| options.read_only(true).create_if_missing(false).pragma("query_only", "ON"));
+    let reader = Database::connect(options).await.unwrap();
+    let database = SqliteDatabase::from_executor(reader, executor);
+    database.validate_reader().await.unwrap();
+    let store = CrudStore::new(database);
+    let db = store.database_connection().begin().await.unwrap();
+    pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+        id: Set("ws".into()), name: Set("CAS fixture".into()), is_active: Set(true),
+        is_current: Set(true), created_at: Set(util::unix_to_datetime(1)), updated_at: Set(util::unix_to_datetime(1)),
+    }).exec(&db).await.unwrap();
+    db.commit().await.unwrap();
+    store.insert_plugin_installation(&parent("cas-parent", "ws")).await.unwrap();
+    store.settle_plugin_installation("cas-parent", 1, "installed", None).await.unwrap();
+    let db = store.database_connection().begin().await.unwrap();
+    let first = repositories::plugins::begin_mutation(&db, "ws", "cas-parent", 1, "updating", true, "{\"owner\":\"A\"}".into()).await.unwrap();
+    assert_eq!(first.revision, 2);
+    // A owns a dispatched transition whose commit is still outstanding.
+    assert_eq!(store.find_plugin_installation("cas-parent").await.unwrap().unwrap().revision, 1);
+    let maintenance = store.with_maintenance_access();
+    let mut second = Box::pin(maintenance.begin_plugin_mutation("ws", "cas-parent", 1, "updating", true, "{\"owner\":\"B\"}"));
+    boundary.armed.store(true, Ordering::SeqCst);
+    tokio::select! {
+        result = &mut second => panic!("writer is still held: {result:?}"),
+        _ = boundary.enqueued.notified() => {}
+    }
+    db.commit().await.unwrap();
+    assert!(second.await.unwrap_err().to_string().contains("plugins.stale"));
+    let retained = store.find_plugin_installation("cas-parent").await.unwrap().unwrap();
+    assert_eq!(retained.revision, 2);
+    assert_eq!(retained.pending_json.as_deref(), Some("{\"owner\":\"A\"}"));
+    let next = store.resume_plugin_mutation("ws", "cas-parent", 2, retained.pending_json.as_deref().unwrap(), "{\"owner\":\"C\"}", "updating").await.unwrap();
+    assert_eq!(next.revision, 3);
+    assert!(store.finish_plugin_mutation("cas-parent", 2, "installed", None).await.is_err());
+    assert!(store.replace_plugin_pending("cas-parent", 2, "{}").await.is_err());
+    assert!(store.interrupt_plugin_mutation("cas-parent", 2, "{}", "late").await.is_err());
+    assert!(store.prepare_plugin_reload("cas-parent", 2).await.is_err());
+    assert!(store.publish_plugin_package("cas-parent", 2, "late", None, "late", None).await.is_err());
+    assert!(store.forget_plugin_component("cas-parent", 2, "skill", "absent").await.is_err());
+    assert_eq!(store.find_plugin_installation("cas-parent").await.unwrap().unwrap().pending_json, next.pending_json);
+    store.finish_plugin_mutation("cas-parent", 3, "installed", None).await.unwrap();
+    assert!(store.find_plugin_installation("cas-parent").await.unwrap().unwrap().pending_json.is_none());
+
 }
 
 #[tokio::test]
-async fn legacy_reserved_standalone_updates_but_new_names_and_owned_adoption_are_rejected() {
+async fn standalone_mcp_names_work_while_owned_adoption_is_rejected() {
     let store = test_store_with_workspace("ws").await;
-    let mut legacy = mcp("old", "ws", "pplugin_custom");
+    let mut legacy = mcp("old", "ws", "custom");
     // Seed the pre-plugin native record through the existing low-level operation.
     store
         .upsert_mcp_server_installation(&legacy, 1)
@@ -973,7 +1042,7 @@ async fn legacy_reserved_standalone_updates_but_new_names_and_owned_adoption_are
     assert!(store.find_mcp_plugin_owner("old").await.unwrap().is_none());
     assert_eq!(
         store
-            .find_mcp_server_installation("workspace", "ws", "pplugin_custom")
+            .find_mcp_server_installation("workspace", "ws", "custom")
             .await
             .unwrap()
             .unwrap()
@@ -981,19 +1050,13 @@ async fn legacy_reserved_standalone_updates_but_new_names_and_owned_adoption_are
         "updated"
     );
 
-    let fresh = mcp("new", "ws", "pplugin_new");
-    assert!(
+    let fresh = mcp("new", "ws", "new-server");
+    assert_eq!(
         store
             .upsert_mcp_server_installation_with_audit(&fresh, &mcp_audit(&fresh), 3,)
             .await
-            .is_err()
-    );
-    assert!(
-        store
-            .find_mcp_server_installation("workspace", "ws", "pplugin_new")
-            .await
-            .unwrap()
-            .is_none()
+            .unwrap(),
+        "new"
     );
 
     store
@@ -1013,7 +1076,7 @@ async fn legacy_reserved_standalone_updates_but_new_names_and_owned_adoption_are
             .is_err(),
         "a matching ID cannot adopt a standalone row"
     );
-    let owned = mcp("child", "ws", "pplugin_owned");
+    let owned = mcp("child", "ws", "zenmoney");
     let owner = ownership("plugin-a", "child", "server");
     store
         .upsert_mcp_server_installation_with_audit_and_ownership(
@@ -1063,9 +1126,21 @@ async fn legacy_reserved_standalone_updates_but_new_names_and_owned_adoption_are
             .await
             .is_err()
     );
+    let mut name_collision = attempt.clone();
+    name_collision.id = Some("another-child".into());
+    let another_owner = ownership("plugin-b", "another-child", "server");
+    assert!(store
+        .upsert_mcp_server_installation_with_audit_and_ownership(
+            &name_collision,
+            &mcp_audit(&name_collision),
+            Some(&another_owner),
+            4,
+        )
+        .await
+        .is_err(), "a second plugin cannot overwrite the same ordinary MCP name");
     assert_eq!(
         store
-            .find_mcp_server_installation("workspace", "ws", "pplugin_owned")
+            .find_mcp_server_installation("workspace", "ws", "zenmoney")
             .await
             .unwrap()
             .unwrap()
@@ -1087,11 +1162,11 @@ async fn legacy_reserved_standalone_updates_but_new_names_and_owned_adoption_are
 #[tokio::test]
 async fn plugin_reservation_consumes_only_its_finalized_owned_upload_atomically() {
     let store = test_store_with_workspace("ws").await;
-    let mut parent = parent("P".repeat(21).as_str(), "ws");
-    parent.pending_json = Some("{\"children\":[]}".into());
+    let mut reserved_parent = parent("P".repeat(21).as_str(), "ws");
+    reserved_parent.pending_json = Some("{\"children\":[]}".into());
     let upload = SkillUploadSessionRecord {
         purpose: "plugin".into(),
-        upload_id: parent.source_upload_id.clone(),
+        upload_id: reserved_parent.source_upload_id.clone(),
         workspace_id: "ws".into(),
         connection_id: 7,
         status: "finalized".into(),
@@ -1110,7 +1185,7 @@ async fn plugin_reservation_consumes_only_its_finalized_owned_upload_atomically(
     store.insert_skill_upload_session(&upload).await.unwrap();
     assert!(
         store
-            .reserve_plugin_installation(&parent, 8, 3)
+            .reserve_plugin_installation(&reserved_parent, 8, 3)
             .await
             .is_err()
     );
@@ -1132,8 +1207,8 @@ async fn plugin_reservation_consumes_only_its_finalized_owned_upload_atomically(
     );
     let maintenance = store.with_maintenance_access();
     let (a, b) = tokio::join!(
-        store.reserve_plugin_installation(&parent, 7, 3),
-        maintenance.reserve_plugin_installation(&parent, 7, 3)
+        store.reserve_plugin_installation(&reserved_parent, 7, 3),
+        maintenance.reserve_plugin_installation(&reserved_parent, 7, 3)
     );
     assert_ne!(a.is_ok(), b.is_ok());
     assert_eq!(
@@ -1151,10 +1226,11 @@ async fn plugin_reservation_consumes_only_its_finalized_owned_upload_atomically(
     );
     assert!(
         store
-            .reserve_plugin_installation(&parent, 7, 3)
+            .reserve_plugin_installation(&reserved_parent, 7, 3)
             .await
             .is_err()
     );
+
 }
 
 #[tokio::test]
@@ -1827,5 +1903,38 @@ async fn owned_skill_policy_and_user_removal_revalidate_in_the_native_writer() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+// NOT_RUN: this extends the existing project DB fixture, including FK=OFF.
+#[tokio::test]
+async fn startup_reconciliation_finishes_more_than_one_thousand_parents_and_is_idempotent() {
+    let store = test_store_with_workspace("ws-startup-batches").await;
+    for index in 0..1001 {
+        store
+            .insert_plugin_installation(&parent(&format!("{index:021}"), "ws-startup-batches"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.list_plugin_installations("ws-startup-batches").await.unwrap().len(), 1001);
+    store.interrupt_unfinished_plugins().await.unwrap();
+    for index in 0..1001 {
+        let row = store
+            .find_plugin_installation(&format!("{index:021}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "interrupted");
+        assert_eq!(row.revision, 1);
+    }
+    store.interrupt_unfinished_plugins().await.unwrap();
+    assert_eq!(
+        store
+            .find_plugin_installation(&format!("{:021}", 1000))
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "interrupted"
     );
 }

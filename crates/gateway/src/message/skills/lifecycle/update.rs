@@ -7,7 +7,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: SkillsUpdateParams,
     ) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = self.agent_manager.control_operation_deadline();
         let native = match self
             .begin_native_plugin_change(
                 request_context,
@@ -43,7 +43,6 @@ impl MessageProcessor {
             }
             None => SkillInstallSource::UploadedSkill(params.source.clone()),
         };
-        let owned = native.is_some();
         let work = self.update_skill_source_deferred(
             request_context,
             request_id.clone(),
@@ -54,21 +53,7 @@ impl MessageProcessor {
             },
             source,
         );
-        let result = if owned {
-            tokio::time::timeout_at(deadline, work)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(skills_error(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        SKILLS_ERROR_INTERNAL,
-                        "plugin change deadline exceeded",
-                        json!({}),
-                    ))
-                })
-        } else {
-            work.await
-        };
+        let result = work.await;
         let result = match (result, native) {
             (Ok(payload), Some(change)) => self
                 .finish_native_plugin_change(change)
@@ -282,21 +267,33 @@ impl MessageProcessor {
         } else {
             materialized.native_write().is_some()
         };
-        let prepared = match pioneer_skills::prepare_materialized_skill(
-            pioneer_skills::PrepareMaterializedSkillRequest {
-                skill_id: params.skill_id.clone(),
-                source_kind,
-                source_ref: source_ref.clone(),
-                materialized_source_path: materialized.source_dir().to_path_buf(),
-                policy: installer_policy(&context),
-            },
-        ) {
+        let prepare_request = pioneer_skills::PrepareMaterializedSkillRequest {
+            skill_id: params.skill_id.clone(),
+            source_kind,
+            source_ref: source_ref.clone(),
+            materialized_source_path: materialized.source_dir().to_path_buf(),
+            policy: installer_policy(&context),
+        };
+        let (materialized, prepared) =
+            materialized
+                .prepare(prepare_request)
+                .await
+                .map_err(|error| {
+                    skills_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INTERNAL,
+                        "package preparation unavailable",
+                        json!({"error":format!("{error:#}")}),
+                    )
+                })?;
+        let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 let mapped = map_lifecycle_error(&error, methods::SKILLS_UPDATE);
                 let (message, details) =
                     lifecycle_error_payload(&error, &mapped, None, &context.validation_policy);
-                materialized.cleanup_failure();
+
                 return Err(skills_error(
                     Some(request_id),
                     mapped.jsonrpc_code,
@@ -332,7 +329,6 @@ impl MessageProcessor {
                 )
                 .await
             {
-                materialized.cleanup_failure();
                 drop(write_guard);
                 drop(upload_guard);
                 return Err(error);
@@ -346,7 +342,6 @@ impl MessageProcessor {
             )
             .await
         {
-            materialized.cleanup_failure();
             return Err(skills_error(
                 Some(request_id),
                 INVALID_REQUEST_CODE,
@@ -363,7 +358,6 @@ impl MessageProcessor {
             .flatten()
             .is_some_and(|current| current == existing);
         if !row_unchanged {
-            materialized.cleanup_failure();
             return Err(skills_error(
                 Some(request_id),
                 INVALID_REQUEST_CODE,
@@ -384,7 +378,7 @@ impl MessageProcessor {
             let mapped = map_lifecycle_error(&error, methods::SKILLS_UPDATE);
             let (message, details) =
                 lifecycle_error_payload(&error, &mapped, None, &context.validation_policy);
-            materialized.cleanup_failure();
+
             return Err(skills_error(
                 Some(request_id),
                 mapped.jsonrpc_code,
@@ -405,7 +399,6 @@ impl MessageProcessor {
         {
             if let Some(id) = materialized.upload_id() {
                 if let Err(error) = self.mark_upload_consumed(id, now).await {
-                    materialized.cleanup_failure();
                     return Err(skills_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
@@ -416,7 +409,7 @@ impl MessageProcessor {
                 }
             }
             if let Some(upload) = materialized.uploaded() {
-                self.cleanup_upload_artifacts(&upload.upload, &upload.cleanup_root);
+                let _ = self.cleanup_upload_artifacts(&upload.upload).await;
             }
             let payload = SkillsUpdateResponse {
                 status: "already_up_to_date".to_owned(),
@@ -455,7 +448,7 @@ impl MessageProcessor {
                 let mapped = map_lifecycle_error(&error, methods::SKILLS_UPDATE);
                 let (message, details) =
                     lifecycle_error_payload(&error, &mapped, None, &context.validation_policy);
-                materialized.cleanup_failure();
+
                 return Err(skills_error(
                     Some(request_id),
                     mapped.jsonrpc_code,
@@ -507,7 +500,7 @@ impl MessageProcessor {
                     "failed to roll back updated skill after lifecycle transaction error"
                 );
             }
-            materialized.cleanup_failure();
+
             let error = match persisted {
                 Ok(false) => anyhow::anyhow!(
                     "upload `{}` changed state before skill update publication",
@@ -526,7 +519,7 @@ impl MessageProcessor {
         }
         pioneer_skills::finalize_prepared_skill_commit(&update_result);
         if let Some(upload) = materialized.uploaded() {
-            self.cleanup_upload_artifacts(&upload.upload, &upload.cleanup_root);
+            let _ = self.cleanup_upload_artifacts(&upload.upload).await;
         }
         drop(write_guard);
         drop(upload_guard);

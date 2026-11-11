@@ -82,7 +82,6 @@ pub const AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS: i64 = 30;
 pub const AGENT_ROUTE_GRAPH_MAX_EDGES: usize = 2_048;
 const AGENT_PROJECTION_BATCH_LIMIT: usize = 200;
 // Independent of graph nodes: one Task occurrence may have many revision Turns.
-const AGENT_GRAPH_RESPONSE_BINDING_LIMIT: usize = 65_536;
 const AGENT_GRAPH_RESPONSE_QUERY_BATCH: usize = 128;
 const AGENT_BACKGROUND_BATCH_LIMIT: u64 = 512;
 pub(super) const AGENT_WORK_GRAPH_MAX_CONCURRENCY: i64 = 4_096;
@@ -7424,7 +7423,6 @@ async fn cancel_agent_work_graph_targets(
         .collect::<Vec<_>>();
     let targets = if collect_owners {
         let mut bindings = BTreeMap::<String, Vec<(String, String, bool, bool)>>::new();
-        let mut binding_count = 0;
         for batch in target_ids.chunks(AGENT_GRAPH_RESPONSE_QUERY_BATCH) {
             let responses = agent_turn_response_execution::Entity::find()
                 .filter(agent_turn_response_execution::Column::ExecutionId.is_in(batch.to_vec()))
@@ -7443,15 +7441,10 @@ async fn cancel_agent_work_graph_targets(
                     "has_cli_binding",
                 )
                 .left_join(turn::Entity)
-                .limit((AGENT_GRAPH_RESPONSE_BINDING_LIMIT - binding_count + 1) as u64)
                 .into_model::<AgentGraphResponseBinding>()
                 .all(db)
                 .await
-                .context("failed to load bounded Agent graph response bindings")?;
-            binding_count += responses.len();
-            if binding_count > AGENT_GRAPH_RESPONSE_BINDING_LIMIT {
-                bail!("Agent graph response bindings exceed independent completion limit");
-            }
+                .context("failed to load Agent graph response bindings")?;
             for response in responses {
                 let thread = response
                     .bound_thread_id

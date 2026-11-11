@@ -12,19 +12,45 @@ pub async fn list<C: ConnectionTrait>(
     let rows = plugin_installation::Entity::find()
         .filter(plugin_installation::Column::WorkspaceId.eq(workspace))
         .order_by_asc(plugin_installation::Column::CreatedAt)
-        .limit(1001)
         .all(db)
         .await?;
-    if rows.len() > 1000 {
-        bail!("plugin inventory limit exceeded");
-    }
     Ok(rows)
 }
 
-/// Only immediate DB validation/writes run under the caller's writer. The
-/// package and bounded pending plan have already been prepared outside it.
-pub async fn settle<C: ConnectionTrait>(
+/// Bounded native-catalog ownership projection; no per-skill reader roundtrips.
+pub async fn skill_owners<C: ConnectionTrait>(
     db: &C,
+    ids: &[String],
+) -> Result<Vec<(plugin_component::Model, Option<plugin_installation::Model>)>> {
+    let mut result = Vec::new();
+    for chunk in ids.chunks(128) {
+        let links = plugin_component::Entity::find()
+            .filter(plugin_component::Column::Kind.eq("skill"))
+            .filter(plugin_component::Column::SkillId.is_in(chunk.iter().cloned()))
+            .all(db)
+            .await?;
+        let parent_ids = links
+            .iter()
+            .map(|l| l.plugin_id.clone())
+            .collect::<Vec<_>>();
+        let parents = plugin_installation::Entity::find()
+            .filter(plugin_installation::Column::Id.is_in(parent_ids))
+            .all(db)
+            .await?;
+        result.extend(links.into_iter().map(|link| {
+            let parent = parents.iter().find(|p| p.id == link.plugin_id).cloned();
+            (link, parent)
+        }));
+    }
+    Ok(result)
+}
+
+/// Transitions require a writer transaction: reader validation and its write
+/// must not be separated by another dispatched transition. Only immediate
+/// DB validation/writes run under the caller's writer. The
+/// package and bounded pending plan have already been prepared outside it.
+pub async fn settle(
+    db: &pioneer_sqlite::SqliteTransaction,
     id: &str,
     revision: i64,
     state: &str,
@@ -44,8 +70,8 @@ pub async fn settle<C: ConnectionTrait>(
     Ok(())
 }
 
-pub async fn record_failure<C: ConnectionTrait>(
-    db: &C,
+pub async fn record_failure(
+    db: &pioneer_sqlite::SqliteTransaction,
     write: &PluginOwnershipWrite,
     kind: &str,
     diagnostic: &str,
@@ -132,6 +158,24 @@ pub async fn components<C: ConnectionTrait>(
         .all(db)
         .await?)
 }
+/// Fetch list inventory in bounded batches rather than one request per parent.
+pub async fn components_for_parents<C: ConnectionTrait>(
+    db: &C,
+    ids: &[String],
+) -> Result<Vec<plugin_component::Model>> {
+    let mut rows = Vec::new();
+    for parents in ids.chunks(16) {
+        let batch = plugin_component::Entity::find()
+            .filter(plugin_component::Column::PluginId.is_in(parents.iter().cloned()))
+            .order_by_asc(plugin_component::Column::Kind)
+            .order_by_asc(plugin_component::Column::MemberKey)
+            .all(db)
+            .await?;
+        rows.extend(batch);
+    }
+    Ok(rows)
+}
+
 pub async fn owner<C: ConnectionTrait>(
     db: &C,
     kind: &str,
@@ -202,11 +246,6 @@ pub async fn validate_publication<C: ConnectionTrait>(
         })
     {
         bail!("plugin ownership cannot adopt or overwrite another installation");
-    }
-    // The plan and its links are explicitly bounded; this read never grows
-    // with the workspace or database. Recheck the count under the writer.
-    if link.is_none() && components(db, &write.plugin_id).await?.len() >= 256 {
-        bail!("plugin component limit exceeded");
     }
     Ok(())
 }
@@ -304,8 +343,8 @@ pub async fn has_mcp_binding<C: ConnectionTrait>(db: &C, turn: &str, server: &st
 
 /// Gate publication is an immediate DB operation. Caller owns parent admission;
 /// the native operations/FS phase run only after this write has returned.
-pub async fn begin_mutation<C: ConnectionTrait>(
-    db: &C,
+pub async fn begin_mutation(
+    db: &pioneer_sqlite::SqliteTransaction,
     workspace: &str,
     id: &str,
     revision: i64,
@@ -333,8 +372,8 @@ pub async fn begin_mutation<C: ConnectionTrait>(
     Ok(row.update(db).await?)
 }
 
-pub async fn finish_mutation<C: ConnectionTrait>(
-    db: &C,
+pub async fn finish_mutation(
+    db: &pioneer_sqlite::SqliteTransaction,
     id: &str,
     revision: i64,
     state: &str,
@@ -355,8 +394,8 @@ pub async fn finish_mutation<C: ConnectionTrait>(
     Ok(())
 }
 
-pub async fn replace_pending<C: ConnectionTrait>(
-    db: &C,
+pub async fn replace_pending(
+    db: &pioneer_sqlite::SqliteTransaction,
     id: &str,
     revision: i64,
     pending: String,
@@ -372,7 +411,7 @@ pub async fn replace_pending<C: ConnectionTrait>(
     Ok(())
 }
 
-pub async fn delete_parent<C: ConnectionTrait>(db: &C, id: &str, revision: i64) -> Result<()> {
+pub async fn delete_parent(db: &pioneer_sqlite::SqliteTransaction, id: &str, revision: i64) -> Result<()> {
     let parent = find(db, id).await?.context("plugins.not_found")?;
     if parent.revision != revision
         || !matches!(parent.state.as_str(), "removing" | "interrupted")
@@ -393,7 +432,7 @@ pub async fn delete_parent<C: ConnectionTrait>(db: &C, id: &str, revision: i64) 
     Ok(())
 }
 
-pub async fn interrupt_unfinished<C: ConnectionTrait>(db: &C) -> Result<()> {
+pub async fn interrupt_unfinished(db: &pioneer_sqlite::SqliteTransaction) -> Result<usize> {
     let parents = plugin_installation::Entity::find()
         .filter(
             Condition::any()
@@ -408,12 +447,10 @@ pub async fn interrupt_unfinished<C: ConnectionTrait>(db: &C) -> Result<()> {
                         .add(plugin_installation::Column::PendingJson.is_not_null()),
                 ),
         )
-        .limit(1001)
+        .limit(128)
         .all(db)
         .await?;
-    if parents.len() > 1000 {
-        bail!("unfinished plugin inventory limit exceeded");
-    }
+    let count = parents.len();
     for parent in parents {
         let mut row: plugin_installation::ActiveModel = parent.into();
         row.state = Set("interrupted".into());
@@ -421,7 +458,7 @@ pub async fn interrupt_unfinished<C: ConnectionTrait>(db: &C) -> Result<()> {
         row.updated_at = Set(chrono::Utc::now().fixed_offset());
         row.update(db).await?;
     }
-    Ok(())
+    Ok(count)
 }
 
 /// Filter the actual native inventory in bounded batches; no historical scan.
@@ -443,8 +480,8 @@ pub async fn workspace_native_threads<C: ConnectionTrait>(
     Ok(result)
 }
 
-pub async fn interrupt_mutation<C: ConnectionTrait>(
-    db: &C,
+pub async fn interrupt_mutation(
+    db: &pioneer_sqlite::SqliteTransaction,
     id: &str,
     revision: i64,
     pending: String,
@@ -465,7 +502,7 @@ pub async fn interrupt_mutation<C: ConnectionTrait>(
 
 /// Allow the native reload after all child/file work, retaining the execution
 /// fence until the caller acknowledges reload and clears pending atomically.
-pub async fn prepare_reload<C: ConnectionTrait>(db: &C, id: &str, revision: i64) -> Result<()> {
+pub async fn prepare_reload(db: &pioneer_sqlite::SqliteTransaction, id: &str, revision: i64) -> Result<()> {
     let parent = find(db, id).await?.context("plugins.not_found")?;
     if parent.revision != revision
         || parent.pending_json.is_none()
@@ -491,27 +528,85 @@ pub async fn graph_stop_candidates<C: ConnectionTrait>(
     workspace: &str,
     parent: &str,
 ) -> Result<Vec<(String, String)>> {
-    use sea_orm::{DbBackend, Statement};
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT t.thread_id AS thread_id,t.id AS turn_id FROM agent_execution e \
-         JOIN agent_work_resource_scope s ON s.root_execution_id=e.id \
-         JOIN agent_turn_response_execution r ON r.execution_id=e.id \
-         JOIN turn t ON t.id=r.turn_id JOIN thread th ON th.id=t.thread_id \
-         WHERE e.workspace_id=? AND th.workspace_id=? AND e.parent_execution_id IS NULL \
-         AND e.work_graph_root_execution_id=e.id AND s.status='active' \
-         AND EXISTS (SELECT 1 FROM json_each(t.plugin_selection_json,'$.parents') p \
-                     WHERE json_extract(p.value,'$.id')=?) LIMIT 1001",
-            vec![workspace.into(), workspace.into(), parent.into()],
-        ))
-        .await?;
-    if rows.len() > 1000 {
-        bail!("plugin graph inventory limit exceeded");
+    use pioneer_entity::{
+        agent_execution as execution, agent_turn_response_execution as response,
+        agent_work_resource_scope as scope, thread, turn,
+    };
+    use sea_orm::{
+        FromQueryResult, JoinType,
+        sea_query::{Alias, Expr, ExprTrait, Func, Query},
+    };
+    #[derive(FromQueryResult)]
+    struct Candidate {
+        thread_id: String,
+        turn_id: String,
     }
-    rows.iter()
-        .map(|row| Ok((row.try_get("", "thread_id")?, row.try_get("", "turn_id")?)))
-        .collect()
+    let parents = Query::select()
+        .expr(Expr::val(1))
+        .from_function(
+            Func::cust(Alias::new("json_each"))
+                .arg(Expr::col((turn::Entity, turn::Column::PluginSelectionJson)))
+                .arg(Expr::val("$.parents")),
+            Alias::new("p"),
+        )
+        .and_where(
+            Func::cust(Alias::new("json_extract"))
+                .arg(Expr::col((Alias::new("p"), Alias::new("value"))))
+                .arg(Expr::val("$.id"))
+                .eq(parent),
+        )
+        .to_owned();
+    let rows = execution::Entity::find()
+        .select_only()
+        .expr_as(
+            Expr::col((turn::Entity, turn::Column::ThreadId)),
+            "thread_id",
+        )
+        .expr_as(Expr::col((turn::Entity, turn::Column::Id)), "turn_id")
+        .join_rev(
+            JoinType::InnerJoin,
+            scope::Entity::belongs_to(execution::Entity)
+                .from(scope::Column::RootExecutionId)
+                .to(execution::Column::Id)
+                .into(),
+        )
+        .join_rev(
+            JoinType::InnerJoin,
+            response::Entity::belongs_to(execution::Entity)
+                .from(response::Column::ExecutionId)
+                .to(execution::Column::Id)
+                .into(),
+        )
+        .join(
+            JoinType::InnerJoin,
+            response::Entity::belongs_to(turn::Entity)
+                .from(response::Column::TurnId)
+                .to(turn::Column::Id)
+                .into(),
+        )
+        .join(
+            JoinType::InnerJoin,
+            turn::Entity::belongs_to(thread::Entity)
+                .from(turn::Column::ThreadId)
+                .to(thread::Column::Id)
+                .into(),
+        )
+        .filter(execution::Column::WorkspaceId.eq(workspace))
+        .filter(thread::Column::WorkspaceId.eq(workspace))
+        .filter(execution::Column::ParentExecutionId.is_null())
+        .filter(
+            Expr::col((
+                execution::Entity,
+                execution::Column::WorkGraphRootExecutionId,
+            ))
+            .eq(Expr::col((execution::Entity, execution::Column::Id))),
+        )
+        .filter(scope::Column::Status.eq("active"))
+        .filter(Expr::exists(parents))
+        .into_model::<Candidate>()
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(|r| (r.thread_id, r.turn_id)).collect())
 }
 
 /// One admitted native settings write. Only field names and an opaque current
@@ -559,8 +654,8 @@ pub async fn validate_native_write<C: ConnectionTrait>(
     }
 }
 
-pub async fn publish_native_write<C: ConnectionTrait>(
-    db: &C,
+pub async fn publish_native_write(
+    db: &pioneer_sqlite::SqliteTransaction,
     write: &PluginNativeWrite,
     kind: &str,
     removed: bool,
@@ -593,19 +688,32 @@ pub async fn publish_native_write<C: ConnectionTrait>(
     Ok(())
 }
 
-/// One bounded read snapshot protects both native and pending credential owners.
-/// Serialization/parsing and keystore work happen after reader capacity is released.
+/// One reader snapshot protects native and pending credential owners.
+/// Both arms originate in the Entity projection path. UNION ALL preserves the
+/// single snapshot when a credential moves between owners during publication.
 pub async fn credential_retention<C: ConnectionTrait>(
     db: &C,
 ) -> Result<Vec<(String, String, String)>> {
-    use sea_orm::{DbBackend, Statement};
-    let rows = db.query_all_raw(Statement::from_string(DbBackend::Sqlite,
-        "SELECT 'native' AS kind,id AS owner,secret_refs_json AS payload FROM mcp_server_installation \
-         UNION ALL SELECT 'pending' AS kind,id AS owner,pending_json AS payload \
-         FROM plugin_installation WHERE pending_json IS NOT NULL LIMIT 100001".to_owned())).await?;
-    if rows.len() > 100000 {
-        bail!("credential retention inventory exceeds bound");
-    }
+    use pioneer_entity::mcp_server_installation as native;
+    use sea_orm::{
+        QueryTrait,
+        sea_query::{Expr, UnionType},
+    };
+    let pending = plugin_installation::Entity::find()
+        .select_only()
+        .expr_as(Expr::val("pending"), "kind")
+        .column_as(plugin_installation::Column::Id, "owner")
+        .column_as(plugin_installation::Column::PendingJson, "payload")
+        .filter(plugin_installation::Column::PendingJson.is_not_null())
+        .into_query();
+    let mut query = native::Entity::find()
+        .select_only()
+        .expr_as(Expr::val("native"), "kind")
+        .column_as(native::Column::Id, "owner")
+        .column_as(native::Column::SecretRefsJson, "payload")
+        .into_query();
+    query.union(UnionType::All, pending);
+    let rows = db.query_all(&query).await?;
     rows.into_iter()
         .map(|row| {
             Ok((
@@ -617,8 +725,8 @@ pub async fn credential_retention<C: ConnectionTrait>(
         .collect()
 }
 
-pub async fn resume_mutation<C: ConnectionTrait>(
-    db: &C,
+pub async fn resume_mutation(
+    db: &pioneer_sqlite::SqliteTransaction,
     workspace: &str,
     id: &str,
     revision: i64,
@@ -644,8 +752,8 @@ pub async fn resume_mutation<C: ConnectionTrait>(
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
     Ok(row.update(db).await?)
 }
-pub async fn publish_package<C: ConnectionTrait>(
-    db: &C,
+pub async fn publish_package(
+    db: &pioneer_sqlite::SqliteTransaction,
     id: &str,
     revision: i64,
     name: &str,
@@ -668,8 +776,8 @@ pub async fn publish_package<C: ConnectionTrait>(
     row.update(db).await?;
     Ok(())
 }
-pub async fn forget_component<C: ConnectionTrait>(
-    db: &C,
+pub async fn forget_component(
+    db: &pioneer_sqlite::SqliteTransaction,
     id: &str,
     revision: i64,
     kind: &str,
@@ -700,8 +808,8 @@ pub async fn forget_component<C: ConnectionTrait>(
 
 /// A package removal interrupted before forgetting its link is a repairable
 /// failure, not a user restriction. Reuse the existing status/diagnostic fields.
-pub async fn mark_package_removed<C: ConnectionTrait>(
-    db: &C,
+pub async fn mark_package_removed(
+    db: &pioneer_sqlite::SqliteTransaction,
     write: &PluginNativeWrite,
     kind: &str,
 ) -> Result<()> {

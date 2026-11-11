@@ -491,7 +491,7 @@ fn attachment_file_icon(flex_none: bool) -> gpui_kit::Div {
 
 fn attachment_capability_icon(kind: ParsedUserAttachmentKind, cx: &mut App) -> gpui_kit::Div {
     let icon = match kind {
-        ParsedUserAttachmentKind::Plugin => PioneerIconName::Mcp,
+        ParsedUserAttachmentKind::Plugin => PioneerIconName::Plugin,
         ParsedUserAttachmentKind::Skill => PioneerIconName::Zap,
         ParsedUserAttachmentKind::Mcp => PioneerIconName::Mcp,
         ParsedUserAttachmentKind::File => PioneerIconName::Paperclip,

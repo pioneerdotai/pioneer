@@ -1,16 +1,12 @@
 use super::*;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 struct PackageAction {
     #[serde(default)]
     kind: String,
     children: Vec<ReservedChild>,
     #[serde(default)]
     target_fingerprint: String,
-    #[serde(default)]
-    published_fingerprint: String,
-    #[serde(default)]
-    denied: Vec<PluginComponentKey>,
     #[serde(default)]
     restore_removed: bool,
     #[serde(default)]
@@ -19,23 +15,13 @@ struct PackageAction {
     cleanup_refs: Vec<String>,
     #[serde(default)]
     source_upload_id: Option<String>,
-    #[serde(default)]
-    staging_name: String,
-    #[serde(default)]
-    prior_fingerprint: String,
 }
 impl PackageAction {
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.children.len() <= 256
-                && self.denied.len() <= 256
-                && matches!(
+            matches!(
                     self.kind.as_str(),
-                    "" | "install" | "update" | "retry" | "remove"
-                )
-                && matches!(
-                    self.staging_name.as_str(),
-                    "" | "package-next" | "package-repair"
+                    "" | "install" | "update" | "retry" | "remove" | "retained"
                 ),
             "plugins.pending_invalid"
         );
@@ -52,10 +38,6 @@ impl PackageAction {
         Ok(())
     }
 }
-fn package_payload_missing(package: &Path) -> bool {
-    [package.to_path_buf(),package.with_file_name("package-backup")].iter()
-        .all(|path|matches!(path.symlink_metadata(),Err(error) if error.kind()==std::io::ErrorKind::NotFound))
-}
 fn key(component: &ComponentPlan) -> PluginComponentKey {
     let component = component_preview(component);
     PluginComponentKey {
@@ -66,83 +48,29 @@ fn key(component: &ComponentPlan) -> PluginComponentKey {
 fn matches_key(component: &PluginComponentKey, kind: &str, member: &str) -> bool {
     component.kind == kind && component.member_key == member
 }
-fn package_snapshot(root: &Path) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
-    let snapshot = Snapshot::capture(root, Default::default(), || false)
+fn package_snapshot(root: &Path, limits: pioneer_plugins::Limits) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
+    package_snapshot_cancellable(root, &tokio_util::sync::CancellationToken::new(), limits)
+}
+fn package_snapshot_cancellable(
+    root: &Path,
+    cancellation: &tokio_util::sync::CancellationToken,
+    limits: pioneer_plugins::Limits,
+) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
+    let snapshot = Snapshot::capture(root, limits, || cancellation.is_cancelled())
         .map_err(|_| anyhow::anyhow!("plugins.package_unavailable"))?;
     let plan = pioneer_plugins::load(&snapshot)
         .map_err(|_| anyhow::anyhow!("plugins.package_rejected"))?;
     Ok((snapshot, plan))
 }
-pub(super) fn denied_keys(snapshot: &Snapshot, plan: &LoadedPluginPlan) -> Vec<PluginComponentKey> {
-    plan.components
-        .iter()
-        .filter_map(|component| match component {
-            ComponentPlan::Skill { member_path, .. }
-                if snapshot.entries().iter().any(|(path, entry)| {
-                    matches!(entry, Entry::Denied)
-                        && (path == member_path || path.starts_with(&format!("{member_path}/")))
-                }) =>
-            {
-                Some(key(component))
-            }
-            _ => None,
-        })
-        .collect()
-}
-fn integrity_path(package: &Path) -> anyhow::Result<std::path::PathBuf> {
-    Ok(package
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("plugins.package_unavailable"))?
-        .join("package.integrity"))
-}
-pub(super) fn save_package_integrity(package: &Path, digest: &str) -> anyhow::Result<()> {
-    let receipt = integrity_path(package)?;
-    let next = receipt.with_extension("integrity-next");
-    use std::io::Write;
-    if next.symlink_metadata().is_ok() {
-        std::fs::remove_file(&next)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&next)?;
-    file.write_all(digest.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(next, receipt)?;
-    Ok(())
-}
-fn read_package_integrity(package: &Path) -> anyhow::Result<Option<String>> {
-    let path = integrity_path(package)?;
-    let metadata = match path.symlink_metadata() {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    anyhow::ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() == 64,
-        "plugins.package_changed"
-    );
-    use std::io::Read;
-    let mut bytes = Vec::with_capacity(65);
-    std::fs::File::open(path)?
-        .take(65)
-        .read_to_end(&mut bytes)?;
-    anyhow::ensure!(
-        bytes.len() == 64 && bytes.iter().all(u8::is_ascii_hexdigit),
-        "plugins.package_changed"
-    );
-    Ok(Some(String::from_utf8(bytes)?))
-}
-fn verified_package(
+pub(super) fn verified_package(
     parent: &pioneer_entity::plugin_installation::Model,
+    cancellation: &tokio_util::sync::CancellationToken,
+    limits: pioneer_plugins::Limits,
 ) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
     let package = Path::new(&parent.package_path);
-    let (snapshot, plan) = package_snapshot(package)?;
-    let expected =
-        read_package_integrity(package)?.unwrap_or_else(|| parent.package_fingerprint.clone());
+    let (snapshot, plan) = package_snapshot_cancellable(package, cancellation, limits)?;
     anyhow::ensure!(
-        snapshot.tree_digest() == expected,
+        snapshot.tree_digest() == parent.package_fingerprint,
         "plugins.package_changed"
     );
     Ok((snapshot, plan))
@@ -163,30 +91,29 @@ impl MessageProcessor {
             )
             .await
             .map_err(|error| plugin_error(request, native_plugin_error_code(&error)))?;
-        if guard.parent.state == "removing" {
-            return Err(plugin_error(request, "plugins.interrupted"));
+        if guard.parent.pending_json.is_some() || guard.parent.state == "removing" {
+            return Err(plugin_error(request, "plugins.use_continue_or_remove"));
         }
-        let runtime = self
-            .skills_runtime_context(&params.workspace_id)
-            .map_err(|_| plugin_error(request, "plugins.workspace_unavailable"))?;
+        let owner = AuthenticatedTransferOwner::from_request_context(context);
+        {
+            let _upload_lock = self.acquire_skill_upload_lock(&params.upload_id).await;
+            self.revalidate_plugin_upload(&owner, &params.workspace_id, &params.upload_id, request).await?;
+        }
+        let runtime = self.package_delivery_context();
         let source = self
             .materialize_uploaded_archive_source(
-                context.connection_id(),
+                &owner,
                 &params.workspace_id,
                 &params.upload_id,
                 &runtime,
                 request,
+                        "plugin",
             )
             .await?;
-        if source.upload.purpose != "plugin" {
-            let _ = std::fs::remove_dir_all(&source.cleanup_root);
-            return Err(plugin_error(request, "plugins.upload_unavailable"));
-        }
-        let result = package_snapshot(&source.source_dir)
-            .map_err(|_| plugin_error(request, "plugins.package_rejected"));
-        let _ = std::fs::remove_dir_all(&source.cleanup_root);
-        let (_, plan) = result?;
-        let (mut removed, mut authorization_changes) = self
+        let (_source, candidate, plan) = load_uploaded_plugin(source)
+            .await
+            .map_err(|_| plugin_error(request, "plugins.package_rejected"))?;
+        let (mut removed, mut authorization_changes, current_content) = self
             .plugin_update_changes(&guard, &plan)
             .await
             .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?;
@@ -212,12 +139,26 @@ impl MessageProcessor {
             .await
             .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?;
         let target = plan.components.iter().map(key).collect::<Vec<_>>();
-        let (added, updated) = target.into_iter().partition(|key| {
-            !existing
-                .iter()
-                .any(|link| matches_key(key, &link.kind, &link.member_key))
-        });
+        let added = target
+            .into_iter()
+            .filter(|key| {
+                !existing
+                    .iter()
+                    .any(|link| matches_key(key, &link.kind, &link.member_key))
+            })
+            .collect();
+        let candidate_plan = plan.clone();
+        let (updated, supporting_files_changed) = guard
+            .fs_prepare(move |_parent, _cancellation| {
+                let (current, previous) = current_content;
+                let (updated, supporting) =
+                    package_content_changes(&current, &previous, &candidate, &candidate_plan);
+                Ok((updated, supporting))
+            })
+            .await
+            .map_err(|_| plugin_error(request, "plugins.package_changed"))?;
         let mut preview = PluginsUpdatePreviewResponse {
+            supporting_files_changed,
             identity_resets: existing
                 .iter()
                 .filter(|link| {
@@ -236,6 +177,7 @@ impl MessageProcessor {
             package: PluginsPreviewResponse {
                 name: plan.manifest.name.clone(),
                 version: plan.manifest.version.clone(),
+                description: public_description(&plan),
                 fingerprint: plan.tree_digest.clone(),
                 components: plan.components.iter().map(component_preview).collect(),
                 diagnostics: public_diagnostics(&plan),
@@ -264,13 +206,19 @@ impl MessageProcessor {
             })
             .collect::<Vec<_>>();
         disclose_update_preview(&mut preview, &existing, &visible, administrative);
+        let _upload_lock = self.acquire_skill_upload_lock(&params.upload_id).await;
+        self.revalidate_plugin_upload(&owner, &params.workspace_id, &params.upload_id, request).await?;
         Ok(preview)
     }
     async fn plugin_update_changes(
         &self,
         guard: &PluginMutationGuard,
         plan: &LoadedPluginPlan,
-    ) -> anyhow::Result<(Vec<PluginComponentKey>, Vec<PluginComponentKey>)> {
+    ) -> anyhow::Result<(
+        Vec<PluginComponentKey>,
+        Vec<PluginComponentKey>,
+        (Snapshot, LoadedPluginPlan),
+    )> {
         let links = self
             .crud_store
             .list_plugin_components(&guard.parent.id)
@@ -288,26 +236,8 @@ impl MessageProcessor {
                 member_key: link.member_key.clone(),
             })
             .collect();
-        if guard.parent.pending_json.is_some()
-            && package_payload_missing(Path::new(&guard.parent.package_path))
-        {
-            let authorization_changes = links
-                .iter()
-                .filter(|link| {
-                    link.kind == "mcp"
-                        && link.mcp_installation_id.is_some()
-                        && target
-                            .iter()
-                            .any(|key| matches_key(key, &link.kind, &link.member_key))
-                })
-                .map(|link| PluginComponentKey {
-                    kind: link.kind.clone(),
-                    member_key: link.member_key.clone(),
-                })
-                .collect();
-            return Ok((removed, authorization_changes));
-        }
-        let (_, previous) = comparison_package(&guard.parent)?;
+        let limits = guard.limits;
+        let (snapshot, previous) = guard.fs_prepare(move |parent, cancellation| verified_package(parent, cancellation, limits)).await?;
         let mut authorization_changes = Vec::new();
         for component in &plan.components {
             if let ComponentPlan::Mcp { member_key, server } = component {
@@ -329,14 +259,13 @@ impl MessageProcessor {
                 }
             }
         }
-        Ok((removed, authorization_changes))
+        Ok((removed, authorization_changes, (snapshot, previous)))
     }
     pub(super) async fn mutate_plugin(
         &self,
         context: &RequestContext,
         request: &RequestId,
         params: PluginsMutateParams,
-        deadline: tokio::time::Instant,
     ) -> Result<PluginsMutationResponse, JsonRpcErrorResponse> {
         let current = self
             .crud_store
@@ -414,57 +343,32 @@ impl MessageProcessor {
                 expected_fingerprint,
                 confirm_changes,
             } => {
-                let previous_action = before
-                    .as_deref()
-                    .map(serde_json::from_str::<PackageAction>)
-                    .transpose()
-                    .map_err(|_| plugin_error(request, "plugins.reapply_native_change"))?;
-                if previous_action.as_ref().is_some_and(|action| {
-                    !matches!(action.kind.as_str(), "" | "install" | "update" | "retry")
-                }) || guard.parent.state == "removing"
-                {
+                if before.is_some() || guard.parent.state == "removing" {
                     return Err(plugin_error(request, "plugins.use_continue_or_remove"));
                 }
-                let prior = if before.is_some()
-                    && package_payload_missing(Path::new(&guard.parent.package_path))
+                let owner = AuthenticatedTransferOwner::from_request_context(context);
                 {
-                    None
-                } else {
-                    Some(
-                        comparison_package(&guard.parent)
-                            .map_err(|_| plugin_error(request, "plugins.package_changed"))?
-                            .0,
-                    )
-                };
-                let runtime = self
-                    .skills_runtime_context(&params.workspace_id)
-                    .map_err(|_| plugin_error(request, "plugins.workspace_unavailable"))?;
+                    let _upload_lock = self.acquire_skill_upload_lock(&upload_id).await;
+                    self.revalidate_plugin_upload(&owner, &params.workspace_id, &upload_id, request).await?;
+                }
+                let runtime = self.package_delivery_context();
                 let source = self
                     .materialize_uploaded_archive_source(
-                        context.connection_id(),
+                        &owner,
                         &params.workspace_id,
                         &upload_id,
                         &runtime,
                         request,
+                        "plugin",
                     )
                     .await?;
-                if source.upload.purpose != "plugin" {
-                    let _ = std::fs::remove_dir_all(&source.cleanup_root);
-                    return Err(plugin_error(request, "plugins.upload_unavailable"));
-                }
-                let loaded = package_snapshot(&source.source_dir);
-                let (snapshot, plan) = match loaded {
-                    Ok(loaded) => loaded,
-                    Err(_) => {
-                        let _ = std::fs::remove_dir_all(&source.cleanup_root);
-                        return Err(plugin_error(request, "plugins.package_rejected"));
-                    }
-                };
+                let (source, snapshot, plan) = load_uploaded_plugin(source)
+                    .await
+                    .map_err(|_| plugin_error(request, "plugins.package_rejected"))?;
                 if plan.tree_digest != expected_fingerprint {
-                    let _ = std::fs::remove_dir_all(&source.cleanup_root);
                     return Err(plugin_error(request, "plugins.fingerprint_changed"));
                 }
-                let (removed, auth) = self
+                let (removed, auth, _) = self
                     .plugin_update_changes(&guard, &plan)
                     .await
                     .map_err(|_| plugin_error(request, "plugins.package_changed"))?;
@@ -481,7 +385,6 @@ impl MessageProcessor {
                 });
                 if !confirm_changes && (!removed.is_empty() || !auth.is_empty() || identity_resets)
                 {
-                    let _ = std::fs::remove_dir_all(&source.cleanup_root);
                     return Err(plugin_error(request, "plugins.confirm_changes"));
                 }
                 let children = plan
@@ -511,47 +414,33 @@ impl MessageProcessor {
                     })
                     .collect();
                 let package = Path::new(&guard.parent.package_path);
-                let staging_name = if previous_action
-                    .as_ref()
-                    .is_some_and(|action| action.staging_name == "package-repair")
-                {
-                    "package-next"
-                } else if previous_action.is_some() {
-                    "package-repair"
-                } else {
-                    "package-next"
-                };
-                let next = package.with_file_name(staging_name);
-                if next.exists() {
-                    std::fs::remove_dir_all(&next)
-                        .map_err(|_| plugin_error(request, "plugins.staging_cleanup_failed"))?;
-                }
-                publish_package(&snapshot, &next)
+                let next = package.with_file_name("package-next");
+                let staged = next.clone();
+                let limits = snapshot.limits();
+                let expected = plan.tree_digest.clone();
+                guard
+                    .fs(move |_| {
+                        if staged.exists() {
+                            std::fs::remove_dir_all(&staged)?;
+                        }
+                        publish_package(&snapshot, &staged)?;
+                        anyhow::ensure!(Snapshot::capture(&staged, limits, || false)?.tree_digest() == expected,
+                            "plugins.package_changed");
+                        Ok(())
+                    })
+                    .await
                     .map_err(|_| plugin_error(request, "plugins.staging_failed"))?;
-                let published = Snapshot::capture(&next, Default::default(), || false)
-                    .map_err(|_| plugin_error(request, "plugins.staging_failed"))?
-                    .tree_digest();
                 let action = PackageAction {
                     kind: "update".into(),
                     source_upload_id: Some(upload_id.clone()),
-                    staging_name: staging_name.into(),
-                    prior_fingerprint: prior
-                        .as_ref()
-                        .map(Snapshot::tree_digest)
-                        .unwrap_or_default(),
-                    cleanup_refs: previous_action
-                        .as_ref()
-                        .map(|action| action.cleanup_refs.clone())
-                        .unwrap_or_default(),
                     children,
                     target_fingerprint: plan.tree_digest.clone(),
-                    published_fingerprint: published,
-                    denied: denied_keys(&snapshot, &plan),
                     ..Default::default()
                 };
                 let pending = serde_json::to_string(&action)
                     .map_err(|_| plugin_error(request, "plugins.plan_too_large"))?;
                 let _upload_lock = self.acquire_skill_upload_lock(&upload_id).await;
+                self.revalidate_plugin_upload(&owner, &params.workspace_id, &upload_id, request).await?;
                 let begin = self
                     .crud_store
                     .begin_plugin_package_update(
@@ -568,7 +457,14 @@ impl MessageProcessor {
                 match begin {
                     Ok(parent) => {
                         guard.parent = parent;
-                        self.cleanup_upload_artifacts(&source.upload, &source.cleanup_root);
+                        let payload = source.upload.clone();
+                        let _ = guard
+                            .fs(move |_| {
+                                super::super::package_delivery::upload::cleanup_consumed_payload(
+                                    &payload,
+                                )
+                            })
+                            .await;
                     }
                     Err(_) => {
                         // The writer may have committed before cancellation. Retain
@@ -581,9 +477,14 @@ impl MessageProcessor {
                             .flatten()
                             .is_some_and(|parent| parent.pending_json.is_none())
                         {
-                            let _ = std::fs::remove_dir_all(&next);
+                            let abandoned = next.clone();
+                            let _ = guard
+                                .fs(move |_| {
+                                    let _ = std::fs::remove_dir_all(abandoned);
+                                    Ok(())
+                                })
+                                .await;
                         }
-                        let _ = std::fs::remove_dir_all(&source.cleanup_root);
                         return Err(plugin_error(request, "plugins.stale_or_upload_unavailable"));
                     }
                 }
@@ -595,9 +496,6 @@ impl MessageProcessor {
             } => {
                 if before.is_some() {
                     return Err(plugin_error(request, "plugins.use_continue"));
-                }
-                if components.len() > 256 {
-                    return Err(plugin_error(request, "plugins.invalid_request"));
                 }
                 let links = self
                     .crud_store
@@ -634,9 +532,6 @@ impl MessageProcessor {
                                 || (restore_removed && link.status == "removed_by_user")
                         })
                         .ok_or_else(|| plugin_error(request, "plugins.component_not_retryable"))?;
-                    if link.diagnostic.as_deref() == Some("component_path_denied") {
-                        return Err(plugin_error(request, "plugins.fresh_package_required"));
-                    }
                     children.push(ReservedChild {
                         kind: component.kind,
                         key: component.member_key,
@@ -647,13 +542,15 @@ impl MessageProcessor {
                             .unwrap_or_else(|| pioneer_protocol::generate_id(21)),
                     });
                 }
-                let (_, plan) = verified_package(&guard.parent)
+                let limits = guard.limits;
+                guard
+                    .fs_prepare(move |parent, cancellation| verified_package(parent, cancellation, limits))
+                    .await
                     .map_err(|_| plugin_error(request, "plugins.package_changed"))?;
                 let action = PackageAction {
                     kind: "retry".into(),
                     children,
                     target_fingerprint: guard.parent.package_fingerprint.clone(),
-                    published_fingerprint: plan.tree_digest.clone(),
                     restore_removed,
                     ..Default::default()
                 };
@@ -684,11 +581,14 @@ impl MessageProcessor {
                     Some("native" | "set_enabled")
                 ) {
                     return self
-                        .continue_native_plugin_action(context, request, guard, value, deadline)
+                        .continue_native_plugin_action(context, request, guard, value)
                         .await;
                 }
                 let mut action: PackageAction = serde_json::from_str(pending)
                     .map_err(|_| plugin_error(request, "plugins.pending_invalid"))?;
+                if action.kind == "retained" {
+                    return Err(plugin_error(request, "plugins.fresh_package_required"));
+                }
                 if action.kind.is_empty() {
                     action.kind = "install".into();
                     action.target_fingerprint = guard.parent.package_fingerprint.clone();
@@ -781,7 +681,8 @@ impl MessageProcessor {
             .validate()
             .map_err(|_| plugin_error(request, "plugins.pending_invalid"))?;
         self.publish_plugin_changed(&guard.parent).await;
-        let result = tokio::time::timeout_at(deadline, async {
+        let deadline = self.agent_manager.control_operation_deadline();
+        let result = async {
             self.stop_plugin_execution(&guard, deadline).await?;
             self.cleanup_pending_refs(&guard).await?;
             if action.kind == "remove" {
@@ -795,49 +696,73 @@ impl MessageProcessor {
                 }
                 // Only Gateway-owned package/staging paths are removed. Data is
                 // retained by default and only this parent's host data is purged.
-                let package = Path::new(&guard.parent.package_path);
-                for path in [
-                    package.to_path_buf(),
-                    package.with_file_name("package-next"),
-                    package.with_file_name("package-repair"),
-                    package.with_file_name("package-backup"),
-                ] {
-                    if path.exists() {
-                        std::fs::remove_dir_all(path)?;
-                    }
-                }
-                let receipt = integrity_path(package)?;
-                for path in [receipt.clone(), receipt.with_extension("integrity-next")] {
-                    if path.symlink_metadata().is_ok() {
-                        std::fs::remove_file(path)?;
-                    }
-                }
-                if action.purge_data && Path::new(&guard.parent.data_path).exists() {
-                    std::fs::remove_dir_all(&guard.parent.data_path)?;
-                }
-                self.crud_store
-                    .delete_plugin_parent(&guard.parent.id, guard.parent.revision)
+                let purge_data = action.purge_data;
+                guard
+                    .fs(move |parent| {
+                        let package = Path::new(&parent.package_path);
+                        for path in [
+                            package.to_path_buf(),
+                            package.with_file_name("package-next"),
+                            package.with_file_name("package-backup"),
+                        ] {
+                            if path.exists() {
+                                std::fs::remove_dir_all(path)?;
+                            }
+                        }
+                        if purge_data && Path::new(&parent.data_path).exists() {
+                            std::fs::remove_dir_all(&parent.data_path)?;
+                        }
+                        Ok(())
+                    })
                     .await?;
+                if action.purge_data {
+                    self.crud_store
+                        .delete_plugin_parent(&guard.parent.id, guard.parent.revision)
+                        .await?;
+                } else {
+                    // Keep an addressable, execution-fenced owner for data. A
+                    // fresh package update on this exact ID restores it; Remove
+                    // with purge explicitly deletes it. Never match by name.
+                    let retained = PackageAction {
+                        kind: "retained".into(),
+                        ..Default::default()
+                    };
+                    self.crud_store
+                        .replace_plugin_pending(
+                            &guard.parent.id,
+                            guard.parent.revision,
+                            &serde_json::to_string(&retained)?,
+                        )
+                        .await?;
+                    self.crud_store
+                        .finish_plugin_mutation(
+                            &guard.parent.id,
+                            guard.parent.revision,
+                            "interrupted",
+                            Some("plugins.data_retained".into()),
+                        )
+                        .await?;
+                }
                 self.mcp_service
                     .reload_workspace(&guard.parent.workspace_id)
                     .await?;
                 return Ok::<_, anyhow::Error>(true);
             }
-            if action.kind == "update" {
-                prepare_replacement_after_stop(Path::new(&guard.parent.package_path), &action)?;
-            }
-            let (snapshot, plan) = package_snapshot(Path::new(&guard.parent.package_path))?;
-            if !action.published_fingerprint.is_empty() {
-                anyhow::ensure!(
-                    snapshot.tree_digest() == action.published_fingerprint,
-                    "plugins.package_changed"
-                );
-            } else {
-                anyhow::ensure!(
-                    snapshot.tree_digest() == guard.parent.package_fingerprint,
-                    "plugins.fresh_package_required"
-                );
-            }
+            let fs_action = action.clone();
+            let limits = guard.limits;
+            let plan = guard
+                .fs(move |parent| {
+                    let package = Path::new(&parent.package_path);
+                    if fs_action.kind == "update" {
+                        swap_package_after_stop(package, &fs_action.target_fingerprint, limits)?;
+                    }
+                    let (snapshot, plan) = package_snapshot(package, limits)?;
+                    let digest = snapshot.tree_digest();
+                    let expected = &fs_action.target_fingerprint;
+                    anyhow::ensure!(&digest == expected, "plugins.package_changed");
+                    Ok(plan)
+                })
+                .await?;
             if action.kind == "update" {
                 let target = plan.components.iter().map(key).collect::<Vec<_>>();
                 for link in self
@@ -874,20 +799,19 @@ impl MessageProcessor {
             }
             self.apply_plugin_components(context, request, &guard, &action, &plan)
                 .await?;
-            for name in ["package-next", "package-repair"] {
-                let path = Path::new(&guard.parent.package_path).with_file_name(name);
-                if path.exists() {
-                    std::fs::remove_dir_all(path)?;
-                }
-            }
-            save_package_integrity(
-                Path::new(&guard.parent.package_path),
-                &snapshot.tree_digest(),
-            )?;
-            let backup = Path::new(&guard.parent.package_path).with_file_name("package-backup");
-            if backup.exists() {
-                std::fs::remove_dir_all(backup)?;
-            }
+            guard
+                .fs(move |parent| {
+                    let next = Path::new(&parent.package_path).with_file_name("package-next");
+                    if next.exists() {
+                        std::fs::remove_dir_all(next)?;
+                    }
+                    let backup = Path::new(&parent.package_path).with_file_name("package-backup");
+                    if backup.exists() {
+                        std::fs::remove_dir_all(backup)?;
+                    }
+                    Ok(())
+                })
+                .await?;
             self.crud_store
                 .prepare_plugin_reload(&guard.parent.id, guard.parent.revision)
                 .await?;
@@ -901,9 +825,9 @@ impl MessageProcessor {
                 )
                 .await?;
             Ok(false)
-        })
+        }
         .await;
-        if !matches!(result, Ok(Ok(_))) {
+        if result.is_err() {
             if let Some(current) = self
                 .crud_store
                 .find_plugin_installation(&guard.parent.id)
@@ -918,7 +842,7 @@ impl MessageProcessor {
                             "interrupted",
                             Some(
                                 match &result {
-                                    Ok(Err(error)) => match error.to_string().as_str() {
+                                    Err(error) => match error.to_string().as_str() {
                                         "plugins.package_unavailable" => {
                                             "plugins.package_unavailable"
                                         }
@@ -1019,7 +943,7 @@ impl MessageProcessor {
                 request.clone(),
                 McpUninstallParams {
                     workspace_id: guard.parent.workspace_id.clone(),
-                    name: mcp::portable::internal_mcp_name(&guard.parent.id, &link.member_key),
+                    name: link.member_key.clone(),
                     scope_kind: pioneer_protocol::McpScopeKind::Workspace,
                 },
                 Some(&write),
@@ -1037,7 +961,6 @@ impl MessageProcessor {
         action: &PackageAction,
         plan: &LoadedPluginPlan,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(action.children.len() <= 256, "plugins.pending_invalid");
         for reserved in &action.children {
             let component = plan
                 .components
@@ -1093,20 +1016,6 @@ impl MessageProcessor {
                 ownership.member_path = Some(member_path.clone());
                 ownership.package_fingerprint = tree_digest.clone();
             }
-            if action
-                .denied
-                .iter()
-                .any(|key| matches_key(key, &reserved.kind, &reserved.key))
-            {
-                self.crud_store
-                    .record_plugin_component_failure(
-                        &ownership,
-                        &reserved.kind,
-                        "component_path_denied",
-                    )
-                    .await?;
-                continue;
-            }
             let masks: std::collections::BTreeSet<String> = current
                 .filter(|link| link.skill_id.is_some() || link.mcp_installation_id.is_some())
                 .map(|link| serde_json::from_str(&link.override_fields_json))
@@ -1138,7 +1047,10 @@ impl MessageProcessor {
                                 skill_id: SkillId::new(reserved.id.clone())?,
                                 expected_previous_fingerprint: None,
                             },
-                            skills::SkillInstallSource::PackageMember(ownership.clone()),
+                            skills::SkillInstallSource::PackageMember(
+                                ownership.clone(),
+                                guard._lock.clone(),
+                            ),
                         )
                         .await
                         .map(|_| ())
@@ -1149,7 +1061,10 @@ impl MessageProcessor {
                             request.clone(),
                             guard.parent.workspace_id.clone(),
                             "user".into(),
-                            skills::SkillInstallSource::PackageMember(ownership.clone()),
+                            skills::SkillInstallSource::PackageMember(
+                                ownership.clone(),
+                                guard._lock.clone(),
+                            ),
                         )
                         .await
                         .map(|_| ())
@@ -1260,7 +1175,6 @@ impl MessageProcessor {
         request: &RequestId,
         mut guard: PluginMutationGuard,
         value: serde_json::Value,
-        deadline: tokio::time::Instant,
     ) -> Result<PluginsMutationResponse, JsonRpcErrorResponse> {
         let before = guard.parent.pending_json.clone().unwrap();
         guard.parent = self
@@ -1275,7 +1189,8 @@ impl MessageProcessor {
             )
             .await
             .map_err(|_| plugin_error(request, "plugins.stale"))?;
-        let result = tokio::time::timeout_at(deadline, async {
+        let deadline = self.agent_manager.control_operation_deadline();
+        let result = async {
             self.stop_plugin_execution(&guard, deadline).await?;
             self.cleanup_pending_refs(&guard).await?;
             let kind = value.get("kind").and_then(serde_json::Value::as_str);
@@ -1326,7 +1241,7 @@ impl MessageProcessor {
                         .installation_lifecycle_guard(
                             "workspace",
                             &guard.parent.workspace_id,
-                            &mcp::portable::internal_mcp_name(&guard.parent.id, &link.member_key),
+                            &link.member_key,
                         )
                         .await;
                     self.mcp_service
@@ -1354,9 +1269,9 @@ impl MessageProcessor {
                 .finish_plugin_mutation(&guard.parent.id, guard.parent.revision, "installed", None)
                 .await?;
             Ok::<_, anyhow::Error>(())
-        })
+        }
         .await;
-        if !matches!(result, Ok(Ok(()))) {
+        if !matches!(result, Ok(())) {
             let current = self
                 .crud_store
                 .find_plugin_installation(&guard.parent.id)
@@ -1364,7 +1279,7 @@ impl MessageProcessor {
                 .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?
                 .ok_or_else(|| plugin_error(request, "plugins.not_found"))?;
             if current.pending_json.is_some() {
-                let code = if matches!(&result,Ok(Err(error)) if error.to_string()=="plugins.reapply_native_change")
+                let code = if matches!(&result,Err(error) if error.to_string()=="plugins.reapply_native_change")
                 {
                     "plugins.reapply_native_change"
                 } else {
@@ -1402,7 +1317,7 @@ impl MessageProcessor {
 /// Caller has a confirmed execution stop and owns the parent mutex. The three
 /// fixed host paths plus target digest identify crash boundaries; no file in the
 /// used package is replaced before that ACK, including assets-only updates.
-fn swap_package_after_stop(package: &Path, target: &str) -> anyhow::Result<()> {
+fn swap_package_after_stop(package: &Path, target: &str, limits: pioneer_plugins::Limits) -> anyhow::Result<()> {
     let next = package.with_file_name("package-next");
     let backup = package.with_file_name("package-backup");
     match (package.exists(), next.exists(), backup.exists()) {
@@ -1416,11 +1331,80 @@ fn swap_package_after_stop(package: &Path, target: &str) -> anyhow::Result<()> {
         (true, false, true) | (true, false, false) => {}
         _ => anyhow::bail!("plugins.package_repair_required"),
     }
-    let snapshot = Snapshot::capture(package, Default::default(), || false)?;
+    let snapshot = Snapshot::capture(package, limits, || false)?;
     anyhow::ensure!(snapshot.tree_digest() == target, "plugins.package_changed");
     Ok(())
 }
 
+/// Compare immutable loader facts. Skill member digests include bytes and modes;
+/// MCP equality compares parsed config semantics, not JSON formatting. No config
+/// values, host paths or secret material cross the public summary boundary.
+fn package_content_changes(
+    current: &Snapshot,
+    previous: &LoadedPluginPlan,
+    candidate: &Snapshot,
+    next: &LoadedPluginPlan,
+) -> (Vec<PluginComponentKey>, bool) {
+    let updated = next
+        .components
+        .iter()
+        .filter(|component| {
+            previous
+                .components
+                .iter()
+                .find(|old| key(old) == key(component))
+                .is_some_and(|old| match (old, *component) {
+                    (
+                        ComponentPlan::Skill { tree_digest: a, .. },
+                        ComponentPlan::Skill { tree_digest: b, .. },
+                    ) => a != b,
+                    (
+                        ComponentPlan::Mcp { server: a, .. },
+                        ComponentPlan::Mcp { server: b, .. },
+                    ) => a != b,
+                    _ => true,
+                })
+        })
+        .map(key)
+        .collect();
+    // Shared files and metadata have package meaning even with no member diff.
+    // Exclude member directories and MCP bytes, whose semantic changes are
+    // already represented above. Retain root and MCP document modes separately.
+    fn supporting<'a>(
+        snapshot: &'a Snapshot,
+        plan: &LoadedPluginPlan,
+    ) -> std::collections::BTreeMap<&'a str, &'a pioneer_plugins::Entry> {
+        snapshot
+            .entries()
+            .iter()
+            .filter(|(path, _)| {
+                !matches!(path.as_str(), "mcp.json" | ".mcp.json")
+                    && !plan.components.iter().any(|component| match component {
+                        ComponentPlan::Skill { member_path, .. } => {
+                            *path == member_path || path.starts_with(&format!("{member_path}/"))
+                        }
+                        _ => false,
+                    })
+            })
+            .map(|(path, entry)| (path.as_str(), entry))
+            .collect()
+    }
+    let mcp_document_modes = |snapshot: &Snapshot| {
+        ["mcp.json", ".mcp.json"].map(|path| match snapshot.entries().get(path) {
+            Some(
+                pioneer_plugins::Entry::Directory { mode }
+                | pioneer_plugins::Entry::File { mode, .. },
+            ) => Some(*mode),
+            _ => None,
+        })
+    };
+    (
+        updated,
+        current.root_mode() != candidate.root_mode()
+            || mcp_document_modes(current) != mcp_document_modes(candidate)
+            || supporting(current, previous) != supporting(candidate, next),
+    )
+}
 fn disclose_update_preview(
     preview: &mut PluginsUpdatePreviewResponse,
     existing: &[PluginComponentKey],
@@ -1458,80 +1442,9 @@ fn disclose_update_preview(
 mod tests {
     // Regression sources only: NOT_RUN / NOT_COMPILED.
     use super::*;
-    #[test]
-    fn fresh_payload_repairs_a_lost_stage_and_survives_each_swap_boundary() {
-        for crash_after_first_rename in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let package = root.path().join("package");
-            let repair = root.path().join("package-repair");
-            std::fs::create_dir(&package).unwrap();
-            std::fs::write(package.join("asset"), "old").unwrap();
-            let prior = Snapshot::capture(&package, Default::default(), || false)
-                .unwrap()
-                .tree_digest();
-            std::fs::create_dir(&repair).unwrap();
-            std::fs::write(repair.join("asset"), "fresh").unwrap();
-            let target = Snapshot::capture(&repair, Default::default(), || false)
-                .unwrap()
-                .tree_digest();
-            let action = PackageAction {
-                kind: "update".into(),
-                staging_name: "package-repair".into(),
-                prior_fingerprint: prior,
-                published_fingerprint: target,
-                ..Default::default()
-            };
-            if crash_after_first_rename {
-                std::fs::rename(&package, root.path().join("package-backup")).unwrap();
-            }
-            prepare_replacement_after_stop(&package, &action).unwrap();
-            prepare_replacement_after_stop(&package, &action).unwrap();
-            assert_eq!(
-                std::fs::read_to_string(package.join("asset")).unwrap(),
-                "fresh"
-            );
-            assert_eq!(
-                std::fs::read_to_string(root.path().join("package-backup/asset")).unwrap(),
-                "old"
-            );
-        }
-        let root = tempfile::tempdir().unwrap();
-        let package = root.path().join("package");
-        let repair = root.path().join("package-repair");
-        std::fs::create_dir(&repair).unwrap();
-        std::fs::write(repair.join("asset"), "replacement").unwrap();
-        let target = Snapshot::capture(&repair, Default::default(), || false)
-            .unwrap()
-            .tree_digest();
-        let action = PackageAction {
-            kind: "update".into(),
-            staging_name: "package-repair".into(),
-            published_fingerprint: target,
-            ..Default::default()
-        };
-        assert!(package_payload_missing(&package));
-        prepare_replacement_after_stop(&package, &action).unwrap();
-        assert!(!package_payload_missing(&package));
-        prepare_replacement_after_stop(&package, &action).unwrap();
-    }
-    #[test]
-    fn integrity_metadata_rejects_oversized_values_and_symlinks() {
-        let root = tempfile::tempdir().unwrap();
-        let package = root.path().join("package");
-        assert_eq!(read_package_integrity(&package).unwrap(), None);
-        let receipt = integrity_path(&package).unwrap();
-        std::fs::write(&receipt, "a".repeat(65)).unwrap();
-        assert!(read_package_integrity(&package).is_err());
-        std::fs::write(&receipt, "z".repeat(64)).unwrap();
-        assert!(read_package_integrity(&package).is_err());
-        std::fs::remove_file(&receipt).unwrap();
-        #[cfg(unix)]
-        {
-            let external = root.path().join("external");
-            std::fs::write(&external, "a".repeat(64)).unwrap();
-            std::os::unix::fs::symlink(external, receipt).unwrap();
-            assert!(read_package_integrity(&package).is_err());
-        }
+    fn snapshot_limits() -> pioneer_plugins::Limits {
+        pioneer_plugins::Limits { expanded_bytes: 50 * 1024 * 1024, entry_bytes: 1024 * 1024,
+            entries: 2048, depth: 2048, components: 2048 }
     }
     #[test]
     fn assets_only_swap_resumes_a_crash_after_first_rename_and_checks_target() {
@@ -1544,11 +1457,11 @@ mod tests {
         }
         std::fs::write(package.join("asset"), "before").unwrap();
         std::fs::write(next.join("asset"), "after").unwrap();
-        let target = Snapshot::capture(&next, Default::default(), || false)
+        let target = Snapshot::capture(&next, snapshot_limits(), || false)
             .unwrap()
             .tree_digest();
         std::fs::rename(&package, root.path().join("package-backup")).unwrap();
-        swap_package_after_stop(&package, &target).unwrap();
+        swap_package_after_stop(&package, &target, snapshot_limits()).unwrap();
         assert_eq!(
             std::fs::read_to_string(package.join("SKILL.md")).unwrap(),
             "unchanged markdown"
@@ -1561,36 +1474,8 @@ mod tests {
             std::fs::read_to_string(root.path().join("package-backup/asset")).unwrap(),
             "before"
         );
-        swap_package_after_stop(&package, &target).unwrap(); // Already swapped, no second rename.
-        assert!(swap_package_after_stop(&package, "wrong-target").is_err());
-    }
-    #[test]
-    fn private_integrity_hash_does_not_become_a_package_asset() {
-        let root = tempfile::tempdir().unwrap();
-        let package = root.path().join("package");
-        std::fs::create_dir(&package).unwrap();
-        std::fs::write(
-            package.join("plugin.json"),
-            serde_json::to_vec(
-                &json!({"$schema":pioneer_plugins::PLUGIN_SCHEMA,"name":"fixture.tools"}),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let digest = Snapshot::capture(&package, Default::default(), || false)
-            .unwrap()
-            .tree_digest();
-        save_package_integrity(&package, &digest).unwrap();
-        assert_eq!(
-            Snapshot::capture(&package, Default::default(), || false)
-                .unwrap()
-                .tree_digest(),
-            digest
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("package.integrity")).unwrap(),
-            digest
-        );
+        swap_package_after_stop(&package, &target, snapshot_limits()).unwrap(); // Already swapped, no second rename.
+        assert!(swap_package_after_stop(&package, "wrong-target", snapshot_limits()).is_err());
     }
     #[test]
     fn update_preview_does_not_disclose_hidden_old_members_or_diagnostic_pointers() {
@@ -1603,9 +1488,11 @@ mod tests {
             member_key: "public-member".into(),
         };
         let mut preview = PluginsUpdatePreviewResponse {
+            supporting_files_changed: false,
             package: PluginsPreviewResponse {
                 name: "fixture.tools".into(),
                 version: None,
+                description: None,
                 fingerprint: "tree".into(),
                 components: vec![PluginComponentItem {
                     kind: hidden.kind.clone(),
@@ -1647,81 +1534,157 @@ mod tests {
                 .contains("private-member")
         );
     }
-}
+    #[test]
+    fn preview_compares_member_content_separately_from_shared_assets_and_metadata() {
+        use pioneer_plugins::Entry;
+        let package = |asset: &str, skill: &str, config: &str, metadata: serde_json::Value| {
+            let mut entries = std::collections::BTreeMap::new();
+            for path in ["skills", "skills/one", "assets"] {
+                entries.insert(path.into(), Entry::Directory { mode: 0o755 });
+            }
+            for (path, bytes) in [
+                ("plugin.json", serde_json::to_vec(&metadata).unwrap()),
+                (
+                    "skills/one/SKILL.md",
+                    format!("---\nname: one\ndescription: Read data.\n---\n{skill}").into_bytes(),
+                ),
+                ("assets/guide.txt", asset.as_bytes().to_vec()),
+                ("mcp.json", config.as_bytes().to_vec()),
+            ] {
+                entries.insert(path.into(), Entry::File { bytes, mode: 0o644 });
+            }
+            let snapshot = Snapshot::from_entries(entries, snapshot_limits()).unwrap();
+            let plan = pioneer_plugins::load(&snapshot).unwrap();
+            assert_eq!(plan.components.len(), 2);
+            (snapshot, plan)
+        };
+        let manifest = json!({"$schema":pioneer_plugins::PLUGIN_SCHEMA,"name":"preview.tools","description":" Read shared data. "});
+        let config = format!(
+            r#"{{"$schema":"{}","mcpServers":{{"bridge":{{"type":"stdio","command":"node","args":["one.js"]}}}}}}"#,
+            pioneer_plugins::MCP_SCHEMA
+        );
+        let (current, previous) = package("old", "Read assets.", &config, manifest.clone());
+        let (candidate, next) = package("new", "Read assets.", &config, manifest.clone());
+        let (changed, supporting) = package_content_changes(&current, &previous, &candidate, &next);
+        assert!(
+            changed.is_empty(),
+            "assets alone must not report all children as changed"
+        );
+        assert!(supporting);
+        assert_eq!(
+            public_description(&next).as_deref(),
+            Some("Read shared data.")
+        );
+        let (candidate, next) = package("old", "Changed instructions.", &config, manifest.clone());
+        let (changed, supporting) = package_content_changes(&current, &previous, &candidate, &next);
+        assert_eq!(
+            changed,
+            vec![PluginComponentKey {
+                kind: "skill".into(),
+                member_key: "one".into()
+            }]
+        );
+        assert!(!supporting);
+        let reformatted = serde_json::to_string_pretty(
+            &serde_json::from_str::<serde_json::Value>(&config).unwrap(),
+        )
+        .unwrap();
+        let (candidate, next) = package("old", "Read assets.", &reformatted, manifest.clone());
+        assert_eq!(
+            package_content_changes(&current, &previous, &candidate, &next),
+            (vec![], false)
+        );
+        let (candidate, next) = package(
+            "old",
+            "Read assets.",
+            &config.replace("one.js", "two.js"),
+            manifest.clone(),
+        );
+        assert_eq!(
+            package_content_changes(&current, &previous, &candidate, &next),
+            (
+                vec![PluginComponentKey {
+                    kind: "mcp".into(),
+                    member_key: "bridge".into()
+                }],
+                false
+            )
+        );
+        let (_, next) = package(
+            "old",
+            "Read assets.",
+            &config,
+            json!({"$schema":pioneer_plugins::PLUGIN_SCHEMA,"name":"preview.tools"}),
+        );
+        assert!(public_description(&next).is_none());
+        let (_, next) = package(
+            "old",
+            "Read assets.",
+            &config,
+            json!({"$schema":pioneer_plugins::PLUGIN_SCHEMA,"name":"preview.tools","description":"x".repeat(4096)}),
+        );
+        assert_eq!(public_description(&next).unwrap().chars().count(), 2048);
 
-fn comparison_package(
-    parent: &pioneer_entity::plugin_installation::Model,
-) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
-    if parent.pending_json.is_none() {
-        return verified_package(parent);
-    }
-    let value: serde_json::Value = serde_json::from_str(parent.pending_json.as_deref().unwrap())?;
-    let package = Path::new(&parent.package_path);
-    let candidate = if package.exists() {
-        package.to_path_buf()
-    } else {
-        package.with_file_name("package-backup")
-    };
-    let (snapshot, plan) = package_snapshot(&candidate)?;
-    let digest = snapshot.tree_digest();
-    let receipt =
-        read_package_integrity(package)?.unwrap_or_else(|| parent.package_fingerprint.clone());
-    anyhow::ensure!(
-        digest == receipt
-            || value
-                .get("published_fingerprint")
-                .and_then(serde_json::Value::as_str)
-                == Some(digest.as_str()),
-        "plugins.package_changed"
-    );
-    Ok((snapshot, plan))
-}
-fn prepare_replacement_after_stop(package: &Path, action: &PackageAction) -> anyhow::Result<()> {
-    let stage = match action.staging_name.as_str() {
-        "" | "package-next" => "package-next",
-        "package-repair" => "package-repair",
-        _ => anyhow::bail!("plugins.pending_invalid"),
-    };
-    if stage == "package-next" && action.prior_fingerprint.is_empty() {
-        return swap_package_after_stop(package, &action.published_fingerprint);
-    }
-    let next = package.with_file_name(stage);
-    let backup = package.with_file_name("package-backup");
-    if next.exists() && action.prior_fingerprint.is_empty() && package_payload_missing(package) {
-        anyhow::ensure!(
-            Snapshot::capture(&next, Default::default(), || false)?.tree_digest()
-                == action.published_fingerprint,
-            "plugins.package_changed"
-        );
-        std::fs::rename(&next, package)?;
-        return Ok(());
-    }
-    if next.exists() {
-        if !package.exists() && backup.exists() {
-            anyhow::ensure!(
-                Snapshot::capture(&backup, Default::default(), || false)?.tree_digest()
-                    == action.prior_fingerprint,
-                "plugins.package_changed"
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            std::fs::create_dir_all(root.join("skills/one")).unwrap();
+            std::fs::create_dir(root.join("assets")).unwrap();
+            for (path, bytes) in [
+                ("plugin.json", serde_json::to_vec(&manifest).unwrap()),
+                (
+                    "skills/one/SKILL.md",
+                    b"---\nname: one\ndescription: Read data.\n---\nRead assets.".to_vec(),
+                ),
+                ("assets/guide.txt", b"old".to_vec()),
+                ("mcp.json", config.as_bytes().to_vec()),
+                (".mcp.json", config.as_bytes().to_vec()),
+            ] {
+                std::fs::write(root.join(path), bytes).unwrap();
+            }
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for path in ["mcp.json", ".mcp.json"] {
+                std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+            let capture = || {
+                let snapshot = Snapshot::capture(root, snapshot_limits(), || false).unwrap();
+                let plan = pioneer_plugins::load(&snapshot).unwrap();
+                assert_eq!(plan.components.len(), 2);
+                (snapshot, plan)
+            };
+            let (current, previous) = capture();
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o750)).unwrap();
+            let (candidate, next) = capture();
+            assert_ne!(current.tree_digest(), candidate.tree_digest());
+            assert_eq!(
+                package_content_changes(&current, &previous, &candidate, &next),
+                (vec![], true),
+                "retained root permissions are a supporting package change"
             );
-            std::fs::rename(&backup, package)?;
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for path in ["mcp.json", ".mcp.json"] {
+                std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o640))
+                    .unwrap();
+                let (candidate, next) = capture();
+                assert_ne!(current.tree_digest(), candidate.tree_digest());
+                assert_eq!(
+                    package_content_changes(&current, &previous, &candidate, &next),
+                    (vec![], true),
+                    "retained {path} permissions must not disappear behind config semantics"
+                );
+                std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+                let (restored, plan) = capture();
+                assert_eq!(
+                    package_content_changes(&current, &previous, &restored, &plan),
+                    (vec![], false),
+                    "restoring permissions must clear the supporting change"
+                );
+            }
         }
-        anyhow::ensure!(
-            Snapshot::capture(package, Default::default(), || false)?.tree_digest()
-                == action.prior_fingerprint,
-            "plugins.package_changed"
-        );
-        // An explicit new payload supersedes the interrupted plan. Its obsolete
-        // backup can be removed only after the same real execution stop proof.
-        if backup.exists() {
-            std::fs::remove_dir_all(&backup)?;
-        }
-        std::fs::rename(package, &backup)?;
-        std::fs::rename(next, package)?;
     }
-    anyhow::ensure!(
-        Snapshot::capture(package, Default::default(), || false)?.tree_digest()
-            == action.published_fingerprint,
-        "plugins.package_changed"
-    );
-    Ok(())
 }

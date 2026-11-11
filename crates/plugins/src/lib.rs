@@ -1,4 +1,4 @@
-//! Bounded offline Agent Plugins 1.0.0 loading. No component execution,
+//! Bounded offline Agent Plugins 1.0.0 loading and Codex/Claude/Cursor package import. No component execution,
 //! installation, database, network or OAuth operations belong here.
 pub mod containment;
 mod diagnostic;
@@ -6,6 +6,7 @@ mod discovery;
 mod manifest;
 pub mod portable_mcp;
 mod snapshot;
+mod source;
 pub use diagnostic::{Boundary, Diagnostic};
 pub use discovery::{ComponentPlan, LoadedPluginPlan, load};
 pub use manifest::{

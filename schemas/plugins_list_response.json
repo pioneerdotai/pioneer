@@ -89,6 +89,14 @@
             "$ref": "#/$defs/PluginComponentItem"
           }
         },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2048,
+          "default": null
+        },
         "diagnostics": {
           "type": "array",
           "items": {

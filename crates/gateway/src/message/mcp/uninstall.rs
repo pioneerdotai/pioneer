@@ -53,7 +53,7 @@ impl MessageProcessor {
         (McpUninstallResponse, String, Vec<McpChangedItem>),
         JsonRpcErrorResponse,
     > {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = self.agent_manager.control_operation_deadline();
         let scope = if params.scope_kind.as_str() == "workspace" {
             params.workspace_id.as_str()
         } else {
@@ -96,28 +96,13 @@ impl MessageProcessor {
                 })?,
             None => None,
         };
-        let owned = native.is_some();
         let work = self.uninstall_mcp_deferred_with_plugin_change(
             request_context,
             request_id.clone(),
             params,
             native.as_ref().map(|change| &change.write),
         );
-        let result = if owned {
-            tokio::time::timeout_at(deadline, work)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(mcp_error(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        MCP_ERROR_INTERNAL,
-                        "plugin change deadline exceeded",
-                        json!({}),
-                    ))
-                })
-        } else {
-            work.await
-        };
+        let result = work.await;
         match (result, native) {
             (Ok(payload), Some(change)) => {
                 self.finish_native_plugin_change(change)

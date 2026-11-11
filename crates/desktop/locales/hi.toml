@@ -1751,3 +1751,6 @@ reason_unknown = "प्रक्रिया अपेक्षा के अ�
 [mcp.oauth]
 callback_received = "जवाब स्वीकार किया गया। साइन इन का परिणाम देखने के लिए Pioneer पर लौटें।"
 callback_rejected = "साइन इन अस्वीकार हुआ। दोबारा प्रयास करने के लिए Pioneer पर लौटें।"
+
+[plugins]
+title = "प्लगइन"

@@ -19,6 +19,16 @@ pub enum PluginShellRequest {
     },
     #[serde(rename = "poll_oauth")]
     PollOAuth,
+    ParentSnapshot {
+        workspace_id: String,
+        plugin_id: String,
+    },
+    ParentCommand {
+        workspace_id: String,
+        plugin_id: String,
+        origin: pioneer_client::plugins::runtime::PluginCommandOrigin,
+        intent: pioneer_client::plugins::runtime::PluginIntent,
+    },
     ComposerPicker {
         thread_id: String,
         draft_id: pioneer_client::composer::store::DraftId,
@@ -56,6 +66,9 @@ pub struct NativeOAuthLaunch {
 #[derive(Serialize)]
 pub struct PluginShellResponse {
     pub accepted: bool,
+    pub parent: Option<pioneer_client::plugins::runtime::PluginPublication>,
+    pub origin: Option<pioneer_client::plugins::runtime::PluginCommandOrigin>,
+    pub command_receipt: Option<pioneer_client::plugins::runtime::PluginCommandReceipt>,
     pub operation_id: Option<u64>,
     pub launches: Vec<NativeOAuthLaunch>,
     pub picker: Vec<pioneer_client::plugins::PluginPickerRow>,
@@ -65,6 +78,9 @@ impl PluginShellResponse {
     fn accepted(accepted: bool) -> Self {
         Self {
             accepted,
+            parent: None,
+            origin: None,
+            command_receipt: None,
             operation_id: None,
             launches: vec![],
             picker: vec![],
@@ -143,6 +159,9 @@ impl NativeOAuthShell {
             .collect();
         PluginShellResponse {
             accepted: true,
+            parent: None,
+            origin: None,
+            command_receipt: None,
             operation_id: None,
             launches,
             picker: vec![],
@@ -263,10 +282,6 @@ impl McpOAuthShell for NativeOAuthShell {
         let expires = Instant::now() + Duration::from_secs(600);
         {
             let mut flows = self.flows.lock().unwrap();
-            if !flows.contains_key(flow) && flows.len() >= 8 {
-                admission.complete();
-                return OAuthBrowserEffectResult::BrowserUnavailable;
-            }
             flows.insert(
                 flow.clone(),
                 Flow {
@@ -345,6 +360,38 @@ pub(crate) fn execute(
                 .set_mcp_oauth_shell(runtime.native_oauth.clone());
             Ok(PluginShellResponse::accepted(true))
         }
+        PluginShellRequest::ParentSnapshot {
+            workspace_id,
+            plugin_id,
+        } => {
+            let origin = runtime.core.plugin_command_origin();
+            let parent = runtime
+                .core
+                .plugin_details_publication(&workspace_id, &plugin_id);
+            if runtime.core.plugin_command_origin() != origin {
+                return Err("plugin_catalog_stale".into());
+            }
+            Ok(PluginShellResponse {
+                parent,
+                origin: Some(origin),
+                ..PluginShellResponse::accepted(true)
+            })
+        }
+        PluginShellRequest::ParentCommand {
+            workspace_id,
+            plugin_id,
+            origin,
+            intent,
+        } => {
+            let receipt = runtime
+                .core
+                .submit_plugin_command(&workspace_id, &plugin_id, intent, &origin)
+                .map_err(|_| "plugin_command_rejected".to_owned())?;
+            Ok(PluginShellResponse {
+                command_receipt: Some(receipt),
+                ..PluginShellResponse::accepted(true)
+            })
+        }
         PluginShellRequest::ComposerPicker {
             thread_id,
             draft_id,
@@ -352,7 +399,7 @@ pub(crate) fn execute(
         } => Ok(PluginShellResponse {
             picker: runtime
                 .core
-                .composer_plugin_picker(&thread_id, draft_id, &query),
+                .composer_catalog_plugin_picker(&thread_id, draft_id, &query),
             ..PluginShellResponse::accepted(true)
         }),
         PluginShellRequest::PollOAuth => Ok(runtime.native_oauth.poll()),
@@ -388,7 +435,8 @@ pub(crate) fn execute(
                 .map_err(|_| "plugin_archive_upload_unavailable".to_owned())?;
             let id = operation.id();
             let mut handles = runtime.plugin_uploads.lock().unwrap();
-            handles.retain(|(w, _), _| w != &workspace_id);
+            // Each retained preview/recovery owns its exact upload identity.
+            // Only its explicit cancellation releases the bridge handle.
             handles.insert((workspace_id, id), operation);
             Ok(PluginShellResponse {
                 operation_id: Some(id),

@@ -529,6 +529,38 @@
         "demand",
         "generation"
       ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "connection_id": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "intent": {
+          "$ref": "#/$defs/PluginIntent"
+        },
+        "kind": {
+          "type": "string",
+          "const": "plugins"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id",
+        "intent"
+      ]
     }
   ],
   "$defs": {
@@ -2519,6 +2551,22 @@
             "kind",
             "workspace_id"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "plugins"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id"
+          ]
         }
       ]
     },
@@ -2948,11 +2996,43 @@
             "kind",
             "identity"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/ComposerOperationIdentity"
+            },
+            "kind": {
+              "type": "string",
+              "const": "toggle_plugin"
+            },
+            "plugin_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "identity",
+            "plugin_id"
+          ]
         }
       ]
     },
     "ComposerCatalogKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "plugins"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -4616,7 +4696,8 @@
       "type": "string",
       "enum": [
         "skills",
-        "mcp"
+        "mcp",
+        "plugins"
       ]
     },
     "ComposerReplyTarget": {
@@ -5739,6 +5820,150 @@
         "NoToolCatalog"
       ]
     },
+    "McpIntent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "retry_authorization_browser"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "sign_in"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "disconnect"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "flow_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "cancel_authorization"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id",
+            "flow_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allow_implicit_invocation": {
+              "type": "boolean"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "policy"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id",
+            "enabled",
+            "allow_implicit_invocation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "restart"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "remove"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "config_json": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "configure"
+            }
+          },
+          "required": [
+            "kind",
+            "config_json"
+          ]
+        }
+      ]
+    },
     "McpScopeKind": {
       "type": "string",
       "enum": [
@@ -6317,6 +6542,18 @@
           "required": [
             "kind"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "back_from_plugin"
+            }
+          },
+          "required": [
+            "kind"
+          ]
         }
       ]
     },
@@ -6573,6 +6810,305 @@
           },
           "required": [
             "resolution"
+          ]
+        }
+      ]
+    },
+    "PluginComponentKey": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "member_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "member_key"
+      ]
+    },
+    "PluginIntent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "observe"
+            },
+            "plugin_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "close"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "expected_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "set_enabled"
+            },
+            "plugin_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "plugin_id",
+            "expected_revision",
+            "enabled"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expected_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "intent": {
+              "$ref": "#/$defs/PluginManagementIntent"
+            },
+            "kind": {
+              "type": "string",
+              "const": "mutate"
+            },
+            "plugin_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "plugin_id",
+            "expected_revision",
+            "intent"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "install"
+            },
+            "upload_operation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "upload_operation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "confirm_changes": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "apply_update"
+            },
+            "upload_operation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "upload_operation",
+            "confirm_changes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allow_implicit_invocation": {
+              "type": "boolean"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "skill"
+            },
+            "skill_id": {
+              "$ref": "#/$defs/SkillId"
+            }
+          },
+          "required": [
+            "kind",
+            "skill_id",
+            "enabled",
+            "allow_implicit_invocation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "remove_skill"
+            },
+            "skill_id": {
+              "$ref": "#/$defs/SkillId"
+            }
+          },
+          "required": [
+            "kind",
+            "skill_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "body": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "configure_mcp"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id",
+            "body"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "intent": {
+              "$ref": "#/$defs/McpIntent"
+            },
+            "kind": {
+              "type": "string",
+              "const": "mcp"
+            }
+          },
+          "required": [
+            "kind",
+            "intent"
+          ]
+        }
+      ]
+    },
+    "PluginManagementIntent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "update"
+            },
+            "confirm_changes": {
+              "type": "boolean"
+            },
+            "expected_fingerprint": {
+              "type": "string"
+            },
+            "upload_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "upload_id",
+            "expected_fingerprint",
+            "confirm_changes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "retry"
+            },
+            "components": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/PluginComponentKey"
+              }
+            },
+            "restore_removed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "components",
+            "restore_removed"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "continue"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "remove"
+            },
+            "purge_data": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "purge_data"
           ]
         }
       ]
@@ -7703,6 +8239,32 @@
           "required": [
             "kind",
             "route"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "component": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PluginComponentKey"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "plugin"
+            },
+            "plugin_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "plugin_id"
           ]
         }
       ]

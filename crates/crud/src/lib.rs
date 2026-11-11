@@ -1,5 +1,5 @@
 mod plugins;
-pub use plugins::{PluginNativeWrite, PluginOwnershipWrite, validate_standalone_mcp_name};
+pub use plugins::{PluginNativeWrite, PluginOwnershipWrite};
 pub mod portable_payload_codec;
 #[doc(hidden)]
 pub use repositories::portable_payload::PayloadReadHold;
@@ -25161,9 +25161,6 @@ impl CrudStore {
                 &record.name,
             )
             .await?;
-            if ownership.is_none() && native.is_none() {
-                validate_standalone_mcp_name(&record.name, existing.is_some())?;
-            }
             let child_id = ownership
                 .map(|write| write.child_id.as_str())
                 .or_else(|| existing.as_ref().map(|row| row.id.as_str()))
@@ -60408,6 +60405,7 @@ mod tests {
         let mut wake = db.work_signal("gateway.control").subscribe();
         wake.begin_pass(&db).await.unwrap();
         let record = SkillUploadSessionRecord {
+            purpose: "skill".into(),
             upload_id: "UUUUUUUUUUUUUUUUUUUUU".into(),
             workspace_id: "ws_control_heads".into(),
             connection_id: 7,

@@ -27,7 +27,7 @@ pub(crate) enum MainRoute {
 impl MainRoute {
     fn from_destination(destination: &SemanticDestination) -> Self {
         match destination {
-            SemanticDestination::Plugins => Self::Plugins,
+            SemanticDestination::Plugins | SemanticDestination::Plugin { .. } => Self::Plugins,
             SemanticDestination::Threads => Self::Threads,
             SemanticDestination::AgentsDocument => Self::AgentsDoc,
             SemanticDestination::Providers { .. } => Self::Providers,

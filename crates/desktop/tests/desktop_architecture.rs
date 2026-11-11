@@ -209,7 +209,7 @@ fn desktop_foundation_is_narrow() {
     let manifest: toml::Value = toml::from_str(&source("desktop-foundation/Cargo.toml")).unwrap();
     assert_eq!(
         dependencies(&manifest),
-        ["gpui-kit".into(), "pioneer-client".into()]
+        ["gpui-kit".into(), "pioneer-client".into(), "tokio".into()]
             .into_iter()
             .collect()
     );
@@ -226,16 +226,34 @@ fn desktop_foundation_is_narrow() {
         .collect();
     assert_eq!(modules, c.foundation_modules);
     for file in sources(&dir) {
+        let name = file.file_name().unwrap().to_str().unwrap().to_owned();
         let text = fs::read_to_string(file).unwrap();
         let text = text.split("#[cfg(test)]").next().unwrap();
-        for forbidden in [
-            "ClientIntent",
-            "ClientEffectPlan",
-            "Entity<",
-            "ClientCore",
-            "impl Element for",
-        ] {
+        for forbidden in ["ClientIntent", "ClientEffectPlan", "impl Element for"] {
             assert!(!text.contains(forbidden), "Foundation: {forbidden}");
+        }
+        // Only the two-consumer upload view retains a Client delivery handle.
+        // Other foundation modules remain value/registration seams. This is a
+        // closed exception, not permission for arbitrary current feature edges.
+        if name != "package_upload.rs" {
+            assert!(
+                !text.contains("Entity<") && !text.contains("ClientCore"),
+                "Foundation: {name}"
+            );
+        } else {
+            for forbidden in [
+                "PluginIntent",
+                "SkillsIntent",
+                "GatewayNotification",
+                "requests_for_connection",
+                "crate::rpc",
+                "crate::transport",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "Upload presentation owns {forbidden}"
+                );
+            }
         }
     }
 }

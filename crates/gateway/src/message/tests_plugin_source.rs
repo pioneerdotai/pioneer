@@ -1,9 +1,9 @@
-//! Plugin native source overrides and package context regressions.
+//! Plugin skills retain the native installer source and native overrides.
 use super::*;
 use std::path::Path;
 
 #[tokio::test]
-async fn owned_source_context_keeps_native_override_and_bundled_siblings_separate() {
+async fn owned_skill_keeps_native_installation_and_native_source_override() {
     use pioneer_crud::{
         PluginNativeWrite, PluginOwnershipWrite, SkillInstallationRecord,
         WorkspaceSkillPolicyRecord,
@@ -124,12 +124,7 @@ async fn owned_source_context_keeps_native_override_and_bundled_siblings_separat
         .unwrap();
     assert_eq!(
         Path::new(&ordinary.identity.skill_dir),
-        member.canonicalize().unwrap()
-    );
-    assert_eq!(
-        std::fs::read_to_string(Path::new(&ordinary.identity.skill_dir).join("../sibling/asset"))
-            .unwrap(),
-        "sibling asset"
+        native.canonicalize().unwrap()
     );
     assert!(ordinary.host_explicit_only);
 

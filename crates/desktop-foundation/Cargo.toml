@@ -8,8 +8,10 @@ authors.workspace = true
 [dependencies]
 gpui-kit = { workspace = true, features = ["component"] }
 pioneer-client.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
 pioneer-client = { workspace = true, features = ["test-support"] }
 
 [package.metadata.pioneer-desktop-foundation]

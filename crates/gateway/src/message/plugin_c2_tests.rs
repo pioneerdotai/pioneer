@@ -15,9 +15,9 @@ async fn seed_owned_c2_skill(
     let skill = SkillId::new("S".repeat(21)).unwrap();
     let member = root.join("skills/bundled");
     std::fs::create_dir_all(&member).unwrap();
-    std::fs::create_dir_all(root.join("scripts")).unwrap();
-    std::fs::write(member.join("SKILL.md"), "---\nname: bundled\ndescription: Selected packaged skill\n---\nRead ../../scripts/helper.txt\n").unwrap();
-    std::fs::write(root.join("scripts/helper.txt"), "package sibling").unwrap();
+    std::fs::create_dir_all(member.join("scripts")).unwrap();
+    std::fs::write(member.join("SKILL.md"), "---\nname: bundled\ndescription: Selected packaged skill\n---\nRead scripts/helper.txt\n").unwrap();
+    std::fs::write(member.join("scripts/helper.txt"), "supporting file").unwrap();
     let now = chrono::Utc::now().fixed_offset();
     store
         .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
@@ -443,27 +443,37 @@ fn ordinary_owned_cli_start_uses_native_skill_and_ready_parent_for_both_provider
                     1,
                     "the selected plugin skill has exactly one committed binding"
                 );
-                let alias = crate::cli_runtime::skills::plugin_skill_alias(&parent, &skill);
-                let context = harness
-                    .native_home
-                    .join(".pioneer-selected-contexts")
-                    .join(&alias);
+                let install_name = "bundled";
+                let receipt = pioneer_skills::read_external_runtime_receipt(
+                    &harness
+                        .runtime_home
+                        .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME),
+                )
+                .unwrap();
+                let installed = receipt
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.skill_id == skill
+                            && entry.runtime_id == harness.runtime_id
+                            && entry.plugin_id.as_deref() == Some(parent.as_str())
+                    })
+                    .unwrap();
+                assert_eq!(installed.install_name, install_name);
+                let context = std::path::PathBuf::from(&installed.install_path);
+                assert_eq!(context, harness.native_home.join("skills").join(install_name));
                 assert_eq!(
                     std::fs::read(context.join("scripts/helper.txt")).unwrap(),
-                    b"package sibling"
+                    b"supporting file"
                 );
                 assert_eq!(
-                    std::fs::read(context.join("skills/bundled/SKILL.md")).unwrap(),
+                    std::fs::read(context.join("SKILL.md")).unwrap(),
                     std::fs::read(root.join("skills/bundled/SKILL.md")).unwrap()
-                );
-                assert!(
-                    !harness.native_home.join("skills/bundled").exists(),
-                    "owned children are not provider-autoloaded standalone skills"
                 );
                 if kind == CLIAgentRuntimeKind::Codex {
                     let items: Vec<pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem> =
                         serde_json::from_value(native.input).unwrap();
-                    assert!(items.iter().any(|item| matches!(item, pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill { name, path } if name == &alias && path == &context.join("skills/bundled/SKILL.md").to_string_lossy())), "Codex receives its genuine explicit native Skill item");
+                    assert!(items.iter().any(|item| matches!(item, pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill { name, path } if name == install_name && path == &context.join("SKILL.md").to_string_lossy())), "Codex receives its genuine explicit native Skill item");
                 }
                 let owners = harness
                     .cli_manager
@@ -483,4 +493,103 @@ fn ordinary_owned_cli_start_uses_native_skill_and_ready_parent_for_both_provider
             }
         }
     });
+}
+
+#[tokio::test]
+async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owner() {
+    let mut harness = setup_cli_runtime_security_harness(None).await;
+    let root = unique_temp_dir("plugin-transfer-owner");
+    let package = root.join("parent/package");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("plugin.json"), serde_json::to_vec(&json!({
+        "$schema": pioneer_plugins::PLUGIN_SCHEMA, "name": "owned-transfer"
+    })).unwrap()).unwrap();
+    let snapshot = pioneer_plugins::Snapshot::capture(&package, harness.processor.package_delivery_context().plugin_limits(), || false).unwrap();
+    let plan = pioneer_plugins::load(&snapshot).unwrap();
+    let archive = build_test_directory_archive(&package);
+    let payload = root.join("valid.tar.gz");
+    std::fs::write(&payload, &archive).unwrap();
+    let now = now_timestamp_secs();
+    let upload_id = "U".repeat(21);
+    harness.crud_store.insert_skill_upload_session(&pioneer_crud::SkillUploadSessionRecord {
+        purpose: "plugin".into(), upload_id: upload_id.clone(), workspace_id: harness.workspace_id.clone(),
+        connection_id: harness.connection_id, status: "finalized".into(), file_name: "valid.tar.gz".into(),
+        archive_format: "tar_gz".into(), compressed_size_bytes: archive.len() as u64, received_bytes: archive.len() as u64,
+        sha256: hex::encode(Sha256::digest(&archive)), payload_path: payload.to_string_lossy().into(),
+        created_at_unix: now, expires_at_unix: now + 3600, finalized_at_unix: Some(now), consumed_at_unix: None, aborted_at_unix: None,
+    }).await.unwrap();
+    let parent = "P".repeat(21);
+    let timestamp = chrono::Utc::now().fixed_offset();
+    harness.crud_store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        id: parent.clone(), workspace_id: harness.workspace_id.clone(), name: plan.manifest.name.clone(), version: None,
+        source_upload_id: "old-source".into(), package_path: package.to_string_lossy().into(),
+        data_path: root.join("parent/data").to_string_lossy().into(), package_fingerprint: plan.tree_digest.clone(), enabled: true,
+        state: "installing".into(), revision: 1, pending_json: None, last_error: None, created_at: timestamp, updated_at: timestamp,
+    }).await.unwrap();
+    harness.crud_store.settle_plugin_installation(&parent, 1, "installed", None).await.unwrap();
+    let context = registered_request_context(&harness.processor, harness.connection_id, methods::PLUGINS_PREVIEW).await;
+    let owner = AuthenticatedTransferOwner::from_request_context(&context);
+    // A genuine finalized archive and full owner form the positive control.
+    // Missing/foreign owner negatives below keep all archive facts valid.
+    let runtime = harness.processor.package_delivery_context();
+    harness.processor.skill_upload_owners.lock().await.insert(upload_id.clone(), owner.clone());
+    let source = harness.processor.materialize_uploaded_archive_source(
+        &owner, &harness.workspace_id, &upload_id, &runtime,
+        &RequestId::new(generate_test_request_id("transfer", "archive-control")).unwrap(), "plugin",
+    ).await.unwrap();
+    assert_eq!(source.upload.status, "finalized");
+    drop(source);
+    // Positive control through the actual preview RPC, with the same archive.
+    harness.processor.skill_upload_owners.lock().await.insert(upload_id.clone(), owner.clone());
+    let preview_id = generate_test_request_id("transfer", "owned-preview");
+    let request = json!({"jsonrpc":"2.0","id":preview_id,"method":methods::PLUGINS_PREVIEW,
+        "params":{"workspace_id":harness.workspace_id,"upload_id":upload_id}});
+    harness.processor.process_request_for_connection(harness.connection_id, &request.to_string()).await;
+    let preview = recv_response_by_id(&mut harness.rx, &preview_id).await;
+    let fingerprint = preview.result["fingerprint"].as_str().unwrap().to_owned();
+    for foreign in [false, true] {
+        harness.processor.skill_upload_owners.lock().await.remove(&upload_id);
+        if foreign {
+            let mut foreign_owner = owner.clone();
+            foreign_owner.auth_session_id = pioneer_protocol::AuthSessionId::new("F".repeat(21)).unwrap();
+            harness.processor.skill_upload_owners.lock().await.insert(upload_id.clone(), foreign_owner);
+        }
+        for (suffix, method, params) in [
+            ("preview", methods::PLUGINS_PREVIEW, json!({"workspace_id":harness.workspace_id,"upload_id":upload_id})),
+            ("update-preview", methods::PLUGINS_PREVIEW, json!({"workspace_id":harness.workspace_id,"upload_id":upload_id,"target":{"plugin_id":parent,"expected_revision":1}})),
+            ("update", methods::PLUGINS_UPDATE, json!({"workspace_id":harness.workspace_id,"plugin_id":parent,"expected_revision":1,"upload_id":upload_id,"expected_fingerprint":fingerprint,"confirm_changes":true})),
+        ] {
+            let id = generate_test_request_id(&format!("transfer-{foreign}"), suffix);
+            let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+            harness.processor.process_request_for_connection(harness.connection_id, &request.to_string()).await;
+            let _rejected = recv_error_by_id(&mut harness.rx, &id).await;
+            let current = harness.crud_store.find_plugin_installation(&parent).await.unwrap().unwrap();
+            assert_eq!(current.revision, 1);
+            assert!(current.pending_json.is_none());
+            assert_eq!(harness.crud_store.find_skill_upload_session(&upload_id).await.unwrap().unwrap().status, "finalized");
+        }
+    }
+    // Alternate Skills entry must not read/abort a foreign malformed Plugin
+    // transfer even when its persisted numeric owner matches this connection.
+    let bad_id = "B".repeat(21);
+    let bad_payload = root.join("malformed.tar.gz");
+    std::fs::write(&bad_payload, b"finalized but not gzip").unwrap();
+    let mut bad = harness.crud_store.find_skill_upload_session(&upload_id).await.unwrap().unwrap();
+    bad.upload_id = bad_id.clone(); bad.payload_path = bad_payload.to_string_lossy().into();
+    bad.sha256 = hex::encode(Sha256::digest(b"finalized but not gzip"));
+    bad.compressed_size_bytes = b"finalized but not gzip".len() as u64; bad.received_bytes = bad.compressed_size_bytes;
+    harness.crud_store.insert_skill_upload_session(&bad).await.unwrap();
+    let request_id = RequestId::new(generate_test_request_id("transfer", "alternate-entry")).unwrap();
+    assert!(harness.processor.materialize_uploaded_skill_source(&owner, &harness.workspace_id, &bad_id, &request_id).await.is_err());
+    assert_eq!(harness.crud_store.find_skill_upload_session(&bad_id).await.unwrap().unwrap().status, "finalized");
+    assert_eq!(std::fs::read(&bad_payload).unwrap(), b"finalized but not gzip");
+    // Matching owner with wrong purpose is also rejected before extraction.
+    harness.processor.skill_upload_owners.lock().await.insert(bad_id.clone(), owner.clone());
+    assert!(harness.processor.materialize_uploaded_skill_pack_source(&owner, &harness.workspace_id, &bad_id, &request_id).await.is_err());
+    assert_eq!(harness.crud_store.find_skill_upload_session(&bad_id).await.unwrap().unwrap().status, "finalized");
+    // Genuine owner + matching Plugin purpose reaches extraction and may abort
+    // its own invalid bytes; no competing transfer is touched.
+    assert!(harness.processor.materialize_uploaded_archive_source(&owner, &harness.workspace_id, &bad_id, &runtime, &request_id, "plugin").await.is_err());
+    assert_eq!(harness.crud_store.find_skill_upload_session(&bad_id).await.unwrap().unwrap().status, "aborted");
+    std::fs::remove_dir_all(root).unwrap();
 }

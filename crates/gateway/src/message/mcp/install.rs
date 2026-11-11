@@ -149,7 +149,7 @@ impl MessageProcessor {
         oauth_redirect_uri: Option<&str>,
         oauth_callback_unavailable: bool,
     ) -> std::result::Result<(McpInstallResponse, Vec<McpChangedItem>), JsonRpcErrorResponse> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = self.agent_manager.control_operation_deadline();
         let mut owned_id = None;
         if ownership.is_none() {
             for item in &plan.items {
@@ -234,7 +234,6 @@ impl MessageProcessor {
                 })?,
             None => None,
         };
-        let owned = native.is_some();
         let work = self.install_mcp_plan_with_native_change(
             request_context,
             request_id.clone(),
@@ -245,21 +244,7 @@ impl MessageProcessor {
             oauth_redirect_uri,
             oauth_callback_unavailable,
         );
-        let result = if owned {
-            tokio::time::timeout_at(deadline, work)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(mcp_error(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        MCP_ERROR_INTERNAL,
-                        "plugin change deadline exceeded",
-                        json!({}),
-                    ))
-                })
-        } else {
-            work.await
-        };
+        let result = work.await;
         match (result, native) {
             (Ok(payload), Some(change)) => self
                 .finish_native_plugin_change(change)
@@ -373,8 +358,7 @@ impl MessageProcessor {
             if let Some(owner) = ownership {
                 if installation.scope_kind != McpScopeKind::Workspace
                     || installation.scope_key != workspace_id
-                    || installation.name
-                        != super::portable::internal_mcp_name(&owner.plugin_id, &owner.member_key)
+                    || installation.name != owner.member_key
                     || existing
                         .as_ref()
                         .is_some_and(|row| row.id.as_deref() != Some(owner.child_id.as_str()))
@@ -430,19 +414,12 @@ impl MessageProcessor {
                         })?,
                     None => None,
                 };
-                if (linked.is_some() && native.is_none())
-                    || (native.is_none()
-                        && pioneer_crud::validate_standalone_mcp_name(
-                            &installation.name,
-                            existing.is_some(),
-                        )
-                        .is_err())
-                {
+                if linked.is_some() && native.is_none() {
                     return Err(mcp_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         MCP_ERROR_INVALID_REQUEST,
-                        "reserved or plugin-owned MCP installation",
+                        "plugin-owned MCP installation",
                         json!({}),
                     ));
                 }

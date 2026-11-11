@@ -20,7 +20,7 @@ use crate::{notifications::effects::ClientEffect, runtime::ClientRuntime};
 // changing production ownership or notification behavior.
 #[cfg(test)]
 std::thread_local! {
-    static IDENTITY_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static IDENTITY_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static SEND_READINESS_BEFORE_WAIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -1060,9 +1060,9 @@ pub struct ClientCore {
         Mutex<crate::settings::model_picker::SettingsModelPickerController>,
     pub(crate) settings_runtime: Mutex<crate::settings::runtime::SettingsRuntime>,
     pub(crate) agents_documents: Mutex<crate::agents_doc::runtime::DocumentRuntime>,
-    pub(crate) plugin_catalog_changes: tokio::sync::watch::Sender<u64>,
     pub(crate) plugins_controller: Mutex<crate::plugins::runtime::PluginController>,
-    pub(crate) skills_controller: Mutex<crate::skills::operations::SkillsController>,
+    pub(crate) capability_operations:
+        Mutex<crate::package_delivery::operations::CapabilityOperations>,
     pub(crate) skills_store: Mutex<crate::skills::store::SkillsStore>,
     pub(crate) mcp_controller: Mutex<crate::mcp::operations::McpController>,
     pub(crate) mcp_oauth: Mutex<crate::mcp::oauth::OAuthController>,
@@ -1346,9 +1346,10 @@ impl Default for ClientCore {
 impl ClientCore {
     pub fn new() -> Self {
         Self {
-            plugin_catalog_changes: tokio::sync::watch::channel(0).0,
             plugins_controller: Mutex::default(),
-            skills_controller: Mutex::new(crate::skills::operations::SkillsController::default()),
+            capability_operations: Mutex::new(
+                crate::package_delivery::operations::CapabilityOperations::default(),
+            ),
             agents_documents: Mutex::new(Default::default()),
             onboarding: Mutex::new(Default::default()),
             settings_runtime: Mutex::new(Default::default()),
@@ -1827,7 +1828,7 @@ impl ClientCore {
             .lock()
             .expect("plugins poisoned")
             .stop();
-        self.skills_controller
+        self.capability_operations
             .lock()
             .expect("Skills controller poisoned")
             .stop();
@@ -2045,45 +2046,25 @@ impl ClientCore {
             _ => {}
         }
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
-            if matches!(
-                notification,
-                pioneer_protocol::GatewayNotification::PluginsChanged(_)
-                    | pioneer_protocol::GatewayNotification::McpServerStatusChanged(_)
-            ) {
-                self.plugin_catalog_changes
-                    .send_modify(|revision| *revision = revision.saturating_add(1));
-            }
             if let pioneer_protocol::GatewayNotification::PluginsChanged(event) = notification {
+                self.refresh_skills(&event.workspace_id);
+                self.refresh_mcp(&event.workspace_id);
                 self.refresh_plugin_publication(&event.workspace_id);
                 return None;
             }
             self.observe_administration_notification(notification);
             self.observe_provider_runtime_notification(notification);
             if self.observe_mcp_oauth_notification(notification) {
-                if let pioneer_protocol::GatewayNotification::McpOAuthChanged(event) = notification
-                {
-                    self.refresh_plugin_publication(&event.workspace_id);
-                }
+                self.refresh_plugins_for_native_notification(notification);
                 return None;
             }
             if self.observe_mcp_notification(notification) {
-                let workspace = match notification {
-                    pioneer_protocol::GatewayNotification::McpChanged(event) => &event.workspace_id,
-                    pioneer_protocol::GatewayNotification::McpServerStatusChanged(event) => {
-                        &event.workspace_id
-                    }
-                    pioneer_protocol::GatewayNotification::McpServerCatalogChanged(event) => {
-                        &event.workspace_id
-                    }
-                    _ => unreachable!("handled MCP notification"),
-                };
-                self.refresh_plugin_publication(workspace);
+                self.refresh_plugins_for_native_notification(notification);
                 return None;
             }
-            if let pioneer_protocol::GatewayNotification::SkillsChanged(notification) = notification
-            {
-                self.refresh_skills(&notification.workspace_id);
-                self.refresh_plugin_publication(&notification.workspace_id);
+            if let pioneer_protocol::GatewayNotification::SkillsChanged(event) = notification {
+                self.refresh_skills(&event.workspace_id);
+                self.refresh_plugins_for_native_notification(notification);
                 return None;
             }
             self.observe_composer_voice_notification(notification);
@@ -3664,6 +3645,9 @@ impl ClientCore {
         drop(document_fence);
         if evict_protected {
             self.retire_thread_controller_jobs();
+            // Identity callers still own I here. Retain the invalidation's
+            // read obligations; admission resumes with other feature demands
+            // after the caller releases I, never recursively inside commit.
         }
         self.wake_thread_timeline_requests();
         self.update_thread_presentation_identity(principal);

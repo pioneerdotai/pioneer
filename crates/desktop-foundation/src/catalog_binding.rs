@@ -1,20 +1,23 @@
+use crate::{ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink};
 use pioneer_client::core::{ClientPublicationReference, ClientScope};
-use pioneer_desktop_foundation::{
-    ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink,
-};
 use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
-pub(crate) struct CatalogBinding {
+/// Shared catalog registrations and ordered publication wakeups for native views.
+pub struct CatalogBinding {
     registrar: Arc<dyn ClientBindingRegistrar>,
     registrations: RefCell<HashMap<ClientScope, ClientBindingRegistration>>,
     latest: RefCell<HashMap<ClientScope, ClientPublicationReference>>,
-    pub(crate) changed: tokio::sync::watch::Sender<u64>,
+    changed: tokio::sync::watch::Sender<u64>,
 }
 impl CatalogBinding {
-    pub(crate) fn registrar(&self) -> Arc<dyn ClientBindingRegistrar> {
+    pub fn watch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    pub fn registrar(&self) -> Arc<dyn ClientBindingRegistrar> {
         self.registrar.clone()
     }
-    pub(crate) fn new(registrar: Arc<dyn ClientBindingRegistrar>) -> Arc<Self> {
+    pub fn new(registrar: Arc<dyn ClientBindingRegistrar>) -> Arc<Self> {
         Arc::new(Self {
             registrar,
             registrations: RefCell::default(),
@@ -22,7 +25,7 @@ impl CatalogBinding {
             changed: tokio::sync::watch::channel(0).0,
         })
     }
-    pub(crate) fn set_scopes(self: &Arc<Self>, scopes: &[ClientScope]) {
+    pub fn set_scopes(self: &Arc<Self>, scopes: &[ClientScope]) {
         self.registrations
             .borrow_mut()
             .retain(|scope, _| scopes.contains(scope));

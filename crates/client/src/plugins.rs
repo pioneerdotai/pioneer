@@ -8,7 +8,6 @@ pub struct PluginCatalogState {
     pub plugins: Vec<PluginItem>,
     pub loading: bool,
     pub failed: bool,
-    pub refresh_requested: bool,
 }
 impl PluginCatalogState {
     pub fn accept(&mut self, response: PluginsListResponse) {
@@ -57,9 +56,6 @@ pub fn replace_selected_plugins(
 }
 
 impl crate::core::ClientCore {
-    pub fn watch_plugin_catalog(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.plugin_catalog_changes.subscribe()
-    }
     pub fn plugins_management_allowed(&self, workspace: &str) -> bool {
         self.capability_management_allowed(workspace)
     }
@@ -86,49 +82,6 @@ impl crate::core::ClientCore {
         );
         Ok(result)
     }
-    /// A timeout is an uncertain server outcome: callers always refetch details
-    /// after an error instead of reverting the parent optimistically.
-    pub fn set_plugin_enabled(
-        &self,
-        params: pioneer_protocol::PluginsSetEnabledParams,
-    ) -> anyhow::Result<PluginItem> {
-        let epoch = self.provider_runtime_epoch();
-        let connection = epoch
-            .2
-            .ok_or_else(|| anyhow::anyhow!("gateway_not_connected"))?;
-        let transport = self
-            .transport_runtime()
-            .ws_command_sender()
-            .requests_for_connection(connection);
-        let result = crate::transport::ws::command_sender::plugins_set_enabled(&transport, params)?;
-        anyhow::ensure!(
-            self.provider_runtime_epoch() == epoch,
-            "plugin_catalog_stale"
-        );
-        Ok(result)
-    }
-    pub fn read_plugin_details(&self, workspace: &str, id: &str) -> anyhow::Result<PluginItem> {
-        let epoch = self.provider_runtime_epoch();
-        let connection = epoch
-            .2
-            .ok_or_else(|| anyhow::anyhow!("gateway_not_connected"))?;
-        let transport = self
-            .transport_runtime()
-            .ws_command_sender()
-            .requests_for_connection(connection);
-        let result = crate::transport::ws::command_sender::plugins_details(
-            &transport,
-            pioneer_protocol::PluginsDetailsParams {
-                workspace_id: workspace.into(),
-                plugin_id: id.into(),
-            },
-        )?;
-        anyhow::ensure!(
-            self.provider_runtime_epoch() == epoch,
-            "plugin_catalog_stale"
-        );
-        Ok(result)
-    }
 }
 
 #[cfg(test)]
@@ -139,6 +92,7 @@ mod tests {
             id: id.to_string().repeat(21),
             name: "mixed".into(),
             version: None,
+            description: None,
             enabled: true,
             state: state.into(),
             revision: 7,
@@ -211,79 +165,6 @@ pub use pioneer_protocol::{
     PluginComponentItem, PluginComponentKey, PluginItem, PluginManagementIntent,
     PluginsMutateParams, PluginsSetEnabledParams, PluginsUpdatePreviewResponse,
 };
-/// UI-neutral current-action state. An error is an uncertain Gateway outcome;
-/// the caller must refetch before enabling another mutation. No operation polling.
-#[derive(Clone, Debug, Default)]
-pub struct PluginManagementState {
-    pub busy: bool,
-    pub failed: bool,
-    pub refresh_required: bool,
-}
-impl PluginManagementState {
-    pub fn begin(&mut self) -> bool {
-        if self.busy || self.refresh_required {
-            return false;
-        }
-        self.busy = true;
-        self.failed = false;
-        true
-    }
-    pub fn complete(&mut self, success: bool) {
-        self.busy = false;
-        self.failed = !success;
-        self.refresh_required = true;
-    }
-    pub fn refreshed(&mut self) {
-        self.refresh_required = false;
-    }
-}
-impl crate::core::ClientCore {
-    /// Desktop calls this typed adapter directly; mobile can use the same intent
-    /// in D. Bind the action to the selected Gateway and authorization epoch.
-    pub fn mutate_plugin(
-        &self,
-        params: PluginsMutateParams,
-    ) -> anyhow::Result<pioneer_protocol::PluginsMutationResponse> {
-        let epoch = self.provider_runtime_epoch();
-        let connection = epoch
-            .2
-            .ok_or_else(|| anyhow::anyhow!("gateway_not_connected"))?;
-        let sender = self
-            .transport_runtime()
-            .ws_command_sender()
-            .requests_for_connection(connection);
-        let result = crate::transport::ws::command_sender::plugins_mutate(&sender, params)?;
-        anyhow::ensure!(
-            self.provider_runtime_epoch() == epoch,
-            "plugin_catalog_stale"
-        );
-        Ok(result)
-    }
-}
-
-#[cfg(test)]
-mod management_tests {
-    // NOT_RUN / NOT_COMPILED. A failed/uncertain action cannot be retried on a
-    // stale projection; a successful refetch is required in every shell.
-    #[test]
-    fn uncertain_mutation_requires_refetch_and_does_not_stick_in_busy() {
-        let mut state = super::PluginManagementState::default();
-        assert!(state.begin());
-        assert!(!state.begin());
-        state.complete(false);
-        assert!(!state.busy);
-        assert!(state.failed);
-        assert!(!state.begin());
-        state.refreshed();
-        assert!(state.begin());
-        state.complete(true);
-        assert!(!state.busy);
-        assert!(!state.failed);
-        assert!(!state.begin());
-        state.refreshed();
-        assert!(state.begin());
-    }
-}
 
 pub mod runtime;
 
@@ -296,6 +177,7 @@ pub struct PluginPickerRow {
     pub plugin_id: String,
     pub key: String,
     pub label: String,
+    pub description: Option<String>,
     pub selected: bool,
     pub selectable: bool,
     pub stale: bool,
@@ -308,7 +190,7 @@ pub fn plugin_picker_rows(
     let query = query.trim().to_lowercase();
     let mut rows:Vec<_>=plugins.iter().filter(|p|p.name.to_lowercase().contains(&query)).map(|p|{
         let selected=current.iter().find(|c|matches!(&c.kind,ComposerCapabilityKind::Plugin{plugin_id,..} if plugin_id==&p.id));
-        PluginPickerRow{plugin_id:p.id.clone(),key:pioneer_protocol::plugin_capability_key(&p.id),label:p.name.clone(),selected:selected.is_some(),selectable:plugin_capability(p).is_some(),stale:selected.is_some_and(|c|matches!(c.kind,ComposerCapabilityKind::Plugin{expected_revision,..} if expected_revision!=p.revision))}
+        PluginPickerRow{plugin_id:p.id.clone(),key:pioneer_protocol::plugin_capability_key(&p.id),label:p.name.clone(),description:p.description.clone(),selected:selected.is_some(),selectable:plugin_capability(p).is_some(),stale:selected.is_some_and(|c|matches!(c.kind,ComposerCapabilityKind::Plugin{expected_revision,..} if expected_revision!=p.revision))}
     }).collect();
     for c in current {
         if let ComposerCapabilityKind::Plugin { plugin_id, .. } = &c.kind {
@@ -319,6 +201,7 @@ pub fn plugin_picker_rows(
                     plugin_id: plugin_id.clone(),
                     key: c.id.clone(),
                     label: c.label.clone(),
+                    description: None,
                     selected: true,
                     selectable: false,
                     stale: true,
@@ -393,6 +276,7 @@ mod picker_regressions {
             id: "P".repeat(21),
             name: "Mixed".into(),
             version: None,
+            description: None,
             enabled: true,
             state: "installed".into(),
             revision: 7,

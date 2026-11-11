@@ -7,7 +7,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: McpOAuthParams,
     ) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = self.agent_manager.control_operation_deadline();
         let client = context.connection_id();
         let workspace = match self
             .validate_mcp_workspace(
@@ -257,17 +257,7 @@ impl MessageProcessor {
                 }
             }
         };
-        let mut result = if mutation.is_some() || _plugin.is_some() {
-            tokio::time::timeout_at(deadline, work)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(pioneer_mcp::McpRuntimeError::failed(
-                        "plugins.oauth_timeout",
-                    ))
-                })
-        } else {
-            work.await
-        };
+        let mut result = work.await;
 
         if let Some(change) = &mutation {
             if result.is_ok() {

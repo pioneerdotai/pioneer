@@ -127,7 +127,7 @@ pub struct CodexJsonlRpcClient {
 
 /// Owns only this transport's reader, writer/dispatcher and ordered ingress.
 /// A service attempt joins these after terminating its own App Server process.
-/// Dropping the owner aborts every task even when client clones remain alive.
+/// Dropping the owner aborts async workers even when client clones remain alive.
 pub struct CodexJsonlRpcOwner {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     join_failure: Option<String>,
@@ -191,9 +191,8 @@ impl CodexJsonlRpcClient {
             DEFAULT_INCOMING_QUEUE_CAPACITY,
             DEFAULT_COMMAND_QUEUE_CAPACITY,
             DEFAULT_SERVER_REQUEST_TIMEOUT,
-            // Service responses are bounded in memory. Disabling the larger
-            // disk recovery path also prevents detached spawn_blocking spool
-            // decoders from surviving cancellation of this attempt's owner.
+            // Service responses retain their bounded in-memory contract.
+            // Persistent Gateway constructors retain their larger spool budget.
             crate::NativeEventBudget {
                 max_frame_bytes: CODEX_MAX_MATERIALIZED_FRAME_BYTES,
                 max_recovery_frame_bytes: CODEX_MAX_MATERIALIZED_FRAME_BYTES,

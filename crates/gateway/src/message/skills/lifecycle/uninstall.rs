@@ -51,7 +51,7 @@ impl MessageProcessor {
         params: SkillsUninstallParams,
     ) -> std::result::Result<(SkillsUninstallResponse, SkillChangePublication), JsonRpcErrorResponse>
     {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = self.agent_manager.control_operation_deadline();
         let native = self
             .begin_native_plugin_change(
                 request_context,
@@ -73,28 +73,13 @@ impl MessageProcessor {
                     json!({}),
                 )
             })?;
-        let owned = native.is_some();
         let work = self.uninstall_skill_deferred_with_plugin_change(
             request_context,
             request_id.clone(),
             params,
             native.as_ref().map(|change| &change.write),
         );
-        let result = if owned {
-            tokio::time::timeout_at(deadline, work)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(skills_error(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        SKILLS_ERROR_INTERNAL,
-                        "plugin change deadline exceeded",
-                        json!({}),
-                    ))
-                })
-        } else {
-            work.await
-        };
+        let result = work.await;
         match (result, native) {
             (Ok(payload), Some(change)) => {
                 self.finish_native_plugin_change(change)

@@ -19,6 +19,7 @@ pub(crate) fn bottom_bar(
     let is_providers_view_active = route == MainRoute::Providers;
     let is_administration_view_active = route == MainRoute::Administration;
     let is_settings_view_active = route == MainRoute::Settings;
+    let is_plugins_view_active = route == MainRoute::Plugins;
     let is_mcp_view_active = matches!(route, MainRoute::Mcp | MainRoute::McpDetails);
     let is_skills_view_active = matches!(route, MainRoute::Skills | MainRoute::SkillDetails);
     h_flex()
@@ -94,10 +95,20 @@ pub(crate) fn bottom_bar(
                 .when(can_manage_capabilities, |this| {
                     this.child(
                         Button::new("bottom-bar-open-plugins")
+                            .debug_selector(|| "bottom-bar-open-plugins".into())
+                            .accessibility_label(t!("plugins.title").to_string())
+                            .tooltip(t!("plugins.title").to_string())
                             .ghost()
                             .small()
                             .compact()
-                            .label(t!("plugins.title").to_string())
+                            .child(
+                                Icon::new(PioneerIconName::Plugin)
+                                    .size_3p5()
+                                    .opacity(0.6)
+                                    .when(is_plugins_view_active, |this| {
+                                        this.opacity(1.0).text_color(cx.theme().blue)
+                                    }),
+                            )
                             .on_click({
                                 let target = action_region.clone();
                                 move |_, window, cx| {

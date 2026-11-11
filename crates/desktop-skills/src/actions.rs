@@ -21,6 +21,10 @@ impl SkillsCatalogView {
         }
     }
     pub(crate) fn close_skill_details_screen(&mut self, _: &mut Context<Self>) {
+        if self.is_plugin_component() {
+            self.client.navigate(NavigationIntent::BackFromPlugin, None);
+            return;
+        }
         self.client.navigate(
             NavigationIntent::Navigate {
                 destination: if self
@@ -66,7 +70,33 @@ impl SkillsCatalogView {
     }
     fn send(&mut self, intent: SkillsIntent, cx: &mut Context<Self>) {
         if let Some(w) = self.input.navigation_input.workspace_id() {
-            if self.client.skills_intent(w, intent).is_err() {
+            let failed = if let Some((workspace, parent)) = self.plugin_parent() {
+                use pioneer_client::plugins::runtime::PluginIntent;
+                let intent = match intent {
+                    SkillsIntent::Policy {
+                        skill_id,
+                        enabled,
+                        allow_implicit_invocation,
+                    } => Some(PluginIntent::Skill {
+                        skill_id,
+                        enabled,
+                        allow_implicit_invocation,
+                    }),
+                    SkillsIntent::Remove { skill_id } => {
+                        Some(PluginIntent::RemoveSkill { skill_id })
+                    }
+                    _ => None,
+                };
+                intent.is_none_or(|intent| {
+                    self.client
+                        .plugin_intent_for(workspace, parent, intent)
+                        .outcome()
+                        != pioneer_client::core::ClientTransitionOutcome::Changed
+                })
+            } else {
+                self.client.skills_intent(w, intent).is_err()
+            };
+            if failed {
                 self.presentation_error =
                     Some(t!("skills.error.gateway_not_connected").to_string());
                 cx.notify();
@@ -112,15 +142,10 @@ impl SkillsCatalogView {
                 },
             );
             self.upload = upload;
-            if self
-                .upload
-                .update(cx, |view, cx| {
-                    view.start(workspace, target, path.into(), cx)
-                })
-                .is_err()
-            {
-                self.presentation_error =
-                    Some(t!("skills.error.gateway_not_connected").to_string());
+            if let Err(failure) = self.upload.update(cx, |view, cx| {
+                view.start(workspace, target, path.into(), cx)
+            }) {
+                self.presentation_error = Some(crate::upload::UploadView::failure_message(failure));
                 cx.notify();
             }
         }

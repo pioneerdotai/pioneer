@@ -891,31 +891,36 @@ impl MessageProcessor {
             }
         }
 
-        for item in &mut response_items {
-            match self
-                .crud_store
-                .find_skill_plugin_owner(&item.skill_id)
-                .await
-            {
-                Ok(owner) => {
-                    item.plugin_owner = owner.map(|o| pioneer_protocol::PluginOwner {
-                        plugin_id: o.plugin_id,
-                        member_key: o.member_key,
-                    })
-                }
-                Err(_) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            "skill ownership unavailable",
-                        ),
-                    )
-                    .await;
-                    return;
-                }
+        let ids = response_items
+            .iter()
+            .map(|item| item.skill_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let owners = match self.crud_store.skill_plugin_owners(&ids).await {
+            Ok(owners) => owners
+                .into_iter()
+                .filter_map(|(owner, _)| owner.skill_id.clone().map(|id| (id, owner)))
+                .collect::<std::collections::HashMap<_, _>>(),
+            Err(_) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        "skill ownership unavailable",
+                    ),
+                )
+                .await;
+                return;
             }
+        };
+        for item in &mut response_items {
+            item.plugin_owner =
+                owners
+                    .get(item.skill_id.as_str())
+                    .map(|owner| pioneer_protocol::PluginOwner {
+                        plugin_id: owner.plugin_id.clone(),
+                        member_key: owner.member_key.clone(),
+                    });
         }
         let response_payload = SkillListResponse {
             snapshot_version: self.current_skills_snapshot_version(),

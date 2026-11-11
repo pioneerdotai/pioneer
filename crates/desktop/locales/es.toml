@@ -1751,3 +1751,6 @@ reason_unknown = "La operación no terminó como se esperaba. Consulta los regis
 [mcp.oauth]
 callback_received = "Respuesta aceptada. Vuelve a Pioneer para comprobar el resultado."
 callback_rejected = "Inicio de sesión rechazado. Vuelve a Pioneer para intentarlo de nuevo."
+
+[plugins]
+title = "Plugins"

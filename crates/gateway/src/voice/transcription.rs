@@ -13,14 +13,15 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VoiceSpeechHypothesis {
     pub(crate) text: String,
-    pub(crate) segments: Option<Vec<transcribe_rs::TranscriptionSegment>>,
+    // Preserve native timing metadata; current live consumers use only text.
+    pub(crate) _segments: Option<Vec<transcribe_rs::TranscriptionSegment>>,
 }
 
 impl VoiceSpeechHypothesis {
     pub(crate) fn text_only(text: String) -> Self {
         Self {
             text,
-            segments: None,
+            _segments: None,
         }
     }
 }
@@ -29,7 +30,7 @@ impl From<transcribe_rs::TranscriptionResult> for VoiceSpeechHypothesis {
     fn from(result: transcribe_rs::TranscriptionResult) -> Self {
         Self {
             text: result.text,
-            segments: result.segments,
+            _segments: result.segments,
         }
     }
 }

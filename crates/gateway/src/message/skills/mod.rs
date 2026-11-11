@@ -33,21 +33,28 @@ use tokio::time::Duration;
 use tracing::warn;
 
 const WORKSPACE_ID_TOKEN: &str = "{workspaceId}";
-const SKILLS_ERROR_NOT_FOUND: &str = "skills.not_found";
-const SKILLS_ERROR_INVALID_REQUEST: &str = "skills.invalid_request";
-const SKILLS_ERROR_SOURCE_NOT_SUPPORTED: &str = "skills.source_not_supported";
-const SKILLS_ERROR_INSTALL_BLOCKED_SECURITY: &str = "skills.install_blocked.security";
-const SKILLS_ERROR_INSTALL_BLOCKED_TRUST: &str = "skills.install_blocked.trust";
-const SKILLS_ERROR_INSTALL_BLOCKED_DEPENDENCY: &str = "skills.install_blocked.dependency";
-const SKILLS_ERROR_UPDATE_CONFLICT_FINGERPRINT: &str =
+pub(in crate::message) const SKILLS_ERROR_NOT_FOUND: &str = "skills.not_found";
+pub(in crate::message) const SKILLS_ERROR_INVALID_REQUEST: &str = "skills.invalid_request";
+pub(in crate::message) const SKILLS_ERROR_SOURCE_NOT_SUPPORTED: &str =
+    "skills.source_not_supported";
+pub(in crate::message) const SKILLS_ERROR_INSTALL_BLOCKED_SECURITY: &str =
+    "skills.install_blocked.security";
+pub(in crate::message) const SKILLS_ERROR_INSTALL_BLOCKED_TRUST: &str =
+    "skills.install_blocked.trust";
+pub(in crate::message) const SKILLS_ERROR_INSTALL_BLOCKED_DEPENDENCY: &str =
+    "skills.install_blocked.dependency";
+pub(in crate::message) const SKILLS_ERROR_UPDATE_CONFLICT_FINGERPRINT: &str =
     "skills.update_conflict.fingerprint_mismatch";
-const SKILLS_ERROR_UPLOAD_INVALID_REQUEST: &str = "skills.upload.invalid_request";
-const SKILLS_ERROR_UPLOAD_NOT_FOUND: &str = "skills.upload.not_found";
-const SKILLS_ERROR_UPLOAD_EXPIRED: &str = "skills.upload.expired";
-const SKILLS_ERROR_UPLOAD_SIZE_LIMIT: &str = "skills.upload.size_limit";
-const SKILLS_ERROR_UPLOAD_DIGEST_MISMATCH: &str = "skills.upload.digest_mismatch";
-const SKILLS_ERROR_UPLOAD_INVALID_ARCHIVE: &str = "skills.upload.invalid_archive";
-const SKILLS_ERROR_INTERNAL: &str = "skills.internal_error";
+pub(in crate::message) const SKILLS_ERROR_UPLOAD_INVALID_REQUEST: &str =
+    "skills.upload.invalid_request";
+pub(in crate::message) const SKILLS_ERROR_UPLOAD_NOT_FOUND: &str = "skills.upload.not_found";
+pub(in crate::message) const SKILLS_ERROR_UPLOAD_EXPIRED: &str = "skills.upload.expired";
+pub(in crate::message) const SKILLS_ERROR_UPLOAD_SIZE_LIMIT: &str = "skills.upload.size_limit";
+pub(in crate::message) const SKILLS_ERROR_UPLOAD_DIGEST_MISMATCH: &str =
+    "skills.upload.digest_mismatch";
+pub(in crate::message) const SKILLS_ERROR_UPLOAD_INVALID_ARCHIVE: &str =
+    "skills.upload.invalid_archive";
+pub(in crate::message) const SKILLS_ERROR_INTERNAL: &str = "skills.internal_error";
 
 #[derive(Clone)]
 pub(crate) struct SkillsRuntimeContext {
@@ -59,14 +66,8 @@ pub(crate) struct SkillsRuntimeContext {
     user_lock_path: PathBuf,
     registry_root: PathBuf,
     registry_lock_path: PathBuf,
-    upload_root: PathBuf,
-    materialized_root: PathBuf,
-    upload_ttl_secs: u64,
-    upload_recommended_chunk_size_bytes: usize,
-    upload_max_chunk_size_bytes: usize,
-    max_upload_compressed_bytes: usize,
-    max_upload_uncompressed_bytes: usize,
-    max_upload_archive_entries: usize,
+    pub(in crate::message) upload_root: PathBuf,
+    pub(in crate::message) materialized_root: PathBuf,
 }
 
 mod catalog;
@@ -352,7 +353,7 @@ fn skill_audit_records(events: &[pioneer_skills::SkillAuditEvent]) -> Vec<SkillA
         .collect()
 }
 
-fn skills_error(
+pub(in crate::message) fn skills_error(
     id: Option<RequestId>,
     jsonrpc_code: i64,
     code: &str,
@@ -425,7 +426,7 @@ impl MessageProcessor {
     }
 }
 
-fn sanitize_workspace_id_component(workspace_id: &str) -> String {
+pub(in crate::message) fn sanitize_workspace_id_component(workspace_id: &str) -> String {
     let mut sanitized = String::with_capacity(workspace_id.len());
     for ch in workspace_id.trim().chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
@@ -475,15 +476,6 @@ pub(crate) fn resolve_root_path(raw: &str, workspace_id: &str) -> PathBuf {
 }
 
 pub(crate) use lifecycle::source::{SkillInstallSource, SkillUpdateInput};
-
-impl SkillsRuntimeContext {
-    pub(crate) fn plugin_root(&self) -> PathBuf {
-        self.upload_root
-            .parent()
-            .expect("skills runtime root")
-            .join("plugins")
-    }
-}
 
 impl MessageProcessor {
     pub(crate) async fn revalidate_plugin_upload(

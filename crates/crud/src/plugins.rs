@@ -1,9 +1,16 @@
 use crate::{CrudStore, repositories::plugins};
 use anyhow::{Result, bail};
 use pioneer_entity::{plugin_component, plugin_installation};
+use sea_orm::TransactionTrait;
 pub use plugins::{PluginNativeWrite, PluginOwnershipWrite};
 
 impl CrudStore {
+    pub async fn skill_plugin_owners(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<(plugin_component::Model, Option<plugin_installation::Model>)>> {
+        plugins::skill_owners(&self.connection, ids).await
+    }
     pub async fn get_plugin_selection(
         &self,
         turn: &str,
@@ -36,7 +43,6 @@ impl CrudStore {
         turn: &str,
         resolved_skills: &[pioneer_protocol::SkillId],
     ) -> Result<()> {
-        use sea_orm::TransactionTrait;
         let Some(mut snapshot) = self.get_plugin_selection(turn).await? else {
             return Ok(());
         };
@@ -160,7 +166,6 @@ impl CrudStore {
         connection_id: u64,
         now: i64,
     ) -> Result<()> {
-        use sea_orm::TransactionTrait;
         if parent.state != "installing"
             || parent.revision != 1
             || parent.pending_json.as_ref().is_none_or(|v| v.len() > 65536)
@@ -225,7 +230,12 @@ impl CrudStore {
         }
         self.run_serialized_write(|| {
             let error = error.clone();
-            async move { plugins::settle(&self.connection, id, revision, state, error).await }
+            async move {
+                let db = self.connection.begin().await?;
+                plugins::settle(&db, id, revision, state, error).await?;
+                db.commit().await?;
+                Ok(())
+            }
         })
         .await
     }
@@ -236,7 +246,10 @@ impl CrudStore {
         diagnostic: &str,
     ) -> Result<()> {
         self.run_serialized_write(|| async move {
-            plugins::record_failure(&self.connection, write, kind, diagnostic).await
+            let db = self.connection.begin().await?;
+            plugins::record_failure(&db, write, kind, diagnostic).await?;
+            db.commit().await?;
+            Ok(())
         })
         .await
     }
@@ -281,7 +294,10 @@ impl CrudStore {
     }
     pub async fn prepare_plugin_reload(&self, id: &str, revision: i64) -> Result<()> {
         self.run_serialized_write(|| async move {
-            plugins::prepare_reload(&self.connection, id, revision).await
+            let db = self.connection.begin().await?;
+            plugins::prepare_reload(&db, id, revision).await?;
+            db.commit().await?;
+            Ok(())
         })
         .await
     }
@@ -317,6 +333,12 @@ impl CrudStore {
     ) -> Result<Option<plugin_installation::Model>> {
         plugins::find_by_upload(&self.connection, upload).await
     }
+    pub async fn plugin_components_inventory(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<plugin_component::Model>> {
+        plugins::components_for_parents(&self.connection, ids).await
+    }
     pub async fn list_plugin_components(&self, id: &str) -> Result<Vec<plugin_component::Model>> {
         plugins::components(&self.connection, id).await
     }
@@ -331,21 +353,10 @@ impl CrudStore {
     }
 }
 
-/// Preserve pre-existing standalone names while reserving new plugin names.
-/// Ownership is checked separately, before side effects and under the writer.
-pub fn validate_standalone_mcp_name(name: &str, existing: bool) -> Result<()> {
-    if name.starts_with("pplugin_") && !existing {
-        bail!("reserved plugin MCP name");
-    }
-    Ok(())
-}
-
 fn validate_selection(snapshot: &pioneer_protocol::PluginSelectionSnapshot) -> Result<()> {
     use std::collections::HashSet;
     if !matches!(snapshot.phase.as_str(), "prepared" | "ready")
         || snapshot.parents.is_empty()
-        || snapshot.parents.len() > 64
-        || snapshot.children.len() > 256
     {
         bail!("invalid plugin selection");
     }
@@ -372,7 +383,7 @@ fn validate_selection(snapshot: &pioneer_protocol::PluginSelectionSnapshot) -> R
 mod selection_tests {
     use super::*;
     #[test]
-    fn selection_rejects_unbound_duplicate_and_unbounded_children() {
+    fn selection_validates_ownership_without_parent_or_child_quotas() {
         use pioneer_protocol::{
             PluginSelectedChild, PluginSelectedParent, PluginSelectionSnapshot,
         };
@@ -397,8 +408,21 @@ mod selection_tests {
         assert!(!selection_has_child(&snapshot, "skill", &"T".repeat(21)));
         snapshot.children.push(snapshot.children[0].clone());
         assert!(validate_selection(&snapshot).is_err());
-        snapshot.children = vec![snapshot.children[0].clone(); 257];
-        assert!(validate_selection(&snapshot).is_err());
+        snapshot.children = (0..256).map(|index| PluginSelectedChild {
+            kind: "skill".into(),
+            id: format!("S{index:020}"),
+            parent_id: snapshot.parents[0].id.clone(),
+        }).collect();
+        assert!(validate_selection(&snapshot).is_ok());
+        snapshot.children.push(PluginSelectedChild {
+            kind: "skill".into(),
+            id: format!("S{:020}", 256),
+            parent_id: snapshot.parents[0].id.clone(),
+        });
+        snapshot.parents.extend((1..65).map(|index| PluginSelectedParent {
+            id: format!("P{index:020}"), revision: 1,
+        }));
+        assert!(validate_selection(&snapshot).is_ok());
     }
 }
 
@@ -428,8 +452,9 @@ impl CrudStore {
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
         self.run_serialized_write(|| async move {
-            plugins::begin_mutation(
-                &self.connection,
+            let db = self.connection.begin().await?;
+            let row = plugins::begin_mutation(
+                &db,
                 workspace,
                 id,
                 revision,
@@ -437,7 +462,9 @@ impl CrudStore {
                 enabled,
                 pending.into(),
             )
-            .await
+            .await?;
+            db.commit().await?;
+            Ok(row)
         })
         .await
     }
@@ -453,7 +480,12 @@ impl CrudStore {
         }
         self.run_serialized_write(|| {
             let error = error.clone();
-            async move { plugins::finish_mutation(&self.connection, id, revision, state, error).await }
+            async move {
+                let db = self.connection.begin().await?;
+                plugins::finish_mutation(&db, id, revision, state, error).await?;
+                db.commit().await?;
+                Ok(())
+            }
         }).await
     }
     pub async fn replace_plugin_pending(
@@ -467,12 +499,14 @@ impl CrudStore {
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
         self.run_serialized_write(|| async move {
-            plugins::replace_pending(&self.connection, id, revision, pending.into()).await
+            let db = self.connection.begin().await?;
+            plugins::replace_pending(&db, id, revision, pending.into()).await?;
+            db.commit().await?;
+            Ok(())
         })
         .await
     }
     pub async fn delete_plugin_parent(&self, id: &str, revision: i64) -> Result<()> {
-        use sea_orm::TransactionTrait;
         self.run_serialized_write(|| async move {
             let db = self.connection.begin().await?;
             plugins::delete_parent(&db, id, revision).await?;
@@ -482,15 +516,24 @@ impl CrudStore {
         .await
     }
     pub async fn interrupt_unfinished_plugins(&self) -> Result<()> {
-        use sea_orm::TransactionTrait;
-        // Only the bounded parent-state scan/write runs here. No installer replay.
-        self.run_serialized_write(|| async move {
-            let db = self.connection.begin().await?;
-            plugins::interrupt_unfinished(&db).await?;
-            db.commit().await?;
-            Ok(())
-        })
-        .await
+        // Each committed batch removes itself from the predicate. Cancellation
+        // or restart resumes remaining parents; no filesystem/installer work is
+        // performed while holding the writer. Incomplete states already gate use.
+        let maintenance = self.with_maintenance_access();
+        loop {
+            let count = maintenance
+                .run_serialized_write(|| async {
+                    let db = maintenance.connection.begin().await?;
+                    let count = plugins::interrupt_unfinished(&db).await?;
+                    db.commit().await?;
+                    Ok(count)
+                })
+                .await?;
+            if count < 128 {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -500,9 +543,6 @@ impl CrudStore {
         workspace: &str,
         ids: &[String],
     ) -> Result<Vec<String>> {
-        if ids.len() > 65536 {
-            bail!("native thread inventory too large");
-        }
         plugins::workspace_native_threads(&self.connection, workspace, ids).await
     }
 }
@@ -522,14 +562,17 @@ impl CrudStore {
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
         self.run_serialized_write(|| async move {
+            let db = self.connection.begin().await?;
             plugins::interrupt_mutation(
-                &self.connection,
+                &db,
                 id,
                 revision,
                 pending.into(),
                 error.into(),
             )
-            .await
+            .await?;
+            db.commit().await?;
+            Ok(())
         })
         .await
     }
@@ -582,7 +625,6 @@ impl CrudStore {
         workspace: &str,
         kind: &str,
     ) -> Result<()> {
-        use sea_orm::TransactionTrait;
         validate_native_write_input(Some(write))?;
         self.run_serialized_write(|| async move {
             let db = self.connection.begin().await?;
@@ -617,8 +659,9 @@ impl CrudStore {
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
         self.run_serialized_write(|| async move {
-            plugins::resume_mutation(
-                &self.connection,
+            let db = self.connection.begin().await?;
+            let row = plugins::resume_mutation(
+                &db,
                 workspace,
                 id,
                 revision,
@@ -626,7 +669,9 @@ impl CrudStore {
                 pending,
                 state,
             )
-            .await
+            .await?;
+            db.commit().await?;
+            Ok(row)
         })
         .await
     }
@@ -641,7 +686,6 @@ impl CrudStore {
         now: i64,
         previous_pending: Option<&str>,
     ) -> Result<plugin_installation::Model> {
-        use sea_orm::TransactionTrait;
         if pending.len() > 65536 {
             bail!("plugin plan exceeds bound");
         }
@@ -710,8 +754,9 @@ impl CrudStore {
         upload_id: Option<&str>,
     ) -> Result<()> {
         self.run_serialized_write(|| async move {
+            let db = self.connection.begin().await?;
             plugins::publish_package(
-                &self.connection,
+                &db,
                 id,
                 revision,
                 name,
@@ -719,7 +764,9 @@ impl CrudStore {
                 fingerprint,
                 upload_id,
             )
-            .await
+            .await?;
+            db.commit().await?;
+            Ok(())
         })
         .await
     }
@@ -731,7 +778,10 @@ impl CrudStore {
         key: &str,
     ) -> Result<()> {
         self.run_serialized_write(|| async move {
-            plugins::forget_component(&self.connection, id, revision, kind, key).await
+            let db = self.connection.begin().await?;
+            plugins::forget_component(&db, id, revision, kind, key).await?;
+            db.commit().await?;
+            Ok(())
         })
         .await
     }

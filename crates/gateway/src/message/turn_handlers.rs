@@ -7397,33 +7397,18 @@ impl MessageProcessor {
                 }
             }
             for plan in &combined_preflight.skill_install_plans {
-                if let Some(plugin) = &plan.plugin_id {
-                    let refresh = async {
-                        let candidates = self.external_runtime_receipt_conversion_candidates().await?;
-                        let current = {
-                            let _receipt_guard = self.acquire_skills_write_lock().await;
-                            crate::cli_runtime::skills::owned_skill_projection_is_current(plan, &candidates)?
-                        };
-                        if !current {
-                            for owner in manager.plugin_stop_inventory(&thread.workspace_id, plugin) {
-                                manager.stop_and_wait(&owner, cli_prepare_deadline).await?;
-                            }
-                            anyhow::ensure!(manager.plugin_stop_inventory(&thread.workspace_id, plugin).is_empty(),
-                                "owned skill projection publication changed during refresh");
+                let before_replace = async {
+                    if let Some(plugin) = &plan.plugin_id {
+                        for owner in manager.plugin_stop_inventory(&thread.workspace_id, plugin) {
+                            manager.stop_and_wait(&owner, cli_prepare_deadline).await?;
                         }
-                        anyhow::Ok(())
-                    }.await;
-                    if let Err(error) = refresh {
-                        self.mark_turn_blocked(outcome.started_notification.thread_id.clone(),
-                            outcome.started_notification.turn.id.clone(),
-                            format!("CLI plugin projection refresh could not confirm stop: {error:#}")).await;
-                        send_turn_start_failure!(format!("CLI plugin projection refresh could not confirm stop: {error:#}"));
-                        return None;
+                        anyhow::ensure!(manager.plugin_stop_inventory(&thread.workspace_id, plugin).is_empty(),
+                            "owned skill projection publication changed during refresh");
                     }
-                }
+                    anyhow::Ok(())
+                };
                 let install_started = std::time::Instant::now();
-                match scope_current_stage(Stage::CliSkillsInstall, self.install_one_cli_runtime_skill(plan))
-                .await {
+                match scope_current_stage(Stage::CliSkillsInstall, self.install_one_cli_runtime_skill(plan, before_replace)).await {
                     Ok(result) => {
                         let result_name = match result.status {
                             crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Current => {
@@ -10655,7 +10640,6 @@ impl MessageProcessor {
         );
         Ok(())
     }
-
     pub(super) async fn resume_blocked_turn_control(
         &self,
         workspace_id: &str,

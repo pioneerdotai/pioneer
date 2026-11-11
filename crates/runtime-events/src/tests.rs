@@ -453,7 +453,7 @@ async fn snapshot_lane_keeps_latest_value_for_each_item() {
 
 #[tokio::test]
 async fn owned_cli_hub_shutdown_rejects_queued_publication_and_late_progress() {
-    let hub = Arc::new(ExecutionEventHub::new_with_owned_progress());
+    let hub = Arc::new(ExecutionEventHub::new());
     let publisher = {
         let hub = hub.clone();
         tokio::spawn(async move { hub.publish_durable_and_wait(completed("turn_1")).await })

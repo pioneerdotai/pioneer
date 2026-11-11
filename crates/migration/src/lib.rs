@@ -25,7 +25,7 @@ mod m20261027_000005_portable_task_event;
 mod m20261029_000001_thread_read_creation_order;
 mod portable_payload_target;
 
-mod m20261005_000001_plugin_ownership;
+mod m20261111_000001_plugin_ownership;
 
 pub struct Migrator;
 
@@ -241,9 +241,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20261101_000101_idle_task_child_work::Migration),
             Box::new(m20261101_000102_idle_task_occurrence_tracking_cutover::Migration),
             Box::new(m20261101_000103_idle_html_preview_io_work::Migration),
-            Box::new(m20261005_000001_plugin_ownership::Migration),
             Box::new(m20261105_000001_portable_pending_indexes::Migration),
             Box::new(m20261104_000001_capsule_bound_routes::Migration),
+            Box::new(m20261111_000001_plugin_ownership::Migration),
         ]
     }
 }
