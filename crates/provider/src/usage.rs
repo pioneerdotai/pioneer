@@ -1486,6 +1486,11 @@ impl UsageContext {
         with_error_usage(error, &usage)
     }
     pub(crate) fn enrich(&self, usage: &mut TokenUsage) {
+        let unconfirmed_service_dispatch = usage.physical_attempt_id.as_deref()
+            == Some(self.attempt.as_str())
+            && usage.accounting.as_ref().is_some_and(|accounting| {
+                accounting["service_mode"]["dispatch_status"] == "unconfirmed_on_error"
+            });
         usage.provider = Some(self.provider.clone());
         usage.model = Some(self.model.clone());
         usage.api = Some(self.api.clone());
@@ -1578,6 +1583,12 @@ impl UsageContext {
                 _ => None,
             };
             accounting["service_mode"] = json!({"requested":plan.id,"parameters":plan.parameters,"sent_parameters":self.service_fields,"reported_service_tier":usage.service_tier,"reported_speed":usage.raw_usage.as_ref().and_then(|raw| raw.get("speed")),"catalog_snapshot":self.catalog.as_ref().map(|catalog| catalog.snapshot_id()),"captured_at_ms":self.captured_at_ms,"source":descriptor});
+            if unconfirmed_service_dispatch {
+                accounting["service_mode"]["prepared_parameters"] =
+                    self.service_fields.clone().unwrap_or(Value::Null);
+                accounting["service_mode"]["sent_parameters"] = Value::Null;
+                accounting["service_mode"]["dispatch_status"] = json!("unconfirmed_on_error");
+            }
             if let Some(pricing) = accounting["pricing"].as_object_mut() {
                 pricing.insert("service_mode".into(), json!({"version":1,"plan":plan,"descriptor":descriptor,
                     "context_tiers":self.catalog.as_ref().and_then(|c| c.context_tiers(&self.provider, &self.model))}));

@@ -1745,6 +1745,8 @@ fn native_service_facts_keep_reports_separate_and_hold_request_price_evidence() 
     );
     assert_eq!(pro.service_tier.as_deref(), Some("default"));
     assert!(pro.accounting.as_ref().unwrap()["estimated_cost"].is_null());
+    context.service_fields = Some(json!({"body":{"service_tier":"default",
+        "reasoning":{"mode":"pro"}},"beta_tokens":[]}));
     let error = context.enrich_error(anyhow::anyhow!("provider denied mode"));
     let failed = error_usage(&error).unwrap();
     assert_eq!(failed.input_tokens, None);
@@ -1752,6 +1754,21 @@ fn native_service_facts_keep_reports_separate_and_hold_request_price_evidence() 
         failed.accounting.as_ref().unwrap()["service_mode"]["requested"],
         "pro"
     );
+    let mut settled = failed.clone();
+    context.finalize_usage(&mut settled);
+    let facts = &settled.accounting.as_ref().unwrap()["service_mode"];
+    assert_eq!(facts["dispatch_status"], "unconfirmed_on_error");
+    assert!(facts["sent_parameters"].is_null());
+    assert_eq!(
+        facts["prepared_parameters"]["body"]["reasoning"]["mode"],
+        "pro"
+    );
+    let mut next_attempt = context.clone();
+    next_attempt.attempt = "next-physical-attempt".into();
+    next_attempt.finalize_usage(&mut settled);
+    let facts = &settled.accounting.as_ref().unwrap()["service_mode"];
+    assert!(facts["dispatch_status"].is_null());
+    assert_eq!(facts["sent_parameters"]["body"]["reasoning"]["mode"], "pro");
     assert_eq!(
         bounded_usage(&json!({"service_tier":"ultrafast","speed":"fast","secret":"discard"})),
         json!({"service_tier":"ultrafast","speed":"fast"})
