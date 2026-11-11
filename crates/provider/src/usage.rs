@@ -1468,15 +1468,6 @@ impl UsageContext {
         Self::prepare_request(provider, request)
     }
 
-    pub(crate) fn enrich_error(&self, error: anyhow::Error) -> anyhow::Error {
-        if let Some(mut usage) = error_usage(&error).cloned() {
-            self.enrich(&mut usage);
-            with_error_usage(error, &usage)
-        } else {
-            error
-        }
-    }
-
     fn captured_mode_estimate(
         &self,
         usage: &TokenUsage,
