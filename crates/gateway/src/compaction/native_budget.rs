@@ -467,6 +467,7 @@ mod tests {
             (1000, Some(9000), Some(2048))
         );
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "model".into(),
             messages: vec![
