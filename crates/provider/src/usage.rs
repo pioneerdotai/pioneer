@@ -1459,86 +1459,15 @@ impl UsageContext {
         usage: &TokenUsage,
         descriptor: &pioneer_protocol::ServiceModeDescriptor,
     ) -> Option<(Value, Option<Value>)> {
-        use pioneer_protocol::ProviderContextTiers;
         let catalog = self.catalog.as_ref()?;
         let entry = catalog.model(&self.provider, &self.model)?;
-        if entry.cost.as_object().is_none_or(|cost| {
-            cost.keys().any(|key| {
-                !matches!(
-                    key.as_str(),
-                    "input"
-                        | "output"
-                        | "cache_read"
-                        | "cache_write"
-                        | "cacheRead"
-                        | "cacheWrite"
-                        | "tiers"
-                        | "context_over_200k"
-                )
-            })
-        }) {
-            return None;
-        }
-        let context_ceiling = match catalog.context_tiers(&self.provider, &self.model)? {
-            ProviderContextTiers::Tiered { windows, .. } => windows.first().copied(),
-            ProviderContextTiers::NoTiers => None,
-            _ => return None,
-        };
-        let base_band = match catalog.context_tiers(&self.provider, &self.model)? {
-            ProviderContextTiers::NoTiers => true,
-            ProviderContextTiers::Tiered { windows, .. } => {
-                usage.input_tokens? <= *windows.first()?
-            }
-            _ => false,
-        };
-        if !base_band {
-            return None;
-        } // no invented context × service multiplier
-        let mut rates = descriptor.cost.clone()?;
-        for (snake, camel) in [("cache_read", "cacheRead"), ("cache_write", "cacheWrite")] {
-            if let Some(value) = rates.get(snake).cloned() {
-                if rates.get(camel).is_some_and(|other| other != &value) {
-                    return None;
-                }
-                rates[camel] = value;
-                rates.as_object_mut()?.remove(snake);
-            }
-        }
-        let mut metadata = entry.metadata.clone();
-        let source = metadata.get_mut("pricingSource")?.as_object_mut()?;
-        if source
-            .get("raw")
-            .and_then(Value::as_object)
-            .is_some_and(|raw| {
-                raw.keys().any(|key| {
-                    !matches!(
-                        key.as_str(),
-                        "input"
-                            | "output"
-                            | "cache_read"
-                            | "cache_write"
-                            | "cacheRead"
-                            | "cacheWrite"
-                            | "tiers"
-                            | "context_over_200k"
-                    )
-                })
-            })
-        {
-            return None;
-        }
-        source.insert("raw".into(), rates.clone());
-        let resolution = guarded_resolution_with_service_rates(usage, &rates, &metadata, true)?;
-        let estimate = estimate_from_resolution(resolution.clone()).map(|mut estimate| {
-            estimate["service_mode"] = json!(descriptor.id);
-            estimate["source_context_input_ceiling"] = json!(context_ceiling);
-            estimate["source_pricing_evidence_version"] = metadata
-                .get("pricingEvidenceVersion")
-                .cloned()
-                .unwrap_or(Value::Null);
-            estimate
-        });
-        Some((resolution, estimate))
+        service_mode_cost(
+            usage,
+            &entry.cost,
+            &entry.metadata,
+            catalog.context_tiers(&self.provider, &self.model)?,
+            descriptor,
+        )
     }
 
     pub(crate) fn enrich_error(&self, error: anyhow::Error) -> anyhow::Error {
@@ -1649,36 +1578,12 @@ impl UsageContext {
                 _ => None,
             };
             accounting["service_mode"] = json!({"requested":plan.id,"parameters":plan.parameters,"sent_parameters":self.service_fields,"reported_service_tier":usage.service_tier,"reported_speed":usage.raw_usage.as_ref().and_then(|raw| raw.get("speed")),"catalog_snapshot":self.catalog.as_ref().map(|catalog| catalog.snapshot_id()),"captured_at_ms":self.captured_at_ms,"source":descriptor});
+            if let Some(pricing) = accounting["pricing"].as_object_mut() {
+                pricing.insert("service_mode".into(), json!({"version":1,"plan":plan,"descriptor":descriptor,
+                    "context_tiers":self.catalog.as_ref().and_then(|c| c.context_tiers(&self.provider, &self.model))}));
+            }
             if plan.id != "standard" {
-                use pioneer_protocol::{OpenAiTier, ServiceModeParameters as P};
-                let reported = usage.service_tier.as_deref();
-                let speed = usage
-                    .raw_usage
-                    .as_ref()
-                    .and_then(|raw| raw["speed"].as_str());
-                let downgrade = match &plan.parameters {
-                    // Anthropic capacity tier and inference speed are separate
-                    // dimensions. Missing/unknown speed proves neither mode.
-                    P::AnthropicFast { .. } => speed == Some("standard"),
-                    P::OpenAiTier { .. } | P::BedrockNestedUltrafast => {
-                        matches!(reported, Some("default" | "standard"))
-                    }
-                    _ => false,
-                };
-                let matches_report = match &plan.parameters {
-                    P::OpenAiTier {
-                        tier: OpenAiTier::Priority,
-                    } => matches!(reported, Some("priority" | "fast")),
-                    P::OpenAiTier {
-                        tier: OpenAiTier::Flex,
-                    } => reported == Some("flex"),
-                    P::OpenAiTier {
-                        tier: OpenAiTier::Ultrafast,
-                    }
-                    | P::BedrockNestedUltrafast => reported == Some("ultrafast"),
-                    P::AnthropicFast { .. } => speed == Some("fast"),
-                    _ => false,
-                };
+                let (downgrade, matches_report) = service_mode_report(usage, &plan.parameters);
                 let (resolution, estimate) = if downgrade {
                     (
                         accounting
@@ -1724,6 +1629,128 @@ impl UsageContext {
             accounting["selected_cost"] = json!(selected);
         }
     }
+}
+
+fn service_mode_report(
+    usage: &TokenUsage,
+    parameters: &pioneer_protocol::ServiceModeParameters,
+) -> (bool, bool) {
+    use pioneer_protocol::{OpenAiTier, ServiceModeParameters as P};
+    let reported = usage.service_tier.as_deref();
+    let speed = usage
+        .raw_usage
+        .as_ref()
+        .and_then(|raw| raw["speed"].as_str());
+    let downgrade = match parameters {
+        // Anthropic capacity tier and inference speed are separate
+        // dimensions. Missing/unknown speed proves neither mode.
+        P::AnthropicFast { .. } => speed == Some("standard"),
+        P::OpenAiTier { .. } | P::BedrockNestedUltrafast => {
+            matches!(reported, Some("default" | "standard"))
+        }
+        _ => false,
+    };
+    let matches_report = match parameters {
+        P::OpenAiTier {
+            tier: OpenAiTier::Priority,
+        } => matches!(reported, Some("priority" | "fast")),
+        P::OpenAiTier {
+            tier: OpenAiTier::Flex,
+        } => reported == Some("flex"),
+        P::OpenAiTier {
+            tier: OpenAiTier::Ultrafast,
+        }
+        | P::BedrockNestedUltrafast => reported == Some("ultrafast"),
+        P::AnthropicFast { .. } => speed == Some("fast"),
+        _ => false,
+    };
+    (downgrade, matches_report)
+}
+
+// The live attempt and historical reconciliation use the same captured inputs.
+fn service_mode_cost(
+    usage: &TokenUsage,
+    cost: &Value,
+    metadata: &std::collections::BTreeMap<String, Value>,
+    tiers: &pioneer_protocol::ProviderContextTiers,
+    descriptor: &pioneer_protocol::ServiceModeDescriptor,
+) -> Option<(Value, Option<Value>)> {
+    use pioneer_protocol::ProviderContextTiers;
+    if cost.as_object().is_none_or(|cost| {
+        cost.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "input"
+                    | "output"
+                    | "cache_read"
+                    | "cache_write"
+                    | "cacheRead"
+                    | "cacheWrite"
+                    | "tiers"
+                    | "context_over_200k"
+            )
+        })
+    }) {
+        return None;
+    }
+    let context_ceiling = match tiers {
+        ProviderContextTiers::Tiered { windows, .. } => windows.first().copied(),
+        ProviderContextTiers::NoTiers => None,
+        _ => return None,
+    };
+    let base_band = match tiers {
+        ProviderContextTiers::NoTiers => true,
+        ProviderContextTiers::Tiered { windows, .. } => usage.input_tokens? <= *windows.first()?,
+        _ => false,
+    };
+    if !base_band {
+        return None;
+    } // no invented context × service multiplier
+    let mut rates = descriptor.cost.clone()?;
+    for (snake, camel) in [("cache_read", "cacheRead"), ("cache_write", "cacheWrite")] {
+        if let Some(value) = rates.get(snake).cloned() {
+            if rates.get(camel).is_some_and(|other| other != &value) {
+                return None;
+            }
+            rates[camel] = value;
+            rates.as_object_mut()?.remove(snake);
+        }
+    }
+    let mut metadata = metadata.clone();
+    let source = metadata.get_mut("pricingSource")?.as_object_mut()?;
+    if source
+        .get("raw")
+        .and_then(Value::as_object)
+        .is_some_and(|raw| {
+            raw.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "input"
+                        | "output"
+                        | "cache_read"
+                        | "cache_write"
+                        | "cacheRead"
+                        | "cacheWrite"
+                        | "tiers"
+                        | "context_over_200k"
+                )
+            })
+        })
+    {
+        return None;
+    }
+    source.insert("raw".into(), rates.clone());
+    let resolution = guarded_resolution_with_service_rates(usage, &rates, &metadata, true)?;
+    let estimate = estimate_from_resolution(resolution.clone()).map(|mut estimate| {
+        estimate["service_mode"] = json!(descriptor.id);
+        estimate["source_context_input_ceiling"] = json!(context_ceiling);
+        estimate["source_pricing_evidence_version"] = metadata
+            .get("pricingEvidenceVersion")
+            .cloned()
+            .unwrap_or(Value::Null);
+        estimate
+    });
+    Some((resolution, estimate))
 }
 
 /// Native Claude only, default retention. Available facts must agree with Messages;
@@ -1840,6 +1867,41 @@ pub fn resolve_retained_tariff(usage: &TokenUsage, evidence: &Value) -> Value {
         ("pricingUnits".into(), evidence["units"].clone()),
         ("pricingSource".into(), evidence["source"].clone()),
     ]);
+    if let Some(mode) = evidence.get("service_mode") {
+        let unresolved = || json!({"version":1,"status":"unresolved","reasons":["unsupported_or_unconfirmed_service_price"],"lines":[]});
+        if mode["version"] != 1 {
+            return unresolved();
+        }
+        let Ok(plan) =
+            serde_json::from_value::<pioneer_protocol::NativeServiceModePlan>(mode["plan"].clone())
+        else {
+            return unresolved();
+        };
+        if plan.id != "standard" {
+            let (downgrade, matches_report) = service_mode_report(usage, &plan.parameters);
+            if !downgrade {
+                if !matches_report {
+                    return unresolved();
+                }
+                let Ok(descriptor) = serde_json::from_value::<
+                    pioneer_protocol::ServiceModeDescriptor,
+                >(mode["descriptor"].clone()) else {
+                    return unresolved();
+                };
+                let Ok(tiers) = serde_json::from_value::<pioneer_protocol::ProviderContextTiers>(
+                    mode["context_tiers"].clone(),
+                ) else {
+                    return unresolved();
+                };
+                if descriptor.id != plan.id || descriptor.parameters != plan.parameters {
+                    return unresolved();
+                }
+                return service_mode_cost(usage, &evidence["cost"], &metadata, &tiers, &descriptor)
+                    .map(|(resolution, _)| resolution)
+                    .unwrap_or_else(unresolved);
+            }
+        }
+    }
     guarded_resolution(usage,&evidence["cost"],&metadata).unwrap_or_else(||json!({"version":1,"status":"unresolved","reasons":["unsupported_historical_conditions"],"lines":[]}))
 }
 

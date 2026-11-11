@@ -1635,6 +1635,13 @@ fn native_service_facts_keep_reports_separate_and_hold_request_price_evidence() 
             tier: OpenAiTier::Priority,
         },
     });
+    // This is the evidence the existing durable owner captures before dispatch.
+    // Historical resolution must not need the subsequently replaced catalog.
+    let prepared = context.initial_usage();
+    let retained: Value = serde_json::from_str(
+        &serde_json::to_string(&prepared.accounting.as_ref().unwrap()["pricing"]).unwrap(),
+    )
+    .unwrap();
     let mut downgrade = billing_usage().with_service_tier(Some("default"));
     context.enrich(&mut downgrade);
     let facts = &downgrade.accounting.as_ref().unwrap()["service_mode"];
@@ -1650,6 +1657,13 @@ fn native_service_facts_keep_reports_separate_and_hold_request_price_evidence() 
         .as_f64()
         .unwrap();
     assert!((amount - 0.0006).abs() < 1e-12);
+    let historical = resolve_retained_tariff(&another, &retained);
+    assert_eq!(historical["status"], "complete");
+    assert_eq!(historical["known_subtotal_decimal"], "0.0006");
+    assert_eq!(
+        resolve_retained_tariff(&downgrade, &retained)["known_subtotal_decimal"],
+        "0.00022"
+    );
 
     assert_eq!(
         another.accounting.as_ref().unwrap()["service_mode"]["source"]["cost"]["input"],
@@ -1680,6 +1694,16 @@ fn native_service_facts_keep_reports_separate_and_hold_request_price_evidence() 
                 .unwrap()
                 .is_empty()
         );
+        let historical = resolve_retained_tariff(&partial, &retained);
+        assert_eq!(historical["status"], "partial");
+        assert_eq!(
+            historical["known_subtotal_decimal"],
+            if tier == "priority" {
+                "0.0004"
+            } else {
+                "0.0002"
+            }
+        );
     }
     let mut media = billing_usage().with_service_tier(Some("priority"));
     context.requested_modalities = vec!["image".into()];
@@ -1687,6 +1711,10 @@ fn native_service_facts_keep_reports_separate_and_hold_request_price_evidence() 
     assert!(media.accounting.as_ref().unwrap()["estimated_cost"].is_null());
     assert_eq!(
         media.accounting.as_ref().unwrap()["unresolved_reasons"],
+        json!(["unsupported_application_modality_pricing_contract"])
+    );
+    assert_eq!(
+        resolve_retained_tariff(&media, &retained)["reasons"],
         json!(["unsupported_application_modality_pricing_contract"])
     );
     context.requested_modalities.clear();
