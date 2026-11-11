@@ -556,9 +556,13 @@ impl OpenAiProvider {
             .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&api_request);
-        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
-            .send()
-            .await?;
+        let response = crate::http::non_stream_request(
+            request_builder,
+            self.timeout_policy
+                .for_service_mode(request.service_mode.as_ref()),
+        )
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -649,8 +653,12 @@ impl OpenAiProvider {
             .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&api_request);
-        let response =
-            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
+        let response = crate::http::send_stream_request(
+            request_builder,
+            self.timeout_policy
+                .for_service_mode(request.service_mode.as_ref()),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -1687,6 +1695,9 @@ fn provider_model_from_openai_model_entry(m: ApiModelEntry) -> ProviderModelInfo
     let capabilities = ProviderModelCapabilities::default();
 
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: m.id.clone(),
         name: None,
         description: None,
@@ -1705,6 +1716,9 @@ fn provider_model_from_openai_model_entry(m: ApiModelEntry) -> ProviderModelInfo
 
 fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> ProviderModelInfo {
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: model.id.to_owned(),
         name: Some(model.name.to_owned()),
         description: Some(model.description.to_owned()),
@@ -1726,6 +1740,72 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn service_tiers_reach_chat_body_but_pro_and_ultrafast_do_not() {
+        use pioneer_protocol::{NativeServiceModePlan, OpenAiTier, ServiceModeParameters as P};
+        let catalog = crate::generation::test_catalog_model(
+            "openai",
+            "chat-fixture",
+            "gpt-5.4",
+            serde_json::json!({"api":"openai-completions"}),
+        );
+        let mut req = crate::generation::test_request("chat-fixture");
+        for (parameters, wire) in [
+            (P::OpenAiStandard, "default"),
+            (
+                P::OpenAiTier {
+                    tier: OpenAiTier::Priority,
+                },
+                "priority",
+            ),
+            (
+                P::OpenAiTier {
+                    tier: OpenAiTier::Flex,
+                },
+                "flex",
+            ),
+        ] {
+            req.service_mode = Some(NativeServiceModePlan {
+                id: wire.into(),
+                parameters,
+            });
+            for stream in [false, true] {
+                let body = serde_json::to_value(
+                    OpenAiProvider::build_chat_request_with_catalog(
+                        &req,
+                        vec![],
+                        stream,
+                        Some(&catalog),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body["service_tier"], wire);
+                assert_eq!(body["model"], "chat-fixture");
+            }
+        }
+        for parameters in [
+            P::OpenAiPro,
+            P::OpenAiTier {
+                tier: OpenAiTier::Ultrafast,
+            },
+        ] {
+            req.service_mode = Some(NativeServiceModePlan {
+                id: "unsupported".into(),
+                parameters,
+            });
+            assert!(
+                OpenAiProvider::build_chat_request_with_catalog(
+                    &req,
+                    vec![],
+                    false,
+                    Some(&catalog)
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn native_openai_honors_negative_fresh_source_temperature() {

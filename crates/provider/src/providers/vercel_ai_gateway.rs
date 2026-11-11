@@ -30,6 +30,7 @@ pub struct VercelAiGatewayProvider {
 
 #[derive(Default)]
 struct ModelSnapshot {
+    context_tiers: BTreeMap<String, pioneer_protocol::ProviderContextTiers>,
     entries: BTreeMap<String, crate::catalog::CatalogModel>,
     complete: bool,
 }
@@ -399,13 +400,19 @@ impl VercelAiGatewayProvider {
         }
         // Only an explicit complete catalog establishes deletions. Missing or
         // future status values use the same conservative merge as partial.
+        let context_tiers = native
+            .iter()
+            .map(|(id, model)| (id.clone(), crate::catalog::context_tiers_for_model(model)))
+            .collect::<BTreeMap<_, _>>();
         let mut snapshot = self.models.write().expect("Vercel model snapshot");
         snapshot.complete = value["catalog_status"] == "complete";
         if snapshot.complete {
             snapshot.entries = native;
+            snapshot.context_tiers = context_tiers;
         } else {
             // Replace whole present rows, including negative/unknown facts.
             snapshot.entries.extend(native);
+            snapshot.context_tiers.extend(context_tiers);
         }
         Ok(result)
     }
@@ -616,6 +623,9 @@ fn model_info(raw: &Value, model: &crate::catalog::CatalogModel) -> ProviderMode
         crate::catalog::InputCapabilityState::Unknown => None,
     };
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: Some(crate::catalog::context_tiers_for_model(model)),
         id: model.id.clone(),
         name: Some(model.name.clone()),
         description: raw["description"].as_str().map(str::to_owned),
@@ -674,6 +684,19 @@ impl Provider for VercelAiGatewayProvider {
     }
     async fn prepare_model(&self, id: &str) -> Result<()> {
         self.ensure_model(id).await
+    }
+    async fn model_context_tiers(
+        &self,
+        id: &str,
+    ) -> Result<Option<pioneer_protocol::ProviderContextTiers>> {
+        self.ensure_model(id).await?;
+        Ok(self
+            .models
+            .read()
+            .expect("Vercel model snapshot")
+            .context_tiers
+            .get(id)
+            .cloned())
     }
     async fn model_limits(&self, id: &str) -> Result<crate::catalog::CatalogLimits> {
         self.ensure_model(id).await?;
@@ -1455,6 +1478,8 @@ mod tests {
         let response = crate::attachments::runtime::with_async_authority_scope(
             provider.authority_fingerprint().unwrap().to_owned(),
             provider.chat(ChatRequest {
+                tool_declarations: None,
+                service_mode: None,
                 model: "private/agent".into(),
                 messages: vec![crate::ChatMessage::user("hello")],
                 temperature: Some(0.5),
@@ -1515,6 +1540,8 @@ mod tests {
                 .await
                 .unwrap();
             let request = ChatRequest {
+                tool_declarations: None,
+                service_mode: None,
                 model: if index == 1 {
                     "private/other"
                 } else {
@@ -1693,6 +1720,8 @@ mod tests {
         for id in ["private/embed", "private/language-batch"] {
             let error = provider
                 .prepare_input_budget(ChatRequest {
+                    tool_declarations: None,
+                    service_mode: None,
                     model: id.into(),
                     messages: vec![crate::ChatMessage::user("hello")],
                     temperature: None,

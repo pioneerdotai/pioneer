@@ -30,6 +30,35 @@ pub enum ToolOutputProjectionKind {
     },
 }
 
+impl ToolOutputProjectionKind {
+    /// Preserve the native file page even when reached through a trusted proxy.
+    pub fn is_file_page(&self, tool_name: &str) -> bool {
+        match self {
+            Self::Builtin => matches!(tool_name, "read_file" | "grep_files"),
+            Self::DynamicFunctionProxy {
+                target_tool_name,
+                target_projection_kind,
+                ..
+            } => target_projection_kind.is_file_page(target_tool_name),
+            _ => false,
+        }
+    }
+
+    /// Whether the LLM view owns the command-output representation, including proxies.
+    pub fn is_shell(&self, tool_name: &str) -> bool {
+        match self {
+            Self::Builtin => matches!(tool_name, "exec_command" | "write_stdin"),
+            Self::DynamicShell => true,
+            Self::DynamicFunctionProxy {
+                target_tool_name,
+                target_projection_kind,
+                ..
+            } => target_projection_kind.is_shell(target_tool_name),
+            _ => false,
+        }
+    }
+}
+
 impl Default for ToolOutputProjectionKind {
     fn default() -> Self {
         Self::Builtin
@@ -175,11 +204,22 @@ pub fn thread_read_page_fits(value: &JsonValue) -> bool {
 }
 
 pub fn thread_read_page_bytes(value: &JsonValue) -> usize {
+    thread_read_page_size(value).bytes
+}
+
+/// Complete projected JSON (view and model payload), including outcome fields.
+/// The page producer uses the same estimate before minting its continuation.
+pub fn thread_read_page_size(value: &JsonValue) -> pioneer_compaction::estimator::TextSize {
+    use pioneer_compaction::estimator::{TextSize, json_size};
+    let failed = TextSize {
+        bytes: usize::MAX,
+        utf16_units: u64::MAX,
+    };
     let view = ToolResultView::Json {
         value: value.clone(),
         truncated: false,
     };
-    let view_bytes = view.serialized_size_bytes();
+    let view_size = json_size(&view).unwrap_or(failed);
     let envelope = ToolResultEnvelope {
         llm_view: view,
         display: ToolDisplayPayload::Hidden,
@@ -189,9 +229,11 @@ pub fn thread_read_page_bytes(value: &JsonValue) -> usize {
         success: true,
         output_policy: ToolOutputPolicySnapshot::for_tool_name("threads_history_read"),
     };
-    view_bytes.max(
-        serde_json::to_vec(&envelope.llm_payload()).map_or(usize::MAX, |encoded| encoded.len()),
-    )
+    let model_size = json_size(&envelope.llm_payload()).unwrap_or(failed);
+    TextSize {
+        bytes: view_size.bytes.max(model_size.bytes),
+        utf16_units: view_size.utf16_units.max(model_size.utf16_units),
+    }
 }
 
 impl ToolResultView {

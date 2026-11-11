@@ -318,13 +318,14 @@ pub use patch_history::{
     TurnPatchStepsPageResponse,
 };
 pub use provider::{
-    ObservedProviderUsageTotals, ProviderConfigureParams, ProviderConfigureResponse,
-    ProviderDefinition, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
-    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    NativeContextBudget, NativeSummaryContext, ObservedProviderUsageTotals,
+    ProviderConfigureParams, ProviderConfigureResponse, ProviderContextTiers, ProviderDefinition,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
     ProviderModelReasoningCapabilities, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
     ProviderSummary, ProviderSummaryCapabilities, ProviderTranscriptionModelMetadata,
-    ReasoningCapabilitySource, observed_provider_usage_totals,
+    ReasoningCapabilitySource, native_context_choice_authority, observed_provider_usage_totals,
 };
 pub use public_error::{PUBLIC_ERROR_VERSION, PublicError, PublicErrorCode, PublicErrorStage};
 pub use settings::{
@@ -596,3 +597,8 @@ pub use artifact::{HtmlPublication, compact_html_timeline_item, compact_html_tim
 
 mod execution_observability;
 pub use execution_observability::*;
+mod service_mode;
+pub use service_mode::{
+    NativeServiceModePlan, NativeServiceModeSelection, OpenAiTier, ServiceModeDescriptor,
+    ServiceModeParameters, SourceServiceMode, SourceServiceModes,
+};

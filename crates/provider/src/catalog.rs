@@ -1,7 +1,9 @@
 //! Runtime model catalog. Readers retain a validated snapshot while background
 //! updates publish a replacement. Unavailable until saved or fetched data loads.
+mod context;
 mod fetch;
 mod input;
+pub mod service;
 pub use input::InputCapabilityState;
 pub(crate) use input::effective_input_model;
 pub mod generator;
@@ -25,6 +27,15 @@ pub(crate) fn tool_support_from_marker_list(value: &Value, marker: &str) -> Opti
         .filter(|values| values.iter().all(Value::is_string))
         .map(|values| values.iter().any(|value| value == marker))
 }
+
+/// Normalize metadata for authority-native discovery without borrowing a public authority.
+pub(crate) fn context_tiers_for_model(
+    model: &CatalogModel,
+) -> pioneer_protocol::ProviderContextTiers {
+    context::normalize(model)
+}
+
+pub use pioneer_protocol::native_context_choice_authority as context_choice_authority;
 
 pub const UNKNOWN_CONTEXT_WINDOW: u64 = 128_000;
 
@@ -115,12 +126,35 @@ pub struct ModelCatalog {
     models: BTreeMap<String, BTreeMap<String, CatalogModel>>,
     billing_models: BTreeMap<String, BTreeMap<String, CatalogModel>>,
     origins: BTreeMap<String, BTreeMap<String, ModelOrigins>>,
+    context_tiers: BTreeMap<String, BTreeMap<String, pioneer_protocol::ProviderContextTiers>>,
+    service_modes: BTreeMap<String, BTreeMap<String, service::SourceServiceModes>>,
     snapshot_id: String,
     retained_pricing: BTreeMap<String, BTreeMap<String, String>>,
     tool_capabilities: Option<ToolCapabilities>,
 }
 
 impl ModelCatalog {
+    /// Source evidence only; callers must apply authority and adapter admission.
+    pub fn source_service_modes(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<&service::SourceServiceModes> {
+        self.service_modes
+            .get(&catalog_provider(provider))?
+            .get(model)
+    }
+
+    pub fn context_tiers(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<&pioneer_protocol::ProviderContextTiers> {
+        self.context_tiers
+            .get(&catalog_provider(provider))?
+            .get(model)
+    }
+
     pub fn tool_support(&self, provider: &str, id: &str) -> Option<bool> {
         let provider = catalog_provider(provider);
         let model = self.models.get(&provider).and_then(|models| models.get(id));
@@ -183,6 +217,8 @@ impl ModelCatalog {
                 hex::encode(Sha256::digest(models.as_bytes()))
             },
             tool_capabilities,
+            context_tiers: BTreeMap::new(),
+            service_modes: BTreeMap::new(),
         };
         // Old Vercel cache records describe a different wire contract. Isolate
         // only those records; last-good evidence for every other source survives.
@@ -251,6 +287,32 @@ impl ModelCatalog {
                 }
             }
         }
+        catalog.context_tiers = catalog
+            .models
+            .iter()
+            .map(|(provider, models)| {
+                (
+                    provider.clone(),
+                    models
+                        .iter()
+                        .map(|(id, model)| (id.clone(), context::normalize(model)))
+                        .collect(),
+                )
+            })
+            .collect();
+        catalog.service_modes = catalog
+            .models
+            .iter()
+            .map(|(provider, models)| {
+                (
+                    provider.clone(),
+                    models
+                        .iter()
+                        .map(|(id, model)| (id.clone(), service::normalize(model)))
+                        .collect(),
+                )
+            })
+            .collect();
         Ok(catalog)
     }
 
@@ -366,6 +428,13 @@ impl ModelCatalog {
             let Some(entry) = self.model(provider, &model.id).filter(|_| use_tool_sources) else {
                 continue;
             };
+            if model.context_tiers.is_none() {
+                model.context_tiers = self
+                    .context_tiers
+                    .get(&catalog_provider(provider))
+                    .and_then(|models| models.get(&model.id))
+                    .cloned();
+            }
             let limits = self.limits(provider, &model.id);
             if limits.context_origin != OriginKind::Fallback {
                 model
@@ -378,6 +447,11 @@ impl ModelCatalog {
             }
             if let Some(max_output) = limits.max_output {
                 model.limits.max_output_tokens.get_or_insert(max_output);
+            }
+            if let (Some(tiers), Some(cap)) =
+                (&mut model.context_tiers, model.limits.context_window)
+            {
+                *tiers = tiers.with_technical_limit(cap);
             }
             if model.name.is_none() {
                 model.name = Some(entry.name.clone());

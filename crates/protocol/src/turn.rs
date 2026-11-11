@@ -319,6 +319,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct TurnStartParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_mode: Option<crate::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_authority: Option<String>,
+    /// User-owned model choice; absent means Auto, not inheritance of a wider override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// Explicit, bounded cross-capsule delegations requested for this root
     /// Agent execution. These are authorization inputs, never prompt content.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -418,6 +425,11 @@ pub struct TurnAgentAuthorityCapSnapshot {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct TurnExecutionSecuritySnapshot {
+    /// Financial context authorization for this exact Native/API execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_context: Option<crate::NativeContextBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_summary: Option<crate::NativeSummaryContext>,
     pub schema_version: u32,
     pub version: u32,
     pub source: TurnSecuritySnapshotSource,
@@ -448,6 +460,8 @@ impl TurnExecutionSecuritySnapshot {
         let process = TurnProcessPolicySnapshot::unrestricted();
         let approval = TurnApprovalScopePolicySnapshot::full_access();
         Self {
+            native_context: None,
+            native_summary: None,
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
             source: TurnSecuritySnapshotSource::ComposerSelection,
@@ -490,6 +504,8 @@ impl TurnExecutionSecuritySnapshot {
         let process = TurnProcessPolicySnapshot::restricted();
         let approval = TurnApprovalScopePolicySnapshot::supervised();
         Self {
+            native_context: None,
+            native_summary: None,
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
             source: TurnSecuritySnapshotSource::ComposerSelection,
@@ -540,6 +556,8 @@ impl TurnExecutionSecuritySnapshot {
         let process = TurnProcessPolicySnapshot::restricted();
         let approval = TurnApprovalScopePolicySnapshot::auto_accept_edits();
         Self {
+            native_context: None,
+            native_summary: None,
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
             source: TurnSecuritySnapshotSource::ComposerSelection,
@@ -6883,6 +6901,9 @@ mod tests {
     #[test]
     fn turn_start_params_encode_user_input_tagged_enum() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thr_123".to_owned(),
             turn_id: "turn_123".to_owned(),
@@ -6950,6 +6971,9 @@ mod tests {
     #[test]
     fn turn_start_params_encode_extended_attachment_input_variants() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thr_123".to_owned(),
             turn_id: "turn_123".to_owned(),

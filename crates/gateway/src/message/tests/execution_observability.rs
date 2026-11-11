@@ -99,6 +99,8 @@ async fn context_rpc_returns_bounded_content_free_breakdown_and_enforces_thread_
         .unwrap()
         .workspace_id;
     let request = ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: "fixture".into(),
         messages: vec![pioneer_provider::ChatMessage::user(
             "CTX\nSECRET_PROMPT_BYTES",
@@ -759,6 +761,8 @@ async fn auxiliary_spawned_decoder_body_eof_reaches_the_drain_owner_and_journal(
     );
     let mut stream = provider
         .stream_chat(ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gpt-5.4".into(),
             messages: vec![pioneer_provider::ChatMessage::user("fixture")],
             temperature: None,

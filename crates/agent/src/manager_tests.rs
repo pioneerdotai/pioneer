@@ -4824,6 +4824,481 @@ async fn provider_failure_prepares_cleanup_for_later_recovery_terminalization() 
     ));
 }
 
+// Capture the actual ACKed canonical group at the crash boundary: discovery
+// result committed, next request proposal rejected, no updated checkpoint.
+async fn discovery_history_before_next_snapshot(
+    commit_next_proposal: bool,
+) -> (Vec<crate::RetainedProviderHistoryMessage>, ChatRequest) {
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "discover-before-crash".into(),
+            name: "request_tools".into(),
+            arguments: json!({"domains":["memory"],"reason":"need memory"}).to_string(),
+        }],
+        "must not dispatch",
+    ));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "sequenced-tools",
+            provider.clone(),
+        )),
+        test_tool_loop_config(),
+    );
+    manager
+        .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(Ok(
+            MemoryToolMaterialization {
+                bundles: vec![fake_standard_memory_tool_bundle()],
+                diagnostics: Vec::new(),
+            },
+        )))))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
+    manager
+        .ensure_thread("disclosure-thread", "disclosure-workspace")
+        .await
+        .unwrap();
+    let mut events = manager
+        .take_durable_receiver("disclosure-thread")
+        .await
+        .unwrap();
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            "disclosure-thread",
+            "disclosure-turn",
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "discover once".into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut retained = Vec::new();
+    let mut round: Option<pioneer_provider::CanonicalProviderRoundEnvelope> = None;
+    let mut result_committed = false;
+    let mut rejected = false;
+    let mut terminal = false;
+    for _ in 0..200 {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(&event, AgentDurableEvent::TurnLlmContextAppended { source, .. }
+            if source == "system_snapshot_v1" && result_committed && !commit_next_proposal)
+        {
+            assert_eq!(
+                provider.snapshot_requests().len(),
+                1,
+                "no request B before snapshot ACK"
+            );
+            events.acknowledge_last(Err(
+                pioneer_runtime_events::DurableCommitRejection::permanent(
+                    "fixture_crash_boundary",
+                    "next proposal not committed",
+                ),
+            ));
+            rejected = true;
+            continue;
+        }
+        // Only accepted durable events enter the fixture's retained history.
+        events.acknowledge_last(Ok(()));
+        let message = match event {
+            AgentDurableEvent::TurnLlmContextAppended {
+                source,
+                payload,
+                item_id,
+                ..
+            } if matches!(
+                source.as_str(),
+                "system_snapshot_v1" | "turn_input_projection_v1" | "tool_result_v2"
+            ) =>
+            {
+                let pioneer_protocol::ToolResultView::Json {
+                    value,
+                    truncated: false,
+                } = payload
+                else {
+                    panic!("incomplete source")
+                };
+                let mut message: ChatMessage = serde_json::from_value(value).unwrap();
+                if source == "tool_result_v2" {
+                    let round = round.as_ref().unwrap();
+                    let call = round
+                        .calls
+                        .iter()
+                        .find(|call| call.turn_item_id == item_id)
+                        .unwrap();
+                    assert_eq!(
+                        message.tool_call_id.as_deref(),
+                        Some(call.provider_call_id.as_str())
+                    );
+                    assert!(message.content.contains("memory_get"));
+                    message.provenance = Some(crate::compaction::history::pending_origin(
+                        "disclosure-workspace",
+                        "disclosure-thread",
+                        "disclosure-turn",
+                        &round.round_id,
+                        crate::compaction::history::PendingOriginKind::ToolResult,
+                        &item_id,
+                    ));
+                    result_committed = true;
+                }
+                Some(message)
+            }
+            AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                let mut envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+                    serde_json::from_value(payload).unwrap();
+                envelope.message.provenance = Some(crate::compaction::history::pending_origin(
+                    "disclosure-workspace",
+                    "disclosure-thread",
+                    "disclosure-turn",
+                    &envelope.round_id,
+                    crate::compaction::history::PendingOriginKind::Assistant,
+                    &envelope.round_id,
+                ));
+                let message = envelope.message.clone();
+                round = Some(envelope);
+                Some(message)
+            }
+            AgentDurableEvent::TurnExecutionWindowCheckpointed { .. } => {
+                // Rejecting the next proposal can checkpoint the aborted attempt.
+                // It must never checkpoint before the captured crash boundary.
+                assert!(rejected, "no updated checkpoint before proposal rejection");
+                None
+            }
+            AgentDurableEvent::TurnFailed { .. }
+            | AgentDurableEvent::TurnBlocked { .. }
+            | AgentDurableEvent::TurnInterrupted { .. }
+            | AgentDurableEvent::TurnCompleted { .. } => {
+                terminal = true;
+                break;
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            retained.push(crate::RetainedProviderHistoryMessage {
+                sequence: retained.len() as i64 + 1,
+                message,
+            });
+        }
+    }
+    assert!(result_committed && terminal);
+    assert_eq!(rejected, !commit_next_proposal);
+    let mut requests = provider.snapshot_requests();
+    assert_eq!(
+        requests.len(),
+        if commit_next_proposal { 2 } else { 1 },
+        "rejected proposal must never dispatch"
+    );
+    let original = requests.pop().unwrap();
+    manager.remove_thread("disclosure-thread").await;
+    (retained, original)
+}
+
+async fn restart_disclosure_history(
+    retained: Vec<crate::RetainedProviderHistoryMessage>,
+    provider: Arc<dyn Provider>,
+    model: &str,
+    bundle: ToolExtensionBundle,
+) -> Vec<AgentEvent> {
+    let name = provider.name().to_owned();
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(&name, provider)),
+        test_tool_loop_config(),
+    );
+    manager
+        .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(Ok(
+            MemoryToolMaterialization {
+                bundles: vec![bundle],
+                diagnostics: Vec::new(),
+            },
+        )))))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
+    manager
+        .ensure_thread("disclosure-thread", "disclosure-workspace")
+        .await
+        .unwrap();
+    let mut events = subscribe_agent_events(&manager, "disclosure-thread").await;
+    manager.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
+        "disclosure-thread", "disclosure-turn", ThreadMode::Agent, AgentTurnHookRuntimeContext::default(),
+        model, &name, HashMap::new(), SkillCatalogSnapshot {version:1, generated_at_unix:0, skills:Vec::new()},
+        Vec::new(), vec![UserInput::Text {text:"discover once".into(), text_elements:Vec::new()}],
+        Vec::new(), Vec::new(), HashMap::new(), Vec::new(), retained, None,
+        pioneer_protocol::default_turn_permission_profile_snapshot(), test_full_access_security_snapshot(),
+    ).await.unwrap();
+    let observed = recv_events_until_terminal(&mut events).await;
+    manager.remove_thread("disclosure-thread").await;
+    observed
+}
+
+#[tokio::test]
+async fn committed_discovery_restores_before_next_proposal_and_checkpoint() {
+    let (retained, original) = discovery_history_before_next_snapshot(false).await;
+    let mut previous = None;
+    for _ in 0..2 {
+        let (bundle, calls) = recording_standard_memory_tool_bundle();
+        let provider = Arc::new(SequencedToolProvider::new(
+            vec![ProviderToolCall {
+                id: "use-restored-memory".into(),
+                name: "memory_get".into(),
+                arguments: "{}".into(),
+            }],
+            "restored",
+        ));
+        let observed =
+            restart_disclosure_history(retained.clone(), provider.clone(), "test-model", bundle)
+                .await;
+        assert_turn_completed(&observed);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["memory_get"],
+            "restored callable visibility must allow execution without rediscovery"
+        );
+        let requests = provider.snapshot_requests();
+        let tools = requests[0].tools.as_ref().unwrap();
+        let prefix = original.tools.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_value(&tools[..prefix.len()]).unwrap(),
+            serde_json::to_value(prefix).unwrap()
+        );
+        assert!(tools.iter().any(|tool| tool.name == "memory_get"));
+        let serialized = serde_json::to_value(tools).unwrap();
+        if let Some(previous) = previous {
+            assert_eq!(serialized, previous, "repeat restore is idempotent");
+        }
+        previous = Some(serialized);
+        assert!(
+            requests[0]
+                .messages
+                .iter()
+                .any(|message| message.role == Role::Tool
+                    && message.tool_call_id.as_deref() == Some("discover-before-crash"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn restored_discovery_rejects_failed_incomplete_and_unowned_results() {
+    let (retained, _) = discovery_history_before_next_snapshot(false).await;
+    for invalid in [
+        "failed",
+        "incomplete",
+        "foreign",
+        "workspace",
+        "turn",
+        "inherited",
+        "unbound",
+        "user",
+        "missing-fields",
+    ] {
+        let mut history = retained.clone();
+        let result = history
+            .iter_mut()
+            .find(|entry| entry.message.role == Role::Tool)
+            .unwrap();
+        match invalid {
+            "failed" | "incomplete" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&result.message.content).unwrap();
+                value["tool_outcome"] = serde_json::to_value(if invalid == "failed" {
+                    pioneer_tools::ToolOutcome::fatal(
+                        pioneer_tools::ToolErrorClass::ExecutionFailed,
+                        None,
+                    )
+                } else {
+                    pioneer_tools::ToolOutcome::partial(
+                        "incomplete retained result",
+                        "read the complete retained result",
+                    )
+                })
+                .unwrap();
+                result.message.content = value.to_string();
+            }
+            "foreign" => {
+                result.message.provenance.as_mut().unwrap().thread_id = "another-thread".into()
+            }
+            "workspace" => {
+                result.message.provenance.as_mut().unwrap().workspace_id =
+                    "another-workspace".into()
+            }
+            "turn" => {
+                result.message.provenance.as_mut().unwrap().sources[0].scope =
+                    "context:another-turn".into()
+            }
+            "inherited" => result.message.provenance.as_mut().unwrap().inherited = true,
+            "unbound" => result.message.tool_call_id = Some("another-call".into()),
+            "user" => {
+                result.message.role = Role::User;
+                result.message.provenance = None;
+            }
+            "missing-fields" => {
+                result.message.content = json!({"added":{"memory":["memory_get"]}}).to_string()
+            }
+            _ => unreachable!(),
+        }
+        let capture = Arc::new(CaptureAgentProvider::default());
+        let observed = restart_disclosure_history(
+            history,
+            capture.clone(),
+            "gpt-5",
+            fake_standard_memory_tool_bundle(),
+        )
+        .await;
+        let requests = capture.snapshot_requests();
+        if requests.is_empty() {
+            assert!(
+                matches!(
+                    observed.last(),
+                    Some(AgentEvent::TurnFailed { .. } | AgentEvent::TurnBlocked { .. })
+                ),
+                "invalid canonical history may instead be rejected before dispatch"
+            );
+        }
+        assert!(
+            requests.iter().all(|request| !request
+                .tools
+                .iter()
+                .flatten()
+                .any(|tool| tool.name.starts_with("memory_"))),
+            "{invalid} must not disclose a domain on any dispatched request"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restored_schema_does_not_authorize_removed_tool_calls() {
+    let (retained, _) = discovery_history_before_next_snapshot(true).await;
+    let (mut bundle, calls) = recording_standard_memory_tool_bundle();
+    bundle.specs.retain(|spec| spec.spec.name != "memory_get");
+    bundle.handlers.retain(|(name, _)| name != "memory_get");
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "removed-call".into(),
+            name: "memory_get".into(),
+            arguments: "{}".into(),
+        }],
+        "done",
+    ));
+    let _observed =
+        restart_disclosure_history(retained, provider.clone(), "test-model", bundle).await;
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "saved disclosure cannot dispatch a removed handler"
+    );
+    let requests = provider.snapshot_requests();
+    assert!(
+        !requests[0]
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|tool| tool.name == "memory_get")
+    );
+    let denied = requests
+        .iter()
+        .flat_map(|request| &request.messages)
+        .find(|message| message.tool_call_id.as_deref() == Some("removed-call"))
+        .unwrap();
+    let error: serde_json::Value = serde_json::from_str(&denied.content).unwrap();
+    assert!(error.get("error").is_some());
+    assert_eq!(error["tool_outcome"]["error_class"], "not_found");
+}
+
+#[tokio::test]
+async fn restored_discovery_uses_current_schema_and_removes_unavailable_tools() {
+    let (retained, original) = discovery_history_before_next_snapshot(true).await;
+    for removed in [false, true] {
+        let mut bundle = fake_standard_memory_tool_bundle();
+        let updated = bundle
+            .specs
+            .iter_mut()
+            .find(|spec| spec.spec.name == "memory_get")
+            .unwrap();
+        updated.spec.description = "current schema version two".into();
+        updated.spec.parameters = json!({"type":"object","properties":{"version":{"type":"integer"}},"additionalProperties":false});
+        if removed {
+            bundle.specs.retain(|spec| spec.spec.name != "memory_get");
+            bundle.handlers.retain(|(name, _)| name != "memory_get");
+        }
+        // Text-only first response; use a capture provider so no extra tool group is produced.
+        let capture = Arc::new(CaptureAgentProvider::default());
+        let observed =
+            restart_disclosure_history(retained.clone(), capture.clone(), "gpt-5", bundle).await;
+        assert_turn_completed(&observed);
+        let request = capture.snapshot_requests().remove(0);
+        let tools = request.tools.as_ref().unwrap();
+        let get = tools.iter().find(|tool| tool.name == "memory_get");
+        if removed {
+            assert!(get.is_none());
+        } else {
+            let get = get.unwrap();
+            assert_eq!(get.description, "current schema version two");
+            assert_eq!(
+                get.parameters,
+                json!({"type":"object","properties":{"version":{"type":"integer"}},"additionalProperties":false})
+            );
+        }
+        let original_tools = original.tools.as_ref().unwrap();
+        let old_get = original_tools
+            .iter()
+            .find(|tool| tool.name == "memory_get")
+            .unwrap();
+        assert_ne!(old_get.description, "current schema version two");
+        let expected_survivors = original_tools
+            .iter()
+            .filter(|tool| tool.name != "memory_get")
+            .collect::<Vec<_>>();
+        let survivors = tools
+            .iter()
+            .filter(|tool| expected_survivors.iter().any(|old| old.name == tool.name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(&survivors).unwrap(),
+            serde_json::to_value(&expected_survivors).unwrap(),
+            "unchanged surviving definitions keep exact order and bytes"
+        );
+        assert!(
+            request
+                .messages
+                .iter()
+                .all(|message| message.provider_replay_state.is_none())
+        );
+        assert_eq!(request.model, "gpt-5");
+        assert!(
+            !original
+                .tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "apply_patch")
+        );
+        let patch = tools
+            .iter()
+            .find(|tool| tool.name == "apply_patch")
+            .expect("new provider capability must rebuild file schemas");
+        assert_eq!(patch.parameters["properties"]["patch"]["type"], "string");
+        assert!(patch.description.contains("JSON field"));
+        assert!(request.messages.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == "discover-before-crash"))
+        }));
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some("discover-before-crash"))
+        );
+    }
+}
+
 #[tokio::test]
 async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_window() {
     let mut provider = SequencedToolProvider::new(
@@ -4882,6 +5357,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
         .await
         .expect("turn should start");
 
+    let mut retained_history = Vec::new();
     let mut exhausted_window_id = None;
     let mut checkpoint_context = None;
     let mut saw_provider_failure = false;
@@ -4892,6 +5368,28 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
             .expect("durable receiver should stay open");
         durable_events.acknowledge_last(Ok(()));
         match event {
+            AgentDurableEvent::TurnLlmContextAppended {
+                source, payload, ..
+            } if matches!(
+                source.as_str(),
+                "system_snapshot_v1" | "turn_input_projection_v1"
+            ) =>
+            {
+                let pioneer_protocol::ToolResultView::Json {
+                    value,
+                    truncated: false,
+                } = payload
+                else {
+                    panic!("retained input and system snapshots must be durable and complete")
+                };
+                // Recovery requires the acknowledged input projection (governing documents)
+                // alongside the system snapshot and its disclosure metadata.
+                let message = serde_json::from_value(value).unwrap();
+                retained_history.push(crate::RetainedProviderHistoryMessage {
+                    sequence: retained_history.len() as i64 + 1,
+                    message,
+                });
+            }
             AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
                 assert_eq!(notification.window_index, 1);
                 assert_eq!(
@@ -4968,7 +5466,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     compact_history: false,
                     continue_generation: true,
                     model_override: None,
-                    retained_provider_history: Vec::new(),
+                    retained_provider_history: retained_history,
                     execution_checkpoint_context: checkpoint_context,
                 },
             )
@@ -4976,11 +5474,23 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
     });
 
     let mut saw_continued = false;
+    let mut recovery_events = Vec::new();
     for _ in 0..40 {
-        let event = timeout(Duration::from_secs(2), durable_events.recv())
-            .await
-            .expect("recovery window event should arrive")
-            .expect("durable receiver should stay open");
+        let event = match timeout(Duration::from_secs(2), durable_events.recv()).await {
+            Ok(event) => event.expect("durable receiver should stay open"),
+            Err(error) => {
+                if recovery_handle.is_finished() {
+                    let admission = recovery_handle.await;
+                    panic!(
+                        "recovery window event timed out: {error}; admission: {admission:?}; events: {recovery_events:?}"
+                    );
+                }
+                panic!(
+                    "recovery window event timed out while admission is pending: {error}; events: {recovery_events:?}"
+                );
+            }
+        };
+        recovery_events.push(format!("{event:?}"));
         durable_events.acknowledge_last(Ok(()));
         match event {
             AgentDurableEvent::TurnExecutionWindowContinued { notification } => {
@@ -5002,6 +5512,11 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                 recv_terminal_effect_preparation_until_completed(&mut durable_events, turn_id)
                     .await;
                 let requests = provider.snapshot_requests();
+                assert_eq!(
+                    serde_json::to_value(&requests[1].tools).unwrap(),
+                    serde_json::to_value(&requests.last().unwrap().tools).unwrap(),
+                    "same-execution recovery must restore the exact proposed definition order after a failed provider round"
+                );
                 assert!(
                     requests
                         .last()
@@ -5054,6 +5569,9 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                         .any(|tool| tool.name == "memory_remember")
                 );
                 return;
+            }
+            AgentDurableEvent::TurnFailed { error, .. } => {
+                panic!("recovery failed before starting execution window 2: {error}");
             }
             _ => {}
         }
@@ -8508,9 +9026,16 @@ async fn phase_11_review_guard_revise_waits_for_revision_candidate_then_accepts(
     assert!(visible_tool_names.contains(&"task_cancel"));
     assert!(visible_tool_names.contains(&"task_wait"));
     assert!(
-        !visible_tool_names.contains(&"task_revise"),
-        "task_revise must stay hidden when the candidate no longer allows revisions"
+        visible_tool_names.contains(&"task_revise"),
+        "an already disclosed schema remains stable when candidate readiness changes"
     );
+    for pair in requests.windows(2) {
+        assert_eq!(
+            serde_json::to_value(&pair[0].tools).unwrap(),
+            serde_json::to_value(&pair[1].tools).unwrap(),
+            "revise/pending/review/accept must retain the same definitions; router and task authority enforce calls"
+        );
+    }
 }
 
 #[tokio::test]
@@ -15064,6 +15589,8 @@ impl crate::compaction::controller::NativeContextController for PendingContextBo
 async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
     use crate::compaction::controller::{NativeContext, NativeContextSession};
     let request = || ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: "fixture".into(),
         messages: vec![ChatMessage::user("request")],
         temperature: None,
@@ -15082,6 +15609,8 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         }
     });
     let context = || NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: true,
         recovery_deadline_ms: Some(
             std::time::SystemTime::now()

@@ -1421,6 +1421,8 @@ fn post_turn_extractor_chat_request(
         .and_then(|value| value.get("max_facts").and_then(serde_json::Value::as_u64))
         .unwrap_or(8) as usize;
     ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: model.to_owned(),
         messages: vec![
             ChatMessage::system(

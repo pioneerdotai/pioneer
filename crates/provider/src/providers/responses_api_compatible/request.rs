@@ -16,6 +16,32 @@ pub(crate) struct PreparedRequest {
     pub(crate) comparison: Option<crate::prompt_cache::Comparison>,
 }
 impl ResponsesApiCompatibleProvider {
+    pub(crate) fn declarations_for_request(
+        &self,
+        request: &ChatRequest,
+    ) -> Option<crate::tool_declarations::ToolDeclarations> {
+        // Exact official authority + documented model contract, never aliases.
+        // https://developers.openai.com/api/docs/guides/tools-tool-search
+        // Narrow initial capability: unknown/new models remain full-list.
+        (self.name == "openai"
+            && self.root == "https://api.openai.com/v1"
+            && matches!(&self.auth, super::AuthStyle::Bearer)
+            && request.model == "gpt-5.4"
+            && request
+                .messages
+                .iter()
+                .all(|message| message.content_parts.is_empty())
+            && crate::tools::policy::model_tool_support(&self.name, &request.model) != Some(false))
+        .then(|| {
+            request
+                .tools
+                .as_deref()
+                .filter(|tools| !tools.is_empty())
+                .and_then(|_| crate::tool_declarations::ToolDeclarations::for_request(request))
+        })
+        .flatten()
+    }
+
     pub(crate) fn project(&self, mut request: ChatRequest) -> Result<ChatRequest> {
         request.messages = crate::history::project_messages_matching(
             &self.name,
@@ -56,8 +82,14 @@ impl ResponsesApiCompatibleProvider {
     }
     pub(crate) fn render(&self, prepared: &PreparedRequest, stream: bool) -> Result<Value> {
         let request = &prepared.request;
+        let declarations = (request.messages.len() == prepared.messages.messages.len())
+            .then(|| self.declarations_for_request(request))
+            .flatten();
         let mut input = Vec::new();
         for (index, message) in prepared.messages.messages.iter().enumerate() {
+            if let Some(declarations) = &declarations {
+                input.extend(declarations.items_before(index));
+            }
             if request.compiled_prompt.is_some() && message.role == Role::System {
                 continue;
             }
@@ -114,6 +146,9 @@ impl ResponsesApiCompatibleProvider {
                 input.push(json!({"role":if message.role==Role::System {"system"} else {"user"},"content":content}));
             }
         }
+        if let Some(declarations) = &declarations {
+            input.extend(declarations.items_before(prepared.messages.messages.len()));
+        }
         let mut body = json!({"model":request.model,"input":input,"store":true,"truncation":"disabled","include":["reasoning.encrypted_content"],"stream":stream});
         if self.gateway_caching {
             body["caching"] = json!("auto");
@@ -130,8 +165,15 @@ impl ResponsesApiCompatibleProvider {
                 body["instructions"] = json!(text);
             }
         }
-        if let Some(tools) = &request.tools {
-            body["tools"]=json!(tools.iter().map(|tool|json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false})).collect::<Vec<_>>());
+        if let Some(tools) = &request.tools
+            && declarations.is_none()
+        {
+            body["tools"] = json!(
+                tools
+                    .iter()
+                    .map(crate::tool_declarations::wire_tool)
+                    .collect::<Vec<_>>()
+            );
         }
         if let Some(choice) = &request.tool_choice {
             body["tool_choice"] = match choice {

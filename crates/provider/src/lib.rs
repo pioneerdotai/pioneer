@@ -17,6 +17,7 @@ pub mod history;
 mod http;
 pub mod messages;
 pub mod prompt_cache;
+mod service_mode;
 pub use messages::{
     ProviderMessage, ProviderMessageBoundary, ProviderMessageCollector, ProviderMessageId,
     ProviderMessageMetadata, ProviderRoundUiCopy, ProviderRoundUiCopyKind,
@@ -24,6 +25,7 @@ pub use messages::{
 pub mod providers;
 pub mod registry;
 pub mod selection;
+pub mod tool_declarations;
 pub mod tools;
 pub mod traits;
 pub mod types;

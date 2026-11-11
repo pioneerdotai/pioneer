@@ -583,6 +583,13 @@ pub enum ThreadUnsubscribeStatus {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct Thread {
+    /// Manual Native/API choice from this thread's latest admitted conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_mode: Option<crate::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_authority: Option<String>,
     pub workspace_id: String,
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

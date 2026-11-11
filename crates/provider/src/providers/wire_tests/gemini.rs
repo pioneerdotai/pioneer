@@ -4,6 +4,8 @@ use crate::types::{AttachmentDataSource, ChatMessage, MessageAttachment, Message
 
 fn request(messages: Vec<ChatMessage>) -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: "gemini-2.5-flash".into(),
         messages,
         temperature: None,
@@ -384,4 +386,28 @@ fn optional_null_args_normalize_to_empty_object_but_wrong_types_fail() {
             .is_err()
         );
     }
+}
+
+#[test]
+fn compact_shell_result_is_one_native_response_object_after_history_restore() {
+    let compact = crate::providers::history_test_support::COMPACT_SHELL_RESULT;
+    let message = ChatMessage::tool_result("call", "write_stdin", compact);
+    let restored: ChatMessage =
+        serde_json::from_value(serde_json::to_value(message).unwrap()).unwrap();
+    let call = ChatMessage::assistant_tool_calls_with_provider_state(
+        None::<String>,
+        None::<String>,
+        vec![ProviderToolCall {
+            id: "call".into(),
+            name: "write_stdin".into(),
+            arguments: "{}".into(),
+        }],
+        None,
+    );
+    let req = request(vec![call, restored]);
+    let wire = serde_json::to_value(GeminiProvider::build_request_result(&req).unwrap()).unwrap();
+    assert_eq!(
+        wire["contents"][1]["parts"][0]["functionResponse"]["response"],
+        serde_json::from_str::<serde_json::Value>(compact).unwrap()
+    );
 }

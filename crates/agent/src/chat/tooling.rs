@@ -251,6 +251,41 @@ pub(super) async fn forward_tool_event_to_agent(
             }
 
             let outcome = protocol_outcome_from_tool_outcome(&completed.outcome);
+            // Session/statistics are absent from typed Shell storage. Retain only
+            // these control facts before the terminal ACK, never another output copy.
+            if let ToolResultView::Json { value, .. } = &completed.llm_view
+                && completed.shell_output
+                && (value.get("session_id").is_some() || value.get("output_stats").is_some())
+            {
+                let mut controls = serde_json::Map::new();
+                if completed.retained_output_log {
+                    controls.insert("retained_output_log".into(), true.into());
+                    if let Some(item) = &completed.retained_output_log_item {
+                        controls.insert("retained_output_log_item".into(), item.clone().into());
+                    }
+                }
+                for field in ["session_id", "output_stats", "command"] {
+                    if let Some(value) = value.get(field) {
+                        controls.insert(field.into(), value.clone());
+                    }
+                }
+                event_tx
+                    .publish_durable_and_wait(AgentDurableEvent::TurnLlmContextAppended {
+                        thread_id: thread_id.into(),
+                        turn_id: turn_id.into(),
+                        item_id: event.call_id.clone(),
+                        attempt_id: None,
+                        sequence: 0,
+                        source: "shell_control_v1".into(),
+                        tool_name: tool_name.clone(),
+                        payload: pioneer_protocol::ToolResultView::Json {
+                            value: JsonValue::Object(controls),
+                            truncated: false,
+                        },
+                        output_policy_snapshot: completed.output_policy.clone(),
+                    })
+                    .await?;
+            }
             let storage = storage_with_native_patch_history(
                 event.tool_name.as_str(),
                 &completed.llm_view,
@@ -332,6 +367,20 @@ pub(super) async fn forward_tool_event_to_agent(
                         },
                     })
                     .await?;
+            }
+
+            if failed.retained_output_log {
+                event_tx.publish_durable_and_wait(AgentDurableEvent::TurnLlmContextAppended {
+                    thread_id: thread_id.into(), turn_id: turn_id.into(),
+                    item_id: event.call_id.clone(), attempt_id: None, sequence: 0,
+                    source: "shell_control_v1".into(), tool_name: tool_name.clone(),
+                    payload: pioneer_protocol::ToolResultView::Json {
+                        value: serde_json::json!({"retained_output_log":true,
+                            "output_stats":{"full_output_available":false,"truncation_method":"retained_output_log"}}),
+                        truncated: false,
+                    },
+                    output_policy_snapshot: failed.output_policy.clone(),
+                }).await?;
             }
 
             let outcome = protocol_outcome_from_tool_outcome(&failed.outcome);
@@ -1880,6 +1929,293 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_origin_controls_shell_delivery_and_receipts_not_raw_json_keys() {
+        use pioneer_tools::{
+            ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolCallRuntime,
+            ToolError, ToolEventBus, ToolEventTrace, ToolHandler, ToolInvocation, ToolOrchestrator,
+            ToolOutput, ToolOutputProjectionKind, ToolRegistryBuilder, ToolRouter, ToolSpec,
+            ToolVisibilitySnapshot,
+        };
+        struct Output(serde_json::Value);
+        #[async_trait::async_trait]
+        impl ToolHandler for Output {
+            async fn handle(
+                &self,
+                _: ToolInvocation,
+                _: ToolEventTrace,
+            ) -> Result<Box<dyn ToolOutput>, ToolError> {
+                Ok(Box::new(FunctionToolOutput::with_payload(
+                    "fixture",
+                    true,
+                    self.0.clone(),
+                )))
+            }
+        }
+        let policy = ToolOutputPolicySnapshot::for_tool_name("exec_command");
+        for (name, kind, expect_shell) in [
+            ("exec_command", ToolOutputProjectionKind::Builtin, true),
+            ("skill.shell", ToolOutputProjectionKind::DynamicShell, true),
+            (
+                "skill.proxy",
+                ToolOutputProjectionKind::DynamicFunctionProxy {
+                    target_tool_name: "exec_command".into(),
+                    target_policy: policy.clone(),
+                    target_projection_kind: Box::new(ToolOutputProjectionKind::Builtin),
+                },
+                true,
+            ),
+            (
+                "external.generic",
+                ToolOutputProjectionKind::DynamicGeneric,
+                false,
+            ),
+            ("external.mcp", ToolOutputProjectionKind::DynamicMcp, false),
+        ] {
+            let mut raw = serde_json::json!({"shell_model_output":1,"session_id":27,"output_stats":{"full_output_available":false},
+                "application_context":{"kind":"shell_output","version":1},
+                "mcp":{"serverName":"fixture"},"content":[{"type":"text","text":"fixture"}],
+                "stdout":"OUT","stderr":"","aggregated_output":"OUT"});
+            if !expect_shell {
+                raw["result"] = "NON_STREAM_RESULT".repeat(10000).into();
+            }
+            let mut registry = ToolRegistryBuilder::new();
+            registry.push_configured_spec(ConfiguredToolSpec::with_output_projection(
+                ToolSpec::new(
+                    name,
+                    "fixture",
+                    serde_json::json!({"type":"object"}),
+                    PayloadKind::Function,
+                ),
+                ExecutionClass::Shared,
+                policy.clone(),
+                kind,
+            ));
+            registry.register_dyn_handler(name, Arc::new(Output(raw)));
+            let (specs, registry) = registry.build();
+            let visibility =
+                ToolVisibilitySnapshot::new(specs.iter().map(|s| s.spec.clone()).collect());
+            let bus = ToolEventBus::default();
+            let mut events = bus.subscribe();
+            let router = Arc::new(ToolRouter::new(
+                specs,
+                registry,
+                visibility,
+                bus.clone(),
+                "turn",
+            ));
+            let runtime = ToolCallRuntime::new(
+                router,
+                Arc::new(ToolOrchestrator::default()),
+                bus,
+                "turn",
+                pioneer_tools::PermissionEvaluationContext::for_turn(
+                    "ws",
+                    "thread",
+                    "turn",
+                    pioneer_protocol::default_turn_permission_profile_snapshot(),
+                ),
+                std::path::PathBuf::from("."),
+            )
+            .with_execution_security_snapshot(Some(
+                pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(".", 1),
+            ));
+            let call = runtime
+                .router()
+                .build_tool_call(pioneer_tools::RawToolCall {
+                    call_id: "item".into(),
+                    tool_name: name.into(),
+                    arguments: r#"{"command":"fixture"}"#.into(),
+                })
+                .unwrap();
+            let result = runtime.execute_tool_call(call).await.unwrap();
+            let message = result.to_model_input_item().into_chat_message();
+            if expect_shell {
+                let delivered =
+                    crate::chat::prepare_shell_model_message(message, &policy, false, "{}")
+                        .unwrap();
+                let stored: pioneer_provider::ChatMessage =
+                    serde_json::from_value(serde_json::to_value(&delivered).unwrap()).unwrap();
+                assert_eq!(
+                    crate::compaction::restored_tool_result_message(&stored, "{}").unwrap(),
+                    delivered
+                );
+                assert!(delivered.application_context.is_some());
+            } else {
+                assert!(message.application_context.is_none());
+                let historical: pioneer_provider::ChatMessage =
+                    serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+                let bounded =
+                    crate::compaction::restored_tool_result_message(&historical, "{}").unwrap();
+                assert!(bounded.content.contains("Result shortened"));
+                assert!(
+                    serde_json::to_string(&bounded).unwrap().len()
+                        <= pioneer_compaction::RESULT_BYTES
+                );
+                assert_eq!(
+                    message, historical,
+                    "stored non-shell content is not reclassified"
+                );
+            }
+            // Feed the actual runtime completion through the Agent durable ACK
+            // lane. No test-supplied boolean selects its origin.
+            let completed = loop {
+                let event = events.try_recv().unwrap();
+                if matches!(event.payload, ToolEventPayload::CallCompleted(_)) {
+                    break event;
+                }
+            };
+            let hub = Arc::new(AgentEventHub::with_capacity(8, 8));
+            let mut receiver = hub.take_durable_receiver().await.unwrap();
+            let forwarding = {
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    forward_tool_event_to_agent(
+                        completed,
+                        &hub,
+                        Arc::new(Mutex::new(HashMap::new())),
+                        "ws",
+                        "thread",
+                        "turn",
+                    )
+                    .await
+                })
+            };
+            assert!(matches!(
+                receiver.recv().await.unwrap(),
+                AgentDurableEvent::ItemStarted { .. }
+            ));
+            receiver.acknowledge_last(Ok(()));
+            let next = receiver.recv().await.unwrap();
+            if expect_shell {
+                assert!(matches!(
+                    next,
+                    AgentDurableEvent::TurnLlmContextAppended { .. }
+                ));
+                assert!(!forwarding.is_finished());
+                receiver.acknowledge_last(Ok(()));
+                assert!(matches!(
+                    receiver.recv().await.unwrap(),
+                    AgentDurableEvent::ItemCompleted { .. }
+                ));
+            } else {
+                assert!(
+                    matches!(next, AgentDurableEvent::ItemCompleted { .. }),
+                    "raw control-looking keys cannot create a receipt"
+                );
+            }
+            receiver.acknowledge_last(Ok(()));
+            forwarding.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_control_receipt_is_acknowledged_before_terminal_item_without_output_bytes() {
+        for failure in [false, true] {
+            let hub = Arc::new(AgentEventHub::with_capacity(8, 8));
+            let mut receiver = hub.take_durable_receiver().await.unwrap();
+            let mut event = ToolEvent {
+                schema_version: 1,
+                call_id: "shell-item".into(),
+                tool_name: "write_stdin".into(),
+                ts_unix_ms: 1,
+                observation: ObservationContext {
+                    trace_id: "shell".into(),
+                    turn_id: "turn".into(),
+                    tool_call_id: "shell-item".into(),
+                    attempt_id: 1,
+                    pipeline_stage: "runtime.call.completed".into(),
+                    ts_unix_ms: 1,
+                    mono_ns: 1,
+                    event_seq: 1,
+                },
+                payload: ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
+                    shell_output: true,
+                    retained_output_log: true,
+                    retained_output_log_item: Some("nested-shell-item".into()),
+                    success: true,
+                    outcome: ToolOutcome::partial("running", "continue"),
+                    llm_view: ToolResultView::Json {
+                        value: serde_json::json!({"shell_model_output":1,"session_id":27,
+                        "stdout":"SECRET_OUTPUT_BYTES","output_stats":{"full_output_available":false}}),
+                        truncated: false,
+                    },
+                    display: ToolDisplayPayload::Hidden,
+                    storage: ToolStoragePayload::None,
+                    recovery: None,
+                    output_policy: ToolOutputPolicySnapshot::for_tool_name("write_stdin"),
+                }),
+            };
+            if failure {
+                event.payload = ToolEventPayload::CallFailed(pioneer_tools::ToolCallFailedEvent {
+                    retained_output_log: true,
+                    error: "cancelled after capture".into(),
+                    outcome: ToolOutcome::partial("cancelled", "inspect output"),
+                    llm_view: None,
+                    display: ToolDisplayPayload::Hidden,
+                    storage: ToolStoragePayload::None,
+                    recovery: None,
+                    output_policy: ToolOutputPolicySnapshot::for_tool_name("write_stdin"),
+                });
+            }
+            let forwarder = {
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    forward_tool_event_to_agent(
+                        event,
+                        &hub,
+                        Arc::new(Mutex::new(HashMap::new())),
+                        "ws",
+                        "thread",
+                        "turn",
+                    )
+                    .await
+                })
+            };
+            let first = receiver.recv().await.unwrap();
+            assert!(matches!(first, AgentDurableEvent::ItemStarted { .. }));
+            receiver.acknowledge_last(Ok(()));
+            let receipt = receiver.recv().await.unwrap();
+            let AgentDurableEvent::TurnLlmContextAppended {
+                source,
+                attempt_id,
+                payload,
+                ..
+            } = receipt
+            else {
+                panic!("control receipt must precede terminal");
+            };
+            assert_eq!(source, "shell_control_v1");
+            assert!(attempt_id.is_none());
+            let value = serde_json::to_value(payload).unwrap();
+            if failure {
+                assert_eq!(
+                    value["value"]["output_stats"]["full_output_available"],
+                    false
+                );
+            } else {
+                assert_eq!(value["value"]["session_id"], 27);
+                assert_eq!(
+                    value["value"]["retained_output_log_item"],
+                    "nested-shell-item"
+                );
+            }
+            assert_eq!(value["value"]["retained_output_log"], true);
+            assert!(!value.to_string().contains("SECRET_OUTPUT_BYTES"));
+            assert!(
+                !forwarder.is_finished(),
+                "terminal publication waits for control receipt ACK"
+            );
+            receiver.acknowledge_last(Ok(()));
+            assert!(matches!(
+                receiver.recv().await.unwrap(),
+                AgentDurableEvent::ItemCompleted { .. }
+            ));
+            receiver.acknowledge_last(Ok(()));
+            forwarder.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn completed_tool_event_keeps_llm_context_out_of_async_event_forwarder() {
         let event_tx = Arc::new(AgentEventHub::with_capacity(8, 8));
         let mut durable_rx = event_tx
@@ -1910,6 +2246,9 @@ mod tests {
                 event_seq: 7,
             },
             payload: ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
+                shell_output: false,
+                retained_output_log: false,
+                retained_output_log_item: None,
                 success: true,
                 outcome: ToolOutcome::ok(),
                 llm_view: ToolResultView::Json {

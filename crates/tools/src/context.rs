@@ -8,6 +8,31 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
+// The internal item ID drives tool lifecycle; the provider ID drives the final
+// serialized model frame. Scope only framing and the configured result policy across native dispatch.
+tokio::task_local! { static MODEL_RESULT_FRAMING: (String, String, crate::ToolOutputPolicySnapshot, crate::ToolOutputProjectionKind); }
+
+pub async fn with_model_result_framing<F: std::future::Future>(
+    call_id: String,
+    tool_name: String,
+    policy: crate::ToolOutputPolicySnapshot,
+    projection: crate::ToolOutputProjectionKind,
+    future: F,
+) -> F::Output {
+    MODEL_RESULT_FRAMING
+        .scope((call_id, tool_name, policy, projection), future)
+        .await
+}
+
+pub(crate) fn model_result_framing() -> Option<(
+    String,
+    String,
+    crate::ToolOutputPolicySnapshot,
+    crate::ToolOutputProjectionKind,
+)> {
+    MODEL_RESULT_FRAMING.try_with(Clone::clone).ok()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecCommandArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +271,17 @@ pub trait ToolOutput: Send + Sync {
     fn raw_text(&self) -> String;
     fn raw_json(&self) -> JsonValue;
     fn to_model_input_item(&self, call_id: &str, tool_name: &str) -> ModelInputItem;
+
+    /// Native producer attestation: the current call has acknowledged log chunks.
+    /// Never derive this from caller-controlled result JSON or a tool name.
+    fn retained_output_log(&self) -> bool {
+        false
+    }
+
+    /// A trusted function proxy may retain its target's source item identity.
+    fn retained_output_log_item(&self) -> Option<&str> {
+        None
+    }
 
     /// A function proxy forwards the target runtime's already-classified outcome.
     /// This channel is populated by host code, never inferred from result JSON.

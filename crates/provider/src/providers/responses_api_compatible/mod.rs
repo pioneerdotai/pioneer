@@ -345,10 +345,19 @@ impl ResponsesApiCompatibleProvider {
         stream: bool,
         comparison: Option<&crate::prompt_cache::Comparison>,
     ) -> Result<reqwest::Response> {
+        let flex_plan = pioneer_protocol::NativeServiceModePlan {
+            id: "flex".into(),
+            parameters: pioneer_protocol::ServiceModeParameters::OpenAiTier {
+                tier: pioneer_protocol::OpenAiTier::Flex,
+            },
+        };
+        let policy = self
+            .policy
+            .for_service_mode((body["service_tier"] == "flex").then_some(&flex_plan));
         let result = if stream {
-            crate::http::send_stream_request(self.builder(body, comparison), self.policy).await
+            crate::http::send_stream_request(self.builder(body, comparison), policy).await
         } else {
-            crate::http::non_stream_request(self.builder(body, comparison), self.policy)
+            crate::http::non_stream_request(self.builder(body, comparison), policy)
                 .send()
                 .await
                 .map_err(Into::into)
@@ -670,7 +679,10 @@ impl Provider for ResponsesApiCompatibleProvider {
     ) -> Result<crate::attachments::PreparedInputBudget> {
         let request = crate::tools::policy::prepare_responses_request(&self.name, request)?;
         crate::generation::responses_fields(&self.name, &request)?;
-        let request = self.project(request)?;
+        let mut request = self.project(request)?;
+        // Budget exactly the selected wire projection; unsupported routes retain
+        // the established full-list representation and calibration identity.
+        request.tool_declarations = self.declarations_for_request(&request);
         crate::attachments::input_estimate::prepare_responses(
             &self.name,
             &self.capabilities(),

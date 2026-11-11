@@ -3999,6 +3999,9 @@ mod tests {
                 previous: (i > 0).then(|| ids[0].into()),
                 summary: format!("summary {i}"),
                 selection: ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: Transport::Api,
                     instance: "p".into(),
                     model: "m".into(),
@@ -4954,6 +4957,9 @@ mod tests {
                 previous: None,
                 summary: "summary".into(),
                 selection: ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: Transport::Api,
                     instance: "p".into(),
                     model: "m".into(),
@@ -5276,6 +5282,9 @@ mod tests {
             previous: None,
             summary: "legacy bound candidate".into(),
             selection: ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 transport: Transport::Api,
                 instance: "p".into(),
                 model: "m".into(),

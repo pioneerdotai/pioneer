@@ -8,6 +8,8 @@ use serde_json::json;
 
 fn request() -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: "gpt-6.1-sol".into(),
         messages: vec![ChatMessage::user("test")],
         temperature: None,
@@ -3103,4 +3105,492 @@ fn vercel_routing_outcomes_survive_json_and_sse_without_session_identifiers() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn compact_shell_result_remains_one_output_part_on_responses_wire() {
+    crate::attachments::runtime::with_async_authority_scope("fixture-authority".into(), async {
+        let compact = crate::providers::history_test_support::COMPACT_SHELL_RESULT;
+        for name in ["openai", "vercel-ai-gateway"] {
+            let provider = ResponsesApiCompatibleProvider::new(
+                name,
+                "https://example.invalid/v1",
+                "fixture",
+                AuthStyle::Bearer,
+            );
+            let mut req = request();
+            req.messages = vec![
+                ChatMessage::assistant_tool_calls(
+                    None::<String>,
+                    vec![crate::ProviderToolCall {
+                        id: "call".into(),
+                        name: "exec_command".into(),
+                        arguments: "{}".into(),
+                    }],
+                ),
+                ChatMessage::tool_result("call", "exec_command", compact),
+            ];
+            let prepared = provider
+                .prepare(req, &provider.capabilities())
+                .await
+                .unwrap();
+            for stream in [false, true] {
+                let body = provider.render(&prepared, stream).unwrap();
+                assert_eq!(
+                    body["input"].as_array().unwrap().len(),
+                    2,
+                    "one function call followed by one compact result"
+                );
+                assert_eq!(
+                    body["input"][1],
+                    json!({"type":"function_call_output", "call_id":"call",
+                    "output":[{"type":"input_text", "text":compact}]})
+                );
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disclosed_tools_keep_prefix_in_serialized_payload() {
+    crate::attachments::runtime::with_async_authority_scope("fixture-authority".into(), async {
+        let provider = ResponsesApiCompatibleProvider::new(
+            "openai",
+            "https://fixture.invalid/v1",
+            "unused",
+            AuthStyle::Bearer,
+        );
+        let mut req = request();
+        let first = provider
+            .prepare(req.clone(), &provider.capabilities())
+            .await
+            .unwrap();
+        let first = provider.render(&first, false).unwrap();
+        let mut added = req.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        req.tools.as_mut().unwrap().push(added);
+        let expanded = provider
+            .prepare(req, &provider.capabilities())
+            .await
+            .unwrap();
+        let expanded = provider.render(&expanded, false).unwrap();
+        assert_eq!(expanded["tools"][0], first["tools"][0]);
+        assert_eq!(expanded["tools"][1]["name"], "alpha");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn positional_declarations_preserve_wire_prefix_and_restore_without_delivery_receipts() {
+    crate::attachments::runtime::with_async_authority_scope("fixture-authority".into(), async {
+        use crate::tool_declarations::ToolDeclarations;
+        let provider = ResponsesApiCompatibleProvider::new(
+            "openai",
+            "https://api.openai.com/v1",
+            "fixture",
+            AuthStyle::Bearer,
+        );
+        let mut req = request();
+        req.model = "gpt-5.4".into();
+        let initial =
+            ToolDeclarations::reconcile(None, &req.messages, req.tools.as_deref().unwrap()).unwrap();
+        req.tool_declarations = Some(initial.clone());
+        assert!(
+            provider
+                .prepare_input_budget(req.clone())
+                .await
+                .unwrap()
+                .request
+                .tool_declarations
+                .is_some()
+        );
+        let first = provider
+            .render(
+                &provider
+                    .prepare(req.clone(), &provider.capabilities())
+                    .await
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert!(first.get("tools").is_none());
+        assert_eq!(
+            first["input"][0],
+            json!({"type":"additional_tools","role":"developer","tools":[{
+                "type":"function","name":"lookup","description":"Lookup","parameters":{"type":"object","properties":{"optional":{"type":"string"}}},"strict":false
+            }]})
+        );
+        // One baseline batch has the same positional identity even after the
+        // common prefix changes. Applicability must select the actual wire form.
+        let mut replaced = req.clone();
+        replaced.messages[0].content = "replacement input".into();
+        let fallback = provider
+            .render(
+                &provider
+                    .prepare(replaced.clone(), &provider.capabilities())
+                    .await
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(fallback["tools"], first["input"][0]["tools"]);
+        assert!(
+            fallback["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "additional_tools")
+        );
+        let fresh =
+            ToolDeclarations::reconcile(None, &replaced.messages, replaced.tools.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(initial.projection_identity(), fresh.projection_identity());
+        replaced.tool_declarations = Some(fresh);
+        let rebuilt = provider
+            .render(
+                &provider
+                    .prepare(replaced, &provider.capabilities())
+                    .await
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert!(rebuilt.get("tools").is_none());
+        assert_eq!(rebuilt["input"][0], first["input"][0]);
+        let mut assistant = ChatMessage::assistant("");
+        assistant.tool_calls = Some(vec![crate::ProviderToolCall {
+            id: "call_discover".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        }]);
+        req.messages.push(assistant);
+        req.messages.push(ChatMessage::tool_result(
+            "call_discover",
+            "lookup",
+            "discovery completed",
+        ));
+        req.tools.as_mut().unwrap().push(ToolDefinition {
+            name: "alpha".into(),
+            description: "New schema".into(),
+            parameters: json!({"type":"object","properties":{"key":{"type":"integer"}}}),
+        });
+        // The prior snapshot is the only persisted proposal: discovery committed
+        // before the next declaration snapshot. No delivery ACK is assumed.
+        let mut saved = json!({});
+        initial.save(&mut saved).unwrap();
+        let restored = ToolDeclarations::from_metadata(
+            &serde_json::from_slice::<Value>(&serde_json::to_vec(&saved).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let next =
+            ToolDeclarations::reconcile(Some(restored), &req.messages, req.tools.as_deref().unwrap())
+                .unwrap();
+        req.tool_declarations = Some(next.clone());
+        let second = provider
+            .render(
+                &provider
+                    .prepare(req.clone(), &provider.capabilities())
+                    .await
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let old = first["input"].as_array().unwrap();
+        assert_eq!(&second["input"].as_array().unwrap()[..old.len()], old);
+        assert_eq!(
+            serde_json::to_vec(&second["input"].as_array().unwrap()[..old.len()]).unwrap(),
+            serde_json::to_vec(old).unwrap()
+        );
+        assert_eq!(second["input"][3]["type"], "function_call_output");
+        assert_eq!(
+            second["input"][4],
+            json!({"type":"additional_tools","role":"developer","tools":[{
+                "type":"function","name":"alpha","description":"New schema","parameters":{"type":"object","properties":{"key":{"type":"integer"}}},"strict":false
+            }]})
+        );
+        for _ in 0..2 {
+            let mut metadata = json!({});
+            next.save(&mut metadata).unwrap();
+            let independent = ToolDeclarations::from_metadata(
+                &serde_json::from_str::<Value>(&metadata.to_string()).unwrap(),
+            )
+            .unwrap();
+            let repeated = ToolDeclarations::reconcile(
+                Some(independent),
+                &req.messages,
+                req.tools.as_deref().unwrap(),
+            )
+            .unwrap();
+            req.tool_declarations = Some(repeated);
+            assert_eq!(
+                provider
+                    .render(
+                        &provider
+                            .prepare(req.clone(), &provider.capabilities())
+                            .await
+                            .unwrap(),
+                        false
+                    )
+                    .unwrap(),
+                second
+            );
+        }
+        let frozen = serde_json::to_vec(&req.messages).unwrap();
+        for (name, root, model) in [
+            ("openai", "https://custom.example/v1", "gpt-5.4"),
+            ("openai", "https://api.openai.com/v1", "unknown"),
+            ("vercel", "https://api.openai.com/v1", "gpt-5.4"),
+        ] {
+            let fallback =
+                ResponsesApiCompatibleProvider::new(name, root, "fixture", AuthStyle::Bearer);
+            let mut switched = req.clone();
+            switched.model = model.into();
+            assert!(
+                fallback
+                    .prepare_input_budget(switched.clone())
+                    .await
+                    .unwrap()
+                    .request
+                    .tool_declarations
+                    .is_none()
+            );
+            let wire = fallback
+                .render(
+                    &fallback
+                        .prepare(switched, &fallback.capabilities())
+                        .await
+                        .unwrap(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(wire["tools"].as_array().unwrap().len(), 2);
+            assert!(
+                wire["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["type"] != "additional_tools")
+            );
+        }
+        assert_eq!(serde_json::to_vec(&req.messages).unwrap(), frozen);
+        assert_eq!(
+            provider
+                .render(
+                    &provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .unwrap(),
+                    false
+                )
+                .unwrap(),
+            second
+        );
+        let mut forced = req.clone();
+        forced.tool_choice = Some(ToolChoice::Tool {
+            name: "alpha".into(),
+        });
+        let wire = provider
+            .render(
+                &provider
+                    .prepare(forced, &provider.capabilities())
+                    .await
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            wire["tool_choice"],
+            json!({"type":"function","name":"alpha"})
+        );
+        let mut none = req.clone();
+        none.tool_choice = Some(ToolChoice::None);
+        let wire = provider
+            .render(
+                &provider
+                    .prepare(none, &provider.capabilities())
+                    .await
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(wire["tool_choice"], "none");
+        let mut compacted = req.clone();
+        compacted.messages[0].content = "summary replaced history".into();
+        let wire = provider
+            .render(
+                &provider
+                    .prepare(compacted, &provider.capabilities())
+                    .await
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(wire["tools"].as_array().unwrap().len(), 2);
+        assert!(
+            wire["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "additional_tools")
+        );
+        // Disabled rounds cannot revive definitions retained in metadata.
+        let mut disabled = req.clone();
+        disabled.tools = None;
+        disabled.tool_choice = Some(ToolChoice::None);
+        let wire = provider
+            .render(
+                &provider
+                    .prepare(disabled, &provider.capabilities())
+                    .await
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert!(wire.get("tools").is_none());
+        assert!(
+            wire["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "additional_tools")
+        );
+        // Unsupported updates/removals rebuild using current schemas only.
+        req.tools.as_mut().unwrap().remove(0);
+        req.tools.as_mut().unwrap()[0].description = "Updated".into();
+        let rebuilt =
+            ToolDeclarations::reconcile(Some(next), &req.messages, req.tools.as_deref().unwrap())
+                .unwrap();
+        req.tool_declarations = Some(rebuilt);
+        let wire = provider
+            .render(
+                &provider
+                    .prepare(req.clone(), &provider.capabilities())
+                    .await
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(wire["input"][0]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(wire["input"][0]["tools"][0]["description"], "Updated");
+        assert_eq!(
+            wire["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "additional_tools")
+                .count(),
+            1
+        );
+        req.tool_declarations = None;
+        let legacy = provider
+            .render(
+                &provider
+                    .prepare(req, &provider.capabilities())
+                    .await
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(legacy["tools"][0]["name"], "alpha");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn admitted_service_presets_survive_production_preparation_without_leakage() {
+    use crate::attachments::{admission::AdmissionState, regression::scoped};
+    use pioneer_protocol::{NativeServiceModePlan, OpenAiTier, ServiceModeParameters as P};
+    use std::sync::Arc;
+    let provider = ResponsesApiCompatibleProvider::new(
+        "openai",
+        "https://api.openai.com/v1",
+        "fixture",
+        AuthStyle::Bearer,
+    );
+    let state = Arc::new(AdmissionState::for_test(Arc::new(compatible_catalog(
+        "openai",
+        "gpt-6.1-sol",
+        json!({}),
+    ))));
+    scoped(state, async {
+        let mut req = request();
+        req.reasoning = Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::High));
+        for (id, parameters, expected_tier, pro) in [
+            ("pro", P::OpenAiPro, "default", true),
+            (
+                "fast",
+                P::OpenAiTier {
+                    tier: OpenAiTier::Priority,
+                },
+                "priority",
+                false,
+            ),
+            ("standard", P::OpenAiStandard, "default", false),
+            (
+                "flex",
+                P::OpenAiTier {
+                    tier: OpenAiTier::Flex,
+                },
+                "flex",
+                false,
+            ),
+            (
+                "ultrafast",
+                P::OpenAiTier {
+                    tier: OpenAiTier::Ultrafast,
+                },
+                "ultrafast",
+                false,
+            ),
+        ] {
+            req.service_mode = Some(NativeServiceModePlan {
+                id: id.into(),
+                parameters,
+            });
+            let budget = provider.prepare_input_budget(req.clone()).await.unwrap();
+            let prepared = provider
+                .prepare(budget.request, &provider.capabilities())
+                .await
+                .unwrap();
+            for stream in [false, true] {
+                let body = provider.render(&prepared, stream).unwrap();
+                assert_eq!(body["service_tier"], expected_tier);
+                assert_eq!(body["reasoning"]["effort"], "high");
+                if pro {
+                    assert_eq!(body["reasoning"]["mode"], "pro");
+                } else {
+                    assert!(body["reasoning"].get("mode").is_none());
+                }
+                assert_eq!(body["model"], "gpt-6.1-sol");
+                assert_eq!(body["max_output_tokens"], 100);
+                assert_eq!(body["parallel_tool_calls"], false);
+            }
+        }
+        req.service_mode = Some(NativeServiceModePlan {
+            id: "pro".into(),
+            parameters: P::OpenAiPro,
+        });
+        req.reasoning = Some(crate::ReasoningConfig::Disabled);
+        let error = provider
+            .prepare_input_budget(req.clone())
+            .await
+            .err()
+            .expect("disabled Pro must fail before network");
+        assert!(error.to_string().contains("Pro"));
+        req.reasoning = None;
+        req.service_mode = None; // Legacy/CLI-owned API request keeps omission.
+        let prepared = provider
+            .prepare(req, &provider.capabilities())
+            .await
+            .unwrap();
+        assert!(
+            provider
+                .render(&prepared, false)
+                .unwrap()
+                .get("service_tier")
+                .is_none()
+        );
+    })
+    .await;
 }

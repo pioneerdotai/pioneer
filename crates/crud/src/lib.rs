@@ -5357,6 +5357,26 @@ impl CrudStore {
         turn_llm_context::list_turn_llm_context(&self.connection, turn_id).await
     }
 
+    /// Called by the existing terminal/recovery owners after their durable
+    /// settlement. The deleting statement revalidates all remaining obligations.
+    pub async fn release_settled_shell_controls(&self, turn_id: &str) -> Result<u64> {
+        let changes = [
+            self.connection.work_signal("maintenance.frozen").changing(),
+            self.connection.work_signal("maintenance.html").changing(),
+        ];
+        let result = self
+            .run_scoped_database_quantum(|| {
+                turn_llm_context::delete_settled_shell_controls(&self.connection, turn_id)
+            })
+            .await;
+        if let Ok(deleted) = &result {
+            for change in changes {
+                change.completed(*deleted > 0);
+            }
+        }
+        result
+    }
+
     pub async fn delete_turn_llm_context_for_turn(&self, turn_id: &str) -> Result<u64> {
         // Removing transient context can release HTML retirement protection.
         let change = self.connection.work_signal("maintenance.html").changing();
@@ -5510,7 +5530,8 @@ impl CrudStore {
                 let ready =
                     repositories::task_child_cleanup::ready(&tx, thread_id, turn_id).await?;
                 if ready == Some(true) {
-                    turn_llm_context::delete_turn_llm_context_for_turn(&tx, turn_id).await?;
+                    turn_llm_context::delete_turn_llm_context_for_settled_child(&tx, turn_id)
+                        .await?;
                     turn_runtime_snapshot::delete_turn_runtime_snapshot(&tx, turn_id).await?;
                 }
                 tx.commit().await?;
@@ -22642,6 +22663,32 @@ impl CrudStore {
         .await
     }
 
+    /// Pin a legacy Native launch once; preparation and serialization occur
+    /// before acquiring the writer. Callers reload the authoritative snapshot.
+    pub async fn pin_turn_native_context(
+        &self,
+        workspace: &str,
+        turn_id: &str,
+        budget: &pioneer_protocol::NativeContextBudget,
+        summary: Option<&pioneer_protocol::NativeSummaryContext>,
+    ) -> Result<bool> {
+        let workspace = workspace.to_owned();
+        let turn_id = turn_id.to_owned();
+        let budget_json = serde_json::to_string(budget)?;
+        let summary_json = serde_json::to_string(&summary)?;
+        self.run_serialized_write(|| async {
+            turn::pin_turn_native_context(
+                &self.connection,
+                &workspace,
+                &turn_id,
+                &budget_json,
+                &summary_json,
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn get_turn_execution_security_snapshot(
         &self,
         turn_id: &str,
@@ -27297,7 +27344,7 @@ impl CrudStore {
                 turn::find_latest_turns_for_threads(&self.connection, &conversation_ids, true)
                     .await?
                     .into_iter()
-                    .map(|model| (model.thread_id, model.reasoning_effort))
+                    .map(|model| (model.thread_id.clone(), model))
                     .collect::<HashMap<_, _>>();
             let mut latest = latest
                 .into_iter()
@@ -27329,12 +27376,43 @@ impl CrudStore {
                     }
                     continue;
                 };
-                let reasoning_effort = if model.turn_kind == turn_kind_to_db(TurnKind::Conversation)
-                {
-                    model.reasoning_effort.clone()
+                let conversation = if model.turn_kind == turn_kind_to_db(TurnKind::Conversation) {
+                    Some(model.clone())
                 } else {
-                    conversations.remove(thread.id.as_str()).flatten()
+                    conversations.remove(thread.id.as_str())
                 };
+                let reasoning_effort = conversation
+                    .as_ref()
+                    .and_then(|turn| turn.reasoning_effort.clone());
+                let native = conversation
+                    .as_ref()
+                    .map(|turn| thread_native_context_from_turn(turn, thread))
+                    .transpose()?
+                    .flatten();
+                thread.service_mode = native.as_ref().and_then(|budget| {
+                    let plan = budget
+                        .service_mode
+                        .as_ref()
+                        .filter(|plan| plan.id != "standard")?;
+                    Some(pioneer_protocol::NativeServiceModeSelection {
+                        id: plan.id.clone(),
+                        authority: pioneer_protocol::native_context_choice_authority(
+                            budget.authority.as_deref()?,
+                            &budget.model,
+                        ),
+                    })
+                });
+                thread.context_window = native.as_ref().and_then(|budget| budget.manual_window);
+                thread.context_authority = native
+                    .filter(|budget| budget.manual_window.is_some())
+                    .and_then(|budget| {
+                        budget.authority.map(|authority| {
+                            pioneer_protocol::native_context_choice_authority(
+                                &authority,
+                                &budget.model,
+                            )
+                        })
+                    });
                 if let Some(turn) = thread_snapshot_turn_from_db_model(model)? {
                     thread.reasoning_effort = reasoning_effort;
                     thread.turns.push(turn);
@@ -27363,13 +27441,41 @@ impl CrudStore {
         // metadata from the newest Conversation turn. A null value there is
         // meaningful: it explicitly restores the provider default instead of
         // leaking an older non-default effort into the thread.
-        let reasoning_effort = if turn_model.turn_kind == turn_kind_to_db(TurnKind::Conversation) {
-            turn_model.reasoning_effort.clone()
+        let conversation = if turn_model.turn_kind == turn_kind_to_db(TurnKind::Conversation) {
+            Some(turn_model.clone())
         } else {
             turn::find_latest_conversation_turn_for_thread(&self.connection, thread.id.as_str())
                 .await?
-                .and_then(|turn| turn.reasoning_effort)
         };
+        let reasoning_effort = conversation
+            .as_ref()
+            .and_then(|turn| turn.reasoning_effort.clone());
+        let native = conversation
+            .as_ref()
+            .map(|turn| thread_native_context_from_turn(turn, thread))
+            .transpose()?
+            .flatten();
+        thread.service_mode = native.as_ref().and_then(|budget| {
+            let plan = budget
+                .service_mode
+                .as_ref()
+                .filter(|plan| plan.id != "standard")?;
+            Some(pioneer_protocol::NativeServiceModeSelection {
+                id: plan.id.clone(),
+                authority: pioneer_protocol::native_context_choice_authority(
+                    budget.authority.as_deref()?,
+                    &budget.model,
+                ),
+            })
+        });
+        thread.context_window = native.as_ref().and_then(|budget| budget.manual_window);
+        thread.context_authority = native
+            .filter(|budget| budget.manual_window.is_some())
+            .and_then(|budget| {
+                budget.authority.map(|authority| {
+                    pioneer_protocol::native_context_choice_authority(&authority, &budget.model)
+                })
+            });
         if let Some(turn) = thread_snapshot_turn_from_db_model(turn_model)? {
             thread.reasoning_effort = reasoning_effort;
             thread.turns.push(turn);
@@ -32364,6 +32470,7 @@ impl CrudStore {
         let control_wakes = vec![GatewayControlWake::Terminalization];
         let control_change = self.control_work_change("gateway.control", &control_wakes);
         let native_change = self.connection.work_signal("maintenance.native").changing();
+        let child_change = self.connection.work_signal("tasks.lifecycle").changing();
         let result = self
             .run_serialized_write(|| async {
                 let now = unix_to_datetime(now_unix);
@@ -32442,8 +32549,9 @@ impl CrudStore {
                             let permanent = error
                                 .downcast_ref::<PermanentRecoveryTerminalizationError>()
                                 .expect("claim decoding only returns permanent validation errors");
+                            let quarantine_tx = self.connection.begin().await?;
                             if !recovery_terminalization_outbox::quarantine_claim(
-                                &self.connection,
+                                &quarantine_tx,
                                 recovery_job_id.as_str(),
                                 claim_token.as_str(),
                                 permanent.reason_code,
@@ -32456,6 +32564,7 @@ impl CrudStore {
                                     "recovery terminalization claim was lost before quarantine"
                                 );
                             }
+                            quarantine_tx.commit().await?;
                             dependency_released = true;
                         }
                     }
@@ -32466,6 +32575,7 @@ impl CrudStore {
         if let Ok((_, released)) = &result {
             control_change.completed(false);
             native_change.completed(*released);
+            child_change.completed(*released);
         }
         result.map(|(valid, _)| valid)
     }
@@ -32603,6 +32713,7 @@ impl CrudStore {
         }
 
         let native_change = self.connection.work_signal("maintenance.native").changing();
+        let child_change = self.connection.work_signal("tasks.lifecycle").changing();
         let result = async {
             let record = record.clone();
             self.run_serialized_write(|| async {
@@ -32780,11 +32891,13 @@ impl CrudStore {
         }
         .await;
         if let Ok(value) = &result {
-            native_change.completed(matches!(
+            let released = matches!(
                 value,
                 RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(_)
                     | RecoveryTerminalizationClaimDisposition::Quarantined { .. }
-            ));
+            );
+            native_change.completed(released);
+            child_change.completed(released);
         }
         result
     }
@@ -32826,6 +32939,7 @@ impl CrudStore {
             "recovery terminalization classification batch contains duplicate jobs"
         );
         let native_change = self.connection.work_signal("maintenance.native").changing();
+        let child_change = self.connection.work_signal("tasks.lifecycle").changing();
         let result = async {
             let records = records.to_vec();
             self.run_serialized_write(|| {
@@ -33064,13 +33178,15 @@ impl CrudStore {
         }
         .await;
         if let Ok(value) = &result {
-            native_change.completed(value.iter().any(|(_, disposition)| {
+            let released = value.iter().any(|(_, disposition)| {
                 matches!(
                     disposition,
                     RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(_)
                         | RecoveryTerminalizationClaimDisposition::Quarantined { .. }
                 )
-            }));
+            });
+            native_change.completed(released);
+            child_change.completed(released);
         }
         result
     }
@@ -33433,6 +33549,7 @@ impl CrudStore {
         ]
         .map(|domain| self.control_work_change(domain, &control_wakes));
         let native_change = self.connection.work_signal("maintenance.native").changing();
+        let child_change = self.connection.work_signal("tasks.lifecycle").changing();
         let control_result = async {
         let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
         let record = record.clone();
@@ -33720,6 +33837,7 @@ impl CrudStore {
             // Every successful disposition resolves the recovery episode,
             // which can release a durable native-event cleanup dependency.
             native_change.completed(true);
+            child_change.completed(true);
         }
         control_result
     }
@@ -34842,20 +34960,34 @@ impl CrudStore {
             GatewayControlWake::Supervision,
             GatewayControlWake::Terminalization,
         ];
-        let changes = ["gateway.control", "maintenance.native", "recovery.due"]
-            .map(|domain| self.control_work_change(domain, &control_wakes));
+        let changes = [
+            "gateway.control",
+            "maintenance.native",
+            "recovery.due",
+            "tasks.lifecycle",
+        ]
+        .map(|domain| self.control_work_change(domain, &control_wakes));
         let _recovery_change = recovery_wake::RecoveryChange(self.recovery_work.clone());
         let result = async {
             let reason_value = reason.clone();
             self.run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
                 let jobs = recovery_job::cancel_open_jobs_for_turn(
-                    &self.connection,
+                    &tx,
                     turn_id,
                     exclude_job_id,
                     reason_value.clone(),
                     unix_to_datetime(now_unix),
                 )
                 .await?;
+                if let Some(job) = jobs.first() {
+                    turn_llm_context::settle_shell_controls_for_recovery_jobs(
+                        &tx,
+                        &[job.id.clone()],
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
                 Ok(jobs
                     .into_iter()
                     .map(recovery_job_record_from_model)
@@ -40066,6 +40198,32 @@ fn contains_any_key(value: &serde_json::Value, keys: &[&str]) -> Option<String> 
     }
 }
 
+fn thread_native_context_from_turn(
+    model: &pioneer_entity::turn::Model,
+    thread: &Thread,
+) -> Result<Option<pioneer_protocol::NativeContextBudget>> {
+    // CLI/external restoration keeps its pre-existing path. This projection
+    // reads only the new Native field, never validates unrelated legacy JSON.
+    if model.prompt_profile.as_deref() == Some("cli_runtime")
+        || thread.model_provider.starts_with("cli_runtime:")
+    {
+        return Ok(None);
+    }
+    let Some(value) = model
+        .execution_security_snapshot_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|mut value| value.get_mut("native_context").map(serde_json::Value::take))
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let budget: pioneer_protocol::NativeContextBudget =
+        serde_json::from_value(value).context("invalid saved Native model choice")?;
+    Ok(Some(budget)
+        .filter(|budget| budget.instance == thread.model_provider && budget.model == thread.model))
+}
+
 fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Result<Option<Thread>> {
     let Some(mode) = thread_mode_from_db(model.mode.as_str()) else {
         return Ok(None);
@@ -40090,6 +40248,9 @@ fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Result<Option<T
         repositories::thread::preview_author_from_json(model.preview_author_json.as_deref())?;
 
     Ok(Some(Thread {
+        context_window: None,
+        service_mode: None,
+        context_authority: None,
         workspace_id: model.workspace_id,
         id: model.id,
         name: model.name,
@@ -41197,6 +41358,9 @@ mod tests {
     ) -> (CrudStore, Thread, Turn) {
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -41259,6 +41423,9 @@ mod tests {
         let store = test_store_with_workspace(workspace_id).await;
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -47324,6 +47491,9 @@ mod tests {
             let thread_id = format!("thr_recovery_batch_{index}");
             let turn_id = format!("turn_recovery_batch_{index}");
             let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
                 workspace_id: workspace_id.to_owned(),
                 id: thread_id.clone(),
                 name: None,
@@ -47498,6 +47668,9 @@ mod tests {
         )
         .await;
         let second_thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_recovery_poison".to_owned(),
             id: "thr_recovery_valid".to_owned(),
             name: None,
@@ -49008,6 +49181,9 @@ mod tests {
 
     fn sample_thread(workspace_id: &str, thread_id: &str, timestamp: i64) -> Thread {
         Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -50862,6 +51038,9 @@ mod tests {
         let created_at = unix_to_datetime(timestamp);
         let store = test_store_with_workspace(workspace_id).await;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -53295,6 +53474,9 @@ mod tests {
     ) -> (CrudStore, Thread, TaskRun) {
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_task".to_owned(),
             id: "thr_task".to_owned(),
             name: Some("TaskRun occurrence reconciliation".to_owned()),
@@ -55493,6 +55675,9 @@ mod tests {
         let timestamp = 1_700_000_000;
         let store = test_store_with_workspace(workspace_id).await;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -56325,6 +56510,9 @@ mod tests {
         let recovery_policy = sample_tool_recovery_policy();
 
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -60381,6 +60569,518 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_controls_release_only_after_canonical_or_definitive_recovery_settlement() {
+        let now = 1_700_000_000;
+        let (store, thread, mut failed) = test_store_with_started_turn(
+            "ws_shell_controls",
+            "thread_shell_controls",
+            "turn_shell_controls",
+        )
+        .await;
+        let (_, _, aborted) = start_test_turn(
+            store.clone(),
+            "ws_shell_controls",
+            &thread.id,
+            "turn_shell_abort",
+        )
+        .await;
+        let (_, _, foreign) = start_test_turn(
+            store.clone(),
+            "ws_shell_controls",
+            &thread.id,
+            "turn_shell_foreign",
+        )
+        .await;
+        for turn_id in [&failed.id, &aborted.id] {
+            turn_execution::insert_immutable(
+                &store.connection,
+                NewTurnExecution {
+                    turn_id: turn_id.clone(),
+                    thread_id: thread.id.clone(),
+                    workspace_id: thread.workspace_id.clone(),
+                    executor_kind: TurnExecutorKind::NativeAgent,
+                    executor_key: None,
+                    status: TurnExecutionStatus::Running,
+                    owner_id: "owner".into(),
+                    lease_until: unix_to_datetime(now + 60),
+                    created_at: unix_to_datetime(now),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for (index, (turn_id, item, expiry)) in [
+            (&failed.id, "abandoned", None),
+            (&failed.id, "expired", Some(unix_to_datetime(now - 1))),
+            (&failed.id, "successful", None),
+            (&aborted.id, "abandoned", None),
+            (&foreign.id, "abandoned", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .insert_turn_llm_context(NewTurnLlmContextEntry {
+                    turn_id: turn_id.clone(),
+                    item_id: Some(item.into()),
+                    attempt_id: None,
+                    sequence: index as i64 + 1,
+                    source: "shell_control_v1".into(),
+                    tool_name: Some("write_stdin".into()),
+                    payload: r#"{"kind":"json","value":{"session_id":27},"truncated":false}"#
+                        .into(),
+                    output_policy_snapshot: serde_json::to_string(
+                        &ToolOutputPolicySnapshot::for_tool_name("write_stdin"),
+                    )
+                    .unwrap(),
+                    created_at: unix_to_datetime(now),
+                    expires_at: expiry,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.delete_expired_turn_llm_context().await.unwrap(), 0);
+        assert_eq!(
+            store
+                .delete_turn_llm_context_for_turn(&failed.id)
+                .await
+                .unwrap(),
+            0
+        );
+        // A real canonical append settles only its own receipt, even on an active Turn.
+        let message = serde_json::json!({"role":"tool","tool_call_id":"call-success","name":"write_stdin","content":r#"{"session_id":27}"#});
+        store
+            .append_turn_llm_context(
+                NewTurnLlmContextEntry {
+                    turn_id: failed.id.clone(),
+                    item_id: Some("successful".into()),
+                    attempt_id: None,
+                    sequence: 0,
+                    source: "tool_result_v2".into(),
+                    tool_name: Some("write_stdin".into()),
+                    payload: serde_json::to_string(&pioneer_protocol::ToolResultView::Json {
+                        value: serde_json::to_value(message).unwrap(),
+                        truncated: false,
+                    })
+                    .unwrap(),
+                    output_policy_snapshot: "{}".into(),
+                    created_at: unix_to_datetime(now),
+                    expires_at: None,
+                },
+                "successful-delivery",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .release_settled_shell_controls(&failed.id)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .shell_control_receipt(&thread.workspace_id, &thread.id, &failed.id, "abandoned")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let job = store
+            .enqueue_recovery_job(
+                failed.id.clone(),
+                "abandoned".into(),
+                TurnItemType::CommandExecution,
+                None,
+                RecoveryTrigger::ProjectionFailure,
+                RecoveryAction::RetryWithBackoff,
+                None,
+                None,
+                None,
+                None,
+                1,
+                2,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                now + 1,
+            )
+            .await
+            .unwrap();
+        failed.status = TurnStatus::Failed;
+        failed.error = Some("terminal materialization/budget failed after control ACK".into());
+        store
+            .materialize_turn_failed(
+                TurnFailedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn: failed.clone(),
+                },
+                now + 2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .release_settled_shell_controls(&failed.id)
+                .await
+                .unwrap(),
+            0,
+            "pending recovery owns the receipt after terminal status"
+        );
+        assert_eq!(
+            store
+                .delete_turn_llm_context_for_terminal_turns()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.delete_expired_turn_llm_context().await.unwrap(), 0);
+        assert!(
+            !store
+                .list_turn_llm_context(&failed.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.item_id.as_deref() == Some("abandoned")
+                    && row.source == "tool_result_v2")
+        );
+        assert_eq!(
+            store
+                .cancel_open_recovery_jobs_for_turn(
+                    &failed.id,
+                    None,
+                    Some("definitive cancellation".into()),
+                    now + 3
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_recovery_job(&job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RecoveryJobStatus::Cancelled
+        );
+        let maintenance = store.with_maintenance_access();
+        let (interactive, background) = tokio::join!(
+            store.release_settled_shell_controls(&failed.id),
+            maintenance.release_settled_shell_controls(&failed.id)
+        );
+        assert_eq!(
+            interactive.unwrap() + background.unwrap(),
+            0,
+            "definitive cancellation already released controls atomically"
+        );
+        assert!(
+            store
+                .shell_control_receipt(&thread.workspace_id, &thread.id, &failed.id, "abandoned")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .shell_control_receipt(
+                    &thread.workspace_id,
+                    &thread.id,
+                    "turn_shell_foreign",
+                    "abandoned"
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .shell_control_receipt(&thread.workspace_id, &thread.id, &aborted.id, "abandoned")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !store
+                .list_turn_llm_context(&failed.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.item_id.as_deref() == Some("abandoned")
+                    && row.source == "tool_result_v2")
+        );
+        // Exercise both real Blocked-job orderings; the audit status must not
+        // be rewritten to Failed/Cancelled merely to release control metadata.
+        for settle_before_abort in [true, false] {
+            let mut blocked = if settle_before_abort {
+                aborted.clone()
+            } else {
+                let (_, _, blocked) = start_test_turn(
+                    store.clone(),
+                    &thread.workspace_id,
+                    &thread.id,
+                    "turn_shell_abort_pending",
+                )
+                .await;
+                turn_execution::insert_immutable(
+                    &store.connection,
+                    NewTurnExecution {
+                        turn_id: blocked.id.clone(),
+                        thread_id: thread.id.clone(),
+                        workspace_id: thread.workspace_id.clone(),
+                        executor_kind: TurnExecutorKind::NativeAgent,
+                        executor_key: None,
+                        status: TurnExecutionStatus::Running,
+                        owner_id: "owner".into(),
+                        lease_until: unix_to_datetime(now + 60),
+                        created_at: unix_to_datetime(now),
+                    },
+                )
+                .await
+                .unwrap();
+                store
+                    .insert_turn_llm_context(NewTurnLlmContextEntry {
+                        turn_id: blocked.id.clone(),
+                        item_id: Some("abandoned".into()),
+                        attempt_id: None,
+                        sequence: 1,
+                        source: "shell_control_v1".into(),
+                        tool_name: Some("write_stdin".into()),
+                        payload: "{}".into(),
+                        output_policy_snapshot: "{}".into(),
+                        created_at: unix_to_datetime(now),
+                        expires_at: None,
+                    })
+                    .await
+                    .unwrap();
+                blocked
+            };
+            let job = store
+                .enqueue_recovery_job(
+                    blocked.id.clone(),
+                    "abandoned".into(),
+                    TurnItemType::CommandExecution,
+                    None,
+                    RecoveryTrigger::ProjectionFailure,
+                    RecoveryAction::RetryWithBackoff,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                    2,
+                    serde_json::json!({}),
+                    serde_json::json!({}),
+                    now + 3,
+                )
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .mark_recovery_job_terminal(
+                        &job.id,
+                        RecoveryJobStatus::Blocked,
+                        Some("await explicit resume".into()),
+                        now + 3
+                    )
+                    .await
+                    .unwrap()
+            );
+            blocked.status = TurnStatus::Blocked;
+            blocked.error = Some("await explicit resume".into());
+            store
+                .materialize_turn_blocked(
+                    pioneer_protocol::TurnBlockedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn: blocked.clone(),
+                        resume: None,
+                    },
+                    now + 4,
+                )
+                .await
+                .unwrap();
+            let claims = store
+                .claim_due_recovery_terminalizations(now + 5, 45, 10)
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            if settle_before_abort {
+                assert!(matches!(
+                    store
+                        .apply_claimed_recovery_terminalization(
+                            &claims[0],
+                            None,
+                            RecoveryTerminalCleanupPlan {
+                                runtime_generation: 1,
+                                runtime_contract: "pioneer.test.attached-task-cleanup.v1".into(),
+                            },
+                            now + 5,
+                        )
+                        .await
+                        .unwrap(),
+                    RecoveryTerminalizationApplyOutcome::Applied(_)
+                ));
+                assert!(
+                    !store
+                        .get_recovery_job(&job.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .resolution_pending
+                );
+            }
+            assert_eq!(
+                store
+                    .delete_turn_llm_context_for_turn(&blocked.id)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                store
+                    .release_settled_shell_controls(&blocked.id)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(
+                store
+                    .shell_control_receipt(
+                        &thread.workspace_id,
+                        &thread.id,
+                        &blocked.id,
+                        "abandoned"
+                    )
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "Blocked Turn still owns its undelivered controls"
+            );
+            assert!(
+                !store
+                    .list_turn_llm_context(&blocked.id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.source == "tool_result_v2")
+            );
+            let execution = turn_execution::find(&store.connection, &blocked.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(execution.status, TurnExecutionStatus::Blocked);
+            assert!(execution.completed_at.is_some());
+            // This reaches the existing tool-resume snapshot gate, rather than
+            // rejecting the Blocked Turn/job as absent. No execution is started.
+            assert!(matches!(
+                store
+                    .resume_blocked_turn_recovery(
+                        &thread.id,
+                        &blocked.id,
+                        Some(&job.id),
+                        now + 6,
+                        "owner",
+                        now + 60
+                    )
+                    .await
+                    .unwrap(),
+                BlockedTurnRecoveryResumeOutcome::MissingRuntimeSnapshot { .. }
+            ));
+            // Use the existing authoritative status transaction, including its
+            // status history, terminal execution settlement and child publication.
+            // Do not append a conflicting second canonical terminal event.
+            assert!(
+                store
+                    .update_turn_status(
+                        &thread.id,
+                        &blocked.id,
+                        TurnStatus::Interrupted,
+                        Some("definitive abort without canonical append"),
+                        now + 7
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(matches!(
+                store
+                    .resume_blocked_turn_recovery(
+                        &thread.id,
+                        &blocked.id,
+                        Some(&job.id),
+                        now + 8,
+                        "owner",
+                        now + 60
+                    )
+                    .await
+                    .unwrap(),
+                BlockedTurnRecoveryResumeOutcome::NotFound
+            ));
+            if settle_before_abort {
+                let (foreground, background) = tokio::join!(
+                    store.release_settled_shell_controls(&blocked.id),
+                    maintenance.release_settled_shell_controls(&blocked.id)
+                );
+                assert_eq!(foreground.unwrap() + background.unwrap(), 1);
+            } else {
+                assert_eq!(
+                    store
+                        .delete_turn_llm_context_for_terminal_turns()
+                        .await
+                        .unwrap(),
+                    0,
+                    "pending outbox must survive definitive abort until supersession"
+                );
+                assert_eq!(
+                    store
+                        .classify_claimed_recovery_terminalization(&claims[0], now + 8)
+                        .await
+                        .unwrap(),
+                    RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
+                        TurnStatus::Interrupted
+                    )
+                );
+            }
+            let audit = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(audit.status, RecoveryJobStatus::Blocked);
+            assert!(!audit.resolution_pending);
+            assert!(
+                store
+                    .list_turn_llm_context(&blocked.id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "no receipt or fabricated canonical row after definitive settlement"
+            );
+            assert_eq!(
+                store
+                    .delete_turn_llm_context_for_turn(&blocked.id)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(
+                store
+                    .shell_control_receipt(
+                        &thread.workspace_id,
+                        &thread.id,
+                        &foreign.id,
+                        "abandoned"
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            store.list_turn_llm_context(&failed.id).await.unwrap().len(),
+            1,
+            "successful canonical remains intact"
+        );
+    }
+
+    #[tokio::test]
     async fn turn_llm_context_repository_round_trips_and_cleans_terminal_turns() {
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_llm_context";
@@ -60389,6 +61089,9 @@ mod tests {
         let active_turn_id = "turn_llm_active";
         let terminal_turn_id = "turn_llm_terminal";
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -60612,6 +61315,9 @@ mod tests {
         let recovery_job_id = "recovery_job_99";
 
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -60876,6 +61582,9 @@ mod tests {
         let episode_id = "tool_retry_turn_199_1";
 
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -63038,6 +63747,9 @@ mod tests {
         let store = CrudStore::new(connection.clone());
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_000000000000000001".to_owned(),
             id: "thr_000000000000000001".to_owned(),
             name: None,
@@ -63241,6 +63953,9 @@ mod tests {
             .expect("migrations must succeed");
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_legacy_actor".to_owned(),
             id: "thr_legacy_actor".to_owned(),
             name: None,
@@ -63626,6 +64341,9 @@ mod tests {
         let store = CrudStore::new(connection.clone());
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_permission_profile".to_owned(),
             id: "thr_permission_profile".to_owned(),
             name: None,
@@ -63820,6 +64538,9 @@ mod tests {
         let store = CrudStore::new(connection.clone());
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_atomic_profile".to_owned(),
             id: "thr_atomic_profile".to_owned(),
             name: None,
@@ -64147,6 +64868,9 @@ mod tests {
         let store = CrudStore::new(connection.clone());
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_atomic_admission_fault".to_owned(),
             id: "thr_atomic_admission_fault".to_owned(),
             name: None,
@@ -64679,6 +65403,9 @@ mod tests {
         .await
         .expect("author principal should persist");
         let authoritative_thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_atomic_message".to_owned(),
             id: "thr_atomic_message".to_owned(),
             name: None,
@@ -65358,6 +66085,9 @@ mod tests {
         transaction.commit().await.expect("membership commit");
 
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -65473,6 +66203,9 @@ mod tests {
         let store = test_store_with_workspace("ws_old_permission_profile").await;
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_old_permission_profile".to_owned(),
             id: "thr_old_permission_profile".to_owned(),
             name: None,
@@ -65536,6 +66269,9 @@ mod tests {
         let store = test_store_with_workspace("ws_unknown_permission_profile").await;
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_unknown_permission_profile".to_owned(),
             id: "thr_unknown_permission_profile".to_owned(),
             name: None,
@@ -66013,7 +66749,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_execution_security_snapshot_roundtrips_unrestricted_snapshot() {
-        let (store, _thread, turn) = test_store_with_started_turn(
+        let (store, thread, turn) = test_store_with_started_turn(
             "ws_security_unrestricted",
             "thr_security_unrestricted",
             "turn_security_unrestricted",
@@ -66057,6 +66793,112 @@ mod tests {
             TurnSandboxMode::Unrestricted
         );
         assert_eq!(persisted_snapshot, snapshot);
+        let budget = pioneer_protocol::NativeContextBudget {
+            service_mode: None,
+            instance: thread.model_provider.clone(),
+            authority: Some("account-a".into()),
+            model: thread.model.clone(),
+            manual_window: None,
+            context_window: 272000,
+            max_input: None,
+            max_output: Some(16000),
+        };
+        assert!(
+            !store
+                .pin_turn_native_context("other-workspace", &turn.id, &budget, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .pin_turn_native_context("ws_security_unrestricted", &turn.id, &budget, None)
+                .await
+                .unwrap()
+        );
+        let mut wider = budget.clone();
+        wider.context_window = 1050000;
+        assert!(
+            !store
+                .pin_turn_native_context("ws_security_unrestricted", &turn.id, &wider, None)
+                .await
+                .unwrap()
+        );
+        let mut expected = snapshot;
+        expected.native_context = Some(budget);
+        let pinned = store
+            .get_turn_execution_security_snapshot(&turn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.snapshot, expected);
+        let mut legacy_plan = wider.clone();
+        legacy_plan.service_mode = Some(pioneer_protocol::NativeServiceModePlan {
+            id: "standard".into(),
+            parameters: pioneer_protocol::ServiceModeParameters::OpenAiStandard,
+        });
+        assert!(
+            store
+                .pin_turn_native_context("ws_security_unrestricted", &turn.id, &legacy_plan, None)
+                .await
+                .unwrap()
+        );
+        let pinned_mode = store
+            .get_turn_execution_security_snapshot(&turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert_eq!(
+            pinned_mode.native_context.as_ref().unwrap().context_window,
+            272000
+        );
+        expected.native_context.as_mut().unwrap().service_mode = legacy_plan.service_mode.clone();
+        assert_eq!(pinned_mode, expected);
+        legacy_plan.service_mode.as_mut().unwrap().id = "pro".into();
+        legacy_plan.service_mode.as_mut().unwrap().parameters =
+            pioneer_protocol::ServiceModeParameters::OpenAiPro;
+        assert!(
+            !store
+                .pin_turn_native_context("ws_security_unrestricted", &turn.id, &legacy_plan, None)
+                .await
+                .unwrap()
+        );
+        // A saved user choice projects through the normal thread read on restart.
+        let manual = expected.native_context.as_mut().unwrap();
+        manual.service_mode = legacy_plan.service_mode.clone();
+        manual.manual_window = Some(1050000);
+        manual.context_window = 1050000;
+        store
+            .set_turn_execution_security_snapshot(&turn.id, &expected)
+            .await
+            .unwrap();
+        let restored = store.get_thread_model(&thread.id).await.unwrap().unwrap();
+        assert_eq!(restored.context_window, Some(1050000));
+        assert_eq!(
+            restored.service_mode.as_ref().map(|mode| mode.id.as_str()),
+            Some("pro")
+        );
+        assert_eq!(
+            restored.context_authority,
+            Some(pioneer_protocol::native_context_choice_authority(
+                "account-a",
+                &thread.model
+            ))
+        );
+        expected.native_context.as_mut().unwrap().manual_window = None;
+        store
+            .set_turn_execution_security_snapshot(&turn.id, &expected)
+            .await
+            .unwrap();
+        let reset = store.get_thread_model(&thread.id).await.unwrap().unwrap();
+        assert_eq!(
+            reset.service_mode.as_ref().map(|mode| mode.id.as_str()),
+            Some("pro")
+        );
+        assert_eq!(
+            (reset.context_window, reset.context_authority),
+            (None, None)
+        );
     }
 
     #[tokio::test]
@@ -66243,6 +67085,9 @@ mod tests {
         let store = CrudStore::new(connection.clone());
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_reasoning_effort".to_owned(),
             id: "thr_reasoning_effort".to_owned(),
             name: None,
@@ -66304,6 +67149,9 @@ mod tests {
         let store = test_store_with_workspace("ws_000000000000000001").await;
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_000000000000000001".to_owned(),
             id: "thr_000000000000000001".to_owned(),
             name: None,
@@ -66547,6 +67395,9 @@ mod tests {
         let second_timestamp = 1_700_000_100;
 
         let first_thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -67473,6 +68324,9 @@ mod tests {
         let store = CrudStore::new(connection.clone());
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_000000000000000001".to_owned(),
             id: "thr_000000000000000002".to_owned(),
             name: None,
@@ -67597,6 +68451,9 @@ mod tests {
         .await
         .expect("reader principal should persist");
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -68468,6 +69325,9 @@ mod tests {
         .await
         .expect("reader principal should persist");
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,

@@ -1820,6 +1820,14 @@ fn spawn_turn_task(
             let context_session = context_controller.map(|controller| {
                 Arc::new(crate::compaction::controller::NativeContextSession::new(
                     crate::compaction::controller::NativeContext {
+                        context_budget: turn_request
+                            .execution_security_snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.native_context.clone()),
+                        summary_context: turn_request
+                            .execution_security_snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.native_summary.clone()),
                         overflow_recovery: turn_request.execution_options.context_overflow_recovery,
                         recovery_deadline_ms: turn_request
                             .execution_options

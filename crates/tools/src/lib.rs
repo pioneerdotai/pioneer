@@ -41,7 +41,7 @@ pub use context::{
     AnyToolResult, CallToolResult, ExecCommandArgs, FunctionToolOutput, LocalShellPayload,
     ToolCallSource, ToolDeliveryReceipt, ToolErrorClass, ToolInvocation, ToolOutcome,
     ToolOutcomeStatus, ToolOutput, ToolPayload, ToolSearchOutput, ToolSearchResultTool,
-    ToolSuggestOutput, WriteStdinArgs,
+    ToolSuggestOutput, WriteStdinArgs, with_model_result_framing,
 };
 pub use domain::{
     ARTIFACT_DOMAIN_TOOL_NAMES, BUILTIN_TOOL_DOMAIN_MAP, BuiltinToolDomain,
@@ -100,7 +100,7 @@ pub use output_policy::{
     ToolResultEnvelope, ToolResultView, ToolStoragePayload, builtin_output_policy,
     computer_use_output_policy, download_output_policy, dynamic_unknown_output_policy,
     is_thread_paged_tool, mcp_output_policy, model_only_metadata_policy, shell_output_policy,
-    thread_read_page_bytes, thread_read_page_fits, web_fetch_output_policy,
+    thread_read_page_bytes, thread_read_page_fits, thread_read_page_size, web_fetch_output_policy,
     web_search_output_policy,
 };
 pub use output_projection::{
@@ -129,7 +129,9 @@ pub use sandbox_backend::{
     NativeSandboxRequest, NonoBackendSupport, NonoCapabilityPlan, NonoSandboxBackend,
     build_nono_capability_plan, configure_nono_command, prepare_native_sandbox_backend,
 };
-pub use shell_format::{ExecModelPayload, ExecPayloadInput, ExecTruncation, render_exec_ui_text};
+pub use shell_format::{
+    ExecModelPayload, ExecPayloadInput, ExecTruncation, bound_shell_output, render_exec_ui_text,
+};
 pub use spec::{
     ConfiguredToolSpec, DynamicSkillPermissionKind, DynamicSkillPermissionMetadata, ExecutionClass,
     PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode, ToolPayloadBinding,

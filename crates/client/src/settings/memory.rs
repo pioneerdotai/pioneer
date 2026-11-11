@@ -196,6 +196,9 @@ mod tests {
                 provider: Some("openai".to_owned()),
                 model: Some("gpt-5.4".to_owned()),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
             }),
             GatewayMemoryModelSelection::custom("openai", "gpt-5.4")
         );
@@ -205,6 +208,9 @@ mod tests {
                 provider: Some("openai".to_owned()),
                 model: Some(" ".to_owned()),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
             }),
             GatewayMemoryModelSelection::thread()
         );

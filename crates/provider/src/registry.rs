@@ -325,6 +325,36 @@ fn redacted_endpoint_error(
 }
 
 impl AuthorityBoundProvider {
+    fn service_modes_for_model(
+        &self,
+        model: &str,
+        source: pioneer_protocol::SourceServiceModes,
+        native_reasoning: Option<bool>,
+    ) -> pioneer_protocol::SourceServiceModes {
+        // Reuse the adapter's existing model-specific route contract. For
+        // example, OpenAI audio chat uses a different API from other models.
+        // This only computes a profile; it performs no preparation or I/O.
+        let profile = self.inner.request_usage_profile(&ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
+            model: model.into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        });
+        crate::catalog::service::for_adapter(
+            source,
+            self.inner.name(),
+            profile.as_ref().map_or("", |profile| profile.api.as_str()),
+            native_reasoning,
+        )
+    }
+
     fn model_tool_calling_with_catalog(
         &self,
         model: &str,
@@ -390,6 +420,32 @@ impl AuthorityBoundProvider {
             && let Some(catalog) = catalog
         {
             catalog.enrich_for_tool_scope(self.inner.name(), &mut models, self.use_public_catalog);
+        }
+        if purpose == ModelPurpose::Chat {
+            for model in &mut models {
+                model.service_modes = if self.use_public_catalog {
+                    crate::catalog::model_catalog()
+                        .ok()
+                        .and_then(|catalog| {
+                            catalog
+                                .source_service_modes(self.inner.name(), &model.id)
+                                .cloned()
+                        })
+                        .map(|source| {
+                            self.service_modes_for_model(
+                                &model.id,
+                                source,
+                                model.capabilities.thinking,
+                            )
+                        })
+                } else {
+                    None
+                };
+                model.context_authority = Some(crate::catalog::context_choice_authority(
+                    self.authority_fingerprint.as_str(),
+                    &model.id,
+                ));
+            }
         }
         models
     }
@@ -567,6 +623,9 @@ impl Provider for AuthorityBoundProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
+        if let Some(plan) = &request.service_mode {
+            crate::catalog::service::validate_plan(self, &request.model, plan).await?;
+        }
         if self.inner.name() == "vercel-ai-gateway" {
             self.public_result(self.inner.model_limits(&request.model).await)?;
             self.ensure_not_revoked()?;
@@ -614,11 +673,15 @@ impl Provider for AuthorityBoundProvider {
         request: ChatRequest,
     ) -> Result<crate::ProviderStream> {
         self.ensure_not_revoked()?;
+        if let Some(plan) = &request.service_mode {
+            crate::catalog::service::validate_plan(self, &request.model, plan).await?;
+        }
         if self.inner.name() == "vercel-ai-gateway" {
             self.public_result(self.inner.model_limits(&request.model).await)?;
             self.ensure_not_revoked()?;
         }
         let context = crate::usage::UsageContext::capture_request(self, &request)?;
+        let request_has_service_mode = request.service_mode.is_some();
         let mut response = self
             .public_result(
                 crate::attachments::admission::scope(
@@ -656,9 +719,9 @@ impl Provider for AuthorityBoundProvider {
                 if let Some(snapshot) = crate::usage::error_usage(&error) {
                     accumulated.update(snapshot);
                 }
-                if accumulated != crate::TokenUsage::default() {
+                if accumulated != crate::TokenUsage::default() || request_has_service_mode {
                     context.enrich(&mut accumulated);
-                    crate::usage::with_error_usage(error, &accumulated)
+                    context.enrich_error(crate::usage::with_error_usage(error, &accumulated))
                 } else {
                     error
                 }
@@ -680,6 +743,75 @@ impl Provider for AuthorityBoundProvider {
     async fn prepare_model(&self, model: &str) -> Result<()> {
         self.ensure_not_revoked()?;
         self.public_result(self.inner.prepare_model(model).await)
+    }
+
+    async fn model_context_tiers(
+        &self,
+        model: &str,
+    ) -> Result<Option<pioneer_protocol::ProviderContextTiers>> {
+        self.ensure_not_revoked()?;
+        if crate::catalog::catalog_provider(self.inner.name()) == "azure-openai-responses" {
+            return Ok(Some(pioneer_protocol::ProviderContextTiers::Excluded));
+        }
+
+        // Native owners can refresh independently of the chat admission DTO
+        // (embedding discovery or on-demand model preparation, for example).
+        if self.inner.name() == "vercel-ai-gateway" {
+            return self.public_result(self.inner.model_context_tiers(model).await);
+        }
+        if let Some(entry) = self.inner.model_catalog_entry(model) {
+            return Ok(Some(crate::catalog::context_tiers_for_model(&entry)));
+        }
+        if let Some(metadata) = self
+            .input_admission
+            .model(model)
+            .and_then(|m| m.context_tiers)
+        {
+            return Ok(Some(metadata));
+        }
+        if !self.use_public_catalog {
+            return Ok(None);
+        }
+        let metadata = self.public_result(self.inner.model_context_tiers(model).await)?;
+        anyhow::ensure!(
+            metadata.is_some(),
+            "Context pricing metadata is unavailable for this public provider/model"
+        );
+        Ok(metadata)
+    }
+
+    async fn model_service_modes(
+        &self,
+        model: &str,
+    ) -> Result<Option<pioneer_protocol::SourceServiceModes>> {
+        self.ensure_not_revoked()?;
+        if !self.use_public_catalog || self.inner.name() == "azure-openai" {
+            return Ok(None);
+        }
+        let source = crate::catalog::model_catalog()?
+            .source_service_modes(self.inner.name(), model)
+            .cloned();
+        Ok(source.map(|source| {
+            self.service_modes_for_model(
+                model,
+                source,
+                self.input_admission
+                    .model(model)
+                    .and_then(|model| model.capabilities.thinking),
+            )
+        }))
+    }
+
+    fn standard_service_mode(&self, _model: &str) -> pioneer_protocol::ServiceModeParameters {
+        use pioneer_protocol::ServiceModeParameters as P;
+        if !self.use_public_catalog {
+            return P::Neutral;
+        }
+        match self.inner.name() {
+            "openai" => P::OpenAiStandard,
+            "anthropic" => P::AnthropicStandard,
+            _ => P::Neutral,
+        }
     }
 
     async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
@@ -731,6 +863,26 @@ impl Provider for AuthorityBoundProvider {
             // Native discovery is usable before bootstrap and during catalog
             // outages. Keep authority-local evidence even without enrichment.
             self.remember_discovery(&models);
+        }
+        for model in &mut models {
+            model.service_modes = if self.use_public_catalog {
+                crate::catalog::model_catalog()
+                    .ok()
+                    .and_then(|catalog| {
+                        catalog
+                            .source_service_modes(self.inner.name(), &model.id)
+                            .cloned()
+                    })
+                    .map(|source| {
+                        self.service_modes_for_model(&model.id, source, model.capabilities.thinking)
+                    })
+            } else {
+                None
+            };
+            model.context_authority = Some(crate::catalog::context_choice_authority(
+                self.authority_fingerprint.as_str(),
+                &model.id,
+            ));
         }
         Ok(models)
     }
@@ -1492,6 +1644,84 @@ impl ProviderRegistry {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn service_modes_respect_actual_registry_authority_before_catalog_access() {
+        use pioneer_protocol::{NativeServiceModeSelection, ServiceModeParameters as P};
+        let mut provider = AuthorityBoundProvider {
+            inner: Arc::new(crate::providers::OpenAiProvider::new("fixture")),
+            authority_fingerprint: ProviderAuthorityFingerprint("private-a".into()),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog: false,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
+        };
+        assert!(
+            provider
+                .model_service_modes("gpt-6.1-sol")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::catalog::service::capture_plan(&provider, "gpt-6.1-sol", None)
+                .await
+                .unwrap()
+                .parameters,
+            P::Neutral
+        );
+        let choice = NativeServiceModeSelection {
+            id: "pro".into(),
+            authority: crate::catalog::context_choice_authority("private-a", "gpt-6.1-sol"),
+        };
+        assert!(
+            crate::catalog::service::capture_plan(&provider, "gpt-6.1-sol", Some(&choice))
+                .await
+                .is_err()
+        );
+        provider.use_public_catalog = true;
+        assert_eq!(
+            crate::catalog::service::capture_plan(&provider, "gpt-6.1-sol", None)
+                .await
+                .unwrap()
+                .parameters,
+            P::OpenAiStandard
+        );
+        let error = crate::catalog::service::capture_plan(&provider, "other-model", Some(&choice))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("another provider authority/model")
+        );
+        let source: pioneer_protocol::SourceServiceModes = serde_json::from_value(serde_json::json!({
+            "status":"known", "modes":{"pro":{"status":"parsed","descriptor":{
+                "id":"pro", "label":"Pro", "parameters":{"kind":"open_ai_pro"},
+                "source_provider":"openai", "source_model":"fixture", "source_api":"openai-responses"
+            }}}
+        })).unwrap();
+        for (model, reasoning, supported) in [
+            ("gpt-6.1-sol", Some(true), true),
+            ("gpt-6.1-sol", Some(false), false),
+            ("gpt-audio", Some(true), false),
+        ] {
+            let pioneer_protocol::SourceServiceModes::Known(modes) =
+                provider.service_modes_for_model(model, source.clone(), reasoning)
+            else {
+                panic!("expected source map")
+            };
+            assert_eq!(
+                matches!(
+                    modes["pro"],
+                    pioneer_protocol::SourceServiceMode::Parsed { .. }
+                ),
+                supported
+            );
+        }
+    }
     use super::*;
     use crate::providers::EchoProvider;
     use crate::{ProviderTermination, TokenUsage};
@@ -1534,6 +1764,8 @@ mod tests {
 
     fn chat_request() -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "test-model".to_owned(),
             messages: vec![crate::ChatMessage::user("hello")],
             temperature: None,
