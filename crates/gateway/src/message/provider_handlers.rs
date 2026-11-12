@@ -1464,9 +1464,9 @@ impl MessageProcessor {
 
 fn provider_model_info_to_protocol(m: ProviderModelInfo) -> ProviderModelInfo {
     ProviderModelInfo {
-        service_modes: None,
-        context_authority: None,
-        context_tiers: None,
+        service_modes: m.service_modes,
+        context_authority: m.context_authority,
+        context_tiers: m.context_tiers,
         id: m.id,
         name: m.name,
         description: m.description,
@@ -1529,6 +1529,58 @@ mod tests {
     use pioneer_protocol::{
         ArtifactBindingDirection, ArtifactBindingKind, ArtifactKind, ArtifactRole,
     };
+
+    #[test]
+    fn model_catalog_response_preserves_execution_choices() {
+        // These fields are consumed together by the model picker: losing the
+        // authority disables choices; losing the lists hides their controls.
+        let model: ProviderModelInfo = serde_json::from_value(serde_json::json!({
+            "id": "gpt-6.1-sol",
+            "provider": "openai",
+            "limits": {"context_window": 1050000},
+            "capabilities": {"chat": true},
+            "context_authority": "workspace-model-authority",
+            "context_tiers": {
+                "status": "tiered",
+                "windows": [272000, 1050000],
+                "price_order_confirmed": true
+            },
+            "service_modes": {
+                "status": "known",
+                "modes": {
+                    "priority": {
+                        "status": "parsed",
+                        "descriptor": {
+                            "id": "priority",
+                            "label": "Priority",
+                            "parameters": {"kind": "open_ai_tier", "tier": "priority"},
+                            "source_provider": "openai",
+                            "source_model": "gpt-6.1-sol",
+                            "source_api": "openai-responses"
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("model discovery fixture");
+        let response = ProviderListModelsResponse {
+            provider: "openai".into(),
+            models: vec![provider_model_info_to_protocol(model)],
+        };
+        let wire = serde_json::to_value(response).expect("serialize model catalog response");
+        let model = &wire["models"][0];
+        assert_eq!(model["context_authority"], "workspace-model-authority");
+        assert_eq!(model["context_tiers"]["status"], "tiered");
+        assert_eq!(
+            model["context_tiers"]["windows"],
+            serde_json::json!([272000, 1050000])
+        );
+        assert_eq!(model["context_tiers"]["price_order_confirmed"], true);
+        assert_eq!(
+            model["service_modes"]["modes"]["priority"]["descriptor"]["parameters"],
+            serde_json::json!({"kind": "open_ai_tier", "tier": "priority"})
+        );
+    }
 
     fn history_artifact_ref(role: ArtifactRole) -> ConversationArtifactRef {
         ConversationArtifactRef {
