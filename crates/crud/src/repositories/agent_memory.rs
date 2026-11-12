@@ -48,11 +48,7 @@ pub async fn insert_memory_record<C: ConnectionTrait>(
         confidence: Set(record.confidence),
         importance: Set(record.importance),
         content_preview: Set(record.content_preview),
-        capsule_id: Set(record.capsule_id),
-        capsule_ref: Set(record.capsule_ref),
-        frame_id: Set(record.frame_id),
-        frame_uri: Set(record.frame_uri),
-        frame_version: Set(record.frame_version),
+        payload_version: Set(record.payload_version),
         source_context_kind: Set(record
             .source_context_kind
             .map(memory_source_context_kind_to_db)
@@ -118,11 +114,7 @@ pub async fn upsert_active_memory_record<C: ConnectionTrait>(
         confidence: Set(record.confidence),
         importance: Set(record.importance),
         content_preview: Set(record.content_preview),
-        capsule_id: Set(record.capsule_id),
-        capsule_ref: Set(record.capsule_ref),
-        frame_id: Set(record.frame_id),
-        frame_uri: Set(record.frame_uri),
-        frame_version: Set(record.frame_version),
+        payload_version: Set(record.payload_version),
         source_context_kind: Set(record
             .source_context_kind
             .map(memory_source_context_kind_to_db)
@@ -162,11 +154,7 @@ pub async fn upsert_active_memory_record<C: ConnectionTrait>(
             agent_memory::Column::Confidence,
             agent_memory::Column::Importance,
             agent_memory::Column::ContentPreview,
-            agent_memory::Column::CapsuleId,
-            agent_memory::Column::CapsuleRef,
-            agent_memory::Column::FrameId,
-            agent_memory::Column::FrameUri,
-            agent_memory::Column::FrameVersion,
+            agent_memory::Column::PayloadVersion,
             agent_memory::Column::SourceContextKind,
             agent_memory::Column::SourceThreadId,
             agent_memory::Column::SourceTurnId,
@@ -309,13 +297,11 @@ pub async fn list_memory_record_page<C: ConnectionTrait>(
     .await
 }
 
-async fn list_memory_records_ordered<C: ConnectionTrait>(
-    db: &C,
+fn memory_records_query(
     filter: AgentMemoryListFilter,
     resolved_scopes: Vec<MemoryScopeResolution>,
     now: DateTimeWithTimeZone,
-    order: MemoryListOrder,
-) -> Result<Vec<agent_memory::Model>> {
+) -> Result<sea_orm::Select<agent_memory::Entity>> {
     let mut query = agent_memory::Entity::find();
 
     if !resolved_scopes.is_empty() {
@@ -397,6 +383,18 @@ async fn list_memory_records_ordered<C: ConnectionTrait>(
     if let Some(limit) = filter.limit {
         query = query.limit(limit);
     }
+
+    Ok(query)
+}
+
+async fn list_memory_records_ordered<C: ConnectionTrait>(
+    db: &C,
+    filter: AgentMemoryListFilter,
+    resolved_scopes: Vec<MemoryScopeResolution>,
+    now: DateTimeWithTimeZone,
+    order: MemoryListOrder,
+) -> Result<Vec<agent_memory::Model>> {
+    let mut query = memory_records_query(filter, resolved_scopes, now)?;
 
     let query = match order {
         MemoryListOrder::Inventory { before } => {
@@ -578,4 +576,218 @@ fn workspace_guard_condition(guard: &MemoryWorkspaceGuard) -> Condition {
                         .eq(memory_scope_kind_to_db(MemoryScopeKind::Agent)),
                 )
         }))
+}
+
+/// The payload is storage owned by MemoryService's existing backend protocol.
+/// It is deliberately separate from control rows: put precedes policy/control
+/// publication, and uncommitted payloads must never appear in product search.
+pub async fn put_payload<C: ConnectionTrait>(
+    db: &C,
+    memory_id: &str,
+    scope_kind: &str,
+    scope_key_hash: &str,
+    content: &str,
+) -> Result<i64> {
+    use pioneer_entity::agent_memory_payloads as payload;
+    if let Some(previous) = payload::Entity::find_by_id(memory_id).one(db).await? {
+        anyhow::ensure!(
+            previous.scope_kind == scope_kind && previous.scope_key_hash == scope_key_hash,
+            "memory payload ownership mismatch"
+        );
+    }
+    payload::Entity::insert(payload::ActiveModel {
+        memory_id: Set(memory_id.to_owned()),
+        scope_kind: Set(scope_kind.to_owned()),
+        scope_key_hash: Set(scope_key_hash.to_owned()),
+        content: Set(content.to_owned()),
+        revision: Set(1),
+    })
+    .on_conflict(
+        OnConflict::column(payload::Column::MemoryId)
+            .update_column(payload::Column::Content)
+            .value(
+                payload::Column::Revision,
+                Expr::col(payload::Column::Revision).add(1),
+            )
+            .to_owned(),
+    )
+    .exec(db)
+    .await?;
+    Ok(payload::Entity::find_by_id(memory_id)
+        .one(db)
+        .await?
+        .context("written memory payload missing")?
+        .revision)
+}
+
+pub async fn get_payload<C: ConnectionTrait>(
+    db: &C,
+    memory_id: &str,
+    scope_kind: &str,
+    scope_key_hash: &str,
+) -> Result<Option<pioneer_entity::agent_memory_payloads::Model>> {
+    use pioneer_entity::agent_memory_payloads as payload;
+    Ok(payload::Entity::find_by_id(memory_id)
+        .filter(payload::Column::ScopeKind.eq(scope_kind))
+        .filter(payload::Column::ScopeKeyHash.eq(scope_key_hash))
+        .one(db)
+        .await?)
+}
+
+pub async fn delete_payload<C: ConnectionTrait>(
+    db: &C,
+    memory_id: &str,
+    scope_kind: &str,
+    scope_key_hash: &str,
+) -> Result<bool> {
+    use pioneer_entity::agent_memory_payloads as payload;
+    Ok(payload::Entity::delete_many()
+        .filter(payload::Column::MemoryId.eq(memory_id))
+        .filter(payload::Column::ScopeKind.eq(scope_kind))
+        .filter(payload::Column::ScopeKeyHash.eq(scope_key_hash))
+        .exec(db)
+        .await?
+        .rows_affected
+        != 0)
+}
+
+pub async fn search_payloads<C: ConnectionTrait>(
+    db: &C,
+    query: &str,
+    mut filter: AgentMemoryListFilter,
+    resolved_scopes: Vec<MemoryScopeResolution>,
+    sensitivities: &[pioneer_protocol::MemorySensitivity],
+    now_unix: i64,
+    limit: u32,
+) -> Result<Vec<(String, String)>> {
+    use sea_orm::{DbBackend, QueryTrait, Statement, Value};
+    if resolved_scopes.is_empty() || limit == 0 || sensitivities.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Eligibility is the existing control-plane filter, evaluated before rank
+    // and LIMIT, with the same ownership and source-provenance rules as listing.
+    filter.limit = None;
+    let eligible = memory_records_query(filter, resolved_scopes, unix_to_datetime(now_unix))?
+        .select_only()
+        .column(agent_memory::Column::Id)
+        .filter(
+            agent_memory::Column::Sensitivity.is_in(
+                sensitivities
+                    .iter()
+                    .map(|value| memory_sensitivity_to_db(*value)),
+            ),
+        )
+        .filter(
+            agent_memory::Column::Id.not_in_subquery(
+                pioneer_entity::agent_memory_quarantine::Entity::find()
+                    .select_only()
+                    .column(pioneer_entity::agent_memory_quarantine::Column::MemoryId)
+                    .filter(pioneer_entity::agent_memory_quarantine::Column::ResolvedAt.is_null())
+                    .into_query(),
+            ),
+        );
+    let eligible = eligible.build(DbBackend::Sqlite);
+    let mut values: Vec<Value> = vec![query.to_owned().into()];
+    values.extend(eligible.values.map(|values| values.0).unwrap_or_default());
+    values.push(i64::from(std::cmp::min(limit, 1000)).into());
+    values.push(query.to_owned().into());
+    // MATCH and rank have no Entity/SeaQuery search representation. The ordinary
+    // eligibility subquery stays typed; only this FTS operation uses raw SQL.
+    let sql = format!(
+        "WITH ranked_payloads AS MATERIALIZED (
+        SELECT p.memory_id, p.rowid AS payload_rowid, bm25(agent_memory_fts) AS rank FROM agent_memory_fts
+        JOIN agent_memory_payloads p ON p.rowid = agent_memory_fts.rowid
+        JOIN agent_memory m ON m.id = p.memory_id
+        WHERE agent_memory_fts MATCH pioneer_fts_literal(?) AND m.id IN ({})
+        AND m.scope_kind = p.scope_kind AND m.scope_key_hash = p.scope_key_hash
+        ORDER BY rank, p.memory_id LIMIT ?)
+        SELECT h.memory_id, substr((SELECT snippet(agent_memory_fts,0,'','','…',8)
+            FROM agent_memory_fts WHERE rowid=h.payload_rowid
+            AND agent_memory_fts MATCH pioneer_fts_literal(?)),1,240) AS content
+        FROM ranked_payloads h ORDER BY h.rank,h.memory_id",
+        eligible.sql
+    );
+    db.query_all_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .await?
+    .into_iter()
+    .map(|row| Ok((row.try_get("", "memory_id")?, row.try_get("", "content")?)))
+    .collect()
+}
+
+/// Discovery for the one-time pre-SQLite payload reset. The migration marker's
+/// timestamp bounds the old contour; a concurrent new SQLite payload excludes
+/// its control row again at the commit boundary.
+pub async fn legacy_payloadless_ids<C: ConnectionTrait>(
+    db: &C,
+    through: DateTimeWithTimeZone,
+    after: Option<&str>,
+) -> Result<Vec<String>> {
+    use sea_orm::QueryTrait;
+    let mut query = agent_memory::Entity::find()
+        .select_only()
+        .column(agent_memory::Column::Id)
+        .filter(agent_memory::Column::CreatedAt.lte(through))
+        .filter(
+            agent_memory::Column::Id.not_in_subquery(
+                pioneer_entity::agent_memory_payloads::Entity::find()
+                    .select_only()
+                    .column(pioneer_entity::agent_memory_payloads::Column::MemoryId)
+                    .into_query(),
+            ),
+        );
+    if let Some(after) = after {
+        query = query.filter(agent_memory::Column::Id.gt(after));
+    }
+    Ok(query
+        .order_by_asc(agent_memory::Column::Id)
+        .limit(64)
+        .into_tuple::<String>()
+        .all(db)
+        .await?)
+}
+
+pub async fn retire_legacy_payloadless_record<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    through: DateTimeWithTimeZone,
+    now: DateTimeWithTimeZone,
+) -> Result<()> {
+    let Some(row) = agent_memory::Entity::find_by_id(id).one(db).await? else {
+        return Ok(());
+    };
+    if row.created_at > through
+        || pioneer_entity::agent_memory_payloads::Entity::find_by_id(id)
+            .one(db)
+            .await?
+            .is_some()
+    {
+        return Ok(());
+    }
+    // FK enforcement is disabled: release the obsolete canonical-key binding
+    // explicitly, without touching sources, quality history or canonical turns.
+    pioneer_entity::agent_memory_identity::Entity::delete_many()
+        .filter(pioneer_entity::agent_memory_identity::Column::MemoryId.eq(id))
+        .exec(db)
+        .await?;
+    mark_memory_deleted(
+        db,
+        id,
+        None,
+        Some("derived_memory_storage_reset".to_owned()),
+        now,
+    )
+    .await?;
+    agent_memory::Entity::update_many()
+        .col_expr(
+            agent_memory::Column::ContentPreview,
+            Expr::value(None::<String>),
+        )
+        .filter(agent_memory::Column::Id.eq(id))
+        .exec(db)
+        .await?;
+    Ok(())
 }

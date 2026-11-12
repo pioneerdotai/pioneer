@@ -14,7 +14,6 @@ pub use super::agent_execution_resource_state::Entity as AgentExecutionResourceS
 pub use super::agent_identity::Entity as AgentIdentity;
 pub use super::agent_memory::Entity as AgentMemory;
 pub use super::agent_memory_candidate::Entity as AgentMemoryCandidate;
-pub use super::agent_memory_capsule::Entity as AgentMemoryCapsule;
 pub use super::agent_memory_event::Entity as AgentMemoryEvent;
 pub use super::agent_memory_identity::Entity as AgentMemoryIdentity;
 pub use super::agent_memory_policy_decision::Entity as AgentMemoryPolicyDecision;
@@ -162,7 +161,6 @@ pub use super::thread::Entity as Thread;
 pub use super::thread_agents_doc::Entity as ThreadAgentsDoc;
 pub use super::thread_agents_doc_revision::Entity as ThreadAgentsDocRevision;
 pub use super::thread_cli_runtime_binding::Entity as ThreadCliRuntimeBinding;
-pub use super::thread_episodic_capsules::Entity as ThreadEpisodicCapsules;
 pub use super::thread_episodic_embedding_artifacts::Entity as ThreadEpisodicEmbeddingArtifacts;
 pub use super::thread_episodic_exclusions::Entity as ThreadEpisodicExclusions;
 pub use super::thread_episodic_index_jobs::Entity as ThreadEpisodicIndexJobs;
@@ -221,5 +219,6 @@ pub use super::portable_payload_block::Entity as PortablePayloadBlock;
 pub use super::task_child_reconcile_pending::Entity as TaskChildReconcilePending;
 pub use super::task_child_reconcile_scope::Entity as TaskChildReconcileScope;
 
+pub use super::agent_memory_payloads::Entity as AgentMemoryPayloads;
 pub use super::execution_observation::Entity as ExecutionObservation;
 pub use super::execution_tariff::Entity as ExecutionTariff;

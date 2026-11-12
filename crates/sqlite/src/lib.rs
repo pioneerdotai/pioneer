@@ -58,6 +58,7 @@ impl SqliteAdmissionSnapshot {
     }
 }
 
+pub mod search;
 pub mod zstd;
 
 pub const DEFAULT_LOCK_RETRY_ATTEMPTS: usize = 5;

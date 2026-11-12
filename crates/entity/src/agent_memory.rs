@@ -30,13 +30,7 @@ pub struct Model {
     pub importance: f64,
     #[sea_orm(column_type = "Text", nullable)]
     pub content_preview: Option<String>,
-    pub capsule_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub capsule_ref: Option<String>,
-    pub frame_id: Option<i64>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub frame_uri: Option<String>,
-    pub frame_version: i64,
+    pub payload_version: i64,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
     pub source_item_id: Option<String>,

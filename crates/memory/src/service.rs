@@ -86,7 +86,6 @@ const REPAIR_JOB_BACKEND_DELETE_FAILED: &str = "backend_delete_failed";
 const REPAIR_JOB_BACKEND_STALE_PAYLOAD: &str = "backend_stale_payload";
 const REPAIR_JOB_BACKEND_QUARANTINE_CLEANUP: &str = "backend_quarantine_cleanup";
 const REPAIR_JOB_BACKEND_REINDEX: &str = "backend_restore_reindex";
-const REPAIR_JOB_MEMVID_STALE_VECTOR: &str = "memvid_stale_vector";
 const REPAIR_PRIORITY_DEFAULT: i64 = 10;
 const REPAIR_MAX_ATTEMPTS_DEFAULT: i32 = 3;
 const POLICY_ACTION_SEMANTIC_WRITE: &str = "semantic_write";
@@ -119,6 +118,18 @@ impl MemoryService {
             policy,
             candidate_policy,
         }
+    }
+
+    /// Pass one scoped view through an entire background operation. This
+    /// shares the existing backend/storage and creates no service owner/worker.
+    pub fn with_maintenance_access(&self) -> Self {
+        Self::new(
+            Arc::new(self.store.with_maintenance_access()),
+            self.backend
+                .with_maintenance_access()
+                .unwrap_or_else(|| self.backend.clone()),
+            self.config.clone(),
+        )
     }
 
     pub fn with_noop_backend(store: Arc<CrudStore>) -> Self {
@@ -289,7 +300,7 @@ impl MemoryService {
             status: MemoryStatus::Active,
             idempotency_key: params.idempotency_key.clone(),
         };
-        let backend_result = match self.backend.put(backend_request).await {
+        let backend_result = match self.backend.prepare_put(backend_request).await {
             Ok(result) => result,
             Err(error) => {
                 let error_message = error.to_string();
@@ -319,11 +330,7 @@ impl MemoryService {
             confidence: prepared.confidence,
             importance: prepared.importance,
             content_preview: content_preview(&prepared.content, self.config.content_preview_chars),
-            capsule_id: backend_result.capsule_id,
-            capsule_ref: backend_result.capsule_ref,
-            frame_id: backend_result.frame_id,
-            frame_uri: backend_result.frame_uri,
-            frame_version: backend_result.frame_version,
+            payload_version: backend_result.payload_version,
             source_context_kind,
             source_thread_id: provenance.source_thread_id.clone(),
             source_turn_id: provenance.source_turn_id.clone(),
@@ -336,12 +343,13 @@ impl MemoryService {
 
         let unpublished_payload = BackendDeleteRequest {
             memory_id: memory_id.clone(),
-            scope: params.scope.clone(),
+            // Hash-addressed cleanup must recheck a late committed owner under
+            // the same writer transaction as DELETE, not trust this snapshot.
+            scope: MemoryScope {
+                kind: params.scope.kind,
+                key: String::new(),
+            },
             scope_key_hash: Some(resolved_scope.scope_key_hash.clone()),
-            capsule_id: new_record.capsule_id.clone(),
-            capsule_ref: new_record.capsule_ref.clone(),
-            frame_id: new_record.frame_id,
-            frame_uri: new_record.frame_uri.clone(),
         };
         let publication = self
             .store
@@ -350,6 +358,8 @@ impl MemoryService {
                 existing.as_ref().map(|row| row.id.clone()),
                 params.supersedes.clone(),
                 canonical_identity,
+                backend_result.publication_guard,
+                backend_result.publication_content,
                 now,
             )
             .await;
@@ -1634,7 +1644,7 @@ impl MemoryService {
         params: MemorySearchParams,
     ) -> Result<MemorySearchResponse> {
         let query = params.query.trim();
-        let backend_query = normalize_backend_search_query(query);
+        let backend_query = query.to_owned();
         if backend_query.is_empty() {
             bail!("memory search query cannot be empty");
         }
@@ -1649,6 +1659,30 @@ impl MemoryService {
         let backend_hits = self
             .backend
             .search(BackendSearchRequest {
+                filter: AgentMemoryListFilter {
+                    scopes: active_scopes.scopes.clone(),
+                    workspace_guard: context.workspace_guard(),
+                    namespace: None,
+                    key: None,
+                    categories: params.categories.clone(),
+                    statuses: params.statuses.clone(),
+                    include_expired: params.statuses.contains(&MemoryStatus::Expired),
+                    include_deleted: params.statuses.contains(&MemoryStatus::Deleted),
+                    include_superseded: params.statuses.contains(&MemoryStatus::Superseded),
+                    allowed_source_thread_ids: context.accessible_source_thread_ids(),
+                    owned_scopes: context.source_access.owned_scopes(),
+                    limit: None,
+                },
+                allowed_sensitivities: [
+                    MemorySensitivity::Normal,
+                    MemorySensitivity::Personal,
+                    MemorySensitivity::SecretLike,
+                    MemorySensitivity::Regulated,
+                ]
+                .into_iter()
+                .filter(|value| self.policy.read_policy(&context).allows(*value))
+                .collect(),
+                now_unix: now,
                 query: backend_query,
                 scopes: active_scopes.scopes.clone(),
                 resolved_scopes,
@@ -1657,11 +1691,8 @@ impl MemoryService {
             .await
             .context("failed to search memory backend")?;
 
-        let backend_returned_any = !backend_hits.is_empty();
         let mut candidates = Vec::new();
-        let mut seen_memory_ids = BTreeSet::new();
         for hit in backend_hits {
-            seen_memory_ids.insert(hit.memory_id.clone());
             let Some(row) = self
                 .store
                 .get_agent_memory_record(hit.memory_id.as_str(), true)
@@ -1695,54 +1726,6 @@ impl MemoryService {
                 recency_anchor_unix,
                 quality,
             });
-        }
-        if candidates.is_empty() && !backend_returned_any {
-            let fallback_rows = self
-                .store
-                .list_agent_memory_records(AgentMemoryListFilter {
-                    scopes: active_scopes.scopes.clone(),
-                    workspace_guard: context.workspace_guard(),
-                    namespace: None,
-                    key: None,
-                    categories: params.categories.clone(),
-                    statuses: params.statuses.clone(),
-                    include_expired: params.statuses.contains(&MemoryStatus::Expired),
-                    include_deleted: params.statuses.contains(&MemoryStatus::Deleted),
-                    include_superseded: params.statuses.contains(&MemoryStatus::Superseded),
-                    allowed_source_thread_ids: context.accessible_source_thread_ids(),
-                    owned_scopes: context.source_access.owned_scopes(),
-                    limit: Some(backend_limit as u64),
-                })
-                .await?;
-            for row in fallback_rows {
-                if seen_memory_ids.contains(row.id.as_str()) {
-                    continue;
-                }
-                let Some(fallback_hit) =
-                    control_plane_fallback_hit(&row, query, &params.categories)
-                else {
-                    continue;
-                };
-                let recency_anchor_unix = recency_anchor_unix(&row);
-                let Some((record, quality)) = self
-                    .hydrate_visible_row_with_quality(row, &context, &params.statuses, now, true)
-                    .await?
-                else {
-                    continue;
-                };
-                let backend_score = fallback_hit.score;
-                candidates.push(MemoryRankingCandidate {
-                    hit: MemorySearchHit {
-                        record,
-                        score: backend_score,
-                        snippet: fallback_hit.snippet,
-                        matched_terms: fallback_hit.matched_terms,
-                    },
-                    backend_score,
-                    recency_anchor_unix,
-                    quality,
-                });
-            }
         }
         let hits = rank_memory_search_hits(
             candidates,
@@ -2436,9 +2419,7 @@ impl MemoryService {
         }
 
         let result = match job.job_kind.as_str() {
-            REPAIR_JOB_BACKEND_STALE_PAYLOAD | REPAIR_JOB_MEMVID_STALE_VECTOR => {
-                self.process_stale_backend_repair(&job).await
-            }
+            REPAIR_JOB_BACKEND_STALE_PAYLOAD => self.process_stale_backend_repair(&job).await,
             REPAIR_JOB_BACKEND_DELETE_FAILED | REPAIR_JOB_BACKEND_QUARANTINE_CLEANUP => {
                 self.process_backend_delete_repair(&job).await
             }
@@ -2851,6 +2832,7 @@ impl MemoryService {
         let payload = match self.backend.get(backend_get_request(&row)).await? {
             Some(payload) => payload,
             None if row.status == MemoryStatus::Deleted => BackendPayload {
+                durable_revision: None,
                 memory_id: row.id.clone(),
                 content: row.content_preview.clone().unwrap_or_default(),
                 snippet: row.content_preview.clone(),
@@ -2945,6 +2927,7 @@ impl MemoryService {
         let payload = match self.backend.get(backend_get_request(&row)).await? {
             Some(payload) => payload,
             None if row.status == MemoryStatus::Deleted => BackendPayload {
+                durable_revision: None,
                 memory_id: row.id.clone(),
                 content: row.content_preview.clone().unwrap_or_default(),
                 snippet: row.content_preview.clone(),
@@ -3069,8 +3052,6 @@ impl MemoryService {
             "memory_id": row.id,
             "operation": operation,
             "error": error,
-            "capsule_ref": row.capsule_ref,
-            "frame_uri": row.frame_uri,
         })
         .to_string();
         self.enqueue_repair_job(
@@ -3080,7 +3061,6 @@ impl MemoryService {
                 scope_kind: Some(row.scope.kind),
                 scope_key_hash: Some(row.scope_key_hash.clone()),
                 memory_id: Some(row.id.clone()),
-                capsule_id: row.capsule_id.clone(),
                 priority: REPAIR_PRIORITY_DEFAULT,
                 max_attempts: REPAIR_MAX_ATTEMPTS_DEFAULT,
                 scheduled_at_unix: now,
@@ -3109,7 +3089,6 @@ impl MemoryService {
                 scope_kind: None,
                 scope_key_hash: None,
                 memory_id: Some(memory_id.to_owned()),
-                capsule_id: None,
                 priority: REPAIR_PRIORITY_DEFAULT,
                 max_attempts: REPAIR_MAX_ATTEMPTS_DEFAULT,
                 scheduled_at_unix: now,
@@ -3129,8 +3108,6 @@ impl MemoryService {
         let payload_json = serde_json::json!({
             "memory_id": row.id,
             "operation": operation,
-            "capsule_ref": row.capsule_ref,
-            "frame_uri": row.frame_uri,
         })
         .to_string();
         self.enqueue_repair_job(
@@ -3140,7 +3117,6 @@ impl MemoryService {
                 scope_kind: Some(row.scope.kind),
                 scope_key_hash: Some(row.scope_key_hash.clone()),
                 memory_id: Some(row.id.clone()),
-                capsule_id: row.capsule_id.clone(),
                 priority: REPAIR_PRIORITY_DEFAULT,
                 max_attempts: REPAIR_MAX_ATTEMPTS_DEFAULT,
                 scheduled_at_unix: now,
@@ -3159,8 +3135,20 @@ impl MemoryService {
             .memory_id
             .as_deref()
             .context("stale backend repair job missing memory id")?;
+        if self
+            .store
+            .get_agent_memory_record(memory_id, true)
+            .await?
+            .is_some()
+        {
+            return Ok(
+                serde_json::json!({"kind":job.job_kind,"action":"retained_published_owner"})
+                    .to_string(),
+            );
+        }
+        // The durable adapter repeats this ownership test with DELETE atomically.
         self.backend
-            .delete(backend_delete_request_from_repair_job(job, memory_id))
+            .delete(backend_delete_request_from_repair_job(job, memory_id)?)
             .await?;
         Ok(serde_json::json!({
             "kind": job.job_kind,
@@ -3180,7 +3168,7 @@ impl MemoryService {
             .context("backend delete repair job missing memory id")?;
         let Some(row) = self.store.get_agent_memory_record(memory_id, true).await? else {
             self.backend
-                .delete(backend_delete_request_from_repair_job(job, memory_id))
+                .delete(backend_delete_request_from_repair_job(job, memory_id)?)
                 .await?;
             return Ok(serde_json::json!({
                 "kind": job.job_kind,
@@ -3189,6 +3177,22 @@ impl MemoryService {
             })
             .to_string());
         };
+        if job.scope_kind.is_some_and(|kind| kind != row.scope.kind)
+            || job
+                .scope_key_hash
+                .as_deref()
+                .is_some_and(|hash| hash != row.scope_key_hash)
+        {
+            bail!("repair job payload ownership does not match current owner");
+        }
+        if row.status == MemoryStatus::Active && !self.row_is_quarantined(memory_id).await? {
+            return Ok(
+                serde_json::json!({"kind":job.job_kind,"action":"retained_active_owner"})
+                    .to_string(),
+            );
+        }
+        // The durable adapter rechecks lifecycle with DELETE; a restore racing
+        // this snapshot must preserve the now-active, non-quarantined payload.
         self.backend.delete(backend_delete_request(&row)).await?;
         Ok(serde_json::json!({
             "kind": job.job_kind,
@@ -3232,16 +3236,19 @@ impl MemoryService {
             .to_string());
         }
 
-        self.backend.put(backend_put_request_from_row(&row)).await?;
-        if row.repair_status != REPAIR_STATUS_OK {
-            self.store
-                .mark_agent_memory_repair_status(row.id.as_str(), REPAIR_STATUS_OK, now)
-                .await?;
-        }
+        let Some(payload) = self.backend.get(backend_get_request(&row)).await? else {
+            self.mark_missing_backend_payload(&row, now).await?;
+            bail!("full memory payload unavailable; preview cannot restore the original");
+        };
+        // Storage projections follow full payload writes transactionally. Reindex
+        // is validation, never a put of a control-plane preview.
+        self.store
+            .confirm_agent_memory_payload_repair(&row, payload.durable_revision, now)
+            .await?;
         Ok(serde_json::json!({
             "kind": job.job_kind,
             "memory_id": memory_id,
-            "action": "backend_reindex_attempted"
+            "action": "full_payload_verified"
         })
         .to_string())
     }
@@ -3391,7 +3398,6 @@ impl MemoryService {
                 scope: scope.scope,
                 scope_key_hash: scope.scope_key_hash,
                 workspace_id: scope.workspace_id,
-                capsule_ref: None,
             })
             .collect())
     }
@@ -3502,101 +3508,6 @@ impl MemoryService {
             .min(self.config.max_limit)
             .max(final_limit)
     }
-}
-
-fn normalize_backend_search_query(value: &str) -> String {
-    let mut normalized = String::new();
-    for ch in value.chars() {
-        if ch.is_alphanumeric() {
-            normalized.push(ch);
-        } else {
-            normalized.push(' ');
-        }
-    }
-    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn control_plane_fallback_hit(
-    row: &AgentMemoryControlRecord,
-    query: &str,
-    requested_categories: &[MemoryCategory],
-) -> Option<MemorySearchHit> {
-    let normalized_query = normalize_lexical_text(query);
-    if normalized_query.is_empty() {
-        return None;
-    }
-    let query_terms = normalized_query
-        .split_whitespace()
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>();
-    let haystack = normalize_lexical_text(
-        format!(
-            "{} {} {:?} {:?} {}",
-            row.content_preview.as_deref().unwrap_or_default(),
-            row.key.as_deref().unwrap_or_default(),
-            row.category,
-            row.sensitivity,
-            row.namespace
-        )
-        .as_str(),
-    );
-    let matched_terms = query_terms
-        .iter()
-        .filter(|term| haystack.contains(**term))
-        .map(|term| (*term).to_owned())
-        .collect::<Vec<_>>();
-    let category_match =
-        !requested_categories.is_empty() && requested_categories.contains(&row.category);
-    let key_match = row
-        .key
-        .as_deref()
-        .map(normalize_lexical_text)
-        .is_some_and(|key| {
-            !key.is_empty()
-                && (normalized_query == key
-                    || normalized_query
-                        .split_whitespace()
-                        .any(|token| token == key))
-        });
-    let score = if haystack.contains(normalized_query.as_str()) {
-        0.45
-    } else if !query_terms.is_empty() && matched_terms.len() == query_terms.len() {
-        0.35
-    } else if !matched_terms.is_empty() || category_match || key_match {
-        0.25
-    } else {
-        return None;
-    };
-
-    Some(MemorySearchHit {
-        record: crud_record_to_protocol(
-            row.clone(),
-            BackendPayload {
-                memory_id: row.id.clone(),
-                content: row.content_preview.clone().unwrap_or_default(),
-                snippet: row.content_preview.clone(),
-                metadata_json: None,
-            },
-        )
-        .ok()?,
-        score: Some(score),
-        snippet: row.content_preview.clone(),
-        matched_terms,
-    })
-}
-
-fn normalize_lexical_text(value: &str) -> String {
-    let mut normalized = String::new();
-    for ch in value.chars() {
-        if ch.is_alphanumeric() {
-            for lower in ch.to_lowercase() {
-                normalized.push(lower);
-            }
-        } else {
-            normalized.push(' ');
-        }
-    }
-    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn sensitivity_from_hint(hint: MemorySensitivityHint) -> MemorySensitivity {
@@ -3975,31 +3886,6 @@ fn backend_get_request(row: &AgentMemoryControlRecord) -> BackendGetRequest {
         memory_id: row.id.clone(),
         scope: row.scope.clone(),
         scope_key_hash: Some(row.scope_key_hash.clone()),
-        capsule_id: row.capsule_id.clone(),
-        capsule_ref: row.capsule_ref.clone(),
-        frame_id: row.frame_id,
-        frame_uri: row.frame_uri.clone(),
-    }
-}
-
-fn backend_put_request_from_row(row: &AgentMemoryControlRecord) -> BackendPutRequest {
-    BackendPutRequest {
-        memory_id: row.id.clone(),
-        scope: row.scope.clone(),
-        namespace: Some(row.namespace.clone()),
-        category: row.category,
-        key: row.key.clone(),
-        content: row.content_preview.clone().unwrap_or_default(),
-        sensitivity: row.sensitivity,
-        metadata_json: row.metadata_json.clone(),
-        source_thread_id: row.source_thread_id.clone(),
-        source_turn_id: row.source_turn_id.clone(),
-        source_item_id: row.source_item_id.clone(),
-        created_by_kind: row.created_by.as_ref().map(|actor| actor.kind),
-        created_by_id: row.created_by.as_ref().and_then(|actor| actor.id.clone()),
-        policy_version: row.policy_version.clone().unwrap_or_default(),
-        status: row.status,
-        idempotency_key: None,
     }
 }
 
@@ -4008,29 +3894,29 @@ fn backend_delete_request(row: &AgentMemoryControlRecord) -> BackendDeleteReques
         memory_id: row.id.clone(),
         scope: row.scope.clone(),
         scope_key_hash: Some(row.scope_key_hash.clone()),
-        capsule_id: row.capsule_id.clone(),
-        capsule_ref: row.capsule_ref.clone(),
-        frame_id: row.frame_id,
-        frame_uri: row.frame_uri.clone(),
     }
 }
 
 fn backend_delete_request_from_repair_job(
     job: &AgentMemoryRepairJobRecord,
     memory_id: &str,
-) -> BackendDeleteRequest {
-    BackendDeleteRequest {
+) -> Result<BackendDeleteRequest> {
+    let kind = job
+        .scope_kind
+        .context("repair payload scope kind missing")?;
+    let hash = job
+        .scope_key_hash
+        .clone()
+        .filter(|hash| !hash.is_empty())
+        .context("repair payload scope hash missing")?;
+    Ok(BackendDeleteRequest {
         memory_id: memory_id.to_owned(),
         scope: MemoryScope {
-            kind: job.scope_kind.unwrap_or(MemoryScopeKind::User),
-            key: "repair".to_owned(),
+            kind,
+            key: String::new(),
         },
-        scope_key_hash: job.scope_key_hash.clone(),
-        capsule_id: job.capsule_id.clone(),
-        capsule_ref: None,
-        frame_id: None,
-        frame_uri: None,
-    }
+        scope_key_hash: Some(hash),
+    })
 }
 
 fn bounded_error_message(message: &str) -> String {

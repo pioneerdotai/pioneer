@@ -365,7 +365,6 @@ pub struct GatewayThreadEpisodicSettings {
     pub max_hit_chars: u32,
     pub default_max_candidates: u32,
     pub max_candidate_work: u32,
-    pub max_segments: u32,
     pub min_relevancy: f32,
     pub min_results: u32,
     pub snippet_chars: u32,
@@ -373,7 +372,6 @@ pub struct GatewayThreadEpisodicSettings {
     pub retry_base_delay_secs: i64,
     pub retry_max_delay_secs: i64,
     pub max_attempts: i64,
-    pub near_capacity_percent: f64,
     #[serde(default)]
     pub vector_search: GatewayThreadEpisodicVectorSearchSettings,
 }
@@ -389,7 +387,6 @@ impl Default for GatewayThreadEpisodicSettings {
             max_hit_chars: 1_200,
             default_max_candidates: 32,
             max_candidate_work: 128,
-            max_segments: 16,
             min_relevancy: 0.25,
             min_results: 1,
             snippet_chars: 360,
@@ -397,7 +394,6 @@ impl Default for GatewayThreadEpisodicSettings {
             retry_base_delay_secs: 30,
             retry_max_delay_secs: 900,
             max_attempts: 5,
-            near_capacity_percent: 85.0,
             vector_search: GatewayThreadEpisodicVectorSearchSettings::default(),
         }
     }
@@ -784,8 +780,6 @@ pub struct GatewayThreadEpisodicSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_candidate_work: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_segments: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_relevancy: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_results: Option<u32>,
@@ -799,8 +793,6 @@ pub struct GatewayThreadEpisodicSettingsUpdate {
     pub retry_max_delay_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_attempts: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub near_capacity_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_search: Option<GatewayThreadEpisodicVectorSearchSettingsUpdate>,
 }
@@ -1104,7 +1096,6 @@ mod tests {
                 max_hit_chars: 800,
                 default_max_candidates: 24,
                 max_candidate_work: 96,
-                max_segments: 8,
                 min_relevancy: 0.3,
                 min_results: 2,
                 snippet_chars: 280,
@@ -1112,7 +1103,6 @@ mod tests {
                 retry_base_delay_secs: 10,
                 retry_max_delay_secs: 300,
                 max_attempts: 3,
-                near_capacity_percent: 85.0,
                 vector_search: GatewayThreadEpisodicVectorSearchSettings::default(),
             },
             cli_runtimes: GatewayCliRuntimeSettings {

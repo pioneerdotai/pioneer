@@ -53,9 +53,18 @@ impl IsolatedEpic4Harness {
     }
 
     async fn with_member_foundation(populated: bool) -> anyhow::Result<Self> {
+        pioneer_sqlite::search::register_auto_extension_once()?;
         let runtime = IsolatedAuthRuntime::new()?;
         runtime.validate()?;
-        let database = Database::connect("sqlite::memory:").await?;
+        let database = Database::connect({
+            let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+            options
+                .max_connections(1)
+                .sqlx_logging(false)
+                .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
+            options
+        })
+        .await?;
         Migrator::up(&database, None).await?;
         if populated {
             materialize_member_auth_foundation(&database).await?;

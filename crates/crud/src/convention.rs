@@ -327,6 +327,11 @@ pub fn memory_lifecycle_reason_code_to_db(reason: MemoryLifecycleReasonCode) -> 
 }
 
 pub fn memory_lifecycle_reason_code_from_db(value: &str) -> Result<MemoryLifecycleReasonCode> {
+    // Preserve historical audit/quarantine records without exposing an obsolete
+    // engine-specific reason in the current product protocol.
+    if value == "memvid_stale_vector" {
+        return Ok(MemoryLifecycleReasonCode::StaleEmbeddingProjection);
+    }
     enum_from_snake_string(value, "memory lifecycle reason code")
 }
 

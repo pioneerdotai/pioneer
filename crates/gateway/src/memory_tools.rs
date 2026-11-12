@@ -1645,6 +1645,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
         );
         let active = runtime
             .service()
+            .with_maintenance_access()
             .list(
                 operation_context.clone(),
                 MemoryListParams {
@@ -1659,6 +1660,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
             })?;
         let candidates = runtime
             .service()
+            .with_maintenance_access()
             .list_candidates(
                 operation_context,
                 MemoryCandidatesListParams {
@@ -1777,6 +1779,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
         }
         let response = runtime
             .service()
+            .with_maintenance_access()
             .write_semantic_memory(operation_context.clone(), params)
             .await
             .map_err(classify_memory_write_failure)?;

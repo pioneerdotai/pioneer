@@ -1,11 +1,7 @@
 use crate::thread_episodic_embedding::{
-    ThreadEpisodicEmbeddingIdentity, ThreadEpisodicMemvidEmbedder,
+    ThreadEpisodicEmbeddingIdentity, ThreadEpisodicEmbeddingProvider,
 };
 use async_trait::async_trait;
-use memvid_core::{
-    AclEnforcementMode, DocMetadata, FrameStatus, Memvid, MemvidError, PutOptions,
-    SearchEngineKind, SearchHit, SearchHitMetadata, SearchRequest, TemporalFilter,
-};
 use pioneer_protocol::{
     ThreadEpisodicAdaptiveStrategy, ThreadEpisodicItemStatus, ThreadEpisodicScoreBreakdown,
     ThreadEpisodicSearchMode, ThreadEpisodicSourceContext, ThreadEpisodicVisibility,
@@ -14,162 +10,70 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::Mutex;
 
-const THREAD_EPISODIC_SCHEMA_VERSION: &str = "1";
-const THREAD_EPISODIC_TRACK: &str = "pioneer_thread_episodic";
-const THREAD_EPISODIC_KIND: &str = "pioneer.thread_episodic.item";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ThreadEpisodicMemvidCapabilityState {
-    Supported,
-    Disabled,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadEpisodicMemvidBackendCapabilities {
-    pub adaptive_retrieval: ThreadEpisodicMemvidCapabilityState,
-    pub adaptive_retrieval_implementation: ThreadEpisodicAdaptiveRetrievalImplementation,
-    pub semantic_search: ThreadEpisodicMemvidCapabilityState,
-    pub hybrid_search: ThreadEpisodicMemvidCapabilityState,
-    pub lexical_search: ThreadEpisodicMemvidCapabilityState,
-    pub temporal_search: ThreadEpisodicMemvidCapabilityState,
-    pub graph_search: ThreadEpisodicMemvidCapabilityState,
-}
-
-impl ThreadEpisodicMemvidBackendCapabilities {
-    pub const fn memvid_default() -> Self {
-        Self {
-            adaptive_retrieval: ThreadEpisodicMemvidCapabilityState::Supported,
-            adaptive_retrieval_implementation:
-                ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback,
-            semantic_search: ThreadEpisodicMemvidCapabilityState::Supported,
-            hybrid_search: ThreadEpisodicMemvidCapabilityState::Supported,
-            lexical_search: ThreadEpisodicMemvidCapabilityState::Supported,
-            temporal_search: ThreadEpisodicMemvidCapabilityState::Supported,
-            graph_search: ThreadEpisodicMemvidCapabilityState::Disabled,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThreadEpisodicAdaptiveRetrievalImplementation {
-    NativeMemvid,
-    PioneerFallback,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThreadEpisodicMemvidAskRetrievalMode {
+pub enum ThreadEpisodicRetrievalMode {
     Hybrid,
     Semantic,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadEpisodicMemvidFeatureAudit {
-    pub memvid_core_version: String,
-    pub enabled_features: Vec<String>,
-    pub disabled_features: Vec<String>,
-    pub adaptive_retrieval_implementation: ThreadEpisodicAdaptiveRetrievalImplementation,
-    pub graph_search_note: String,
-}
-
-impl ThreadEpisodicMemvidFeatureAudit {
-    pub fn current() -> Self {
-        Self {
-            memvid_core_version: "3.1.2".to_owned(),
-            enabled_features: vec![
-                "lex".to_owned(),
-                "temporal_track".to_owned(),
-                "simd".to_owned(),
-                "vec".to_owned(),
-            ],
-            disabled_features: vec!["api_embed".to_owned(), "logic_mesh".to_owned()],
-            adaptive_retrieval_implementation:
-                ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback,
-            graph_search_note: "logic_mesh/graph search is intentionally not enabled for thread episodic memory in this phase".to_owned(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ThreadEpisodicMemvidFailureKind {
+pub enum ThreadEpisodicSearchFailureKind {
     Retryable,
     NonRetryable,
-    CapacityExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadEpisodicMemvidError {
-    pub kind: ThreadEpisodicMemvidFailureKind,
+pub struct ThreadEpisodicSearchError {
+    pub kind: ThreadEpisodicSearchFailureKind,
     pub message: String,
 }
 
-impl ThreadEpisodicMemvidError {
+impl ThreadEpisodicSearchError {
     pub fn retryable(message: impl Into<String>) -> Self {
         Self {
-            kind: ThreadEpisodicMemvidFailureKind::Retryable,
+            kind: ThreadEpisodicSearchFailureKind::Retryable,
             message: message.into(),
         }
     }
 
     pub fn non_retryable(message: impl Into<String>) -> Self {
         Self {
-            kind: ThreadEpisodicMemvidFailureKind::NonRetryable,
-            message: message.into(),
-        }
-    }
-
-    pub fn capacity_exceeded(message: impl Into<String>) -> Self {
-        Self {
-            kind: ThreadEpisodicMemvidFailureKind::CapacityExceeded,
+            kind: ThreadEpisodicSearchFailureKind::NonRetryable,
             message: message.into(),
         }
     }
 
     pub fn is_retryable(&self) -> bool {
-        matches!(self.kind, ThreadEpisodicMemvidFailureKind::Retryable)
+        matches!(self.kind, ThreadEpisodicSearchFailureKind::Retryable)
     }
 }
 
-impl Display for ThreadEpisodicMemvidError {
+impl Display for ThreadEpisodicSearchError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{:?}: {}", self.kind, self.message)
     }
 }
 
-impl Error for ThreadEpisodicMemvidError {}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct ThreadEpisodicMemvidStats {
-    pub active_frame_count: Option<i64>,
-    pub frame_count: Option<i64>,
-    pub size_bytes: Option<i64>,
-    pub capacity_bytes: Option<i64>,
-    pub remaining_capacity_bytes: Option<i64>,
-    pub utilization_percent: Option<f64>,
-}
+impl Error for ThreadEpisodicSearchError {}
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ThreadEpisodicMemvidIndexEmbedding {
+pub struct ThreadEpisodicIndexEmbedding {
     pub identity: ThreadEpisodicEmbeddingIdentity,
     pub vector: Vec<f32>,
 }
 
-impl ThreadEpisodicMemvidIndexEmbedding {
+impl ThreadEpisodicIndexEmbedding {
     pub fn new(
         identity: ThreadEpisodicEmbeddingIdentity,
         vector: Vec<f32>,
-    ) -> Result<Self, ThreadEpisodicMemvidError> {
+    ) -> Result<Self, ThreadEpisodicSearchError> {
         if vector.len() != identity.dimension {
-            return Err(ThreadEpisodicMemvidError::non_retryable(format!(
+            return Err(ThreadEpisodicSearchError::non_retryable(format!(
                 "thread episodic embedding dimension mismatch for `{}`/`{}`: expected {}, got {}",
                 identity.provider_id,
                 identity.model,
@@ -177,39 +81,35 @@ impl ThreadEpisodicMemvidIndexEmbedding {
                 vector.len()
             )));
         }
+        if identity.dimension == 0
+            || vector.iter().any(|value| !value.is_finite())
+            || !vector.iter().any(|value| *value != 0.0)
+        {
+            return Err(ThreadEpisodicSearchError::non_retryable(
+                "invalid embedding vector",
+            ));
+        }
 
         Ok(Self { identity, vector })
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ThreadEpisodicMemvidIndexRequest {
-    pub storage_uri: String,
-    pub capsule_id: String,
-    pub capsule_ref: String,
-    pub workspace_capsule: bool,
+pub struct ThreadEpisodicIndexDocument {
+    pub workspace_id: String,
     pub index_item_id: String,
-    pub frame_uri: String,
     pub text: String,
     pub metadata: BTreeMap<String, String>,
-    pub embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
+    pub embedding: Option<ThreadEpisodicIndexEmbedding>,
 }
 
-/// Limits for prepared requests retained by one file dispatch. Large existing
-/// single-item requests keep their original path and WAL/capacity policy.
-pub const THREAD_EPISODIC_MEMVID_BATCH_ITEMS: usize = 8;
-pub const THREAD_EPISODIC_MEMVID_BATCH_BYTES: usize = 256 * 1024;
+/// Limits for prepared documents retained by one existing executor dispatch.
+pub const THREAD_EPISODIC_INDEX_BATCH_ITEMS: usize = 8;
+pub const THREAD_EPISODIC_INDEX_BATCH_BYTES: usize = 256 * 1024;
 
-impl ThreadEpisodicMemvidIndexRequest {
+impl ThreadEpisodicIndexDocument {
     pub fn prepared_bytes(&self) -> usize {
-        let strings = [
-            &self.storage_uri,
-            &self.capsule_id,
-            &self.capsule_ref,
-            &self.index_item_id,
-            &self.frame_uri,
-            &self.text,
-        ];
+        let strings = [&self.workspace_id, &self.index_item_id, &self.text];
         let mut bytes = strings
             .into_iter()
             .fold(0usize, |n, value| n.saturating_add(value.len()));
@@ -231,19 +131,13 @@ impl ThreadEpisodicMemvidIndexRequest {
     }
 
     pub fn batch_compatible(&self, other: &Self) -> bool {
-        self.storage_uri == other.storage_uri
-            && self.capsule_id == other.capsule_id
-            && self.capsule_ref == other.capsule_ref
-            && self.workspace_capsule == other.workspace_capsule
-            && self.metadata.get("pioneer.thread_episodic.workspace_id")
-                == other.metadata.get("pioneer.thread_episodic.workspace_id")
+        self.workspace_id == other.workspace_id
             && self.embedding.as_ref().map(|value| &value.identity)
                 == other.embedding.as_ref().map(|value| &value.identity)
-            && self.frame_uri != other.frame_uri
+            && self.index_item_id != other.index_item_id
     }
 
-    pub fn validate_prepared(&self) -> Result<(), ThreadEpisodicMemvidError> {
-        path_from_storage_uri(&self.storage_uri)?;
+    pub fn validate_prepared(&self) -> Result<(), ThreadEpisodicSearchError> {
         if let Some(embedding) = &self.embedding {
             validate_index_embedding(embedding)?;
         }
@@ -251,13 +145,7 @@ impl ThreadEpisodicMemvidIndexRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadEpisodicMemvidIndexOutput {
-    pub frame_id: i64,
-    pub frame_uri: String,
-    pub stats: ThreadEpisodicMemvidStats,
-    pub embedding_identity: Option<ThreadEpisodicEmbeddingIdentity>,
-}
+pub type ThreadEpisodicValidationResult = ();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -276,7 +164,6 @@ pub struct ThreadEpisodicSearchProfile {
     pub min_relevancy: f32,
     pub max_candidates: u32,
     pub min_results: u32,
-    pub max_segments: u32,
     pub snippet_chars: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_start_unix: Option<i64>,
@@ -292,7 +179,6 @@ impl ThreadEpisodicSearchProfile {
                 min_relevancy: 0.25,
                 max_candidates: 32,
                 min_results: 1,
-                max_segments: 4,
                 snippet_chars: 360,
                 recent_start_unix: None,
             },
@@ -300,10 +186,9 @@ impl ThreadEpisodicSearchProfile {
                 kind,
                 mode: ThreadEpisodicSearchMode::Lexical,
                 adaptive_strategy: ThreadEpisodicAdaptiveStrategy::Absolute,
-                min_relevancy: 0.55,
+                min_relevancy: 0.25,
                 max_candidates: 16,
                 min_results: 1,
-                max_segments: 6,
                 snippet_chars: 420,
                 recent_start_unix: None,
             },
@@ -314,7 +199,6 @@ impl ThreadEpisodicSearchProfile {
                 min_relevancy: 0.20,
                 max_candidates: 64,
                 min_results: 2,
-                max_segments: 8,
                 snippet_chars: 420,
                 recent_start_unix: None,
             },
@@ -325,39 +209,32 @@ impl ThreadEpisodicSearchProfile {
                 min_relevancy: 0.20,
                 max_candidates: 40,
                 min_results: 1,
-                max_segments: 4,
                 snippet_chars: 360,
                 recent_start_unix: None,
             },
         }
     }
 
-    pub fn validate(&self) -> Result<(), ThreadEpisodicMemvidError> {
+    pub fn validate(&self) -> Result<(), ThreadEpisodicSearchError> {
         if !(0.0..=1.0).contains(&self.min_relevancy) {
-            return Err(ThreadEpisodicMemvidError::non_retryable(format!(
+            return Err(ThreadEpisodicSearchError::non_retryable(format!(
                 "thread episodic min_relevancy {} must be in 0..=1",
                 self.min_relevancy
             )));
         }
         if self.max_candidates == 0 || self.max_candidates > 256 {
-            return Err(ThreadEpisodicMemvidError::non_retryable(format!(
+            return Err(ThreadEpisodicSearchError::non_retryable(format!(
                 "thread episodic max_candidates {} must be in 1..=256",
                 self.max_candidates
             )));
         }
         if self.min_results > self.max_candidates {
-            return Err(ThreadEpisodicMemvidError::non_retryable(
+            return Err(ThreadEpisodicSearchError::non_retryable(
                 "thread episodic min_results cannot exceed max_candidates",
             ));
         }
-        if self.max_segments == 0 || self.max_segments > 32 {
-            return Err(ThreadEpisodicMemvidError::non_retryable(format!(
-                "thread episodic max_segments {} must be in 1..=32",
-                self.max_segments
-            )));
-        }
         if self.snippet_chars == 0 || self.snippet_chars > 4_000 {
-            return Err(ThreadEpisodicMemvidError::non_retryable(format!(
+            return Err(ThreadEpisodicSearchError::non_retryable(format!(
                 "thread episodic snippet_chars {} must be in 1..=4000",
                 self.snippet_chars
             )));
@@ -533,40 +410,18 @@ impl PioneerAdaptiveCutoff {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadEpisodicMemvidSearchSegment {
-    pub capsule_id: String,
-    pub capsule_ref: String,
-    pub storage_uri: String,
-    pub segment_index: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ThreadEpisodicExactSourceTarget {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub index_item_id: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ThreadEpisodicMemvidSearchRequest {
+pub struct ThreadEpisodicSearchRequest {
     pub workspace_id: String,
     pub thread_id: String,
     pub query: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
     pub profile: ThreadEpisodicSearchProfile,
     #[serde(default)]
-    pub segments: Vec<ThreadEpisodicMemvidSearchSegment>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exact_source: Option<ThreadEpisodicExactSourceTarget>,
+    pub access: pioneer_crud::ThreadEpisodicSearchAccess,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ThreadEpisodicMemvidSearchHit {
+pub struct ThreadEpisodicSearchHit {
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
@@ -577,25 +432,28 @@ pub struct ThreadEpisodicMemvidSearchHit {
     pub source_context: ThreadEpisodicSourceContext,
     pub visibility: ThreadEpisodicVisibility,
     pub status: ThreadEpisodicItemStatus,
-    pub segment_index: i64,
-    pub capsule_id: String,
-    pub capsule_ref: String,
-    pub frame_id: u64,
-    pub frame_uri: String,
     pub text: String,
-    pub memvid_score: Option<f32>,
-    pub lexical_score: Option<f32>,
-    pub semantic_score: Option<f32>,
-    pub temporal_score: Option<f32>,
+    /// One-based positions within each eligible branch, independent of its
+    /// engine's raw similarity/distance scale.
+    pub lexical_rank: Option<i64>,
+    pub semantic_rank: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_unix: Option<i64>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
 }
 
+impl ThreadEpisodicSearchHit {
+    /// Equal-weight RRF is product policy. The adapter returns only branch
+    /// ranks; its storage query may push down this order to bound pagination.
+    pub fn rank_score(&self) -> f32 {
+        pioneer_crud::thread_search_rank_score(self.lexical_rank, self.semantic_rank)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadEpisodicRankedSearchHit {
-    pub hit: ThreadEpisodicMemvidSearchHit,
+    pub hit: ThreadEpisodicSearchHit,
     pub score_breakdown: ThreadEpisodicScoreBreakdown,
 }
 
@@ -619,7 +477,7 @@ pub struct ThreadEpisodicCandidateSuppression {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadEpisodicFilteredSearchCandidates {
-    pub hits: Vec<ThreadEpisodicMemvidSearchHit>,
+    pub hits: Vec<ThreadEpisodicSearchHit>,
     pub suppressions: Vec<ThreadEpisodicCandidateSuppression>,
 }
 
@@ -628,13 +486,9 @@ pub struct ThreadEpisodicSearchDiagnostics {
     pub profile_kind: ThreadEpisodicSearchProfileKind,
     pub search_mode: ThreadEpisodicSearchMode,
     pub adaptive: PioneerAdaptiveCutoffDiagnostics,
-    pub searched_segment_ids: Vec<String>,
-    pub searched_segment_count: u32,
-    pub unavailable_segment_ids: Vec<String>,
     pub raw_candidate_count: u32,
     pub filtered_candidate_count: u32,
     pub returned_count: u32,
-    pub native_memvid_adaptive_used: bool,
     #[serde(default)]
     pub suppressions: Vec<ThreadEpisodicCandidateSuppression>,
     #[serde(default)]
@@ -642,58 +496,49 @@ pub struct ThreadEpisodicSearchDiagnostics {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ThreadEpisodicMemvidSearchOutput {
+pub struct ThreadEpisodicSearchOutput {
     pub hits: Vec<ThreadEpisodicRankedSearchHit>,
     pub diagnostics: ThreadEpisodicSearchDiagnostics,
 }
 
-/// One engine page from a single segment. Access and current-source validation
-/// belong to the caller; an empty page may still carry a continuation.
+/// One bounded retrieval page. Eligibility is applied before candidate selection;
+/// the caller revalidates current source access before disclosure.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ThreadEpisodicMemvidSearchPage {
-    pub hits: Vec<ThreadEpisodicMemvidSearchHit>,
+pub struct ThreadEpisodicSearchPage {
+    pub hits: Vec<ThreadEpisodicSearchHit>,
     pub next_cursor: Option<String>,
-    pub unavailable_segment_ids: Vec<String>,
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ThreadEpisodicRankingContext {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exact_source: Option<ThreadEpisodicExactSourceTarget>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub now_unix: Option<i64>,
-}
-
 #[async_trait]
-pub trait ThreadEpisodicMemvidBackend: Send + Sync {
-    fn capabilities(&self) -> ThreadEpisodicMemvidBackendCapabilities;
-
-    async fn index_item(
+pub trait ThreadEpisodicSearchBackend: Send + Sync {
+    async fn validate_document(
         &self,
-        request: ThreadEpisodicMemvidIndexRequest,
-    ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>;
+        request: ThreadEpisodicIndexDocument,
+    ) -> Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError> {
+        request.validate_prepared()
+    }
 
-    async fn index_item_with_workspace_ownership(
+    async fn validate_document_with_workspace_ownership(
         &self,
-        request: ThreadEpisodicMemvidIndexRequest,
+        request: ThreadEpisodicIndexDocument,
         ownership: ThreadEpisodicWorkspaceOwnership,
-    ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
+    ) -> Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError> {
         let _ownership = ownership;
-        self.index_item(request).await
+        self.validate_document(request).await
     }
 
     /// Stable per-request results. Implementations may retain the single-item
     /// API; an error for one request must not skip its already admitted peers.
-    async fn index_batch_with_workspace_ownership(
+    async fn validate_documents_with_workspace_ownership(
         &self,
-        requests: Vec<ThreadEpisodicMemvidIndexRequest>,
+        requests: Vec<ThreadEpisodicIndexDocument>,
         ownership: ThreadEpisodicWorkspaceOwnership,
-    ) -> Vec<Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>> {
+    ) -> Vec<Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>> {
         let mut outputs = Vec::with_capacity(requests.len());
         for request in requests {
             outputs.push(
-                self.index_item_with_workspace_ownership(request, ownership.clone())
+                self.validate_document_with_workspace_ownership(request, ownership.clone())
                     .await,
             );
         }
@@ -702,44 +547,102 @@ pub trait ThreadEpisodicMemvidBackend: Send + Sync {
 
     async fn search(
         &self,
-        request: ThreadEpisodicMemvidSearchRequest,
-    ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>;
-
-    /// Search exactly one explicitly selected segment without profile cutoffs.
-    /// The caller owns catalog traversal, authorization and global pagination.
-    async fn search_segment_page(
-        &self,
-        _request: ThreadEpisodicMemvidSearchRequest,
-        _page_size: usize,
-        _cursor: Option<String>,
-        _embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
-    ) -> Result<ThreadEpisodicMemvidSearchPage, ThreadEpisodicMemvidError> {
-        Err(ThreadEpisodicMemvidError::non_retryable(
-            "segment pagination is not implemented for this backend",
+        request: ThreadEpisodicSearchRequest,
+    ) -> Result<ThreadEpisodicSearchOutput, ThreadEpisodicSearchError> {
+        request.profile.validate()?;
+        let page = self
+            .search_page(
+                request.clone(),
+                request.profile.max_candidates as usize,
+                None,
+                None,
+            )
+            .await?;
+        Ok(finalize_thread_episodic_search_output(
+            request,
+            page.hits,
+            page.warnings,
         ))
     }
 
+    /// Return a bounded ranked page within the caller's eligibility conditions.
+    /// Cursors are internal; the product exposes only its own signed cursor.
+    async fn search_page(
+        &self,
+        request: ThreadEpisodicSearchRequest,
+        page_size: usize,
+        cursor: Option<String>,
+        embedding: Option<ThreadEpisodicIndexEmbedding>,
+    ) -> Result<ThreadEpisodicSearchPage, ThreadEpisodicSearchError>;
+
     async fn ask_retrieval(
         &self,
-        _request: ThreadEpisodicMemvidSearchRequest,
-        mode: ThreadEpisodicMemvidAskRetrievalMode,
-        embedder: Arc<ThreadEpisodicMemvidEmbedder>,
-    ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError> {
-        Err(ThreadEpisodicMemvidError::non_retryable(format!(
-            "thread episodic memvid ask retrieval is not implemented for this backend; mode={mode:?}, provider={}, model={}",
-            embedder.provider().provider_id(),
-            embedder.provider().model()
-        )))
+        mut request: ThreadEpisodicSearchRequest,
+        mode: ThreadEpisodicRetrievalMode,
+        embedding_provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
+    ) -> Result<ThreadEpisodicSearchOutput, ThreadEpisodicSearchError> {
+        request.profile.validate()?;
+        request.profile.mode = match mode {
+            ThreadEpisodicRetrievalMode::Semantic => ThreadEpisodicSearchMode::Semantic,
+            ThreadEpisodicRetrievalMode::Hybrid
+                if request.profile.mode == ThreadEpisodicSearchMode::Temporal =>
+            {
+                ThreadEpisodicSearchMode::Temporal
+            }
+            ThreadEpisodicRetrievalMode::Hybrid => ThreadEpisodicSearchMode::Auto,
+        };
+        let identity = embedding_provider.identity();
+        let query = request.query.clone();
+        let prepared = async {
+            let vector =
+                tokio::task::spawn_blocking(move || embedding_provider.embed_query_checked(&query))
+                    .await
+                    .map_err(|_| {
+                        ThreadEpisodicSearchError::retryable("embedding worker interrupted")
+                    })?
+                    .map_err(|error| {
+                        if error.is_retryable() {
+                            ThreadEpisodicSearchError::retryable(error.to_string())
+                        } else {
+                            ThreadEpisodicSearchError::non_retryable(error.to_string())
+                        }
+                    })?;
+            ThreadEpisodicIndexEmbedding::new(identity, vector)
+        }
+        .await;
+        let (embedding, warning) = match prepared {
+            Ok(embedding) => (Some(embedding), None),
+            Err(error) if mode == ThreadEpisodicRetrievalMode::Hybrid => {
+                let warning = if error.is_retryable() {
+                    "query_embedding_retryable_failure"
+                } else {
+                    "query_embedding_unavailable"
+                };
+                (None, Some(warning.to_owned()))
+            }
+            Err(error) => return Err(error),
+        };
+        let mut page = self
+            .search_page(
+                request.clone(),
+                request.profile.max_candidates as usize,
+                None,
+                embedding,
+            )
+            .await?;
+        if let Some(warning) = warning {
+            page.warnings.push(warning);
+        }
+        Ok(finalize_thread_episodic_search_output(
+            request,
+            page.hits,
+            page.warnings,
+        ))
     }
 }
 
-pub struct MemvidThreadEpisodicBackend {
-    capabilities: ThreadEpisodicMemvidBackendCapabilities,
-    workspace_ownership: Option<ThreadEpisodicWorkspaceOwnership>,
-}
-
 // Shared by ordinary indexing and destructive projection replacement. The
-// clone passed into a blocking capsule operation outlives a canceled waiter.
+// ownership fences publication against replacement until the commit settles.
 pub type ThreadEpisodicWorkspaceOwnership = Arc<ThreadEpisodicWorkspaceGuard>;
 
 pub struct ThreadEpisodicWorkspaceGuard {
@@ -752,7 +655,7 @@ fn workspace_releases() -> &'static tokio::sync::watch::Sender<()> {
 }
 
 // A single coalesced release signal covers all workspaces, including releases
-// by blocking capsule operations whose async waiter has been canceled.
+// by attempts interrupted while a serialized writer commit was settling.
 pub fn thread_episodic_workspace_releases() -> tokio::sync::watch::Receiver<()> {
     workspace_releases().subscribe()
 }
@@ -797,508 +700,19 @@ pub async fn try_lock_thread_episodic_workspace(
         .map(|guard| Arc::new(ThreadEpisodicWorkspaceGuard { guard: Some(guard) }))
 }
 
-// Serialize deletion with capsule readers too, and retain workspace ownership
-// in the actual blocking removal even if its async caller is canceled.
-pub async fn remove_thread_episodic_capsule_file(
-    path: &Path,
-    ownership: ThreadEpisodicWorkspaceOwnership,
-) -> std::io::Result<()> {
-    let path_for_task = path.to_owned();
-    run_capsule_blocking(path, move || {
-        let _ownership = ownership;
-        std::fs::remove_file(path_for_task)
-    })
-    .await
-    .map_err(std::io::Error::other)?
-}
-
-// Idle readers release their OS lock. Local mutations still evict under the
-// capsule lock so no pre-mutation handle can be returned after invalidation.
-// The bounded idle cache is independent of corpus size: eviction only reopens.
-const IDLE_READER_CAPACITY: usize = 8;
-struct IdleReader {
-    path: PathBuf,
-    owner: (String, String),
-    reader: memvid_core::ReadOnlyReader,
-    embedding_identity: Option<ThreadEpisodicEmbeddingIdentity>,
-}
-#[derive(Default)]
-struct ReaderCache {
-    idle: std::sync::Mutex<Vec<IdleReader>>,
-    #[cfg(test)]
-    opens: std::sync::atomic::AtomicUsize,
-}
-fn reader_cache() -> &'static ReaderCache {
-    static READERS: OnceLock<ReaderCache> = OnceLock::new();
-    READERS.get_or_init(ReaderCache::default)
-}
-fn take_idle_reader(cache: &ReaderCache, path: &Path) -> Option<IdleReader> {
-    let mut readers = cache.idle.lock().unwrap_or_else(|e| e.into_inner());
-    let index = readers.iter().position(|entry| entry.path == path)?;
-    Some(readers.remove(index))
-}
-fn with_segment_reader<T>(
-    cache: &ReaderCache,
-    path: &Path,
-    workspace_id: &str,
-    capsule_id: &str,
-    operation: impl FnOnce(
-        &mut Memvid,
-        &mut Option<ThreadEpisodicEmbeddingIdentity>,
-    ) -> Result<T, ThreadEpisodicMemvidError>,
-) -> Result<T, ThreadEpisodicMemvidError> {
-    // Caller owns the capsule lock throughout checkout, validation and return.
-    let path = normalized_capsule_lock_path(path);
-    let owner = (workspace_id.to_owned(), capsule_id.to_owned());
-    let cached = take_idle_reader(cache, &path).filter(|entry| entry.owner == owner);
-    let mut entry = match cached {
-        Some(entry) => entry,
-        None => IdleReader {
-            reader: memvid_core::ReadOnlyReader::new(&path),
-            embedding_identity: None,
-            path,
-            owner,
-        },
-    };
-    let identity = &mut entry.embedding_identity;
-    let result = entry
-        .reader
-        .read(|reader, reopened| {
-            if reopened {
-                *identity = None;
-                #[cfg(test)]
-                cache
-                    .opens
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            operation(reader, identity)
-        })
-        .map_err(classify_memvid_error)?;
-    // Do not retain a possibly damaged handle after a failed search.
-    if result.is_ok() {
-        let evicted = {
-            let mut readers = cache.idle.lock().unwrap_or_else(|e| e.into_inner());
-            let evicted = if readers.len() >= IDLE_READER_CAPACITY {
-                Some(readers.remove(0))
-            } else {
-                None
-            };
-            readers.push(entry);
-            evicted
-        };
-        // Closing a reader is never work for the global registry lock.
-        drop(evicted);
-    }
-    result
-}
-
-type CapsuleLock = Arc<Mutex<()>>;
-type CapsuleLockRegistry = Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>;
-
-fn capsule_lock_registry() -> &'static CapsuleLockRegistry {
-    static LOCKS: OnceLock<CapsuleLockRegistry> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn normalized_capsule_lock_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| {
-        let Some(file_name) = path.file_name() else {
-            return path.to_path_buf();
-        };
-        path.parent()
-            .and_then(|parent| parent.canonicalize().ok())
-            .map_or_else(|| path.to_path_buf(), |parent| parent.join(file_name))
-    })
-}
-
-async fn lock_for_capsule_path(path: &Path) -> CapsuleLock {
-    let path = normalized_capsule_lock_path(path);
-    let mut locks = capsule_lock_registry().lock().await;
-    if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
-        return lock;
-    }
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(path, Arc::downgrade(&lock));
-    lock
-}
-
-async fn run_capsule_blocking<T, F>(path: &Path, operation: F) -> Result<T, tokio::task::JoinError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    run_capsule_blocking_mode(path, true, operation).await
-}
-
-async fn run_capsule_blocking_mode<T, F>(
-    path: &Path,
-    invalidate: bool,
-    operation: F,
-) -> Result<T, tokio::task::JoinError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let key = normalized_capsule_lock_path(path);
-    let guard = lock_for_capsule_path(path).await.lock_owned().await;
-    pioneer_observability::work::spawn_blocking(move || {
-        // Keep ownership inside the blocking task. Cancelling the async waiter detaches the
-        // task but cannot expose the capsule to another operation while this closure is running.
-        let _guard = guard;
-        if invalidate {
-            drop(take_idle_reader(reader_cache(), &key));
-        }
-        operation()
-    })
-    .await
-}
-
-impl MemvidThreadEpisodicBackend {
-    pub fn new() -> Self {
-        Self {
-            capabilities: ThreadEpisodicMemvidBackendCapabilities::memvid_default(),
-            workspace_ownership: None,
-        }
-    }
-
-    pub fn with_capabilities(capabilities: ThreadEpisodicMemvidBackendCapabilities) -> Self {
-        Self {
-            capabilities,
-            workspace_ownership: None,
-        }
-    }
-
-    pub fn with_workspace_ownership(mut self, ownership: ThreadEpisodicWorkspaceOwnership) -> Self {
-        self.workspace_ownership = Some(ownership);
-        self
-    }
-
-    async fn run_read_blocking<T, F>(
-        &self,
-        path: &Path,
-        operation: F,
-    ) -> Result<T, tokio::task::JoinError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        let ownership = self.workspace_ownership.clone();
-        run_capsule_blocking_mode(path, false, move || {
-            let _ownership = ownership;
-            operation()
-        })
-        .await
-    }
-
-    async fn run_blocking<T, F>(
-        &self,
-        path: &Path,
-        operation: F,
-    ) -> Result<T, tokio::task::JoinError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        let ownership = self.workspace_ownership.clone();
-        run_capsule_blocking(path, move || {
-            let _ownership = ownership;
-            operation()
-        })
-        .await
-    }
-}
-
-impl Default for MemvidThreadEpisodicBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
-    fn capabilities(&self) -> ThreadEpisodicMemvidBackendCapabilities {
-        self.capabilities.clone()
-    }
-
-    async fn index_item(
-        &self,
-        request: ThreadEpisodicMemvidIndexRequest,
-    ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
-        let path = path_from_storage_uri(request.storage_uri.as_str())?;
-        let parent = path.parent().ok_or_else(|| {
-            ThreadEpisodicMemvidError::non_retryable(format!(
-                "thread episodic memvid path `{}` has no parent",
-                path.display()
-            ))
-        })?;
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            ThreadEpisodicMemvidError::retryable(format!(
-                "failed to create thread episodic memvid dir `{}`: {error}",
-                parent.display()
-            ))
-        })?;
-
-        let path_for_task = path.clone();
-        let request_for_task = request.clone();
-
-        self.run_blocking(path.as_path(), move || {
-            index_item_blocking(path_for_task, request_for_task)
-        })
-        .await
-        .map_err(|error| {
-            ThreadEpisodicMemvidError::retryable(format!(
-                "thread episodic memvid index task failed: {error}"
-            ))
-        })?
-    }
-
-    async fn index_item_with_workspace_ownership(
-        &self,
-        request: ThreadEpisodicMemvidIndexRequest,
-        ownership: ThreadEpisodicWorkspaceOwnership,
-    ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
-        Self::with_capabilities(self.capabilities.clone())
-            .with_workspace_ownership(ownership)
-            .index_item(request)
-            .await
-    }
-
-    async fn index_batch_with_workspace_ownership(
-        &self,
-        requests: Vec<ThreadEpisodicMemvidIndexRequest>,
-        ownership: ThreadEpisodicWorkspaceOwnership,
-    ) -> Vec<Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>> {
-        if requests.is_empty() {
-            return Vec::new();
-        }
-        let count = requests.len();
-        let operation = async {
-            validate_index_batch(&requests)?;
-            let path = path_from_storage_uri(&requests[0].storage_uri)?;
-            let parent = path.parent().ok_or_else(|| {
-                ThreadEpisodicMemvidError::non_retryable("capsule path has no parent")
-            })?;
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?;
-            let task_path = path.clone();
-            Self::with_capabilities(self.capabilities.clone())
-                .with_workspace_ownership(ownership)
-                .run_blocking(&path, move || {
-                    index_batch_or_single_blocking(task_path, requests)
-                })
-                .await
-                .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
-        };
-        match operation.await {
-            Ok(outputs) => outputs,
-            Err(mut error) => {
-                // A shared mutation error does not identify an offending item.
-                // The executor isolates subsequent attempts through single writes.
-                if count > 1 && error.kind == ThreadEpisodicMemvidFailureKind::NonRetryable {
-                    error.kind = ThreadEpisodicMemvidFailureKind::Retryable;
-                }
-                vec![Err(error); count]
-            }
-        }
-    }
-
-    async fn search(
-        &self,
-        request: ThreadEpisodicMemvidSearchRequest,
-    ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError> {
-        request.profile.validate()?;
-        let mut segments = request.segments.clone();
-        segments.sort_by(|left, right| right.segment_index.cmp(&left.segment_index));
-
-        let mut warnings = Vec::new();
-        if request.profile.mode == ThreadEpisodicSearchMode::Semantic {
-            warnings.push("semantic search requested but memvid vec feature is not enabled; using lexical search".to_owned());
-        }
-
-        let mut searched_segment_ids = Vec::new();
-        let mut unavailable_segment_ids = Vec::new();
-        let mut raw_hits = Vec::new();
-        for segment in &segments {
-            let path = path_from_storage_uri(segment.storage_uri.as_str())?;
-            if !path.exists() {
-                unavailable_segment_ids.push(segment.capsule_id.clone());
-                continue;
-            }
-
-            let path_for_task = path.clone();
-            let search_request = memvid_thread_episodic_search_request(
-                &request.profile,
-                &request.query,
-                request.scope.as_deref(),
-            );
-            let segment_for_task = segment.clone();
-            let workspace_id = request.workspace_id.clone();
-            let thread_id = request.thread_id.clone();
-            let segment_hits = self
-                .run_blocking(path.as_path(), move || {
-                    search_segment_blocking(
-                        path_for_task,
-                        search_request,
-                        segment_for_task,
-                        workspace_id.as_str(),
-                        thread_id.as_str(),
-                    )
-                })
-                .await
-                .map_err(|error| {
-                    ThreadEpisodicMemvidError::retryable(format!(
-                        "thread episodic memvid search task failed: {error}"
-                    ))
-                })?;
-
-            match segment_hits {
-                Ok(hits) => {
-                    searched_segment_ids.push(segment.capsule_id.clone());
-                    raw_hits.extend(hits);
-                }
-                Err(error) if error.kind == ThreadEpisodicMemvidFailureKind::NonRetryable => {
-                    unavailable_segment_ids.push(segment.capsule_id.clone());
-                    warnings.push(error.message);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Ok(finalize_thread_episodic_search_output(
-            request,
-            raw_hits,
-            searched_segment_ids,
-            unavailable_segment_ids,
-            warnings,
-            false,
-        ))
-    }
-
-    async fn search_segment_page(
-        &self,
-        request: ThreadEpisodicMemvidSearchRequest,
-        page_size: usize,
-        cursor: Option<String>,
-        embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
-    ) -> Result<ThreadEpisodicMemvidSearchPage, ThreadEpisodicMemvidError> {
-        if request.segments.len() != 1 || page_size == 0 {
-            return Err(ThreadEpisodicMemvidError::non_retryable(
-                "segment search requires exactly one segment and a positive page size",
-            ));
-        }
-        let segment = request.segments[0].clone();
-        let path = path_from_storage_uri(&segment.storage_uri)?;
-        let task_path = path.clone();
-        self.run_read_blocking(&path, move || {
-            search_segment_page_blocking(
-                task_path, request, segment, page_size, cursor, embedding, false,
-            )
-        })
-        .await
-        .map_err(|error| {
-            ThreadEpisodicMemvidError::retryable(format!(
-                "thread episodic segment page task failed: {error}"
-            ))
-        })?
-    }
-
-    async fn ask_retrieval(
-        &self,
-        request: ThreadEpisodicMemvidSearchRequest,
-        mode: ThreadEpisodicMemvidAskRetrievalMode,
-        embedder: Arc<ThreadEpisodicMemvidEmbedder>,
-    ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError> {
-        request.profile.validate()?;
-        let provider = embedder.provider();
-        let query = request.query.clone();
-        let embedder_for_task = embedder.clone();
-        let vector = tokio::task::spawn_blocking(move || {
-            embedder_for_task.provider().embed_query_checked(&query)
-        })
-        .await
-        .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
-        .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?;
-        let embedding = ThreadEpisodicMemvidIndexEmbedding::new(provider.identity(), vector)?;
-        let mut hits = Vec::new();
-        let mut searched = Vec::new();
-        let mut unavailable = Vec::new();
-        let mut warnings = Vec::new();
-        let mut segments = request.segments.clone();
-        segments.sort_by(|a, b| b.segment_index.cmp(&a.segment_index));
-        for segment in &segments {
-            if !path_from_storage_uri(&segment.storage_uri)?.exists() {
-                unavailable.push(segment.capsule_id.clone());
-                continue;
-            }
-            let mut segment_request = request.clone();
-            segment_request.segments = vec![segment.clone()];
-            let page = if mode == ThreadEpisodicMemvidAskRetrievalMode::Semantic {
-                let path = path_from_storage_uri(&segment.storage_uri)?;
-                let task_path = path.clone();
-                let segment = segment.clone();
-                let embedding = embedding.clone();
-                let size = request.profile.max_candidates as usize;
-                self.run_read_blocking(&path, move || {
-                    search_segment_page_blocking(
-                        task_path,
-                        segment_request,
-                        segment,
-                        size,
-                        None,
-                        Some(embedding),
-                        true,
-                    )
-                })
-                .await
-                .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
-            } else {
-                self.search_segment_page(
-                    segment_request,
-                    request.profile.max_candidates as usize,
-                    None,
-                    Some(embedding.clone()),
-                )
-                .await
-            };
-            match page {
-                Ok(page) => {
-                    searched.push(segment.capsule_id.clone());
-                    hits.extend(page.hits);
-                    warnings.extend(page.warnings);
-                }
-                Err(error) if error.kind == ThreadEpisodicMemvidFailureKind::NonRetryable => {
-                    unavailable.push(segment.capsule_id.clone());
-                    warnings.push(error.message);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(finalize_thread_episodic_search_output(
-            request,
-            hits,
-            searched,
-            unavailable,
-            warnings,
-            false,
-        ))
-    }
-}
+mod sqlite;
+pub use sqlite::SqliteThreadEpisodicBackend;
 
 fn finalize_thread_episodic_search_output(
-    request: ThreadEpisodicMemvidSearchRequest,
-    mut raw_hits: Vec<ThreadEpisodicMemvidSearchHit>,
-    searched_segment_ids: Vec<String>,
-    unavailable_segment_ids: Vec<String>,
+    request: ThreadEpisodicSearchRequest,
+    mut raw_hits: Vec<ThreadEpisodicSearchHit>,
     warnings: Vec<String>,
-    native_memvid_adaptive_used: bool,
-) -> ThreadEpisodicMemvidSearchOutput {
+) -> ThreadEpisodicSearchOutput {
     raw_hits.sort_by(|left, right| {
-        score_or_zero(right.memvid_score)
-            .partial_cmp(&score_or_zero(left.memvid_score))
+        right
+            .rank_score()
+            .partial_cmp(&left.rank_score())
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| right.segment_index.cmp(&left.segment_index))
             .then_with(|| left.index_item_id.cmp(&right.index_item_id))
     });
 
@@ -1310,7 +724,7 @@ fn finalize_thread_episodic_search_output(
     let scores = filtered
         .hits
         .iter()
-        .map(|hit| hit.memvid_score)
+        .map(|hit| Some(hit.rank_score()))
         .collect::<Vec<_>>();
     let (cutoff_len, adaptive) =
         PioneerAdaptiveCutoff::cutoff_len(&scores, request.profile.adaptive_cutoff_config());
@@ -1318,196 +732,38 @@ fn finalize_thread_episodic_search_output(
         hits: filtered.hits.into_iter().take(cutoff_len).collect(),
         suppressions: filtered.suppressions,
     };
-    let mut ranked = rank_thread_episodic_search_hits(
-        filtered.hits,
-        ThreadEpisodicRankingContext {
-            exact_source: request.exact_source,
-            now_unix: None,
-        },
-    );
+    let mut ranked = rank_thread_episodic_search_hits(filtered.hits);
     ranked.truncate(request.profile.max_candidates as usize);
 
     let diagnostics = ThreadEpisodicSearchDiagnostics {
         profile_kind: request.profile.kind,
         search_mode: request.profile.mode,
-        searched_segment_count: searched_segment_ids.len() as u32,
-        searched_segment_ids,
-        unavailable_segment_ids,
         raw_candidate_count: adaptive.candidate_count,
         filtered_candidate_count: ranked.len() as u32,
         returned_count: ranked.len() as u32,
         adaptive,
-        native_memvid_adaptive_used,
         suppressions: filtered.suppressions,
         warnings,
     };
 
-    ThreadEpisodicMemvidSearchOutput {
+    ThreadEpisodicSearchOutput {
         hits: ranked,
         diagnostics,
     }
 }
 
-fn validate_index_batch(
-    requests: &[ThreadEpisodicMemvidIndexRequest],
-) -> Result<(), ThreadEpisodicMemvidError> {
-    if requests.is_empty()
-        || requests.len() > THREAD_EPISODIC_MEMVID_BATCH_ITEMS
-        || requests
-            .iter()
-            .fold(0usize, |n, r| n.saturating_add(r.prepared_bytes()))
-            > THREAD_EPISODIC_MEMVID_BATCH_BYTES
-        || requests.iter().enumerate().any(|(i, r)| {
-            requests[..i]
-                .iter()
-                .any(|previous| !previous.batch_compatible(r))
-        })
-    {
-        return Err(ThreadEpisodicMemvidError::non_retryable(
-            "incompatible or oversized Memvid batch",
-        ));
-    }
-    for request in requests {
-        request.validate_prepared()?;
-    }
-    Ok(())
-}
-
-fn index_item_blocking(
-    path: PathBuf,
-    request: ThreadEpisodicMemvidIndexRequest,
-) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
-    request.validate_prepared()?;
-    index_batch_blocking(path, vec![request]).map(|mut outputs| outputs.remove(0))
-}
-
-fn index_batch_or_single_blocking(
-    path: PathBuf,
-    requests: Vec<ThreadEpisodicMemvidIndexRequest>,
-) -> Result<
-    Vec<Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>>,
-    ThreadEpisodicMemvidError,
-> {
-    let memvid = open_or_create_memvid(&path, requests[0].workspace_capsule)?;
-    let stats = memvid.stats().map_err(classify_memvid_error)?;
-    // Retained c499f5e checks capacity against cached_payload_end per put,
-    // without pending payloads. Reserve cumulative compressed payload plus WAL
-    // growth BEFORE any mutation. Compression can expand small inputs. The
-    // reserve covers two times raw payload + 1 KiB/frame, and twice a generous
-    // WAL encoding bound (16x prepared bytes + 64 KiB fixed overhead). Include
-    // the existing WAL size: wrapping pending entries can double that region.
-    // Chunk plans can duplicate text/metadata; keep their original single path.
-    let bytes = requests.iter().fold(0u64, |n, request| {
-        n.saturating_add(request.prepared_bytes() as u64)
-    });
-    let payload_reserve = requests.iter().fold(0u64, |n, request| {
-        n.saturating_add((request.text.len() as u64).saturating_mul(2))
-            .saturating_add(1024)
-    });
-    let wal_reserve = bytes.saturating_mul(16).saturating_add(64 * 1024);
-    let headroom = stats
-        .wal_bytes
-        .saturating_add(wal_reserve.saturating_mul(2))
-        .saturating_add(payload_reserve);
-    let chunks = requests
-        .iter()
-        .any(|request| memvid.preview_chunks(request.text.as_bytes()).is_some());
-    if chunks || stats.remaining_capacity_bytes < headroom {
-        // Finite, bounded fallback through the same blocking owner. Each result
-        // follows its own Full commit; a committed prefix is never relabeled as
-        // failed or replayed into a rotated file because a later item is full.
-        drop(memvid);
-        return Ok(requests
-            .into_iter()
-            .map(|request| index_item_blocking(path.clone(), request))
-            .collect());
-    }
-    index_items_on_handle(memvid, requests).map(|outputs| outputs.into_iter().map(Ok).collect())
-}
-
-fn index_batch_blocking(
-    path: PathBuf,
-    requests: Vec<ThreadEpisodicMemvidIndexRequest>,
-) -> Result<Vec<ThreadEpisodicMemvidIndexOutput>, ThreadEpisodicMemvidError> {
-    // Validate all prepared data before any shared mutation. Keep the normal
-    // WAL sync, automatic checkpoints and growth/capacity limits unchanged.
-    // Small groups normally reach the final Full commit together; recovery,
-    // auto-checkpoint and dirty-handle Drop may perform additional commits.
-    for request in &requests {
-        request.validate_prepared()?;
-    }
-    let memvid = open_or_create_memvid(&path, requests[0].workspace_capsule)?;
-    index_items_on_handle(memvid, requests)
-}
-
-fn index_items_on_handle(
-    mut memvid: Memvid,
-    requests: Vec<ThreadEpisodicMemvidIndexRequest>,
-) -> Result<Vec<ThreadEpisodicMemvidIndexOutput>, ThreadEpisodicMemvidError> {
-    let first = &requests[0];
-    if let Some(embedding) = &first.embedding {
-        memvid.enable_vec().map_err(classify_memvid_error)?;
-        memvid
-            .set_vec_model(&embedding.identity.memvid_model_id())
-            .map_err(classify_memvid_error)?;
-    }
-    for request in &requests {
-        let options = index_put_options(request);
-        let payload = request.text.as_bytes().to_vec();
-        let embedding_vector = request
-            .embedding
-            .as_ref()
-            .map(|embedding| embedding.vector.clone());
-        match memvid.frame_by_uri(request.frame_uri.as_str()) {
-            Ok(frame) if frame.status == FrameStatus::Active => {
-                memvid
-                    .update_frame(frame.id, Some(payload), options, embedding_vector)
-                    .map_err(classify_memvid_error)?;
-            }
-            _ => {
-                if let Some(embedding_vector) = embedding_vector {
-                    memvid
-                        .put_with_embedding_and_options(
-                            payload.as_slice(),
-                            embedding_vector,
-                            options,
-                        )
-                        .map_err(classify_memvid_error)?;
-                } else {
-                    memvid
-                        .put_bytes_with_options(payload.as_slice(), options)
-                        .map_err(classify_memvid_error)?;
-                }
-            }
-        }
-    }
-    // Never reuse this handle after any error, including unknown publication.
-    memvid.commit().map_err(classify_memvid_error)?;
-    let stats = thread_episodic_stats_from_memvid(memvid.stats().map_err(classify_memvid_error)?)?;
-    requests
-        .into_iter()
-        .map(|request| {
-            let frame = memvid
-                .frame_by_uri(&request.frame_uri)
-                .map_err(classify_memvid_error)?;
-            Ok(ThreadEpisodicMemvidIndexOutput {
-                frame_id: i64_from_u64(frame.id)?,
-                frame_uri: request.frame_uri,
-                stats: stats.clone(),
-                embedding_identity: request.embedding.map(|embedding| embedding.identity),
-            })
-        })
-        .collect()
-}
-
 fn validate_index_embedding(
-    embedding: &ThreadEpisodicMemvidIndexEmbedding,
-) -> Result<(), ThreadEpisodicMemvidError> {
-    if embedding.vector.len() == embedding.identity.dimension {
+    embedding: &ThreadEpisodicIndexEmbedding,
+) -> Result<(), ThreadEpisodicSearchError> {
+    if embedding.identity.dimension > 0
+        && embedding.vector.len() == embedding.identity.dimension
+        && embedding.vector.iter().all(|value| value.is_finite())
+        && embedding.vector.iter().any(|value| *value != 0.0)
+    {
         return Ok(());
     }
 
-    Err(ThreadEpisodicMemvidError::non_retryable(format!(
+    Err(ThreadEpisodicSearchError::non_retryable(format!(
         "thread episodic embedding dimension mismatch for `{}`/`{}`: expected {}, got {}",
         embedding.identity.provider_id,
         embedding.identity.model,
@@ -1516,314 +772,17 @@ fn validate_index_embedding(
     )))
 }
 
-fn search_segment_blocking(
-    path: PathBuf,
-    request: SearchRequest,
-    segment: ThreadEpisodicMemvidSearchSegment,
-    workspace_id: &str,
-    thread_id: &str,
-) -> Result<Vec<ThreadEpisodicMemvidSearchHit>, ThreadEpisodicMemvidError> {
-    let mut memvid = Memvid::open_read_only(path.as_path()).map_err(classify_memvid_error)?;
-    let response = memvid.search(request).map_err(classify_memvid_error)?;
-    let engine = response.engine;
-    Ok(response
-        .hits
-        .into_iter()
-        .filter_map(|mut hit| {
-            hydrate_search_hit_metadata(&memvid, &mut hit);
-            search_hit_to_thread_episodic_hit(
-                hit,
-                engine.clone(),
-                &segment,
-                workspace_id,
-                thread_id,
-            )
-        })
-        .collect())
-}
-
-// Read only committed TOC metadata under the already-held Memvid file lock.
-// Public codecs preserve legacy-format decoding; no vector/payload data is read.
-fn validate_segment_embedding_identity(
-    path: &Path,
-    embedding: &ThreadEpisodicMemvidIndexEmbedding,
-) -> Result<(), ThreadEpisodicMemvidError> {
-    use memvid_core::{CommitFooter, Toc, footer::FOOTER_SIZE, io::header::HeaderCodec};
-    use std::io::{Read, Seek, SeekFrom};
-    let unavailable = || {
-        ThreadEpisodicMemvidError::non_retryable(
-            "segment has no compatible persisted embedding identity",
-        )
-    };
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?;
-    let header = HeaderCodec::read(&mut file).map_err(classify_memvid_error)?;
-    let length = file.metadata().map_err(|_| unavailable())?.len();
-    let footer_offset = length
-        .checked_sub(FOOTER_SIZE as u64)
-        .ok_or_else(unavailable)?;
-    file.seek(SeekFrom::Start(footer_offset))
-        .map_err(|_| unavailable())?;
-    let mut footer_bytes = [0u8; FOOTER_SIZE];
-    file.read_exact(&mut footer_bytes)
-        .map_err(|_| unavailable())?;
-    let footer = CommitFooter::decode(&footer_bytes).ok_or_else(unavailable)?;
-    let toc_offset = footer_offset
-        .checked_sub(footer.toc_len)
-        .ok_or_else(unavailable)?;
-    if toc_offset != header.footer_offset {
-        return Err(unavailable());
-    }
-    let toc_len = usize::try_from(footer.toc_len).map_err(|_| unavailable())?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(toc_len)
-        .map_err(|_| unavailable())?;
-    bytes.resize(toc_len, 0);
-    file.seek(SeekFrom::Start(toc_offset))
-        .map_err(|_| unavailable())?;
-    file.read_exact(&mut bytes).map_err(|_| unavailable())?;
-    if !footer.hash_matches(&bytes) {
-        return Err(unavailable());
-    }
-    let toc = Toc::decode(&bytes).map_err(classify_memvid_error)?;
-    let manifest = toc.indexes.vec.as_ref().ok_or_else(unavailable)?;
-    if manifest.model.as_deref() != Some(embedding.identity.memvid_model_id().as_str())
-        || usize::try_from(manifest.dimension).ok() != Some(embedding.identity.dimension)
-        || toc.segment_catalog.vec_segments.iter().any(|segment| {
-            segment.dimension != 0
-                && usize::try_from(segment.dimension).ok() != Some(embedding.identity.dimension)
-        })
-    {
-        return Err(unavailable());
-    }
-    Ok(())
-}
-
-fn search_segment_page_blocking(
-    path: PathBuf,
-    request: ThreadEpisodicMemvidSearchRequest,
-    segment: ThreadEpisodicMemvidSearchSegment,
-    page_size: usize,
-    cursor: Option<String>,
-    embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
-    semantic_only: bool,
-) -> Result<ThreadEpisodicMemvidSearchPage, ThreadEpisodicMemvidError> {
-    with_segment_reader(
-        reader_cache(),
-        &path,
-        &request.workspace_id,
-        &segment.capsule_id,
-        |memvid, identity| {
-            let mut search = memvid_thread_episodic_search_request(
-                &request.profile,
-                &request.query,
-                request.scope.as_deref(),
-            );
-            search.top_k = page_size;
-            search.cursor = cursor;
-            if let Some(embedding) = embedding {
-                validate_index_embedding(&embedding)?;
-                if identity.as_ref() != Some(&embedding.identity) {
-                    validate_segment_embedding_identity(&path, &embedding)?;
-                    *identity = Some(embedding.identity.clone());
-                }
-                search.query_embedding = Some(embedding.vector);
-            }
-            let response = if semantic_only {
-                memvid
-                    .vec_search_with_embedding_acl(
-                        &search.query,
-                        search.query_embedding.as_deref().unwrap_or_default(),
-                        search.top_k,
-                        search.snippet_chars,
-                        search.scope.as_deref(),
-                        search.acl_context.as_ref(),
-                        search.acl_enforcement_mode,
-                        search.cursor.as_deref(),
-                    )
-                    .map_err(classify_memvid_error)?
-            } else {
-                memvid.search(search).map_err(classify_memvid_error)?
-            };
-
-            let engine = response.engine;
-            let hits = response
-                .hits
-                .into_iter()
-                .filter_map(|mut hit| {
-                    hydrate_search_hit_metadata(memvid, &mut hit);
-                    // The public engine snippet is sufficient; the canonical source is
-                    // opened through its real history reference when more text is needed.
-                    hit.chunk_text = None;
-                    search_hit_to_thread_episodic_hit(
-                        hit,
-                        engine.clone(),
-                        &segment,
-                        &request.workspace_id,
-                        &request.thread_id,
-                    )
-                })
-                .collect();
-            Ok(ThreadEpisodicMemvidSearchPage {
-                hits,
-                next_cursor: response.next_cursor,
-                unavailable_segment_ids: Vec::new(),
-                warnings: Vec::new(),
-            })
-        },
-    )
-}
-
-fn hydrate_search_hit_metadata(memvid: &Memvid, hit: &mut SearchHit) {
-    if hit
-        .metadata
-        .as_ref()
-        .is_some_and(|metadata| !metadata.extra_metadata.is_empty())
-    {
-        return;
-    }
-
-    let Ok(frame) = memvid.frame_by_id(hit.frame_id) else {
-        return;
-    };
-
-    let existing = hit.metadata.take().unwrap_or_default();
-    hit.metadata = Some(SearchHitMetadata {
-        matches: existing.matches,
-        tags: frame.tags,
-        labels: if existing.labels.is_empty() {
-            frame.labels
-        } else {
-            existing.labels
-        },
-        track: existing.track.or(frame.track),
-        created_at: existing.created_at,
-        content_dates: if existing.content_dates.is_empty() {
-            frame.content_dates
-        } else {
-            existing.content_dates
-        },
-        entities: existing.entities,
-        extra_metadata: frame.extra_metadata,
-        temporal: None,
-    });
-}
-
-fn search_hit_to_thread_episodic_hit(
-    hit: SearchHit,
-    engine: SearchEngineKind,
-    segment: &ThreadEpisodicMemvidSearchSegment,
-    workspace_id: &str,
-    thread_id: &str,
-) -> Option<ThreadEpisodicMemvidSearchHit> {
-    let metadata = hit.metadata.as_ref()?.extra_metadata.clone();
-    let candidate_workspace_id = metadata
-        .get("pioneer.thread_episodic.workspace_id")
-        .cloned()
-        .unwrap_or_else(|| workspace_id.to_owned());
-    let candidate_thread_id = metadata
-        .get("pioneer.thread_episodic.thread_id")
-        .cloned()
-        .unwrap_or_else(|| thread_id.to_owned());
-    let index_item_id = metadata
-        .get("pioneer.thread_episodic.index_item_id")
-        .cloned()
-        .or_else(|| hit.title.clone())
-        .unwrap_or_else(|| hit.uri.clone());
-    let source_context = metadata
-        .get("pioneer.thread_episodic.source_context")
-        .and_then(|value| parse_thread_episodic_source_context(value))
-        .unwrap_or(ThreadEpisodicSourceContext::Unknown);
-    let visibility = metadata
-        .get("pioneer.thread_episodic.visibility")
-        .and_then(|value| parse_thread_episodic_visibility(value))
-        .unwrap_or(ThreadEpisodicVisibility::UserVisible);
-    let status = metadata
-        .get("pioneer.thread_episodic.status")
-        .and_then(|value| parse_thread_episodic_item_status(value))
-        .unwrap_or(ThreadEpisodicItemStatus::Active);
-    let score = hit.score;
-    let lexical_score = match engine {
-        SearchEngineKind::Tantivy | SearchEngineKind::LexFallback => score,
-        SearchEngineKind::Hybrid => score,
-    };
-    Some(ThreadEpisodicMemvidSearchHit {
-        workspace_id: candidate_workspace_id,
-        thread_id: candidate_thread_id,
-        turn_id: metadata
-            .get("pioneer.thread_episodic.turn_id")
-            .cloned()
-            .unwrap_or_default(),
-        item_id: metadata
-            .get("pioneer.thread_episodic.item_id")
-            .cloned()
-            .unwrap_or_default(),
-        index_item_id,
-        source_actor_role: metadata
-            .get("pioneer.thread_episodic.source_actor_role")
-            .cloned()
-            .unwrap_or_default(),
-        source_runtime_kind: metadata
-            .get("pioneer.thread_episodic.source_runtime_kind")
-            .cloned()
-            .unwrap_or_default(),
-        source_context,
-        visibility,
-        status,
-        segment_index: segment.segment_index,
-        capsule_id: segment.capsule_id.clone(),
-        capsule_ref: segment.capsule_ref.clone(),
-        frame_id: hit.frame_id,
-        frame_uri: hit.uri,
-        text: hit.chunk_text.unwrap_or(hit.text),
-        memvid_score: score,
-        lexical_score,
-        semantic_score: None,
-        temporal_score: None,
-        created_at_unix: parse_i64_metadata(&metadata, "pioneer.thread_episodic.created_at_unix"),
-        metadata,
-    })
-}
-
-fn memvid_thread_episodic_search_request(
-    profile: &ThreadEpisodicSearchProfile,
-    query: &str,
-    scope: Option<&str>,
-) -> SearchRequest {
-    SearchRequest {
-        query_embedding: None,
-        query: query.to_owned(),
-        top_k: profile.max_candidates as usize,
-        snippet_chars: profile.snippet_chars as usize,
-        uri: None,
-        scope: scope.map(str::to_owned),
-        cursor: None,
-        temporal: profile.recent_start_unix.map(|start_utc| TemporalFilter {
-            start_utc: Some(start_utc),
-            end_utc: None,
-            phrase: None,
-            tz: None,
-        }),
-        as_of_frame: None,
-        as_of_ts: None,
-        no_sketch: true,
-        acl_context: None,
-        acl_enforcement_mode: AclEnforcementMode::default(),
-    }
-}
-
 pub fn filter_thread_episodic_search_candidates(
     workspace_id: &str,
     thread_id: &str,
-    hits: Vec<ThreadEpisodicMemvidSearchHit>,
+    hits: Vec<ThreadEpisodicSearchHit>,
 ) -> ThreadEpisodicFilteredSearchCandidates {
     let mut accepted = Vec::new();
     let mut suppressions = Vec::new();
     for hit in hits {
         let reason = if hit.workspace_id != workspace_id {
             Some(ThreadEpisodicCandidateSuppressionReason::WrongWorkspace)
-        } else if hit.thread_id != thread_id {
+        } else if !thread_id.is_empty() && hit.thread_id != thread_id {
             Some(ThreadEpisodicCandidateSuppressionReason::WrongThread)
         } else if hit.source_context.is_hidden_or_internal()
             || hit.visibility.is_hidden_or_internal()
@@ -1862,29 +821,19 @@ pub fn filter_thread_episodic_search_candidates(
 }
 
 pub fn rank_thread_episodic_search_hits(
-    hits: Vec<ThreadEpisodicMemvidSearchHit>,
-    context: ThreadEpisodicRankingContext,
+    hits: Vec<ThreadEpisodicSearchHit>,
 ) -> Vec<ThreadEpisodicRankedSearchHit> {
     let mut ranked = hits
         .into_iter()
         .map(|hit| {
-            let memvid_score = hit.memvid_score;
-            let exact_source_boost = exact_source_boost(&hit, context.exact_source.as_ref());
-            let recency_boost = recency_boost(&hit, context.now_unix);
-            let source_role_boost = source_role_boost(hit.source_actor_role.as_str());
-            let final_score = score_or_zero(memvid_score)
-                + exact_source_boost.unwrap_or(0.0)
-                + recency_boost.unwrap_or(0.0)
-                + source_role_boost.unwrap_or(0.0);
+            let final_score = hit.rank_score();
+            let branch_score = |rank| pioneer_crud::thread_search_rank_score(rank, None) * 2.0;
             let score_breakdown = ThreadEpisodicScoreBreakdown {
                 final_score,
-                memvid_score,
-                semantic_score: hit.semantic_score,
-                lexical_score: hit.lexical_score,
-                temporal_score: hit.temporal_score,
-                exact_source_boost,
-                recency_boost,
-                source_role_boost,
+                rank_score: Some(final_score),
+                semantic_score: hit.semantic_rank.map(|rank| branch_score(Some(rank))),
+                lexical_score: hit.lexical_rank.map(|rank| branch_score(Some(rank))),
+                temporal_score: None,
             };
             ThreadEpisodicRankedSearchHit {
                 hit,
@@ -1898,72 +847,9 @@ pub fn rank_thread_episodic_search_hits(
             .final_score
             .partial_cmp(&left.score_breakdown.final_score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| right.hit.segment_index.cmp(&left.hit.segment_index))
             .then_with(|| left.hit.index_item_id.cmp(&right.hit.index_item_id))
     });
     ranked
-}
-
-fn index_put_options(request: &ThreadEpisodicMemvidIndexRequest) -> PutOptions {
-    let mut builder = PutOptions::builder()
-        .uri(request.frame_uri.as_str())
-        .title(request.index_item_id.as_str())
-        .track(THREAD_EPISODIC_TRACK)
-        .kind(THREAD_EPISODIC_KIND)
-        .tag(
-            "pioneer.thread_episodic.schema_version",
-            THREAD_EPISODIC_SCHEMA_VERSION,
-        )
-        .tag(
-            "pioneer.thread_episodic.capsule_id",
-            request.capsule_id.as_str(),
-        )
-        .tag(
-            "pioneer.thread_episodic.capsule_ref",
-            request.capsule_ref.as_str(),
-        )
-        .tag(
-            "pioneer.thread_episodic.index_item_id",
-            request.index_item_id.as_str(),
-        )
-        .metadata(DocMetadata {
-            mime: Some("text/plain; charset=utf-8".to_owned()),
-            ..DocMetadata::default()
-        })
-        .search_text(request.text.as_str())
-        .auto_tag(false)
-        .extract_dates(false)
-        .extract_triplets(false)
-        .instant_index(false)
-        .extraction_budget_ms(0);
-
-    for (key, value) in &request.metadata {
-        builder = builder.tag(key.as_str(), value.as_str());
-    }
-
-    if let Some(embedding) = request.embedding.as_ref() {
-        let dimension = embedding.identity.dimension.to_string();
-        builder = builder
-            .tag(
-                "pioneer.thread_episodic.embedding.provider_id",
-                embedding.identity.provider_id.as_str(),
-            )
-            .tag(
-                "pioneer.thread_episodic.embedding.model",
-                embedding.identity.model.as_str(),
-            )
-            .tag("pioneer.thread_episodic.embedding.dimension", dimension)
-            .tag(
-                "pioneer.thread_episodic.embedding.normalized",
-                if embedding.identity.normalized {
-                    "true"
-                } else {
-                    "false"
-                },
-            );
-    }
-
-    builder.build()
 }
 
 fn absolute_cutoff(scores: &[f32], min_relevancy: f32) -> usize {
@@ -2040,214 +926,7 @@ fn first_below(scores: &[f32], threshold: f32) -> Option<usize> {
     scores.iter().position(|score| *score < threshold)
 }
 
-fn score_or_zero(score: Option<f32>) -> f32 {
-    score.unwrap_or(0.0)
-}
-
-fn parse_i64_metadata(metadata: &BTreeMap<String, String>, key: &str) -> Option<i64> {
-    metadata.get(key)?.parse::<i64>().ok()
-}
-
-fn parse_thread_episodic_visibility(value: &str) -> Option<ThreadEpisodicVisibility> {
-    match value {
-        "user_visible" => Some(ThreadEpisodicVisibility::UserVisible),
-        "hidden" => Some(ThreadEpisodicVisibility::Hidden),
-        "internal" | "internal_hidden" => Some(ThreadEpisodicVisibility::Internal),
-        _ => None,
-    }
-}
-
-fn parse_thread_episodic_item_status(value: &str) -> Option<ThreadEpisodicItemStatus> {
-    match value {
-        "indexed" => Some(ThreadEpisodicItemStatus::Indexed),
-        "active" => Some(ThreadEpisodicItemStatus::Active),
-        "pending_index" => Some(ThreadEpisodicItemStatus::PendingIndex),
-        "deleted" => Some(ThreadEpisodicItemStatus::Deleted),
-        "excluded" => Some(ThreadEpisodicItemStatus::Excluded),
-        "index_failed" | "failed" => Some(ThreadEpisodicItemStatus::IndexFailed),
-        _ => None,
-    }
-}
-
-fn parse_thread_episodic_source_context(value: &str) -> Option<ThreadEpisodicSourceContext> {
-    serde_json::from_str::<ThreadEpisodicSourceContext>(value)
-        .ok()
-        .or_else(|| match value {
-            "user_visible_thread_item" => Some(ThreadEpisodicSourceContext::UserVisibleThreadItem),
-            "user_visible_task_summary" => {
-                Some(ThreadEpisodicSourceContext::UserVisibleTaskSummary)
-            }
-            "thread_compaction_summary" => {
-                Some(ThreadEpisodicSourceContext::ThreadCompactionSummary)
-            }
-            "hidden_prompt" => Some(ThreadEpisodicSourceContext::HiddenPrompt),
-            "reasoning_trace" => Some(ThreadEpisodicSourceContext::ReasoningTrace),
-            "raw_tool_output" => Some(ThreadEpisodicSourceContext::RawToolOutput),
-            "raw_task_runtime" => Some(ThreadEpisodicSourceContext::RawTaskRuntime),
-            "internal_hook_runtime" => Some(ThreadEpisodicSourceContext::InternalHookRuntime),
-            "system_prompt" => Some(ThreadEpisodicSourceContext::SystemPrompt),
-            "developer_prompt" => Some(ThreadEpisodicSourceContext::DeveloperPrompt),
-            _ => None,
-        })
-}
-
-fn exact_source_boost(
-    hit: &ThreadEpisodicMemvidSearchHit,
-    exact_source: Option<&ThreadEpisodicExactSourceTarget>,
-) -> Option<f32> {
-    let exact_source = exact_source?;
-    if exact_source
-        .index_item_id
-        .as_deref()
-        .is_some_and(|index_item_id| index_item_id == hit.index_item_id)
-    {
-        return Some(2.0);
-    }
-    if exact_source
-        .item_id
-        .as_deref()
-        .is_some_and(|item_id| item_id == hit.item_id)
-    {
-        return Some(1.0);
-    }
-    if exact_source
-        .turn_id
-        .as_deref()
-        .is_some_and(|turn_id| turn_id == hit.turn_id)
-    {
-        return Some(0.5);
-    }
-    None
-}
-
-fn recency_boost(hit: &ThreadEpisodicMemvidSearchHit, now_unix: Option<i64>) -> Option<f32> {
-    let (Some(created_at), Some(now_unix)) = (hit.created_at_unix, now_unix) else {
-        return None;
-    };
-    let age_seconds = now_unix.saturating_sub(created_at).max(0) as f32;
-    let day = 86_400.0;
-    let boost = if age_seconds <= day {
-        0.30
-    } else if age_seconds <= 7.0 * day {
-        0.20
-    } else if age_seconds <= 30.0 * day {
-        0.10
-    } else {
-        0.0
-    };
-    (boost > 0.0).then_some(boost)
-}
-
-fn source_role_boost(source_actor_role: &str) -> Option<f32> {
-    match source_actor_role {
-        "user" => Some(0.08),
-        "assistant" => Some(0.05),
-        "task" | "task_summary" => Some(0.03),
-        "system_visible" | "generated_summary" => Some(0.04),
-        _ => None,
-    }
-}
-
-fn open_or_create_memvid(
-    path: &Path,
-    _workspace_capsule: bool,
-) -> Result<Memvid, ThreadEpisodicMemvidError> {
-    if path.exists() {
-        Memvid::open(path).map_err(classify_memvid_error)
-    } else {
-        Memvid::create(path).map_err(classify_memvid_error)
-    }
-}
-
-fn thread_episodic_stats_from_memvid(
-    stats: memvid_core::Stats,
-) -> Result<ThreadEpisodicMemvidStats, ThreadEpisodicMemvidError> {
-    let capacity_bytes = optional_i64_from_unlimited_capacity(stats.capacity_bytes)?;
-    let remaining_capacity_bytes = optional_i64_from_capacity_bound_stat(
-        stats.remaining_capacity_bytes,
-        stats.capacity_bytes,
-    )?;
-    Ok(ThreadEpisodicMemvidStats {
-        active_frame_count: Some(i64_from_u64(stats.active_frame_count)?),
-        frame_count: Some(i64_from_u64(stats.frame_count)?),
-        size_bytes: Some(i64_from_u64(stats.size_bytes)?),
-        capacity_bytes,
-        remaining_capacity_bytes,
-        utilization_percent: Some(stats.storage_utilisation_percent),
-    })
-}
-
-fn classify_memvid_error(error: MemvidError) -> ThreadEpisodicMemvidError {
-    match error {
-        MemvidError::CapacityExceeded { .. } => {
-            ThreadEpisodicMemvidError::capacity_exceeded(error.to_string())
-        }
-        MemvidError::Lock(_)
-        | MemvidError::Locked(_)
-        | MemvidError::CheckpointFailed { .. }
-        | MemvidError::Io { .. }
-        | MemvidError::InvalidSketchTrack { .. } => {
-            ThreadEpisodicMemvidError::retryable(error.to_string())
-        }
-        MemvidError::InvalidHeader { .. }
-        | MemvidError::InvalidToc { .. }
-        | MemvidError::InvalidTimeIndex { .. }
-        | MemvidError::InvalidLogicMesh { .. }
-        | MemvidError::LogicMeshNotEnabled
-        | MemvidError::LexNotEnabled
-        | MemvidError::VecNotEnabled
-        | MemvidError::ClipNotEnabled
-        | MemvidError::VecDimensionMismatch { .. }
-        | MemvidError::ModelMismatch { .. }
-        | MemvidError::InvalidTier
-        | MemvidError::EncryptedFile { .. }
-        | MemvidError::AuxiliaryFileDetected { .. }
-        | MemvidError::RequiresSealed
-        | MemvidError::RequiresOpen => ThreadEpisodicMemvidError::non_retryable(error.to_string()),
-        _ => ThreadEpisodicMemvidError::retryable(error.to_string()),
-    }
-}
-
-fn i64_from_u64(value: u64) -> Result<i64, ThreadEpisodicMemvidError> {
-    i64::try_from(value)
-        .map_err(|_| ThreadEpisodicMemvidError::non_retryable("memvid stat does not fit i64"))
-}
-
-fn optional_i64_from_unlimited_capacity(
-    value: u64,
-) -> Result<Option<i64>, ThreadEpisodicMemvidError> {
-    if value == u64::MAX {
-        Ok(None)
-    } else {
-        i64_from_u64(value).map(Some)
-    }
-}
-
-fn optional_i64_from_capacity_bound_stat(
-    value: u64,
-    capacity_bytes: u64,
-) -> Result<Option<i64>, ThreadEpisodicMemvidError> {
-    if capacity_bytes == u64::MAX {
-        Ok(None)
-    } else {
-        i64_from_u64(value).map(Some)
-    }
-}
-
-fn path_from_storage_uri(storage_uri: &str) -> Result<PathBuf, ThreadEpisodicMemvidError> {
-    let path = storage_uri.strip_prefix("file://").ok_or_else(|| {
-        ThreadEpisodicMemvidError::non_retryable(format!(
-            "unsupported thread episodic memvid storage URI `{storage_uri}`"
-        ))
-    })?;
-    Ok(PathBuf::from(path))
-}
-
-pub fn thread_episodic_storage_uri_from_path(path: &Path) -> String {
-    format!("file://{}", path.display())
-}
-
-pub fn thread_episodic_memvid_metadata(
+pub fn thread_episodic_source_metadata(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -2285,1009 +964,6 @@ pub fn thread_episodic_memvid_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::thread_episodic_embedding::ThreadEpisodicEmbeddingProvider;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    // Local cache isolates capacity/open observations from parallel tests while
-    // exercising the same Memvid open and search boundary as production.
-    fn cached_lexical_page(
-        cache: &ReaderCache,
-        path: &Path,
-        cursor: Option<String>,
-    ) -> memvid_core::SearchResponse {
-        with_segment_reader(cache, path, "workspace", "capsule", |reader, _| {
-            let profile = ThreadEpisodicSearchProfile::for_kind(
-                ThreadEpisodicSearchProfileKind::DefaultContext,
-            );
-            let mut query =
-                memvid_thread_episodic_search_request(&profile, "paginationneedle", None);
-            query.top_k = 2;
-            query.cursor = cursor;
-            reader.search(query).map_err(classify_memvid_error)
-        })
-        .unwrap()
-    }
-
-    fn lexical_fixture(path: &Path, count: usize) {
-        for number in 0..count {
-            let mut item = concurrent_index_request(path, &number.to_string(), vec![1.0, 0.0, 0.0]);
-            item.embedding = None;
-            item.text = format!("paginationneedle document {number}");
-            index_item_blocking(path.to_owned(), item).unwrap();
-        }
-    }
-
-    #[test]
-    fn idle_reader_reuses_real_open_across_queries_and_pages_and_reopens_after_eviction() {
-        use std::sync::atomic::Ordering;
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("pages.mv2");
-        lexical_fixture(&path, 5);
-        let cache = ReaderCache::default();
-        let first = cached_lexical_page(&cache, &path, None);
-        assert_eq!(first.hits.len(), 2);
-        let second = cached_lexical_page(&cache, &path, first.next_cursor);
-        assert_eq!(second.hits.len(), 2);
-        assert_eq!(
-            cached_lexical_page(&cache, &path, second.next_cursor)
-                .hits
-                .len(),
-            1
-        );
-        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 2);
-        assert_eq!(cache.opens.load(Ordering::Relaxed), 1);
-        for n in 0..IDLE_READER_CAPACITY {
-            let other = temp.path().join(format!("other-{n}.mv2"));
-            lexical_fixture(&other, 1);
-            assert_eq!(cached_lexical_page(&cache, &other, None).hits.len(), 1);
-        }
-        assert_eq!(cache.idle.lock().unwrap().len(), IDLE_READER_CAPACITY);
-        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 2);
-        assert_eq!(
-            cache.opens.load(Ordering::Relaxed),
-            IDLE_READER_CAPACITY + 2
-        );
-        // The evicted file remains writable; idle snapshots retain no OS lock.
-        let evicted = temp.path().join("other-0.mv2");
-        drop(Memvid::open(&evicted).unwrap());
-        with_segment_reader(
-            &cache,
-            &path,
-            "another-workspace",
-            "capsule",
-            |reader, _| {
-                assert_eq!(reader.frame_count(), 5);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            cache.opens.load(Ordering::Relaxed),
-            IDLE_READER_CAPACITY + 3
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_reader_open_is_coalesced_by_capsule_ownership() {
-        use std::sync::atomic::Ordering;
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("concurrent.mv2");
-        lexical_fixture(&path, 1);
-        let cache = Arc::new(ReaderCache::default());
-        let mut tasks = Vec::new();
-        let barrier = Arc::new(tokio::sync::Barrier::new(5));
-        for _ in 0..4 {
-            let cache = cache.clone();
-            let path = path.clone();
-            let barrier = barrier.clone();
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                let task_path = path.clone();
-                run_capsule_blocking_mode(&path, false, move || {
-                    cached_lexical_page(&cache, &task_path, None).hits.len()
-                })
-                .await
-                .unwrap()
-            }));
-        }
-        barrier.wait().await;
-        for task in tasks {
-            assert_eq!(task.await.unwrap(), 1);
-        }
-        assert_eq!(cache.opens.load(Ordering::Relaxed), 1);
-        drop(cache);
-        drop(Memvid::open(&path).unwrap());
-    }
-
-    #[test]
-    fn reader_open_failure_recovers_and_external_replacement_discards_old_inode() {
-        use std::sync::atomic::Ordering;
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("recover.mv2");
-        let cache = ReaderCache::default();
-        assert!(with_segment_reader(&cache, &path, "workspace", "capsule", |_, _| Ok(())).is_err());
-        lexical_fixture(&path, 1);
-        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 1);
-        let replacement = temp.path().join("replacement.mv2");
-        lexical_fixture(&replacement, 3);
-        std::fs::rename(&replacement, &path).unwrap();
-        let first = cached_lexical_page(&cache, &path, None);
-        assert_eq!(first.hits.len(), 2);
-        assert_eq!(
-            cached_lexical_page(&cache, &path, first.next_cursor)
-                .hits
-                .len(),
-            1
-        );
-        assert_eq!(cache.opens.load(Ordering::Relaxed), 2);
-        std::fs::remove_file(&path).unwrap();
-        assert!(with_segment_reader(&cache, &path, "workspace", "capsule", |_, _| Ok(())).is_err());
-        lexical_fixture(&path, 1);
-        assert_eq!(cached_lexical_page(&cache, &path, None).hits.len(), 1);
-    }
-
-    // The adapter preserves continuation even with a smaller legacy candidate cap.
-    #[tokio::test]
-    async fn segment_page_preserves_continuation_and_ignores_profile_candidate_cap() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let path = temp.path().join("pages.mv2");
-        let backend = MemvidThreadEpisodicBackend::new();
-        for number in 0..7 {
-            let mut item =
-                concurrent_index_request(&path, &number.to_string(), vec![1.0, 0.0, 0.0]);
-            item.embedding = None;
-            item.text = format!("paginationneedle saved message {number}");
-            backend.index_item(item).await.expect("index document");
-        }
-        let mut profile =
-            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
-        profile.max_candidates = 1;
-        let request = ThreadEpisodicMemvidSearchRequest {
-            workspace_id: "workspace".into(),
-            thread_id: String::new(),
-            query: "paginationneedle".into(),
-            scope: None,
-            profile,
-            segments: vec![ThreadEpisodicMemvidSearchSegment {
-                capsule_id: "shared_capsule".into(),
-                capsule_ref: "capsule".into(),
-                storage_uri: thread_episodic_storage_uri_from_path(&path),
-                segment_index: 25,
-            }],
-            exact_source: None,
-        };
-        let mut cursor = None;
-        let mut ids = std::collections::BTreeSet::new();
-        let mut sizes = Vec::new();
-        loop {
-            let page = backend
-                .search_segment_page(request.clone(), 3, cursor, None)
-                .await
-                .expect("page");
-            sizes.push(page.hits.len());
-            ids.extend(page.hits.into_iter().map(|hit| hit.index_item_id));
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
-        }
-        assert_eq!(sizes, vec![3, 3, 1]);
-        assert_eq!(ids.len(), 7);
-        let mut appended = concurrent_index_request(&path, "appended", vec![1.0, 0.0, 0.0]);
-        appended.embedding = None;
-        appended.text = "paginationneedle after committed write".into();
-        backend.index_item(appended).await.unwrap();
-        assert_eq!(
-            backend
-                .search_segment_page(request.clone(), 20, None, None)
-                .await
-                .unwrap()
-                .hits
-                .len(),
-            8
-        );
-        // The same mutation boundary covers open-time WAL recovery/repair.
-        let repair_path = path.clone();
-        backend
-            .run_blocking(&path, move || {
-                let mut repaired = Memvid::open(&repair_path).unwrap();
-                repaired.commit().unwrap();
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            backend
-                .search_segment_page(request.clone(), 20, None, None)
-                .await
-                .unwrap()
-                .hits
-                .len(),
-            8
-        );
-        let ownership = lock_thread_episodic_workspace("reader-delete-regression").await;
-        remove_thread_episodic_capsule_file(&path, ownership)
-            .await
-            .unwrap();
-        assert!(
-            backend
-                .search_segment_page(request.clone(), 20, None, None)
-                .await
-                .is_err()
-        );
-        let mut recreated = concurrent_index_request(&path, "recreated", vec![1.0, 0.0, 0.0]);
-        recreated.embedding = None;
-        recreated.text = "paginationneedle replacement".into();
-        backend.index_item(recreated).await.unwrap();
-        let page = backend
-            .search_segment_page(request, 20, None, None)
-            .await
-            .unwrap();
-        assert_eq!(page.hits.len(), 1);
-        assert_eq!(page.hits[0].index_item_id, "index_recreated");
-    }
-
-    #[tokio::test]
-    async fn segment_page_rejects_incompatible_prepared_embedding_identity() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let path = temp.path().join("identity.mv2");
-        let backend = MemvidThreadEpisodicBackend::new();
-        backend
-            .index_item(concurrent_index_request(
-                &path,
-                "identity",
-                vec![1.0, 0.0, 0.0],
-            ))
-            .await
-            .expect("index embedded document");
-        let request = ThreadEpisodicMemvidSearchRequest {
-            workspace_id: "workspace".into(),
-            thread_id: String::new(),
-            query: "concurrent".into(),
-            scope: None,
-            profile: ThreadEpisodicSearchProfile::for_kind(
-                ThreadEpisodicSearchProfileKind::DefaultContext,
-            ),
-            segments: vec![ThreadEpisodicMemvidSearchSegment {
-                capsule_id: "shared_capsule".into(),
-                capsule_ref: "capsule".into(),
-                storage_uri: thread_episodic_storage_uri_from_path(&path),
-                segment_index: 0,
-            }],
-            exact_source: None,
-        };
-        for identity in [
-            ThreadEpisodicEmbeddingIdentity::new("other", "test-model", 3, true),
-            ThreadEpisodicEmbeddingIdentity::new("test", "other", 3, true),
-            ThreadEpisodicEmbeddingIdentity::new("test", "test-model", 3, false),
-            ThreadEpisodicEmbeddingIdentity::new("test", "test-model", 4, true),
-        ] {
-            let vector = vec![1.0; identity.dimension];
-            let embedding = ThreadEpisodicMemvidIndexEmbedding::new(identity, vector).unwrap();
-            let error = backend
-                .search_segment_page(request.clone(), 3, None, Some(embedding))
-                .await
-                .expect_err("incompatible vector space");
-            assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
-        }
-    }
-
-    #[tokio::test]
-    async fn segment_page_rejects_unbound_vector_manifest() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("unbound.mv2");
-        {
-            let mut mem = Memvid::create(&path).unwrap();
-            mem.enable_lex().unwrap();
-            mem.enable_vec().unwrap();
-            mem.put_with_embedding_and_options(
-                b"unknown embedding identity",
-                vec![1.0, 0.0, 0.0],
-                PutOptions::default(),
-            )
-            .unwrap();
-            mem.commit().unwrap();
-        }
-        let embedding = ThreadEpisodicMemvidIndexEmbedding::new(
-            ThreadEpisodicEmbeddingIdentity::new("test", "test-model", 3, true),
-            vec![1.0, 0.0, 0.0],
-        )
-        .unwrap();
-        let request = ThreadEpisodicMemvidSearchRequest {
-            workspace_id: "workspace".into(),
-            thread_id: String::new(),
-            query: "unknown".into(),
-            scope: None,
-            profile: ThreadEpisodicSearchProfile::for_kind(
-                ThreadEpisodicSearchProfileKind::DefaultContext,
-            ),
-            segments: vec![ThreadEpisodicMemvidSearchSegment {
-                capsule_id: "unbound".into(),
-                capsule_ref: "unbound".into(),
-                storage_uri: thread_episodic_storage_uri_from_path(&path),
-                segment_index: 0,
-            }],
-            exact_source: None,
-        };
-        let error = MemvidThreadEpisodicBackend::new()
-            .search_segment_page(request, 3, None, Some(embedding))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
-        assert!(error.message.contains("persisted embedding identity"));
-    }
-
-    #[tokio::test]
-    async fn prepared_vector_can_be_reused_across_independent_segment_pages() {
-        let temp = tempfile::tempdir().unwrap();
-        let backend = MemvidThreadEpisodicBackend::new();
-        let embedding = ThreadEpisodicMemvidIndexEmbedding::new(
-            ThreadEpisodicEmbeddingIdentity::new("test", "test-model", 3, true),
-            vec![1.0, 0.0, 0.0],
-        )
-        .unwrap();
-        for name in ["first", "second"] {
-            let path = temp.path().join(format!("{name}.mv2"));
-            backend
-                .index_item(concurrent_index_request(
-                    &path,
-                    name,
-                    embedding.vector.clone(),
-                ))
-                .await
-                .unwrap();
-            let request = ThreadEpisodicMemvidSearchRequest {
-                workspace_id: "workspace".into(),
-                thread_id: String::new(),
-                query: "concurrent".into(),
-                scope: None,
-                profile: ThreadEpisodicSearchProfile::for_kind(
-                    ThreadEpisodicSearchProfileKind::DefaultContext,
-                ),
-                segments: vec![ThreadEpisodicMemvidSearchSegment {
-                    capsule_id: name.into(),
-                    capsule_ref: name.into(),
-                    storage_uri: thread_episodic_storage_uri_from_path(&path),
-                    segment_index: 0,
-                }],
-                exact_source: None,
-            };
-            let page = backend
-                .search_segment_page(request, 3, None, Some(embedding.clone()))
-                .await
-                .unwrap();
-            assert_eq!(page.hits.len(), 1);
-            assert_eq!(page.hits[0].index_item_id, format!("index_{name}"));
-            assert_eq!(page.hits[0].capsule_id, name);
-            assert!(page.next_cursor.is_none());
-        }
-    }
-
-    #[tokio::test]
-    async fn independent_backends_share_capsule_lock_after_async_cancellation() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("shared-capsule.mv2");
-        lexical_fixture(&path, 1);
-        let refill_backend = Arc::new(MemvidThreadEpisodicBackend::new());
-        let indexer_backend = Arc::new(MemvidThreadEpisodicBackend::new());
-        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
-        let (first_finished_tx, first_finished_rx) = tokio::sync::oneshot::channel();
-        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
-
-        let first_path = path.clone();
-        let first_backend = refill_backend.clone();
-        let first = tokio::spawn(async move {
-            first_backend
-                .run_read_blocking(first_path.as_path(), {
-                    let task_path = first_path.clone();
-                    move || {
-                        with_segment_reader(
-                            reader_cache(),
-                            &task_path,
-                            "workspace",
-                            "capsule",
-                            |reader, _| {
-                                assert_eq!(reader.frame_count(), 1);
-                                let _ = first_started_tx.send(());
-                                release_first_rx.recv().expect("release first reader");
-                                let _ = first_finished_tx.send(());
-                                Ok(())
-                            },
-                        )
-                        .unwrap();
-                    }
-                })
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), first_started_rx)
-            .await
-            .expect("first blocking writer start timeout")
-            .expect("first blocking writer started");
-
-        first.abort();
-        assert!(
-            first
-                .await
-                .expect_err("async waiter should be cancelled")
-                .is_cancelled()
-        );
-
-        let other_path = temp_dir.path().join("independent-capsule.mv2");
-        let (other_started_tx, other_started_rx) = tokio::sync::oneshot::channel();
-        let other_backend = indexer_backend.clone();
-        let other = tokio::spawn(async move {
-            other_backend
-                .run_blocking(other_path.as_path(), move || {
-                    let _ = other_started_tx.send(());
-                })
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), other_started_rx)
-            .await
-            .expect("different capsule start timeout")
-            .expect("different capsule must remain independently runnable");
-        other
-            .await
-            .expect("other capsule async task")
-            .expect("other capsule blocking task");
-
-        let (second_attempting_tx, second_attempting_rx) = tokio::sync::oneshot::channel();
-        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
-        let second_path = path.clone();
-        let second_backend = indexer_backend.clone();
-        let second = tokio::spawn(async move {
-            let _ = second_attempting_tx.send(());
-            second_backend
-                .run_blocking(second_path.as_path(), {
-                    let task_path = second_path.clone();
-                    move || {
-                        drop(Memvid::open(&task_path).unwrap());
-                        let _ = second_started_tx.send(());
-                    }
-                })
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), second_attempting_rx)
-            .await
-            .expect("second task attempt timeout")
-            .expect("second task reached the lock attempt");
-        assert!(
-            lock_for_capsule_path(&path).await.try_lock_owned().is_err(),
-            "canceled reader still owns the capsule until its blocking operation finishes"
-        );
-
-        release_first_tx.send(()).expect("finish first reader");
-        tokio::time::timeout(Duration::from_secs(2), second)
-            .await
-            .expect("second writer completion timeout")
-            .expect("second async task")
-            .expect("second blocking task");
-        second_started_rx
-            .await
-            .expect("actual writer acquired exclusive OS lock");
-        tokio::time::timeout(Duration::from_secs(2), first_finished_rx)
-            .await
-            .expect("detached blocking writer completion timeout")
-            .expect("detached blocking writer finished");
-    }
-
-    fn concurrent_index_request(
-        path: &Path,
-        name: &str,
-        vector: Vec<f32>,
-    ) -> ThreadEpisodicMemvidIndexRequest {
-        ThreadEpisodicMemvidIndexRequest {
-            storage_uri: thread_episodic_storage_uri_from_path(path),
-            capsule_id: "shared_capsule".to_owned(),
-            capsule_ref: "mv2://pioneer/thread_episodic/shared_capsule".to_owned(),
-            workspace_capsule: true,
-            index_item_id: format!("index_{name}"),
-            frame_uri: format!("mv2://workspace/shared/item/{name}"),
-            text: format!("concurrent payload {name}"),
-            metadata: BTreeMap::from([("writer".to_owned(), name.to_owned())]),
-            embedding: Some(
-                ThreadEpisodicMemvidIndexEmbedding::new(
-                    ThreadEpisodicEmbeddingIdentity::new("test", "test-model", 3, true),
-                    vector,
-                )
-                .expect("valid test embedding"),
-            ),
-        }
-    }
-
-    fn capsule_generation_for_test(path: &Path) -> u64 {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(path).unwrap();
-        file.seek(SeekFrom::End(-(memvid_core::footer::FOOTER_SIZE as i64)))
-            .unwrap();
-        let mut bytes = [0u8; memvid_core::footer::FOOTER_SIZE];
-        file.read_exact(&mut bytes).unwrap();
-        memvid_core::CommitFooter::decode(&bytes)
-            .unwrap()
-            .generation
-    }
-
-    #[tokio::test]
-    async fn native_batch_commits_one_generation_with_ordered_frames_and_absolute_stats() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("batch.mv2");
-        // Persisted footer generation is a dependency format contract, not a
-        // production counter. Seed first so creation/recovery is outside the delta.
-        let backend = MemvidThreadEpisodicBackend::new();
-        backend
-            .index_item(concurrent_index_request(&path, "seed", vec![1.0, 0.0, 0.0]))
-            .await
-            .unwrap();
-        let before = capsule_generation_for_test(&path);
-        let requests = vec![
-            concurrent_index_request(&path, "alpha", vec![1.0, 0.0, 0.0]),
-            concurrent_index_request(&path, "beta", vec![0.0, 1.0, 0.0]),
-            concurrent_index_request(&path, "gamma", vec![0.0, 0.0, 1.0]),
-        ];
-        let owner = lock_thread_episodic_workspace("native_batch_generation").await;
-        let outputs = backend
-            .index_batch_with_workspace_ownership(requests.clone(), owner.clone())
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(capsule_generation_for_test(&path), before + 1);
-        assert_eq!(outputs.len(), 3);
-        assert_eq!(outputs[0].stats.active_frame_count, Some(4));
-        assert_eq!(outputs[0].stats.frame_count, Some(4));
-        assert_eq!(
-            outputs[0].stats.size_bytes,
-            Some(std::fs::metadata(&path).unwrap().len() as i64)
-        );
-        let mut memvid = Memvid::open_read_only(&path).unwrap();
-        for (request, output) in requests.iter().zip(&outputs) {
-            assert_eq!(output.frame_uri, request.frame_uri);
-            assert_eq!(
-                output.embedding_identity.as_ref(),
-                request.embedding.as_ref().map(|e| &e.identity)
-            );
-            assert_eq!(output.stats, outputs[0].stats);
-            let frame = memvid.frame_by_uri(&request.frame_uri).unwrap();
-            assert_eq!(frame.id, output.frame_id as u64);
-            assert_eq!(
-                memvid.frame_canonical_payload(frame.id).unwrap(),
-                request.text.as_bytes()
-            );
-        }
-        assert_eq!(
-            memvid.search_vec(&[0.0, 0.0, 1.0], 1).unwrap()[0].frame_id,
-            outputs[2].frame_id as u64
-        );
-        drop(memvid);
-        // Replay after a lost DB acknowledgement may supersede old versions,
-        // but never produces a second active document for a stable URI.
-        let replay = backend
-            .index_batch_with_workspace_ownership(requests, owner)
-            .await;
-        assert!(replay.iter().all(Result::is_ok));
-        let memvid = Memvid::open_read_only(&path).unwrap();
-        assert_eq!(memvid.stats().unwrap().active_frame_count, 4);
-    }
-
-    #[tokio::test]
-    async fn native_batch_near_capacity_returns_committed_prefix_without_relabeling_it() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("small-capacity.mv2");
-        let seed = concurrent_index_request(&path, "seed", vec![1.0, 0.0, 0.0]);
-        let backend = MemvidThreadEpisodicBackend::new();
-        let seed_output = backend.index_item(seed).await.unwrap();
-        // A tiny real ticket boundary above the actual seed payload tail,
-        // independent of the size of derived indexes and the footer.
-        {
-            let mut memvid = Memvid::open(&path).unwrap();
-            let frame = memvid.frame_by_id(seed_output.frame_id as u64).unwrap();
-            let limit = frame.payload_offset + frame.payload_length + 1024;
-            #[expect(
-                deprecated,
-                reason = "The local capacity fixture needs a tiny unsigned ticket; signed tickets require the upstream private key"
-            )]
-            memvid
-                .apply_ticket(
-                    memvid_core::Ticket::new("batch-capacity-test", 2).capacity_bytes(limit),
-                )
-                .unwrap();
-        }
-        let first = concurrent_index_request(&path, "fits", vec![0.0, 1.0, 0.0]);
-        let mut second = concurrent_index_request(&path, "full", vec![0.0, 0.0, 1.0]);
-        // Deterministic varied ASCII avoids a highly compressible repeated
-        // string. Capacity is checked before automatic chunk planning.
-        second.text = (0..1000u32)
-            .map(|i| format!("{:08x}", i.wrapping_mul(2654435761)))
-            .collect();
-        let owner = lock_thread_episodic_workspace("native_batch_capacity_prefix").await;
-        let results = backend
-            .index_batch_with_workspace_ownership(vec![first.clone(), second.clone()], owner)
-            .await;
-        assert_eq!(results.len(), 2);
-        let output = results[0].as_ref().unwrap();
-        assert_eq!(output.frame_uri, first.frame_uri);
-        assert_eq!(
-            results[1].as_ref().unwrap_err().kind,
-            ThreadEpisodicMemvidFailureKind::CapacityExceeded
-        );
-        let memvid = Memvid::open_read_only(&path).unwrap();
-        assert_eq!(
-            memvid.frame_by_uri(&first.frame_uri).unwrap().id,
-            output.frame_id as u64
-        );
-        assert!(memvid.frame_by_uri(&second.frame_uri).is_err());
-        assert_eq!(memvid.stats().unwrap().active_frame_count, 2);
-    }
-
-    #[tokio::test]
-    async fn native_batch_rejects_invalid_peers_before_any_file_mutation() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("invalid-batch.mv2");
-        let first = concurrent_index_request(&path, "first", vec![1.0, 0.0, 0.0]);
-        let second = concurrent_index_request(&path, "second", vec![0.0, 1.0, 0.0]);
-        let mut invalid = second.clone();
-        invalid.embedding.as_mut().unwrap().vector.pop();
-        let mut wrong_model = second.clone();
-        wrong_model.embedding.as_mut().unwrap().identity.model = "another-model".into();
-        let mut wrong_capsule = second.clone();
-        wrong_capsule.capsule_id = "other".into();
-        let mut wrong_workspace = second.clone();
-        wrong_workspace.metadata.insert(
-            "pioneer.thread_episodic.workspace_id".into(),
-            "other".into(),
-        );
-        let mut conflicting_uri = second.clone();
-        conflicting_uri.frame_uri = first.frame_uri.clone();
-        let mut oversized = second.clone();
-        oversized.text = "x".repeat(THREAD_EPISODIC_MEMVID_BATCH_BYTES);
-        let owner = lock_thread_episodic_workspace("invalid_batch_prevalidation").await;
-        let backend = MemvidThreadEpisodicBackend::new();
-        for peer in [
-            invalid,
-            wrong_model,
-            wrong_capsule,
-            wrong_workspace,
-            conflicting_uri,
-            oversized,
-        ] {
-            let results = backend
-                .index_batch_with_workspace_ownership(vec![first.clone(), peer], owner.clone())
-                .await;
-            assert_eq!(results.len(), 2);
-            assert!(results.iter().all(Result::is_err));
-            assert!(
-                !path.exists(),
-                "invalid group must not create or mutate the capsule"
-            );
-        }
-        // Same identity and individually valid vectors: only their combined
-        // byte count makes this group invalid (not a model/dimension mismatch).
-        let mut large_first = first.clone();
-        let mut large_second = second;
-        for request in [&mut large_first, &mut large_second] {
-            let embedding = request.embedding.as_mut().unwrap();
-            embedding.identity.dimension = THREAD_EPISODIC_MEMVID_BATCH_BYTES / 8;
-            embedding.vector = vec![0.0; embedding.identity.dimension];
-        }
-        assert!(
-            backend
-                .index_batch_with_workspace_ownership(
-                    vec![large_first, large_second],
-                    owner.clone()
-                )
-                .await
-                .iter()
-                .all(Result::is_err)
-        );
-        assert!(!path.exists());
-        let too_many = (0..=THREAD_EPISODIC_MEMVID_BATCH_ITEMS)
-            .map(|i| concurrent_index_request(&path, &format!("item_{i}"), vec![1.0, 0.0, 0.0]))
-            .collect();
-        assert!(
-            backend
-                .index_batch_with_workspace_ownership(too_many, owner)
-                .await
-                .iter()
-                .all(Result::is_err)
-        );
-        assert!(!path.exists());
-    }
-
-    #[tokio::test]
-    async fn refill_and_ordinary_backend_instances_preserve_both_indexed_documents() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("shared-writers.mv2");
-        let start = Arc::new(tokio::sync::Barrier::new(3));
-
-        let refill_backend = Arc::new(MemvidThreadEpisodicBackend::new());
-        let refill_request = concurrent_index_request(&path, "refill", vec![1.0, 0.0, 0.0]);
-        let refill_start = start.clone();
-        let refill = tokio::spawn(async move {
-            refill_start.wait().await;
-            refill_backend.index_item(refill_request).await
-        });
-
-        let ordinary_backend = Arc::new(MemvidThreadEpisodicBackend::new());
-        let ordinary_request = concurrent_index_request(&path, "ordinary", vec![0.0, 1.0, 0.0]);
-        let ordinary_start = start.clone();
-        let ordinary = tokio::spawn(async move {
-            ordinary_start.wait().await;
-            ordinary_backend.index_item(ordinary_request).await
-        });
-
-        start.wait().await;
-        let refill_output = refill
-            .await
-            .expect("refill task")
-            .expect("refill write succeeds");
-        let ordinary_output = ordinary
-            .await
-            .expect("ordinary task")
-            .expect("ordinary write succeeds");
-        assert_ne!(refill_output.frame_id, ordinary_output.frame_id);
-
-        let mut memvid = Memvid::open_read_only(&path).expect("reopen shared capsule");
-        for (name, vector, output) in [
-            ("refill", [1.0, 0.0, 0.0], refill_output),
-            ("ordinary", [0.0, 1.0, 0.0], ordinary_output),
-        ] {
-            let uri = format!("mv2://workspace/shared/item/{name}");
-            let frame = memvid.frame_by_uri(&uri).expect("indexed frame exists");
-            assert_eq!(frame.id, output.frame_id as u64);
-            assert_eq!(output.frame_uri, uri);
-            assert_eq!(
-                memvid
-                    .frame_canonical_payload(frame.id)
-                    .expect("indexed payload"),
-                format!("concurrent payload {name}").as_bytes()
-            );
-            assert_eq!(
-                memvid
-                    .search_vec(&vector, 1)
-                    .expect("search indexed vector")[0]
-                    .frame_id,
-                frame.id
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn canceled_blocking_index_retains_workspace_until_real_write_finishes_before_reset() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("transition.mv2");
-        let workspace = "blocking_projection_transition";
-        let ownership = lock_thread_episodic_workspace(workspace).await;
-        let backend = MemvidThreadEpisodicBackend::new().with_workspace_ownership(ownership);
-        let old_requests = vec![
-            concurrent_index_request(&path, "model_a", vec![1.0, 0.0, 0.0]),
-            concurrent_index_request(&path, "model_a_peer", vec![0.0, 1.0, 0.0]),
-        ];
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let old_path = path.clone();
-        let waiter = tokio::spawn(async move {
-            // The real backend helper moves ownership into its blocking task.
-            // This controlled point is inside the capsule write, outside Tokio
-            // and DB capacity. Dropping release_tx on panic also unblocks it.
-            let task_path = old_path.clone();
-            backend
-                .run_blocking(&old_path, move || {
-                    let _ = started_tx.send(());
-                    if release_rx.recv().is_err() {
-                        return None;
-                    }
-                    let output = index_batch_blocking(task_path, old_requests);
-                    let _ = finished_tx.send(output);
-                    Some(())
-                })
-                .await
-        });
-        started_rx.await.unwrap();
-        assert!(
-            try_lock_thread_episodic_workspace(workspace)
-                .await
-                .is_none()
-        );
-        waiter.abort();
-        assert!(waiter.await.unwrap_err().is_cancelled());
-        // Cancellation of the waiter cannot admit cleanup or a new claim.
-        assert!(
-            try_lock_thread_episodic_workspace(workspace)
-                .await
-                .is_none()
-        );
-        assert!(
-            try_lock_thread_episodic_workspace("independent_projection_transition")
-                .await
-                .is_some()
-        );
-        release_tx.send(()).unwrap();
-        assert_eq!(finished_rx.await.unwrap().unwrap().len(), 2);
-        let replacement = lock_thread_episodic_workspace(workspace).await;
-        remove_thread_episodic_capsule_file(&path, replacement.clone())
-            .await
-            .unwrap();
-        let mut request_b = concurrent_index_request(&path, "model_b", vec![0.0, 1.0, 0.0]);
-        request_b.embedding = Some(
-            ThreadEpisodicMemvidIndexEmbedding::new(
-                ThreadEpisodicEmbeddingIdentity::new("test", "model-b", 4, true),
-                vec![0.0, 1.0, 0.0, 0.0],
-            )
-            .unwrap(),
-        );
-        MemvidThreadEpisodicBackend::new()
-            .index_item_with_workspace_ownership(request_b, replacement.clone())
-            .await
-            .unwrap();
-        // The detached A task has completed before deletion and B's actual
-        // commit. Its old frame cannot reappear after the replacement.
-        let mut capsule = Memvid::open_read_only(&path).unwrap();
-        assert!(
-            capsule
-                .frame_by_uri("mv2://workspace/shared/item/model_a")
-                .is_err()
-        );
-        let frame_b = capsule
-            .frame_by_uri("mv2://workspace/shared/item/model_b")
-            .unwrap();
-        assert_eq!(
-            capsule
-                .frame_canonical_payload(frame_b.id)
-                .unwrap()
-                .as_slice(),
-            b"concurrent payload model_b"
-        );
-    }
-
-    struct StaticEmbeddingProvider {
-        calls: Arc<AtomicUsize>,
-        embedding: Vec<f32>,
-    }
-
-    impl ThreadEpisodicEmbeddingProvider for StaticEmbeddingProvider {
-        fn provider_id(&self) -> &str {
-            "test"
-        }
-
-        fn model(&self) -> &str {
-            "test-embedding"
-        }
-
-        fn dimension(&self) -> usize {
-            self.embedding.len()
-        }
-
-        fn normalized(&self) -> bool {
-            true
-        }
-
-        fn embed_text(&self, _text: &str) -> Result<Vec<f32>, crate::ThreadEpisodicEmbeddingError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.embedding.clone())
-        }
-    }
-
-    struct FakeThreadEpisodicMemvidBackend {
-        capabilities: ThreadEpisodicMemvidBackendCapabilities,
-    }
-
-    #[async_trait]
-    impl ThreadEpisodicMemvidBackend for FakeThreadEpisodicMemvidBackend {
-        fn capabilities(&self) -> ThreadEpisodicMemvidBackendCapabilities {
-            self.capabilities.clone()
-        }
-
-        async fn index_item(
-            &self,
-            request: ThreadEpisodicMemvidIndexRequest,
-        ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
-            Ok(ThreadEpisodicMemvidIndexOutput {
-                frame_id: 7,
-                frame_uri: request.frame_uri,
-                stats: ThreadEpisodicMemvidStats::default(),
-                embedding_identity: request.embedding.map(|embedding| embedding.identity),
-            })
-        }
-
-        async fn search(
-            &self,
-            _request: ThreadEpisodicMemvidSearchRequest,
-        ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError> {
-            Ok(ThreadEpisodicMemvidSearchOutput {
-                hits: Vec::new(),
-                diagnostics: ThreadEpisodicSearchDiagnostics {
-                    profile_kind: ThreadEpisodicSearchProfileKind::DefaultContext,
-                    search_mode: ThreadEpisodicSearchMode::Auto,
-                    adaptive: PioneerAdaptiveCutoffDiagnostics {
-                        strategy: ThreadEpisodicAdaptiveStrategy::Combined,
-                        min_relevancy: 0.25,
-                        cutoff_score: None,
-                        cutoff_reason: PioneerAdaptiveCutoffReason::NoCandidates,
-                        candidate_count: 0,
-                        result_count: 0,
-                    },
-                    searched_segment_ids: Vec::new(),
-                    searched_segment_count: 0,
-                    unavailable_segment_ids: Vec::new(),
-                    raw_candidate_count: 0,
-                    filtered_candidate_count: 0,
-                    returned_count: 0,
-                    native_memvid_adaptive_used: false,
-                    suppressions: Vec::new(),
-                    warnings: Vec::new(),
-                },
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn ask_retrieval_default_reports_unsupported_instead_of_lexical_fallback() {
-        let backend = FakeThreadEpisodicMemvidBackend {
-            capabilities: ThreadEpisodicMemvidBackendCapabilities::memvid_default(),
-        };
-        let provider = Arc::new(StaticEmbeddingProvider {
-            calls: Arc::new(AtomicUsize::new(0)),
-            embedding: vec![0.9, 0.1, 0.0],
-        });
-        let error = backend
-            .ask_retrieval(
-                ThreadEpisodicMemvidSearchRequest {
-                    workspace_id: "workspace_1".to_owned(),
-                    thread_id: "thread_1".to_owned(),
-                    query: "fallback".to_owned(),
-                    scope: None,
-                    profile: ThreadEpisodicSearchProfile::for_kind(
-                        ThreadEpisodicSearchProfileKind::DefaultContext,
-                    ),
-                    segments: Vec::new(),
-                    exact_source: None,
-                },
-                ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
-                Arc::new(ThreadEpisodicMemvidEmbedder::new(provider)),
-            )
-            .await
-            .expect_err("default ask retrieval should be explicit unsupported");
-
-        assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
-        assert!(error.message.contains("ask retrieval is not implemented"));
-    }
-
-    #[test]
-    fn capabilities_serialize_as_typed_states() {
-        let json = serde_json::to_value(ThreadEpisodicMemvidBackendCapabilities::memvid_default())
-            .expect("capabilities should serialize");
-
-        assert_eq!(json["adaptive_retrieval"], "supported");
-        assert_eq!(
-            json["adaptive_retrieval_implementation"],
-            "pioneer_fallback"
-        );
-        assert_eq!(json["semantic_search"], "supported");
-        assert_eq!(json["hybrid_search"], "supported");
-        assert_eq!(json["lexical_search"], "supported");
-        assert_eq!(json["temporal_search"], "supported");
-        assert_eq!(json["graph_search"], "disabled");
-    }
-
-    #[test]
-    fn feature_audit_records_current_memvid_feature_set() {
-        let audit = ThreadEpisodicMemvidFeatureAudit::current();
-        assert_eq!(audit.memvid_core_version, "3.1.2");
-        assert!(audit.enabled_features.contains(&"lex".to_owned()));
-        assert!(
-            audit
-                .enabled_features
-                .contains(&"temporal_track".to_owned())
-        );
-        assert!(audit.enabled_features.contains(&"vec".to_owned()));
-        assert!(audit.disabled_features.contains(&"api_embed".to_owned()));
-        assert_eq!(
-            audit.adaptive_retrieval_implementation,
-            ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback
-        );
-        assert!(audit.graph_search_note.contains("not enabled"));
-    }
 
     #[test]
     fn adaptive_absolute_cuts_low_score_tail() {
@@ -3392,37 +1068,6 @@ mod tests {
     }
 
     #[test]
-    fn recent_profile_builds_temporal_search_request() {
-        let mut profile =
-            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::RecentContext);
-        profile.recent_start_unix = Some(1_700_000_000);
-        let request =
-            memvid_thread_episodic_search_request(&profile, "architecture decision", None);
-        assert_eq!(request.query, "architecture decision");
-        assert_eq!(request.top_k, profile.max_candidates as usize);
-        assert_eq!(
-            request
-                .temporal
-                .as_ref()
-                .and_then(|filter| filter.start_utc),
-            Some(1_700_000_000)
-        );
-    }
-
-    #[test]
-    fn search_request_preserves_optional_scope() {
-        let profile =
-            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
-        let scope = "mv2://workspace/workspace_a/thread/thread_a/";
-
-        let scoped = memvid_thread_episodic_search_request(&profile, "memory limit", Some(scope));
-        assert_eq!(scoped.scope.as_deref(), Some(scope));
-
-        let unscoped = memvid_thread_episodic_search_request(&profile, "memory limit", None);
-        assert_eq!(unscoped.scope, None);
-    }
-
-    #[test]
     fn hard_filter_suppresses_hidden_deleted_excluded_and_wrong_scope() {
         let mut hits = vec![
             test_hit("workspace_a", "thread_a", "active"),
@@ -3450,574 +1095,70 @@ mod tests {
     }
 
     #[test]
-    fn ranking_returns_explainable_score_breakdown() {
-        let mut generic = test_hit("workspace_a", "thread_a", "generic");
-        generic.memvid_score = Some(0.70);
-        generic.created_at_unix = Some(100);
-        let mut exact = test_hit("workspace_a", "thread_a", "exact");
-        exact.memvid_score = Some(0.30);
-        exact.turn_id = "turn_1".to_owned();
-        exact.item_id = "item_1".to_owned();
-        exact.created_at_unix = Some(1_000);
-
-        let ranked = rank_thread_episodic_search_hits(
-            vec![generic, exact],
-            ThreadEpisodicRankingContext {
-                exact_source: Some(ThreadEpisodicExactSourceTarget {
-                    turn_id: Some("turn_1".to_owned()),
-                    item_id: Some("item_1".to_owned()),
-                    index_item_id: None,
-                }),
-                now_unix: Some(1_000),
-            },
+    fn rank_scores_have_deterministic_ties_and_no_source_boosts() {
+        let mut lower = test_hit("workspace", "thread", "a");
+        lower.lexical_rank = Some(1);
+        lower.semantic_rank = None;
+        lower.source_actor_role = "user".into();
+        lower.created_at_unix = Some(1_000);
+        let mut higher = test_hit("workspace", "thread", "b");
+        higher.lexical_rank = Some(1);
+        higher.semantic_rank = Some(1);
+        higher.created_at_unix = Some(1);
+        let mut tied = higher.clone();
+        tied.index_item_id = "c".into();
+        let ranked = rank_thread_episodic_search_hits(vec![tied, lower, higher]);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|hit| hit.hit.index_item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c", "a"]
         );
-
-        assert_eq!(ranked[0].hit.index_item_id, "exact");
-        assert_eq!(ranked[0].score_breakdown.exact_source_boost, Some(1.0));
-        assert_eq!(ranked[0].score_breakdown.recency_boost, Some(0.30));
-        assert_eq!(ranked[0].score_breakdown.source_role_boost, Some(0.08));
+        assert_eq!(ranked[0].score_breakdown.final_score, 1.0);
+        assert_eq!(ranked[2].score_breakdown.rank_score, Some(0.5));
     }
 
     #[test]
-    fn rejects_non_file_storage_uri() {
-        let error = path_from_storage_uri("s3://bucket/capsule.mv2").expect_err("must reject");
-        assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
-    }
-
-    #[test]
-    fn invalid_sketch_track_is_retryable() {
-        let error = classify_memvid_error(MemvidError::InvalidSketchTrack {
-            reason: "Invalid sketch track magic".into(),
-        });
-
-        assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::Retryable);
-        assert_eq!(
-            error.message,
-            "Sketch track is invalid: Invalid sketch track magic"
-        );
-    }
-
-    #[test]
-    fn lexical_write_does_not_initialize_vector_index_and_preserves_metadata() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("segment-lexical.mv2");
-        let frame_uri =
-            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
-
-        let output = index_item_blocking(
-            path.clone(),
-            ThreadEpisodicMemvidIndexRequest {
-                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
-                capsule_id: "capsule_lexical".to_owned(),
-                capsule_ref:
-                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_lexical".to_owned(),
-                workspace_capsule: true,
-                index_item_id: "index_item_lexical".to_owned(),
-                frame_uri: frame_uri.to_owned(),
-                text: "workspace lexical memory item".to_owned(),
-                metadata: thread_episodic_memvid_metadata(
-                    "workspace_1",
-                    "thread_1",
-                    "turn_1",
-                    "item_1",
-                    "assistant",
-                    "agent",
-                    "user_visible_thread_item",
-                    "text_hash",
-                    "source_text_hash",
-                ),
-                embedding: None,
-            },
-        )
-        .expect("lexical item should index");
-
-        assert_eq!(output.frame_uri, frame_uri);
-        assert_eq!(output.embedding_identity, None);
-        assert_eq!(output.stats.capacity_bytes, Some(50 * 1024 * 1024));
-        assert!(output.stats.remaining_capacity_bytes.is_some());
-        let memvid = Memvid::open(path.as_path()).expect("memvid should reopen");
-        assert_eq!(
-            memvid
-                .effective_vec_index_dimension()
-                .expect("vec dimension should inspect"),
-            None
-        );
-        let frame = memvid.frame_by_uri(frame_uri).expect("frame should exist");
-        assert_eq!(
-            frame
-                .extra_metadata
-                .get("pioneer.thread_episodic.index_item_id")
-                .map(String::as_str),
-            Some("index_item_lexical")
-        );
-        assert_eq!(
-            frame
-                .extra_metadata
-                .get("pioneer.thread_episodic.workspace_id")
-                .map(String::as_str),
-            Some("workspace_1")
-        );
-        assert!(
-            !frame
-                .extra_metadata
-                .contains_key("pioneer.thread_episodic.embedding.model")
-        );
-    }
-
-    #[test]
-    fn lexical_write_updates_existing_frame_by_uri_without_vector_index() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("segment-lexical-update.mv2");
-        let frame_uri =
-            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
-
-        let first = ThreadEpisodicMemvidIndexRequest {
-            storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
-            capsule_id: "capsule_lexical".to_owned(),
-            capsule_ref:
-                "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_lexical".to_owned(),
-            workspace_capsule: true,
-            index_item_id: "index_item_lexical".to_owned(),
-            frame_uri: frame_uri.to_owned(),
-            text: "first lexical text".to_owned(),
+    fn index_document_rejects_invalid_vectors_before_publication() {
+        let identity =
+            ThreadEpisodicEmbeddingIdentity::new("openai", "text-embedding-3-small", 3, true);
+        let document = ThreadEpisodicIndexDocument {
+            workspace_id: "workspace".into(),
+            index_item_id: "validate_document".into(),
+            text: "document".into(),
             metadata: BTreeMap::new(),
             embedding: None,
         };
-        let first_output =
-            index_item_blocking(path.clone(), first).expect("first lexical write should index");
-
-        let second_output = index_item_blocking(
-            path.clone(),
-            ThreadEpisodicMemvidIndexRequest {
-                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
-                capsule_id: "capsule_lexical".to_owned(),
-                capsule_ref:
-                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_lexical".to_owned(),
-                workspace_capsule: true,
-                index_item_id: "index_item_lexical".to_owned(),
-                frame_uri: frame_uri.to_owned(),
-                text: "second lexical text".to_owned(),
-                metadata: BTreeMap::new(),
-                embedding: None,
-            },
-        )
-        .expect("second lexical write should update existing frame");
-
-        assert_ne!(second_output.frame_id, first_output.frame_id);
-        assert_eq!(second_output.embedding_identity, None);
-        let memvid = Memvid::open(path.as_path()).expect("memvid should reopen");
-        assert_eq!(
-            memvid
-                .effective_vec_index_dimension()
-                .expect("vec dimension should inspect"),
-            None
-        );
-        let old_frame = memvid
-            .frame_by_id(first_output.frame_id as u64)
-            .expect("old frame should still be addressable");
-        assert_eq!(old_frame.status, FrameStatus::Superseded);
-        let frame = memvid.frame_by_uri(frame_uri).expect("frame should exist");
-        assert_eq!(frame.id, second_output.frame_id as u64);
-        assert_eq!(frame.status, FrameStatus::Active);
-        assert!(
-            frame
-                .search_text
-                .as_deref()
-                .is_some_and(|text| text.starts_with("second lexical text"))
-        );
-    }
-
-    #[test]
-    fn index_request_embedding_is_optional_and_validates_identity_dimension() {
-        let identity =
-            ThreadEpisodicEmbeddingIdentity::new("openai", "text-embedding-3-small", 3, true);
-        let embedding =
-            ThreadEpisodicMemvidIndexEmbedding::new(identity.clone(), vec![0.1, 0.2, 0.3])
-                .expect("matching embedding should build");
-
-        let request = ThreadEpisodicMemvidIndexRequest {
-            storage_uri: "file:///tmp/thread-episodic-vector.mv2".to_owned(),
-            capsule_id: "capsule_vector".to_owned(),
-            capsule_ref: "mv2://pioneer/thread_episodic/test/capsules/capsule_vector".to_owned(),
-            workspace_capsule: true,
-            index_item_id: "index_item_vector".to_owned(),
-            frame_uri:
-                "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1"
-                    .to_owned(),
-            text: "vector-ready memory item".to_owned(),
-            metadata: BTreeMap::new(),
-            embedding: Some(embedding),
-        };
-
-        assert_eq!(
-            request.embedding.as_ref().map(|value| &value.identity),
-            Some(&identity)
-        );
-
-        let mismatch = ThreadEpisodicMemvidIndexEmbedding::new(identity, vec![0.1, 0.2])
-            .expect_err("dimension mismatch should fail before Memvid write");
-        assert_eq!(mismatch.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
-
-        let lexical_request = ThreadEpisodicMemvidIndexRequest {
-            embedding: None,
-            ..request
-        };
-        assert!(lexical_request.embedding.is_none());
-    }
-
-    #[test]
-    fn vector_write_creates_active_frame_with_embedding_metadata() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("segment-vector.mv2");
-        let frame_uri =
-            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
-        let identity =
-            ThreadEpisodicEmbeddingIdentity::new("openai", "text-embedding-3-small", 3, true);
-        let embedding =
-            ThreadEpisodicMemvidIndexEmbedding::new(identity.clone(), vec![0.1, 0.2, 0.3])
-                .expect("embedding should match identity dimension");
-
-        let output = index_item_blocking(
-            path.clone(),
-            ThreadEpisodicMemvidIndexRequest {
-                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
-                capsule_id: "capsule_vector".to_owned(),
-                capsule_ref:
-                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_vector".to_owned(),
-                workspace_capsule: true,
-                index_item_id: "index_item_vector".to_owned(),
-                frame_uri: frame_uri.to_owned(),
-                text: "workspace memory item with vectors".to_owned(),
-                metadata: thread_episodic_memvid_metadata(
-                    "workspace_1",
-                    "thread_1",
-                    "turn_1",
-                    "item_1",
-                    "user",
-                    "agent",
-                    "user_visible_thread_item",
-                    "text_hash",
-                    "source_text_hash",
-                ),
-                embedding: Some(embedding),
-            },
-        )
-        .expect("vector item should index");
-
-        assert_eq!(output.frame_uri, frame_uri);
-        assert_eq!(output.embedding_identity, Some(identity.clone()));
-
-        let memvid = Memvid::open(path.as_path()).expect("memvid should reopen");
-        assert_eq!(
-            memvid.effective_vec_index_dimension().expect("vec dim"),
-            Some(3)
-        );
-        let frame = memvid.frame_by_uri(frame_uri).expect("frame should exist");
-        assert_eq!(frame.status, FrameStatus::Active);
-        assert_eq!(
-            frame
-                .extra_metadata
-                .get("pioneer.thread_episodic.index_item_id")
-                .map(String::as_str),
-            Some("index_item_vector")
-        );
-        assert_eq!(
-            frame
-                .extra_metadata
-                .get("pioneer.thread_episodic.embedding.provider_id")
-                .map(String::as_str),
-            Some("openai")
-        );
-        assert_eq!(
-            frame
-                .extra_metadata
-                .get("pioneer.thread_episodic.embedding.model")
-                .map(String::as_str),
-            Some("text-embedding-3-small")
-        );
-        assert_eq!(
-            frame
-                .extra_metadata
-                .get("pioneer.thread_episodic.embedding.dimension")
-                .map(String::as_str),
-            Some("3")
-        );
-        assert_eq!(
-            frame
-                .extra_metadata
-                .get("pioneer.thread_episodic.embedding.normalized")
-                .map(String::as_str),
-            Some("true")
-        );
-    }
-
-    #[test]
-    fn vector_write_dimension_mismatch_fails_before_file_mutation() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("segment-vector-mismatch.mv2");
-        let identity =
-            ThreadEpisodicEmbeddingIdentity::new("openai", "text-embedding-3-small", 3, true);
-        let error = index_item_blocking(
-            path.clone(),
-            ThreadEpisodicMemvidIndexRequest {
-                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
-                capsule_id: "capsule_vector".to_owned(),
-                capsule_ref:
-                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_vector".to_owned(),
-                workspace_capsule: true,
-                index_item_id: "index_item_vector".to_owned(),
-                frame_uri:
-                    "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1"
-                        .to_owned(),
-                text: "workspace memory item with bad vector".to_owned(),
-                metadata: BTreeMap::new(),
-                embedding: Some(ThreadEpisodicMemvidIndexEmbedding {
-                    identity,
-                    vector: vec![0.1, 0.2],
-                }),
-            },
-        )
-        .expect_err("dimension mismatch should fail");
-
-        assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
-        assert!(
-            !path.exists(),
-            "dimension mismatch should fail before creating the .mv2 file"
-        );
-    }
-
-    #[tokio::test]
-    async fn ask_response_mapping_hybrid_ask_retrieval_uses_memvid_with_supplied_embedder() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("segment-ask-vector.mv2");
-        let frame_uri =
-            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
-        let identity = ThreadEpisodicEmbeddingIdentity::new("test", "test-embedding", 3, true);
-        let embedding = ThreadEpisodicMemvidIndexEmbedding::new(identity, vec![0.9, 0.1, 0.0])
-            .expect("embedding should match identity");
-
-        index_item_blocking(
-            path.clone(),
-            ThreadEpisodicMemvidIndexRequest {
-                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
-                capsule_id: "capsule_ask".to_owned(),
-                capsule_ref:
-                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_ask".to_owned(),
-                workspace_capsule: true,
-                index_item_id: "index_item_ask".to_owned(),
-                frame_uri: frame_uri.to_owned(),
-                text: "hybrid vector retrieval architecture decision".to_owned(),
-                metadata: thread_episodic_memvid_metadata(
-                    "workspace_1",
-                    "thread_1",
-                    "turn_1",
-                    "item_1",
-                    "user",
-                    "agent",
-                    "user_visible_thread_item",
-                    "text_hash",
-                    "source_text_hash",
-                ),
-                embedding: Some(embedding),
-            },
-        )
-        .expect("vector item should index");
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = Arc::new(StaticEmbeddingProvider {
-            calls: calls.clone(),
-            embedding: vec![0.9, 0.1, 0.0],
-        });
-        let embedder = Arc::new(ThreadEpisodicMemvidEmbedder::new(provider));
-        let backend = MemvidThreadEpisodicBackend::new();
-        let output = backend
-            .ask_retrieval(
-                ThreadEpisodicMemvidSearchRequest {
-                    workspace_id: "workspace_1".to_owned(),
-                    thread_id: "thread_1".to_owned(),
-                    query: "architecture decision".to_owned(),
-                    scope: None,
-                    profile: ThreadEpisodicSearchProfile::for_kind(
-                        ThreadEpisodicSearchProfileKind::DefaultContext,
-                    ),
-                    segments: vec![ThreadEpisodicMemvidSearchSegment {
-                        capsule_id: "capsule_ask".to_owned(),
-                        capsule_ref:
-                            "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_ask".to_owned(),
-                        storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
-                        segment_index: 1,
-                    }],
-                    exact_source: None,
-                },
-                ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
-                embedder,
-            )
-            .await
-            .expect("ask retrieval should return hits");
-
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "prepare the query once per retrieval"
-        );
-        assert!(!output.diagnostics.native_memvid_adaptive_used);
-        assert_eq!(output.diagnostics.returned_count, 1);
-        let hit = &output.hits[0].hit;
-        assert_eq!(hit.index_item_id, "index_item_ask");
-        assert_eq!(hit.workspace_id, "workspace_1");
-        assert_eq!(hit.thread_id, "thread_1");
-        assert_eq!(hit.turn_id, "turn_1");
-        assert_eq!(hit.item_id, "item_1");
-        assert_eq!(hit.frame_uri, frame_uri);
-        assert!(hit.text.contains("hybrid vector retrieval"));
-        assert_eq!(
-            hit.metadata
-                .get("pioneer.thread_episodic.source_text_hash")
-                .map(String::as_str),
-            Some("source_text_hash")
-        );
-        assert!(hit.memvid_score.is_some());
-        assert_eq!(hit.lexical_score, hit.memvid_score);
-    }
-
-    #[tokio::test]
-    async fn segment_merge_hybrid_ask_retrieval_merges_segments_and_reports_unavailable() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path_one = temp_dir.path().join("segment-merge-one.mv2");
-        let path_two = temp_dir.path().join("segment-merge-two.mv2");
-        let missing_path = temp_dir.path().join("segment-merge-missing.mv2");
-        let identity = ThreadEpisodicEmbeddingIdentity::new("test", "test-embedding", 3, true);
-
-        for (path, capsule_id, index_item_id, turn_id, item_id, text) in [
-            (
-                path_one.as_path(),
-                "capsule_one",
-                "index_item_one",
-                "turn_one",
-                "item_one",
-                "architecture decision in first segment",
-            ),
-            (
-                path_two.as_path(),
-                "capsule_two",
-                "index_item_two",
-                "turn_two",
-                "item_two",
-                "architecture decision in second segment",
-            ),
+        document.validate_prepared().unwrap();
+        for vector in [
+            vec![0.1, 0.2],
+            vec![0.1, f32::NAN, 0.3],
+            vec![f32::INFINITY, 0.2, 0.3],
+            vec![0.0, 0.0, 0.0],
         ] {
-            index_item_blocking(
-                path.to_path_buf(),
-                ThreadEpisodicMemvidIndexRequest {
-                    storage_uri: thread_episodic_storage_uri_from_path(path),
-                    capsule_id: capsule_id.to_owned(),
-                    capsule_ref: format!(
-                        "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/{capsule_id}/capsules/{capsule_id}"
-                    ),
-                    workspace_capsule: true,
-                    index_item_id: index_item_id.to_owned(),
-                    frame_uri: format!(
-                        "mv2://workspace/workspace_1/thread/thread_1/turn/{turn_id}/item/{item_id}/index/{index_item_id}"
-                    ),
-                    text: text.to_owned(),
-                    metadata: thread_episodic_memvid_metadata(
-                        "workspace_1",
-                        "thread_1",
-                        turn_id,
-                        item_id,
-                        "user",
-                        "agent",
-                        "user_visible_thread_item",
-                        "text_hash",
-                        "source_text_hash",
-                    ),
-                    embedding: Some(
-                        ThreadEpisodicMemvidIndexEmbedding::new(
-                            identity.clone(),
-                            vec![0.9, 0.1, 0.0],
-                        )
-                        .expect("embedding should match identity"),
-                    ),
-                },
-            )
-            .expect("vector item should index");
+            assert_eq!(
+                ThreadEpisodicIndexEmbedding::new(identity.clone(), vector)
+                    .unwrap_err()
+                    .kind,
+                ThreadEpisodicSearchFailureKind::NonRetryable
+            );
         }
-
-        let provider = Arc::new(StaticEmbeddingProvider {
-            calls: Arc::new(AtomicUsize::new(0)),
-            embedding: vec![0.9, 0.1, 0.0],
-        });
-        let embedder = Arc::new(ThreadEpisodicMemvidEmbedder::new(provider));
-        let backend = MemvidThreadEpisodicBackend::new();
-        let request = ThreadEpisodicMemvidSearchRequest {
-            workspace_id: "workspace_1".to_owned(),
-            thread_id: "thread_1".to_owned(),
-            query: "architecture decision".to_owned(),
-            scope: Some("mv2://workspace/workspace_1/thread/thread_1/".to_owned()),
-            profile: ThreadEpisodicSearchProfile::for_kind(
-                ThreadEpisodicSearchProfileKind::DefaultContext,
+        let valid = ThreadEpisodicIndexDocument {
+            embedding: Some(
+                ThreadEpisodicIndexEmbedding::new(identity, vec![0.1, 0.2, 0.3]).unwrap(),
             ),
-            segments: vec![
-                ThreadEpisodicMemvidSearchSegment {
-                    capsule_id: "capsule_one".to_owned(),
-                    capsule_ref:
-                        "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/one/capsules/capsule_one"
-                            .to_owned(),
-                    storage_uri: thread_episodic_storage_uri_from_path(path_one.as_path()),
-                    segment_index: 1,
-                },
-                ThreadEpisodicMemvidSearchSegment {
-                    capsule_id: "capsule_two".to_owned(),
-                    capsule_ref:
-                        "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/two/capsules/capsule_two"
-                            .to_owned(),
-                    storage_uri: thread_episodic_storage_uri_from_path(path_two.as_path()),
-                    segment_index: 2,
-                },
-                ThreadEpisodicMemvidSearchSegment {
-                    capsule_id: "capsule_missing".to_owned(),
-                    capsule_ref:
-                        "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/missing/capsules/capsule_missing"
-                            .to_owned(),
-                    storage_uri: thread_episodic_storage_uri_from_path(missing_path.as_path()),
-                    segment_index: 3,
-                },
-            ],
-            exact_source: None,
+            ..document
         };
-
-        let output = backend
-            .ask_retrieval(
-                request,
-                ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
-                embedder,
-            )
-            .await
-            .expect("ask retrieval should merge segment hits");
-
-        assert_eq!(
-            output.diagnostics.searched_segment_ids,
-            vec!["capsule_two".to_owned(), "capsule_one".to_owned()]
-        );
-        assert_eq!(
-            output.diagnostics.unavailable_segment_ids,
-            vec!["capsule_missing".to_owned()]
-        );
-        let returned_ids = output
-            .hits
-            .iter()
-            .map(|hit| hit.hit.index_item_id.as_str())
-            .collect::<Vec<_>>();
-        assert!(returned_ids.contains(&"index_item_one"));
-        assert!(returned_ids.contains(&"index_item_two"));
+        valid.validate_prepared().unwrap();
     }
 
     fn test_hit(
         workspace_id: &str,
         thread_id: &str,
         index_item_id: &str,
-    ) -> ThreadEpisodicMemvidSearchHit {
-        ThreadEpisodicMemvidSearchHit {
+    ) -> ThreadEpisodicSearchHit {
+        ThreadEpisodicSearchHit {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: "turn".to_owned(),
@@ -4028,16 +1169,9 @@ mod tests {
             source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
             visibility: ThreadEpisodicVisibility::UserVisible,
             status: ThreadEpisodicItemStatus::Active,
-            segment_index: 1,
-            capsule_id: "capsule".to_owned(),
-            capsule_ref: "capsule_ref".to_owned(),
-            frame_id: 1,
-            frame_uri: format!("mv2://frame/{index_item_id}"),
             text: "text".to_owned(),
-            memvid_score: Some(0.5),
-            lexical_score: Some(0.5),
-            semantic_score: None,
-            temporal_score: None,
+            lexical_rank: Some(1),
+            semantic_rank: None,
             created_at_unix: None,
             metadata: BTreeMap::new(),
         }

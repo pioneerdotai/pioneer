@@ -458,11 +458,6 @@ pub fn prepare_source_record(
         projection_group_id,
         language_hint: None,
         token_estimate: estimate_tokens(text),
-        capsule_id: None,
-        capsule_ref: None,
-        segment_index: None,
-        frame_id: None,
-        frame_uri: None,
         indexed_at: None,
         deleted_at: None,
     }

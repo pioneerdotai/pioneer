@@ -60,6 +60,14 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        // Migrations and identity setup have their own bounded budget. Tests
+        // start their transport deadline only after this fixture is ready.
+        tokio::time::timeout(Duration::from_secs(30), Self::prepare())
+            .await
+            .expect("control RPC fixture setup must finish")
+    }
+
+    async fn prepare() -> Self {
         // Message mode intentionally discards Work on completion. Admit an
         // Agent turn so the visible item below survives terminal projection.
         let (mut processor, store, workspace) =
@@ -253,8 +261,8 @@ fn dispatch(
 
 #[tokio::test]
 async fn blocked_ordinary_allows_exact_cancel_and_wait_without_reordering_binary() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut f = Fixture::new().await;
         let mut ordinary = f.ordinary().await;
         let (input, mut reader) = incoming();
         let mut context = f
@@ -382,13 +390,25 @@ async fn deferred_count_bytes_single_message_and_control_capacity_close_boundedl
                 .map(move |case| (mode, case))
         })
     {
+        let mode_label = if mode == IngressMode::Serial {
+            "serial"
+        } else {
+            "read-group"
+        };
+        // Migrations and identity setup are independent of ingress latency and
+        // can contend with another test. Keep handler readiness and overload
+        // separately bounded by the original ten-second operation budget.
+        let mut f = Fixture::new().await;
+        let mut ordinary = if mode == IngressMode::Serial {
+            Some(
+                tokio::time::timeout(Duration::from_secs(10), f.ordinary())
+                    .await
+                    .unwrap_or_else(|_| panic!("blocked handler not ready: {mode_label}/{case}")),
+            )
+        } else {
+            None
+        };
         tokio::time::timeout(Duration::from_secs(10), async {
-            let mut f = Fixture::new().await;
-            let mut ordinary = if mode == IngressMode::Serial {
-                Some(f.ordinary().await)
-            } else {
-                None
-            };
             let (input, mut reader) = incoming();
             match case {
                 "count" => {
@@ -557,7 +577,7 @@ async fn deferred_count_bytes_single_message_and_control_capacity_close_boundedl
             f.assert_task_running().await;
         })
         .await
-        .unwrap_or_else(|_| panic!("bounded overload failed: {case}"));
+        .unwrap_or_else(|_| panic!("bounded overload failed: {mode_label}/{case}"));
     }
 }
 
@@ -582,8 +602,8 @@ async fn wait_reauthorizes_original_task_and_run_targets_after_initial_proof() {
             Loss::None,
             Loss::Renew,
         ] {
+            let f = Fixture::new().await;
             tokio::time::timeout(Duration::from_secs(10), async {
-                let f = Fixture::new().await;
                 materialize_test_member_collaborator(&f.processor.crud_store, &f.workspace, THREAD)
                     .await;
                 let mut principal = (*authenticated_test_member_collaborator()).clone();
@@ -758,8 +778,8 @@ async fn wait_reauthorizes_original_task_and_run_targets_after_initial_proof() {
 
 #[tokio::test]
 async fn task_wait_timeout_preserves_pending_result_and_durable_work() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut f = Fixture::new().await;
         f.processor
             .process_request_for_connection(
                 f.connection,
@@ -789,8 +809,8 @@ async fn task_wait_timeout_preserves_pending_result_and_durable_work() {
 
 #[tokio::test]
 async fn durable_session_revocation_during_wait_is_not_hidden_by_original_principal() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut f = Fixture::new().await;
         let processor = Arc::new((*f.processor).clone().with_auth_service(f.auth.clone()));
         let context =
             registered_request_context(&processor, f.connection, methods::TASK_WAIT).await;
@@ -933,8 +953,8 @@ fn get_thread(label: &str) -> Message {
 
 #[tokio::test]
 async fn independent_read_finishes_before_blocked_peer_and_serial_head_fences_later_reads() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut f = Fixture::new().await;
         let mut context = f
             .processor
             .session_manager
@@ -1033,8 +1053,8 @@ async fn independent_read_finishes_before_blocked_peer_and_serial_head_fences_la
 
 #[tokio::test]
 async fn full_read_slots_defer_and_reuse_capacity_without_spending_cancel_or_wait_slots() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut f = Fixture::new().await;
         let mut context = f
             .processor
             .session_manager
@@ -1120,8 +1140,8 @@ async fn full_read_slots_defer_and_reuse_capacity_without_spending_cancel_or_wai
 
 #[tokio::test]
 async fn read_classification_keeps_actual_dispatcher_validation_and_target_authorization() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut f = Fixture::new().await;
         let mut context = f
             .processor
             .session_manager
@@ -1193,8 +1213,8 @@ async fn socket_serial_predecessors_finish_before_explicit_and_implicit_reads() 
     use axum::{Router, extract::ws::WebSocketUpgrade, routing::get};
     use futures_util::SinkExt;
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+    let f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(15), async {
-        let f = Fixture::new().await;
         let workspace_b = f.processor.workspace_manager.create_workspace("read_barrier_b", Some("B")).await.unwrap().id;
         let (stop, stop_rx) = watch::channel(false);
         let (finished, completion) = tokio::sync::oneshot::channel();
@@ -1401,9 +1421,9 @@ impl OutboundSocket {
 #[tokio::test]
 async fn sealed_normal_writer_delivers_shutdown_and_revoke_fifo_before_close() {
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    let fixtures = [Fixture::new().await, Fixture::new().await];
     tokio::time::timeout(Duration::from_secs(15), async {
-        for revoke in [false, true] {
-            let f = Fixture::new().await;
+        for (revoke, f) in [false, true].into_iter().zip(fixtures) {
             let (mut wire, _block, _entered) = OutboundSocket::new(&f, false).await;
             if revoke {
                 wire.outbound
@@ -1477,8 +1497,8 @@ async fn sealed_normal_writer_delivers_shutdown_and_revoke_fifo_before_close() {
 async fn normal_writer_deadline_joins_pending_handler_and_cleans_connection_resources() {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    let f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(15), async {
-        let f = Fixture::new().await;
         let (mut wire, block, entered) = OutboundSocket::new(&f, true).await;
         let principal = authenticated_test_superuser();
         let owner = AuthenticatedTransferOwner {
@@ -1588,8 +1608,8 @@ async fn normal_writer_deadline_joins_pending_handler_and_cleans_connection_reso
 
 #[tokio::test]
 async fn blocked_ordinary_accepts_eighty_voice_frames_without_using_deferred_fifo() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut f = Fixture::new().await;
         let mut ordinary = f.ordinary().await;
         let mut context = f
             .processor
@@ -1738,8 +1758,8 @@ fn ingress_frame(session: &str, sequence: u64) -> Message {
 
 #[tokio::test]
 async fn paused_audio_ingest_does_not_hold_independent_read_group_or_cancel() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut f = Fixture::new().await;
         let mut context = f
             .processor
             .session_manager
@@ -1858,8 +1878,8 @@ async fn paused_audio_ingest_does_not_hold_independent_read_group_or_cancel() {
 
 #[tokio::test]
 async fn audio_capacity_failure_is_terminal_for_its_recording_and_preserves_read_group() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut f = Fixture::new().await;
         let mut context = f
             .processor
             .session_manager
@@ -1975,8 +1995,8 @@ async fn audio_capacity_failure_is_terminal_for_its_recording_and_preserves_read
 #[tokio::test]
 async fn audio_worker_retirement_releases_active_and_queued_tickets() {
     for terminal in ["shutdown", "drop", "panic"] {
+        let mut f = Fixture::new().await;
         tokio::time::timeout(Duration::from_secs(10), async {
-            let mut f = Fixture::new().await;
             let mut context = f
                 .processor
                 .session_manager
@@ -2076,8 +2096,8 @@ async fn audio_worker_retirement_releases_active_and_queued_tickets() {
 
 #[tokio::test]
 async fn finalize_transport_seal_includes_active_and_queued_audio_and_rejects_late_tail() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut f = Fixture::new().await;
         let mut context = f.processor.session_manager.connection_context(f.connection).await.unwrap();
         let session = ingress_recording(&f.processor, &f.workspace, &context, "voice_finalize_ingress");
         f.processor.voice_session_buffers.remove_session(&session.session_id).unwrap();
@@ -2238,8 +2258,8 @@ async fn unrelated_committed_policy_change_reauthorizes_same_audio_without_loss(
 async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer() {
     for buffered in [false, true] {
         let phase = std::cell::Cell::new("fixture setup");
+        let mut f = Fixture::new().await;
         tokio::time::timeout(Duration::from_secs(60), async {
-            let mut f = Fixture::new().await;
             let home = tempfile::tempdir().unwrap();
             let mut processor = (*f.processor).clone().with_runtime_home_for_tests(home.path().to_path_buf())
                 .with_test_voice_transcript("complete transport transcript")
@@ -2425,8 +2445,8 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
 
 #[tokio::test]
 async fn real_ack_capacity_wait_preserves_rpc_and_controls_with_full_ordinary_data() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(15), async {
-        let mut f = Fixture::new().await;
         let mut context = f
             .processor
             .session_manager
@@ -2568,8 +2588,8 @@ async fn real_ack_capacity_wait_preserves_rpc_and_controls_with_full_ordinary_da
 #[tokio::test]
 async fn durable_revoke_before_publication_is_rechecked_before_audio_effect() {
     for publish in [false, true] {
+        let mut f = Fixture::new().await;
         tokio::time::timeout(Duration::from_secs(10), async {
-            let mut f = Fixture::new().await;
             let unrelated = f.connection;
             materialize_test_member_collaborator(
                 f.processor.crud_store.as_ref(),
@@ -2924,8 +2944,8 @@ async fn unpolled_audio_owner_drops_queued_payload_and_completion_ticket() {
 async fn idle_socket_audio_demultiplex_keeps_normal_rpc_and_exact_pcm() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WireMessage;
+    let f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(15), async {
-        let f = Fixture::new().await;
         let (mut wire, _block, _entered) = OutboundSocket::new(&f, false).await;
         let context = f
             .processor
@@ -3037,8 +3057,8 @@ async fn idle_socket_audio_demultiplex_keeps_normal_rpc_and_exact_pcm() {
 #[tokio::test]
 async fn queued_and_active_audio_revalidate_current_lease_and_exact_socket() {
     for action in ["renewal", "expiry", "disconnect", "replacement"] {
+        let mut f = Fixture::new().await;
         tokio::time::timeout(Duration::from_secs(10),async {
-            let mut f=Fixture::new().await;
             let mut context=f.processor.session_manager.connection_context(f.connection).await.unwrap();
             // Start with a real expiry so renewal extends it instead of
             // overflowing the superuser fixture's i64::MAX sentinel.
@@ -3110,8 +3130,8 @@ async fn queued_and_active_audio_revalidate_current_lease_and_exact_socket() {
 
 #[tokio::test]
 async fn fail_cancel_restart_while_terminal_delivery_is_full_preserves_new_recording() {
+    let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(15), async {
-        let mut f = Fixture::new().await;
         let mut context = f
             .processor
             .session_manager
@@ -3286,8 +3306,8 @@ async fn fail_cancel_restart_while_terminal_delivery_is_full_preserves_new_recor
 #[tokio::test]
 async fn production_cancel_dispatch_keeps_other_class_admissible_after_reply() {
     for voice_first in [false, true] {
+        let mut f = Fixture::new().await;
         tokio::time::timeout(Duration::from_secs(10), async {
-            let mut f = Fixture::new().await;
             let mut context = f
                 .processor
                 .session_manager
