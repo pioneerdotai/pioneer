@@ -1264,8 +1264,6 @@ impl MessageProcessor {
                 });
             }
         }
-        let partial = diagnostics.iter().any(diagnostic_affects_status)
-            || components.iter().any(|c| c.status != "installed");
         let app_manifest = if parent.kind == PackageKind::App {
             Some(pioneer_plugins::app::AppManifest::parse(
                 parent
@@ -1281,37 +1279,56 @@ impl MessageProcessor {
             .as_ref()
             .and_then(|manifest| manifest.document()["version"].as_str().map(str::to_owned));
         let mut metadata = if let Some(manifest) = &app_manifest {
+            let saved_metadata = package_plan::app_metadata(
+                manifest,
+                &Default::default(),
+                &manifest.validate_localizations_json(
+                    parent
+                        .app_localizations_json
+                        .as_deref()
+                        .context("App localizations missing")?
+                        .as_bytes(),
+                )?,
+            );
             if parent.state == "installed" && parent.pending_json.is_none() {
                 let stored = parent.clone();
                 let limits = self.package_delivery_context().plugin_limits();
-                let metadata = super::package_delivery::prepare_cancellable(move |cancellation| {
-                    let (_, plan) = lifecycle::verified_package(&stored, cancellation, limits)?;
-                    Ok(plan.presentation.metadata)
+                // Only package preparation failures are degradable presentation.
+                // Keep cancellation/join failures outside the inner result, and
+                // DB/stale failures below outside the fallback entirely.
+                let prepared = super::package_delivery::prepare_cancellable(move |cancellation| {
+                    Ok(lifecycle::verified_package(&stored, cancellation, limits)
+                        .map(|(_, plan)| plan.presentation.metadata))
                 })
                 .await?;
                 anyhow::ensure!(
                     self.crud_store
                         .find_package_installation(&parent.id)
                         .await?
-                        .is_some_and(|current| current.revision == parent.revision
+                        .is_some_and(|current| current.kind == parent.kind
+                            && current.workspace_id == parent.workspace_id
+                            && current.revision == parent.revision
                             && current.package_fingerprint == parent.package_fingerprint
+                            && current.enabled == parent.enabled
                             && current.state == "installed"
                             && current.pending_json.is_none()),
                     "packages.stale"
                 );
-                metadata
+                match prepared {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        diagnostics.push(PluginDiagnostic {
+                            code: "app_package_unavailable".into(),
+                            path: String::new(),
+                            message: "Installed App files could not be verified".into(),
+                        });
+                        // Stored text/localizations remain valid. No image refs
+                        // are published without successful file verification.
+                        saved_metadata
+                    }
+                }
             } else {
-                package_plan::app_metadata(
-                    manifest,
-                    &Default::default(),
-                    &manifest.validate_localizations_json(
-                        parent
-                            .app_localizations_json
-                            .as_deref()
-                            .context("App localizations missing")?
-                            .as_bytes(),
-                    )?,
-                )
+                saved_metadata
             }
         } else {
             let metadata: PluginMetadata =
@@ -1333,6 +1350,8 @@ impl MessageProcessor {
                 };
             metadata
         };
+        let partial = diagnostics.iter().any(diagnostic_affects_status)
+            || components.iter().any(|c| c.status != "installed");
         plugin_icon_links(&mut metadata, parent);
         Ok(PluginItem {
             id: parent.id.clone(),

@@ -348,7 +348,7 @@ fn image(v: &Value, p: &str) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn path(s: &str, p: &str) -> Result<String> {
+pub fn path(s: &str, p: &str) -> Result<String> {
     let s = s.strip_prefix("./").unwrap_or(s);
     let s = s.strip_suffix('/').unwrap_or(s);
     if s.is_empty()

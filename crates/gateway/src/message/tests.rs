@@ -10298,6 +10298,29 @@ async fn create_finalized_archive_upload(
     file_name: String,
     request_prefix: &str,
 ) -> String {
+    create_finalized_archive_upload_with_purpose(
+        processor,
+        rx,
+        connection_id,
+        workspace_id,
+        archive,
+        file_name,
+        request_prefix,
+        pioneer_protocol::SkillUploadPurpose::Skill,
+    )
+    .await
+}
+
+async fn create_finalized_archive_upload_with_purpose(
+    processor: &MessageProcessor,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
+    connection_id: u64,
+    workspace_id: &str,
+    archive: Vec<u8>,
+    file_name: String,
+    request_prefix: &str,
+    purpose: pioneer_protocol::SkillUploadPurpose,
+) -> String {
     let sha256 = hex::encode(Sha256::digest(archive.as_slice()));
     let start_request_id = generate_test_request_id(request_prefix, "start");
     let start_request = json!({
@@ -10306,6 +10329,7 @@ async fn create_finalized_archive_upload(
         "method": "skills/upload/start",
         "params": {
             "workspace_id": workspace_id,
+            "purpose": purpose,
             "file_name": file_name,
             "archive_format": SkillArchiveFormat::TarGz,
             "compressed_size_bytes": archive.len(),

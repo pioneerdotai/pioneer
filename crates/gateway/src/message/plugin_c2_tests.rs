@@ -978,3 +978,321 @@ fn app_selection_preserves_both_parent_domains_and_blocks_owned_leaf_bypass() {
         std::fs::remove_dir_all(root).unwrap();
     });
 }
+
+// NOT_RUN / NOT_COMPILED. Real authenticated transfer and App facade, no providers.
+async fn app_rpc(
+    harness: &mut CliRuntimeSecurityHarness,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let id = pioneer_protocol::generate_id(21);
+    harness
+        .processor
+        .process_request_for_connection(
+            harness.connection_id,
+            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string(),
+        )
+        .await;
+    recv_response_by_id(&mut harness.rx, &id).await.result
+}
+
+async fn install_rpc_app(
+    harness: &mut CliRuntimeSecurityHarness,
+    root: &std::path::Path,
+    slug: &str,
+    decorated_paths: bool,
+) -> pioneer_protocol::AppItem {
+    let package = root.join(slug);
+    std::fs::create_dir_all(package.join("assets")).unwrap();
+    std::fs::create_dir_all(package.join("skills").join(slug)).unwrap();
+    let mut revisions = Vec::new();
+    for (name, size) in [("light", 1), ("dark", 2)] {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(size, size)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = png.into_inner();
+        revisions.push(hex::encode(Sha256::digest(&bytes)));
+        std::fs::write(package.join(format!("assets/{name}.png")), bytes).unwrap();
+    }
+    let path = |name| {
+        if decorated_paths {
+            format!("./assets/{name}.png/")
+        } else {
+            format!("assets/{name}.png")
+        }
+    };
+    let icons = json!({"light":path("light"),"dark":path("dark")});
+    std::fs::write(
+        package.join("app.json"),
+        json!({
+            "slug":slug,"name":format!("App {slug}"),"version":"1.2.3",
+            "shortDescription":"Saved description","developer":{"name":"Author","logo":icons},
+            "icon":icons,"skills":"./skills/","locales":{"en":"en.json"},"defaultLocale":"en"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("en.json"),
+        r#"{"name":"Localized App","shortDescription":"Localized description"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("skills").join(slug).join("SKILL.md"),
+        format!(
+            "---\nname: {slug}\ndescription: App regression skill\n---\nUse this installed skill.\n"
+        ),
+    )
+    .unwrap();
+    let upload = create_finalized_archive_upload_with_purpose(
+        &harness.processor,
+        &mut harness.rx,
+        harness.connection_id,
+        &harness.workspace_id,
+        build_test_directory_archive(&package),
+        format!("{slug}.tar.gz"),
+        slug,
+        pioneer_protocol::SkillUploadPurpose::App,
+    )
+    .await;
+    assert_eq!(
+        harness
+            .crud_store
+            .find_skill_upload_session(&upload)
+            .await
+            .unwrap()
+            .unwrap()
+            .purpose,
+        "app"
+    );
+    let workspace = harness.workspace_id.clone();
+    let preview: pioneer_protocol::AppsPreviewResponse = serde_json::from_value(
+        app_rpc(
+            harness,
+            methods::APPS_PREVIEW,
+            json!({"workspace_id":workspace,"upload_id":upload}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(preview.components.len(), 1);
+    assert!(preview.diagnostics.is_empty());
+    let installed_wire = app_rpc(
+        harness,
+        methods::APPS_INSTALL,
+        json!({
+            "workspace_id":workspace,"upload_id":upload,"expected_fingerprint":preview.fingerprint
+        }),
+    )
+    .await;
+    assert!(installed_wire.get("slug").is_some());
+    assert!(installed_wire.get("plugin").is_none());
+    let installed: pioneer_protocol::AppItem = serde_json::from_value(installed_wire).unwrap();
+    assert_eq!(installed.slug, slug);
+    assert_eq!(installed.name, "Localized App");
+    assert_eq!(
+        installed.description.as_deref(),
+        Some("Localized description")
+    );
+    assert_eq!(installed.version.as_deref(), Some("1.2.3"));
+    assert_eq!(installed.state, "installed");
+    assert_eq!(installed.status, "installed");
+    assert_eq!(installed.revision, 1);
+    let artwork = installed.metadata.app.as_ref().unwrap();
+    let icon = artwork
+        .icon
+        .as_ref()
+        .expect("both validated themes must reach presentation");
+    assert_eq!(
+        icon.light,
+        pioneer_protocol::ImageReference::app_icon(&workspace, &installed.id, &revisions[0])
+    );
+    assert_eq!(
+        icon.dark,
+        pioneer_protocol::ImageReference::app_icon(&workspace, &installed.id, &revisions[1])
+    );
+    assert_eq!(artwork.composer_icon.as_ref(), Some(icon));
+    assert_eq!(artwork.developer_logo.as_ref(), Some(icon));
+    assert_eq!(
+        artwork.localizations["en"].name.as_deref(),
+        Some("Localized App")
+    );
+    let stored = harness
+        .crud_store
+        .find_package_installation(&installed.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.kind, pioneer_protocol::PackageKind::App);
+    assert_eq!(stored.name, slug);
+    let manifest: serde_json::Value =
+        serde_json::from_str(stored.app_manifest_json.as_deref().unwrap()).unwrap();
+    assert_eq!(manifest["name"], format!("App {slug}"));
+    assert_eq!(stored.package_fingerprint, preview.fingerprint);
+    let skill = installed.components[0].skill_id.as_ref().unwrap();
+    let owner = harness
+        .crud_store
+        .native_package_owner("skill", skill.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.kind, pioneer_protocol::PackageKind::App);
+    assert_eq!(owner.package_id, installed.id);
+    let selected = pioneer_protocol::package_capability(
+        pioneer_protocol::PackageKind::App,
+        &installed.id,
+        installed.revision,
+    );
+    let normalized = harness
+        .processor
+        .normalize_turn_skill_capabilities(&workspace, &[selected])
+        .await
+        .unwrap();
+    assert_eq!(normalized.presentation.len(), 1);
+    assert!(
+        matches!(&normalized.presentation[0].kind, TurnCapabilityKind::App {app_id,expected_revision:1} if app_id==&installed.id)
+    );
+    assert!(
+        normalized.execution.iter().any(
+            |cap| matches!(&cap.kind,TurnCapabilityKind::Skill{skill_id,..} if skill_id==skill)
+        )
+    );
+    let frozen = normalized.plugin_selection.unwrap();
+    assert_eq!(frozen.parents[0].kind, pioneer_protocol::PackageKind::App);
+    assert_eq!(frozen.parents[0].revision, 1);
+    assert!(
+        frozen
+            .children
+            .iter()
+            .any(|child| child.parent_id == installed.id && child.id == skill.as_str())
+    );
+    installed
+}
+
+#[tokio::test]
+async fn app_rpc_install_read_selection_and_damaged_inventory_removal() {
+    let mut harness = setup_cli_runtime_security_harness(None).await;
+    let root = unique_temp_dir("app-rpc-correction");
+    // One scenario owns the real install contract and path→themed presentation
+    // regression. No direct insertion of parent rows or fabricated fingerprints.
+    let a = install_rpc_app(&mut harness, &root, "rpc-app-a", false).await;
+    let b = install_rpc_app(&mut harness, &root, "rpc-app-b", true).await;
+    let workspace = harness.workspace_id.clone();
+    let list: pioneer_protocol::AppsListResponse = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_LIST,
+            json!({"workspace_id":workspace}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(list.apps.len(), 2);
+    let details: pioneer_protocol::AppItem = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_DETAILS,
+            json!({"workspace_id":workspace,"app_id":a.id}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(details, a);
+    let stored = harness
+        .crud_store
+        .find_package_installation(&a.id)
+        .await
+        .unwrap()
+        .unwrap();
+    for missing in [false, true] {
+        if missing {
+            std::fs::remove_dir_all(&stored.package_path).unwrap();
+        } else {
+            // Keep the manifest and both raster files valid, but change the
+            // selected tree digest: this must hit fingerprint verification.
+            std::fs::copy(
+                std::path::Path::new(&stored.package_path).join("assets/dark.png"),
+                std::path::Path::new(&stored.package_path).join("assets/light.png"),
+            )
+            .unwrap();
+        }
+        let list: pioneer_protocol::AppsListResponse = serde_json::from_value(
+            app_rpc(
+                &mut harness,
+                methods::APPS_LIST,
+                json!({"workspace_id":workspace}),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(list.apps.len(), 2);
+        assert_eq!(list.apps.iter().find(|item| item.id == b.id).unwrap(), &b);
+        let damaged = list.apps.iter().find(|item| item.id == a.id).unwrap();
+        assert_eq!(damaged.slug, a.slug);
+        assert_eq!(damaged.name, a.name);
+        assert_eq!(damaged.version, a.version);
+        assert_eq!(damaged.description, a.description);
+        assert_eq!(damaged.revision, a.revision);
+        assert_eq!(damaged.components, a.components);
+        assert_eq!(damaged.status, "partial");
+        let artwork = damaged.metadata.app.as_ref().unwrap();
+        assert_eq!(
+            artwork.localizations,
+            a.metadata.app.as_ref().unwrap().localizations
+        );
+        assert!(
+            artwork.icon.is_none()
+                && artwork.composer_icon.is_none()
+                && artwork.developer_logo.is_none()
+        );
+        assert!(damaged.metadata.logo.is_none() && damaged.metadata.composer_icon.is_none());
+        let diagnostic = damaged
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "app_package_unavailable")
+            .unwrap();
+        assert!(diagnostic.path.is_empty());
+        assert_eq!(
+            diagnostic.message,
+            "Installed App files could not be verified"
+        );
+        assert!(
+            !serde_json::to_string(damaged)
+                .unwrap()
+                .contains(&stored.package_path)
+        );
+        let details: pioneer_protocol::AppItem = serde_json::from_value(
+            app_rpc(
+                &mut harness,
+                methods::APPS_DETAILS,
+                json!({"workspace_id":workspace,"app_id":a.id}),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(&details, damaged);
+    }
+    let removed: pioneer_protocol::AppsMutationResponse = serde_json::from_value(app_rpc(&mut harness,
+        methods::APPS_REMOVE,json!({"workspace_id":workspace,"app_id":a.id,"expected_revision":a.revision,"purge_data":true})).await).unwrap();
+    assert!(removed.removed && removed.app.is_none());
+    assert!(
+        harness
+            .crud_store
+            .find_package_installation(&a.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let list: pioneer_protocol::AppsListResponse = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_LIST,
+            json!({"workspace_id":workspace}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(list.apps, vec![b]);
+    std::fs::remove_dir_all(root).unwrap();
+}

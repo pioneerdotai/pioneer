@@ -48,12 +48,16 @@ pub(super) fn app_metadata(
     };
     let image = |value: &serde_json::Value| {
         let path = value.get("light")?.as_str()?;
-        images.get(path.strip_prefix("./").unwrap_or(path)).cloned()
+        images
+            .get(&pioneer_plugins::app::canonical_package_path(path, "image").ok()?)
+            .cloned()
     };
     let themed = |value: &serde_json::Value| -> Option<AppThemedIcon> {
         let get = |theme: &str| {
             let path = value.get(theme)?.as_str()?;
-            images.get(path.strip_prefix("./").unwrap_or(path)).cloned()
+            images
+                .get(&pioneer_plugins::app::canonical_package_path(path, "image").ok()?)
+                .cloned()
         };
         Some(AppThemedIcon {
             light: get("light")?,
