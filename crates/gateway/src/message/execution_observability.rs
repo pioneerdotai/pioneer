@@ -956,7 +956,7 @@ impl MessageProcessor {
                     .await?
             };
             let count = rows.len();
-            for (mut row, mut facts) in self
+            for (row, facts) in self
                 .observation_facts(proof.workspace_id(), proof.thread_id(), rows)
                 .await?
             {

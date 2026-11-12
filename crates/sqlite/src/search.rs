@@ -49,7 +49,7 @@ unsafe extern "C" fn literal_auto_extension(
                 |context| {
                     let text = context.get::<String>(0)?;
                     // The borrowed connection cannot escape this callback.
-                    let connection = unsafe { context.get_connection()? };
+                    let connection = context.get_connection()?;
                     literal::render(&connection, &text)
                 },
             )

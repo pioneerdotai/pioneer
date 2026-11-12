@@ -48,10 +48,7 @@ pub const RECOVERY_STATUS_BLOCKED: &str = "blocked";
 pub const RECOVERY_STATUS_CANCELLED: &str = "cancelled";
 
 pub const MEMORY_NAMESPACE_DEFAULT: &str = "default";
-pub const MEMORY_SCOPE_SLOT_PRIMARY: &str = "primary";
 pub const MEMORY_REPAIR_STATUS_OK: &str = "ok";
-pub const MEMORY_REPAIR_STATUS_REPAIR_NEEDED: &str = "repair_needed";
-pub const MEMORY_REPAIR_STATUS_FAILED: &str = "failed";
 
 pub const MEMORY_EVENT_CREATED: &str = "created";
 pub const MEMORY_EVENT_UPDATED: &str = "updated";
@@ -60,16 +57,12 @@ pub const MEMORY_EVENT_SUPERSEDED: &str = "superseded";
 pub const MEMORY_EVENT_EXPIRED: &str = "expired";
 pub const MEMORY_EVENT_ACCESSED: &str = "accessed";
 pub const MEMORY_EVENT_REPAIR_STATUS_CHANGED: &str = "repair_status_changed";
-pub const MEMORY_EVENT_CAPSULE_REPAIR_STATUS_CHANGED: &str = "capsule_repair_status_changed";
 pub const MEMORY_EVENT_QUARANTINED: &str = "quarantined";
 pub const MEMORY_EVENT_RESTORED: &str = "restored";
 pub const MEMORY_EVENT_CANDIDATE_CREATED: &str = "candidate_created";
 pub const MEMORY_EVENT_CANDIDATE_APPROVED: &str = "candidate_approved";
 pub const MEMORY_EVENT_CANDIDATE_REJECTED: &str = "candidate_rejected";
 pub const MEMORY_EVENT_CANDIDATE_EXPIRED: &str = "candidate_expired";
-
-pub const MEMORY_CAPSULE_STATUS_MISSING: &str = "missing";
-pub const MEMORY_CAPSULE_STATUS_REPAIR_NEEDED: &str = "repair_needed";
 
 pub const MEMORY_REPAIR_JOB_STATUS_PENDING: &str = "pending";
 pub const MEMORY_REPAIR_JOB_STATUS_RUNNING: &str = "running";

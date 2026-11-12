@@ -56,6 +56,8 @@ use pioneer_crud::{
     NewAgentMemoryQuarantine, NewAgentMemoryRepairJob, ResolveAgentMemoryQuarantine,
 };
 use pioneer_hooks::HookRunId;
+#[cfg(test)]
+use pioneer_protocol::MemoryCategory;
 use pioneer_protocol::{
     MemoryCandidate, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
     MemoryCandidatePolicyInput, MemoryCandidatePolicyOutput, MemoryCandidateStatus,
@@ -64,7 +66,7 @@ use pioneer_protocol::{
     MemoryCandidatesEditAndApproveResponse, MemoryCandidatesGetParams, MemoryCandidatesGetResponse,
     MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCandidatesMergeParams,
     MemoryCandidatesMergeResponse, MemoryCandidatesRejectParams, MemoryCandidatesRejectResponse,
-    MemoryCandidatesSuppressSimilarParams, MemoryCandidatesSuppressSimilarResponse, MemoryCategory,
+    MemoryCandidatesSuppressSimilarParams, MemoryCandidatesSuppressSimilarResponse,
     MemoryExplicitness, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
     MemoryGetParams, MemoryGetResponse, MemoryIntent, MemoryLifecycleActor,
     MemoryLifecycleActorKind, MemoryLifecycleReasonCode, MemoryListParams, MemoryListResponse,
@@ -75,7 +77,7 @@ use pioneer_protocol::{
     MemorySemanticWriteRouteInfo, MemorySensitivity, MemorySensitivityHint,
     MemorySourceContextKind, MemoryStatus, MemoryWriteEvidence, MemoryWriteRelation, generate_id,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const ID_LEN: usize = 21;

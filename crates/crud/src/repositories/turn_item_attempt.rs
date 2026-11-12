@@ -454,18 +454,6 @@ fn clears_attempt_payload(status: TurnItemAttemptStatus) -> bool {
     )
 }
 
-pub async fn list_expired_running_attempt_page<C: ConnectionTrait>(
-    db: &C,
-    now: DateTimeWithTimeZone,
-    limit: u64,
-    after: Option<&crate::TimeoutCandidateCursor>,
-) -> Result<(
-    Vec<RunningAttemptSnapshot>,
-    Option<crate::TimeoutCandidateCursor>,
-)> {
-    list_expired_running_attempt_page_scoped(db, now, limit, after, None).await
-}
-
 pub(crate) async fn list_expired_running_attempt_page_scoped<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -1258,19 +1246,6 @@ pub async fn running_attempt_upper_id_by_item_type<C: ConnectionTrait>(
 
 /// Stable bounded discovery for command supervision. Continue from raw rows,
 /// including skipped legacy rows, within the captured upper frontier.
-pub async fn list_running_attempt_page_by_item_type_bounded<C: ConnectionTrait>(
-    db: &C,
-    item_type: TurnItemType,
-    after_id: Option<&str>,
-    upper_id: &str,
-    limit: u64,
-) -> Result<(Vec<RunningAttemptSnapshot>, Option<String>)> {
-    list_running_attempt_page_by_item_type_bounded_scoped(
-        db, item_type, after_id, upper_id, limit, None,
-    )
-    .await
-}
-
 pub(crate) async fn list_running_attempt_page_by_item_type_bounded_scoped<C: ConnectionTrait>(
     db: &C,
     item_type: TurnItemType,

@@ -8358,6 +8358,7 @@ impl MessageProcessor {
     /// in-memory Turn from the authoritative transaction. Bootstrap performs
     /// the same database repair before threads are loaded; this path covers a
     /// listener/agent task loss while the Gateway process keeps running.
+    #[cfg(test)]
     pub(super) async fn reconcile_prepared_native_turn_finalizations(
         &self,
         now_unix: i64,

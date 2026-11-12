@@ -45724,7 +45724,6 @@ async fn production_snapshot_save_wakes_idle_runner_and_preserves_draft_unchange
         StoreThreadEpisodicIndexPayloadProvider, ThreadEpisodicIndexExecutor,
     };
     let (workspace_manager, store, workspace) = setup_workspace_manager().await;
-    let root = tempfile::tempdir().unwrap();
     let session_manager = Arc::new(SessionManager::new());
     let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let connection = register_authenticated_test_connection(session_manager.as_ref(), tx).await;

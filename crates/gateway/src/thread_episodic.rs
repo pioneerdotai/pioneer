@@ -7358,7 +7358,6 @@ mod tests {
     async fn ordinary_discovery_is_bounded_and_busy_prefix_cannot_starve_other_workspaces() {
         use sea_orm::{EntityTrait, Set};
         let (store, workspace) = setup_thread_episodic_store().await;
-        let root = TempDir::new().unwrap();
         let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().into();
         for index in 0..256 {
             pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
@@ -9393,7 +9392,6 @@ mod tests {
         use sea_orm::TransactionTrait;
         for stage in ["claim", "creation", "poll", "result", "settlement"] {
             let (store, a) = setup_thread_episodic_store().await;
-            let root = TempDir::new().unwrap();
             let b = format!("unwind_b_{stage}");
             let c = format!("unwind_c_{stage}");
             runner_workspace_for_test(&store, &b).await;
@@ -9537,7 +9535,7 @@ mod tests {
         async fn validate_document_with_workspace_ownership(
             &self,
             request: ThreadEpisodicIndexDocument,
-            ownership: ThreadEpisodicWorkspaceOwnership,
+            _ownership: ThreadEpisodicWorkspaceOwnership,
         ) -> std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>
         {
             self.dispatches.lock().await.push(vec![request.clone()]);
@@ -9546,7 +9544,7 @@ mod tests {
         async fn validate_documents_with_workspace_ownership(
             &self,
             requests: Vec<ThreadEpisodicIndexDocument>,
-            ownership: ThreadEpisodicWorkspaceOwnership,
+            _ownership: ThreadEpisodicWorkspaceOwnership,
         ) -> Vec<std::result::Result<ThreadEpisodicValidationResult, ThreadEpisodicSearchError>>
         {
             self.dispatches.lock().await.push(requests.clone());
@@ -9582,7 +9580,7 @@ mod tests {
         }
         async fn search(
             &self,
-            request: ThreadEpisodicSearchRequest,
+            _request: ThreadEpisodicSearchRequest,
         ) -> std::result::Result<ThreadEpisodicSearchOutput, ThreadEpisodicSearchError> {
             Err(ThreadEpisodicSearchError::non_retryable(
                 "unexpected search in indexing fixture",
@@ -9605,7 +9603,6 @@ mod tests {
 
     fn recording_batch_executor(
         store: Arc<CrudStore>,
-        root: &std::path::Path,
         backend: Arc<RecordingValidationBackend>,
         limit: u64,
     ) -> ThreadEpisodicIndexExecutor {
@@ -9624,9 +9621,8 @@ mod tests {
     #[tokio::test]
     async fn native_executor_batches_within_existing_candidate_quantum_and_item_bound() {
         let (store, workspace) = setup_thread_episodic_store().await;
-        let root = TempDir::new().unwrap();
         let backend = Arc::new(RecordingValidationBackend::default());
-        let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 10);
+        let executor = recording_batch_executor(store.clone(), backend.clone(), 10);
         let now = chrono::Utc::now().timestamp() + 60;
         let mut jobs = Vec::new();
         for i in 0..11 {
@@ -9739,7 +9735,6 @@ mod tests {
         for case in 0..3 {
             let poison = case == 2;
             let (store, workspace) = setup_thread_episodic_store().await;
-            let root = TempDir::new().unwrap();
             let backend = Arc::new(RecordingValidationBackend::default());
             let now = chrono::Utc::now().timestamp() + 60;
             let mut jobs = Vec::new();
@@ -9820,7 +9815,6 @@ mod tests {
             if different_workspace {
                 runner_workspace_for_test(&store, &other_workspace).await;
             }
-            let root = TempDir::new().unwrap();
             let backend = Arc::new(RecordingValidationBackend::default());
             let now = chrono::Utc::now().timestamp() + 60;
             let first =
@@ -9873,10 +9867,9 @@ mod tests {
     async fn shared_file_failure_and_unknown_commit_never_ack_and_retry_singly() {
         for published in [false, true] {
             let (store, workspace) = setup_thread_episodic_store().await;
-            let root = TempDir::new().unwrap();
             let backend = Arc::new(RecordingValidationBackend::default());
             *backend.failure.lock().await = Some(published);
-            let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 3);
+            let executor = recording_batch_executor(store.clone(), backend.clone(), 3);
             let now = chrono::Utc::now().timestamp() + 60;
             let mut jobs = Vec::new();
             for i in 0..3 {
@@ -9949,9 +9942,8 @@ mod tests {
     #[tokio::test]
     async fn partial_db_completion_after_native_batch_commit_replays_only_unacked_job() {
         let (store, workspace) = setup_thread_episodic_store().await;
-        let root = TempDir::new().unwrap();
         let backend = Arc::new(RecordingValidationBackend::default());
-        let executor = recording_batch_executor(store.clone(), root.path(), backend.clone(), 3);
+        let executor = recording_batch_executor(store.clone(), backend.clone(), 3);
         let now = chrono::Utc::now().timestamp() + 60;
         let mut jobs = Vec::new();
         for (i, name) in ["batch_ack_a", "batch_ack_b", "batch_ack_c"]
@@ -10000,17 +9992,11 @@ mod tests {
     #[tokio::test]
     async fn committed_batch_keeps_source_exclusion_and_stale_attempt_cas_per_job() {
         let (store, workspace) = setup_thread_episodic_store().await;
-        let root = TempDir::new().unwrap();
         let backend = Arc::new(RecordingValidationBackend::default());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *backend.after_commit.lock().await = Some((started_tx, release_rx));
-        let executor = Arc::new(recording_batch_executor(
-            store.clone(),
-            root.path(),
-            backend,
-            4,
-        ));
+        let executor = Arc::new(recording_batch_executor(store.clone(), backend, 4));
         let now = chrono::Utc::now().timestamp() + 60;
         let mut jobs = Vec::new();
         for i in 0..4 {
@@ -10191,7 +10177,7 @@ mod tests {
         }
         async fn search(
             &self,
-            request: ThreadEpisodicSearchRequest,
+            _request: ThreadEpisodicSearchRequest,
         ) -> std::result::Result<ThreadEpisodicSearchOutput, ThreadEpisodicSearchError> {
             Err(ThreadEpisodicSearchError::non_retryable(
                 "unexpected search in indexing fixture",
@@ -10242,7 +10228,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canceled_quantum_and_canceled_join_keep_every_batch_claim_visible_to_shutdown() {
         let (store, workspace) = setup_thread_episodic_store().await;
-        let root = TempDir::new().unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let backend = Arc::new(BlockingNativeRunnerBackend {
@@ -10323,7 +10308,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runner_shutdown_joins_blocking_write_and_rejects_subsequent_wakes() {
         let (store, workspace) = setup_thread_episodic_store().await;
-        let root = TempDir::new().unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let backend = Arc::new(BlockingNativeRunnerBackend {
@@ -12192,7 +12176,6 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        let temp_dir = TempDir::new().expect("temp dir");
         let request = static_index_request(item.id.as_str());
         let backend = Arc::new(PreparedDocumentBackend::new(vec![Ok(())]));
         let provider = static_index_payload_provider(crud_store.as_ref(), &item, request).await;
@@ -12735,7 +12718,6 @@ mod tests {
     #[tokio::test]
     async fn store_payload_provider_preserves_workspace_and_source_occurrences() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
-        let temp_dir = TempDir::new().expect("temp dir");
         let provider = StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone());
 
         let mut resolved = Vec::new();
@@ -13250,7 +13232,6 @@ mod tests {
         let backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
             ThreadEpisodicSearchError::retryable("workspace capsule full"),
         )]));
-        let temp_dir = TempDir::new().expect("temp dir");
         let executor = ThreadEpisodicIndexExecutor::new(
             crud_store.clone(),
             backend.clone(),
@@ -13344,7 +13325,6 @@ mod tests {
         let changed_backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
             ThreadEpisodicSearchError::retryable("stale capacity result"),
         )]));
-        let changed_temp_dir = TempDir::new().expect("changed temp dir");
         let changed_executor = ThreadEpisodicIndexExecutor::new(
             changed_store.clone(),
             changed_backend.clone(),
@@ -13431,7 +13411,6 @@ mod tests {
         let terminal_backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
             ThreadEpisodicSearchError::retryable("terminal stale capacity result"),
         )]));
-        let terminal_temp_dir = TempDir::new().expect("terminal temp dir");
         let terminal_executor = ThreadEpisodicIndexExecutor::new(
             terminal_store.clone(),
             terminal_backend.clone(),
@@ -13558,7 +13537,6 @@ mod tests {
                 DatabaseBackend::Sqlite,
                 "CREATE TRIGGER forbid_suppressed_job_deletion BEFORE DELETE ON thread_episodic_index_jobs BEGIN SELECT RAISE(FAIL, 'durable user outcome must not be deleted'); END".to_owned(),
             )).await.expect("deletion guard should install");
-            let temp_dir = TempDir::new().expect("temp dir");
             let base_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider> = Arc::new(
                 StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone()),
             );
@@ -13657,7 +13635,6 @@ mod tests {
                 "second backend failure",
             )),
         ]));
-        let temp_dir = TempDir::new().expect("temp dir");
         let executor = ThreadEpisodicIndexExecutor::new(
             crud_store.clone(),
             backend.clone(),
@@ -13734,7 +13711,6 @@ mod tests {
         let target_backend = Arc::new(PreparedDocumentBackend::new(vec![Err(
             ThreadEpisodicSearchError::retryable("target backend failure"),
         )]));
-        let target_temp = TempDir::new().expect("target temp dir");
         let target_executor = ThreadEpisodicIndexExecutor::new(
             target_store.clone(),
             target_backend,
@@ -13803,7 +13779,6 @@ mod tests {
             .await
             .expect("source update should persist");
         let transition_backend = Arc::new(PreparedDocumentBackend::new(Vec::new()));
-        let transition_temp = TempDir::new().expect("transition temp dir");
         let transition_executor = ThreadEpisodicIndexExecutor::new(
             transition_store.clone(),
             transition_backend.clone(),

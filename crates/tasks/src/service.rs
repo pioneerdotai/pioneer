@@ -2167,7 +2167,6 @@ impl TaskService {
         parent: ParentContext,
         now: i64,
     ) -> TaskRuntimeResult<PreparedTaskContract> {
-        let trigger_kind = params.trigger.spec.kind();
         TaskTriggerCalculator::validate(&params.trigger.spec)?;
 
         let depth = parent.depth;

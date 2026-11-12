@@ -43,7 +43,7 @@ fff-search = "0.11.0"
 globset = "0.4"
 regex = "1"
 regex-syntax = "0.8"
-jsonschema = { version = "0.58", default-features = false }
+jsonschema = { version = "0.61", default-features = false }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 nono.workspace = true

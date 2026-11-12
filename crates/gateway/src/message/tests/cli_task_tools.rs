@@ -4232,7 +4232,6 @@ fn admitted_cli_prompt_context_does_not_recall_and_keeps_explicit_history_search
         processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
             "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,'Other indexed conversation','',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
             [other.into(),binding.thread_id.clone().into()])).await.unwrap();
-        let temp = tempfile::tempdir().unwrap();
         let capsule = binding.workspace_id.clone();
         crate::message::thread_search_tools::tests::seed(
             &processor,
@@ -4548,7 +4547,6 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
             .await
             .unwrap()
             .unwrap();
-        let temp = tempfile::tempdir().unwrap();
         let capsule = binding.workspace_id.clone();
         let mut titles = ["A".to_owned(), "B".to_owned(), "C".to_owned()];
         // Give the three sources distinct lexical relevance. Equal documents

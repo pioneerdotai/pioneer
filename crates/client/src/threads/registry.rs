@@ -3047,8 +3047,7 @@ mod tests {
         let scope = crate::core::ClientScope::Timeline {
             thread_id: "a".into(),
         };
-        let mut subscription =
-            core.subscribe(scope.clone(), std::num::NonZeroUsize::new(8).unwrap());
+        let subscription = core.subscribe(scope.clone(), std::num::NonZeroUsize::new(8).unwrap());
         while subscription.try_next().is_some() {}
         let page = reconciliation_page(reconciliation_history()[0..=1].to_vec(), false, true);
         let bytes = serde_json::to_vec(&page).unwrap().len();

@@ -1837,6 +1837,7 @@ impl ThreadManager {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn subscription_incarnation(
         &self,
         connection: ConnectionId,

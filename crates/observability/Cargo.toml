@@ -27,7 +27,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 
-object = { version = "0.37.3", default-features = false, features = ["read", "std"] }
+object = { version = "0.41", default-features = false, features = ["read", "std"] }
 tokio.workspace = true
 nanoid.workspace = true
 libc.workspace = true

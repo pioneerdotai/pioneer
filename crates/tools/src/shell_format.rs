@@ -55,6 +55,7 @@ pub struct ExecPayloadInput {
     pub force_truncated_stderr: bool,
 }
 
+#[cfg(test)]
 pub fn build_exec_model_payload(input: ExecPayloadInput) -> ExecModelPayload {
     build_exec_model_payload_with_stats(input, None)
 }

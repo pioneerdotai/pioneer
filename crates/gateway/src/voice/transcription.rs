@@ -8,11 +8,12 @@ use pioneer_protocol::{VoiceError, VoiceErrorKind};
 #[cfg(test)]
 use std::sync::Arc;
 
-// Private one-shot result, retaining only timing actually supplied by the SDK.
-// No confidence, fabricated word times, or persistent decoder state.
+// Production consumes transcript text; SDK timing metadata is retained only
+// for the backend boundary tests, without fabricating word times.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VoiceSpeechHypothesis {
     pub(crate) text: String,
+    #[cfg(test)]
     pub(crate) segments: Option<Vec<transcribe_rs::TranscriptionSegment>>,
 }
 
@@ -20,6 +21,7 @@ impl VoiceSpeechHypothesis {
     pub(crate) fn text_only(text: String) -> Self {
         Self {
             text,
+            #[cfg(test)]
             segments: None,
         }
     }
@@ -29,6 +31,7 @@ impl From<transcribe_rs::TranscriptionResult> for VoiceSpeechHypothesis {
     fn from(result: transcribe_rs::TranscriptionResult) -> Self {
         Self {
             text: result.text,
+            #[cfg(test)]
             segments: result.segments,
         }
     }

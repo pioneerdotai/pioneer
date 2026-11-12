@@ -10216,7 +10216,7 @@ mod tests {
         let built = build_tools_with_extension_names(&["task_accept", "task_revise", "task_get"]);
         let mut callable = vec!["task_accept".to_owned(), "task_revise".to_owned()];
         let mut disclosed = callable.clone();
-        sync_review_action_tools_to_observations(&mut callable, &[]);
+        sync_review_action_tools_to_observations(&mut callable, &[], &[]);
         built.router.set_model_visible_tools(&callable).await;
         super::reconcile_tool_disclosure_order(
             &mut disclosed,

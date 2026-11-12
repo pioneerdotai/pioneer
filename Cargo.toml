@@ -45,7 +45,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.71.0"
+version = "0.72.0"
 edition = "2024"
 license = "MIT"
 authors = ["Pioneer Contributors"]
@@ -114,11 +114,11 @@ semver = "1"
 toml = "1.1"
 schemars = { version = "1.2", features = ["derive"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
-uuid = "1.27"
+uuid = "1.29"
 
 # Async
 axum = { version = "0.8.9", features = ["ws"] }
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -145,7 +145,7 @@ markdown = "1"
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-onig", "dump-load"] }
 two-face = { version = "=0.5.1", default-features = false, features = ["syntect-onig"] }
 unicode-width = "0.2"
-webbrowser = { version = "1.2.4", features = ["hardened"] }
+webbrowser = { version = "1.2", features = ["hardened"] }
 
 # Utils
 nanoid = "0.5"
@@ -158,7 +158,7 @@ dirs = "7"
 rand = "0.10"
 webclaw-core = { git = "https://github.com/0xMassi/webclaw", package = "webclaw-core", default-features = false }
 nono = { git = "https://github.com/nolabs-ai/nono", tag = "v0.66.0", default-features = false }
-scraper = "0.27"
+scraper = "0.29"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 tempfile = "3"
@@ -193,7 +193,7 @@ sha2 = "0.11"
 zeroize = "1"
 subtle = "2.6"
 hex = "0.4"
-icu_collator = "2.3"
+icu_collator = "2.4"
 base64 = "0.23"
 url = "2"
 libc = "0.2"
@@ -211,10 +211,5 @@ rusqlite = { version = "0.39", default-features = false, features = ["functions"
 zstd = { version = "0.14", features = ["experimental"] }
 
 # MCP
-rmcp = { version = "3.5", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "3", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 process-wrap = { version = "10", features = ["tokio1"] }
-
-[patch.crates-io]
-gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "4ade107d5211b8be4aaf8a961d80a03e0cd85116" }
-gpui-fast-windows = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "4ade107d5211b8be4aaf8a961d80a03e0cd85116" }
-gpui-fast-linux = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "4ade107d5211b8be4aaf8a961d80a03e0cd85116" }

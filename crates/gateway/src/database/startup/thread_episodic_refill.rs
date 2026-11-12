@@ -1024,6 +1024,7 @@ pub(crate) async fn refill_once_with_projection_resolver_and_config(
     }
     match execute_refill_jobs(
         crud_store,
+        #[cfg(test)]
         thread_episodic_lock_root,
         workspace_id,
         embedding_provider_resolver,
@@ -1792,7 +1793,7 @@ impl ThreadEpisodicSearchBackend for BlockingRefillTestBackend {
     }
     async fn search(
         &self,
-        request: pioneer_memory::ThreadEpisodicSearchRequest,
+        _request: pioneer_memory::ThreadEpisodicSearchRequest,
     ) -> std::result::Result<
         pioneer_memory::ThreadEpisodicSearchOutput,
         pioneer_memory::ThreadEpisodicSearchError,
@@ -1820,12 +1821,13 @@ impl ThreadEpisodicSearchBackend for BlockingRefillTestBackend {
 
 async fn execute_refill_jobs(
     crud_store: Arc<CrudStore>,
-    thread_episodic_lock_root: &Path,
+    #[cfg(test)] thread_episodic_lock_root: &Path,
     workspace_id: &str,
     embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
     config: ThreadEpisodicIndexExecutorConfig,
     summary: &mut ThreadEpisodicWorkspaceRefillSummary,
-    ownership: ThreadEpisodicWorkspaceOwnership,
+    // Retain the workspace lock for the entire refill, including awaits.
+    _ownership: ThreadEpisodicWorkspaceOwnership,
     #[cfg(test)] mut after_claim: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     let backend: Arc<dyn ThreadEpisodicSearchBackend> =
@@ -1839,7 +1841,7 @@ async fn execute_refill_jobs(
         if let Some(gate) = gate {
             Arc::new(BlockingRefillTestBackend {
                 native: backend,
-                ownership,
+                ownership: _ownership,
                 gate: std::sync::Mutex::new(Some(gate)),
             })
         } else {
@@ -3933,7 +3935,7 @@ mod tests {
         for (retry_after_ms, persistence_fallback) in
             [(60_001, false), (60_001, true), (u64::MAX, false)]
         {
-            let (store, root, workspace) = setup_concurrent_store().await;
+            let (store, _root, workspace) = setup_concurrent_store().await;
             let store = Arc::new(store.with_maintenance_access());
             ingest_materialized_user_item(
                 store.clone(),
@@ -4205,7 +4207,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_episodic_refill_success_commit_rechecks_source_after_resolution() {
-        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let (crud_store, _temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_refill_atomic_source_check";
         let turn_id = "turn_refill_atomic_source_check";
         let item_id = "item_refill_atomic_source_check";
@@ -4518,7 +4520,7 @@ mod tests {
 
     #[tokio::test]
     async fn refill_candidate_unwind_keeps_a_c_success_and_b_durable_running() {
-        let (store, root, workspace) = setup_store().await;
+        let (store, _root, workspace) = setup_store().await;
         mark_refill_marker_with_workspace_target(
             &store,
             &workspace,
@@ -4608,7 +4610,7 @@ mod tests {
             .unwrap();
         drop(backend);
         drop(ownership);
-        let ownership = lock_thread_episodic_workspace(&workspace).await;
+        let _ownership = lock_thread_episodic_workspace(&workspace).await;
         assert_eq!(
             store
                 .requeue_running_thread_episodic_index_jobs_for_workspace(&workspace, now, 5)
@@ -4643,7 +4645,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_episodic_refill_finishes_claimed_batch_before_returning_error() {
-        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let (crud_store, _temp_dir, workspace_id) = setup_store().await;
         mark_refill_marker_with_workspace_target(
             &crud_store,
             &workspace_id,

@@ -48,7 +48,6 @@ struct FoundSource {
     thread_id: String,
     title: Option<String>,
     fragment: Value,
-    canonical_key: (String, String, String),
     score: f32,
     position: usize,
 }
@@ -181,7 +180,7 @@ impl MessageProcessor {
                     item.turn_id.clone(),
                     item.item_id.clone(),
                 );
-                if !seen.insert(key.clone()) {
+                if !seen.insert(key) {
                     continue;
                 }
                 let score = hit.rank_score();
@@ -191,7 +190,7 @@ impl MessageProcessor {
                         "workspaceId":item.workspace_id,"threadId":item.thread_id,"turnId":item.turn_id,
                         "itemId":item.item_id,"indexItemId":item.id,"sourceKind":item.source_context,
                         "sourceVersion":item.source_text_hash}}),
-                    canonical_key: key, score, position: candidate_position,
+                    score, position: candidate_position,
                 });
                 if found.len() > request.limit {
                     let continuation = found.pop().unwrap().position;
@@ -478,12 +477,6 @@ fn search_page_fits_output(response: &Value) -> Result<bool> {
         return Ok(false);
     }
     Ok(pioneer_tools::builtin_json_llm_payload_size(SEARCH_TOOL, response)? <= PAGE_BYTES)
-}
-
-fn source_order(a: &FoundSource, b: &FoundSource) -> std::cmp::Ordering {
-    b.score
-        .total_cmp(&a.score)
-        .then_with(|| a.canonical_key.cmp(&b.canonical_key))
 }
 
 fn search_response(

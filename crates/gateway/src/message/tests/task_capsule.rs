@@ -19,6 +19,8 @@ async fn sequenced_task_provider_finishes_without_requesting_spent_tools() {
             ]);
         }
         let mut request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "test-model".into(),
             messages: Vec::new(),
             temperature: None,

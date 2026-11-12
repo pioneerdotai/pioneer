@@ -192,8 +192,6 @@ async fn search(
 #[tokio::test]
 async fn conversations_participate_with_canonical_dedup_and_position_pages() {
     let (_h, p) = fixture().await;
-    let temp = tempfile::tempdir().unwrap();
-    let root = format!("file://{}", temp.path().display());
     let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
     let mut expected = std::collections::BTreeSet::new();
     let mut duplicate = None;
@@ -233,7 +231,14 @@ async fn conversations_participate_with_canonical_dedup_and_position_pages() {
         assert_eq!(more, position != 14);
         for f in found {
             assert!(
-                seen.insert(f.canonical_key.clone()),
+                seen.insert((
+                    f.fragment["source"]["threadId"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    f.fragment["source"]["turnId"].as_str().unwrap().to_owned(),
+                    f.fragment["source"]["itemId"].as_str().unwrap().to_owned(),
+                )),
                 "duplicate source across files/pages"
             );
             assert_eq!(f.fragment["source"]["workspaceId"], WORKSPACE_RED_ID);
@@ -263,7 +268,6 @@ async fn conversations_participate_with_canonical_dedup_and_position_pages() {
 #[tokio::test]
 async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_acl() {
     let (_h, p) = fixture().await;
-    let temp = tempfile::tempdir().unwrap();
     let c = WORKSPACE_RED_ID;
     // More than one engine quantum of inaccessible candidates must not hide a later own source.
     let mut source_ids = Vec::new();
@@ -419,7 +423,6 @@ async fn filtered_engine_pages_fill_results_and_disclosure_rechecks_source_and_a
 #[tokio::test]
 async fn oversized_card_preserves_full_unicode_title_and_rejects_deleted_source_continuation() {
     let (_h, p) = fixture().await;
-    let temp = tempfile::tempdir().unwrap();
     let c = WORKSPACE_RED_ID;
     let item = seed(
         &p,
@@ -513,7 +516,6 @@ async fn oversized_card_preserves_full_unicode_title_and_rejects_deleted_source_
 async fn indexed_search_uses_authorized_sources_and_trusted_execution_identity() {
     use crate::message::thread_read_tools::tests::member;
     let (_h, p) = fixture().await;
-    let temp = tempfile::tempdir().unwrap();
     let c = WORKSPACE_RED_ID;
     seed(
         &p,
@@ -594,7 +596,6 @@ async fn indexed_search_uses_authorized_sources_and_trusted_execution_identity()
 #[tokio::test]
 async fn saved_search_over_256_kib_reconstructs_exact_payload_and_revalidates_disclosure() {
     let (_h, p) = fixture().await;
-    let temp = tempfile::tempdir().unwrap();
     let c = WORKSPACE_RED_ID;
     let source = seed(
         &p,
@@ -763,5 +764,5 @@ async fn configured_provider_failure_keeps_lexical_results_and_reports_incomplet
     assert_eq!(found.len(), 1);
     assert!(!more);
     assert!(incomplete);
-    assert_eq!(found[0].canonical_key.2, "provider_failure");
+    assert_eq!(found[0].fragment["source"]["itemId"], "provider_failure");
 }
