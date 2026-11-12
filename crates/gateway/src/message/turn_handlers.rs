@@ -1344,6 +1344,7 @@ impl MessageProcessor {
                     Some((capability, skill_id))
                 }
                 pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+                | pioneer_protocol::TurnCapabilityKind::App { .. }
                 | pioneer_protocol::TurnCapabilityKind::SkillPack { .. }
                 | pioneer_protocol::TurnCapabilityKind::McpServer { .. }
                 | pioneer_protocol::TurnCapabilityKind::McpTool { .. } => None,
@@ -1569,14 +1570,11 @@ impl MessageProcessor {
             }
         }
         for parent in &snapshot.parents {
-            presentation.push(pioneer_protocol::TurnCapability {
-                id: pioneer_protocol::plugin_capability_key(&parent.id),
-                label: None,
-                kind: pioneer_protocol::TurnCapabilityKind::Plugin {
-                    plugin_id: parent.id.clone(),
-                    expected_revision: parent.revision,
-                },
-            });
+            presentation.push(pioneer_protocol::package_capability(
+                parent.kind,
+                &parent.id,
+                parent.revision,
+            ));
         }
         Ok(presentation)
     }
@@ -1589,23 +1587,25 @@ impl MessageProcessor {
         capabilities: &[pioneer_protocol::TurnCapability],
     ) -> Result<NormalizedTurnCapabilities, TurnStartFailure> {
         let mut selected = capabilities.to_vec();
-        for parent in self
-            .crud_store
-            .list_plugin_installations(workspace_id)
-            .await
-            .map_err(|_| TurnStartFailure::unavailable("plugin inventory unavailable"))?
-        {
-            if parent.enabled && parent.allow_implicit_invocation && parent.state == "installed"
-                && parent.pending_json.is_none()
-                && !selected.iter().any(|cap| matches!(&cap.kind,
-                    pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id, .. } if plugin_id == &parent.id)) {
-                selected.push(pioneer_protocol::TurnCapability {
-                    id: pioneer_protocol::plugin_capability_key(&parent.id),
-                    label: None,
-                    kind: pioneer_protocol::TurnCapabilityKind::Plugin {
-                        plugin_id: parent.id, expected_revision: parent.revision,
-                    },
-                });
+        for kind in [
+            pioneer_protocol::PackageKind::Plugin,
+            pioneer_protocol::PackageKind::App,
+        ] {
+            for parent in self
+                .crud_store
+                .list_package_installations(workspace_id, kind)
+                .await
+                .map_err(|_| TurnStartFailure::unavailable("package inventory unavailable"))?
+            {
+                let key = pioneer_protocol::package_capability(kind, &parent.id, parent.revision);
+                if parent.enabled
+                    && parent.allow_implicit_invocation
+                    && parent.state == "installed"
+                    && parent.pending_json.is_none()
+                    && !selected.iter().any(|cap| cap.id == key.id)
+                {
+                    selected.push(key);
+                }
             }
         }
         self.normalize_selected_turn_capabilities(workspace_id, &selected)
@@ -1635,10 +1635,45 @@ impl MessageProcessor {
         // Disabled/unavailable installed members are omitted from input leaves;
         // trust/security/dependencies are resolved with the real MCP projection
         // later, and only that resolver's bindings become the ready snapshot.
-        let plugin_skill_projection = if capabilities
-            .iter()
-            .any(|c| matches!(c.kind, TurnCapabilityKind::Plugin { .. }))
-        {
+        let mut plugin_skill_projection=None;
+
+        for capability in capabilities {
+            match &capability.kind {
+                TurnCapabilityKind::Plugin { plugin_id, expected_revision }
+                | TurnCapabilityKind::App { app_id: plugin_id, expected_revision } => {
+                    let owner_kind = if matches!(&capability.kind, TurnCapabilityKind::App { .. }) { pioneer_protocol::PackageKind::App } else { pioneer_protocol::PackageKind::Plugin };
+                    if plugin_selection.parents.iter().any(|p| &p.id == plugin_id) {
+                        return Err(TurnStartFailure::invalid_input(
+                            "duplicate plugin selection",
+                        ));
+                    }
+                    let parent = self
+                        .crud_store
+                        .find_package_installation(plugin_id)
+                        .await
+                        .map_err(|_| TurnStartFailure::unavailable("plugin inventory unavailable"))?
+                        .filter(|p| {
+                            p.kind == owner_kind
+                                && p.workspace_id == workspace_id
+                                && p.enabled
+                                && p.state == "installed"
+                                && p.pending_json.is_none()
+                                && p.revision == *expected_revision
+                        })
+                        .ok_or_else(|| {
+                            TurnStartFailure::invalid_input(
+                                "plugin unavailable or revision changed",
+                            )
+                        })?;
+                    let components = self
+                        .crud_store
+                        .list_plugin_components(plugin_id)
+                        .await
+                        .map_err(|_| {
+                            TurnStartFailure::unavailable("plugin components unavailable")
+                        })?;
+                    if plugin_skill_projection.is_none() && components.iter().any(|c|c.kind=="skill"&&c.status=="installed") {
+                        plugin_skill_projection=Some({
             let context = self
                 .skills_runtime_context(workspace_id)
                 .map_err(|_| TurnStartFailure::unavailable("skill projection unavailable"))?;
@@ -1666,46 +1701,8 @@ impl MessageProcessor {
                     )
                 })
                 .collect::<HashMap<_, _>>()
-        } else {
-            HashMap::new()
-        };
-
-        for capability in capabilities {
-            match &capability.kind {
-                TurnCapabilityKind::Plugin {
-                    plugin_id,
-                    expected_revision,
-                } => {
-                    if plugin_selection.parents.iter().any(|p| &p.id == plugin_id) {
-                        return Err(TurnStartFailure::invalid_input(
-                            "duplicate plugin selection",
-                        ));
+                        });
                     }
-                    let parent = self
-                        .crud_store
-                        .find_package_installation(plugin_id)
-                        .await
-                        .map_err(|_| TurnStartFailure::unavailable("plugin inventory unavailable"))?
-                        .filter(|p| {
-                            p.kind == pioneer_protocol::PackageKind::Plugin
-                                && p.workspace_id == workspace_id
-                                && p.enabled
-                                && p.state == "installed"
-                                && p.pending_json.is_none()
-                                && p.revision == *expected_revision
-                        })
-                        .ok_or_else(|| {
-                            TurnStartFailure::invalid_input(
-                                "plugin unavailable or revision changed",
-                            )
-                        })?;
-                    let components = self
-                        .crud_store
-                        .list_plugin_components(plugin_id)
-                        .await
-                        .map_err(|_| {
-                            TurnStartFailure::unavailable("plugin components unavailable")
-                        })?;
                     let mut leaves = Vec::new();
                     for component in components.iter().filter(|c| c.status == "installed") {
                         let (id, leaf) = match component.kind.as_str() {
@@ -1791,8 +1788,7 @@ impl MessageProcessor {
                             ));
                         }
                         let eligible = match &leaf.kind {
-                            TurnCapabilityKind::Skill { skill_id, .. } => plugin_skill_projection
-                                .get(skill_id)
+                            TurnCapabilityKind::Skill { skill_id, .. } => plugin_skill_projection.as_ref().and_then(|projection|projection.get(skill_id))
                                 .copied()
                                 .unwrap_or(false),
                             _ => true,
@@ -1811,7 +1807,13 @@ impl MessageProcessor {
                         });
                     plugin_leaves.insert(plugin_id.clone(), leaves);
                     presentation.push(TurnCapability {
-                        label: Some(parent.name),
+                        label: Some(if parent.kind==pioneer_protocol::PackageKind::App {
+                            (||->anyhow::Result<String>{
+                                let manifest=pioneer_plugins::app::AppManifest::parse(parent.app_manifest_json.as_deref().context("App manifest missing")?.as_bytes())?;
+                                let locales=manifest.validate_localizations_json(parent.app_localizations_json.as_deref().context("App localizations missing")?.as_bytes())?;
+                                Ok(manifest.presentation("",&locales).name)
+                            })().map_err(|_|TurnStartFailure::unavailable("App presentation unavailable"))?
+                        }else{parent.name}),
                         ..capability.clone()
                     });
                 }
@@ -1985,7 +1987,7 @@ impl MessageProcessor {
         let mut seen_skill_ids = HashSet::new();
         for capability in &presentation {
             match &capability.kind {
-                TurnCapabilityKind::Plugin { plugin_id, .. } => {
+                TurnCapabilityKind::Plugin { plugin_id, .. } | TurnCapabilityKind::App { app_id: plugin_id, .. } => {
                     execution.extend(plugin_leaves.remove(plugin_id).expect("validated plugin"));
                 }
                 TurnCapabilityKind::Skill { skill_id, pack_id } => {
@@ -2416,6 +2418,7 @@ impl MessageProcessor {
                 matches!(
                     cap.kind,
                     pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+                        | pioneer_protocol::TurnCapabilityKind::App { .. }
                 )
             }) {
                 canonical_launch.execution.selected_capabilities = launch.capabilities.clone();
@@ -3204,22 +3207,6 @@ impl MessageProcessor {
             })?;
         pioneer_protocol::validate_turn_execution_envelope(&params)
             .map_err(TurnStartFailure::invalid_input)?;
-        if params
-            .capabilities
-            .iter()
-            .any(|c| matches!(c.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }))
-            && !self.native_api_provider_supports_agent_skill_overlay(
-                &thread.workspace_id,
-                params
-                    .model_provider
-                    .as_deref()
-                    .unwrap_or(&thread.model_provider),
-            )
-        {
-            return Err(TurnStartFailure::invalid_input(
-                "Plugins require a native provider with tool calling",
-            ));
-        }
         let normalized_capabilities = {
             let _startup_part = pioneer_observability::turn_startup::stage(
                 &params.turn_id,
@@ -3231,6 +3218,24 @@ impl MessageProcessor {
             )
             .await?
         };
+        if params
+            .capabilities
+            .iter()
+            .any(|c| matches!(c.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }))
+            || !normalized_capabilities.plugin_capability_ids.is_empty()
+        {
+            if !self.native_api_provider_supports_agent_skill_overlay(
+                &thread.workspace_id,
+                params
+                    .model_provider
+                    .as_deref()
+                    .unwrap_or(&thread.model_provider),
+            ) {
+                return Err(TurnStartFailure::invalid_input(
+                    "Packages with executable capabilities require a native provider with tool calling",
+                ));
+            }
+        }
         if execution_admission.uses_scoped_collaboration_policy() {
             self.enforce_scoped_skill_capability_projection(
                 thread.workspace_id.as_str(),
@@ -5581,7 +5586,7 @@ impl MessageProcessor {
                 return None;
             };
             if matches!(&execution_authority, TurnExecutionAuthority::Durable { .. })
-                && !params.capabilities.iter().any(|cap| matches!(cap.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. })) {
+                && !params.capabilities.iter().any(|cap| matches!(cap.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. } | pioneer_protocol::TurnCapabilityKind::App { .. })) {
                 match self.crud_store.get_plugin_selection(params.turn_id.as_str()).await {
                     Ok(Some(snapshot)) => match self.plugin_presentation_from_selection(&thread.workspace_id, &snapshot, &params.capabilities).await {
                         Ok(presentation) => params.capabilities = presentation,

@@ -70,6 +70,7 @@ impl McpCatalogView {
         if let Some(w) = self.input.navigation_input.workspace_id() {
             let failed = if let Some((workspace, parent, _)) = &self.plugin_component {
                 self.client
+                    .packages(self.package_kind)
                     .plugin_intent_for(
                         workspace,
                         parent,

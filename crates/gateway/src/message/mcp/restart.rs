@@ -179,11 +179,12 @@ impl MessageProcessor {
                     return;
                 }
             };
-        server.plugin_owner = match self.crud_store.find_mcp_plugin_owner(&server.id).await {
-            Ok(owner) => owner.map(|owner| pioneer_protocol::PluginOwner {
-                plugin_id: owner.package_id,
-                member_key: owner.member_key,
-            }),
+        server.package_owner = match self
+            .crud_store
+            .native_package_owner("mcp", &server.id)
+            .await
+        {
+            Ok(owner) => owner,
             Err(_) => {
                 self.send_error(
                     connection_id,
@@ -199,6 +200,10 @@ impl MessageProcessor {
                 return;
             }
         };
+        server.plugin_owner = server
+            .package_owner
+            .as_ref()
+            .and_then(pioneer_protocol::PackageOwner::as_plugin);
         let payload = McpServerRestartResponse {
             accepted: true,
             server,

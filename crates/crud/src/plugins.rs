@@ -83,11 +83,21 @@ impl CrudStore {
                 if plugins::selection(&db, turn).await?.as_deref() != Some(expected.as_str()) {
                     bail!("plugin selection changed");
                 }
+                use sea_orm::EntityTrait;
+                let turn_row = pioneer_entity::turn::Entity::find_by_id(turn.to_owned())
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("selection turn missing"))?;
+                let thread = pioneer_entity::thread::Entity::find_by_id(turn_row.thread_id)
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("selection thread missing"))?;
                 for selected in &snapshot.parents {
                     let parent = plugins::find(&db, &selected.id)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("plugin missing"))?;
                     if parent.kind != selected.kind
+                        || parent.workspace_id != thread.workspace_id
                         || !parent.enabled
                         || parent.state != "installed"
                         || parent.pending_json.is_some()
@@ -260,7 +270,10 @@ impl CrudStore {
         let db = self.connection.begin_read().await?;
         let rows = plugins::list(&db, workspace, kind).await?;
         db.commit().await?;
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .map(PackageRecord::with_error_presentation)
+            .collect())
     }
     pub async fn settle_plugin_installation(
         &self,
@@ -414,13 +427,13 @@ impl CrudStore {
         let db = self.connection.begin_read().await?;
         let row = plugins::find(&db, id).await?;
         db.commit().await?;
-        Ok(row)
+        Ok(row.map(PackageRecord::with_error_presentation))
     }
     pub async fn find_plugin_by_upload(&self, upload: &str) -> Result<Option<PackageRecord>> {
         let db = self.connection.begin_read().await?;
         let row = plugins::find_by_upload(&db, upload).await?;
         db.commit().await?;
-        Ok(row)
+        Ok(row.map(PackageRecord::with_error_presentation))
     }
     pub async fn plugin_components_inventory(
         &self,
@@ -964,5 +977,30 @@ impl CrudStore {
             Ok(())
         })
         .await
+    }
+}
+
+impl CrudStore {
+    pub async fn native_package_owner(
+        &self,
+        kind: &str,
+        child: &str,
+    ) -> Result<Option<pioneer_protocol::PackageOwner>> {
+        let db = self.connection.begin_read().await?;
+        let link = plugins::owner(&db, kind, child).await?;
+        let owner = if let Some(link) = link {
+            let parent = plugins::find(&db, &link.package_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("package owner missing"))?;
+            Some(pioneer_protocol::PackageOwner {
+                kind: parent.kind,
+                package_id: parent.id,
+                member_key: link.member_key,
+            })
+        } else {
+            None
+        };
+        db.commit().await?;
+        Ok(owner)
     }
 }

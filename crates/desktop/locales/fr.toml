@@ -1761,3 +1761,6 @@ callback_rejected = "Connexion refusée. Revenez à Pioneer pour réessayer."
 
 [plugins]
 title = "Plugins"
+
+[apps]
+title = "Applications"

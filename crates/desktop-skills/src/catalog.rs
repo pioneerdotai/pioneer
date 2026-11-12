@@ -119,6 +119,7 @@ pub struct SkillsCatalogView {
     pub(crate) input: Arc<CatalogInput>,
     pub(crate) binding: Arc<CatalogBinding>,
     sidebar: Entity<CatalogSidebar>,
+    pub(crate) package_kind: pioneer_client::plugins::PackageKind,
     plugin_component: Option<(String, String, SkillId)>,
     demand: Option<SkillsDemand>,
     demand_key: Option<(String, Option<SkillId>)>,
@@ -157,8 +158,28 @@ impl SkillsCatalogView {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
+        Self::new_package_details(
+            config,
+            pioneer_client::plugins::PackageKind::Plugin,
+            workspace,
+            parent,
+            child,
+            window,
+            cx,
+        )
+    }
+    pub fn new_package_details(
+        config: SkillsCatalogConfig,
+        kind: pioneer_client::plugins::PackageKind,
+        workspace: String,
+        parent: String,
+        child: SkillId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
         let view = Self::new(config, window, cx);
         view.update(cx, |view, cx| {
+            view.package_kind = kind;
             view.plugin_component = Some((workspace, parent, child));
             view.sync_publications(window, cx);
         });
@@ -229,6 +250,7 @@ impl SkillsCatalogView {
                 binding,
                 sidebar,
                 demand: None,
+                package_kind: pioneer_client::plugins::PackageKind::Plugin,
                 plugin_component: None,
                 demand_key: None,
                 sidebar_width: px(320.),
@@ -292,8 +314,8 @@ impl SkillsCatalogView {
             let navigation = self.client.navigation_snapshot();
             return self.embedded_active
                 && navigation.workspace_id() == Some(workspace.as_str())
-                && matches!(navigation.destination(), SemanticDestination::Plugin { plugin_id, component: Some(key) }
-                    if plugin_id == parent && self.client.plugin_details_publication(workspace, parent)
+                && matches!(navigation.destination().package_details(),Some((kind,plugin_id,Some(key)))
+                    if kind==self.package_kind && plugin_id == parent && self.client.packages(self.package_kind).plugin_details_publication(workspace, parent)
                         .and_then(|p| p.details).is_some_and(|p| p.components.iter().any(|c|
                             c.kind == key.kind && c.member_key == key.member_key && c.skill_id.as_ref() == Some(child))));
         }
@@ -369,10 +391,9 @@ impl SkillsCatalogView {
                         Some((expected_workspace, parent, child)) => {
                             expected_workspace == &workspace
                                 && &skill.skill_id == child
-                                && skill
-                                    .plugin_owner
-                                    .as_ref()
-                                    .is_some_and(|owner| &owner.plugin_id == parent)
+                                && skill.package_owner().as_ref().is_some_and(|owner| {
+                                    owner.kind == self.package_kind && &owner.package_id == parent
+                                })
                         }
                         None => pioneer_client::skills::catalog::skill_is_user_selectable(skill),
                     })
@@ -385,10 +406,9 @@ impl SkillsCatalogView {
                         Some((expected_workspace, parent, child)) => {
                             expected_workspace == &workspace
                                 && &skill.skill_id == child
-                                && skill
-                                    .plugin_owner
-                                    .as_ref()
-                                    .is_some_and(|owner| &owner.plugin_id == parent)
+                                && skill.package_owner().as_ref().is_some_and(|owner| {
+                                    owner.kind == self.package_kind && &owner.package_id == parent
+                                })
                         }
                         None => true,
                     })
@@ -480,15 +500,22 @@ impl SkillsCatalogView {
             self.upload.update(cx, |upload, cx| upload.cancel(cx));
         }
         if let Some((workspace, parent, child)) = &self.plugin_component {
-            scopes.push(ClientScope::Plugins {
-                workspace_id: workspace.clone(),
-            });
-            if let Some(publication) = self.client.plugin_details_publication(workspace, parent) {
+            scopes.push(
+                self.client
+                    .packages(self.package_kind)
+                    .scope(workspace.clone()),
+            );
+            if let Some(publication) = self
+                .client
+                .packages(self.package_kind)
+                .plugin_details_publication(workspace, parent)
+            {
                 if let Some(operation) = publication.operations.get(parent) {
                     if operation.busy
                         || (operation.uncertain
                             && !self
                                 .client
+                                .packages(self.package_kind)
                                 .plugin_parent_recovery_available(workspace, parent))
                     {
                         next.pending.insert(child.clone());

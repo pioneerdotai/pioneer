@@ -229,55 +229,71 @@ impl PluginsView {
 
         let busy = self.busy(cx);
 
-        let header = pioneer_desktop_foundation::CatalogDetailsHeader::new(plugin.name.clone())
-            .icon(
-                self.plugin_images
-                    .element(plugin.metadata.logo.as_ref())
-                    .size_10(),
-            )
-            .when_some(summary_status(plugin), |header, status| {
-                header.status(status_label(status), status_color(status, cx))
-            })
-            .when_some(plugin.description.clone(), |header, description| {
-                header.description(description)
-            })
-            .when(manage, |header| {
-                header.actions(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            Button::new("plugin-header-enabled")
-                                .xsmall()
-                                .compact()
-                                .h_6()
-                                .px_3()
-                                .when(plugin.enabled, |button| button.primary())
-                                .when(!plugin.enabled, |button| button.outline())
-                                .disabled(busy || plugin.state != "installed")
-                                .label(t!("plugins.enabled").to_string())
-                                .on_click(cx.listener({
-                                    let plugin = plugin.clone();
-                                    move |view, _, _, cx| view.set_enabled(plugin.clone(), cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("plugin-header-implicit")
-                                .xsmall()
-                                .compact()
-                                .h_6()
-                                .px_3()
-                                .when(plugin.allow_implicit_invocation, |button| button.primary())
-                                .when(!plugin.allow_implicit_invocation, |button| button.outline())
-                                .disabled(busy || plugin.state != "installed")
-                                .label(t!("plugins.implicit").to_string())
-                                .on_click(cx.listener({
-                                    let plugin = plugin.clone();
-                                    move |view, _, _, cx| view.set_implicit(plugin.clone(), cx)
-                                })),
-                        ),
+        let header = pioneer_desktop_foundation::CatalogDetailsHeader::new(
+            plugin
+                .metadata
+                .name_for_locale(&plugin.name, &rust_i18n::locale()),
+        )
+        .icon(
+            self.plugin_images
+                .element(plugin.metadata.logo_for_theme(cx.theme().mode.is_dark()))
+                .size_10(),
+        )
+        .when_some(summary_status(plugin), |header, status| {
+            header.status(status_label(status), status_color(status, cx))
+        })
+        .when(
+            self.kind == pioneer_client::plugins::PackageKind::App,
+            |header| {
+                header.when_some(
+                    plugin.metadata.developer_name.clone(),
+                    |header, developer| header.owner(developer),
                 )
-            });
+            },
+        )
+        .when_some(
+            plugin
+                .metadata
+                .description_for_locale(plugin.description.as_deref(), &rust_i18n::locale()),
+            |header, description| header.description(description),
+        )
+        .when(manage, |header| {
+            header.actions(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("plugin-header-enabled")
+                            .xsmall()
+                            .compact()
+                            .h_6()
+                            .px_3()
+                            .when(plugin.enabled, |button| button.primary())
+                            .when(!plugin.enabled, |button| button.outline())
+                            .disabled(busy || plugin.state != "installed")
+                            .label(t!("plugins.enabled").to_string())
+                            .on_click(cx.listener({
+                                let plugin = plugin.clone();
+                                move |view, _, _, cx| view.set_enabled(plugin.clone(), cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("plugin-header-implicit")
+                            .xsmall()
+                            .compact()
+                            .h_6()
+                            .px_3()
+                            .when(plugin.allow_implicit_invocation, |button| button.primary())
+                            .when(!plugin.allow_implicit_invocation, |button| button.outline())
+                            .disabled(busy || plugin.state != "installed")
+                            .label(t!("plugins.implicit").to_string())
+                            .on_click(cx.listener({
+                                let plugin = plugin.clone();
+                                move |view, _, _, cx| view.set_implicit(plugin.clone(), cx)
+                            })),
+                    ),
+            )
+        });
         let content = v_flex()
             .p_6()
             .gap_6()
@@ -285,6 +301,25 @@ impl PluginsView {
                 view.child(self.upload.clone())
             })
             .children(self.upload_recovery(cx))
+            .children(self.install_preview(cx))
+            .when(
+                self.kind == pioneer_client::plugins::PackageKind::App,
+                |view| {
+                    let description = plugin
+                        .metadata
+                        .app
+                        .as_ref()
+                        .and_then(|app| {
+                            app.localized(&rust_i18n::locale(), |locale| {
+                                locale.long_description.as_deref()
+                            })
+                        })
+                        .or_else(|| plugin.metadata.long_description.clone());
+                    view.when_some(description, |view, description| {
+                        view.child(div().text_sm().child(description))
+                    })
+                },
+            )
             .when_some(self.installation_error(cx), |view, error| {
                 view.child(div().text_sm().text_color(cx.theme().danger).child(error))
             })
@@ -296,17 +331,26 @@ impl PluginsView {
             })
             .when(self.input.error.is_some(), |view| {
                 view.child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().danger)
-                        .child(t!("plugins.error").to_string()),
+                    div().text_sm().text_color(cx.theme().danger).child(
+                        t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                            "apps.error"
+                        } else {
+                            "plugins.error"
+                        })
+                        .to_string(),
+                    ),
                 )
             })
             .when(plugin.state == "retained", |view| {
                 view.child(
-                    div()
-                        .text_sm()
-                        .child(t!("plugins.retained_notice").to_string()),
+                    div().text_sm().child(
+                        t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                            "apps.retained_notice"
+                        } else {
+                            "plugins.retained_notice"
+                        })
+                        .to_string(),
+                    ),
                 )
             })
             .children(self.management_controls(plugin, manage, busy, window, cx))

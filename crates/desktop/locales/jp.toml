@@ -1761,3 +1761,6 @@ callback_rejected = "ログインを受け付けられませんでした。Pione
 
 [plugins]
 title = "プラグイン"
+
+[apps]
+title = "アプリ"

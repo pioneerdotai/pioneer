@@ -358,3 +358,13 @@
 "chat.composer.model.service_standard" = "Standard"
 
 "chat.composer.model.service_invalid" = "Saved service tier is unavailable. Choose Standard or reselect a mode."
+
+"chat.composer.add_menu.apps" = "Add apps"
+"apps.empty" = "No apps installed"
+"apps.error" = "Could not load apps. Try again."
+"apps.loading" = "Loading apps…"
+"apps.search" = "Search apps"
+"apps.select" = "Select apps"
+"apps.unavailable" = "Unavailable"
+"apps.retry" = "Try again"
+"apps.stale" = "Selected revision is no longer current"

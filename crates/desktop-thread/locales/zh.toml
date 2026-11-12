@@ -356,3 +356,13 @@
 "chat.composer.model.service_standard" = "标准"
 
 "chat.composer.model.service_invalid" = "已保存的服务级别不可用。请选择标准或其他模式。"
+
+"chat.composer.add_menu.apps" = "添加应用"
+"apps.empty" = "尚未安装应用"
+"apps.error" = "无法加载应用，请重试。"
+"apps.loading" = "正在加载应用…"
+"apps.search" = "搜索应用"
+"apps.select" = "选择应用"
+"apps.unavailable" = "不可用"
+"apps.retry" = "重试"
+"apps.stale" = "所选版本已不是当前版本"

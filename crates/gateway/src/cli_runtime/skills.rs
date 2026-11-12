@@ -31,6 +31,7 @@ pub(crate) struct CliRuntimeSelectedSkill {
     pub installed_path: PathBuf,
     pub source_folder_hash: String,
     pub plugin_id: Option<String>,
+    pub package_owner: Option<pioneer_protocol::PackageIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,6 +214,7 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
         }
         plans.push(CliRuntimeSkillInstallPlan {
             plugin_id: None,
+            package_owner: None,
             skill_id: skill.skill_id.clone(),
             owner: skill.definition.identity.owner.clone(),
             slug: skill.definition.identity.slug.clone(),
@@ -266,7 +268,12 @@ pub(crate) async fn build_cli_runtime_owned_skill_install_plans(
                     && p.pending_json.is_none()
             })
             .context("plugin skill source unavailable")?;
-        plan.plugin_id = Some(parent.id);
+        plan.plugin_id =
+            (parent.kind == pioneer_protocol::PackageKind::Plugin).then(|| parent.id.clone());
+        plan.package_owner = Some(pioneer_protocol::PackageIdentity {
+            kind: parent.kind,
+            id: parent.id,
+        });
     }
     Ok(plans)
 }
@@ -277,6 +284,18 @@ pub(crate) fn normalize_cli_runtime_selected_skills(
     selected: impl IntoIterator<Item = CliRuntimeSelectedSkill>,
 ) -> Result<Vec<CliRuntimeSelectedSkill>> {
     let mut selected = selected.into_iter().collect::<Vec<_>>();
+    for skill in &mut selected {
+        skill.package_owner = pioneer_protocol::PackageIdentity::resolve(
+            skill.package_owner.as_ref(),
+            skill.plugin_id.as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        skill.plugin_id = skill
+            .package_owner
+            .as_ref()
+            .filter(|owner| owner.kind == pioneer_protocol::PackageKind::Plugin)
+            .map(|owner| owner.id.clone());
+    }
     selected.sort_by(|left, right| left.install_name.cmp(&right.install_name));
     if selected
         .windows(2)
@@ -336,8 +355,24 @@ pub(crate) fn restore_cli_runtime_selected_skills(
                     .find(|child| child.kind == "skill" && child.id == binding.skill_id.as_str())
             })
             .map(|child| child.parent_id.as_str());
+        let expected_owner = expected_parent
+            .map(|id| {
+                let parent = plugin_selection
+                    .and_then(|snapshot| snapshot.parents.iter().find(|parent| parent.id == id))
+                    .context("frozen package parent missing")?;
+                Ok::<_, anyhow::Error>(pioneer_protocol::PackageIdentity {
+                    kind: parent.kind,
+                    id: id.into(),
+                })
+            })
+            .transpose()?;
         anyhow::ensure!(
-            entry.plugin_id.as_deref() == expected_parent,
+            pioneer_protocol::PackageIdentity::resolve(
+                entry.package_owner.as_ref(),
+                entry.plugin_id.as_deref()
+            )
+            .map_err(anyhow::Error::msg)?
+                == expected_owner,
             "CLI skill receipt ownership differs from the ready selection"
         );
         verify_system_skill_export_alias(
@@ -405,6 +440,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
         }
         selected.push(CliRuntimeSelectedSkill {
             plugin_id: entry.plugin_id.clone(),
+            package_owner: entry.package_owner.clone(),
             install_name: entry.install_name.clone(),
             installed_path,
             source_folder_hash: entry.source_folder_hash.clone(),
@@ -492,7 +528,8 @@ pub(crate) fn partition_cli_runtime_capabilities(
     let mut partition = CliRuntimeCapabilityPartition::default();
     for capability in capabilities {
         match &capability.kind {
-            pioneer_protocol::TurnCapabilityKind::Plugin { .. } => {
+            pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+            | pioneer_protocol::TurnCapabilityKind::App { .. } => {
                 return Err("plugin parent must be expanded before CLI projection".into());
             }
             TurnCapabilityKind::Skill {
@@ -584,6 +621,7 @@ pub(crate) async fn acquire_cli_runtime_skill_destination_lock(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CliRuntimeSkillInstallPlan {
     pub plugin_id: Option<String>,
+    pub package_owner: Option<pioneer_protocol::PackageIdentity>,
     pub skill_id: SkillId,
     pub owner: Option<String>,
     pub slug: String,
@@ -608,6 +646,7 @@ pub(crate) enum CliRuntimeSkillInstallStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CliRuntimeSkillInstallResult {
     pub plugin_id: Option<String>,
+    pub package_owner: Option<pioneer_protocol::PackageIdentity>,
     pub status: CliRuntimeSkillInstallStatus,
     pub install_name: String,
     pub source_folder_hash: String,
@@ -619,6 +658,7 @@ impl From<&CliRuntimeSkillInstallResult> for CliRuntimeSelectedSkill {
     fn from(value: &CliRuntimeSkillInstallResult) -> Self {
         Self {
             plugin_id: value.plugin_id.clone(),
+            package_owner: value.package_owner.clone(),
             install_name: value.install_name.clone(),
             installed_path: value.installed_path.clone(),
             source_folder_hash: value.source_folder_hash.clone(),
@@ -641,6 +681,7 @@ fn planned_receipt_entry(
 ) -> ExternalRuntimeSkillReceiptEntry {
     ExternalRuntimeSkillReceiptEntry {
         plugin_id: plan.plugin_id.clone(),
+        package_owner: plan.package_owner.clone(),
         skill_id: plan.skill_id.clone(),
         owner: plan.owner.clone(),
         slug: plan.slug.clone(),
@@ -816,6 +857,7 @@ pub(crate) async fn install_one_cli_runtime_skill<F: std::future::Future<Output 
     {
         return Ok(CliRuntimeSkillInstallResult {
             plugin_id: plan.plugin_id.clone(),
+            package_owner: plan.package_owner.clone(),
             status: CliRuntimeSkillInstallStatus::Current,
             install_name: plan.install_name.clone(),
             source_folder_hash,
@@ -871,6 +913,7 @@ pub(crate) async fn install_one_cli_runtime_skill<F: std::future::Future<Output 
 
     Ok(CliRuntimeSkillInstallResult {
         plugin_id: plan.plugin_id.clone(),
+        package_owner: plan.package_owner.clone(),
         status: if previous.is_some() {
             CliRuntimeSkillInstallStatus::Updated
         } else {
@@ -987,6 +1030,7 @@ mod tests {
         fs::write(source.join("SKILL.md"), format!("# {name}\n")).unwrap();
         CliRuntimeSkillInstallPlan {
             plugin_id: None,
+            package_owner: None,
             skill_id: test_skill_id(name, SkillSourceKind::Registry),
             owner: Some("registry".to_owned()),
             slug: name.to_owned(),
@@ -1088,6 +1132,7 @@ mod tests {
     fn installed_skill(name: &str, path: &str) -> CliRuntimeSkillInstallResult {
         CliRuntimeSkillInstallResult {
             plugin_id: None,
+            package_owner: None,
             status: CliRuntimeSkillInstallStatus::Current,
             install_name: name.to_owned(),
             source_folder_hash: "source-hash-not-prompt-content".to_owned(),
@@ -2435,6 +2480,7 @@ mod tests {
         .unwrap();
         let installed = CliRuntimeSkillInstallResult {
             plugin_id: None,
+            package_owner: None,
             status: CliRuntimeSkillInstallStatus::Installed,
             install_name: "proposal-51-sentinel".to_owned(),
             source_folder_hash: "fixture-hash".to_owned(),
@@ -2819,6 +2865,7 @@ mod tests {
             selected,
             vec![CliRuntimeSelectedSkill {
                 plugin_id: None,
+                package_owner: None,
                 install_name: installed.install_name,
                 installed_path: installed.installed_path.clone(),
                 source_folder_hash: installed.source_folder_hash,

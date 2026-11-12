@@ -356,3 +356,13 @@
 "chat.composer.model.service_standard" = "Estándar"
 
 "chat.composer.model.service_invalid" = "El nivel guardado no está disponible. Elige Estándar u otro modo."
+
+"chat.composer.add_menu.apps" = "Añadir aplicaciones"
+"apps.empty" = "No hay aplicaciones instalados"
+"apps.error" = "No se pudieron cargar los aplicaciones. Inténtalo de nuevo."
+"apps.loading" = "Cargando aplicaciones…"
+"apps.search" = "Buscar aplicaciones"
+"apps.select" = "Seleccionar aplicaciones"
+"apps.unavailable" = "No disponible"
+"apps.retry" = "Reintentar"
+"apps.stale" = "La versión seleccionada ya no es la actual"

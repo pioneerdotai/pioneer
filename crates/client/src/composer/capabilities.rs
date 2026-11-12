@@ -51,6 +51,14 @@ impl<'de> serde::Deserialize<'de> for ComposerCapability {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ComposerCapabilityKind {
+    App {
+        app_id: String,
+        expected_revision: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<pioneer_protocol::PluginIcon>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dark_icon: Option<pioneer_protocol::PluginIcon>,
+    },
     Plugin {
         plugin_id: String,
         expected_revision: i64,
@@ -411,7 +419,7 @@ pub fn composer_capability_removal_reason(
     match &capability.kind {
         // Preserve the parent across provider changes. Unsupported runtimes
         // reject it explicitly at Gateway admission instead of losing the chip.
-        ComposerCapabilityKind::Plugin { .. } => None,
+        ComposerCapabilityKind::Plugin { .. } | ComposerCapabilityKind::App { .. } => None,
         ComposerCapabilityKind::Skill { source_kind, .. } => {
             if !policy.supports_skills {
                 Some(ComposerCapabilityRemovalReason::SkillsUnsupported)
@@ -600,6 +608,14 @@ impl ComposerCapability {
         TurnCapability {
             id: self.key(),
             kind: match &self.kind {
+                ComposerCapabilityKind::App {
+                    app_id,
+                    expected_revision,
+                    ..
+                } => TurnCapabilityKind::App {
+                    app_id: app_id.clone(),
+                    expected_revision: *expected_revision,
+                },
                 ComposerCapabilityKind::Plugin {
                     plugin_id,
                     expected_revision,
@@ -628,12 +644,28 @@ impl ComposerCapability {
                     scope_kind: *scope_kind,
                 },
             },
-            label: (!self.label.trim().is_empty()).then(|| self.label.clone()),
+            label: (!matches!(self.kind, ComposerCapabilityKind::App { .. })
+                && !self.label.trim().is_empty())
+            .then(|| self.label.clone()),
         }
     }
 
     pub fn to_user_message_attachment(&self) -> UserMessageAttachment {
         match &self.kind {
+            ComposerCapabilityKind::App {
+                app_id,
+                expected_revision,
+                icon,
+                dark_icon,
+            } => UserMessageAttachment::App {
+                capability: pioneer_protocol::TurnAppCapabilitySummary {
+                    app_id: app_id.clone(),
+                    expected_revision: *expected_revision,
+                    label: self.label.clone(),
+                    icon: icon.clone(),
+                    dark_icon: dark_icon.clone(),
+                },
+            },
             ComposerCapabilityKind::Plugin {
                 plugin_id,
                 expected_revision,
@@ -691,6 +723,7 @@ impl ComposerCapability {
 impl ComposerCapabilityKind {
     pub fn key(&self) -> String {
         match self {
+            Self::App { app_id, .. } => pioneer_protocol::app_capability_key(app_id),
             Self::Plugin { plugin_id, .. } => pioneer_protocol::plugin_capability_key(plugin_id),
             Self::Skill { skill_id, .. } => pioneer_protocol::skill_capability_key(skill_id),
             Self::McpServer { name, scope_kind } => {
@@ -1460,6 +1493,7 @@ mod tests {
     fn skill_item(slug: &str) -> SkillListItem {
         SkillListItem {
             plugin_owner: None,
+            package_owner: None,
             skill_id: skill_id(slug),
             pack: None,
             owner: None,
@@ -1496,6 +1530,7 @@ mod tests {
     fn mcp_server(name: &str) -> McpListItem {
         McpListItem {
             plugin_owner: None,
+            package_owner: None,
             id: format!("mcp:{name}"),
             name: name.to_owned(),
             display_name: None,
@@ -2596,4 +2631,14 @@ pub fn project_mcp_picker_rows(
         filter_active_mcp_tool_capability_rows(tool_rows, active_server_id, query)
     };
     (servers, tools, has_query)
+}
+
+impl ComposerCapabilityKind {
+    pub fn package_kind(&self) -> Option<pioneer_protocol::PackageKind> {
+        match self {
+            Self::Plugin { .. } => Some(pioneer_protocol::PackageKind::Plugin),
+            Self::App { .. } => Some(pioneer_protocol::PackageKind::App),
+            _ => None,
+        }
+    }
 }

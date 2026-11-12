@@ -169,8 +169,9 @@ mod tests {
 }
 
 pub use pioneer_protocol::{
-    PluginComponentItem, PluginComponentKey, PluginIcon, PluginItem, PluginManagementIntent,
-    PluginMetadata, PluginsMutateParams, PluginsSetEnabledParams, PluginsUpdatePreviewResponse,
+    PackageKind, PluginComponentItem, PluginComponentKey, PluginIcon, PluginItem,
+    PluginManagementIntent, PluginMetadata, PluginsMutateParams, PluginsSetEnabledParams,
+    PluginsUpdatePreviewResponse,
 };
 
 pub mod runtime;
@@ -309,5 +310,177 @@ mod picker_regressions {
         assert!(unknown[0].selected && unknown[0].stale && !unknown[0].selectable);
         p.enabled = false;
         assert!(!plugin_picker_rows(&[], &[p], "")[0].selectable);
+    }
+}
+
+/// Parent projection shared by the two catalogs; domain stays in the capability.
+pub fn package_capability(
+    kind: pioneer_protocol::PackageKind,
+    p: &PluginItem,
+) -> Option<ComposerCapability> {
+    if kind == pioneer_protocol::PackageKind::Plugin {
+        return plugin_capability(p);
+    }
+    (p.enabled && p.state == "installed").then(|| ComposerCapability {
+        id: pioneer_protocol::app_capability_key(&p.id),
+        label: p
+            .metadata
+            .display_name
+            .clone()
+            .unwrap_or_else(|| p.name.clone()),
+        kind: ComposerCapabilityKind::App {
+            app_id: p.id.clone(),
+            expected_revision: p.revision,
+            dark_icon: p
+                .metadata
+                .app
+                .as_ref()
+                .and_then(|a| a.composer_icon.as_ref())
+                .map(|i| i.dark.clone()),
+            icon: p
+                .metadata
+                .composer_icon
+                .clone()
+                .or_else(|| p.metadata.logo.clone()),
+        },
+    })
+}
+pub fn package_picker_rows(
+    kind: pioneer_protocol::PackageKind,
+    current: &[ComposerCapability],
+    packages: &[PluginItem],
+    query: &str,
+) -> Vec<PluginPickerRow> {
+    if kind == pioneer_protocol::PackageKind::Plugin {
+        return plugin_picker_rows(current, packages, query);
+    }
+    let query = query.trim().to_lowercase();
+    let mut rows = Vec::new();
+    for p in packages {
+        let label = p
+            .metadata
+            .display_name
+            .clone()
+            .unwrap_or_else(|| p.name.clone());
+        if !label.to_lowercase().contains(&query) {
+            continue;
+        }
+        let selected = current
+            .iter()
+            .find(|c| matches!(&c.kind,ComposerCapabilityKind::App{app_id,..} if app_id==&p.id));
+        rows.push(PluginPickerRow{plugin_id:p.id.clone(),key:pioneer_protocol::app_capability_key(&p.id),label,description:p.description.clone(),selected:selected.is_some(),selectable:package_capability(kind,p).is_some(),stale:selected.is_some_and(|c|matches!(c.kind,ComposerCapabilityKind::App{expected_revision,..} if expected_revision!=p.revision))});
+    }
+    for c in current {
+        if let ComposerCapabilityKind::App { app_id, .. } = &c.kind {
+            if !packages.iter().any(|p| &p.id == app_id) && c.label.to_lowercase().contains(&query)
+            {
+                rows.push(PluginPickerRow {
+                    plugin_id: app_id.clone(),
+                    key: c.id.clone(),
+                    label: c.label.clone(),
+                    description: None,
+                    selected: true,
+                    selectable: false,
+                    stale: true,
+                });
+            }
+        }
+    }
+    rows
+}
+impl crate::core::ClientCore {
+    pub fn read_apps(&self, workspace: &str) -> anyhow::Result<PluginsListResponse> {
+        let epoch = self.provider_runtime_epoch();
+        let bound = self
+            .transport_runtime()
+            .ws_command_sender()
+            .requests_for_connection(
+                epoch
+                    .2
+                    .ok_or_else(|| anyhow::anyhow!("gateway_not_connected"))?,
+            );
+        let result = crate::transport::ws::command_sender::packages_list(
+            &bound,
+            pioneer_protocol::PackageKind::App,
+            pioneer_protocol::PluginsListParams {
+                workspace_id: workspace.into(),
+            },
+        )?;
+        anyhow::ensure!(self.provider_runtime_epoch() == epoch, "app_catalog_stale");
+        Ok(result)
+    }
+}
+
+pub(crate) fn package_target_supported(
+    kind: PackageKind,
+    parent: &PluginItem,
+    target: crate::composer::capabilities::ComposerCapabilityTarget,
+) -> bool {
+    if kind == PackageKind::Plugin {
+        return plugin_picker_target_supported(target);
+    }
+    let policy = target.policy();
+    parent.components.iter().all(|c| match c.kind.as_str() {
+        "skill" => policy.supports_skills,
+        "mcp" => policy.supports_mcp_tools,
+        _ => false,
+    })
+}
+
+impl crate::core::ClientCore {
+    /// Catalog text is usable only at the selected revision. Refresh never
+    /// silently upgrades a pinned chip's presentation or execution identity.
+    pub fn composer_capability_label(
+        &self,
+        thread: &str,
+        capability: &ComposerCapability,
+        locale: &str,
+    ) -> String {
+        if let ComposerCapabilityKind::App {
+            app_id,
+            expected_revision,
+            ..
+        } = &capability.kind
+        {
+            if let Some(parent) = self.composer_catalog_snapshot(thread).and_then(|p| {
+                p.apps
+                    .iter()
+                    .find(|p| &p.id == app_id && p.revision == *expected_revision)
+                    .cloned()
+            }) {
+                return parent.metadata.name_for_locale(&parent.name, locale);
+            }
+        }
+        capability.label.clone()
+    }
+}
+
+#[cfg(test)]
+mod app_target_regressions {
+    use super::*;
+    // NOT_RUN / NOT_COMPILED. An empty App stays an identity without fake tools.
+    #[test]
+    fn empty_app_is_selectable_without_skill_or_mcp_provider_support() {
+        let parent:PluginItem=serde_json::from_value(serde_json::json!({"id":"A".repeat(21),"name":"empty-app","version":"1.0.0","enabled":true,"state":"installed","revision":1,"status":"installed","components":[],"diagnostics":[]})).unwrap();
+        let target = crate::composer::capabilities::ComposerCapabilityTarget::cli(
+            crate::composer::capabilities::ComposerCapabilityPolicy::unsupported_cli(),
+        );
+        assert!(package_target_supported(PackageKind::App, &parent, target));
+        assert!(!package_target_supported(
+            PackageKind::Plugin,
+            &parent,
+            target
+        ));
+        let wire = package_capability(PackageKind::App, &parent)
+            .unwrap()
+            .to_turn_capability();
+        assert_eq!(wire.id, format!("app:{}", parent.id));
+        assert!(matches!(
+            wire.kind,
+            pioneer_protocol::TurnCapabilityKind::App {
+                expected_revision: 1,
+                ..
+            }
+        ));
     }
 }

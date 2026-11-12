@@ -51,27 +51,34 @@ fn matches_key(component: &PluginComponentKey, kind: &str, member: &str) -> bool
 fn package_snapshot(
     root: &Path,
     limits: pioneer_plugins::Limits,
-) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
-    package_snapshot_cancellable(root, &tokio_util::sync::CancellationToken::new(), limits)
+    kind: PackageKind,
+) -> anyhow::Result<(Snapshot, PackagePlan)> {
+    package_snapshot_cancellable(
+        root,
+        &tokio_util::sync::CancellationToken::new(),
+        limits,
+        kind,
+    )
 }
 fn package_snapshot_cancellable(
     root: &Path,
     cancellation: &tokio_util::sync::CancellationToken,
     limits: pioneer_plugins::Limits,
-) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
+    kind: PackageKind,
+) -> anyhow::Result<(Snapshot, PackagePlan)> {
     let snapshot = Snapshot::capture(root, limits, || cancellation.is_cancelled())
         .map_err(|_| anyhow::anyhow!("plugins.package_unavailable"))?;
-    let plan = pioneer_plugins::load(&snapshot)
-        .map_err(|_| anyhow::anyhow!("plugins.package_rejected"))?;
+    let plan = load_package(&snapshot, kind)?;
     Ok((snapshot, plan))
 }
 pub(super) fn verified_package(
     parent: &pioneer_crud::PackageRecord,
     cancellation: &tokio_util::sync::CancellationToken,
     limits: pioneer_plugins::Limits,
-) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
+) -> anyhow::Result<(Snapshot, PackagePlan)> {
     let package = Path::new(&parent.package_path);
-    let (snapshot, plan) = package_snapshot_cancellable(package, cancellation, limits)?;
+    let (snapshot, plan) =
+        package_snapshot_cancellable(package, cancellation, limits, parent.kind)?;
     anyhow::ensure!(
         snapshot.tree_digest() == parent.package_fingerprint,
         "plugins.package_changed"
@@ -100,8 +107,14 @@ impl MessageProcessor {
         let owner = AuthenticatedTransferOwner::from_request_context(context);
         {
             let _upload_lock = self.acquire_skill_upload_lock(&params.upload_id).await;
-            self.revalidate_plugin_upload(&owner, &params.workspace_id, &params.upload_id, request)
-                .await?;
+            self.revalidate_package_upload(
+                &owner,
+                &params.workspace_id,
+                &params.upload_id,
+                request,
+                guard.parent.kind,
+            )
+            .await?;
         }
         let runtime = self.package_delivery_context();
         let source = self
@@ -111,12 +124,12 @@ impl MessageProcessor {
                 &params.upload_id,
                 &runtime,
                 request,
-                "plugin",
+                guard.parent.kind.as_str(),
             )
             .await?;
-        let (_source, candidate, plan) = load_uploaded_plugin(source)
+        let (_source, candidate, plan) = load_uploaded_plugin(guard.parent.kind, source)
             .await
-            .map_err(|_| plugin_error(request, "plugins.package_rejected"))?;
+            .map_err(|error| package_parse_error(request, error))?;
         let (mut removed, mut authorization_changes, current_content) = self
             .plugin_update_changes(&guard, &plan)
             .await
@@ -179,8 +192,14 @@ impl MessageProcessor {
             added,
             updated,
             package: PluginsPreviewResponse {
-                name: plan.manifest.name.clone(),
-                version: plan.manifest.version.clone(),
+                name: plan
+                    .presentation
+                    .metadata
+                    .display_name
+                    .clone()
+                    .filter(|_| plan.kind == PackageKind::App)
+                    .unwrap_or_else(|| plan.presentation.name.clone()),
+                version: plan.presentation.version.clone(),
                 description: public_description(&plan),
                 fingerprint: plan.tree_digest.clone(),
                 components: plan.components.iter().map(component_preview).collect(),
@@ -211,19 +230,30 @@ impl MessageProcessor {
             .collect::<Vec<_>>();
         disclose_update_preview(&mut preview, &existing, &visible, administrative);
         let _upload_lock = self.acquire_skill_upload_lock(&params.upload_id).await;
-        self.revalidate_plugin_upload(&owner, &params.workspace_id, &params.upload_id, request)
-            .await?;
+        self.revalidate_package_upload(
+            &owner,
+            &params.workspace_id,
+            &params.upload_id,
+            request,
+            guard.parent.kind,
+        )
+        .await?;
         Ok(preview)
     }
     async fn plugin_update_changes(
         &self,
         guard: &PluginMutationGuard,
-        plan: &LoadedPluginPlan,
+        plan: &PackagePlan,
     ) -> anyhow::Result<(
         Vec<PluginComponentKey>,
         Vec<PluginComponentKey>,
-        (Snapshot, LoadedPluginPlan),
+        (Snapshot, PackagePlan),
     )> {
+        anyhow::ensure!(
+            plan.kind == guard.parent.kind
+                && (plan.kind != PackageKind::App || plan.presentation.name == guard.parent.name),
+            "apps.slug_immutable"
+        );
         let links = self
             .crud_store
             .list_plugin_components(&guard.parent.id)
@@ -356,11 +386,12 @@ impl MessageProcessor {
                 let owner = AuthenticatedTransferOwner::from_request_context(context);
                 {
                     let _upload_lock = self.acquire_skill_upload_lock(&upload_id).await;
-                    self.revalidate_plugin_upload(
+                    self.revalidate_package_upload(
                         &owner,
                         &params.workspace_id,
                         &upload_id,
                         request,
+                        guard.parent.kind,
                     )
                     .await?;
                 }
@@ -372,12 +403,12 @@ impl MessageProcessor {
                         &upload_id,
                         &runtime,
                         request,
-                        "plugin",
+                        guard.parent.kind.as_str(),
                     )
                     .await?;
-                let (source, snapshot, plan) = load_uploaded_plugin(source)
+                let (source, snapshot, plan) = load_uploaded_plugin(guard.parent.kind, source)
                     .await
-                    .map_err(|_| plugin_error(request, "plugins.package_rejected"))?;
+                    .map_err(|error| package_parse_error(request, error))?;
                 if plan.tree_digest != expected_fingerprint {
                     return Err(plugin_error(request, "plugins.fingerprint_changed"));
                 }
@@ -455,8 +486,14 @@ impl MessageProcessor {
                 let pending = serde_json::to_string(&action)
                     .map_err(|_| plugin_error(request, "plugins.plan_too_large"))?;
                 let _upload_lock = self.acquire_skill_upload_lock(&upload_id).await;
-                self.revalidate_plugin_upload(&owner, &params.workspace_id, &upload_id, request)
-                    .await?;
+                self.revalidate_package_upload(
+                    &owner,
+                    &params.workspace_id,
+                    &upload_id,
+                    request,
+                    guard.parent.kind,
+                )
+                .await?;
                 let begin = self
                     .crud_store
                     .begin_plugin_package_update(
@@ -774,7 +811,7 @@ impl MessageProcessor {
                     if fs_action.kind == "update" {
                         swap_package_after_stop(package, &fs_action.target_fingerprint, limits)?;
                     }
-                    let (snapshot, plan) = package_snapshot(package, limits)?;
+                    let (snapshot, plan) = package_snapshot(package, limits, parent.kind)?;
                     let digest = snapshot.tree_digest();
                     let expected = &fs_action.target_fingerprint;
                     anyhow::ensure!(&digest == expected, "plugins.package_changed");
@@ -804,17 +841,29 @@ impl MessageProcessor {
                             .await?;
                     }
                 }
-                self.crud_store
-                    .publish_plugin_package_with_metadata(
-                        &guard.parent.id,
-                        guard.parent.revision,
-                        &plan.manifest.name,
-                        plan.manifest.version.as_deref(),
-                        &action.target_fingerprint,
-                        action.source_upload_id.as_deref(),
-                        Some(&plan.manifest.metadata),
-                    )
-                    .await?;
+                if let Some(app) = &plan.app {
+                    let metadata = pioneer_crud::PreparedAppMetadata::from_package(app)?;
+                    self.crud_store
+                        .publish_app_package(
+                            &guard.parent.id,
+                            guard.parent.revision,
+                            action.source_upload_id.as_deref(),
+                            &metadata,
+                        )
+                        .await?;
+                } else {
+                    self.crud_store
+                        .publish_plugin_package_with_metadata(
+                            &guard.parent.id,
+                            guard.parent.revision,
+                            &plan.presentation.name,
+                            plan.presentation.version.as_deref(),
+                            &action.target_fingerprint,
+                            action.source_upload_id.as_deref(),
+                            Some(&plan.presentation.metadata),
+                        )
+                        .await?;
+                }
             }
             self.apply_plugin_components(context, request, &guard, &action, &plan)
                 .await?;
@@ -979,7 +1028,7 @@ impl MessageProcessor {
         request: &RequestId,
         guard: &PluginMutationGuard,
         action: &PackageAction,
-        plan: &LoadedPluginPlan,
+        plan: &PackagePlan,
     ) -> anyhow::Result<()> {
         for reserved in &action.children {
             let component = plan
@@ -1366,9 +1415,9 @@ fn swap_package_after_stop(
 /// values, host paths or secret material cross the public summary boundary.
 fn package_content_changes(
     current: &Snapshot,
-    previous: &LoadedPluginPlan,
+    previous: &PackagePlan,
     candidate: &Snapshot,
-    next: &LoadedPluginPlan,
+    next: &PackagePlan,
 ) -> (Vec<PluginComponentKey>, bool) {
     let updated = next
         .components
@@ -1397,7 +1446,7 @@ fn package_content_changes(
     // already represented above. Retain root and MCP document modes separately.
     fn supporting<'a>(
         snapshot: &'a Snapshot,
-        plan: &LoadedPluginPlan,
+        plan: &PackagePlan,
     ) -> std::collections::BTreeMap<&'a str, &'a pioneer_plugins::Entry> {
         snapshot
             .entries()
@@ -1584,7 +1633,7 @@ mod tests {
                 entries.insert(path.into(), Entry::File { bytes, mode: 0o644 });
             }
             let snapshot = Snapshot::from_entries(entries, snapshot_limits()).unwrap();
-            let plan = pioneer_plugins::load(&snapshot).unwrap();
+            let plan = load_package(&snapshot, PackageKind::Plugin).unwrap();
             assert_eq!(plan.components.len(), 2);
             (snapshot, plan)
         };
@@ -1682,7 +1731,7 @@ mod tests {
             }
             let capture = || {
                 let snapshot = Snapshot::capture(root, snapshot_limits(), || false).unwrap();
-                let plan = pioneer_plugins::load(&snapshot).unwrap();
+                let plan = load_package(&snapshot, PackageKind::Plugin).unwrap();
                 assert_eq!(plan.components.len(), 2);
                 (snapshot, plan)
             };

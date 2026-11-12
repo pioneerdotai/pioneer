@@ -96,7 +96,7 @@ fn scoped_publications_update_plugin_details_without_redrawing_unchanged_content
         let view = PluginsView::new(
             client.clone(),
             registrar.clone(),
-            Box::new(|_, _, _, _, _| None),
+            Box::new(|_, _, _, _, _, _| None),
             window,
             cx,
         );
@@ -296,7 +296,7 @@ fn accepted_update_keeps_exact_upload_through_other_parent_and_uncertain_settlem
         let view = PluginsView::new(
             client.clone(),
             registrar.clone(),
-            Box::new(|_, _, _, _, _| None),
+            Box::new(|_, _, _, _, _, _| None),
             window,
             cx,
         );
@@ -467,7 +467,7 @@ fn publication_replaces_child_only_when_native_locator_changes_and_releases_old_
         let view = PluginsView::new(
             client.clone(),
             registrar.clone(),
-            Box::new(move |workspace, _, member, _, cx| {
+            Box::new(move |_, workspace, _, member, _, cx| {
                 let id = member.mcp_installation_id.as_ref().unwrap();
                 created.borrow_mut().push(id.clone());
                 let child = cx.new(|_| NativeSurface {
@@ -589,7 +589,7 @@ fn missing_parent_uses_admission_authorization_and_connection_states(cx: &mut Te
             PluginsView::new(
                 client.clone(),
                 registrar,
-                Box::new(|_, _, _, _, _| None),
+                Box::new(|_, _, _, _, _, _| None),
                 window,
                 cx,
             ),
@@ -660,5 +660,110 @@ fn missing_parent_uses_admission_authorization_and_connection_states(cx: &mut Te
     assert_eq!(
         view.read_with(cx, |v, _| v.missing_parent_label()),
         t!("plugins.unavailable").to_string()
+    );
+}
+
+// NOT_RUN / NOT_COMPILED. One retained management surface switches domain
+// subscriptions without displaying another inventory or accepting late rows.
+#[gpui_kit::test]
+fn apps_navigation_uses_its_live_scope_and_ignores_retired_app_publications(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let client = pioneer_client::catalog_test_support::client();
+    set_origin(&client);
+    select_workspace(&client);
+    client.navigate(
+        NavigationIntent::Navigate {
+            destination: SemanticDestination::Apps,
+        },
+        None,
+    );
+    let app_scope = ClientScope::Apps {
+        workspace_id: "workspace".into(),
+    };
+    let plugin_scope = ClientScope::Plugins {
+        workspace_id: "workspace".into(),
+    };
+    let row = |id: &str| PluginItem {
+        id: id.repeat(21),
+        name: id.into(),
+        version: Some("1.0.0".into()),
+        description: None,
+        metadata: Default::default(),
+        enabled: true,
+        allow_implicit_invocation: false,
+        state: "installed".into(),
+        revision: 3,
+        status: "installed".into(),
+        components: vec![],
+        diagnostics: vec![],
+    };
+    let app = row("A");
+    let plugin = row("P");
+    for (scope, item) in [(&app_scope, &app), (&plugin_scope, &plugin)] {
+        publish(
+            &client,
+            scope,
+            PluginPublication {
+                loaded: true,
+                connection_id: client.gateway_session().startup.connection_id,
+                revision: 1,
+                plugins: vec![item.clone()],
+                ..Default::default()
+            },
+        );
+    }
+    let registrar = Arc::new(Registrar {
+        client: client.clone(),
+        sinks: Rc::default(),
+    });
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = PluginsView::new(
+            client.clone(),
+            registrar.clone(),
+            Box::new(|_, _, _, _, _, _| None),
+            window,
+            cx,
+        );
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<PluginsView>().unwrap()
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.kind),
+        pioneer_client::plugins::PackageKind::App
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.input.plugins[0].id.clone()),
+        app.id
+    );
+    let retired = registrar
+        .sinks
+        .borrow()
+        .get(&app_scope)
+        .unwrap()
+        .upgrade()
+        .unwrap();
+    client.navigate(
+        NavigationIntent::Navigate {
+            destination: SemanticDestination::Plugin {
+                plugin_id: plugin.id.clone(),
+                component: None,
+            },
+        },
+        None,
+    );
+    cx.update(|_, cx| view.update(cx, |view, cx| view.sync_publications(cx)));
+    retired.publish(client.snapshot(&app_scope).unwrap());
+    cx.update(|_, cx| view.update(cx, |view, cx| view.sync_publications(cx)));
+    assert_eq!(
+        view.read_with(cx, |view, _| view.kind),
+        pioneer_client::plugins::PackageKind::Plugin
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selected_plugin().unwrap().id.clone()),
+        plugin.id
     );
 }

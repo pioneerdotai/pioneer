@@ -1761,3 +1761,6 @@ callback_rejected = "Inicio de sesión rechazado. Vuelve a Pioneer para intentar
 
 [plugins]
 title = "Plugins"
+
+[apps]
+title = "Aplicaciones"

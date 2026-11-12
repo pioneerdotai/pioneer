@@ -356,3 +356,13 @@
 "chat.composer.model.service_standard" = "標準"
 
 "chat.composer.model.service_invalid" = "保存されたサービス階層は利用できません。標準または別のモードを選択してください。"
+
+"chat.composer.add_menu.apps" = "アプリを追加"
+"apps.empty" = "アプリがインストールされていません"
+"apps.error" = "アプリを読み込めませんでした。もう一度お試しください。"
+"apps.loading" = "アプリを読み込み中…"
+"apps.search" = "アプリを検索"
+"apps.select" = "アプリを選択"
+"apps.unavailable" = "利用不可"
+"apps.retry" = "再試行"
+"apps.stale" = "選択したバージョンは最新ではありません"

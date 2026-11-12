@@ -770,18 +770,24 @@ impl MessageProcessor {
             });
 
             let mut published_server = list_item_from_record(&record);
-            published_server.plugin_owner = native
+            published_server.package_owner = native
                 .as_deref()
-                .map(|change| pioneer_protocol::PluginOwner {
-                    plugin_id: change.write.plugin_id.clone(),
+                .map(|change| pioneer_protocol::PackageOwner {
+                    kind: change.write.kind,
+                    package_id: change.write.plugin_id.clone(),
                     member_key: change.write.member_key.clone(),
                 })
                 .or_else(|| {
-                    ownership.map(|owner| pioneer_protocol::PluginOwner {
-                        plugin_id: owner.plugin_id.clone(),
+                    ownership.map(|owner| pioneer_protocol::PackageOwner {
+                        kind: owner.kind,
+                        package_id: owner.plugin_id.clone(),
                         member_key: owner.member_key.clone(),
                     })
                 });
+            published_server.plugin_owner = published_server
+                .package_owner
+                .as_ref()
+                .and_then(pioneer_protocol::PackageOwner::as_plugin);
             response_items.push(McpInstallResult {
                 name: record.name.clone(),
                 status: if changed_action == McpChangedAction::Update {

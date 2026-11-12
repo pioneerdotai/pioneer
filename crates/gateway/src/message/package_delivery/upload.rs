@@ -855,7 +855,7 @@ impl MessageProcessor {
                         limits.max_upload_uncompressed_bytes,
                         limits.max_upload_archive_entries,
                         limits.max_file_bytes,
-                        source.upload.purpose == "plugin",
+                        matches!(source.upload.purpose.as_str(), "plugin" | "app"),
                         cancellation,
                     )
                 });

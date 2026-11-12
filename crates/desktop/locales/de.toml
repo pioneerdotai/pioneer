@@ -1761,3 +1761,6 @@ callback_rejected = "Anmeldung abgelehnt. Kehren Sie zu Pioneer zurück und meld
 
 [plugins]
 title = "Plugins"
+
+[apps]
+title = "Apps"

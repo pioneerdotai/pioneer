@@ -13,6 +13,21 @@ use std::{
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginShellRequest {
+    AppParentSnapshot {
+        workspace_id: String,
+        app_id: String,
+    },
+    AppParentCommand {
+        workspace_id: String,
+        app_id: String,
+        origin: pioneer_client::plugins::runtime::PluginCommandOrigin,
+        intent: pioneer_client::plugins::runtime::PluginIntent,
+    },
+    AppComposerPicker {
+        thread_id: String,
+        draft_id: pioneer_client::composer::store::DraftId,
+        query: String,
+    },
     #[serde(rename = "configure_oauth")]
     ConfigureOAuth {
         redirect_uri: String,
@@ -353,6 +368,53 @@ pub(crate) fn execute(
     request: PluginShellRequest,
 ) -> Result<PluginShellResponse, String> {
     match request {
+        PluginShellRequest::AppParentSnapshot {
+            workspace_id,
+            app_id,
+        } => {
+            let core = runtime
+                .core
+                .packages(pioneer_client::plugins::PackageKind::App);
+            let origin = core.plugin_command_origin();
+            let parent = core.plugin_details_publication(&workspace_id, &app_id);
+            if core.plugin_command_origin() != origin {
+                return Err("app_catalog_stale".into());
+            }
+            Ok(PluginShellResponse {
+                parent,
+                origin: Some(origin),
+                ..PluginShellResponse::accepted(true)
+            })
+        }
+        PluginShellRequest::AppParentCommand {
+            workspace_id,
+            app_id,
+            origin,
+            intent,
+        } => {
+            let receipt = runtime
+                .core
+                .packages(pioneer_client::plugins::PackageKind::App)
+                .submit_plugin_command(&workspace_id, &app_id, intent, &origin)
+                .map_err(|_| "app_command_rejected".to_owned())?;
+            Ok(PluginShellResponse {
+                command_receipt: Some(receipt),
+                ..PluginShellResponse::accepted(true)
+            })
+        }
+        PluginShellRequest::AppComposerPicker {
+            thread_id,
+            draft_id,
+            query,
+        } => Ok(PluginShellResponse {
+            picker: runtime.core.composer_catalog_package_picker(
+                pioneer_client::plugins::PackageKind::App,
+                &thread_id,
+                draft_id,
+                &query,
+            ),
+            ..PluginShellResponse::accepted(true)
+        }),
         PluginShellRequest::ConfigureOAuth { redirect_uri } => {
             runtime.native_oauth.configure(redirect_uri)?;
             runtime
@@ -420,6 +482,8 @@ pub(crate) fn execute(
                 target,
                 SkillUploadTarget::PluginPreview
                     | SkillUploadTarget::PluginUpdatePreview { .. }
+                    | SkillUploadTarget::AppPreview
+                    | SkillUploadTarget::AppUpdatePreview { .. }
                     | SkillUploadTarget::Update { .. }
             ) {
                 return Err("plugin_preview_target_required".into());

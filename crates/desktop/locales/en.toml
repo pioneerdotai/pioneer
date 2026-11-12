@@ -1761,3 +1761,6 @@ callback_rejected = "Callback rejected. Return to Pioneer to retry sign-in."
 
 [plugins]
 title = "Plugins"
+
+[apps]
+title = "Apps"

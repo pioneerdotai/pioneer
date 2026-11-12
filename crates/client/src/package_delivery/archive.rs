@@ -17,9 +17,100 @@ pub struct SkillUploadArchive {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SkillUploadSourceKind {
+    App,
     Plugin,
     Skill,
     Pack,
+}
+/// App directories are captured from declarations only. Ready archives retain
+/// the existing upload limit and are independently checked at the Gateway.
+pub fn build_app_upload_archive(
+    source: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Result<SkillUploadArchive> {
+    let metadata = fs::symlink_metadata(source)?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "selected_symlink_denied"
+    );
+    if metadata.is_file() {
+        use std::io::Read;
+        const MAX_BYTES: usize = 64 * 1024 * 1024;
+        anyhow::ensure!(metadata.len() <= MAX_BYTES as u64, "archive_input_limit");
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(source)?;
+        let opened = file.metadata()?;
+        anyhow::ensure!(
+            opened.is_file()
+                && opened.len() == metadata.len()
+                && opened.modified()? == metadata.modified()?,
+            "source_changed"
+        );
+        let mut bytes = Vec::new();
+        let mut reader = (&file).take((MAX_BYTES + 1) as u64);
+        let mut chunk = [0u8; 65536];
+        loop {
+            anyhow::ensure!(!cancelled(), "cancelled");
+            let n = reader.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+            anyhow::ensure!(bytes.len() <= MAX_BYTES, "archive_input_limit");
+        }
+        let after = file.metadata()?;
+        let path_after = fs::symlink_metadata(source)?;
+        anyhow::ensure!(
+            after.len() == opened.len()
+                && after.modified()? == opened.modified()?
+                && !path_after.file_type().is_symlink()
+                && path_after.len() == after.len()
+                && path_after.modified()? == after.modified()?,
+            "source_changed"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                opened.dev() == metadata.dev()
+                    && opened.ino() == metadata.ino()
+                    && path_after.dev() == opened.dev()
+                    && path_after.ino() == opened.ino()
+                    && after.ctime() == opened.ctime()
+                    && after.ctime_nsec() == opened.ctime_nsec(),
+                "source_changed"
+            );
+        }
+        return Ok(SkillUploadArchive {
+            file_name: source
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("app.tar.gz")
+                .into(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+            bytes,
+            uncompressed_size_bytes: 0,
+        });
+    }
+    anyhow::ensure!(metadata.is_dir(), "source_kind");
+    let (_, snapshot) = pioneer_plugins::app::SelectionPlan::capture(
+        source,
+        pioneer_plugins::Limits {
+            expanded_bytes: 50 * 1024 * 1024,
+            entry_bytes: 10 * 1024 * 1024,
+            entries: 4096,
+            depth: 64,
+            components: 256,
+        },
+        &cancelled,
+    )?;
+    build_app_snapshot_archive(&snapshot, cancelled)
 }
 
 #[derive(Debug)]
@@ -191,9 +282,8 @@ fn build_upload_archive(source_root: &Path, root_name: String) -> Result<SkillUp
 }
 
 /// Archive immutable, selectively captured App bytes, never reread the source project.
-/// Integration prerequisite: the Apps upload controller must retain this snapshot's
-/// fingerprint through preview/install and use an App-purpose Gateway upload.
-/// Ready archives continue through bounded Gateway extraction and independent validation.
+/// The delivery controller retains these bytes through preview/install using an
+/// App-purpose upload; Gateway independently validates the extracted selection.
 pub fn build_app_snapshot_archive(
     snapshot: &pioneer_plugins::Snapshot,
     cancelled: impl Fn() -> bool,
@@ -213,6 +303,21 @@ pub fn build_app_snapshot_archive(
     root_header.set_cksum();
     builder.append_data(&mut root_header, root, io::empty())?;
     let mut total = 0u64;
+    struct CancellableBytes<'a, F> {
+        bytes: &'a [u8],
+        cancelled: &'a F,
+    }
+    impl<F: Fn() -> bool> io::Read for CancellableBytes<'_, F> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if (self.cancelled)() {
+                return Err(io::Error::other("cancelled"));
+            }
+            let count = buffer.len().min(self.bytes.len()).min(64 * 1024);
+            buffer[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            Ok(count)
+        }
+    }
     for (path, entry) in snapshot.entries() {
         if cancelled() {
             bail!("cancelled");
@@ -237,7 +342,14 @@ pub fn build_app_snapshot_archive(
         header.set_size(bytes.len() as u64);
         header.set_mtime(0);
         header.set_cksum();
-        builder.append_data(&mut header, format!("{root}/{path}"), bytes)?;
+        builder.append_data(
+            &mut header,
+            format!("{root}/{path}"),
+            CancellableBytes {
+                bytes,
+                cancelled: &cancelled,
+            },
+        )?;
     }
     if cancelled() {
         bail!("cancelled");

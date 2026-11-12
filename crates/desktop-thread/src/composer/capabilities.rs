@@ -363,6 +363,10 @@ impl ComposerView {
                 capabilities.can_use_mcp,
                 t!("chat.composer.capability_picker.search_mcp").to_string(),
             ),
+            ComposerPickerKind::Apps => (
+                capabilities.can_use_skills && capabilities.can_use_mcp,
+                t!("apps.search").to_string(),
+            ),
             ComposerPickerKind::Plugins => (
                 capabilities.can_use_skills && capabilities.can_use_mcp,
                 t!("plugins.search").to_string(),
@@ -1502,9 +1506,20 @@ fn capability_picker_footer(
 impl CapabilityPickerState {
     fn toggle_plugin(&mut self, plugin_id: &str, cx: &mut Context<Self>) {
         self.send(
-            ComposerCatalogIntent::TogglePlugin {
-                identity: self.identity.clone(),
-                plugin_id: plugin_id.into(),
+            if self
+                .input()
+                .and_then(|p| p.session.clone())
+                .is_some_and(|s| s.kind == ComposerPickerKind::Apps)
+            {
+                ComposerCatalogIntent::ToggleApp {
+                    identity: self.identity.clone(),
+                    app_id: plugin_id.into(),
+                }
+            } else {
+                ComposerCatalogIntent::TogglePlugin {
+                    identity: self.identity.clone(),
+                    plugin_id: plugin_id.into(),
+                }
             },
             cx,
         );
@@ -1563,8 +1578,30 @@ impl ComposerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(picker) = self.new_capability_picker(ComposerPickerKind::Plugins, window, cx)
-        else {
+        self.open_composer_package_picker(pioneer_client::plugins::PackageKind::Plugin, window, cx)
+    }
+    pub(super) fn open_composer_apps_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_composer_package_picker(pioneer_client::plugins::PackageKind::App, window, cx)
+    }
+    fn open_composer_package_picker(
+        &mut self,
+        kind: pioneer_client::plugins::PackageKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(picker) = self.new_capability_picker(
+            if kind == pioneer_client::plugins::PackageKind::App {
+                ComposerPickerKind::Apps
+            } else {
+                ComposerPickerKind::Plugins
+            },
+            window,
+            cx,
+        ) else {
             return;
         };
         let weak = picker.downgrade();
@@ -1573,30 +1610,59 @@ impl ComposerView {
                 return dialog;
             };
             let state = picker.read(cx);
-            let rows = state.client.composer_catalog_plugin_picker(
+            let rows = state.client.composer_catalog_package_picker_for_locale(
+                kind,
                 &state.identity.thread_id,
                 state.identity.draft_id,
                 &state.query(cx),
+                &rust_i18n::locale(),
             );
             let input = state.input();
             let search = state.search.clone();
-            let loading = input
-                .as_ref()
-                .is_some_and(|p| p.plugin_request.state == ComposerCatalogRequestState::Loading);
+            let loading = input.as_ref().is_some_and(|p| {
+                (if kind == pioneer_client::plugins::PackageKind::App {
+                    &p.app_request
+                } else {
+                    &p.plugin_request
+                })
+                .state
+                    == ComposerCatalogRequestState::Loading
+            });
             let failed = input.as_ref().is_some_and(|p| {
                 matches!(
-                    p.plugin_request.state,
+                    (if kind == pioneer_client::plugins::PackageKind::App {
+                        &p.app_request
+                    } else {
+                        &p.plugin_request
+                    })
+                    .state,
                     ComposerCatalogRequestState::Failed { .. }
                 )
             });
             let mut list = v_flex().max_h(px(360.)).overflow_y_scrollbar();
             if loading {
-                list = list.child(picker_status_banner(t!("plugins.loading").to_string(), cx));
+                list = list.child(picker_status_banner(
+                    t!(if kind == pioneer_client::plugins::PackageKind::App {
+                        "apps.loading"
+                    } else {
+                        "plugins.loading"
+                    })
+                    .to_string(),
+                    cx,
+                ));
             }
             if failed {
                 let retry = picker.downgrade();
                 list = list
-                    .child(picker_error_banner(t!("plugins.error").to_string(), cx))
+                    .child(picker_error_banner(
+                        t!(if kind == pioneer_client::plugins::PackageKind::App {
+                            "apps.error"
+                        } else {
+                            "plugins.error"
+                        })
+                        .to_string(),
+                        cx,
+                    ))
                     .child(
                         default_outline_button("composer-plugin-retry")
                             .label(t!("plugins.retry").to_string())
@@ -1606,7 +1672,13 @@ impl ComposerView {
                                         ComposerCatalogIntent::Retry {
                                             thread_id: state.identity.thread_id.clone(),
                                             draft_id: state.identity.draft_id,
-                                            catalog: ComposerCatalogKind::Plugins,
+                                            catalog: if kind
+                                                == pioneer_client::plugins::PackageKind::App
+                                            {
+                                                ComposerCatalogKind::Apps
+                                            } else {
+                                                ComposerCatalogKind::Plugins
+                                            },
                                         },
                                         cx,
                                     );
@@ -1615,7 +1687,15 @@ impl ComposerView {
                     );
             }
             if rows.is_empty() && !loading && !failed {
-                list = list.child(empty_picker_state(t!("plugins.empty").to_string(), cx));
+                list = list.child(empty_picker_state(
+                    t!(if kind == pioneer_client::plugins::PackageKind::App {
+                        "apps.empty"
+                    } else {
+                        "plugins.empty"
+                    })
+                    .to_string(),
+                    cx,
+                ));
             }
             let row_count = rows.len();
             list = list.children(rows.into_iter().enumerate().map(|(index, row)| {
@@ -1627,7 +1707,12 @@ impl ComposerView {
             capability_picker_dialog(
                 dialog,
                 window.rem_size() * 32.5,
-                t!("chat.composer.add_menu.plugins").to_string(),
+                t!(if kind == pioneer_client::plugins::PackageKind::App {
+                    "chat.composer.add_menu.apps"
+                } else {
+                    "chat.composer.add_menu.plugins"
+                })
+                .to_string(),
                 picker.downgrade(),
             )
             .on_ok({

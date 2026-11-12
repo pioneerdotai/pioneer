@@ -356,3 +356,13 @@
 "chat.composer.model.service_standard" = "Standard"
 
 "chat.composer.model.service_invalid" = "Die gespeicherte Servicestufe ist nicht verfügbar. Wählen Sie Standard oder einen anderen Modus."
+
+"chat.composer.add_menu.apps" = "Apps hinzufügen"
+"apps.empty" = "Keine Apps installiert"
+"apps.error" = "Apps konnten nicht geladen werden. Erneut versuchen."
+"apps.loading" = "Apps werden geladen…"
+"apps.search" = "Apps suchen"
+"apps.select" = "Apps auswählen"
+"apps.unavailable" = "Nicht verfügbar"
+"apps.retry" = "Erneut versuchen"
+"apps.stale" = "Die ausgewählte Version ist nicht mehr aktuell"

@@ -71,6 +71,9 @@ const fn image_format(media_type: ImageMediaType) -> ImageFormat {
 
 /// Bounded decode of a declared package image; no URL fetching or format fallback.
 pub fn prepare_package_image(bytes: &[u8]) -> Result<PreparedImage, ()> {
+    if bytes.is_empty() || bytes.len() > IMAGE_MAX_BYTES {
+        return Err(());
+    }
     let media = match image::guess_format(bytes).map_err(|_| ())? {
         ImageFormat::Png => ImageMediaType::Png,
         ImageFormat::Jpeg => ImageMediaType::Jpeg,

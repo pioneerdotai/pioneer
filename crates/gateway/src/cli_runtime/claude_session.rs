@@ -5660,6 +5660,7 @@ done
     fn selected_skill_fixture(path: &Path, install_name: &str) -> CliRuntimeSelectedSkill {
         CliRuntimeSelectedSkill {
             plugin_id: None,
+            package_owner: None,
             install_name: install_name.to_owned(),
             installed_path: path.to_path_buf(),
             source_folder_hash: compute_skill_folder_hash(path).expect("skill fixture hash"),

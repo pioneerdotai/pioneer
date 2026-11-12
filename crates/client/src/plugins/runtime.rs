@@ -300,13 +300,211 @@ impl Drop for PluginController {
 /// A visible catalog/details consumer, using the same retained-demand pattern
 /// as SkillsDemand and McpDemand. Dropping a lease never erases published data.
 pub type PluginDemand = crate::request_state::CatalogDemand;
+/// The same lifecycle controller serves exactly the two installed package domains.
+/// Each domain retains independent demand, generations, publications and queueing.
+#[derive(Clone, Copy)]
+pub struct PackageClient<'a> {
+    core: &'a ClientCore,
+    kind: PackageKind,
+}
+impl std::ops::Deref for PackageClient<'_> {
+    type Target = ClientCore;
+    fn deref(&self) -> &ClientCore {
+        self.core
+    }
+}
 impl ClientCore {
+    pub fn packages(&self, kind: PackageKind) -> PackageClient<'_> {
+        PackageClient { core: self, kind }
+    }
+    pub fn plugin_parent_recovery_available(&self, workspace: &str, parent: &str) -> bool {
+        self.packages(PackageKind::Plugin)
+            .plugin_parent_recovery_available(workspace, parent)
+    }
+    pub fn plugin_command_origin(&self) -> PluginCommandOrigin {
+        self.packages(PackageKind::Plugin).plugin_command_origin()
+    }
+    pub fn submit_plugin_command(
+        &self,
+        workspace: &str,
+        parent: &str,
+        intent: PluginIntent,
+        origin: &PluginCommandOrigin,
+    ) -> anyhow::Result<PluginCommandReceipt> {
+        self.packages(PackageKind::Plugin)
+            .submit_plugin_command(workspace, parent, intent, origin)
+    }
+    pub fn plugin_command_operation(
+        &self,
+        workspace: &str,
+        receipt: &PluginCommandReceipt,
+    ) -> Option<PluginOperationPublication> {
+        self.packages(PackageKind::Plugin)
+            .plugin_command_operation(workspace, receipt)
+    }
+    pub fn acquire_plugin_demand(
+        self: &Arc<Self>,
+        workspace: &str,
+        plugin_id: Option<&str>,
+    ) -> PluginDemand {
+        self.packages(PackageKind::Plugin)
+            .acquire_plugin_demand(self, workspace, plugin_id)
+    }
+    fn publish_plugins(&self, workspace: &str, p: &mut PluginPublication) -> ClientTransition {
+        self.packages(PackageKind::Plugin)
+            .publish_plugins(workspace, p)
+    }
+    pub fn plugin_details_publication(
+        &self,
+        workspace: &str,
+        plugin_id: &str,
+    ) -> Option<PluginPublication> {
+        self.packages(PackageKind::Plugin)
+            .plugin_details_publication(workspace, plugin_id)
+    }
+    fn project_plugin_native_snapshots(
+        &self,
+        workspace: &str,
+        publication: &mut PluginPublication,
+    ) {
+        self.packages(PackageKind::Plugin)
+            .project_plugin_native_snapshots(workspace, publication)
+    }
+    pub fn plugin_intent_for(
+        &self,
+        workspace: &str,
+        plugin_id: &str,
+        intent: PluginIntent,
+    ) -> ClientTransition {
+        self.packages(PackageKind::Plugin)
+            .plugin_intent_for(workspace, plugin_id, intent)
+    }
+    pub fn plugin_intent(&self, workspace: &str, intent: PluginIntent) -> ClientTransition {
+        self.packages(PackageKind::Plugin)
+            .plugin_intent(workspace, intent)
+    }
+    fn plugin_intent_with_management(
+        &self,
+        workspace: &str,
+        intent: PluginIntent,
+        managing: bool,
+    ) -> ClientTransition {
+        self.packages(PackageKind::Plugin)
+            .plugin_intent_with_management(workspace, intent, managing)
+    }
+    fn plugin_intent_bound(
+        &self,
+        workspace: &str,
+        intent: PluginIntent,
+        managing: bool,
+        parent: Option<String>,
+        origin: Option<&PluginCommandOrigin>,
+        continuing_read: bool,
+    ) -> ClientTransition {
+        self.packages(PackageKind::Plugin).plugin_intent_bound(
+            workspace,
+            intent,
+            managing,
+            parent,
+            origin,
+            continuing_read,
+        )
+    }
+    fn plugin_work_current(&self, work: &Work) -> bool {
+        self.packages(PackageKind::Plugin).plugin_work_current(work)
+    }
+    fn plugin_work_parent(&self, work: &Work) -> Option<Option<String>> {
+        self.packages(PackageKind::Plugin).plugin_work_parent(work)
+    }
+    fn admit_plugin_child(
+        &self,
+        work: &Work,
+        admit: impl FnOnce() -> anyhow::Result<u64>,
+    ) -> anyhow::Result<u64> {
+        self.packages(PackageKind::Plugin)
+            .admit_plugin_child(work, admit)
+    }
+    pub(crate) fn refresh_plugins_for_native_notification(
+        &self,
+        notification: &GatewayNotification,
+    ) {
+        for kind in [PackageKind::Plugin, PackageKind::App] {
+            self.packages(kind)
+                .refresh_plugins_for_native_notification(notification);
+        }
+    }
+    pub(crate) fn refresh_plugin_publication(&self, workspace: &str) {
+        self.packages(PackageKind::Plugin)
+            .refresh_plugin_publication(workspace)
+    }
+    pub(crate) fn invalidate_plugin_publications(&self) {
+        for kind in [PackageKind::Plugin, PackageKind::App] {
+            self.packages(kind).invalidate_plugin_publications();
+        }
+    }
+    pub(crate) fn resume_plugin_publications(&self) {
+        for kind in [PackageKind::Plugin, PackageKind::App] {
+            self.packages(kind).resume_plugin_publications();
+        }
+    }
+    pub(crate) fn plugin_demand_changed(
+        &self,
+        scope: &ClientScope,
+        demand: crate::core::ClientDemand,
+    ) {
+        for kind in [PackageKind::Plugin, PackageKind::App] {
+            self.packages(kind).plugin_demand_changed(scope, demand);
+        }
+    }
+    fn resume_pending_plugin_reads(&self) {
+        self.packages(PackageKind::Plugin)
+            .resume_pending_plugin_reads()
+    }
+    fn settle_plugin_work(
+        &self,
+        work: &Work,
+        result: anyhow::Result<PluginPublication>,
+        mutation_dispatched: bool,
+        catalog_read_succeeded: Option<bool>,
+    ) {
+        self.packages(PackageKind::Plugin).settle_plugin_work(
+            work,
+            result,
+            mutation_dispatched,
+            catalog_read_succeeded,
+        )
+    }
+    pub(crate) fn start_plugins_controller(self: &Arc<Self>) {
+        for kind in [PackageKind::Plugin, PackageKind::App] {
+            self.packages(kind).start_plugins_controller(self);
+        }
+    }
+}
+impl PackageClient<'_> {
+    fn controller(&self) -> &std::sync::Mutex<PluginController> {
+        match self.kind {
+            PackageKind::Plugin => &self.core.plugins_controller,
+            PackageKind::App => &self.core.apps_controller,
+        }
+    }
+    pub fn scope(&self, workspace: String) -> ClientScope {
+        match self.kind {
+            PackageKind::Plugin => ClientScope::Plugins {
+                workspace_id: workspace,
+            },
+            PackageKind::App => ClientScope::Apps {
+                workspace_id: workspace,
+            },
+        }
+    }
+}
+impl PackageClient<'_> {
     /// A fresh authorized Observe enables an explicit recovery against its CAS.
     /// The old operation remains uncertain. Upload retries use their own exact
     /// upload/fingerprint flow and are never admitted through this path.
     pub fn plugin_parent_recovery_available(&self, workspace: &str, parent: &str) -> bool {
         let epoch = self.provider_runtime_epoch();
-        let owner = self.plugins_controller.lock().expect("plugins poisoned");
+        let owner = self.controller().lock().expect("plugins poisoned");
         owner.parent_recovery_available(workspace, parent, epoch)
     }
 
@@ -374,12 +572,13 @@ impl ClientCore {
             .cloned()
     }
     pub fn acquire_plugin_demand(
-        self: &Arc<Self>,
+        &self,
+        core_arc: &Arc<ClientCore>,
         workspace: &str,
         plugin_id: Option<&str>,
     ) -> PluginDemand {
         let epoch = self.provider_runtime_epoch();
-        let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
+        let mut owner = self.controller().lock().expect("plugins poisoned");
         owner.next_consumer = owner
             .next_consumer
             .checked_add(1)
@@ -411,19 +610,19 @@ impl ClientCore {
                 },
             );
         }
-        let core = Arc::downgrade(self);
+        let kind = self.kind;
+        let core = Arc::downgrade(core_arc);
         let workspace = workspace.to_owned();
         crate::request_state::CatalogDemand::new(identity, move || {
-            if let Some(core) = core.upgrade() {
-                let mut owner = core.plugins_controller.lock().expect("plugins poisoned");
+            if let Some(core_owner) = core.upgrade() {
+                let core = core_owner.packages(kind);
+                let mut owner = core.controller().lock().expect("plugins poisoned");
                 if let Some(consumers) = owner.consumers.get_mut(&workspace) {
                     consumers.remove(&identity);
                     if consumers.is_empty() {
                         owner.consumers.remove(&workspace);
                         if core
-                            .current_scope_demand(&ClientScope::Plugins {
-                                workspace_id: workspace.clone(),
-                            })
+                            .current_scope_demand(&core.scope(workspace.clone()))
                             .is_none_or(|demand| demand == crate::core::ClientDemand::Suspended)
                         {
                             owner.suspended.insert(workspace);
@@ -435,9 +634,7 @@ impl ClientCore {
     }
 
     fn publish_plugins(&self, workspace: &str, p: &mut PluginPublication) -> ClientTransition {
-        let scope = ClientScope::Plugins {
-            workspace_id: workspace.into(),
-        };
+        let scope = self.scope(workspace.into());
         p.revision = self
             .snapshot(&scope)
             .map_or(0, |s| s.revisions().scoped().get())
@@ -458,9 +655,7 @@ impl ClientCore {
         plugin_id: &str,
     ) -> Option<PluginPublication> {
         let epoch = self.provider_runtime_epoch();
-        let scope = ClientScope::Plugins {
-            workspace_id: workspace.into(),
-        };
+        let scope = self.scope(workspace.into());
         let publication: Arc<PluginPublication> = self.snapshot(&scope)?.snapshot().payload()?;
         let mut publication = (*publication).clone();
         publication.details = publication
@@ -612,7 +807,7 @@ impl ClientCore {
             return self.reject_intent();
         }
         let epoch = self.provider_runtime_epoch();
-        let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
+        let mut owner = self.controller().lock().expect("plugins poisoned");
         if origin
             .is_some_and(|origin| origin.epoch() != epoch || self.provider_runtime_epoch() != epoch)
         {
@@ -913,7 +1108,7 @@ impl ClientCore {
 
     fn plugin_work_current(&self, work: &Work) -> bool {
         let epoch = self.provider_runtime_epoch();
-        let owner = self.plugins_controller.lock().expect("plugins poisoned");
+        let owner = self.controller().lock().expect("plugins poisoned");
         !self.is_stopped() && epoch == work.epoch
             && owner.publications.contains_key(&work.workspace)
             && owner.requests.get(&(work.workspace.clone(),work.key.clone())).is_some_and(|r| matches!(r.status(), crate::request_state::RequestStatus::Pending { generation, .. } if generation.get()==work.generation))
@@ -930,7 +1125,7 @@ impl ClientCore {
         work: &Work,
         admit: impl FnOnce() -> anyhow::Result<u64>,
     ) -> anyhow::Result<u64> {
-        let owner = self.plugins_controller.lock().expect("plugins poisoned");
+        let owner = self.controller().lock().expect("plugins poisoned");
         anyhow::ensure!(
             !self.is_stopped()
                 && self.provider_runtime_epoch() == work.epoch
@@ -988,7 +1183,7 @@ impl ClientCore {
             _ => return,
         };
         let affected = {
-            let owner = self.plugins_controller.lock().expect("plugins poisoned");
+            let owner = self.controller().lock().expect("plugins poisoned");
             owner.publications.get(workspace).is_none_or(|p| {
                 if !p.loaded {
                     return true;
@@ -1035,7 +1230,7 @@ impl ClientCore {
     pub(crate) fn refresh_plugin_publication(&self, workspace: &str) {
         self.refresh_composer_plugins(workspace);
         let id = {
-            let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
+            let mut owner = self.controller().lock().expect("plugins poisoned");
             let Some(p) = owner.publications.get(workspace) else {
                 return;
             };
@@ -1048,7 +1243,7 @@ impl ClientCore {
         self.plugin_intent(workspace, PluginIntent::Observe { plugin_id: id });
     }
     pub(crate) fn invalidate_plugin_publications(&self) {
-        let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
+        let mut owner = self.controller().lock().expect("plugins poisoned");
         let workspaces = owner
             .publications
             .keys()
@@ -1083,7 +1278,7 @@ impl ClientCore {
     }
     pub(crate) fn resume_plugin_publications(&self) {
         let resume = {
-            let owner = self.plugins_controller.lock().expect("plugins poisoned");
+            let owner = self.controller().lock().expect("plugins poisoned");
             owner
                 .publications
                 .iter()
@@ -1092,7 +1287,7 @@ impl ClientCore {
                 .collect::<Vec<_>>()
         };
         for (workspace, plugin_id) in resume {
-            self.plugins_controller
+            self.controller()
                 .lock()
                 .expect("plugins poisoned")
                 .refresh_requested
@@ -1112,12 +1307,14 @@ impl ClientCore {
         scope: &ClientScope,
         demand: crate::core::ClientDemand,
     ) {
-        let ClientScope::Plugins { workspace_id } = scope else {
-            return;
+        let workspace_id = match (self.kind, scope) {
+            (PackageKind::Plugin, ClientScope::Plugins { workspace_id })
+            | (PackageKind::App, ClientScope::Apps { workspace_id }) => workspace_id,
+            _ => return,
         };
         let demand = self.current_scope_demand(scope).unwrap_or(demand);
         let epoch = self.provider_runtime_epoch();
-        let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
+        let mut owner = self.controller().lock().expect("plugins poisoned");
         if demand == crate::core::ClientDemand::Suspended {
             if !owner.consumers.contains_key(workspace_id) {
                 owner.suspended.insert(workspace_id.clone());
@@ -1149,7 +1346,7 @@ impl ClientCore {
             return;
         }
         let reads = {
-            let owner = self.plugins_controller.lock().expect("plugins poisoned");
+            let owner = self.controller().lock().expect("plugins poisoned");
             owner
                 .pending_observations
                 .keys()
@@ -1207,7 +1404,7 @@ impl ClientCore {
         if !self.plugin_work_current(work) {
             return;
         }
-        let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
+        let mut owner = self.controller().lock().expect("plugins poisoned");
         if !owner.requests.get(&(work.workspace.clone(),work.key.clone())).is_some_and(|r| matches!(r.status(),crate::request_state::RequestStatus::Pending { generation,.. } if generation.get()==work.generation)){return;}
         let retained_parents = owner
             .consumers
@@ -1249,7 +1446,7 @@ impl ClientCore {
         }
         drop(owner);
     }
-    pub(crate) fn start_plugins_controller(self: &Arc<Self>) {
+    pub(crate) fn start_plugins_controller(&self, core_arc: &Arc<ClientCore>) {
         let (sender, receiver) =
             mpsc::sync_channel::<Work>(crate::request_state::CONTROLLER_QUEUE_CAPACITY);
         let queue_observer = pioneer_observability::queues::QueueObserver::new(
@@ -1258,7 +1455,8 @@ impl ClientCore {
             "plugin controller requests; payload bytes unavailable without traversal",
         );
         let worker_queue = queue_observer.clone();
-        let weak = Arc::downgrade(self);
+        let kind = self.kind;
+        let weak = Arc::downgrade(core_arc);
         let task=std::thread::Builder::new().name("client-plugins".into()).spawn(move||while let Ok(work)=receiver.recv(){
             worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
             let mut processing = worker_queue.processing();
@@ -1269,10 +1467,11 @@ impl ClientCore {
             );
             let _scope = carrier.enter();
             let mut active = pioneer_observability::live::WorkGuard::start(carrier.context(), false);
-            let Some(core)=weak.upgrade() else{return;};
+            let Some(core_owner)=weak.upgrade() else{return;};
+            let core = core_owner.packages(kind);
             core.resume_pending_plugin_reads();
             if !core.plugin_work_current(&work){continue;}
-            let current=||weak.upgrade().is_some_and(|c|c.plugin_work_current(&work));
+            let current=||weak.upgrade().is_some_and(|c|c.packages(kind).plugin_work_current(&work));
             let mut mutation_dispatched = false;
             let mut catalog_read_succeeded = None;
             let result=(||->anyhow::Result<PluginPublication>{
@@ -1281,25 +1480,25 @@ impl ClientCore {
                 let mut id=core.plugin_work_parent(&work).ok_or_else(||anyhow::anyhow!("plugin_catalog_stale"))?;
                 let mut mutation_result = None;
                 match &work.intent {
-                    PluginIntent::SetEnabled{plugin_id,expected_revision,enabled,allow_implicit_invocation}=>{mutation_dispatched=true;let item=crate::transport::ws::command_sender::plugins_set_enabled(&bound,PluginsSetEnabledParams{workspace_id:work.workspace.clone(),plugin_id:plugin_id.clone(),expected_revision:*expected_revision,enabled:*enabled,allow_implicit_invocation:*allow_implicit_invocation})?;mutation_result=Some(PluginsMutationResponse{plugin:Some(item),removed:false});},
-                    PluginIntent::Mutate{plugin_id,expected_revision,intent}=>{mutation_dispatched=true;mutation_result=Some(crate::transport::ws::command_sender::plugins_mutate(&bound,PluginsMutateParams{workspace_id:work.workspace.clone(),plugin_id:plugin_id.clone(),expected_revision:*expected_revision,intent:intent.clone()})?);},
+                    PluginIntent::SetEnabled{plugin_id,expected_revision,enabled,allow_implicit_invocation}=>{mutation_dispatched=true;let item=crate::transport::ws::command_sender::packages_set_enabled(&bound,kind,PluginsSetEnabledParams{workspace_id:work.workspace.clone(),plugin_id:plugin_id.clone(),expected_revision:*expected_revision,enabled:*enabled,allow_implicit_invocation:*allow_implicit_invocation})?;mutation_result=Some(PluginsMutationResponse{plugin:Some(item),removed:false});},
+                    PluginIntent::Mutate{plugin_id,expected_revision,intent}=>{mutation_dispatched=true;mutation_result=Some(crate::transport::ws::command_sender::packages_mutate(&bound,kind,PluginsMutateParams{workspace_id:work.workspace.clone(),plugin_id:plugin_id.clone(),expected_revision:*expected_revision,intent:intent.clone()})?);},
                     PluginIntent::Install{upload_operation}=>{
-                        anyhow::ensure!(matches!(preview_target(&core,&work.workspace,*upload_operation)?, crate::package_delivery::operations::SkillUploadTarget::PluginPreview | crate::package_delivery::operations::SkillUploadTarget::PluginInstall),"plugin_install_preview_required");
+                        anyhow::ensure!(preview_target(&core,&work.workspace,*upload_operation)?.package_kind()==Some(kind) && matches!(preview_target(&core,&work.workspace,*upload_operation)?,crate::package_delivery::operations::SkillUploadTarget::PluginPreview|crate::package_delivery::operations::SkillUploadTarget::PluginInstall|crate::package_delivery::operations::SkillUploadTarget::AppPreview),"plugin_install_preview_required");
                         let preview=core.confirm_plugin_upload(&work.workspace,*upload_operation,work.epoch)?;
                         let preview=preview.plugin_preview.ok_or_else(||anyhow::anyhow!("plugin_preview_required"))?;let upload_id=preview.upload_id;let preview=preview.package;
                         mutation_dispatched=true;
-                        let result = crate::transport::ws::command_sender::plugins_install(&bound,PluginsInstallParams{workspace_id:work.workspace.clone(),upload_id,expected_fingerprint:preview.fingerprint});
+                        let result = crate::transport::ws::command_sender::packages_install(&bound,kind,PluginsInstallParams{workspace_id:work.workspace.clone(),upload_id,expected_fingerprint:preview.fingerprint});
                         core.complete_plugin_upload_confirmation(&work.workspace,*upload_operation,work.epoch,result.is_ok());
                         let item=result?;
                         id=Some(item.id.clone());
                         mutation_result=Some(PluginsMutationResponse{plugin:Some(item),removed:false});
                     },
                     PluginIntent::ApplyUpdate{upload_operation,confirm_changes}=>{
-                        let crate::package_delivery::operations::SkillUploadTarget::PluginUpdatePreview{plugin_id,expected_revision}=preview_target(&core,&work.workspace,*upload_operation)? else{anyhow::bail!("plugin_update_required");};
+                        let target=preview_target(&core,&work.workspace,*upload_operation)?; anyhow::ensure!(target.package_kind()==Some(kind),"package_kind_mismatch"); let (plugin_id,expected_revision)=match target {crate::package_delivery::operations::SkillUploadTarget::PluginUpdatePreview{plugin_id,expected_revision}|crate::package_delivery::operations::SkillUploadTarget::AppUpdatePreview{app_id:plugin_id,expected_revision}=>(plugin_id,expected_revision),_=>anyhow::bail!("package_update_required")};
                         let preview=core.confirm_plugin_upload(&work.workspace,*upload_operation,work.epoch)?;
                         let preview=preview.plugin_update_preview.ok_or_else(||anyhow::anyhow!("plugin_preview_required"))?;let upload_id=preview.upload_id;let preview=preview.preview;
                         mutation_dispatched=true;
-                        let result = crate::transport::ws::command_sender::plugins_mutate(&bound,PluginsMutateParams{workspace_id:work.workspace.clone(),plugin_id,expected_revision,intent:PluginManagementIntent::Update{upload_id,expected_fingerprint:preview.package.fingerprint,confirm_changes:*confirm_changes}});
+                        let result = crate::transport::ws::command_sender::packages_mutate(&bound,kind,PluginsMutateParams{workspace_id:work.workspace.clone(),plugin_id,expected_revision,intent:PluginManagementIntent::Update{upload_id,expected_fingerprint:preview.package.fingerprint,confirm_changes:*confirm_changes}});
                         core.complete_plugin_upload_confirmation(&work.workspace,*upload_operation,work.epoch,result.is_ok());
                         mutation_result=Some(result?);
                     },
@@ -1309,7 +1508,7 @@ impl ClientCore {
                 if let Some(result)=&mutation_result {
                     let _identity=core.identity_authorization.lock().expect("identity owner poisoned");
                     anyhow::ensure!(core.provider_runtime_epoch()==work.epoch,"plugin_catalog_stale");
-                    let mut owner=core.plugins_controller.lock().expect("plugins poisoned");
+                    let mut owner=core.controller().lock().expect("plugins poisoned");
                     anyhow::ensure!(owner.requests.get(&(work.workspace.clone(),work.key.clone())).is_some_and(|r| matches!(r.status(),crate::request_state::RequestStatus::Pending { generation,.. } if generation.get()==work.generation)),"plugin_catalog_stale");
                     if let Some(p)=owner.publications.get_mut(&work.workspace) {
                         if let Some(operation)=p.operations.get_mut(&work.key){operation.result=Some(result.clone());}
@@ -1329,7 +1528,7 @@ impl ClientCore {
                         core.publish_plugins(&work.workspace,p);
                     }
                 }
-                let list=crate::transport::ws::command_sender::plugins_list(&bound,PluginsListParams{workspace_id:work.workspace.clone()});
+                let list=crate::transport::ws::command_sender::packages_list(&bound,kind,PluginsListParams{workspace_id:work.workspace.clone()});
                 catalog_read_succeeded=Some(list.is_ok());
                 let list=list?;
                 let details=id.as_deref().and_then(|id|list.plugins.iter().find(|p|p.id==id)).cloned();
@@ -1348,7 +1547,7 @@ impl ClientCore {
                             // Link only the ID returned by the existing native owner.
                             // Native completion may race this projection; lookup is exact.
                             let _identity = core.identity_authorization.lock().expect("identity owner poisoned");
-                            let mut owner = core.plugins_controller.lock().expect("plugins poisoned");
+                            let mut owner = core.controller().lock().expect("plugins poisoned");
                             if core.provider_runtime_epoch() == work.epoch {
                                 if let Some(publication) = owner.publications.get_mut(&work.workspace) {
                                     if let Some(operation) = publication.operations.get_mut(&work.key).filter(|o| o.generation == work.generation) {
@@ -1378,7 +1577,7 @@ impl ClientCore {
             processing.processed();
             active.finish(outcome);
         }).expect("plugins worker start");
-        let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
+        let mut owner = self.controller().lock().expect("plugins poisoned");
         owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);

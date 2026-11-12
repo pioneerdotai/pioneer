@@ -1,5 +1,4 @@
 use super::json;
-use icu_locale_core::LanguageIdentifier;
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -361,7 +360,5 @@ pub(super) fn path(s: &str, p: &str) -> Result<String> {
     Ok(s.into())
 }
 fn locale(s: &str, p: &str) -> Result<String> {
-    s.parse::<LanguageIdentifier>()
-        .map(|l| l.to_string())
-        .map_err(|_| ManifestError::new("invalid_locale", p))
+    pioneer_protocol::canonical_app_locale(s).map_err(|_| ManifestError::new("invalid_locale", p))
 }

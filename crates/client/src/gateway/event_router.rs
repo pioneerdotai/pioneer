@@ -49,7 +49,9 @@ impl GatewayEventRoute {
             | McpChanged(_)
             | McpServerStatusChanged(_)
             | McpServerCatalogChanged(_) => Self::Mcp,
-            SkillsChanged(_) | SkillsUploadChunkAck(_) | PluginsChanged(_) => Self::Skills,
+            SkillsChanged(_) | SkillsUploadChunkAck(_) | PluginsChanged(_) | AppsChanged(_) => {
+                Self::Skills
+            }
             TaskCreated(_)
             | TaskScheduled(_)
             | TaskQueued(_)

@@ -179,6 +179,7 @@ pub(crate) fn project(
         })
         .map(|parent| {
             let metadata = PluginMetadata {
+                app: None,
                 display_name: parent.display_name.clone(),
                 short_description: parent.short_description.clone(),
                 description: parent.description.clone(),

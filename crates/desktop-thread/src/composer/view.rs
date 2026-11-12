@@ -613,6 +613,22 @@ impl ComposerView {
 
                 let menu = if can_use_skills && can_use_mcp {
                     menu.item(Self::composer_add_menu_item(
+                        t!("chat.composer.add_menu.apps").to_string().into(),
+                        PioneerIconName::Plugin,
+                        {
+                            let entity = desktop_entity.clone();
+                            move |window, cx| {
+                                let _ = entity.update(cx, |view, cx| {
+                                    view.open_composer_apps_picker(window, cx)
+                                });
+                            }
+                        },
+                    ))
+                } else {
+                    menu
+                };
+                let menu = if can_use_skills && can_use_mcp {
+                    menu.item(Self::composer_add_menu_item(
                         t!("chat.composer.add_menu.plugins").to_string().into(),
                         PioneerIconName::Plugin,
                         {
@@ -805,14 +821,28 @@ impl ComposerView {
         capability: ComposerCapability,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let label = self.client.composer_capability_label(
+            self.current_active_thread_id().unwrap_or_default(),
+            &capability,
+            &rust_i18n::locale(),
+        );
         let identity = capability.id.clone();
         let group_id = format!("composer-capability-chip-{identity}");
         let plugin_icon = match &capability.kind {
             ComposerCapabilityKind::Plugin { icon, .. } => Some(icon.clone()),
+            ComposerCapabilityKind::App {
+                icon, dark_icon, ..
+            } => Some(if cx.theme().mode.is_dark() {
+                dark_icon.clone()
+            } else {
+                icon.clone()
+            }),
             _ => None,
         };
         let icon = match capability.kind {
-            ComposerCapabilityKind::Plugin { .. } => PioneerIconName::Plugin,
+            ComposerCapabilityKind::Plugin { .. } | ComposerCapabilityKind::App { .. } => {
+                PioneerIconName::Plugin
+            }
             ComposerCapabilityKind::Skill { .. } => PioneerIconName::Zap,
             ComposerCapabilityKind::McpServer { .. } | ComposerCapabilityKind::McpTool { .. } => {
                 PioneerIconName::Mcp
@@ -864,7 +894,7 @@ impl ComposerView {
                     .whitespace_nowrap()
                     .pr(COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH)
                     .text_xs()
-                    .child(capability.label)
+                    .child(label)
                     .child(
                         div()
                             .absolute()

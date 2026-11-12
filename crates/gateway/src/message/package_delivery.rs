@@ -44,6 +44,21 @@ impl MessageProcessor {
             max_file_bytes: limits.max_install_file_bytes,
         }
     }
+    pub(crate) fn package_storage_root(
+        &self,
+        workspace: &str,
+        kind: pioneer_protocol::PackageKind,
+    ) -> PathBuf {
+        match kind {
+            pioneer_protocol::PackageKind::Plugin => self.plugin_storage_root(workspace),
+            pioneer_protocol::PackageKind::App => {
+                use sha2::{Digest, Sha256};
+                self.artifact_runtime_home
+                    .join("apps")
+                    .join(hex::encode(Sha256::digest(workspace.as_bytes())))
+            }
+        }
+    }
     pub(crate) fn plugin_storage_root(&self, workspace: &str) -> PathBuf {
         use sha2::{Digest, Sha256};
         // Existing parents retain their authoritative absolute package/data

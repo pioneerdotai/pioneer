@@ -14,7 +14,14 @@ impl PluginsView {
         .into()
     }
     pub(super) fn begin_install(&mut self, cx: &mut Context<Self>) {
-        self.pick_source(SkillUploadTarget::PluginInstall, cx);
+        self.pick_source(
+            if self.kind == pioneer_client::plugins::PackageKind::App {
+                SkillUploadTarget::AppPreview
+            } else {
+                SkillUploadTarget::PluginInstall
+            },
+            cx,
+        );
     }
 }
 impl Render for PluginsSidebar {
@@ -84,9 +91,16 @@ impl Render for PluginsSidebar {
                     .on_click(move |_, _, cx| {
                         let _ = update_owner.update(cx, |view, cx| {
                             view.pick_source(
-                                SkillUploadTarget::PluginUpdatePreview {
-                                    plugin_id: update.id.clone(),
-                                    expected_revision: update.revision,
+                                if view.kind == pioneer_client::plugins::PackageKind::App {
+                                    SkillUploadTarget::AppUpdatePreview {
+                                        app_id: update.id.clone(),
+                                        expected_revision: update.revision,
+                                    }
+                                } else {
+                                    SkillUploadTarget::PluginUpdatePreview {
+                                        plugin_id: update.id.clone(),
+                                        expected_revision: update.revision,
+                                    }
                                 },
                                 cx,
                             )

@@ -2514,6 +2514,7 @@ mod tests {
         let skill_enabled = CLIAgentRuntimeSessionStartOptions {
             selected_skills: vec![crate::cli_runtime::skills::CliRuntimeSelectedSkill {
                 plugin_id: None,
+                package_owner: None,
                 install_name: "selected".to_owned(),
                 installed_path: std::path::PathBuf::from("/tmp/selected"),
                 source_folder_hash: "selected-hash".to_owned(),
@@ -2551,6 +2552,7 @@ mod tests {
             ]
             .map(|name| CliRuntimeSelectedSkill {
                 plugin_id: None,
+                package_owner: None,
                 install_name: name.to_owned(),
                 installed_path: std::path::PathBuf::from("/native/skills").join(name),
                 source_folder_hash: format!("hash-{name}"),

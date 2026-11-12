@@ -48,7 +48,9 @@ pub use recovery_diagnostic::{
     ProviderErrorReason, ProviderErrorResponse, ProviderRequestId, RecoveryDiagnostic,
     RecoveryProviderFailure, RecoveryStopReason,
 };
+mod apps;
 mod plugins;
+pub use apps::*;
 mod schema;
 mod scoped_push;
 pub use scoped_push::{
@@ -524,17 +526,18 @@ pub use turn::{
     ToolPermissionPolicySnapshot, ToolPhaseBoundary, ToolRecoveryIdempotencyMode,
     ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind,
     ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution,
-    ToolStoragePayload, Turn, TurnApprovalScopePolicySnapshot, TurnAuthorSnapshot,
-    TurnBlockedNotification, TurnBlockedResumeMetadata, TurnCLIRuntimeOptions, TurnCancelParams,
-    TurnCancelResponse, TurnCapability, TurnCapabilityKind, TurnCommandRiskPolicy,
-    TurnCompletedNotification, TurnEnvironmentPolicy, TurnExecutionSecuritySnapshot,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnFilesystemAccess,
-    TurnFilesystemSandboxEntry, TurnFilesystemSandboxKind, TurnFilesystemSandboxPath,
-    TurnFilesystemSandboxPolicy, TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus,
-    TurnItemEvent, TurnItemEventPayload, TurnItemExecutionClass, TurnItemTimeoutReason,
-    TurnItemType, TurnItemsParams, TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary,
+    ToolStoragePayload, Turn, TurnAppCapabilitySummary, TurnApprovalScopePolicySnapshot,
+    TurnAuthorSnapshot, TurnBlockedNotification, TurnBlockedResumeMetadata, TurnCLIRuntimeOptions,
+    TurnCancelParams, TurnCancelResponse, TurnCapability, TurnCapabilityKind,
+    TurnCommandRiskPolicy, TurnCompletedNotification, TurnEnvironmentPolicy,
+    TurnExecutionSecuritySnapshot, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
+    TurnFailedNotification, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
+    TurnFilesystemSandboxKind, TurnFilesystemSandboxPath, TurnFilesystemSandboxPolicy,
+    TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus, TurnItemEvent,
+    TurnItemEventPayload, TurnItemExecutionClass, TurnItemTimeoutReason, TurnItemType,
+    TurnItemsParams, TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary,
     TurnMcpToolCapabilitySummary, TurnMention, TurnMessageDeleteParams, TurnMessageDeleteResponse,
     TurnMessageDeletedEvent, TurnMessageEditParams, TurnMessageEditResponse,
     TurnMessageEditedEvent, TurnMessageErrorReason, TurnMessageParamsError, TurnMessageRevision,
@@ -554,11 +557,12 @@ pub use turn::{
     TurnSkillPackPresentationSummary, TurnStartParams, TurnStartResponse, TurnStartedNotification,
     TurnStatus, TurnStatusChangedNotification, TurnTmpMode, TurnTmpPolicy,
     TurnToolLoopBudgetExceededNotification, TurnWorkOwner, UserInput, UserMessageAttachment,
-    WebFetchLink, WebSearchResultItem, build_execution_checkpoint_original_request_summary,
-    build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
-    build_execution_checkpoint_tool_summary, collect_execution_checkpoint_strict_obligations,
-    context_compaction_status, mcp_server_capability_key, mcp_tool_capability_key,
-    normalize_metadata_reasoning_effort, plugin_capability_key, reasoning_effort_comparison_key,
+    WebFetchLink, WebSearchResultItem, app_capability_key,
+    build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
+    build_execution_checkpoint_provider_budget_summary, build_execution_checkpoint_tool_summary,
+    collect_execution_checkpoint_strict_obligations, context_compaction_status,
+    mcp_server_capability_key, mcp_tool_capability_key, normalize_metadata_reasoning_effort,
+    package_capability, plugin_capability_key, reasoning_effort_comparison_key,
     resolve_turn_permission_profile, skill_capability_key, skill_pack_capability_key,
     validate_turn_execution_envelope, validate_turn_message_content,
 };

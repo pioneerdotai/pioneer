@@ -131,6 +131,7 @@ impl PluginComponentDetails {
 }
 pub type PluginComponentDetailsFactory = Box<
     dyn Fn(
+        pioneer_client::plugins::PackageKind,
         &str,
         &str,
         &PluginComponentItem,
@@ -140,6 +141,8 @@ pub type PluginComponentDetailsFactory = Box<
 >;
 
 pub struct PluginsView {
+    kind: pioneer_client::plugins::PackageKind,
+    completed_install: Option<u64>,
     client: Arc<ClientCore>,
     binding: Arc<CatalogBinding>,
     input: Arc<PluginPublication>,

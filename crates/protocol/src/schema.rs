@@ -323,6 +323,36 @@ macro_rules! schema_doc {
 
 pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
     vec![
+        schema_doc!("apps_source_params.json", crate::AppsSourceParams),
+        schema_doc!("apps_install_params.json", crate::AppsInstallParams),
+        schema_doc!("apps_set_enabled_params.json", crate::AppsSetEnabledParams),
+        schema_doc!("apps_list_params.json", crate::AppsListParams),
+        schema_doc!("apps_details_params.json", crate::AppsDetailsParams),
+        schema_doc!("apps_list_response.json", crate::AppsListResponse),
+        schema_doc!("apps_preview_response.json", crate::AppsPreviewResponse),
+        schema_doc!(
+            "apps_changed_notification.json",
+            crate::AppsChangedNotification
+        ),
+        schema_doc!(
+            "apps_update_preview_response.json",
+            crate::AppsUpdatePreviewResponse
+        ),
+        schema_doc!("apps_mutation_response.json", crate::AppsMutationResponse),
+        schema_doc!("apps_update_params.json", crate::AppsUpdateParams),
+        schema_doc!("apps_remove_params.json", crate::AppsRemoveParams),
+        schema_doc!("apps_retry_params.json", crate::AppsRetryParams),
+        schema_doc!("apps_continue_params.json", crate::AppsContinueParams),
+        schema_doc!("app_item.json", crate::AppItem),
+        schema_doc!("app_metadata.json", crate::AppMetadata),
+        schema_doc!("app_themed_icon.json", crate::AppThemedIcon),
+        schema_doc!("app_localization.json", crate::AppLocalization),
+        schema_doc!("package_owner.json", crate::PackageOwner),
+        schema_doc!("package_identity.json", crate::PackageIdentity),
+        schema_doc!(
+            "turn_app_capability_summary.json",
+            crate::TurnAppCapabilitySummary
+        ),
         schema_doc!("plugins_source_params.json", crate::PluginsSourceParams),
         schema_doc!("plugins_install_params.json", crate::PluginsInstallParams),
         schema_doc!(

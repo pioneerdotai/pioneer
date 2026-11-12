@@ -1761,3 +1761,6 @@ callback_rejected = "साइन इन अस्वीकार हुआ। �
 
 [plugins]
 title = "प्लगइन"
+
+[apps]
+title = "ऐप्स"

@@ -354,7 +354,7 @@ impl Snapshot {
         cancelled: &impl Fn() -> bool,
     ) -> Result<Self> {
         use crate::app::SelectionKind;
-        if fs::symlink_metadata(root)?.file_type().is_symlink() {
+        if selected_link(&fs::symlink_metadata(root)?) {
             bail!("selected_symlink");
         }
         let root = root.canonicalize()?;
@@ -362,6 +362,7 @@ impl Snapshot {
         if !root_before.is_dir() {
             bail!("source_kind");
         }
+        let selected_root = SelectedRoot::open(root.clone(), &root_before)?;
         let mut entries = BTreeMap::new();
         let mut observed = BTreeMap::new();
         let mut total = 0;
@@ -377,7 +378,7 @@ impl Snapshot {
             for p in parents.into_iter().rev() {
                 let key = p.to_str().context("invalid_path")?;
                 if !entries.contains_key(key) {
-                    let metadata = selected_metadata(&root, key)?;
+                    let metadata = selected_metadata(&selected_root, key)?;
                     if !metadata.is_dir() {
                         bail!("selected_path_kind: {key}");
                     }
@@ -393,14 +394,14 @@ impl Snapshot {
                     observed.insert(key.into(), metadata);
                 }
             }
-            let metadata = selected_metadata(&root, key)?;
+            let metadata = selected_metadata(&selected_root, key)?;
             if (*kind == SelectionKind::File && !metadata.is_file())
                 || (*kind == SelectionKind::Directory && !metadata.is_dir())
             {
                 bail!("selected_path_kind: {key}");
             }
             visit_selected(
-                &root,
+                &selected_root,
                 key,
                 limits,
                 cancelled,
@@ -414,13 +415,14 @@ impl Snapshot {
             if cancelled() {
                 bail!("cancelled");
             }
-            if !same_file(before, &selected_metadata(&root, key)?) {
+            if !same_file(before, &selected_metadata(&selected_root, key)?) {
                 bail!("source_changed: {key}");
             }
         }
         // Root sibling edits are excluded from the package; only root identity/mode matter.
-        let root_after = fs::symlink_metadata(&root)?;
+        let root_after = fs::symlink_metadata(&selected_root.path)?;
         if !root_after.is_dir()
+            || selected_link(&root_after)
             || !same_identity(&root_before, &root_after)
             || mode(&root_before) != mode(&root_after)
         {
@@ -431,27 +433,34 @@ impl Snapshot {
         Ok(snapshot)
     }
 }
-fn selected_metadata(root: &Path, key: &str) -> Result<fs::Metadata> {
-    let mut path = root.to_path_buf();
-    // Reject symlinks in ancestors as well as the final selected entry.
-    for part in key.split('/') {
-        path.push(part);
-        let m = fs::symlink_metadata(&path)?;
-        if m.file_type().is_symlink() {
-            bail!("selected_symlink: {key}");
-        }
-        if !m.is_file() && !m.is_dir() {
-            bail!("selected_special_file: {key}");
-        }
+fn selected_metadata(root: &SelectedRoot, key: &str) -> Result<fs::Metadata> {
+    #[cfg(any(unix, windows))]
+    {
+        return root.open_member(key)?.metadata().map_err(Into::into);
     }
-    if !path.canonicalize()?.starts_with(root) {
-        bail!("package_path_escape");
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut path = root.path.clone();
+        // Reject symlinks in ancestors as well as the final selected entry.
+        for part in key.split('/') {
+            path.push(part);
+            let m = fs::symlink_metadata(&path)?;
+            if m.file_type().is_symlink() {
+                bail!("selected_symlink: {key}");
+            }
+            if !m.is_file() && !m.is_dir() {
+                bail!("selected_special_file: {key}");
+            }
+        }
+        if !path.canonicalize()?.starts_with(&root.path) {
+            bail!("package_path_escape");
+        }
+        Ok(fs::symlink_metadata(path)?)
     }
-    Ok(fs::symlink_metadata(path)?)
 }
 #[allow(clippy::too_many_arguments)]
 fn visit_selected(
-    root: &Path,
+    root: &SelectedRoot,
     key: &str,
     limits: Limits,
     cancelled: &impl Fn() -> bool,
@@ -479,18 +488,9 @@ fn visit_selected(
             },
         );
         observed.entry(key.into()).or_insert(metadata);
-        let mut children = fs::read_dir(root.join(key))?
-            .take(limits.entries + 1)
-            .collect::<std::io::Result<Vec<_>>>()?;
-        if children.len() > limits.entries {
-            bail!("entry_limit");
-        }
-        children.sort_by_key(|e| e.file_name());
-        for child in children {
-            let name = child
-                .file_name()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("invalid_path"))?;
+        let mut children = root.names(key, limits.entries, cancelled)?;
+        children.sort();
+        for name in children {
             visit_selected(
                 root,
                 &format!("{key}/{name}"),
@@ -505,15 +505,7 @@ fn visit_selected(
         if metadata.len() > limits.entry_bytes as u64 {
             bail!("entry_size_limit");
         }
-        let mut options = File::options();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // A raced symlink/FIFO must not escape or block capture.
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let mut file = options.open(root.join(key))?;
+        let mut file = root.open_member(key)?;
         if !same_file(&metadata, &file.metadata()?) {
             bail!("source_changed: {key}");
         }
@@ -567,5 +559,253 @@ fn same_identity(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     #[cfg(not(unix))]
     {
         a.created().ok() == b.created().ok()
+    }
+}
+
+// A held root and no-follow opens anchor every Unix member read. Path-only
+// metadata followed by File::open would allow an ancestor symlink substitution.
+struct SelectedRoot {
+    path: PathBuf,
+    #[cfg(any(unix, windows))]
+    handle: File,
+    #[cfg(windows)]
+    pins: std::sync::Mutex<BTreeMap<String, File>>,
+}
+impl SelectedRoot {
+    fn open(path: PathBuf, before: &fs::Metadata) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let handle = File::options()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)?;
+            let actual = handle.metadata()?;
+            if !same_identity(before, &actual) || mode(before) != mode(&actual) {
+                bail!("source_changed");
+            }
+            Ok(Self { path, handle })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // OPEN_REPARSE_POINT | BACKUP_SEMANTICS, shared read only: pin the
+            // selected root against writes, junction replacement and rename.
+            let handle = File::options()
+                .read(true)
+                .share_mode(1)
+                .custom_flags(0x00200000 | 0x02000000)
+                .open(&path)?;
+            let actual = handle.metadata()?;
+            if selected_link(&actual) || !actual.is_dir() || !same_identity(before, &actual) {
+                bail!("selected_symlink_or_source_changed");
+            }
+            Ok(Self {
+                path,
+                handle,
+                pins: std::sync::Mutex::new(BTreeMap::new()),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = before;
+            Ok(Self { path })
+        }
+    }
+    fn open_member(&self, key: &str) -> Result<File> {
+        #[cfg(unix)]
+        {
+            use std::{
+                ffi::CString,
+                os::fd::{AsRawFd, FromRawFd},
+            };
+            let mut current = self.handle.try_clone()?;
+            let mut parts = key.split('/').peekable();
+            while let Some(part) = parts.next() {
+                let name = CString::new(part)?;
+                let flags = libc::O_RDONLY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC
+                    | if parts.peek().is_some() {
+                        libc::O_DIRECTORY
+                    } else {
+                        0
+                    };
+                // SAFETY: parent is held open; name is NUL-terminated; successful
+                // descriptors are immediately transferred to their sole File owner.
+                let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+                if fd < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ELOOP) {
+                        bail!("selected_symlink: {key}");
+                    }
+                    return Err(error).with_context(|| format!("selected_path_denied: {key}"));
+                }
+                current = unsafe { File::from_raw_fd(fd) };
+                let metadata = current.metadata()?;
+                if !metadata.is_file() && !metadata.is_dir() {
+                    bail!("selected_special_file: {key}");
+                }
+            }
+            Ok(current)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let mut path = self.path.clone();
+            if selected_link(&self.handle.metadata()?) {
+                bail!("selected_symlink");
+            }
+            let mut prefix = String::new();
+            let mut parts = key.split('/').peekable();
+            let mut final_file = None;
+            let mut pins = self.pins.lock().expect("selected source handles poisoned");
+            while let Some(part) = parts.next() {
+                path.push(part);
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                if let Some(file) = pins.get(&prefix) {
+                    final_file = Some(file.try_clone()?);
+                    continue;
+                }
+                // Every ancestor remains pinned before opening its child. No
+                // reparse point is followed; write/delete sharing stays denied
+                // until the entire immutable snapshot has been captured.
+                let file = File::options()
+                    .read(true)
+                    .share_mode(1)
+                    .custom_flags(0x00200000 | 0x02000000)
+                    .open(&path)?;
+                let metadata = file.metadata()?;
+                if selected_link(&metadata) {
+                    bail!("selected_symlink: {key}");
+                }
+                if (!metadata.is_file() && !metadata.is_dir())
+                    || (parts.peek().is_some() && !metadata.is_dir())
+                {
+                    bail!("selected_special_file: {key}");
+                }
+                final_file = Some(file.try_clone()?);
+                pins.insert(prefix.clone(), file);
+            }
+            final_file.context("invalid_path")
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let before = selected_metadata(self, key)?;
+            let file = File::open(self.path.join(key))?;
+            if !same_file(&before, &file.metadata()?) {
+                bail!("source_changed: {key}");
+            }
+            Ok(file)
+        }
+    }
+
+    fn names(&self, key: &str, limit: usize, cancelled: &impl Fn() -> bool) -> Result<Vec<String>> {
+        #[cfg(all(
+            unix,
+            any(target_vendor = "apple", target_os = "linux", target_os = "android")
+        ))]
+        {
+            use std::{
+                ffi::CStr,
+                os::fd::{FromRawFd, IntoRawFd},
+            };
+            let fd = self.open_member(key)?.into_raw_fd();
+            // SAFETY: fd is a uniquely owned directory descriptor. fdopendir
+            // takes it on success; a failed call leaves ownership with us.
+            let pointer = unsafe { libc::fdopendir(fd) };
+            if pointer.is_null() {
+                let error = std::io::Error::last_os_error();
+                drop(unsafe { File::from_raw_fd(fd) });
+                return Err(error.into());
+            }
+            struct Directory(*mut libc::DIR);
+            impl Drop for Directory {
+                fn drop(&mut self) {
+                    unsafe {
+                        libc::closedir(self.0);
+                    }
+                }
+            }
+            let directory = Directory(pointer);
+            let mut names = Vec::new();
+            loop {
+                if cancelled() {
+                    bail!("cancelled");
+                }
+                #[cfg(target_vendor = "apple")]
+                let errno = unsafe { libc::__error() };
+                #[cfg(target_os = "linux")]
+                let errno = unsafe { libc::__errno_location() };
+                #[cfg(target_os = "android")]
+                let errno = unsafe { libc::__errno() };
+                // SAFETY: readdir's buffer is copied before the next call; the
+                // directory is private to this thread and alive for the loop.
+                unsafe {
+                    *errno = 0;
+                }
+                let entry = unsafe { libc::readdir(directory.0) };
+                if entry.is_null() {
+                    let error = unsafe { *errno };
+                    if error != 0 {
+                        return Err(std::io::Error::from_raw_os_error(error).into());
+                    }
+                    break;
+                }
+                let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                if names.len() >= limit {
+                    bail!("entry_limit");
+                }
+                names.push(
+                    std::str::from_utf8(bytes)
+                        .context("invalid_path")?
+                        .to_owned(),
+                );
+            }
+            Ok(names)
+        }
+        #[cfg(not(all(
+            unix,
+            any(target_vendor = "apple", target_os = "linux", target_os = "android")
+        )))]
+        {
+            #[cfg(windows)]
+            let _directory = self.open_member(key)?;
+            let mut names = Vec::new();
+            for entry in fs::read_dir(self.path.join(key))?.take(limit.saturating_add(1)) {
+                if cancelled() {
+                    bail!("cancelled");
+                }
+                if names.len() >= limit {
+                    bail!("entry_limit");
+                }
+                names.push(
+                    entry?
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("invalid_path"))?,
+                );
+            }
+            Ok(names)
+        }
+    }
+}
+
+fn selected_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
     }
 }

@@ -2050,7 +2050,9 @@ pub(crate) fn pin_launch_selection_capabilities(
                 }
                 skill_ids.push(skill_id.clone());
             }
-            TurnCapabilityKind::SkillPack { .. } | TurnCapabilityKind::Plugin { .. } => {
+            TurnCapabilityKind::SkillPack { .. }
+            | TurnCapabilityKind::Plugin { .. }
+            | TurnCapabilityKind::App { .. } => {
                 anyhow::bail!("normalized Task launch contains an unexpanded Skill pack");
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
@@ -2160,6 +2162,14 @@ pub(crate) fn task_launch_selection_capabilities(
             }
             capability_ids.push(capability.id.clone());
             match &capability.kind {
+                TurnCapabilityKind::App {
+                    app_id,
+                    expected_revision,
+                } if *expected_revision > 0
+                    && capability.id == pioneer_protocol::app_capability_key(app_id) =>
+                {
+                    has_plugins = true;
+                }
                 TurnCapabilityKind::Plugin {
                     plugin_id,
                     expected_revision,

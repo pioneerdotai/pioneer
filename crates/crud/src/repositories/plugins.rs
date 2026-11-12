@@ -67,6 +67,12 @@ pub async fn skill_owners<C: ConnectionTrait>(
             .all(db)
             .await?;
         let parents = project_rows(db, parents).await?;
+        anyhow::ensure!(
+            links
+                .iter()
+                .all(|link| parents.iter().any(|parent| parent.id == link.package_id)),
+            "package owner missing"
+        );
         result.extend(links.into_iter().map(|link| {
             let parent = parents.iter().find(|p| p.id == link.package_id).cloned();
             (link, parent)
@@ -330,6 +336,16 @@ pub async fn insert_parent(
     row: &PackageRecord,
     metadata: Option<super::plugin_metadata::PreparedMetadata>,
 ) -> Result<()> {
+    if row.kind == crate::PackageKind::App {
+        anyhow::ensure!(
+            app_installation::Entity::find()
+                .filter(app_installation::Column::Slug.eq(&row.name))
+                .one(db)
+                .await?
+                .is_none(),
+            "apps.slug_conflict"
+        );
+    }
     package_installation::Entity::insert(row.operational())
         .exec(db)
         .await?;

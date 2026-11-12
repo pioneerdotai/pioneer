@@ -1,9 +1,12 @@
 //! Bounded package delivery and sequential calls to the native installers.
 use super::*;
 use anyhow::Context;
+mod apps;
 mod lifecycle;
 use pioneer_crud::PluginOwnershipWrite;
-use pioneer_plugins::{ComponentPlan, Entry, LoadedPluginPlan, Snapshot};
+use pioneer_plugins::{ComponentPlan, Entry, Snapshot};
+mod package_plan;
+use package_plan::{PackagePlan, load_package};
 use pioneer_protocol::constants::methods;
 use pioneer_protocol::*;
 use serde::{Deserialize, Serialize};
@@ -35,7 +38,15 @@ struct ReservedChild {
 fn plugin_error(id: &RequestId, message: &str) -> JsonRpcErrorResponse {
     JsonRpcErrorResponse::new(Some(id.clone()), INVALID_REQUEST_CODE, message)
 }
-fn public_diagnostics(plan: &LoadedPluginPlan) -> Vec<PluginDiagnostic> {
+fn package_parse_error(id: &RequestId, error: anyhow::Error) -> JsonRpcErrorResponse {
+    if let Some(detail) = error.downcast_ref::<pioneer_plugins::app::ManifestError>() {
+        let mut response = plugin_error(id, "apps.package_rejected");
+        response.error.data = Some(json!({"code":detail.code,"field":detail.field}));
+        return response;
+    }
+    plugin_error(id, "plugins.package_rejected")
+}
+fn public_diagnostics(plan: &PackagePlan) -> Vec<PluginDiagnostic> {
     let mut diagnostics: Vec<_> = plan
         .diagnostics
         .iter()
@@ -57,8 +68,8 @@ fn public_diagnostics(plan: &LoadedPluginPlan) -> Vec<PluginDiagnostic> {
 }
 // Description is authored public text, not arbitrary metadata. Keep the same
 // bound for installed inventory, preview and vendor-adapted manifests.
-fn public_description(plan: &LoadedPluginPlan) -> Option<String> {
-    plan.manifest
+fn public_description(plan: &PackagePlan) -> Option<String> {
+    plan.presentation
         .description
         .as_deref()
         .map(str::trim)
@@ -87,16 +98,55 @@ pub(super) fn plugin_icon_links(
     metadata: &mut PluginMetadata,
     parent: &pioneer_crud::PackageRecord,
 ) {
+    if let Some(app) = &mut metadata.app {
+        for theme in [
+            &mut app.icon,
+            &mut app.composer_icon,
+            &mut app.developer_logo,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for icon in [&mut theme.light, &mut theme.dark] {
+                *icon = ImageReference::app_icon(
+                    &parent.workspace_id,
+                    &parent.id,
+                    icon.revision.clone(),
+                );
+            }
+        }
+    }
     for icon in [&mut metadata.logo, &mut metadata.composer_icon]
         .into_iter()
         .flatten()
     {
-        *icon =
-            ImageReference::plugin_icon(&parent.workspace_id, &parent.id, icon.revision.clone());
+        *icon = match parent.kind {
+            PackageKind::Plugin => {
+                ImageReference::plugin_icon(&parent.workspace_id, &parent.id, icon.revision.clone())
+            }
+            PackageKind::App => {
+                ImageReference::app_icon(&parent.workspace_id, &parent.id, icon.revision.clone())
+            }
+        };
     }
 }
 
 impl MessageProcessor {
+    pub(super) async fn package_presentation_item(
+        &self,
+        parent: &pioneer_crud::PackageRecord,
+    ) -> anyhow::Result<PluginMetadata> {
+        let stored = parent.clone();
+        let limits = self.package_delivery_context().plugin_limits();
+        let mut metadata = super::package_delivery::prepare_cancellable(move |cancellation| {
+            let (_, plan) = lifecycle::verified_package(&stored, cancellation, limits)?;
+            Ok(plan.presentation.metadata)
+        })
+        .await?;
+        plugin_icon_links(&mut metadata, parent);
+        Ok(metadata)
+    }
+
     async fn admit_plugin_image(
         &self,
         context: &crate::request_context::AuthenticatedRequestContext,
@@ -132,13 +182,34 @@ impl MessageProcessor {
         plugin_id: &str,
         revision: &str,
     ) -> anyhow::Result<crate::images::PreparedImage> {
+        self.package_icon_snapshot(context, workspace, plugin_id, revision, PackageKind::Plugin)
+            .await
+    }
+    pub(crate) async fn app_icon_snapshot(
+        &self,
+        context: &crate::request_context::AuthenticatedRequestContext,
+        workspace: &str,
+        app_id: &str,
+        revision: &str,
+    ) -> anyhow::Result<crate::images::PreparedImage> {
+        self.package_icon_snapshot(context, workspace, app_id, revision, PackageKind::App)
+            .await
+    }
+    async fn package_icon_snapshot(
+        &self,
+        context: &crate::request_context::AuthenticatedRequestContext,
+        workspace: &str,
+        plugin_id: &str,
+        revision: &str,
+        kind: PackageKind,
+    ) -> anyhow::Result<crate::images::PreparedImage> {
         use sha2::{Digest, Sha256};
         self.admit_plugin_image(context, workspace).await?;
         let parent = self
             .crud_store
             .find_package_installation(plugin_id)
             .await?
-            .filter(|parent| parent.kind == PackageKind::Plugin && parent.workspace_id == workspace)
+            .filter(|parent| parent.kind == kind && parent.workspace_id == workspace)
             .context("plugins.not_found")?;
         let guard = self
             .acquire_plugin_mutation(workspace, plugin_id, parent.revision)
@@ -147,21 +218,24 @@ impl MessageProcessor {
             guard.parent.state == "installed" && guard.parent.pending_json.is_none(),
             "plugins.not_found"
         );
-        let metadata = self
-            .crud_store
-            .plugin_metadata(&guard.parent)
-            .await?
-            .context("plugins.metadata_unavailable")?;
-        let icon = metadata
-            .logo
-            .into_iter()
-            .chain(metadata.composer_icon)
-            .find(|icon| icon.revision == revision)
-            .context("plugins.not_found")?;
+        let revision = revision.to_owned();
         let limits = guard.limits;
         let result = guard
             .fs_prepare(move |parent, cancellation| {
-                let (snapshot, _) = lifecycle::verified_package(parent, cancellation, limits)?;
+                let (snapshot, plan) = lifecycle::verified_package(parent, cancellation, limits)?;
+                let icon = if let Some(app) = plan.app {
+                    app.images
+                        .into_values()
+                        .find(|icon| icon.revision == revision)
+                } else {
+                    plan.presentation
+                        .metadata
+                        .logo
+                        .into_iter()
+                        .chain(plan.presentation.metadata.composer_icon)
+                        .find(|icon| icon.revision == revision)
+                }
+                .context("plugins.not_found")?;
                 let bytes = snapshot.file(&icon.path).context("plugins.not_found")?;
                 anyhow::ensure!(
                     hex::encode(Sha256::digest(bytes)) == icon.revision,
@@ -201,15 +275,16 @@ fn component_preview(component: &ComponentPlan) -> PluginComponentItem {
 }
 
 async fn load_uploaded_plugin(
+    kind: PackageKind,
     source: super::package_delivery::upload::MaterializedSkillSource,
 ) -> anyhow::Result<(
     super::package_delivery::upload::MaterializedSkillSource,
     Snapshot,
-    LoadedPluginPlan,
+    PackagePlan,
 )> {
     super::package_delivery::prepare_cancellable(move |cancellation| {
         anyhow::ensure!(
-            source.upload.purpose == "plugin",
+            source.upload.purpose == kind.as_str(),
             "plugins.upload_purpose_mismatch"
         );
         let snapshot = Snapshot::capture(&source.source_dir, source.package_limits, || {
@@ -223,8 +298,7 @@ async fn load_uploaded_plugin(
                 .any(|entry| matches!(entry, Entry::Denied)),
             "plugins.package_rejected"
         );
-        let plan = pioneer_plugins::load(&snapshot)
-            .map_err(|_| anyhow::anyhow!("plugins.package_rejected"))?;
+        let plan = load_package(&snapshot, kind)?;
         Ok((source, snapshot, plan))
     })
     .await
@@ -333,8 +407,28 @@ impl MessageProcessor {
     }
 
     pub(super) async fn plugins_request(&self, context: &RequestContext, request: JsonRpcRequest) {
+        self.packages_request(context, request, PackageKind::Plugin)
+            .await;
+    }
+    pub(super) async fn packages_request(
+        &self,
+        context: &RequestContext,
+        request: JsonRpcRequest,
+        kind: PackageKind,
+    ) {
         let id = request.id.clone();
-        let result = self.plugins_request_result(context, request).await;
+        let method = request.method.clone();
+        let result = self
+            .packages_request_result(context, request, kind)
+            .await
+            .and_then(|value| {
+                if kind == PackageKind::App {
+                    apps::app_response(&method, value)
+                        .map_err(|_| plugin_error(&id, "apps.response_failed"))
+                } else {
+                    Ok(value)
+                }
+            });
         match result {
             Ok(value) => {
                 let response = JsonRpcResponse::from_result(id.clone(), &value);
@@ -354,10 +448,11 @@ impl MessageProcessor {
             Err(error) => self.send_error(context.connection_id(), error).await,
         }
     }
-    async fn plugins_request_result(
+    async fn packages_request_result(
         &self,
         context: &RequestContext,
         request: JsonRpcRequest,
+        kind: PackageKind,
     ) -> Result<serde_json::Value, JsonRpcErrorResponse> {
         let id = &request.id;
         let params = request.params.unwrap_or_else(|| json!({}));
@@ -400,9 +495,7 @@ impl MessageProcessor {
                 .find_package_installation(parent_id)
                 .await
                 .map_err(|_| invalid())?
-                .is_some_and(|parent| {
-                    parent.kind != PackageKind::Plugin || parent.workspace_id != workspace
-                })
+                .is_some_and(|parent| parent.kind != kind || parent.workspace_id != workspace)
             {
                 return Err(invalid());
             }
@@ -413,7 +506,7 @@ impl MessageProcessor {
                     serde_json::from_value(params.clone()).map_err(|_| invalid())?;
                 let parents = self
                     .crud_store
-                    .list_plugin_installations(&workspace)
+                    .list_package_installations(&workspace, kind)
                     .await
                     .map_err(|_| plugin_error(id, "plugins.inventory_failed"))?;
                 let mut plugins = Vec::with_capacity(parents.len());
@@ -560,7 +653,8 @@ impl MessageProcessor {
                         .await
                         .map_err(|_| invalid())?
                 {
-                    if parent.workspace_id != workspace
+                    if parent.kind != kind
+                        || parent.workspace_id != workspace
                         || expected.as_deref() != Some(&parent.package_fingerprint)
                     {
                         return Err(invalid());
@@ -574,13 +668,18 @@ impl MessageProcessor {
                 let owner = AuthenticatedTransferOwner::from_request_context(context);
                 {
                     let _upload_guard = self.acquire_skill_upload_lock(&upload_id).await;
-                    self.revalidate_plugin_upload(&owner, &workspace, &upload_id, id)
+                    self.revalidate_package_upload(&owner, &workspace, &upload_id, id, kind)
                         .await?;
                 }
                 let runtime = self.package_delivery_context();
                 let source = self
                     .materialize_uploaded_archive_source(
-                        &owner, &workspace, &upload_id, &runtime, id, "plugin",
+                        &owner,
+                        &workspace,
+                        &upload_id,
+                        &runtime,
+                        id,
+                        kind.as_str(),
                     )
                     .await
                     .map_err(|error| {
@@ -590,9 +689,9 @@ impl MessageProcessor {
                             plugin_error(id, "plugins.upload_unavailable_or_invalid_archive")
                         }
                     })?;
-                let (source, snapshot, plan) = load_uploaded_plugin(source)
+                let (source, snapshot, plan) = load_uploaded_plugin(kind, source)
                     .await
-                    .map_err(|_| plugin_error(id, "plugins.package_rejected"))?;
+                    .map_err(|error| package_parse_error(id, error))?;
                 if let Some(expected) = expected {
                     if expected != plan.tree_digest {
                         return Err(plugin_error(id, "plugins.fingerprint_changed"));
@@ -604,7 +703,8 @@ impl MessageProcessor {
                         .await
                         .map_err(|_| invalid())?
                     {
-                        if parent.workspace_id != workspace
+                        if parent.kind != kind
+                            || parent.workspace_id != workspace
                             || parent.package_fingerprint != expected
                         {
                             Err(invalid())
@@ -619,7 +719,7 @@ impl MessageProcessor {
                             id,
                             &workspace,
                             &source.upload,
-                            &self.plugin_storage_root(&workspace),
+                            &self.package_storage_root(&workspace, kind),
                             snapshot,
                             plan,
                         )
@@ -644,11 +744,17 @@ impl MessageProcessor {
                     // Revalidate after preparation too: a concurrent abort/consume
                     // must not return a preview for a no-longer-owned transfer.
                     let _upload_guard = self.acquire_skill_upload_lock(&upload_id).await;
-                    self.revalidate_plugin_upload(&owner, &workspace, &upload_id, id)
+                    self.revalidate_package_upload(&owner, &workspace, &upload_id, id, kind)
                         .await?;
                     Ok(json!(PluginsPreviewResponse {
-                        name: plan.manifest.name.clone(),
-                        version: plan.manifest.version.clone(),
+                        name: plan
+                            .presentation
+                            .metadata
+                            .display_name
+                            .clone()
+                            .filter(|_| plan.kind == PackageKind::App)
+                            .unwrap_or_else(|| plan.presentation.name.clone()),
+                        version: plan.presentation.version.clone(),
                         description: public_description(&plan),
                         fingerprint: plan.tree_digest.clone(),
                         components: plan.components.iter().map(component_preview).collect(),
@@ -668,7 +774,7 @@ impl MessageProcessor {
         upload: &pioneer_crud::SkillUploadSessionRecord,
         runtime_root: &Path,
         snapshot: Snapshot,
-        plan: LoadedPluginPlan,
+        plan: PackagePlan,
     ) -> Result<PluginItem, JsonRpcErrorResponse> {
         let error = || plugin_error(request_id, "plugins.install_failed");
         let plugin_id = pioneer_protocol::generate_id(21);
@@ -716,14 +822,22 @@ impl MessageProcessor {
             .try_lock_owned()
             .map_err(|_| error())?;
         let parent = pioneer_crud::PackageRecord {
-            kind: pioneer_crud::PackageKind::Plugin,
-            app_manifest_json: None,
-            app_localizations_json: None,
+            kind: plan.kind,
+            app_manifest_json: plan
+                .app
+                .as_ref()
+                .map(|app| app.manifest.document().to_string()),
+            app_localizations_json: plan
+                .app
+                .as_ref()
+                .map(|app| serde_json::to_string(&app.localizations))
+                .transpose()
+                .map_err(|_| error())?,
             operation_error_json: None,
             id: plugin_id.clone(),
             workspace_id: workspace.into(),
-            name: plan.manifest.name.clone(),
-            version: plan.manifest.version.clone(),
+            name: plan.presentation.name.clone(),
+            version: plan.presentation.version.clone(),
             source_upload_id: upload.upload_id.clone(),
             package_path: package.to_string_lossy().into(),
             data_path: data.to_string_lossy().into(),
@@ -732,43 +846,43 @@ impl MessageProcessor {
             allow_implicit_invocation: false,
             state: "installing".into(),
             revision: 1,
-            display_name: plan.manifest.metadata.display_name.clone(),
-            short_description: plan.manifest.metadata.short_description.clone(),
-            description: plan.manifest.metadata.description.clone(),
-            long_description: plan.manifest.metadata.long_description.clone(),
-            developer_name: plan.manifest.metadata.developer_name.clone(),
-            author_name: plan.manifest.metadata.author.name.clone(),
-            author_email: plan.manifest.metadata.author.email.clone(),
-            author_url: plan.manifest.metadata.author.url.clone(),
-            homepage: plan.manifest.metadata.homepage.clone(),
-            repository: plan.manifest.metadata.repository.clone(),
-            documentation_url: plan.manifest.metadata.documentation_url.clone(),
-            support_url: plan.manifest.metadata.support_url.clone(),
-            privacy_policy_url: plan.manifest.metadata.privacy_policy_url.clone(),
-            terms_of_service_url: plan.manifest.metadata.terms_of_service_url.clone(),
-            license: plan.manifest.metadata.license.clone(),
-            category: plan.manifest.metadata.category.clone(),
-            brand_color: plan.manifest.metadata.brand_color.clone(),
+            display_name: plan.presentation.metadata.display_name.clone(),
+            short_description: plan.presentation.metadata.short_description.clone(),
+            description: plan.presentation.metadata.description.clone(),
+            long_description: plan.presentation.metadata.long_description.clone(),
+            developer_name: plan.presentation.metadata.developer_name.clone(),
+            author_name: plan.presentation.metadata.author.name.clone(),
+            author_email: plan.presentation.metadata.author.email.clone(),
+            author_url: plan.presentation.metadata.author.url.clone(),
+            homepage: plan.presentation.metadata.homepage.clone(),
+            repository: plan.presentation.metadata.repository.clone(),
+            documentation_url: plan.presentation.metadata.documentation_url.clone(),
+            support_url: plan.presentation.metadata.support_url.clone(),
+            privacy_policy_url: plan.presentation.metadata.privacy_policy_url.clone(),
+            terms_of_service_url: plan.presentation.metadata.terms_of_service_url.clone(),
+            license: plan.presentation.metadata.license.clone(),
+            category: plan.presentation.metadata.category.clone(),
+            brand_color: plan.presentation.metadata.brand_color.clone(),
             logo_path: plan
-                .manifest
+                .presentation
                 .metadata
                 .logo
                 .as_ref()
                 .map(|icon| icon.path.clone()),
             logo_revision: plan
-                .manifest
+                .presentation
                 .metadata
                 .logo
                 .as_ref()
                 .map(|icon| icon.revision.clone()),
             composer_icon_path: plan
-                .manifest
+                .presentation
                 .metadata
                 .composer_icon
                 .as_ref()
                 .map(|icon| icon.path.clone()),
             composer_icon_revision: plan
-                .manifest
+                .presentation
                 .metadata
                 .composer_icon
                 .as_ref()
@@ -782,23 +896,22 @@ impl MessageProcessor {
         // the existing upload contract immediately before the atomic DB reserve.
         let owner = AuthenticatedTransferOwner::from_request_context(context);
         if let Err(error) = self
-            .revalidate_plugin_upload(&owner, workspace, &upload.upload_id, request_id)
+            .revalidate_package_upload(&owner, workspace, &upload.upload_id, request_id, plan.kind)
             .await
         {
             return Err(error);
         }
         // From dispatch onward cancellation/returned Err cannot establish rollback.
         staging.preserve();
-        if self
+        if let Err(reserve_error) = self
             .crud_store
-            .reserve_plugin_installation_with_metadata(
+            .reserve_package_installation_with_metadata(
                 &parent,
                 context.connection_id(),
                 now.timestamp(),
-                Some(&plan.manifest.metadata),
+                (plan.kind == PackageKind::Plugin).then_some(&plan.presentation.metadata),
             )
             .await
-            .is_err()
         {
             // A failed reserve response does not prove rollback. Match update's
             // conservative reconciliation: delete only after a successful read
@@ -812,7 +925,11 @@ impl MessageProcessor {
             ) {
                 staging.remove_on_drop(root.clone());
             }
-            return Err(error());
+            return Err(if reserve_error.to_string() == "apps.slug_conflict" {
+                plugin_error(request_id, "apps.slug_conflict")
+            } else {
+                error()
+            });
         }
         // The durable parent now owns package/data. Release the unused cleanup
         // reservation before native member staging needs its own scratch owner.
@@ -829,7 +946,7 @@ impl MessageProcessor {
 
         for (component, reserved) in plan.components.iter().zip(&pending.children) {
             let mut ownership = PluginOwnershipWrite {
-                kind: pioneer_protocol::PackageKind::Plugin,
+                kind: parent.kind,
                 plugin_id: plugin_id.clone(),
                 expected_revision: 1,
                 member_key: reserved.key.clone(),
@@ -940,11 +1057,14 @@ impl MessageProcessor {
             .plugin_item(context, &parent)
             .await
             .map_err(|_| error())?;
-        self.send_plugin_changed_notification(&PluginsChangedNotification {
-            workspace_id: workspace.into(),
-            plugin_id,
-            revision: 1,
-        })
+        self.send_plugin_changed_notification(
+            &PluginsChangedNotification {
+                workspace_id: workspace.into(),
+                plugin_id,
+                revision: 1,
+            },
+            parent.kind,
+        )
         .await;
         Ok(item)
     }
@@ -1146,28 +1266,78 @@ impl MessageProcessor {
         }
         let partial = diagnostics.iter().any(diagnostic_affects_status)
             || components.iter().any(|c| c.status != "installed");
-        let mut metadata: PluginMetadata =
+        let app_manifest = if parent.kind == PackageKind::App {
+            Some(pioneer_plugins::app::AppManifest::parse(
+                parent
+                    .app_manifest_json
+                    .as_deref()
+                    .context("App manifest missing")?
+                    .as_bytes(),
+            )?)
+        } else {
+            None
+        };
+        let app_version = app_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.document()["version"].as_str().map(str::to_owned));
+        let mut metadata = if let Some(manifest) = &app_manifest {
             if parent.state == "installed" && parent.pending_json.is_none() {
-                match &inventory.metadata {
-                    Some(metadata) => metadata
-                        .get(&parent.id)
-                        .filter(|(revision, _)| *revision == parent.revision)
-                        .map(|(_, metadata)| metadata.clone())
-                        .unwrap_or_default(),
-                    None => self
-                        .crud_store
-                        .plugin_metadata(parent)
+                let stored = parent.clone();
+                let limits = self.package_delivery_context().plugin_limits();
+                let metadata = super::package_delivery::prepare_cancellable(move |cancellation| {
+                    let (_, plan) = lifecycle::verified_package(&stored, cancellation, limits)?;
+                    Ok(plan.presentation.metadata)
+                })
+                .await?;
+                anyhow::ensure!(
+                    self.crud_store
+                        .find_package_installation(&parent.id)
                         .await?
-                        .unwrap_or_default(),
-                }
+                        .is_some_and(|current| current.revision == parent.revision
+                            && current.package_fingerprint == parent.package_fingerprint
+                            && current.state == "installed"
+                            && current.pending_json.is_none()),
+                    "packages.stale"
+                );
+                metadata
             } else {
-                Default::default()
-            };
+                package_plan::app_metadata(
+                    manifest,
+                    &Default::default(),
+                    &manifest.validate_localizations_json(
+                        parent
+                            .app_localizations_json
+                            .as_deref()
+                            .context("App localizations missing")?
+                            .as_bytes(),
+                    )?,
+                )
+            }
+        } else {
+            let metadata: PluginMetadata =
+                if parent.state == "installed" && parent.pending_json.is_none() {
+                    match &inventory.metadata {
+                        Some(metadata) => metadata
+                            .get(&parent.id)
+                            .filter(|(revision, _)| *revision == parent.revision)
+                            .map(|(_, metadata)| metadata.clone())
+                            .unwrap_or_default(),
+                        None => self
+                            .crud_store
+                            .plugin_metadata(parent)
+                            .await?
+                            .unwrap_or_default(),
+                    }
+                } else {
+                    Default::default()
+                };
+            metadata
+        };
         plugin_icon_links(&mut metadata, parent);
         Ok(PluginItem {
             id: parent.id.clone(),
             name: parent.name.clone(),
-            version: parent.version.clone(),
+            version: app_version.or_else(|| parent.version.clone()),
             description: metadata.description.clone(),
             metadata,
             enabled: parent.enabled,
@@ -1498,7 +1668,11 @@ impl MessageProcessor {
         recipients
     }
 
-    async fn send_plugin_changed_notification(&self, notification: &PluginsChangedNotification) {
+    async fn send_plugin_changed_notification(
+        &self,
+        notification: &PluginsChangedNotification,
+        kind: PackageKind,
+    ) {
         // Only the invalidation locator is sent. Administrative inventory and
         // diagnostics still require a newly authorized read with role disclosure.
         let candidates = self.session_manager.connection_ids().await;
@@ -1514,19 +1688,29 @@ impl MessageProcessor {
         if recipients.is_empty() {
             return;
         }
-        let Some(serialized) = self.serialize_notification(methods::PLUGINS_CHANGED, notification)
-        else {
+        let method = match kind {
+            PackageKind::Plugin => methods::PLUGINS_CHANGED,
+            PackageKind::App => methods::APPS_CHANGED,
+        };
+        let serialized = match kind {
+            PackageKind::Plugin => self.serialize_notification(method, notification),
+            PackageKind::App => self.serialize_notification(
+                method,
+                &AppsChangedNotification {
+                    workspace_id: notification.workspace_id.clone(),
+                    app_id: notification.plugin_id.clone(),
+                    revision: notification.revision,
+                },
+            ),
+        };
+        let Some(serialized) = serialized else {
             return;
         };
         let recipients = self
             .plugin_notification_recipients(&notification.workspace_id, recipients)
             .await;
-        self.send_serialized_notification_to_connections(
-            methods::PLUGINS_CHANGED,
-            &serialized,
-            recipients,
-        )
-        .await;
+        self.send_serialized_notification_to_connections(method, &serialized, recipients)
+            .await;
     }
 
     /// Native configuration/policy publication also invalidates member parent
@@ -1550,19 +1734,28 @@ impl MessageProcessor {
     }
 
     pub(super) async fn notify_plugin_native_changed(&self, workspace: &str) {
-        if let Ok(parents) = self.crud_store.list_plugin_installations(workspace).await {
-            for parent in parents {
-                self.publish_plugin_changed(&parent).await;
+        for kind in [PackageKind::Plugin, PackageKind::App] {
+            if let Ok(parents) = self
+                .crud_store
+                .list_package_installations(workspace, kind)
+                .await
+            {
+                for parent in parents {
+                    self.publish_plugin_changed(&parent).await;
+                }
             }
         }
     }
 
     async fn publish_plugin_changed(&self, parent: &pioneer_crud::PackageRecord) {
-        self.send_plugin_changed_notification(&PluginsChangedNotification {
-            workspace_id: parent.workspace_id.clone(),
-            plugin_id: parent.id.clone(),
-            revision: parent.revision,
-        })
+        self.send_plugin_changed_notification(
+            &PluginsChangedNotification {
+                workspace_id: parent.workspace_id.clone(),
+                plugin_id: parent.id.clone(),
+                revision: parent.revision,
+            },
+            parent.kind,
+        )
         .await;
     }
 
@@ -2004,7 +2197,8 @@ pub(super) async fn acquire_plugin_selection_admission(
             .await?
             .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
         anyhow::ensure!(
-            parent.workspace_id == workspace
+            parent.kind == selected.kind
+                && parent.workspace_id == workspace
                 && parent.enabled
                 && parent.state == "installed"
                 && parent.pending_json.is_none()
@@ -2056,7 +2250,8 @@ pub(super) async fn validate_cli_plugin_selection(
             .await?
             .context("plugin parent missing")?;
         anyhow::ensure!(
-            parent.workspace_id == workspace
+            parent.kind == selected.kind
+                && parent.workspace_id == workspace
                 && parent.revision == selected.revision
                 && parent.enabled
                 && parent.state == "installed"

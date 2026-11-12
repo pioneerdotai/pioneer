@@ -1075,6 +1075,7 @@ impl ThreadManager {
             matches!(
                 cap.kind,
                 pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+                    | pioneer_protocol::TurnCapabilityKind::App { .. }
             )
         }) {
             anyhow::ensure!(
@@ -3767,11 +3768,13 @@ fn validate_plugin_expansion(
 ) -> Result<()> {
     pioneer_protocol::validate_turn_execution_envelope(params)
         .map_err(|message| anyhow!(message))?;
-    if !params
-        .capabilities
-        .iter()
-        .any(|c| matches!(c.kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }))
-        || capabilities.len() > 256
+    if !params.capabilities.iter().any(|c| {
+        matches!(
+            c.kind,
+            pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+                | pioneer_protocol::TurnCapabilityKind::App { .. }
+        )
+    }) || capabilities.len() > 256
         || capabilities.iter().any(|c| {
             !matches!(
                 c.kind,

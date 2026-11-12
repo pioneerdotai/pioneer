@@ -1761,3 +1761,6 @@ callback_rejected = "Запрос входа отклонён. Вернитес�
 
 [plugins]
 title = "Плагины"
+
+[apps]
+title = "Приложения"

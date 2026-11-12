@@ -198,6 +198,7 @@ mod cli_runtime_resolver_tests {
         assert!(pioneer_client::skills::catalog::skill_is_user_selectable(
             &SkillListItem {
                 plugin_owner: None,
+                package_owner: None,
                 skill_id: skill.identity.skill_id.clone(),
                 pack: None,
                 owner: skill.identity.owner.clone(),
@@ -829,6 +830,7 @@ impl MessageProcessor {
 
                 SkillListItem {
                     plugin_owner: None,
+                    package_owner: None,
                     skill_id: skill.identity.skill_id.clone(),
                     pack: installation.and_then(|item| {
                         item.pack_id.clone().zip(item.pack_member_key.clone()).map(
@@ -898,7 +900,18 @@ impl MessageProcessor {
         let owners = match self.crud_store.skill_plugin_owners(&ids).await {
             Ok(owners) => owners
                 .into_iter()
-                .filter_map(|(owner, _)| owner.skill_id.clone().map(|id| (id, owner)))
+                .filter_map(|(owner, parent)| {
+                    owner.skill_id.clone().zip(parent).map(|(id, parent)| {
+                        (
+                            id,
+                            pioneer_protocol::PackageOwner {
+                                kind: parent.kind,
+                                package_id: owner.package_id,
+                                member_key: owner.member_key,
+                            },
+                        )
+                    })
+                })
                 .collect::<std::collections::HashMap<_, _>>(),
             Err(_) => {
                 self.send_error(
@@ -914,13 +927,11 @@ impl MessageProcessor {
             }
         };
         for item in &mut response_items {
-            item.plugin_owner =
-                owners
-                    .get(item.skill_id.as_str())
-                    .map(|owner| pioneer_protocol::PluginOwner {
-                        plugin_id: owner.package_id.clone(),
-                        member_key: owner.member_key.clone(),
-                    });
+            item.package_owner = owners.get(item.skill_id.as_str()).cloned();
+            item.plugin_owner = item
+                .package_owner
+                .as_ref()
+                .and_then(pioneer_protocol::PackageOwner::as_plugin);
         }
         let response_payload = SkillListResponse {
             snapshot_version: self.current_skills_snapshot_version(),

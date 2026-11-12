@@ -313,10 +313,17 @@ impl MessageProcessor {
         record.id = Some(installation_id);
 
         let mut server = list_item_from_record(&record);
-        server.plugin_owner = plugin.as_ref().map(|change| pioneer_protocol::PluginOwner {
-            plugin_id: change.write.plugin_id.clone(),
-            member_key: change.write.member_key.clone(),
-        });
+        server.package_owner = plugin
+            .as_ref()
+            .map(|change| pioneer_protocol::PackageOwner {
+                kind: change.write.kind,
+                package_id: change.write.plugin_id.clone(),
+                member_key: change.write.member_key.clone(),
+            });
+        server.plugin_owner = server
+            .package_owner
+            .as_ref()
+            .and_then(pioneer_protocol::PackageOwner::as_plugin);
         let payload = McpPolicySetResponse {
             policy: McpServerPolicy {
                 workspace_id: workspace_id.clone(),

@@ -8,10 +8,25 @@ impl PluginsView {
             && self.connected()
             && self.readable()
             && !self.upload.read(cx).active()
+            && self
+                .upload
+                .read(cx)
+                .publication()
+                .is_none_or(|upload| upload.plugin_preview.is_none())
             && self.installation_error(cx).is_none();
         let header = pioneer_desktop_foundation::catalog_list_header(
-            t!("plugins.title").to_string(),
-            t!("plugins.description").to_string(),
+            t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                "apps.title"
+            } else {
+                "plugins.title"
+            })
+            .to_string(),
+            t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                "apps.description"
+            } else {
+                "plugins.description"
+            })
+            .to_string(),
             t!("plugins.found_count", count = self.input.plugins.len()).to_string(),
             cx,
         );
@@ -24,6 +39,7 @@ impl PluginsView {
                 view.child(self.upload.clone())
             })
             .children(self.upload_recovery(cx))
+            .children(self.install_preview(cx))
             .when_some(self.installation_error(cx), |list, error| {
                 list.child(div().text_sm().text_color(cx.theme().danger).child(error))
             })
@@ -32,7 +48,14 @@ impl PluginsView {
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(t!("plugins.loading").to_string()),
+                        .child(
+                            t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                                "apps.loading"
+                            } else {
+                                "plugins.loading"
+                            })
+                            .to_string(),
+                        ),
                 )
             })
             .when(self.connected() && !self.readable(), |view| {
@@ -43,10 +66,14 @@ impl PluginsView {
             })
             .when(self.input.error.is_some(), |list| {
                 list.child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().danger)
-                        .child(t!("plugins.error").to_string()),
+                    div().text_sm().text_color(cx.theme().danger).child(
+                        t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                            "apps.error"
+                        } else {
+                            "plugins.error"
+                        })
+                        .to_string(),
+                    ),
                 )
             })
             .when(show_empty, |list| list.child(self.render_empty_state(cx)))
@@ -83,25 +110,34 @@ impl PluginsView {
     fn render_plugin_row(&self, plugin: &PluginItem, cx: &mut Context<Self>) -> AnyElement {
         let id = plugin.id.clone();
         let owner = cx.weak_entity();
-        let card = pioneer_desktop_foundation::CatalogCard::new(plugin.name.clone())
-            .icon(
-                self.plugin_images
-                    .element(plugin.metadata.logo.as_ref())
-                    .size_8(),
+        let card = pioneer_desktop_foundation::CatalogCard::new(
+            plugin
+                .metadata
+                .name_for_locale(&plugin.name, &rust_i18n::locale()),
+        )
+        .icon(
+            self.plugin_images
+                .element(plugin.metadata.logo_for_theme(cx.theme().mode.is_dark()))
+                .size_8(),
+        )
+        .description(
+            plugin
+                .metadata
+                .description_for_locale(plugin.description.as_deref(), &rust_i18n::locale())
+                .unwrap_or_default(),
+        )
+        .metadata(format!(
+            "{} {} · {}",
+            t!("plugins.version"),
+            plugin.version.as_deref().unwrap_or("-"),
+            t!("plugins.component_count", count = plugin.components.len())
+        ))
+        .when_some(crate::details::summary_status(plugin), |card, status| {
+            card.status(
+                status_label(status),
+                crate::details::status_color(status, cx),
             )
-            .description(plugin.description.clone().unwrap_or_default())
-            .metadata(format!(
-                "{} {} · {}",
-                t!("plugins.version"),
-                plugin.version.as_deref().unwrap_or("-"),
-                t!("plugins.component_count", count = plugin.components.len())
-            ))
-            .when_some(crate::details::summary_status(plugin), |card, status| {
-                card.status(
-                    status_label(status),
-                    crate::details::status_color(status, cx),
-                )
-            });
+        });
         v_flex()
             .w_full()
             .h(px(pioneer_desktop_foundation::CatalogCard::HEIGHT + 10.))
@@ -140,8 +176,18 @@ impl PluginsView {
                 .on_click(cx.listener(|view, _, _, cx| view.begin_install(cx)))
         });
         pioneer_desktop_foundation::catalog_empty_state(
-            t!("plugins.empty").to_string(),
-            t!("plugins.empty_description").to_string(),
+            t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                "apps.empty"
+            } else {
+                "plugins.empty"
+            })
+            .to_string(),
+            t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                "apps.empty_description"
+            } else {
+                "plugins.empty_description"
+            })
+            .to_string(),
             install,
             cx,
         )

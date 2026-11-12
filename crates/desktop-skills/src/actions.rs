@@ -89,6 +89,7 @@ impl SkillsCatalogView {
                 };
                 intent.is_none_or(|intent| {
                     self.client
+                        .packages(self.package_kind)
                         .plugin_intent_for(workspace, parent, intent)
                         .outcome()
                         != pioneer_client::core::ClientTransitionOutcome::Changed

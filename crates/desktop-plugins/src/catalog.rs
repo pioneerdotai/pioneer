@@ -33,6 +33,8 @@ impl PluginsView {
                 },
             );
             let mut view = Self {
+                kind: pioneer_client::plugins::PackageKind::Plugin,
+                completed_install: None,
                 client,
                 binding,
                 input: Arc::new(PluginPublication::default()),
@@ -94,10 +96,7 @@ impl PluginsView {
             .is_some_and(|status| status.connection_state == GatewayConnectionState::Connected);
         let wanted = (self.window_active
             && connected
-            && matches!(
-                navigation.destination(),
-                SemanticDestination::Plugins | SemanticDestination::Plugin { .. }
-            ))
+            && navigation.destination().package_kind() == Some(self.kind))
         .then(|| {
             self.workspace.as_ref().map(|workspace| {
                 (
@@ -122,15 +121,48 @@ impl PluginsView {
                     self.skills_demand = Some(self.client.acquire_skills_demand(&workspace, None));
                     self.mcp_demand = Some(self.client.acquire_mcp_demand(&workspace, None));
                 }
-                self.demand = Some(
-                    self.client
-                        .acquire_plugin_demand(&workspace, selected.as_deref()),
-                );
+                self.demand = Some(self.client.packages(self.kind).acquire_plugin_demand(
+                    &self.client,
+                    &workspace,
+                    selected.as_deref(),
+                ));
             }
         }
     }
 
     pub(super) fn sync_publications(&mut self, cx: &mut Context<Self>) {
+        if let Some(kind) = self
+            .client
+            .navigation_snapshot()
+            .destination()
+            .package_kind()
+        {
+            if kind != self.kind {
+                self.kind = kind;
+                self.completed_install = None;
+                self.demand = None;
+                self.skills_demand = None;
+                self.mcp_demand = None;
+                self.demand_key = None;
+                self.selected = None;
+                self.route_child = None;
+                if let Some(child) = self.child_details.take() {
+                    (child.set_sidebar_width)(self.sidebar_width, false, cx);
+                }
+                self.child_locator = None;
+                self.restore_confirmation = None;
+                self.source_picker = None;
+                self.applying_update = None;
+                self.presentation_error = None;
+                self.preview_dismissed = false;
+                self.upload.update(cx, |upload, cx| upload.clear(cx));
+                self.input = Arc::new(PluginPublication::default());
+                self.plugin_images = pioneer_desktop_foundation::ImageViews::new();
+                if kind == pioneer_client::plugins::PackageKind::Plugin {
+                    self.plugin_images = self.plugin_images.clone().placeholder("icons/box.svg");
+                }
+            }
+        }
         let workspace = self
             .client
             .navigation_snapshot()
@@ -147,6 +179,7 @@ impl PluginsView {
             self.mcp_demand = None;
             self.demand_key = None;
             self.workspace = workspace;
+            self.completed_install = None;
             self.connection = connection;
             self.authorization = authorization;
             self.selected = None;
@@ -171,17 +204,14 @@ impl PluginsView {
             scopes.push(ClientScope::Administration {
                 workspace_id: Some(workspace.clone()),
             });
-            scopes.push(ClientScope::Plugins {
-                workspace_id: workspace.clone(),
-            });
+            scopes.push(self.client.packages(self.kind).scope(workspace.clone()));
             if self.window_active
-                && matches!(
-                    self.client.navigation_snapshot().destination(),
-                    SemanticDestination::Plugin {
-                        component: None,
-                        ..
-                    }
-                )
+                && self
+                    .client
+                    .navigation_snapshot()
+                    .destination()
+                    .package_details()
+                    .is_some_and(|(kind, _, child)| kind == self.kind && child.is_none())
             {
                 scopes.push(ClientScope::Skills {
                     workspace_id: Some(workspace.clone()),
@@ -193,13 +223,12 @@ impl PluginsView {
         }
         self.binding.set_scopes(&scopes);
         let navigation = self.client.navigation_snapshot();
-        let (selected, child) = match navigation.destination() {
-            SemanticDestination::Plugin {
-                plugin_id,
-                component,
-            } => (Some(plugin_id.clone()), component.clone()),
-            _ => (None, None),
-        };
+        let (selected, child) = navigation
+            .destination()
+            .package_details()
+            .filter(|(kind, _, _)| *kind == self.kind)
+            .map(|(_, id, child)| (Some(id.to_owned()), child.cloned()))
+            .unwrap_or((None, None));
         if self.selected != selected || self.route_child != child {
             self.selected = selected;
             self.route_child = child;
@@ -218,23 +247,20 @@ impl PluginsView {
                 if let Some(id) = &self.selected {
                     return self
                         .client
+                        .packages(self.kind)
                         .plugin_details_publication(workspace, id)
                         .map(|mut p| {
                             // Catalog read and command failures have distinct owners.
                             p.error = self
                                 .client
-                                .snapshot(&ClientScope::Plugins {
-                                    workspace_id: workspace.clone(),
-                                })
+                                .snapshot(&self.client.packages(self.kind).scope(workspace.clone()))
                                 .and_then(|p| p.snapshot().payload::<PluginPublication>())
                                 .and_then(|p| p.error.clone());
                             Arc::new(p)
                         });
                 }
                 self.client
-                    .snapshot(&ClientScope::Plugins {
-                        workspace_id: workspace.clone(),
-                    })
+                    .snapshot(&self.client.packages(self.kind).scope(workspace.clone()))
                     .and_then(|publication| publication.snapshot().payload::<PluginPublication>())
             })
             .filter(|publication| {
@@ -253,13 +279,41 @@ impl PluginsView {
             || self.input.error != next.error
             || self.input.operations != next.operations;
         self.input = next;
+        if self.kind == pioneer_client::plugins::PackageKind::App {
+            let installed = self.upload.read(cx).publication().and_then(|upload| {
+                if upload.target != SkillUploadTarget::AppPreview
+                    || self.completed_install == Some(upload.operation_id)
+                {
+                    return None;
+                }
+                self.input
+                    .operations
+                    .get(&format!("upload:{}", upload.operation_id))
+                    .and_then(|operation| operation.result.as_ref())
+                    .and_then(|result| result.plugin.as_ref())
+                    .map(|app| (upload.operation_id, app.id.clone()))
+            });
+            if let Some((operation, id)) = installed {
+                self.completed_install = Some(operation);
+                self.select_plugin(Some(id), cx);
+                return;
+            }
+        }
         let icons = self
             .input
             .plugins
             .iter()
             .chain(self.input.details.iter())
             .filter(|_| self.demand.is_some() && self.route_child.is_none())
-            .filter_map(|plugin| plugin.metadata.logo.clone())
+            .flat_map(|p| {
+                p.metadata.logo.iter().cloned().chain(
+                    p.metadata
+                        .app
+                        .iter()
+                        .filter_map(|a| a.icon.as_ref())
+                        .flat_map(|i| [i.light.clone(), i.dark.clone()]),
+                )
+            })
             .collect::<Vec<_>>();
         self.plugin_images.reconcile(icons, cx);
         // Navigate only after the selected parent's acknowledged removal. A
@@ -289,7 +343,7 @@ impl PluginsView {
         let Some(upload) = self.client.skill_upload_snapshot(workspace, *operation) else {
             return;
         };
-        let exact = matches!(&upload.target, SkillUploadTarget::PluginUpdatePreview { plugin_id, .. } if plugin_id == parent);
+        let exact = matches!(&upload.target, SkillUploadTarget::PluginUpdatePreview { plugin_id, .. } | SkillUploadTarget::AppUpdatePreview {app_id:plugin_id,..} if plugin_id == parent);
         // Only consumption of this exact preview acknowledges its Apply. A
         // selected parent's older result cannot establish this upload's outcome.
         if exact
@@ -329,15 +383,15 @@ impl PluginsView {
             if navigation.workspace_id() != Some(workspace.as_str()) {
                 return None;
             }
-            let SemanticDestination::Plugin {
-                plugin_id,
-                component: Some(key),
-            } = navigation.destination()
-            else {
+            let (kind, plugin_id, Some(key)) = navigation.destination().package_details()? else {
                 return None;
             };
+            if kind != self.kind {
+                return None;
+            }
             let parent = self
                 .client
+                .packages(self.kind)
                 .plugin_details_publication(workspace, plugin_id)?
                 .details?;
             let member = parent
@@ -352,7 +406,7 @@ impl PluginsView {
             Some((
                 (
                     workspace.clone(),
-                    plugin_id.clone(),
+                    plugin_id.to_owned(),
                     key.kind.clone(),
                     key.member_key.clone(),
                     native,
@@ -369,7 +423,8 @@ impl PluginsView {
         }
         self.child_locator = locator;
         if let Some(((workspace, parent, _, _, _), member)) = wanted {
-            self.child_details = (self.component_details)(&workspace, &parent, &member, window, cx);
+            self.child_details =
+                (self.component_details)(self.kind, &workspace, &parent, &member, window, cx);
             if let Some(child) = &self.child_details {
                 (child.set_sidebar_width)(self.sidebar_width, self.window_active, cx);
             }
@@ -394,12 +449,14 @@ impl PluginsView {
     pub(super) fn select_plugin(&mut self, selected: Option<String>, cx: &mut Context<Self>) {
         self.client.navigate(
             pioneer_client::navigation::NavigationIntent::Navigate {
-                destination: selected.map_or(SemanticDestination::Plugins, |plugin_id| {
-                    SemanticDestination::Plugin {
-                        plugin_id,
-                        component: None,
-                    }
-                }),
+                destination: selected.map_or(
+                    if self.kind == pioneer_client::plugins::PackageKind::App {
+                        SemanticDestination::Apps
+                    } else {
+                        SemanticDestination::Plugins
+                    },
+                    |id| SemanticDestination::package(self.kind, id, None),
+                ),
             },
             None,
         );
@@ -418,8 +475,9 @@ impl PluginsView {
                     .publication()
                     .and_then(|p| match &p.target {
                         SkillUploadTarget::PluginUpdatePreview { plugin_id, .. }
-                            if p.operation_id == *upload_operation =>
-                        {
+                        | SkillUploadTarget::AppUpdatePreview {
+                            app_id: plugin_id, ..
+                        } if p.operation_id == *upload_operation => {
                             Some((plugin_id.clone(), *upload_operation))
                         }
                         _ => None,
@@ -444,18 +502,23 @@ impl PluginsView {
                         .read(cx)
                         .publication()
                         .and_then(|p| match &p.target {
-                            SkillUploadTarget::PluginUpdatePreview { plugin_id, .. } => {
-                                Some(plugin_id.clone())
-                            }
+                            SkillUploadTarget::PluginUpdatePreview { plugin_id, .. }
+                            | SkillUploadTarget::AppUpdatePreview {
+                                app_id: plugin_id, ..
+                            } => Some(plugin_id.clone()),
                             _ => None,
                         })
                 }
                 _ => self.selected.clone(),
             };
             let transition = if let Some(id) = &parent {
-                self.client.plugin_intent_for(workspace, id, intent)
+                self.client
+                    .packages(self.kind)
+                    .plugin_intent_for(workspace, id, intent)
             } else {
-                self.client.plugin_intent(workspace, intent)
+                self.client
+                    .packages(self.kind)
+                    .plugin_intent(workspace, intent)
             };
             self.set_presentation_error(
                 matches!(
@@ -526,10 +589,20 @@ impl PluginsView {
             return self.access_label();
         }
         if self.input.error.is_some() {
-            return t!("plugins.error").to_string();
+            return t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                "apps.error"
+            } else {
+                "plugins.error"
+            })
+            .to_string();
         }
         if self.initial_loading() {
-            return t!("plugins.loading").to_string();
+            return t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                "apps.loading"
+            } else {
+                "plugins.loading"
+            })
+            .to_string();
         }
         t!("plugins.unavailable").to_string()
     }
@@ -552,6 +625,7 @@ impl PluginsView {
                             .zip(self.selected.as_deref())
                             .is_some_and(|(workspace, parent)| {
                                 self.client
+                                    .packages(self.kind)
                                     .plugin_parent_recovery_available(workspace, parent)
                             }))
             })
@@ -618,10 +692,12 @@ impl PluginsView {
         let workspace = self.workspace.clone();
         let connection = self.connection;
         let authorization = self.authorization;
+        let kind = self.kind;
         self.source_picker = Some(cx.spawn(async move |view, cx| {
             let answer = paths.await;
             let _ = view.update(cx, |view, cx| {
-                if view.workspace != workspace
+                if view.kind != kind
+                    || view.workspace != workspace
                     || view.connection != connection
                     || view.client.authorization_permissions_epoch() != authorization
                 {

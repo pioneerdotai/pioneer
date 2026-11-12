@@ -120,12 +120,13 @@ impl MessageProcessor {
             ) {
                 continue;
             }
-            match self.crud_store.find_mcp_plugin_owner(&item.id).await {
+            match self.crud_store.native_package_owner("mcp", &item.id).await {
                 Ok(owner) => {
-                    item.plugin_owner = owner.map(|o| pioneer_protocol::PluginOwner {
-                        plugin_id: o.package_id,
-                        member_key: o.member_key,
-                    })
+                    item.package_owner = owner;
+                    item.plugin_owner = item
+                        .package_owner
+                        .as_ref()
+                        .and_then(pioneer_protocol::PackageOwner::as_plugin);
                 }
                 Err(_) => {
                     self.send_error(

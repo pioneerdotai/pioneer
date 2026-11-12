@@ -11,29 +11,45 @@ async fn seed_owned_c2_skill(
     workspace: &str,
     root: &std::path::Path,
 ) -> (String, SkillId, TurnCapability) {
-    let parent = "P".repeat(21);
-    let skill = SkillId::new("S".repeat(21)).unwrap();
-    let member = root.join("skills/bundled");
+    seed_owned_c2_package(
+        store,
+        workspace,
+        root,
+        pioneer_protocol::PackageKind::Plugin,
+    )
+    .await
+}
+async fn seed_owned_c2_package(
+    store: &CrudStore,
+    workspace: &str,
+    root: &std::path::Path,
+    kind: pioneer_protocol::PackageKind,
+) -> (String, SkillId, TurnCapability) {
+    let app = kind == pioneer_protocol::PackageKind::App;
+    let parent = if app { "A" } else { "P" }.repeat(21);
+    let skill = SkillId::new(if app { "T" } else { "S" }.repeat(21)).unwrap();
+    let member_name = if app { "bundled-app" } else { "bundled" };
+    let member = root.join(format!("skills/{member_name}"));
     std::fs::create_dir_all(&member).unwrap();
     std::fs::create_dir_all(member.join("scripts")).unwrap();
     std::fs::write(
         member.join("SKILL.md"),
-        "---\nname: bundled\ndescription: Selected packaged skill\n---\nRead scripts/helper.txt\n",
+        format!("---\nname: {member_name}\ndescription: Selected packaged skill\n---\nRead scripts/helper.txt\n"),
     )
     .unwrap();
     std::fs::write(member.join("scripts/helper.txt"), "supporting file").unwrap();
     let now = chrono::Utc::now().fixed_offset();
     store
-        .insert_plugin_installation(&pioneer_crud::PackageRecord {
-            kind: pioneer_crud::PackageKind::Plugin,
-            app_manifest_json: None,
-            app_localizations_json: None,
+        .insert_package_installation(&pioneer_crud::PackageRecord {
+            kind,
+            app_manifest_json:app.then(||serde_json::json!({"slug":"authoritative-app","name":"Authoritative App","version":"1.0.0","shortDescription":"App regression","developer":{"name":"Author"},"icon":{"light":"icon.png","dark":"icon.png"},"skills":"skills"}).to_string()),
+            app_localizations_json:app.then(||"{}".into()),
             operation_error_json: None,
             id: parent.clone(),
             workspace_id: workspace.into(),
-            name: "authoritative-parent".into(),
+            name:if app{"authoritative-app"}else{"authoritative-parent"}.into(),
             version: None,
-            source_upload_id: "c2-upload".into(),
+            source_upload_id:format!("c2-upload-{}",kind.as_str()),
             package_path: root.to_string_lossy().into(),
             data_path: root.with_extension("data").to_string_lossy().into(),
             package_fingerprint: "context".into(),
@@ -74,11 +90,15 @@ async fn seed_owned_c2_skill(
             &pioneer_crud::SkillInstallationRecord {
                 skill_id: skill.clone(),
                 owner: None,
-                slug: "bundled".into(),
+                slug: member_name.into(),
                 version: None,
                 source_kind: "user".into(),
                 scope_key: workspace.into(),
-                source_ref: "c2-package".into(),
+                source_ref: if app {
+                    format!("app:{parent}:{member_name}")
+                } else {
+                    "c2-package".into()
+                },
                 install_path: member.to_string_lossy().into(),
                 trust_level: "community".into(),
                 fingerprint: "member".into(),
@@ -87,7 +107,7 @@ async fn seed_owned_c2_skill(
                 pack_member_key: None,
             },
             &pioneer_crud::WorkspaceSkillPolicyRecord {
-                id: "c2-policy".into(),
+                id: format!("c2-policy-{}", kind.as_str()),
                 workspace_id: workspace.into(),
                 skill_id: skill.clone(),
                 enabled: Some(true),
@@ -98,11 +118,11 @@ async fn seed_owned_c2_skill(
             )],
             None,
             Some(&pioneer_crud::PluginOwnershipWrite {
-                kind: pioneer_protocol::PackageKind::Plugin,
+                kind,
                 plugin_id: parent.clone(),
                 expected_revision: 1,
-                member_key: "bundled".into(),
-                member_path: Some("skills/bundled".into()),
+                member_key: member_name.into(),
+                member_path: Some(format!("skills/{member_name}")),
                 package_fingerprint: "member".into(),
                 child_id: skill.to_string(),
             }),
@@ -114,14 +134,8 @@ async fn seed_owned_c2_skill(
         .settle_plugin_installation(&parent, 1, "installed", None)
         .await
         .unwrap();
-    let selection = TurnCapability {
-        id: pioneer_protocol::plugin_capability_key(&parent),
-        label: Some("fabricated-label".into()),
-        kind: TurnCapabilityKind::Plugin {
-            plugin_id: parent.clone(),
-            expected_revision: 1,
-        },
-    };
+    let mut selection = pioneer_protocol::package_capability(kind, &parent, 1);
+    selection.label = Some("fabricated-label".into());
     (parent, skill, selection)
 }
 
@@ -317,7 +331,7 @@ async fn cli_restore_requires_committed_ready_bindings_and_current_parent_author
     assert_eq!(presentation.len(), 1);
     assert!(matches!(
         presentation[0].kind,
-        TurnCapabilityKind::Plugin { .. }
+        TurnCapabilityKind::Plugin { .. } | TurnCapabilityKind::App { .. }
     ));
     let mut omitted = snapshot.clone();
     omitted.children.clear();
@@ -934,4 +948,33 @@ async fn plugin_policy_rpc_preserves_independent_toggles_and_frozen_task_grants(
     assert!(explicit.execution.iter().any(|cap| matches!(&cap.kind,
         TurnCapabilityKind::Skill { skill_id, .. } if skill_id == &skill)));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+// NOT_RUN / NOT_COMPILED. Native catalog and owner admission, no provider process.
+#[test]
+fn app_selection_preserves_both_parent_domains_and_blocks_owned_leaf_bypass() {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async{
+        let harness=setup_cli_runtime_security_harness(None).await;
+        let root=unique_temp_dir("app-selection-owner");
+        let (app,skill,selected)=seed_owned_c2_package(&harness.crud_store,&harness.workspace_id,&root.join("app"),pioneer_protocol::PackageKind::App).await;
+        let (plugin,_,plugin_selected)=seed_owned_c2_skill(&harness.crud_store,&harness.workspace_id,&root.join("plugin")).await;
+        let result=harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[selected.clone(),plugin_selected.clone()]).await.unwrap();
+        assert_eq!(result.presentation.len(),2);
+        assert_eq!(result.presentation[0].label.as_deref(),Some("Authoritative App"));
+        assert!(matches!(&result.presentation[0].kind,TurnCapabilityKind::App{app_id,expected_revision:1} if app_id==&app));
+        let snapshot=result.plugin_selection.unwrap();assert_eq!(snapshot.parents.len(),2);
+        assert_eq!(snapshot.parents[0].kind,pioneer_protocol::PackageKind::App);
+        assert_eq!(snapshot.parents[1].kind,pioneer_protocol::PackageKind::Plugin);
+        assert!(snapshot.children.iter().any(|c|c.parent_id==app&&c.id==skill.as_str()));
+        let raw=TurnCapability{id:pioneer_protocol::skill_capability_key(&skill),kind:TurnCapabilityKind::Skill{skill_id:skill,pack_id:None},label:None};
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[raw]).await.is_err());
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[pioneer_protocol::package_capability(pioneer_protocol::PackageKind::Plugin,&app,1)]).await.is_err());
+        assert!(harness.processor.normalize_turn_skill_capabilities("foreign-workspace",&[selected.clone()]).await.is_err());
+        let guards=super::super::plugins::acquire_plugin_selection_admission(&harness.crud_store,&harness.processor.plugin_mutation_locks,&harness.workspace_id,&snapshot).await.unwrap();drop(guards);
+        harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&app,1,"updating",false,"{\"kind\":\"enable\"}").await.unwrap();
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[selected]).await.is_err());
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[plugin_selected]).await.is_ok());
+        assert!(harness.crud_store.find_package_installation(&plugin).await.unwrap().unwrap().enabled);
+        std::fs::remove_dir_all(root).unwrap();
+    });
 }

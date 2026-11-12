@@ -52,7 +52,8 @@ impl SkillUploadFailure {
                     machine_code,
                     ..
                 } => match machine_code.as_deref().unwrap_or(message) {
-                    "plugins.package_rejected"
+                    "apps.package_rejected"
+                    | "plugins.package_rejected"
                     | "plugins.upload_unavailable_or_invalid_archive" => Self::InvalidPackage,
                     "plugins.busy" | "package_delivery.busy" => Self::Busy,
                     _ => Self::Unknown,

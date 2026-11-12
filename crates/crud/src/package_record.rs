@@ -92,10 +92,6 @@ impl PackageRecord {
             "package extension mismatch"
         );
         let app_slug = app.as_ref().map(|a| a.slug.clone());
-        let last_error = parent
-            .last_error_json
-            .as_deref()
-            .map(decode_operation_error);
         let mut row = Self {
             kind,
             app_manifest_json: app.as_ref().map(|a| a.manifest_json.clone()),
@@ -111,7 +107,7 @@ impl PackageRecord {
             state: parent.state,
             revision: parent.revision,
             pending_json: parent.pending_json,
-            last_error: last_error,
+            last_error: None,
             operation_error_json: parent.last_error_json,
             created_at: parent.created_at,
             updated_at: parent.updated_at,
@@ -146,6 +142,14 @@ impl PackageRecord {
             row.name = slug;
         }
         Ok(row)
+    }
+    /// Decode legacy diagnostics only after releasing the database snapshot.
+    pub(crate) fn with_error_presentation(mut self) -> Self {
+        self.last_error = self
+            .operation_error_json
+            .as_deref()
+            .map(decode_operation_error);
+        self
     }
     pub(crate) fn operational(&self) -> package_installation::ActiveModel {
         package_installation::ActiveModel {
@@ -214,7 +218,10 @@ pub(crate) fn decode_operation_error(value: &str) -> String {
         .unwrap_or_else(|| "packages.invalid_operation_error".into())
 }
 pub(crate) fn encode_operation_error(value: &str) -> String {
-    serde_json::json!({"code": value.chars().take(4096).collect::<String>()}).to_string()
+    // Existing callers also pass serialized component diagnostics, not just a
+    // machine code. Preserve their exact payload as the migration does; turning
+    // it into a truncated code loses member diagnostics during recovery.
+    serde_json::json!({"legacy": value}).to_string()
 }
 
 /// Validated App publication prepared without holding database capacity.

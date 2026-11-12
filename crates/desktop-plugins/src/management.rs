@@ -99,6 +99,64 @@ mod restore_tests {
 }
 
 impl PluginsView {
+    pub(super) fn install_preview(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.kind != pioneer_client::plugins::PackageKind::App {
+            return None;
+        }
+        let upload = self.upload.read(cx).publication()?;
+        if upload.target != SkillUploadTarget::AppPreview
+            || upload.state != SkillUploadState::Succeeded
+        {
+            return None;
+        }
+        let preview = &upload.plugin_preview.as_ref()?.package;
+        let operation = upload.operation_id;
+        let disabled = self.busy(cx)
+            || !self.connected()
+            || self
+                .workspace
+                .as_deref()
+                .is_none_or(|w| !self.client.plugins_management_allowed(w));
+        Some(
+            v_flex()
+                .gap_3()
+                .p_3()
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div()
+                        .text_base()
+                        .font_semibold()
+                        .child(preview.name.clone()),
+                )
+                .when_some(preview.description.clone(), |view, text| {
+                    view.child(div().text_sm().child(text))
+                })
+                .child(div().text_sm().child(
+                    t!("plugins.component_count", count = preview.components.len()).to_string(),
+                ))
+                .children(
+                    preview.diagnostics.iter().map(|diagnostic| {
+                        div().text_sm().child(diagnostic_label(&diagnostic.code))
+                    }),
+                )
+                .child(
+                    Button::new("app-install-preview-confirm")
+                        .primary()
+                        .label(t!("plugins.install").to_string())
+                        .disabled(disabled)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.send_intent(
+                                PluginIntent::Install {
+                                    upload_operation: operation,
+                                },
+                                cx,
+                            )
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
     pub(super) fn mutate(
         &mut self,
         plugin: PluginItem,
@@ -158,13 +216,14 @@ impl PluginsView {
         let _ = (workspace, window);
         self.client.navigate(
             pioneer_client::navigation::NavigationIntent::Navigate {
-                destination: pioneer_client::navigation::SemanticDestination::Plugin {
-                    plugin_id: plugin.id.clone(),
-                    component: Some(PluginComponentKey {
+                destination: pioneer_client::navigation::SemanticDestination::package(
+                    self.kind,
+                    plugin.id.clone(),
+                    Some(PluginComponentKey {
                         kind: component.kind.clone(),
                         member_key: component.member_key.clone(),
                     }),
-                },
+                ),
             },
             None,
         );
@@ -243,8 +302,11 @@ impl PluginsView {
         // consumer until the confirmed command is admitted, so focus loss does
         // not suspend the plugin controller underneath this confirmation.
         let confirmation_demand = self.workspace.as_deref().map(|workspace| {
-            self.client
-                .acquire_plugin_demand(workspace, Some(&parent.id))
+            self.client.packages(self.kind).acquire_plugin_demand(
+                &self.client,
+                workspace,
+                Some(&parent.id),
+            )
         });
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -313,13 +375,23 @@ impl PluginsView {
         // consumer until the confirmed command is admitted, so focus loss does
         // not suspend the plugin controller underneath this confirmation.
         let confirmation_demand = self.workspace.as_deref().map(|workspace| {
-            self.client
-                .acquire_plugin_demand(workspace, Some(&parent.id))
+            self.client.packages(self.kind).acquire_plugin_demand(
+                &self.client,
+                workspace,
+                Some(&parent.id),
+            )
         });
         let answer = window.prompt(
             PromptLevel::Warning,
             &t!("plugins.remove_title", name = parent.name.as_str()).to_string(),
-            Some(&t!("plugins.remove_notice").to_string()),
+            Some(
+                &t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                    "apps.remove_notice"
+                } else {
+                    "plugins.remove_notice"
+                })
+                .to_string(),
+            ),
             &[
                 PromptButton::new(t!("plugins.keep_data").to_string()),
                 PromptButton::new(t!("plugins.purge_data").to_string()),
@@ -366,7 +438,10 @@ impl PluginsView {
     pub(super) fn upload_recovery(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let publication = self.upload.read(cx).publication()?;
         let key = match &publication.target {
-            SkillUploadTarget::PluginUpdatePreview { plugin_id, .. } => plugin_id.clone(),
+            SkillUploadTarget::PluginUpdatePreview { plugin_id, .. }
+            | SkillUploadTarget::AppUpdatePreview {
+                app_id: plugin_id, ..
+            } => plugin_id.clone(),
             _ => format!("upload:{}", publication.operation_id),
         };
         let operation = self.input.operations.get(&key);
@@ -376,12 +451,13 @@ impl PluginsView {
             return None;
         }
         let intent = match &publication.target {
-            SkillUploadTarget::PluginInstall | SkillUploadTarget::PluginPreview => {
-                PluginIntent::Install {
-                    upload_operation: publication.operation_id,
-                }
-            }
-            SkillUploadTarget::PluginUpdatePreview { .. } => PluginIntent::ApplyUpdate {
+            SkillUploadTarget::PluginInstall
+            | SkillUploadTarget::PluginPreview
+            | SkillUploadTarget::AppPreview => PluginIntent::Install {
+                upload_operation: publication.operation_id,
+            },
+            SkillUploadTarget::PluginUpdatePreview { .. }
+            | SkillUploadTarget::AppUpdatePreview { .. } => PluginIntent::ApplyUpdate {
                 upload_operation: publication.operation_id,
                 confirm_changes: true,
             },
@@ -410,15 +486,26 @@ impl PluginsView {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(t!("plugins.read_only").to_string())
+                    .child(
+                        t!(if self.kind == pioneer_client::plugins::PackageKind::App {
+                            "apps.read_only"
+                        } else {
+                            "plugins.read_only"
+                        })
+                        .to_string(),
+                    )
                     .into_any_element(),
             );
         }
         let update_preview = self.upload.read(cx).publication().and_then(|publication| {
-            let SkillUploadTarget::PluginUpdatePreview {
+            let (SkillUploadTarget::PluginUpdatePreview {
                 plugin_id,
                 expected_revision,
-            } = &publication.target
+            }
+            | SkillUploadTarget::AppUpdatePreview {
+                app_id: plugin_id,
+                expected_revision,
+            }) = &publication.target
             else {
                 return None;
             };
@@ -507,9 +594,16 @@ impl PluginsView {
                                 }))
                                 .when(stale, |view| {
                                     view.child(
-                                        div()
-                                            .text_color(cx.theme().danger)
-                                            .child(t!("plugins.stale_preview").to_string()),
+                                        div().text_color(cx.theme().danger).child(
+                                            t!(if self.kind
+                                                == pioneer_client::plugins::PackageKind::App
+                                            {
+                                                "apps.stale_preview"
+                                            } else {
+                                                "plugins.stale_preview"
+                                            })
+                                            .to_string(),
+                                        ),
                                     )
                                 })
                                 .child(

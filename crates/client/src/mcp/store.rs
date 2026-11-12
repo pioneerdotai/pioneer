@@ -1123,6 +1123,7 @@ mod tests {
                 .iter()
                 .map(|id| McpListItem {
                     plugin_owner: None,
+                    package_owner: None,
                     id: (*id).into(),
                     name: (*id).into(),
                     display_name: None,

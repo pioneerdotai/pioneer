@@ -88,7 +88,9 @@ impl DesktopShellView {
             self.onboarding.as_ref().map(|root| root.clone().into())
         } else {
             match route.route() {
-                MainRoute::Plugins => self.plugins.as_ref().map(|root| root.clone().into()),
+                MainRoute::Plugins | MainRoute::Apps => {
+                    self.plugins.as_ref().map(|root| root.clone().into())
+                }
                 MainRoute::Threads => self.thread.as_ref().map(|(_, root)| root.clone().into()),
                 MainRoute::AgentsDoc => self
                     .agents_document
@@ -397,13 +399,14 @@ impl DesktopShellView {
         let plugins = pioneer_desktop_plugins::PluginsView::new(
             client.clone(),
             registrar.clone(),
-            Box::new(move |workspace, plugin, component, window, cx| {
+            Box::new(move |kind, workspace, plugin, component, window, cx| {
                 if let Some(id) = component.mcp_installation_id.clone() {
-                    let view = pioneer_desktop_mcp::McpCatalogView::new_plugin_details(
+                    let view = pioneer_desktop_mcp::McpCatalogView::new_package_details(
                         pioneer_desktop_mcp::McpCatalogConfig::new(
                             details_client.clone(),
                             details_registrar.clone(),
                         ),
+                        kind,
                         workspace.to_owned(),
                         plugin.to_owned(),
                         id,
@@ -423,11 +426,12 @@ impl DesktopShellView {
                     ))
                 } else {
                     component.skill_id.clone().map(|id| {
-                        let view = pioneer_desktop_skills::SkillsCatalogView::new_plugin_details(
+                        let view = pioneer_desktop_skills::SkillsCatalogView::new_package_details(
                             pioneer_desktop_skills::SkillsCatalogConfig::new(
                                 details_client.clone(),
                                 details_registrar.clone(),
                             ),
+                            kind,
                             workspace.to_owned(),
                             plugin.to_owned(),
                             id,
@@ -814,6 +818,7 @@ impl DesktopShellView {
                 route: SettingsRoute::Account,
             },
             MainRoute::Mcp if self.can_manage => SemanticDestination::Mcp { server_id: None },
+            MainRoute::Apps if self.can_manage => SemanticDestination::Apps,
             MainRoute::Plugins if self.can_manage => SemanticDestination::Plugins,
             MainRoute::Skills if self.can_manage => SemanticDestination::Skills { skill_id: None },
             _ => return,
@@ -965,6 +970,9 @@ impl Render for DesktopShellView {
                     view.activate_navigation(MainRoute::Mcp, cx)
                 }),
             )
+            .on_action(cx.listener(|view, _: &OpenApps, _, cx| {
+                view.activate_navigation(MainRoute::Apps, cx)
+            }))
             .on_action(cx.listener(|view, _: &OpenPlugins, _, cx| {
                 view.activate_navigation(MainRoute::Plugins, cx)
             }))
@@ -1052,7 +1060,7 @@ impl Render for SidebarHostView {
             MainRoute::Providers => &self.providers,
             MainRoute::Administration => &self.administration,
             MainRoute::Mcp | MainRoute::McpDetails => &self.mcp,
-            MainRoute::Plugins => &self.plugins_sidebar,
+            MainRoute::Plugins | MainRoute::Apps => &self.plugins_sidebar,
             MainRoute::Skills | MainRoute::SkillDetails => &self.skills,
             MainRoute::Threads | MainRoute::AgentsDoc => unreachable!(),
         }

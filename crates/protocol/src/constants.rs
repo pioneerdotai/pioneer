@@ -112,6 +112,16 @@ pub mod methods {
     pub const PLUGINS_LIST: &str = "plugins/list";
     pub const PLUGINS_DETAILS: &str = "plugins/details";
     pub const PLUGINS_CHANGED: &str = "plugins/changed";
+    pub const APPS_PREVIEW: &str = "apps/preview";
+    pub const APPS_INSTALL: &str = "apps/install";
+    pub const APPS_UPDATE: &str = "apps/update";
+    pub const APPS_REMOVE: &str = "apps/remove";
+    pub const APPS_RETRY: &str = "apps/retry";
+    pub const APPS_CONTINUE: &str = "apps/continue";
+    pub const APPS_SET_ENABLED: &str = "apps/set_enabled";
+    pub const APPS_LIST: &str = "apps/list";
+    pub const APPS_DETAILS: &str = "apps/details";
+    pub const APPS_CHANGED: &str = "apps/changed";
     pub const SKILLS_LIST: &str = "skills/list";
     pub const SKILLS_INSTALL: &str = "skills/install";
     pub const SKILLS_UPDATE: &str = "skills/update";
