@@ -252,7 +252,7 @@ impl MessageProcessor {
                     )
                 })?;
             let Some(link) = link.filter(|link| {
-                link.plugin_id == owner.plugin_id && link.member_key == owner.member_key
+                link.package_id == owner.plugin_id && link.member_key == owner.member_key
             }) else {
                 return Err(skills_error(
                     Some(request_id),

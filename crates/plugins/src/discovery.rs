@@ -147,6 +147,9 @@ fn limit() -> Diagnostic {
     )
 }
 fn valid_skill(text: &str, name: &str) -> bool {
+    valid_skill_at(text, name, &format!("skills/{name}"))
+}
+pub(crate) fn valid_skill_at(text: &str, name: &str, member_path: &str) -> bool {
     let Ok(skill_id) = SkillId::new("000000000000000000000") else {
         return false;
     };
@@ -156,8 +159,8 @@ fn valid_skill(text: &str, name: &str) -> bool {
             skill_id,
             source_kind: SkillSourceKind::User,
             source_root: String::new(),
-            skill_dir: format!("skills/{name}"),
-            skill_file: format!("skills/{name}/SKILL.md"),
+            skill_dir: member_path.into(),
+            skill_file: format!("{member_path}/SKILL.md"),
             parent_directory_name: name.into(),
             identity_owner_override: None,
             identity_slug_override: None,

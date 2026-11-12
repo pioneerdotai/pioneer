@@ -127,14 +127,15 @@ pub(crate) async fn load<C: ConnectionTrait>(
     db: &C,
     ids: &[String],
 ) -> Result<(
-    Vec<plugin_installation::Model>,
+    Vec<crate::PackageRecord>,
     Vec<plugin_keyword::Model>,
     Vec<plugin_default_prompt::Model>,
 )> {
-    let parents = plugin_installation::Entity::find()
-        .filter(plugin_installation::Column::Id.is_in(ids.iter().cloned()))
+    let rows = pioneer_entity::package_installation::Entity::find()
+        .filter(pioneer_entity::package_installation::Column::Id.is_in(ids.iter().cloned()))
         .all(db)
         .await?;
+    let parents = super::plugins::project_rows(db, rows).await?;
     let keywords = plugin_keyword::Entity::find()
         .filter(plugin_keyword::Column::PluginId.is_in(ids.iter().cloned()))
         .order_by_asc(plugin_keyword::Column::PluginId)
@@ -151,7 +152,7 @@ pub(crate) async fn load<C: ConnectionTrait>(
 }
 /// Runs only after releasing the read snapshot; every list is bounded by schema positions.
 pub(crate) fn project(
-    parents: Vec<plugin_installation::Model>,
+    parents: Vec<crate::PackageRecord>,
     keywords: Vec<plugin_keyword::Model>,
     prompts: Vec<plugin_default_prompt::Model>,
 ) -> HashMap<String, (i64, PluginMetadata)> {
@@ -171,7 +172,11 @@ pub(crate) fn project(
     }
     parents
         .into_iter()
-        .filter(|parent| parent.state == "installed" && parent.pending_json.is_none())
+        .filter(|parent| {
+            parent.kind == crate::PackageKind::Plugin
+                && parent.state == "installed"
+                && parent.pending_json.is_none()
+        })
         .map(|parent| {
             let metadata = PluginMetadata {
                 display_name: parent.display_name.clone(),

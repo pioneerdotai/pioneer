@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "plugin_component")]
+#[sea_orm(table_name = "package_component")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub plugin_id: String,
+    pub package_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub kind: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
@@ -37,12 +37,12 @@ pub struct Model {
     pub mcp_server_installation: HasOne<super::mcp_server_installation::Entity>,
     #[sea_orm(
         belongs_to,
-        from = "plugin_id",
+        from = "package_id",
         to = "id",
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub plugin_installation: HasOne<super::plugin_installation::Entity>,
+    pub package_installation: HasOne<super::package_installation::Entity>,
     #[sea_orm(
         belongs_to,
         from = "skill_id",

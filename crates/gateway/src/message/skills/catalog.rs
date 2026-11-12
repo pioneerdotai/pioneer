@@ -918,7 +918,7 @@ impl MessageProcessor {
                 owners
                     .get(item.skill_id.as_str())
                     .map(|owner| pioneer_protocol::PluginOwner {
-                        plugin_id: owner.plugin_id.clone(),
+                        plugin_id: owner.package_id.clone(),
                         member_key: owner.member_key.clone(),
                     });
         }

@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn")]
 pub struct Model {
-    pub plugin_selection_json: Option<String>,
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub thread_id: String,
@@ -53,6 +52,8 @@ pub struct Model {
     pub author_agent_snapshot_json: Option<String>,
     pub initiated_by_actor_kind: Option<String>,
     pub work_owner: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub package_selection_json: Option<String>,
     #[sea_orm(has_many)]
     pub agent_action_timeline_targets: HasMany<super::agent_action_timeline_target::Entity>,
     #[sea_orm(has_one)]

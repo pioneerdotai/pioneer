@@ -2,6 +2,30 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Product identity is distinct even when installation mechanics are shared.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageKind {
+    #[default]
+    Plugin,
+    App,
+}
+impl PackageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plugin => "plugin",
+            Self::App => "app",
+        }
+    }
+    pub fn from_storage(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "plugin" => Ok(Self::Plugin),
+            "app" => Ok(Self::App),
+            _ => Err("invalid package kind"),
+        }
+    }
+}
+
 /// Authored presentation only. None of these fields grant execution authority.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct PluginAuthor {
@@ -141,6 +165,8 @@ pub struct PluginSelectionSnapshot {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginSelectedParent {
+    #[serde(default)]
+    pub kind: PackageKind,
     pub id: String,
     pub revision: i64,
 }
@@ -285,3 +311,8 @@ pub struct PluginsContinueParams {
     pub plugin_id: String,
     pub expected_revision: i64,
 }
+
+/// One persisted package selection; aliases retain existing Plugin source consumers.
+pub type PackageSelectionSnapshot = PluginSelectionSnapshot;
+pub type PackageSelectedParent = PluginSelectedParent;
+pub type PackageSelectedChild = PluginSelectedChild;

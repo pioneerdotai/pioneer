@@ -214,3 +214,81 @@ fn selected_symlink_is_rejected_even_when_target_is_contained() {
             .contains("selected_symlink")
     );
 }
+
+#[test]
+fn app_loader_supports_declared_component_combinations_and_rejects_invalid_artwork() {
+    use pioneer_plugins::{ComponentPlan, app};
+    for (skills, mcp, local, count) in [
+        (false, false, false, 0),
+        (true, false, false, 1),
+        (false, true, false, 1),
+        (false, true, true, 1),
+        (true, true, true, 2),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut value = manifest();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        fs::write(root.path().join("icon.png"), png.into_inner()).unwrap();
+        if skills {
+            value["skills"] = json!("./capabilities/");
+            fs::create_dir_all(root.path().join("capabilities/one")).unwrap();
+            fs::write(
+                root.path().join("capabilities/one/SKILL.md"),
+                "---\nname: one\ndescription: Inspect bundled data.\n---\nRead bundled data.\n",
+            )
+            .unwrap();
+        }
+        if mcp {
+            let server = if local {
+                value["mcp"] = json!({"config": "./config/mcp.json", "include": ["./dist/mcp/"]});
+                fs::create_dir_all(root.path().join("dist/mcp")).unwrap();
+                fs::write(
+                    root.path().join("dist/mcp/server"),
+                    b"local runtime payload",
+                )
+                .unwrap();
+                json!({"type":"stdio", "command":"./dist/mcp/server", "args":["${APP_ROOT}/dist/mcp/server"], "cwd":"${APP_ROOT}"})
+            } else {
+                value["mcp"] = json!({"config": "./config/mcp.json"});
+                json!({"type":"streamable-http", "url":"https://example.test/mcp"})
+            };
+            fs::create_dir(root.path().join("config")).unwrap();
+            fs::write(
+                root.path().join("config/mcp.json"),
+                json!({"mcpServers":{"example":server}}).to_string(),
+            )
+            .unwrap();
+        }
+        fs::write(root.path().join("app.json"), value.to_string()).unwrap();
+        let (_, snapshot) = SelectionPlan::capture(root.path(), limits(), || false).unwrap();
+        let package = app::load(&snapshot).unwrap();
+        assert!(package.diagnostics.is_empty(), "{:?}", package.diagnostics);
+        assert_eq!(package.components.len(), count);
+        if skills {
+            assert!(
+                package
+                    .components
+                    .iter()
+                    .any(|component| matches!(component,
+                ComponentPlan::Skill { member_path, .. } if member_path == "capabilities/one"))
+            );
+        }
+        if local {
+            assert_eq!(
+                snapshot.file("dist/mcp/server"),
+                Some(b"local runtime payload".as_slice())
+            );
+        }
+        // Declaration alone is not image validity: the loader must decode bytes.
+        fs::write(root.path().join("icon.png"), b"not an image").unwrap();
+        let (_, invalid) = SelectionPlan::capture(root.path(), limits(), || false).unwrap();
+        let error = app::load(&invalid).unwrap_err();
+        assert_eq!(
+            (error.code, error.field.as_str()),
+            ("invalid_image", "app.json/icon/light")
+        );
+    }
+}

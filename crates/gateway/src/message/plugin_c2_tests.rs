@@ -24,7 +24,11 @@ async fn seed_owned_c2_skill(
     std::fs::write(member.join("scripts/helper.txt"), "supporting file").unwrap();
     let now = chrono::Utc::now().fixed_offset();
     store
-        .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        .insert_plugin_installation(&pioneer_crud::PackageRecord {
+            kind: pioneer_crud::PackageKind::Plugin,
+            app_manifest_json: None,
+            app_localizations_json: None,
+            operation_error_json: None,
             id: parent.clone(),
             workspace_id: workspace.into(),
             name: "authoritative-parent".into(),
@@ -94,6 +98,7 @@ async fn seed_owned_c2_skill(
             )],
             None,
             Some(&pioneer_crud::PluginOwnershipWrite {
+                kind: pioneer_protocol::PackageKind::Plugin,
                 plugin_id: parent.clone(),
                 expected_revision: 1,
                 member_key: "bundled".into(),
@@ -574,7 +579,11 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
     let timestamp = chrono::Utc::now().fixed_offset();
     harness
         .crud_store
-        .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        .insert_plugin_installation(&pioneer_crud::PackageRecord {
+            kind: pioneer_crud::PackageKind::Plugin,
+            app_manifest_json: None,
+            app_localizations_json: None,
+            operation_error_json: None,
             id: parent.clone(),
             workspace_id: harness.workspace_id.clone(),
             name: plan.manifest.name.clone(),

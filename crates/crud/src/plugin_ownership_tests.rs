@@ -1,11 +1,15 @@
 //! Plugin ownership and native lifecycle regressions.
 use super::tests::{pack_skill_record, skill_pack_record, test_store_with_workspace};
 use super::*;
-use pioneer_entity::plugin_installation;
+
 use sea_orm::ConnectionTrait;
 
-fn parent(id: &str, workspace: &str) -> plugin_installation::Model {
-    plugin_installation::Model {
+fn parent(id: &str, workspace: &str) -> crate::PackageRecord {
+    crate::PackageRecord {
+        kind: crate::PackageKind::Plugin,
+        app_manifest_json: None,
+        app_localizations_json: None,
+        operation_error_json: None,
         id: id.into(),
         workspace_id: workspace.into(),
         name: "same-name".into(),
@@ -47,6 +51,7 @@ fn parent(id: &str, workspace: &str) -> plugin_installation::Model {
 }
 fn ownership(parent: &str, child: &str, key: &str) -> PluginOwnershipWrite {
     PluginOwnershipWrite {
+        kind: pioneer_protocol::PackageKind::Plugin,
         plugin_id: parent.into(),
         expected_revision: 1,
         member_key: key.into(),
@@ -163,6 +168,7 @@ async fn package_update_retains_native_identity_policy_overrides_and_successful_
         .await
         .unwrap();
     let write = PluginNativeWrite {
+        kind: pioneer_protocol::PackageKind::Plugin,
         plugin_id: id.clone(),
         expected_revision: native.revision,
         member_key: "one".into(),
@@ -304,6 +310,7 @@ async fn interrupted_package_removal_is_repairable_and_cannot_forget_a_live_nati
             .is_err()
     );
     let write = PluginNativeWrite {
+        kind: pioneer_protocol::PackageKind::Plugin,
         plugin_id: id.clone(),
         expected_revision: gate.revision,
         member_key: "one".into(),
@@ -505,6 +512,7 @@ async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings(
     ).await.unwrap();
     let prepared = PluginSelectionSnapshot {
         parents: vec![PluginSelectedParent {
+            kind: pioneer_protocol::PackageKind::Plugin,
             id: parent_id.clone(),
             revision: 1,
         }],
@@ -520,6 +528,22 @@ async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings(
     };
     store
         .prepare_plugin_selection("turn", &prepared)
+        .await
+        .unwrap();
+    // Historical prepared JSON predates the parent kind field. It must remain
+    // usable without rewriting frozen selections during schema installation.
+    let mut legacy = serde_json::to_value(&prepared).unwrap();
+    for selected in legacy["parents"].as_array_mut().unwrap() {
+        selected.as_object_mut().unwrap().remove("kind");
+    }
+    let legacy = legacy.to_string();
+    store
+        .run_serialized_write(|| async {
+            let db = store.connection.begin().await?;
+            crate::repositories::plugins::set_selection(&db, "turn", legacy.clone()).await?;
+            db.commit().await?;
+            Ok(())
+        })
         .await
         .unwrap();
     assert!(
@@ -551,7 +575,7 @@ async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings(
     store
         .database_connection()
         .execute_unprepared(
-            "CREATE TRIGGER fail_plugin_ready BEFORE UPDATE OF plugin_selection_json ON turn \
+            "CREATE TRIGGER fail_plugin_ready BEFORE UPDATE OF package_selection_json ON turn \
          BEGIN SELECT RAISE(ABORT,'fixture ready write failure'); END;",
         )
         .await
@@ -664,7 +688,7 @@ async fn native_skill_policy_audit_and_ownership_commit_together_without_upload(
             .await
             .unwrap()
             .unwrap()
-            .plugin_id,
+            .package_id,
         "plugin-a"
     );
     // Genuine settings remain in the native row/policy, not in plugin_component.
@@ -694,7 +718,7 @@ async fn failed_ownership_insert_rolls_back_native_rows_policies_and_audits() {
         .unwrap();
     // Inject a failure specifically at the final link publication, after the
     // native child/policy/audit writes, using the scoped SQLite writer.
-    store.database_connection().execute_unprepared("CREATE TRIGGER fail_plugin_link BEFORE INSERT ON plugin_component BEGIN SELECT RAISE(ABORT,'injected link failure'); END;").await.unwrap();
+    store.database_connection().execute_unprepared("CREATE TRIGGER fail_plugin_link BEFORE INSERT ON package_component BEGIN SELECT RAISE(ABORT,'injected link failure'); END;").await.unwrap();
     let row = skill('A', "ws");
     let owner = ownership("plugin-a", row.skill_id.as_str(), "one");
     assert!(
@@ -885,7 +909,7 @@ async fn same_authored_skill_names_do_not_collide_and_child_delete_unlinks_with_
     assert!(
         store
             .database_connection()
-            .execute_unprepared("DELETE FROM plugin_installation WHERE id='plugin-a'")
+            .execute_unprepared("DELETE FROM package_installation WHERE id='plugin-a'")
             .await
             .is_err()
     );
@@ -1302,7 +1326,7 @@ async fn standalone_mcp_names_work_while_owned_adoption_is_rejected() {
             .await
             .unwrap()
             .unwrap()
-            .plugin_id,
+            .package_id,
         "plugin-a"
     );
 }
@@ -1675,6 +1699,7 @@ async fn native_policy_audit_override_and_parent_commit_marker_are_atomic() {
         .await
         .unwrap();
     let write = PluginNativeWrite {
+        kind: pioneer_protocol::PackageKind::Plugin,
         plugin_id: parent_id.clone(),
         expected_revision: gate.revision,
         member_key: "one".into(),
@@ -1922,6 +1947,7 @@ async fn owned_skill_policy_and_user_removal_revalidate_in_the_native_writer() {
         .await
         .unwrap();
     let mut write = PluginNativeWrite {
+        kind: pioneer_protocol::PackageKind::Plugin,
         plugin_id: parent_id.clone(),
         expected_revision: gate.revision,
         member_key: "one".into(),
@@ -2092,4 +2118,194 @@ async fn startup_reconciliation_finishes_more_than_one_thousand_parents_and_is_i
             .state,
         "interrupted"
     );
+}
+
+// App storage regressions: source-only, NOT_RUN / NOT_COMPILED.
+fn app_parent(id: &str, workspace: &str) -> crate::PackageRecord {
+    let mut record = parent(id, workspace);
+    record.kind = pioneer_protocol::PackageKind::App;
+    record.name = "shared-app-slug".into();
+    record.app_manifest_json = Some(
+        serde_json::json!({
+            "slug": "shared-app-slug", "name": "Example", "version": "1.0.0",
+            "shortDescription": "Example App", "developer": {"name": "Author"},
+            "icon": {"light": "icon.png", "dark": "icon.png"}
+        })
+        .to_string(),
+    );
+    record.app_localizations_json = Some("{}".into());
+    record
+}
+
+#[tokio::test]
+async fn app_slug_is_global_and_failed_reservation_leaves_no_orphan_parent() {
+    use sea_orm::{EntityTrait, Set};
+    let store = test_store_with_workspace("ws-app-one").await;
+    store
+        .run_serialized_write(|| async {
+            pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+                id: Set("ws-app-two".into()),
+                name: Set("Other workspace".into()),
+                is_active: Set(true),
+                is_current: Set(false),
+                created_at: Set(util::unix_to_datetime(1)),
+                updated_at: Set(util::unix_to_datetime(1)),
+            })
+            .exec(&store.connection)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store
+        .insert_package_installation(&app_parent("app-one", "ws-app-one"))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .insert_package_installation(&app_parent("app-two", "ws-app-two"))
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .find_package_installation("app-two")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .find_plugin_installation("app-one")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let apps = store
+        .list_package_installations("ws-app-one", pioneer_protocol::PackageKind::App)
+        .await
+        .unwrap();
+    assert_eq!(
+        apps.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        ["app-one"]
+    );
+    assert!(
+        store
+            .list_plugin_installations("ws-app-one")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn app_owned_native_child_cannot_be_adopted_by_plugin_or_published_with_wrong_kind() {
+    let store = test_store_with_workspace("ws-app").await;
+    let mut declared_app = app_parent("app-parent", "ws-app");
+    let mut declared: serde_json::Value =
+        serde_json::from_str(declared_app.app_manifest_json.as_deref().unwrap()).unwrap();
+    declared["skills"] = serde_json::json!("skills");
+    declared_app.app_manifest_json = Some(declared.to_string());
+    store
+        .insert_package_installation(&declared_app)
+        .await
+        .unwrap();
+    store
+        .insert_plugin_installation(&parent("plugin-parent", "ws-app"))
+        .await
+        .unwrap();
+    let row = skill('A', "ws-app");
+    let mut app_owner = ownership("app-parent", row.skill_id.as_str(), "one");
+    // Same ID/revision with a forged kind must fail before any native write.
+    assert!(
+        store
+            .install_skill_lifecycle_with_ownership(
+                &row,
+                &policy(&row),
+                &[skill_audit(&row)],
+                None,
+                Some(&app_owner),
+                1
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .find_skill_installation(&row.skill_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    app_owner.kind = pioneer_protocol::PackageKind::App;
+    assert!(
+        store
+            .install_skill_lifecycle_with_ownership(
+                &row,
+                &policy(&row),
+                &[skill_audit(&row)],
+                None,
+                Some(&app_owner),
+                1
+            )
+            .await
+            .unwrap()
+    );
+    let plugin_owner = ownership("plugin-parent", row.skill_id.as_str(), "one");
+    assert!(
+        store
+            .install_skill_lifecycle_with_ownership(
+                &row,
+                &policy(&row),
+                &[skill_audit(&row)],
+                None,
+                Some(&plugin_owner),
+                1
+            )
+            .await
+            .is_err()
+    );
+    let owner = store
+        .find_skill_plugin_owner(&row.skill_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.package_id, "app-parent");
+    assert!(
+        store
+            .list_plugin_components("plugin-parent")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !store
+            .plugin_child_available("skill", row.skill_id.as_str(), "other-workspace")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn package_reload_preserves_structured_legacy_operation_diagnostic() {
+    let store = test_store_with_workspace("ws-diagnostic").await;
+    let mut record = parent("diagnostic-parent", "ws-diagnostic");
+    let diagnostic = r#"{"legacy":"plugins.data_retained","detail":"preserved"}"#;
+    record.last_error = Some("plugins.data_retained".into());
+    record.operation_error_json = Some(diagnostic.into());
+    record.pending_json = Some("{}".into());
+    store.insert_plugin_installation(&record).await.unwrap();
+    store.prepare_plugin_reload(&record.id, 1).await.unwrap();
+    let reloaded = store
+        .find_package_installation(&record.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.last_error.as_deref(),
+        Some("plugins.data_retained")
+    );
+    assert_eq!(reloaded.operation_error_json.as_deref(), Some(diagnostic));
+    assert_eq!(reloaded.state, "installed");
+    assert_eq!(reloaded.pending_json.as_deref(), Some("{}"));
 }

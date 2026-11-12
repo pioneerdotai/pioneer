@@ -1,5 +1,8 @@
+use crate::PackageRecord;
 use anyhow::{Context, Result, bail};
-use pioneer_entity::{plugin_component, plugin_installation};
+use pioneer_entity::{
+    app_installation, package_component, package_installation, plugin_installation,
+};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, ModelTrait,
     QueryFilter, QueryOrder, QuerySelect, Set,
@@ -8,37 +11,64 @@ use sea_orm::{
 pub async fn list<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
-) -> Result<Vec<plugin_installation::Model>> {
-    let rows = plugin_installation::Entity::find()
-        .filter(plugin_installation::Column::WorkspaceId.eq(workspace))
-        .order_by_asc(plugin_installation::Column::CreatedAt)
+    kind: crate::PackageKind,
+) -> Result<Vec<PackageRecord>> {
+    let rows = package_installation::Entity::find()
+        .filter(package_installation::Column::WorkspaceId.eq(workspace))
+        .filter(package_installation::Column::Kind.eq(kind.as_str()))
+        .order_by_asc(package_installation::Column::CreatedAt)
         .all(db)
         .await?;
-    Ok(rows)
+    project_rows(db, rows).await
 }
-
+pub(super) async fn project_rows<C: ConnectionTrait>(
+    db: &C,
+    rows: Vec<package_installation::Model>,
+) -> Result<Vec<PackageRecord>> {
+    let mut result = Vec::with_capacity(rows.len());
+    for chunk in rows.chunks(64) {
+        let ids: Vec<_> = chunk.iter().map(|p| p.id.clone()).collect();
+        let plugins = plugin_installation::Entity::find()
+            .filter(plugin_installation::Column::Id.is_in(ids.clone()))
+            .all(db)
+            .await?;
+        let apps = app_installation::Entity::find()
+            .filter(app_installation::Column::Id.is_in(ids))
+            .all(db)
+            .await?;
+        for parent in chunk {
+            result.push(PackageRecord::project(
+                parent.clone(),
+                plugins.iter().find(|p| p.id == parent.id).cloned(),
+                apps.iter().find(|p| p.id == parent.id).cloned(),
+            )?);
+        }
+    }
+    Ok(result)
+}
 /// Bounded native-catalog ownership projection; no per-skill reader roundtrips.
 pub async fn skill_owners<C: ConnectionTrait>(
     db: &C,
     ids: &[String],
-) -> Result<Vec<(plugin_component::Model, Option<plugin_installation::Model>)>> {
+) -> Result<Vec<(package_component::Model, Option<PackageRecord>)>> {
     let mut result = Vec::new();
     for chunk in ids.chunks(128) {
-        let links = plugin_component::Entity::find()
-            .filter(plugin_component::Column::Kind.eq("skill"))
-            .filter(plugin_component::Column::SkillId.is_in(chunk.iter().cloned()))
+        let links = package_component::Entity::find()
+            .filter(package_component::Column::Kind.eq("skill"))
+            .filter(package_component::Column::SkillId.is_in(chunk.iter().cloned()))
             .all(db)
             .await?;
         let parent_ids = links
             .iter()
-            .map(|l| l.plugin_id.clone())
+            .map(|l| l.package_id.clone())
             .collect::<Vec<_>>();
-        let parents = plugin_installation::Entity::find()
-            .filter(plugin_installation::Column::Id.is_in(parent_ids))
+        let parents = package_installation::Entity::find()
+            .filter(package_installation::Column::Id.is_in(parent_ids))
             .all(db)
             .await?;
+        let parents = project_rows(db, parents).await?;
         result.extend(links.into_iter().map(|link| {
-            let parent = parents.iter().find(|p| p.id == link.plugin_id).cloned();
+            let parent = parents.iter().find(|p| p.id == link.package_id).cloned();
             (link, parent)
         }));
     }
@@ -61,10 +91,12 @@ pub async fn settle(
         bail!("plugin operation changed");
     }
     let pending = parent.pending_json.clone();
-    let mut row: plugin_installation::ActiveModel = parent.into();
+    let mut row: package_installation::ActiveModel = parent.operational();
     row.state = Set(state.to_owned());
     row.pending_json = Set(if state == "installed" { None } else { pending });
-    row.last_error = Set(error);
+    row.last_error_json = Set(error
+        .as_deref()
+        .map(crate::package_record::encode_operation_error));
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
     row.update(db).await?;
     Ok(())
@@ -76,7 +108,7 @@ pub async fn record_failure(
     kind: &str,
     diagnostic: &str,
 ) -> Result<()> {
-    let existing = plugin_component::Entity::find_by_id((
+    let existing = package_component::Entity::find_by_id((
         write.plugin_id.clone(),
         kind.to_owned(),
         write.member_key.clone(),
@@ -120,8 +152,10 @@ pub async fn record_failure(
 
 /// Host-derived ownership accompanying the native child write. The reserved ID
 /// is also recorded in the parent's pending plan by the caller before I/O.
+pub type PluginOwnershipWrite = PackageOwnershipWrite;
 #[derive(Clone, Debug)]
-pub struct PluginOwnershipWrite {
+pub struct PackageOwnershipWrite {
+    pub kind: crate::PackageKind,
     pub plugin_id: String,
     pub expected_revision: i64,
     pub member_key: String,
@@ -130,31 +164,30 @@ pub struct PluginOwnershipWrite {
     pub child_id: String,
 }
 
-pub async fn find<C: ConnectionTrait>(
-    db: &C,
-    id: &str,
-) -> Result<Option<plugin_installation::Model>> {
-    Ok(plugin_installation::Entity::find_by_id(id.to_owned())
+pub async fn find<C: ConnectionTrait>(db: &C, id: &str) -> Result<Option<PackageRecord>> {
+    let row = package_installation::Entity::find_by_id(id.to_owned())
         .one(db)
-        .await?)
+        .await?;
+    Ok(project_rows(db, row.into_iter().collect()).await?.pop())
 }
 pub async fn find_by_upload<C: ConnectionTrait>(
     db: &C,
     upload: &str,
-) -> Result<Option<plugin_installation::Model>> {
-    Ok(plugin_installation::Entity::find()
-        .filter(plugin_installation::Column::SourceUploadId.eq(upload))
-        .one(db)
-        .await?)
+) -> Result<Option<PackageRecord>> {
+    let rows = package_installation::Entity::find()
+        .filter(package_installation::Column::SourceUploadId.eq(upload))
+        .all(db)
+        .await?;
+    Ok(project_rows(db, rows).await?.pop())
 }
 pub async fn components<C: ConnectionTrait>(
     db: &C,
     id: &str,
-) -> Result<Vec<plugin_component::Model>> {
-    Ok(plugin_component::Entity::find()
-        .filter(plugin_component::Column::PluginId.eq(id))
-        .order_by_asc(plugin_component::Column::Kind)
-        .order_by_asc(plugin_component::Column::MemberKey)
+) -> Result<Vec<package_component::Model>> {
+    Ok(package_component::Entity::find()
+        .filter(package_component::Column::PackageId.eq(id))
+        .order_by_asc(package_component::Column::Kind)
+        .order_by_asc(package_component::Column::MemberKey)
         .all(db)
         .await?)
 }
@@ -162,13 +195,13 @@ pub async fn components<C: ConnectionTrait>(
 pub async fn components_for_parents<C: ConnectionTrait>(
     db: &C,
     ids: &[String],
-) -> Result<Vec<plugin_component::Model>> {
+) -> Result<Vec<package_component::Model>> {
     let mut rows = Vec::new();
     for parents in ids.chunks(16) {
-        let batch = plugin_component::Entity::find()
-            .filter(plugin_component::Column::PluginId.is_in(parents.iter().cloned()))
-            .order_by_asc(plugin_component::Column::Kind)
-            .order_by_asc(plugin_component::Column::MemberKey)
+        let batch = package_component::Entity::find()
+            .filter(package_component::Column::PackageId.is_in(parents.iter().cloned()))
+            .order_by_asc(package_component::Column::Kind)
+            .order_by_asc(package_component::Column::MemberKey)
             .all(db)
             .await?;
         rows.extend(batch);
@@ -180,13 +213,13 @@ pub async fn owner<C: ConnectionTrait>(
     db: &C,
     kind: &str,
     child_id: &str,
-) -> Result<Option<plugin_component::Model>> {
+) -> Result<Option<package_component::Model>> {
     let column = match kind {
-        "skill" => plugin_component::Column::SkillId,
-        "mcp" => plugin_component::Column::McpInstallationId,
+        "skill" => package_component::Column::SkillId,
+        "mcp" => package_component::Column::McpInstallationId,
         _ => bail!("invalid plugin component kind"),
     };
-    Ok(plugin_component::Entity::find()
+    Ok(package_component::Entity::find()
         .filter(column.eq(child_id))
         .one(db)
         .await?)
@@ -219,7 +252,8 @@ pub async fn validate_publication<C: ConnectionTrait>(
     let parent = find(db, &write.plugin_id)
         .await?
         .context("plugin parent not found")?;
-    if parent.workspace_id != workspace
+    if parent.kind != write.kind
+        || parent.workspace_id != workspace
         || parent.revision != write.expected_revision
         || !matches!(
             parent.state.as_str(),
@@ -228,7 +262,7 @@ pub async fn validate_publication<C: ConnectionTrait>(
     {
         bail!("plugin scope, revision or operation state changed");
     }
-    let link = plugin_component::Entity::find_by_id((
+    let link = package_component::Entity::find_by_id((
         write.plugin_id.clone(),
         kind.to_owned(),
         write.member_key.clone(),
@@ -242,7 +276,7 @@ pub async fn validate_publication<C: ConnectionTrait>(
     if linked_id.is_some_and(|id| id != child_id)
         || existing_id.is_some_and(|id| id != child_id || linked_id != Some(id))
         || current_owner.as_ref().is_some_and(|link| {
-            link.plugin_id != write.plugin_id || link.member_key != write.member_key
+            link.package_id != write.plugin_id || link.member_key != write.member_key
         })
     {
         bail!("plugin ownership cannot adopt or overwrite another installation");
@@ -250,9 +284,9 @@ pub async fn validate_publication<C: ConnectionTrait>(
     Ok(())
 }
 
-pub fn prepare_link(write: &PluginOwnershipWrite, kind: &str) -> plugin_component::ActiveModel {
-    plugin_component::ActiveModel {
-        plugin_id: Set(write.plugin_id.clone()),
+pub fn prepare_link(write: &PluginOwnershipWrite, kind: &str) -> package_component::ActiveModel {
+    package_component::ActiveModel {
+        package_id: Set(write.plugin_id.clone()),
         kind: Set(kind.to_owned()),
         member_key: Set(write.member_key.clone()),
         member_path: Set(write.member_path.clone()),
@@ -266,23 +300,23 @@ pub fn prepare_link(write: &PluginOwnershipWrite, kind: &str) -> plugin_componen
 }
 pub async fn publish<C: ConnectionTrait>(
     db: &C,
-    link: plugin_component::ActiveModel,
+    link: package_component::ActiveModel,
 ) -> Result<()> {
     use sea_orm::sea_query::OnConflict;
-    plugin_component::Entity::insert(link)
+    package_component::Entity::insert(link)
         .on_conflict(
             OnConflict::columns([
-                plugin_component::Column::PluginId,
-                plugin_component::Column::Kind,
-                plugin_component::Column::MemberKey,
+                package_component::Column::PackageId,
+                package_component::Column::Kind,
+                package_component::Column::MemberKey,
             ])
             .update_columns([
-                plugin_component::Column::MemberPath,
-                plugin_component::Column::SkillId,
-                plugin_component::Column::McpInstallationId,
-                plugin_component::Column::PackageFingerprint,
-                plugin_component::Column::Status,
-                plugin_component::Column::Diagnostic,
+                package_component::Column::MemberPath,
+                package_component::Column::SkillId,
+                package_component::Column::McpInstallationId,
+                package_component::Column::PackageFingerprint,
+                package_component::Column::Status,
+                package_component::Column::Diagnostic,
             ])
             .to_owned(),
         )
@@ -291,11 +325,55 @@ pub async fn publish<C: ConnectionTrait>(
     Ok(())
 }
 
-pub async fn insert_parent<C: ConnectionTrait>(
-    db: &C,
-    row: plugin_installation::ActiveModel,
+pub async fn insert_parent(
+    db: &pioneer_sqlite::SqliteTransaction,
+    row: &PackageRecord,
+    metadata: Option<super::plugin_metadata::PreparedMetadata>,
 ) -> Result<()> {
-    plugin_installation::Entity::insert(row).exec(db).await?;
+    package_installation::Entity::insert(row.operational())
+        .exec(db)
+        .await?;
+    match row.kind {
+        crate::PackageKind::Plugin => {
+            let mut extension = row.plugin_metadata();
+            if let Some(ref prepared) = metadata {
+                super::plugin_metadata::apply_columns(&mut extension, prepared.columns.clone());
+            }
+            plugin_installation::Entity::insert(extension)
+                .exec(db)
+                .await?;
+            if let Some(prepared) = metadata {
+                super::plugin_metadata::replace_lists(
+                    db,
+                    &row.id,
+                    prepared.keywords,
+                    prepared.prompts,
+                )
+                .await?;
+            }
+        }
+        crate::PackageKind::App => {
+            anyhow::ensure!(
+                metadata.is_none(),
+                "App cannot contain Plugin metadata storage"
+            );
+            app_installation::Entity::insert(app_installation::ActiveModel {
+                id: Set(row.id.clone()),
+                slug: Set(row.name.clone()),
+                manifest_json: Set(row
+                    .app_manifest_json
+                    .clone()
+                    .context("App manifest missing")?),
+                localizations_json: Set(row
+                    .app_localizations_json
+                    .clone()
+                    .context("App locales missing")?),
+                ..Default::default()
+            })
+            .exec(db)
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -303,7 +381,7 @@ pub async fn selection<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<Opti
     Ok(pioneer_entity::turn::Entity::find_by_id(turn_id)
         .one(db)
         .await?
-        .and_then(|t| t.plugin_selection_json))
+        .and_then(|t| t.package_selection_json))
 }
 pub async fn set_selection<C: ConnectionTrait>(db: &C, turn_id: &str, value: String) -> Result<()> {
     let row = pioneer_entity::turn::Entity::find_by_id(turn_id)
@@ -311,7 +389,7 @@ pub async fn set_selection<C: ConnectionTrait>(db: &C, turn_id: &str, value: Str
         .await?
         .context("turn missing")?;
     let mut row: pioneer_entity::turn::ActiveModel = row.into();
-    row.plugin_selection_json = Set(Some(value));
+    row.package_selection_json = Set(Some(value));
     row.update(db).await?;
     Ok(())
 }
@@ -352,7 +430,7 @@ pub async fn begin_mutation(
     enabled: bool,
     pending: String,
     allow_implicit_invocation: Option<bool>,
-) -> Result<plugin_installation::Model> {
+) -> Result<PackageRecord> {
     let parent = find(db, id).await?.context("plugins.not_found")?;
     if parent.workspace_id != workspace || parent.revision != revision {
         bail!("plugins.stale");
@@ -363,7 +441,7 @@ pub async fn begin_mutation(
     let next = revision
         .checked_add(1)
         .context("plugin revision exhausted")?;
-    let mut row: plugin_installation::ActiveModel = parent.into();
+    let mut row: package_installation::ActiveModel = parent.operational();
     row.state = Set(state.into());
     row.enabled = Set(enabled);
     if let Some(implicit) = allow_implicit_invocation {
@@ -371,9 +449,12 @@ pub async fn begin_mutation(
     }
     row.revision = Set(next);
     row.pending_json = Set(Some(pending));
-    row.last_error = Set(None);
+    row.last_error_json = Set(None);
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
-    Ok(row.update(db).await?)
+    row.update(db).await?;
+    find(db, id)
+        .await?
+        .context("package missing after mutation")
 }
 
 pub async fn finish_mutation(
@@ -387,12 +468,14 @@ pub async fn finish_mutation(
     if parent.revision != revision || parent.pending_json.is_none() {
         bail!("plugins.stale");
     }
-    let mut row: plugin_installation::ActiveModel = parent.into();
+    let mut row: package_installation::ActiveModel = parent.operational();
     row.state = Set(state.into());
     if state == "installed" {
         row.pending_json = Set(None);
     }
-    row.last_error = Set(error);
+    row.last_error_json = Set(error
+        .as_deref()
+        .map(crate::package_record::encode_operation_error));
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
     row.update(db).await?;
     Ok(())
@@ -408,7 +491,7 @@ pub async fn replace_pending(
     if parent.revision != revision || parent.pending_json.is_none() || parent.state == "installed" {
         bail!("plugins.stale");
     }
-    let mut row: plugin_installation::ActiveModel = parent.into();
+    let mut row: package_installation::ActiveModel = parent.operational();
     row.pending_json = Set(Some(pending));
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
     row.update(db).await?;
@@ -430,30 +513,30 @@ pub async fn delete_parent(
     {
         bail!("plugin removal is incomplete");
     }
-    plugin_component::Entity::delete_many()
-        .filter(plugin_component::Column::PluginId.eq(id))
+    package_component::Entity::delete_many()
+        .filter(package_component::Column::PackageId.eq(id))
         .exec(db)
         .await?;
     super::plugin_metadata::replace_lists(db, id, Vec::new(), Vec::new()).await?;
-    plugin_installation::Entity::delete_by_id(id.to_owned())
+    package_installation::Entity::delete_by_id(id.to_owned())
         .exec(db)
         .await?;
     Ok(())
 }
 
 pub async fn interrupt_unfinished(db: &pioneer_sqlite::SqliteTransaction) -> Result<usize> {
-    let parents = plugin_installation::Entity::find()
+    let parents = package_installation::Entity::find()
         .filter(
             Condition::any()
-                .add(plugin_installation::Column::State.is_in([
+                .add(package_installation::Column::State.is_in([
                     "installing",
                     "updating",
                     "removing",
                 ]))
                 .add(
                     Condition::all()
-                        .add(plugin_installation::Column::State.eq("installed"))
-                        .add(plugin_installation::Column::PendingJson.is_not_null()),
+                        .add(package_installation::Column::State.eq("installed"))
+                        .add(package_installation::Column::PendingJson.is_not_null()),
                 ),
         )
         .limit(128)
@@ -461,9 +544,11 @@ pub async fn interrupt_unfinished(db: &pioneer_sqlite::SqliteTransaction) -> Res
         .await?;
     let count = parents.len();
     for parent in parents {
-        let mut row: plugin_installation::ActiveModel = parent.into();
+        let mut row: package_installation::ActiveModel = parent.into();
         row.state = Set("interrupted".into());
-        row.last_error = Set(Some("plugins.interrupted".into()));
+        row.last_error_json = Set(Some(crate::package_record::encode_operation_error(
+            "plugins.interrupted",
+        )));
         row.updated_at = Set(chrono::Utc::now().fixed_offset());
         row.update(db).await?;
     }
@@ -500,10 +585,10 @@ pub async fn interrupt_mutation(
     if parent.revision != revision {
         bail!("plugins.stale");
     }
-    let mut row: plugin_installation::ActiveModel = parent.into();
+    let mut row: package_installation::ActiveModel = parent.operational();
     row.state = Set("interrupted".into());
     row.pending_json = Set(Some(pending));
-    row.last_error = Set(Some(error));
+    row.last_error_json = Set(Some(crate::package_record::encode_operation_error(&error)));
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
     row.update(db).await?;
     Ok(())
@@ -526,7 +611,7 @@ pub async fn prepare_reload(
     {
         bail!("plugins.stale");
     }
-    let mut row: plugin_installation::ActiveModel = parent.into();
+    let mut row: package_installation::ActiveModel = parent.operational();
     row.state = Set("installed".into());
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
     row.update(db).await?;
@@ -558,7 +643,10 @@ pub async fn graph_stop_candidates<C: ConnectionTrait>(
         .expr(Expr::val(1))
         .from_function(
             Func::cust(Alias::new("json_each"))
-                .arg(Expr::col((turn::Entity, turn::Column::PluginSelectionJson)))
+                .arg(Expr::col((
+                    turn::Entity,
+                    turn::Column::PackageSelectionJson,
+                )))
                 .arg(Expr::val("$.parents")),
             Alias::new("p"),
         )
@@ -624,8 +712,10 @@ pub async fn graph_stop_candidates<C: ConnectionTrait>(
 
 /// One admitted native settings write. Only field names and an opaque current
 /// action outcome live on the parent/link; settings remain in native records.
+pub type PluginNativeWrite = PackageNativeWrite;
 #[derive(Clone, Debug)]
-pub struct PluginNativeWrite {
+pub struct PackageNativeWrite {
+    pub kind: crate::PackageKind,
     pub plugin_id: String,
     pub expected_revision: i64,
     pub member_key: String,
@@ -649,8 +739,9 @@ pub async fn validate_native_write<C: ConnectionTrait>(
                 .await?
                 .context("plugin parent missing")?;
             if write.child_id != child
-                || link.plugin_id != write.plugin_id
+                || link.package_id != write.plugin_id
                 || link.member_key != write.member_key
+                || parent.kind != write.kind
                 || parent.workspace_id != workspace
                 || parent.revision != write.expected_revision
                 || parent.pending_json.is_none()
@@ -673,7 +764,7 @@ pub async fn publish_native_write(
     kind: &str,
     removed: bool,
 ) -> Result<()> {
-    let link = plugin_component::Entity::find_by_id((
+    let link = package_component::Entity::find_by_id((
         write.plugin_id.clone(),
         kind.to_owned(),
         write.member_key.clone(),
@@ -681,7 +772,7 @@ pub async fn publish_native_write(
     .one(db)
     .await?
     .context("plugin component missing")?;
-    let mut row: plugin_component::ActiveModel = link.into();
+    let mut row: package_component::ActiveModel = link.into();
     row.override_fields_json = Set(write.override_fields_json.clone());
     if removed {
         row.status = Set("removed_by_user".into());
@@ -691,10 +782,10 @@ pub async fn publish_native_write(
     let parent = find(db, &write.plugin_id)
         .await?
         .context("plugin parent missing")?;
-    if parent.revision != write.expected_revision {
+    if parent.kind != write.kind || parent.revision != write.expected_revision {
         bail!("plugin settings revision changed");
     }
-    let mut parent: plugin_installation::ActiveModel = parent.into();
+    let mut parent: package_installation::ActiveModel = parent.operational();
     parent.pending_json = Set(Some(write.pending_after.clone()));
     parent.updated_at = Set(chrono::Utc::now().fixed_offset());
     parent.update(db).await?;
@@ -712,12 +803,12 @@ pub async fn credential_retention<C: ConnectionTrait>(
         QueryTrait,
         sea_query::{Expr, UnionType},
     };
-    let pending = plugin_installation::Entity::find()
+    let pending = package_installation::Entity::find()
         .select_only()
         .expr_as(Expr::val("pending"), "kind")
-        .column_as(plugin_installation::Column::Id, "owner")
-        .column_as(plugin_installation::Column::PendingJson, "payload")
-        .filter(plugin_installation::Column::PendingJson.is_not_null())
+        .column_as(package_installation::Column::Id, "owner")
+        .column_as(package_installation::Column::PendingJson, "payload")
+        .filter(package_installation::Column::PendingJson.is_not_null())
         .into_query();
     let mut query = native::Entity::find()
         .select_only()
@@ -746,7 +837,7 @@ pub async fn resume_mutation(
     expected_pending: &str,
     pending: &str,
     state: &str,
-) -> Result<plugin_installation::Model> {
+) -> Result<PackageRecord> {
     let parent = find(db, id).await?.context("plugins.not_found")?;
     if parent.workspace_id != workspace
         || parent.revision != revision
@@ -757,13 +848,16 @@ pub async fn resume_mutation(
     let next = revision
         .checked_add(1)
         .context("plugin revision exhausted")?;
-    let mut row: plugin_installation::ActiveModel = parent.into();
+    let mut row: package_installation::ActiveModel = parent.operational();
     row.revision = Set(next);
     row.state = Set(state.to_owned());
     row.pending_json = Set(Some(pending.to_owned()));
-    row.last_error = Set(None);
+    row.last_error_json = Set(None);
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
-    Ok(row.update(db).await?)
+    row.update(db).await?;
+    find(db, id)
+        .await?
+        .context("package missing after mutation")
 }
 pub(crate) async fn publish_package(
     db: &pioneer_sqlite::SqliteTransaction,
@@ -774,21 +868,43 @@ pub(crate) async fn publish_package(
     fingerprint: &str,
     upload_id: Option<&str>,
     metadata: Option<super::plugin_metadata::PreparedMetadata>,
+    app: Option<&crate::PreparedAppMetadata>,
 ) -> Result<()> {
     let parent = find(db, id).await?.context("plugins.not_found")?;
     if parent.revision != revision || parent.pending_json.is_none() || parent.state != "updating" {
         bail!("plugins.stale");
     }
-    let mut row: plugin_installation::ActiveModel = parent.into();
+    match (parent.kind, app) {
+        (crate::PackageKind::Plugin, None) => {}
+        (crate::PackageKind::App, Some(app))
+            if parent.name == app.slug && app.fingerprint == fingerprint && metadata.is_none() => {}
+        _ => bail!("package metadata domain or App identity changed"),
+    }
+    let mut row: package_installation::ActiveModel = parent.operational();
     if let Some(upload) = upload_id {
         row.source_upload_id = Set(upload.into());
     }
-    if let Some(metadata) = metadata {
-        super::plugin_metadata::apply_columns(&mut row, metadata.columns);
-        super::plugin_metadata::replace_lists(db, id, metadata.keywords, metadata.prompts).await?;
+    if parent.kind == crate::PackageKind::Plugin {
+        let mut extension = parent.plugin_metadata();
+        extension.name = Set(name.into());
+        extension.version = Set(version.map(str::to_owned));
+        if let Some(metadata) = metadata {
+            super::plugin_metadata::apply_columns(&mut extension, metadata.columns);
+            super::plugin_metadata::replace_lists(db, id, metadata.keywords, metadata.prompts)
+                .await?;
+        }
+        extension.update(db).await?;
     }
-    row.name = Set(name.into());
-    row.version = Set(version.map(str::to_owned));
+    if let Some(app) = app {
+        let extension = app_installation::Entity::find_by_id(id.to_owned())
+            .one(db)
+            .await?
+            .context("App extension missing")?;
+        let mut extension: app_installation::ActiveModel = extension.into();
+        extension.manifest_json = Set(app.manifest_json.clone());
+        extension.localizations_json = Set(app.localizations_json.clone());
+        extension.update(db).await?;
+    }
     row.package_fingerprint = Set(fingerprint.into());
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
     row.update(db).await?;
@@ -812,7 +928,7 @@ pub async fn forget_component(
         bail!("plugins.stale");
     }
     if let Some(row) =
-        plugin_component::Entity::find_by_id((id.to_owned(), kind.to_owned(), key.to_owned()))
+        package_component::Entity::find_by_id((id.to_owned(), kind.to_owned(), key.to_owned()))
             .one(db)
             .await?
     {
@@ -831,7 +947,7 @@ pub async fn mark_package_removed(
     write: &PluginNativeWrite,
     kind: &str,
 ) -> Result<()> {
-    let link = plugin_component::Entity::find_by_id((
+    let link = package_component::Entity::find_by_id((
         write.plugin_id.clone(),
         kind.to_owned(),
         write.member_key.clone(),
@@ -842,7 +958,7 @@ pub async fn mark_package_removed(
     if link.skill_id.is_some() || link.mcp_installation_id.is_some() {
         bail!("native removal not published");
     }
-    let mut row: plugin_component::ActiveModel = link.into();
+    let mut row: package_component::ActiveModel = link.into();
     row.status = Set("failed".into());
     row.diagnostic = Set(Some("component_removed_for_update".into()));
     row.update(db).await?;

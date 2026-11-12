@@ -209,7 +209,6 @@ pub use super::user_notification_outbox::Entity as UserNotificationOutbox;
 pub use super::workspace::Entity as Workspace;
 pub use super::workspace_membership::Entity as WorkspaceMembership;
 
-pub use super::plugin_component::Entity as PluginComponent;
 pub use super::plugin_installation::Entity as PluginInstallation;
 pub use super::portable_payload_dictionary::Entity as PortablePayloadDictionary;
 
@@ -226,3 +225,7 @@ pub use super::task_child_reconcile_scope::Entity as TaskChildReconcileScope;
 pub use super::agent_memory_payloads::Entity as AgentMemoryPayloads;
 pub use super::execution_observation::Entity as ExecutionObservation;
 pub use super::execution_tariff::Entity as ExecutionTariff;
+
+pub use super::app_installation::Entity as AppInstallation;
+pub use super::package_component::Entity as PackageComponent;
+pub use super::package_installation::Entity as PackageInstallation;

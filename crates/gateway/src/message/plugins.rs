@@ -15,7 +15,7 @@ use std::path::Path;
 #[derive(Default)]
 struct PluginNativeInventory {
     metadata: Option<std::collections::HashMap<String, (i64, PluginMetadata)>>,
-    links: Option<std::collections::HashMap<String, Vec<pioneer_entity::plugin_component::Model>>>,
+    links: Option<std::collections::HashMap<String, Vec<pioneer_entity::package_component::Model>>>,
     skills: Option<std::collections::HashMap<String, (bool, String)>>,
     mcp: Option<std::collections::HashMap<String, (bool, Option<String>)>>,
 }
@@ -85,7 +85,7 @@ fn diagnostic_affects_status(diagnostic: &PluginDiagnostic) -> bool {
 /// Resolve authored package paths into the same authenticated storage namespace as avatars.
 pub(super) fn plugin_icon_links(
     metadata: &mut PluginMetadata,
-    parent: &pioneer_entity::plugin_installation::Model,
+    parent: &pioneer_crud::PackageRecord,
 ) {
     for icon in [&mut metadata.logo, &mut metadata.composer_icon]
         .into_iter()
@@ -136,9 +136,9 @@ impl MessageProcessor {
         self.admit_plugin_image(context, workspace).await?;
         let parent = self
             .crud_store
-            .find_plugin_installation(plugin_id)
+            .find_package_installation(plugin_id)
             .await?
-            .filter(|parent| parent.workspace_id == workspace)
+            .filter(|parent| parent.kind == PackageKind::Plugin && parent.workspace_id == workspace)
             .context("plugins.not_found")?;
         let guard = self
             .acquire_plugin_mutation(workspace, plugin_id, parent.revision)
@@ -383,6 +383,30 @@ impl MessageProcessor {
             .validate_workspace_id(workspace)
             .await
             .map_err(|_| invalid())?;
+        // Public Plugin facade cannot address an App, even though mechanics use
+        // the common package parent internally. Kind is immutable across this read.
+        if let Some(parent_id) = params
+            .get("plugin_id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                params
+                    .get("target")
+                    .and_then(|v| v.get("plugin_id"))
+                    .and_then(serde_json::Value::as_str)
+            })
+        {
+            if self
+                .crud_store
+                .find_package_installation(parent_id)
+                .await
+                .map_err(|_| invalid())?
+                .is_some_and(|parent| {
+                    parent.kind != PackageKind::Plugin || parent.workspace_id != workspace
+                })
+            {
+                return Err(invalid());
+            }
+        }
         match request.method.as_str() {
             methods::PLUGINS_LIST => {
                 let _: PluginsListParams =
@@ -401,7 +425,7 @@ impl MessageProcessor {
                     .await
                     .map_err(|_| plugin_error(id, "plugins.inventory_failed"))?
                 {
-                    links.entry(link.plugin_id.clone()).or_default().push(link);
+                    links.entry(link.package_id.clone()).or_default().push(link);
                 }
                 let mut inventory = PluginNativeInventory {
                     metadata: Some(
@@ -427,7 +451,7 @@ impl MessageProcessor {
                     serde_json::from_value(params).map_err(|_| invalid())?;
                 let parent = self
                     .crud_store
-                    .find_plugin_installation(&params.plugin_id)
+                    .find_package_installation(&params.plugin_id)
                     .await
                     .map_err(|_| invalid())?
                     .filter(|p| p.workspace_id == workspace)
@@ -691,7 +715,11 @@ impl MessageProcessor {
             .await
             .try_lock_owned()
             .map_err(|_| error())?;
-        let parent = pioneer_entity::plugin_installation::Model {
+        let parent = pioneer_crud::PackageRecord {
+            kind: pioneer_crud::PackageKind::Plugin,
+            app_manifest_json: None,
+            app_localizations_json: None,
+            operation_error_json: None,
             id: plugin_id.clone(),
             workspace_id: workspace.into(),
             name: plan.manifest.name.clone(),
@@ -801,6 +829,7 @@ impl MessageProcessor {
 
         for (component, reserved) in plan.components.iter().zip(&pending.children) {
             let mut ownership = PluginOwnershipWrite {
+                kind: pioneer_protocol::PackageKind::Plugin,
                 plugin_id: plugin_id.clone(),
                 expected_revision: 1,
                 member_key: reserved.key.clone(),
@@ -903,7 +932,7 @@ impl MessageProcessor {
         }
         let parent = self
             .crud_store
-            .find_plugin_installation(&plugin_id)
+            .find_package_installation(&plugin_id)
             .await
             .map_err(|_| error())?
             .ok_or_else(error)?;
@@ -923,7 +952,7 @@ impl MessageProcessor {
     async fn plugin_item(
         &self,
         context: &RequestContext,
-        parent: &pioneer_entity::plugin_installation::Model,
+        parent: &pioneer_crud::PackageRecord,
     ) -> anyhow::Result<PluginItem> {
         self.plugin_item_with_inventory(context, parent, &mut PluginNativeInventory::default())
             .await
@@ -932,7 +961,7 @@ impl MessageProcessor {
     async fn plugin_item_with_inventory(
         &self,
         context: &RequestContext,
-        parent: &pioneer_entity::plugin_installation::Model,
+        parent: &pioneer_crud::PackageRecord,
         inventory: &mut PluginNativeInventory,
     ) -> anyhow::Result<PluginItem> {
         let links = match inventory.links.as_mut() {
@@ -1171,7 +1200,7 @@ impl MessageProcessor {
 /// Request-owned parent admission. Internal native calls borrow this typed
 /// context instead of reacquiring the parent before their native lifecycle lock.
 pub(crate) struct PluginMutationGuard {
-    pub(super) parent: pioneer_entity::plugin_installation::Model,
+    pub(super) parent: pioneer_crud::PackageRecord,
     limits: pioneer_plugins::Limits,
     _lock: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
@@ -1182,7 +1211,7 @@ impl PluginMutationGuard {
     pub(super) async fn fs_prepare<T: Send + 'static>(
         &self,
         work: impl FnOnce(
-            &pioneer_entity::plugin_installation::Model,
+            &pioneer_crud::PackageRecord,
             &tokio_util::sync::CancellationToken,
         ) -> anyhow::Result<T>
         + Send
@@ -1201,9 +1230,7 @@ impl PluginMutationGuard {
     /// remains in the async request and its durable pending plan.
     pub(super) async fn fs<T: Send + 'static>(
         &self,
-        work: impl FnOnce(&pioneer_entity::plugin_installation::Model) -> anyhow::Result<T>
-        + Send
-        + 'static,
+        work: impl FnOnce(&pioneer_crud::PackageRecord) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
         let hold = self._lock.clone();
         let parent = self.parent.clone();
@@ -1213,7 +1240,7 @@ impl PluginMutationGuard {
         })
         .await?
     }
-    pub(crate) fn parent(&self) -> &pioneer_entity::plugin_installation::Model {
+    pub(crate) fn parent(&self) -> &pioneer_crud::PackageRecord {
         &self.parent
     }
 }
@@ -1233,7 +1260,7 @@ impl MessageProcessor {
         // acquiring the same parent mutex as native launch/recovery.
         anyhow::ensure!(
             self.crud_store
-                .find_plugin_installation(id)
+                .find_package_installation(id)
                 .await?
                 .is_some_and(|parent| parent.workspace_id == workspace),
             "plugins.not_found"
@@ -1245,7 +1272,7 @@ impl MessageProcessor {
             .map_err(|_| anyhow::anyhow!("plugins.busy"))?;
         let parent = self
             .crud_store
-            .find_plugin_installation(id)
+            .find_package_installation(id)
             .await?
             .filter(|parent| parent.workspace_id == workspace)
             .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
@@ -1428,7 +1455,7 @@ impl MessageProcessor {
                 .find_mcp_plugin_owner(&id)
                 .await?
                 .filter(|owner| {
-                    owner.plugin_id == parent.id && owner.member_key == child.member_key
+                    owner.package_id == parent.id && owner.member_key == child.member_key
                 })
                 .ok_or_else(|| anyhow::anyhow!("plugins.component_owner_changed"))?;
             let _ = owner;
@@ -1514,7 +1541,7 @@ impl MessageProcessor {
         let Ok(Some(owner)) = store.find_mcp_plugin_owner(installation).await else {
             return;
         };
-        let Ok(Some(parent)) = store.find_plugin_installation(&owner.plugin_id).await else {
+        let Ok(Some(parent)) = store.find_package_installation(&owner.package_id).await else {
             return;
         };
         if parent.workspace_id == workspace {
@@ -1530,7 +1557,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn publish_plugin_changed(&self, parent: &pioneer_entity::plugin_installation::Model) {
+    async fn publish_plugin_changed(&self, parent: &pioneer_crud::PackageRecord) {
         self.send_plugin_changed_notification(&PluginsChangedNotification {
             workspace_id: parent.workspace_id.clone(),
             plugin_id: parent.id.clone(),
@@ -1613,7 +1640,7 @@ impl MessageProcessor {
             // Re-read it instead of reopening a completed action with stale data.
             if let Some(current) = self
                 .crud_store
-                .find_plugin_installation(&guard.parent.id)
+                .find_package_installation(&guard.parent.id)
                 .await
                 .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?
             {
@@ -1632,7 +1659,7 @@ impl MessageProcessor {
         }
         let parent = self
             .crud_store
-            .find_plugin_installation(&guard.parent.id)
+            .find_package_installation(&guard.parent.id)
             .await
             .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?
             .ok_or_else(|| plugin_error(request, "plugins.not_found"))?;
@@ -1679,7 +1706,7 @@ impl MessageProcessor {
             .map_err(|_| anyhow::anyhow!("plugins.management_denied"))?;
         let parent = self
             .crud_store
-            .find_plugin_installation(&link.plugin_id)
+            .find_package_installation(&link.package_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
         let mut guard = self
@@ -1720,7 +1747,7 @@ impl MessageProcessor {
         };
         let link = current
             .filter(|current| {
-                current.plugin_id == guard.parent.id && current.member_key == link.member_key
+                current.package_id == guard.parent.id && current.member_key == link.member_key
             })
             .ok_or_else(|| anyhow::anyhow!("plugins.stale"))?;
         let mut overrides: std::collections::BTreeSet<String> =
@@ -1771,6 +1798,7 @@ impl MessageProcessor {
         }
         pending["native_committed"] = json!(true);
         let write = pioneer_crud::PluginNativeWrite {
+            kind: guard.parent.kind,
             plugin_id: guard.parent.id.clone(),
             expected_revision: guard.parent.revision,
             member_key: link.member_key,
@@ -1803,7 +1831,7 @@ impl MessageProcessor {
             // marker. Do not replace it with pre-commit pending after a failed effect.
             let current = self
                 .crud_store
-                .find_plugin_installation(&parent.id)
+                .find_package_installation(&parent.id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
             if current.revision == parent.revision
@@ -1854,7 +1882,7 @@ impl MessageProcessor {
     ) -> anyhow::Result<()> {
         let parent = self
             .crud_store
-            .find_plugin_installation(&change.guard.parent.id)
+            .find_package_installation(&change.guard.parent.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
         if let Some(pending) = &parent.pending_json {
@@ -1894,7 +1922,7 @@ impl MessageProcessor {
         };
         let parent = self
             .crud_store
-            .find_plugin_installation(&link.plugin_id)
+            .find_package_installation(&link.package_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
         let guard = self
@@ -1913,7 +1941,7 @@ impl MessageProcessor {
             }
         };
         anyhow::ensure!(
-            current.is_some_and(|current| current.plugin_id == guard.parent.id
+            current.is_some_and(|current| current.package_id == guard.parent.id
                 && current.member_key == link.member_key),
             "plugins.stale"
         );
@@ -1972,7 +2000,7 @@ pub(super) async fn acquire_plugin_selection_admission(
             .try_lock_owned()
             .map_err(|_| anyhow::anyhow!("plugins.busy"))?;
         let parent = store
-            .find_plugin_installation(&selected.id)
+            .find_package_installation(&selected.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
         anyhow::ensure!(
@@ -2024,7 +2052,7 @@ pub(super) async fn validate_cli_plugin_selection(
     anyhow::ensure!(snapshot.phase == "ready", "plugins.selection_not_ready");
     for selected in &snapshot.parents {
         let parent = store
-            .find_plugin_installation(&selected.id)
+            .find_package_installation(&selected.id)
             .await?
             .context("plugin parent missing")?;
         anyhow::ensure!(

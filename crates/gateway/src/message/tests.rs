@@ -1679,7 +1679,11 @@ fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
         std::fs::create_dir_all(&member).unwrap();
         std::fs::write(member.join("SKILL.md"), "---\nname: bundled\ndescription: Bundled regression skill\n---\nInstructions\n").unwrap();
         let now = chrono::Utc::now().fixed_offset();
-        harness.crud_store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        harness.crud_store.insert_plugin_installation(&pioneer_crud::PackageRecord {
+            kind: pioneer_crud::PackageKind::Plugin,
+            app_manifest_json: None,
+            app_localizations_json: None,
+                operation_error_json: None,
             id: parent_id.clone(), workspace_id: harness.workspace_id.clone(), name: "authoritative-name".into(), version: None, source_upload_id: "upload-plugin".into(), package_path: package.to_string_lossy().into(), data_path: fixture.join("data").to_string_lossy().into(), package_fingerprint: "tree".into(), enabled: true, allow_implicit_invocation: false, state: "installing".into(), revision: 1,
         display_name: None,
         short_description: None,
@@ -1723,6 +1727,7 @@ fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
         let mut disabled = policy.clone(); disabled.enabled = Some(false);
         let gate=harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&parent_id,1,"updating",true,"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":false}").await.unwrap();
         harness.crud_store.upsert_workspace_skill_policy_with_plugin_change(&disabled,Some(&pioneer_crud::PluginNativeWrite {
+            kind: pioneer_protocol::PackageKind::Plugin,
             plugin_id:parent_id.clone(),expected_revision:gate.revision,member_key:"bundled".into(),child_id:skill_id.to_string(),override_fields_json:"[\"enabled\"]".into(),
             pending_after:"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":true}".into()
         }),2).await.unwrap();
@@ -1747,7 +1752,11 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
     let package = fixture.join("package");
     let parent_id = "P".repeat(21);
     let now = chrono::Utc::now().fixed_offset();
-    let parent = pioneer_entity::plugin_installation::Model {
+    let parent = pioneer_crud::PackageRecord {
+        kind: pioneer_crud::PackageKind::Plugin,
+        app_manifest_json: None,
+        app_localizations_json: None,
+        operation_error_json: None,
         id: parent_id.clone(),
         workspace_id: harness.workspace_id.clone(),
         name: "fixture".into(),
@@ -1833,6 +1842,7 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
                 &[fixture_skill_lifecycle_audit(id, key, "install", 1)],
                 None,
                 Some(&pioneer_crud::PluginOwnershipWrite {
+                    kind: pioneer_protocol::PackageKind::Plugin,
                     plugin_id: parent_id.clone(),
                     expected_revision: 1,
                     member_key: key.into(),
@@ -1898,6 +1908,7 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
                     created_at_unix: 1,
                 },
                 Some(&pioneer_crud::PluginOwnershipWrite {
+                    kind: pioneer_protocol::PackageKind::Plugin,
                     plugin_id: parent_id.clone(),
                     expected_revision: 1,
                     member_key: key.into(),
@@ -1914,6 +1925,7 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
         .crud_store
         .record_plugin_component_failure(
             &pioneer_crud::PluginOwnershipWrite {
+                kind: pioneer_protocol::PackageKind::Plugin,
                 plugin_id: parent_id.clone(),
                 expected_revision: 1,
                 member_key: "secret-failed-skill".into(),
@@ -90773,7 +90785,11 @@ async fn failed_drained_selected_plugin_task_child(tool_calling: bool) {
     let parent = "P".repeat(21);
     let now = chrono::Utc::now().fixed_offset();
     store
-        .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        .insert_plugin_installation(&pioneer_crud::PackageRecord {
+            kind: pioneer_crud::PackageKind::Plugin,
+            app_manifest_json: None,
+            app_localizations_json: None,
+            operation_error_json: None,
             id: parent.clone(),
             workspace_id: workspace.clone(),
             name: "empty-selected".into(),
@@ -91106,7 +91122,11 @@ async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barri
     std::fs::create_dir(temporary.path().join("data")).unwrap();
     let id = "P".repeat(21);
     let now = chrono::Utc::now().fixed_offset();
-    let parent = pioneer_entity::plugin_installation::Model {
+    let parent = pioneer_crud::PackageRecord {
+        kind: pioneer_crud::PackageKind::Plugin,
+        app_manifest_json: None,
+        app_localizations_json: None,
+        operation_error_json: None,
         id: id.clone(),
         workspace_id: workspace.clone(),
         name: "empty".into(),
@@ -91164,6 +91184,7 @@ async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barri
             "plugin-admission-turn",
             &pioneer_protocol::PluginSelectionSnapshot {
                 parents: vec![pioneer_protocol::PluginSelectedParent {
+                    kind: pioneer_protocol::PackageKind::Plugin,
                     id: id.clone(),
                     revision: 1,
                 }],

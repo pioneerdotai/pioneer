@@ -214,7 +214,6 @@ pub mod workspace_membership;
 pub mod compaction_checkpoint_event_input;
 pub mod compaction_checkpoint_import;
 pub mod compaction_checkpoint_replay_alias;
-pub mod plugin_component;
 pub mod plugin_installation;
 
 pub mod portable_payload_dictionary;
@@ -232,3 +231,7 @@ pub mod task_child_reconcile_scope;
 pub mod agent_memory_payloads;
 pub mod execution_observation;
 pub mod execution_tariff;
+
+pub mod app_installation;
+pub mod package_component;
+pub mod package_installation;

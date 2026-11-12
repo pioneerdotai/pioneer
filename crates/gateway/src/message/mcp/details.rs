@@ -171,7 +171,7 @@ impl MessageProcessor {
 
         server.plugin_owner = match self.crud_store.find_mcp_plugin_owner(&server_id).await {
             Ok(owner) => owner.map(|owner| pioneer_protocol::PluginOwner {
-                plugin_id: owner.plugin_id,
+                plugin_id: owner.package_id,
                 member_key: owner.member_key,
             }),
             Err(_) => {

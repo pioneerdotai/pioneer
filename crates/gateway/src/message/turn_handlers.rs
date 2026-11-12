@@ -1683,11 +1683,12 @@ impl MessageProcessor {
                     }
                     let parent = self
                         .crud_store
-                        .find_plugin_installation(plugin_id)
+                        .find_package_installation(plugin_id)
                         .await
                         .map_err(|_| TurnStartFailure::unavailable("plugin inventory unavailable"))?
                         .filter(|p| {
-                            p.workspace_id == workspace_id
+                            p.kind == pioneer_protocol::PackageKind::Plugin
+                                && p.workspace_id == workspace_id
                                 && p.enabled
                                 && p.state == "installed"
                                 && p.pending_json.is_none()
@@ -1804,6 +1805,7 @@ impl MessageProcessor {
                     plugin_selection
                         .parents
                         .push(pioneer_protocol::PluginSelectedParent {
+                            kind: parent.kind,
                             id: plugin_id.clone(),
                             revision: *expected_revision,
                         });

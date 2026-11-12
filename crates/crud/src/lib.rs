@@ -1,5 +1,9 @@
+mod package_record;
+pub use package_record::{PackageKind, PackageRecord, PreparedAppMetadata};
 mod plugins;
-pub use plugins::{PluginNativeWrite, PluginOwnershipWrite};
+pub use plugins::{
+    PackageNativeWrite, PackageOwnershipWrite, PluginNativeWrite, PluginOwnershipWrite,
+};
 mod memory_payload_store;
 pub mod portable_payload_codec;
 #[doc(hidden)]
@@ -40774,7 +40778,7 @@ mod tests {
         for (table, column) in [
             ("task_trigger", "webhook_secret_ref"),
             ("task_run", "trigger_input_json"),
-            ("turn", "plugin_selection_json"),
+            ("turn", "package_selection_json"),
         ] {
             if !schema.has_column(table, column).await.unwrap() {
                 schema
@@ -48329,7 +48333,7 @@ mod tests {
         pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
             id: Set(turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
-            plugin_selection_json: Set(None),
+            package_selection_json: Set(None),
             status: Set("completed".to_owned()),
             error: Set(None),
             prompt_manifest_json: Set("{}".to_owned()),

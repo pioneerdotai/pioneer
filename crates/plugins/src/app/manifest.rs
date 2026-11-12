@@ -220,6 +220,37 @@ impl AppManifest {
         }
         Ok(result)
     }
+    /// Validate the stored translation snapshot with the same strict JSON rules.
+    /// It must cover exactly the declared canonical locales, never extra authority.
+    pub fn validate_localizations_json(&self, bytes: &[u8]) -> Result<BTreeMap<String, Value>> {
+        let value = json::parse(bytes, "localizations")?;
+        let map = value
+            .as_object()
+            .ok_or_else(|| ManifestError::new("invalid_type", "localizations"))?;
+        if map.len() != self.locales.len() || map.keys().any(|key| !self.locales.contains_key(key))
+        {
+            return Err(ManifestError::new(
+                "locale_snapshot_mismatch",
+                "localizations",
+            ));
+        }
+        for (key, value) in map {
+            let field = format!("localizations/{key}");
+            let m = object(
+                value,
+                &field,
+                &["name", "shortDescription", "longDescription"],
+            )?;
+            for (key, limit) in [
+                ("name", 80),
+                ("shortDescription", 240),
+                ("longDescription", 16000),
+            ] {
+                optional(m, key, &field, limit)?;
+            }
+        }
+        Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
     pub fn presentation(
         &self,
         requested: &str,

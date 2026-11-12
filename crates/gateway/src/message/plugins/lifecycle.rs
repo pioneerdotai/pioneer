@@ -66,7 +66,7 @@ fn package_snapshot_cancellable(
     Ok((snapshot, plan))
 }
 pub(super) fn verified_package(
-    parent: &pioneer_entity::plugin_installation::Model,
+    parent: &pioneer_crud::PackageRecord,
     cancellation: &tokio_util::sync::CancellationToken,
     limits: pioneer_plugins::Limits,
 ) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
@@ -276,7 +276,7 @@ impl MessageProcessor {
     ) -> Result<PluginsMutationResponse, JsonRpcErrorResponse> {
         let current = self
             .crud_store
-            .find_plugin_installation(&params.plugin_id)
+            .find_package_installation(&params.plugin_id)
             .await
             .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?;
         if current
@@ -487,7 +487,7 @@ impl MessageProcessor {
                         // staged files unless a reread proves that no plan owns them.
                         if self
                             .crud_store
-                            .find_plugin_installation(&params.plugin_id)
+                            .find_package_installation(&params.plugin_id)
                             .await
                             .ok()
                             .flatten()
@@ -849,7 +849,7 @@ impl MessageProcessor {
         if result.is_err() {
             if let Some(current) = self
                 .crud_store
-                .find_plugin_installation(&guard.parent.id)
+                .find_package_installation(&guard.parent.id)
                 .await
                 .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?
             {
@@ -887,7 +887,7 @@ impl MessageProcessor {
         }
         let parent = self
             .crud_store
-            .find_plugin_installation(&guard.parent.id)
+            .find_package_installation(&guard.parent.id)
             .await
             .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?;
         self.publish_plugin_changed(parent.as_ref().unwrap_or(&guard.parent))
@@ -910,15 +910,16 @@ impl MessageProcessor {
     async fn native_write_for_link(
         &self,
         guard: &PluginMutationGuard,
-        link: &pioneer_entity::plugin_component::Model,
+        link: &pioneer_entity::package_component::Model,
     ) -> anyhow::Result<pioneer_crud::PluginNativeWrite> {
         let parent = self
             .crud_store
-            .find_plugin_installation(&guard.parent.id)
+            .find_package_installation(&guard.parent.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
         anyhow::ensure!(parent.revision == guard.parent.revision, "plugins.stale");
         Ok(pioneer_crud::PluginNativeWrite {
+            kind: parent.kind,
             plugin_id: parent.id,
             expected_revision: parent.revision,
             member_key: link.member_key.clone(),
@@ -938,7 +939,7 @@ impl MessageProcessor {
         context: &RequestContext,
         request: &RequestId,
         guard: &PluginMutationGuard,
-        link: &pioneer_entity::plugin_component::Model,
+        link: &pioneer_entity::package_component::Model,
     ) -> anyhow::Result<()> {
         if link.skill_id.is_none() && link.mcp_installation_id.is_none() {
             return Ok(());
@@ -1019,6 +1020,7 @@ impl MessageProcessor {
                     .await?;
             }
             let mut ownership = PluginOwnershipWrite {
+                kind: guard.parent.kind,
                 plugin_id: guard.parent.id.clone(),
                 expected_revision: guard.parent.revision,
                 member_key: reserved.key.clone(),
@@ -1144,7 +1146,7 @@ impl MessageProcessor {
     ) -> anyhow::Result<()> {
         let parent = self
             .crud_store
-            .find_plugin_installation(&guard.parent.id)
+            .find_package_installation(&guard.parent.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("plugins.not_found"))?;
         let value: serde_json::Value = serde_json::from_str(
@@ -1253,7 +1255,7 @@ impl MessageProcessor {
                         .crud_store
                         .find_mcp_plugin_owner(id)
                         .await?
-                        .filter(|link| link.plugin_id == guard.parent.id)
+                        .filter(|link| link.package_id == guard.parent.id)
                         .ok_or_else(|| anyhow::anyhow!("plugins.component_owner_changed"))?;
                     let _native = self
                         .mcp_service
@@ -1293,7 +1295,7 @@ impl MessageProcessor {
         if !matches!(result, Ok(())) {
             let current = self
                 .crud_store
-                .find_plugin_installation(&guard.parent.id)
+                .find_package_installation(&guard.parent.id)
                 .await
                 .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?
                 .ok_or_else(|| plugin_error(request, "plugins.not_found"))?;
@@ -1317,7 +1319,7 @@ impl MessageProcessor {
         }
         let parent = self
             .crud_store
-            .find_plugin_installation(&guard.parent.id)
+            .find_package_installation(&guard.parent.id)
             .await
             .map_err(|_| plugin_error(request, "plugins.inventory_failed"))?
             .ok_or_else(|| plugin_error(request, "plugins.not_found"))?;

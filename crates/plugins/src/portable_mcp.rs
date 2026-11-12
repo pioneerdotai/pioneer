@@ -8,6 +8,32 @@ use std::{
 };
 use url::{Host, Url};
 
+/// Format-specific root convention; runtime ownership is supplied separately by Gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageRootKind {
+    Plugin,
+    App,
+}
+impl PackageRootKind {
+    fn root(self) -> &'static str {
+        match self {
+            Self::Plugin => "${PLUGIN_ROOT}",
+            Self::App => "${APP_ROOT}",
+        }
+    }
+    fn data(self) -> &'static str {
+        match self {
+            Self::Plugin => "${PLUGIN_DATA}",
+            Self::App => "${APP_DATA}",
+        }
+    }
+    fn env(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Plugin => ("PLUGIN_ROOT", "PLUGIN_DATA"),
+            Self::App => ("APP_ROOT", "APP_DATA"),
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum PortableServer {
@@ -69,6 +95,13 @@ pub fn parse_mcp(
         .collect())
 }
 fn parse_server(key: &str, value: &Value) -> Result<PortableServer, Diagnostic> {
+    parse_server_for(key, value, PackageRootKind::Plugin)
+}
+pub(crate) fn parse_server_for(
+    key: &str,
+    value: &Value,
+    roots: PackageRootKind,
+) -> Result<PortableServer, Diagnostic> {
     let pointer = format!(
         "mcp.json/mcpServers/{}",
         crate::diagnostic::pointer_key(key)
@@ -95,11 +128,14 @@ fn parse_server(key: &str, value: &Value) -> Result<PortableServer, Diagnostic> 
             if !valid_command(command)
                 || args.iter().any(|v| v.contains('\0'))
                 || env.iter().any(|(k, v)| {
-                    k.is_empty() || k.contains(['=', '\0']) || v.contains('\0') || reserved_env(k)
+                    k.is_empty()
+                        || k.contains(['=', '\0'])
+                        || v.contains('\0')
+                        || reserved_env(k, roots)
                 })
                 || cwd
                     .as_ref()
-                    .is_some_and(|s| !valid_cwd(s) || s.contains('\0'))
+                    .is_some_and(|s| !valid_cwd(s, roots) || s.contains('\0'))
             {
                 return Err(fail());
             }
@@ -120,11 +156,12 @@ fn parse_server(key: &str, value: &Value) -> Result<PortableServer, Diagnostic> 
     }
     Ok(server)
 }
-fn reserved_env(key: &str) -> bool {
+fn reserved_env(key: &str, roots: PackageRootKind) -> bool {
+    let (root, data) = roots.env();
     if cfg!(windows) {
-        key.eq_ignore_ascii_case("PLUGIN_ROOT") || key.eq_ignore_ascii_case("PLUGIN_DATA")
+        key.eq_ignore_ascii_case(root) || key.eq_ignore_ascii_case(data)
     } else {
-        key == "PLUGIN_ROOT" || key == "PLUGIN_DATA"
+        key == root || key == data
     }
 }
 fn valid_command(s: &str) -> bool {
@@ -139,12 +176,12 @@ fn valid_command(s: &str) -> bool {
     // Bare executable names are resolved by Command::new on the Gateway.
     !s.chars().any(char::is_whitespace) && !s.contains(['/', '\\', ':']) && s != "." && s != ".."
 }
-fn valid_cwd(s: &str) -> bool {
+fn valid_cwd(s: &str, roots: PackageRootKind) -> bool {
     s.starts_with("./")
-        || s == "${PLUGIN_ROOT}"
-        || s.starts_with("${PLUGIN_ROOT}/")
-        || s == "${PLUGIN_DATA}"
-        || s.starts_with("${PLUGIN_DATA}/")
+        || s == roots.root()
+        || s.starts_with(&format!("{}/", roots.root()))
+        || s == roots.data()
+        || s.starts_with(&format!("{}/", roots.data()))
 }
 fn valid_url(s: &str) -> bool {
     let Ok(url) = Url::parse(s) else {
@@ -188,20 +225,23 @@ fn valid_headers(headers: &BTreeMap<String, String>) -> bool {
 /// Replace only exact tokens in the original input. Replacement text is never
 /// rescanned, including roots which happen to contain another token.
 pub fn expand(value: &str, root: &str, data: &str) -> String {
+    expand_for(value, root, data, PackageRootKind::Plugin)
+}
+fn expand_for(value: &str, root: &str, data: &str, roots: PackageRootKind) -> String {
     let mut result = String::with_capacity(value.len());
     let mut rest = value;
-    while let Some(index) = rest.find("${PLUGIN_") {
+    while let Some(index) = rest.find("${") {
         result.push_str(&rest[..index]);
         rest = &rest[index..];
-        if let Some(next) = rest.strip_prefix("${PLUGIN_ROOT}") {
+        if let Some(next) = rest.strip_prefix(roots.root()) {
             result.push_str(root);
             rest = next;
-        } else if let Some(next) = rest.strip_prefix("${PLUGIN_DATA}") {
+        } else if let Some(next) = rest.strip_prefix(roots.data()) {
             result.push_str(data);
             rest = next;
         } else {
-            result.push_str("${PLUGIN_");
-            rest = &rest[9..];
+            result.push_str("${");
+            rest = &rest[2..];
         }
     }
     result.push_str(rest);
@@ -215,12 +255,20 @@ pub fn expanded_environment(
     root: &str,
     data: &str,
 ) -> BTreeMap<String, String> {
+    expanded_environment_for(env, root, data, PackageRootKind::Plugin)
+}
+fn expanded_environment_for(
+    env: &BTreeMap<String, String>,
+    root: &str,
+    data: &str,
+    roots: PackageRootKind,
+) -> BTreeMap<String, String> {
     let mut values: BTreeMap<_, _> = env
         .iter()
-        .map(|(k, v)| (k.clone(), expand(v, root, data)))
+        .map(|(k, v)| (k.clone(), expand_for(v, root, data, roots)))
         .collect();
-    values.insert("PLUGIN_ROOT".into(), root.into());
-    values.insert("PLUGIN_DATA".into(), data.into());
+    values.insert(roots.env().0.into(), root.into());
+    values.insert(roots.env().1.into(), data.into());
     values
 }
 
@@ -246,8 +294,16 @@ pub fn resolve(
     root: &std::path::Path,
     data: &std::path::Path,
 ) -> anyhow::Result<ResolvedServer> {
+    resolve_for(server, root, data, PackageRootKind::Plugin)
+}
+pub fn resolve_for(
+    server: &PortableServer,
+    root: &std::path::Path,
+    data: &std::path::Path,
+    roots: PackageRootKind,
+) -> anyhow::Result<ResolvedServer> {
     use anyhow::{Context, bail};
-    parse_server("adapter", &serde_json::to_value(server)?)
+    parse_server_for("adapter", &serde_json::to_value(server)?, roots)
         .map_err(|_| anyhow::anyhow!("invalid_portable_server"))?;
     if let PortableServer::StreamableHttp { url, headers } = server {
         return Ok(ResolvedServer::StreamableHttp {
@@ -281,9 +337,10 @@ pub fn resolve(
             let cwd = match cwd.as_deref() {
                 None => root.clone(),
                 Some(value)
-                    if value == "${PLUGIN_DATA}" || value.starts_with("${PLUGIN_DATA}/") =>
+                    if value == roots.data()
+                        || value.starts_with(&format!("{}/", roots.data())) =>
                 {
-                    let expanded = expand(value, root_text, data_text);
+                    let expanded = expand_for(value, root_text, data_text, roots);
                     let suffix = expanded
                         .strip_prefix(data_text)
                         .context("invalid_data_cwd")?
@@ -292,7 +349,7 @@ pub fn resolve(
                     crate::containment::resolve_data_directory(&data, suffix)?
                 }
                 Some(value) => {
-                    let expanded = expand(value, root_text, data_text);
+                    let expanded = expand_for(value, root_text, data_text, roots);
                     let path = if let Some(relative) = expanded.strip_prefix("./") {
                         root.join(relative)
                     } else {
@@ -309,9 +366,9 @@ pub fn resolve(
                 command,
                 args: args
                     .iter()
-                    .map(|a| expand(a, root_text, data_text))
+                    .map(|a| expand_for(a, root_text, data_text, roots))
                     .collect(),
-                env: expanded_environment(env, root_text, data_text),
+                env: expanded_environment_for(env, root_text, data_text, roots),
                 cwd: cwd.to_str().context("invalid_cwd_path")?.to_owned(),
             })
         }
@@ -326,6 +383,13 @@ pub fn resolve(
 /// Preview checks the package path subset against the immutable byte snapshot.
 /// Opaque args/env/headers are deliberately excluded from containment checks.
 pub(crate) fn validate_snapshot_paths(server: &PortableServer, snapshot: &crate::Snapshot) -> bool {
+    validate_snapshot_paths_for(server, snapshot, PackageRootKind::Plugin)
+}
+pub(crate) fn validate_snapshot_paths_for(
+    server: &PortableServer,
+    snapshot: &crate::Snapshot,
+    roots: PackageRootKind,
+) -> bool {
     use crate::Entry;
     let contained_key = |value: &str| -> Option<String> {
         let mut parts = Vec::new();
@@ -351,15 +415,16 @@ pub(crate) fn validate_snapshot_paths(server: &PortableServer, snapshot: &crate:
                 }
             }
             match cwd.as_deref() {
-                None | Some("${PLUGIN_ROOT}") | Some("${PLUGIN_DATA}") => true,
-                Some(value) if value.starts_with("${PLUGIN_DATA}/") => value
-                    .strip_prefix("${PLUGIN_DATA}/")
+                None => true,
+                Some(value) if value == roots.root() || value == roots.data() => true,
+                Some(value) if value.starts_with(&format!("{}/", roots.data())) => value
+                    .strip_prefix(format!("{}/", roots.data()).as_str())
                     .and_then(contained_key)
                     .is_some(),
                 Some(value) => {
                     let path = value
                         .strip_prefix("./")
-                        .or_else(|| value.strip_prefix("${PLUGIN_ROOT}/"));
+                        .or_else(|| value.strip_prefix(format!("{}/", roots.root()).as_str()));
                     path.and_then(contained_key).is_some_and(|key| {
                         key.is_empty()
                             || matches!(snapshot.entries().get(&key), Some(Entry::Directory { .. }))

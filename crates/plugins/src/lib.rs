@@ -4,6 +4,7 @@ pub mod app;
 pub mod containment;
 mod diagnostic;
 mod discovery;
+pub mod images;
 mod manifest;
 mod metadata;
 pub mod portable_mcp;

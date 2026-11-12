@@ -386,7 +386,7 @@ impl MessageProcessor {
                             )
                         })?;
                     if !linked.is_some_and(|link| {
-                        link.plugin_id == owner.plugin_id && link.member_key == owner.member_key
+                        link.package_id == owner.plugin_id && link.member_key == owner.member_key
                     }) {
                         return Err(mcp_error(
                             Some(request_id),

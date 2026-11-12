@@ -1589,13 +1589,13 @@ impl HistoricalMigrationRows {
             pioneer_entity::turn::Entity::find_by_id(self.turn.id.clone())
                 .select_only()
                 .columns(pioneer_entity::turn::Column::iter().filter(|column| {
-                    !matches!(column, pioneer_entity::turn::Column::PluginSelectionJson)
+                    !matches!(column, pioneer_entity::turn::Column::PackageSelectionJson)
                 }))
                 // This historical schema predates plugin selections. Compare
                 // every stored column and supply its absent nullable field.
                 .expr_as(
                     Expr::val(None::<String>),
-                    pioneer_entity::turn::Column::PluginSelectionJson,
+                    pioneer_entity::turn::Column::PackageSelectionJson,
                 )
                 .one(db)
                 .await

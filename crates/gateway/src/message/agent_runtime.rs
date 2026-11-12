@@ -12767,7 +12767,7 @@ impl MessageProcessor {
                 capability.icon = None;
                 if let Ok(Some(parent)) = self
                     .crud_store
-                    .find_plugin_installation(&capability.plugin_id)
+                    .find_package_installation(&capability.plugin_id)
                     .await
                 {
                     if parent.workspace_id == workspace_id

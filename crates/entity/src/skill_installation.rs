@@ -30,6 +30,8 @@ pub struct Model {
         unique_key = "uq_skill_installation_pack_member_key"
     )]
     pub pack_member_key: Option<String>,
+    #[sea_orm(has_one)]
+    pub package_component: HasOne<super::package_component::Entity>,
     #[sea_orm(
         belongs_to,
         from = "pack_id",

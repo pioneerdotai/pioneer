@@ -2962,6 +2962,7 @@ mod tests {
         let manager = Arc::new(manager_with_factory(factory));
         let selection = pioneer_protocol::PluginSelectionSnapshot {
             parents: vec![pioneer_protocol::PluginSelectedParent {
+                kind: pioneer_protocol::PackageKind::Plugin,
                 id: "parent".into(),
                 revision: 1,
             }],

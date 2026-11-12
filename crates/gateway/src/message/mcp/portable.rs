@@ -27,7 +27,19 @@ pub(crate) fn portable_install_plan(
             .map(|(name, value)| (name, McpConfigValue::Literal { value }))
             .collect()
     };
-    let transport = match pioneer_plugins::portable_mcp::resolve(server, root, data)? {
+    let transport = match pioneer_plugins::portable_mcp::resolve_for(
+        server,
+        root,
+        data,
+        match owner.kind {
+            pioneer_protocol::PackageKind::Plugin => {
+                pioneer_plugins::portable_mcp::PackageRootKind::Plugin
+            }
+            pioneer_protocol::PackageKind::App => {
+                pioneer_plugins::portable_mcp::PackageRootKind::App
+            }
+        },
+    )? {
         ResolvedServer::Stdio {
             command,
             args,
@@ -72,7 +84,14 @@ pub(crate) fn portable_install_plan(
         name: owner.member_key.clone(),
         display_name: Some(owner.member_key.clone()),
         source_kind: McpSourceKind::Config,
-        source_ref: serde_json::json!({"plugin_id": owner.plugin_id, "member_key": owner.member_key}),
+        source_ref: match owner.kind {
+            pioneer_protocol::PackageKind::Plugin => {
+                serde_json::json!({"plugin_id": owner.plugin_id, "member_key": owner.member_key})
+            }
+            pioneer_protocol::PackageKind::App => {
+                serde_json::json!({"app_id": owner.plugin_id, "member_key": owner.member_key})
+            }
+        },
         transport,
         auth: McpAuthConfig::default(),
         secret_refs: vec![],
@@ -98,6 +117,7 @@ mod tests {
     use std::collections::BTreeMap;
     fn owner(plugin: &str) -> PluginOwnershipWrite {
         PluginOwnershipWrite {
+            kind: pioneer_protocol::PackageKind::Plugin,
             plugin_id: plugin.into(),
             expected_revision: 1,
             member_key: "zenmoney".into(),

@@ -123,7 +123,7 @@ impl MessageProcessor {
             match self.crud_store.find_mcp_plugin_owner(&item.id).await {
                 Ok(owner) => {
                     item.plugin_owner = owner.map(|o| pioneer_protocol::PluginOwner {
-                        plugin_id: o.plugin_id,
+                        plugin_id: o.package_id,
                         member_key: o.member_key,
                     })
                 }

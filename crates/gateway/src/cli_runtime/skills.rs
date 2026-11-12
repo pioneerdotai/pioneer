@@ -257,7 +257,7 @@ pub(crate) async fn build_cli_runtime_owned_skill_install_plans(
             continue;
         };
         let parent = store
-            .find_plugin_installation(&owner.plugin_id)
+            .find_package_installation(&owner.package_id)
             .await?
             .filter(|p| {
                 p.workspace_id == workspace
