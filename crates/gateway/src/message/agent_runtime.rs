@@ -10818,10 +10818,9 @@ impl MessageProcessor {
                 captured.contains(&exact),
                 "native fallback owner changed before stop"
             );
-            let pending = turn.status == pioneer_protocol::TurnStatus::InProgress;
             // Its normal completion path drains its captured predecessors;
             // do that before examining the rest of the unordered inventory.
-            if pending || !exact.is_quiescent() {
+            if !exact.is_quiescent() {
                 self.await_native_graph_owner(&exact, reason, deadline)
                     .await?;
             }
@@ -10836,10 +10835,9 @@ impl MessageProcessor {
                     );
                     continue;
                 }
-                // Preserve the outcome of an outstanding or pending run. A
-                // later independent mutation needs only a historical run's
-                // actual quiescence, not replay of its command failure.
-                if pending || !owner.is_quiescent() {
+                // A logical Turn can stay pending after its native run drained.
+                // This new stop needs actual quiescence, not that run's failure.
+                if !owner.is_quiescent() {
                     self.await_native_graph_owner(owner, reason, deadline)
                         .await?;
                 }
@@ -13695,21 +13693,12 @@ pub(super) fn select_native_graph_owners(
     if root_pending && !known_turns.contains(&(root_thread, root_turn)) {
         anyhow::bail!("pending root native owner is unknown");
     }
-    let pending_turns = targets
-        .iter()
-        .filter(|target| target.turn_pending)
-        .filter_map(|target| Some((target.thread_id.as_deref()?, target.turn_id.as_deref()?)))
-        .collect::<std::collections::BTreeSet<_>>();
-    // Retain every outstanding exact run, plus already proven latest outcomes
-    // requested by still-pending admission rows. Never replay historical errors.
+    // Pending rows require a known native owner above, but may lag its completed
+    // cleanup. A new stop awaits outstanding runs; the complete initial snapshot
+    // still owns final identity validation, including already quiescent runs.
     Ok(owners
         .into_iter()
-        .filter(|owner| {
-            !owner.is_quiescent()
-                || pending_turns.contains(&(owner.thread_id(), owner.turn_id()))
-                || (root_pending
-                    && (owner.thread_id(), owner.turn_id()) == (root_thread, root_turn))
-        })
+        .filter(|owner| !owner.is_quiescent())
         .collect())
 }
 

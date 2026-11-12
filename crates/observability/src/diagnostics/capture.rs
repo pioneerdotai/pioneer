@@ -1684,7 +1684,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_plan_version_spawn_and_early_exit_all_leave_sql_until_original_deadline() {
-        use std::os::unix::fs::PermissionsExt;
         let _consent = ConsentFixture::new();
         for case in ["plan", "version", "spawn", "exit_failure", "exit_success"] {
             let temp = tempfile::tempdir().unwrap();
@@ -1694,20 +1693,15 @@ mod tests {
                 "plan" => Err("fixture_plan_failed"),
                 "version" => Ok(shell_plan(0, "exit 7")),
                 "spawn" => {
-                    // The actual bounded version succeeds, then the actual
-                    // recording spawn fails because that fixture removed itself.
-                    let script = temp.path().join("one-version-only");
-                    fs::write(
-                        &script,
-                        b"#!/bin/sh\nrm -- \"$0\"\nprintf fixture-version\n",
-                    )
-                    .unwrap();
-                    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+                    // The supported platform version fallback succeeds, then
+                    // the real recording spawn fails with a missing executable.
+                    // Do not put first execution of a freshly written program
+                    // inside the short SQL capture window.
                     Ok(ToolPlan {
-                        program: script,
+                        program: temp.path().join("missing-profiler"),
                         args: vec![],
                         format: "fixture.native",
-                        version_args: vec!["--version".into()],
+                        version_args: vec![],
                         graceful_stop: false,
                     })
                 }
@@ -1724,7 +1718,7 @@ mod tests {
                     wait_native(&done);
                     assert!(
                         Instant::now() < deadline,
-                        "fixture failure must precede SQL callback"
+                        "{case}: fixture failure must precede SQL callback"
                     );
                     crate::query_cpu::tests::capture_command(17, true);
                 });

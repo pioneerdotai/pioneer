@@ -90367,24 +90367,24 @@ async fn graph_snapshot_matches_revision_runs_and_rejects_foreign_or_unknown() {
     .unwrap();
     assert_eq!(active_sibling.len(), 1);
     assert_eq!(active_sibling[0].turn_id(), "revision");
-    // A still-pending DB row can reuse the latest actual joined outcome on retry,
-    // while completed initial/revision history needs no retained old owner.
+    // A still-pending DB row must have an actual owner, but its joined run
+    // needs no new stop. Only the live revision belongs to this new selection.
     let joined_snapshot = native_snapshot_after_publication(
         &processor.agent_manager,
         &["graph-initial".into(), "graph-revision".into()],
     )
     .await;
-    assert_eq!(
-        super::agent_runtime::select_native_graph_owners(
-            &targets,
-            joined_snapshot,
-            "root",
-            "root-turn",
-            false
-        )
-        .unwrap()
-        .len(),
-        2
+    let still_live = super::agent_runtime::select_native_graph_owners(
+        &targets,
+        joined_snapshot,
+        "root",
+        "root-turn",
+        false,
+    )
+    .unwrap();
+    assert!(
+        still_live == active_sibling,
+        "pending durable rows must select only the same outstanding revision"
     );
     processor
         .await_native_graph_owner(
@@ -91022,14 +91022,55 @@ async fn failed_drained_selected_plugin_task_child(tool_calling: bool) {
                 && run.run_id() == owner.run_id()
                 && run.is_quiescent())
     );
-    let mutation = processor
+    let parent_owner = processor
+        .agent_manager
+        .capture_turn_stop_owner(
+            &parent_lineage.child_thread_id,
+            &parent_lineage.child_turn_id,
+        )
+        .await
+        .unwrap();
+    let mut mutation = processor
         .acquire_plugin_mutation(&workspace, &parent, 1)
         .await
         .unwrap();
-    processor
-        .stop_plugin_execution(&mutation, deadline)
-        .await
-        .expect("a new mutation must not replay the drained child's historical error");
+    if let Err(error) = processor.stop_plugin_execution(&mutation, deadline).await {
+        // Stopping the live parent can finish its native cleanup before the
+        // actor clears publication. Preserve that existing fail-closed refusal,
+        // and retry only after the actual captured runs prove fully settled.
+        assert_eq!(
+            error.downcast_ref::<pioneer_agent::StopError>(),
+            Some(&pioneer_agent::StopError::UnknownOwner),
+            "a historical child failure must never become the new stop outcome"
+        );
+        assert!(parent_owner.is_quiescent());
+        assert!(owner.is_quiescent());
+        let settled = native_snapshot_after_publication(
+            &processor.agent_manager,
+            &[
+                parent_lineage.child_thread_id.clone(),
+                lineage.child_thread_id.clone(),
+            ],
+        )
+        .await;
+        assert!(
+            settled
+                .iter()
+                .all(|run| { run.is_quiescent() && (run == &parent_owner || run == &owner) })
+        );
+        drop(mutation);
+        mutation = processor
+            .acquire_plugin_mutation(&workspace, &parent, 1)
+            .await
+            .unwrap();
+        processor
+            .stop_plugin_execution(
+                &mutation,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("a settled new mutation must not replay the drained child's historical error");
+    }
     let disabled = store
         .begin_plugin_mutation(
             &workspace,
