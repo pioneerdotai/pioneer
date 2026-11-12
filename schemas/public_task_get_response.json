@@ -62,6 +62,13 @@
         "string",
         "null"
       ]
+    },
+    "reviewRequired": {
+      "description": "Current review candidates only; full immutable content uses task_result.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PublicTaskWaitReviewItem"
+      }
     }
   },
   "required": [
@@ -2122,6 +2129,11 @@
           "items": {
             "$ref": "#/$defs/TaskResultReviewerSpec"
           }
+        },
+        "disableTimeoutAcceptance": {
+          "description": "Mandatory-review marker: never resolve this policy through the legacy review timeout. Legacy records default to false.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -4748,6 +4760,189 @@
             "path"
           ]
         }
+      ]
+    },
+    "PublicTaskResultCandidate": {
+      "type": "object",
+      "properties": {
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicTaskResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "round": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskResultCandidateStatus"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "runId",
+        "round",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PublicTaskReviewContent": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "contentSha256": {
+          "type": "string"
+        },
+        "format": {
+          "$ref": "#/$defs/PublicTaskReviewContentFormat"
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "totalBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "format",
+        "content",
+        "totalBytes",
+        "contentSha256",
+        "truncated"
+      ]
+    },
+    "PublicTaskReviewContentFormat": {
+      "description": "Reviewer-facing content extracted from one immutable result candidate.\n\nThis is deliberately separate from `TaskResult::data`: the persisted value\nmay also contain extraction diagnostics and source-runtime identifiers that\nare not part of the child-authored result.",
+      "type": "string",
+      "enum": [
+        "text",
+        "json"
+      ]
+    },
+    "PublicTaskWaitItem": {
+      "type": "object",
+      "properties": {
+        "run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicTaskRun"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task": {
+          "$ref": "#/$defs/PublicTask"
+        }
+      },
+      "required": [
+        "task"
+      ]
+    },
+    "TaskWaitReviewAction": {
+      "type": "string",
+      "enum": [
+        "task_accept",
+        "task_revise",
+        "task_cancel"
+      ]
+    },
+    "TaskWaitRevisionBlockedReason": {
+      "type": "string",
+      "enum": [
+        "review_not_allowed",
+        "max_revision_rounds_reached",
+        "candidate_not_revisable"
+      ]
+    },
+    "PublicTaskWaitReviewItem": {
+      "type": "object",
+      "properties": {
+        "allowedActions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskWaitReviewAction"
+          }
+        },
+        "candidate": {
+          "$ref": "#/$defs/PublicTaskResultCandidate"
+        },
+        "item": {
+          "$ref": "#/$defs/PublicTaskWaitItem"
+        },
+        "remainingRevisionRounds": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "reviewContent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicTaskReviewContent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revisionBlockedReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskWaitRevisionBlockedReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "item",
+        "candidate"
       ]
     }
   }

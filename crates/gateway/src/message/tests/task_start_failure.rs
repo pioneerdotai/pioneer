@@ -1047,6 +1047,7 @@ async fn create_cli_child_with_attachment_and_write_policy(
             mode: TaskAgentReviewMode::UserApproval,
             max_revision_rounds: 2,
             require_explicit_acceptance: true,
+            disable_timeout_acceptance: false,
             reviewers: if reviewer {
                 vec![pioneer_protocol::TaskResultReviewerSpec {
                     reviewer_kind: TaskResultReviewerKind::ReviewAgent,

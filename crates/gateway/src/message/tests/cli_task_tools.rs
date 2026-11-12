@@ -737,16 +737,13 @@ fn cli_accepted_nested_result_keeps_substantive_final_without_another_attempt() 
             CLIAgentRuntimeKind::Claude,
             CLIAgentRuntimeKind::OpenCode,
         ] {
-            let mut config = review_enabled_task_runtime_config();
-            config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks = true;
+            let config = review_enabled_task_runtime_config();
             let (harness, processor, root) =
                 start_task_cli_fixture_with_task_config(kind, config).await;
             *harness.cli_session.next_native_turn_id.lock().await =
                 Some(format!("middle_{kind:?}"));
             let parent = invoke_task(&processor, &root, "parent-create", "task_create", json!({
-                "title":"Integrate research", "goal":"Review research and provide the final explanation",
+                "requireReview":true, "title":"Integrate research", "goal":"Review research and provide the final explanation",
                 "outputInstructions":"Return the complete explanation."
             })).await.unwrap().structured_content.unwrap();
             let middle =
@@ -754,7 +751,7 @@ fn cli_accepted_nested_result_keeps_substantive_final_without_another_attempt() 
             *harness.cli_session.next_native_turn_id.lock().await =
                 Some(format!("researcher_{kind:?}"));
             let child = invoke_task(&processor, &middle.turn_id, "child-create", "task_create", json!({
-                "title":"Research", "goal":"Return specific evidence", "outputInstructions":"Return all evidence."
+                "requireReview":true, "title":"Research", "goal":"Return specific evidence", "outputInstructions":"Return all evidence."
             })).await.unwrap().structured_content.unwrap();
             let researcher =
                 wait_for_task_cli_child(&processor, child["runId"].as_str().unwrap(), None).await;
@@ -1640,17 +1637,14 @@ fn cli_recovery_delivers_exact_task_facts_and_preserves_substantive_final() {
         ] {
             // 0: fresh recovery, 1: committed receipt before marker, 2: marker before provider start.
             for window in 0..3 {
-                let mut config = review_enabled_task_runtime_config();
-                config
-                    .review
-                    .default_parent_review_for_immediate_attached_agent_tasks = true;
+                let config = review_enabled_task_runtime_config();
                 let (harness, processor, root) =
                     start_task_cli_fixture_with_task_config(kind, config).await;
                 harness
                     .cli_session
                     .set_next_native_turn_id("payload_middle")
                     .await;
-                let parent = invoke_task(&processor, &root, "payload-parent", "task_create", json!({"title":"Integrate recovered work","goal":"Return the full explanation"})).await.unwrap().structured_content.unwrap();
+                let parent = invoke_task(&processor, &root, "payload-parent", "task_create", json!({"requireReview":true, "title":"Integrate recovered work","goal":"Return the full explanation"})).await.unwrap().structured_content.unwrap();
                 let middle =
                     wait_for_task_cli_child(&processor, parent["runId"].as_str().unwrap(), None)
                         .await;
@@ -1664,7 +1658,7 @@ fn cli_recovery_delivers_exact_task_facts_and_preserves_substantive_final() {
                     &turn_id,
                     "payload-create",
                     "task_create",
-                    json!({"title":"Payload child","goal":"Inspect the project"}),
+                    json!({"requireReview":true, "title":"Payload child","goal":"Inspect the project"}),
                 )
                 .await
                 .unwrap()
@@ -3754,16 +3748,13 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             CLIAgentRuntimeKind::Claude,
             CLIAgentRuntimeKind::OpenCode,
         ] {
-            let mut task_config = review_enabled_task_runtime_config();
-            task_config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks = true;
+            let task_config = review_enabled_task_runtime_config();
             let (harness, processor, turn_id) =
                 start_task_cli_fixture_with_task_config(kind, task_config).await;
             *harness.cli_session.next_native_turn_id.lock().await =
                 Some(format!("review_child_{kind:?}"));
             let created = invoke_task(&processor, &turn_id, "review-create", "task_create", json!({
-                "title":"Reviewable work", "goal":"Inspect and return evidence", "outputInstructions":"Return a concise report."
+                "requireReview":true, "title":"Reviewable work", "goal":"Inspect and return evidence", "outputInstructions":"Return a concise report."
             })).await.unwrap();
             assert!(!created.is_error, "{created:?}");
             let created = created.structured_content.unwrap();
@@ -3826,6 +3817,28 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             .await
             .unwrap();
             assert!(!review.is_error, "{review:?}");
+            let pending = processor
+                .crud_store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let candidate = pending
+                .result_candidates
+                .iter()
+                .find(|c| c.status == pioneer_protocol::TaskResultCandidateStatus::PendingReview)
+                .unwrap();
+            assert_eq!(
+                processor
+                    .task_runtime
+                    .service()
+                    .auto_accept_expired_review_candidates(candidate.created_at + 3600, 64)
+                    .await
+                    .unwrap(),
+                0,
+                "explicit attached review must survive the legacy timeout"
+            );
+
             let early_detach = invoke_task(
                 &processor,
                 &turn_id,
@@ -3925,7 +3938,7 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
                 &turn_id,
                 "detach-create",
                 "task_create",
-                json!({"title":"Continue separately","goal":"Inspect another part of the project"}),
+                json!({"requireReview": false, "title":"Continue separately","goal":"Inspect another part of the project"}),
             )
             .await
             .unwrap();
@@ -3953,6 +3966,13 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             assert_eq!(
                 current.task.lifecycle_policy.unwrap().attachment,
                 pioneer_protocol::TaskAttachmentMode::Detached
+            );
+            assert!(
+                current.agent_specs.iter().all(|spec| spec
+                    .review_policy
+                    .as_ref()
+                    .is_none_or(|policy| !policy.is_enabled())),
+                "explicit false must preserve automatic completion"
             );
             let cancelled = invoke_task(
                 &processor,

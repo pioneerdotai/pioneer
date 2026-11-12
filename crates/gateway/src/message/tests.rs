@@ -5047,9 +5047,12 @@ impl Provider for GuardAwareProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if let Some(response) =
-            request_optional_fixture_tools(&request, &["task_create", "task_wait"])
-        {
+        let next_tools: &[&str] = match self.next_index.load(Ordering::SeqCst) {
+            0 => &["task_create"],
+            2 => &["task_detach"],
+            _ => &[],
+        };
+        if let Some(response) = request_optional_fixture_tools(&request, next_tools) {
             return Ok(response);
         }
         if request.messages.iter().any(|message| {
@@ -7109,7 +7112,9 @@ impl Provider for SequencedToolProvider {
             .tool_call_rounds
             .as_ref()
             .and_then(|rounds| rounds.get(index))
-            .unwrap_or(&self.first_tool_calls);
+            .or_else(|| (index == 0).then_some(&self.first_tool_calls))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let names = next_calls
             .iter()
             .map(|call| call.name.as_str())
@@ -8695,7 +8700,24 @@ async fn complete_recorded_cli_task_turn_with_recovery(
                 .await
                 .expect("native Task binding lookup should succeed")
             {
-                break binding;
+                // Native ownership is persisted before admission confirms the
+                // provider context. Wait for that confirmation before injecting
+                // terminal events, just as the ordinary buffered consumer does.
+                let thread_binding = processor
+                    .crud_store
+                    .get_cli_runtime_thread_binding(binding.continuation_thread_id.as_str())
+                    .await
+                    .expect("native Task context receipt lookup should succeed");
+                if let Some(thread_binding) = thread_binding {
+                    let cursor: serde_json::Value =
+                        serde_json::from_str(&thread_binding.resume_cursor_json)
+                            .expect("native Task context receipt should decode");
+                    if cursor["pioneerContext"]["acceptedTurnId"].as_str()
+                        == Some(binding.turn_id.as_str())
+                    {
+                        break binding;
+                    }
+                }
             }
             tokio::task::yield_now().await;
         }
@@ -9504,7 +9526,6 @@ fn review_enabled_task_runtime_config() -> pioneer_tasks::TaskRuntimeConfig {
         review: pioneer_tasks::TaskReviewRuntimeConfig {
             enabled: true,
             allow_task_create_review_policy: true,
-            default_parent_review_for_immediate_attached_agent_tasks: false,
             default_max_revision_rounds: 2,
             auto_accept_after_seconds: 300,
         },
@@ -9516,6 +9537,22 @@ fn review_enabled_processor(
     session_manager: Arc<SessionManager>,
     workspace_manager: Arc<WorkspaceManager>,
     crud_store: Arc<CrudStore>,
+) -> Arc<MessageProcessor> {
+    processor_with_review_config(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store,
+        review_enabled_task_runtime_config(),
+    )
+}
+
+fn processor_with_review_config(
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+    session_manager: Arc<SessionManager>,
+    workspace_manager: Arc<WorkspaceManager>,
+    crud_store: Arc<CrudStore>,
+    task_runtime_config: pioneer_tasks::TaskRuntimeConfig,
 ) -> Arc<MessageProcessor> {
     let runtime_home = unique_temp_dir("message-review");
     let capsule_root = runtime_home.join("memory").join("capsules");
@@ -9534,7 +9571,7 @@ fn review_enabled_processor(
         runtime_home,
         capsule_root,
         pioneer_config::GatewayArtifactsConfig::default(),
-        review_enabled_task_runtime_config(),
+        task_runtime_config,
         crate::thread_episodic::ThreadEpisodicRuntimeConfig {
             enabled: false,
             indexing_enabled: false,
@@ -25385,6 +25422,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -25658,6 +25696,7 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -25690,6 +25729,7 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -25843,6 +25883,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 1,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -26042,6 +26083,7 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -26196,6 +26238,7 @@ async fn task_revise_restart_reuses_in_progress_revision_turn_impl() {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -41085,23 +41128,20 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "task_list",
         "task_reschedule",
         "task_pause",
+        "task_result",
+        "task_accept",
+        "task_revise",
     ] {
         assert!(
             tool_names.contains(&expected),
             "agent mode should expose {expected}"
         );
     }
-    for hidden_until_review in ["task_accept", "task_revise"] {
-        assert!(
-            !tool_names.contains(&hidden_until_review),
-            "agent mode should expose {hidden_until_review} only after a review-required candidate is observed"
-        );
-    }
     assert!(
         tool_names
             .iter()
             .all(|name| !name.contains("review") && !name.contains("approval")),
-        "review-disabled Phase 3 must not expose review/approval tools"
+        "the task domain must not expose a separate review/approval tool family"
     );
 
     // Start at the text response; Chat has no initial tool round to execute.
@@ -42715,7 +42755,8 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let (_database_dir, workspace_manager, crud_store, workspace_id) =
+            setup_pooled_file_workspace_manager().await;
         let provider = Arc::new(GuardAwareProvider::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",

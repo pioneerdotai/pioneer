@@ -89,9 +89,9 @@ hard_secs = 14400
 recovery_grace_secs = 900
 
 [gateway.tasks.review]
+# Review is opt-in per task; enabled permits explicit review policies.
 enabled = true
 allow_task_create_review_policy = false
-default_parent_review_for_immediate_attached_agent_tasks = true
 default_max_revision_rounds = 5
 auto_accept_after_seconds = 300
 

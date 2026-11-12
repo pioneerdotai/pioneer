@@ -927,6 +927,11 @@
           "items": {
             "$ref": "#/$defs/TaskResultReviewerSpec"
           }
+        },
+        "disableTimeoutAcceptance": {
+          "description": "Mandatory-review marker: never resolve this policy through the legacy review timeout. Legacy records default to false.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -1929,6 +1934,7 @@
     "TaskWaitRevisionBlockedReason": {
       "type": "string",
       "enum": [
+        "review_not_allowed",
         "max_revision_rounds_reached",
         "candidate_not_revisable"
       ]

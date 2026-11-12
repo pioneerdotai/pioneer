@@ -3,6 +3,7 @@
   "title": "TaskWaitRevisionBlockedReason",
   "type": "string",
   "enum": [
+    "review_not_allowed",
     "max_revision_rounds_reached",
     "candidate_not_revisable"
   ]

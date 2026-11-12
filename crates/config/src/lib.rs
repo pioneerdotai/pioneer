@@ -190,8 +190,6 @@ pub struct GatewayTaskReviewConfig {
     pub enabled: bool,
     #[serde(default = "default_tasks_review_allow_task_create_review_policy")]
     pub allow_task_create_review_policy: bool,
-    #[serde(default = "default_tasks_review_parent_review_for_attached_agent_tasks")]
-    pub default_parent_review_for_immediate_attached_agent_tasks: bool,
     #[serde(default = "default_tasks_review_max_revision_rounds")]
     pub default_max_revision_rounds: u32,
     #[serde(default = "default_tasks_review_auto_accept_after_seconds")]
@@ -270,8 +268,6 @@ impl Default for GatewayTaskReviewConfig {
         Self {
             enabled: default_tasks_review_enabled(),
             allow_task_create_review_policy: default_tasks_review_allow_task_create_review_policy(),
-            default_parent_review_for_immediate_attached_agent_tasks:
-                default_tasks_review_parent_review_for_attached_agent_tasks(),
             default_max_revision_rounds: default_tasks_review_max_revision_rounds(),
             auto_accept_after_seconds: default_tasks_review_auto_accept_after_seconds(),
         }
@@ -284,10 +280,6 @@ const fn default_tasks_review_enabled() -> bool {
 
 const fn default_tasks_review_allow_task_create_review_policy() -> bool {
     false
-}
-
-const fn default_tasks_review_parent_review_for_attached_agent_tasks() -> bool {
-    true
 }
 
 const fn default_tasks_review_max_revision_rounds() -> u32 {
@@ -4018,13 +4010,6 @@ service_name = "com.pioneer.gateway.env"
         assert!(!config.gateway.keepawake);
         assert!(config.gateway.tasks.review.enabled);
         assert!(!config.gateway.tasks.review.allow_task_create_review_policy);
-        assert!(
-            config
-                .gateway
-                .tasks
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(config.gateway.tasks.review.default_max_revision_rounds, 5);
         assert_eq!(config.gateway.tasks.review.auto_accept_after_seconds, 300);
         assert!(!config.gateway.cli_agent_runtime.enabled);
@@ -5119,11 +5104,6 @@ enabled = false
 
         assert!(!config.review.enabled);
         assert!(!config.review.allow_task_create_review_policy);
-        assert!(
-            config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(config.review.default_max_revision_rounds, 5);
         assert_eq!(config.review.auto_accept_after_seconds, 300);
     }

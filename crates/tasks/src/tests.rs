@@ -385,7 +385,6 @@ pub(crate) async fn runtime_with_review_config() -> TaskRuntime {
             review: TaskReviewRuntimeConfig {
                 enabled: true,
                 allow_task_create_review_policy: true,
-                default_parent_review_for_immediate_attached_agent_tasks: false,
                 default_max_revision_rounds: 2,
                 auto_accept_after_seconds: 300,
             },
@@ -1134,13 +1133,25 @@ async fn create_waiting_review_agent_task_with_delivery(
         .await
         .expect("review task should create");
     let run = response.run.expect("review task should have run");
+    let candidate_id =
+        submit_pending_review_for_run(runtime, &run, candidate_round, candidate_status).await;
+    (response.task.id, run.id, candidate_id)
+}
+
+// Reuse the real candidate submission boundary for pre-existing scheduled/webhook runs.
+async fn submit_pending_review_for_run(
+    runtime: &TaskRuntime,
+    run: &TaskRun,
+    candidate_round: u32,
+    candidate_status: TaskResultCandidateStatus,
+) -> String {
     let execution = runtime
         .service()
         .store()
         .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, run.created_at)
         .await
         .expect("execution should reserve");
-    persist_mock_agent_execution(runtime.service().store(), &run).await;
+    persist_mock_agent_execution(runtime.service().store(), run).await;
     let handle = TaskExecutionHandle::new(
         runtime.service().store(),
         runtime.event_bus(),
@@ -1239,7 +1250,7 @@ async fn create_waiting_review_agent_task_with_delivery(
         )
         .await
         .expect("pending review candidate should record");
-    (response.task.id, run.id, candidate_id)
+    candidate_id
 }
 
 fn accept_params(task_id: String, run_id: String, candidate_id: String) -> TaskAcceptParams {
@@ -1507,6 +1518,7 @@ async fn review_event_advisory_keeps_candidate_pending() {
         mode: TaskAgentReviewMode::ParentAgentWithReviewers,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: vec![reviewer_spec.clone()],
         resolution_strategy:
             TaskResultReviewResolutionStrategy::RequireAllRequiredReviewersThenParent,
@@ -1887,6 +1899,7 @@ async fn user_review_event_resolves_when_policy_is_user_final() {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 1,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     };
@@ -1965,20 +1978,91 @@ async fn user_review_event_is_blocked_when_policy_is_parent_final() {
 }
 
 #[tokio::test]
-async fn result_read_returns_exact_candidate_for_its_parent_reviewer() {
+async fn task_create_rejects_advanced_policy_without_advanced_admission() {
     let runtime = runtime_with_review_config().await;
-    let (task_id, _run_id, candidate_id) =
-        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
-            .await;
-    let context =
-        parent_accept_context_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str())
-            .await;
+    let runtime = TaskRuntime::new_with_config(
+        runtime.service().store(),
+        TaskRuntimeConfig {
+            review: TaskReviewRuntimeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        },
+    );
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    configure_agent_task(&mut params);
+    let mut policy = TaskAgentReviewPolicy::parent_agent_default(5);
+    policy.disable_timeout_acceptance = true;
+    // Merely carrying the mandatory-timeout marker cannot unlock a custom final reviewer policy.
+    policy.resolution_strategy = TaskResultReviewResolutionStrategy::UserFinal;
+    let mut spec = agent_spec(3);
+    spec.review_policy = Some(policy);
+    params.agent_spec = Some(spec);
+    let error = runtime
+        .service()
+        .create_task(task_create_context_for(&params), params)
+        .await
+        .expect_err("advanced review policy must still require its gate");
+    assert!(format!("{error:#}").contains("not enabled for task_create"));
+}
 
+#[tokio::test]
+async fn result_read_by_later_capsule_execution_does_not_require_final_review_policy() {
+    let runtime = runtime_with_review_config().await;
+    let mut policy = TaskAgentReviewPolicy::parent_agent_default(5);
+    policy.resolution_strategy = TaskResultReviewResolutionStrategy::UserFinal;
+    let (task_id, run_id, candidate_id) = create_waiting_review_agent_task_with_policy(
+        &runtime,
+        policy,
+        0,
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+    let execution = "B".repeat(21);
+    let turn = "later_review_turn";
+    let reviewer_thread = "L".repeat(21);
+    persist_test_agent_turn(&runtime, &execution, &reviewer_thread, turn, None).await;
+    // A later independent execution has its own thread in the same capsule;
+    // the original thread's persisted creator remains unchanged.
+    let at = chrono::Utc::now().timestamp();
+    runtime
+        .service()
+        .store()
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: reviewer_thread.clone(),
+                    parent_thread_id: TEST_PARENT_THREAD_ID.into(),
+                    root_thread_id: TEST_PARENT_THREAD_ID.into(),
+                    depth: 1,
+                    origin_kind: Some("task_run".into()),
+                    created_by_thread_id: Some(TEST_PARENT_THREAD_ID.into()),
+                    created_by_turn_id: Some(TEST_PARENT_TURN_ID.into()),
+                    created_at: at,
+                },
+            },
+            at,
+        )
+        .await
+        .unwrap();
+    let mut context = TaskMutationContext::parent_agent(reviewer_thread, turn);
+    context.actor_id = Some(execution);
+    let denied = runtime
+        .service()
+        .accept_task_result_candidate(
+            context.clone(),
+            accept_params(task_id, run_id, candidate_id.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{denied:#}").contains("not allowed"));
     let candidate = runtime
         .service()
         .get_task_result_candidate_for_reviewer(context, candidate_id.as_str())
         .await
-        .expect("exact parent reviewer should read its immutable candidate");
+        .expect("later capsule execution should read the immutable candidate");
 
     assert_eq!(candidate.id, candidate_id);
     assert_eq!(candidate.round, 0);
@@ -1986,7 +2070,7 @@ async fn result_read_returns_exact_candidate_for_its_parent_reviewer() {
 }
 
 #[tokio::test]
-async fn result_read_rejects_sibling_execution_for_parent_candidate() {
+async fn result_read_rejects_forged_execution_for_real_reviewer_turn() {
     let runtime = runtime_with_review_config().await;
     let (task_id, _run_id, candidate_id) =
         create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
@@ -2000,10 +2084,10 @@ async fn result_read_rejects_sibling_execution_for_parent_candidate() {
         .service()
         .get_task_result_candidate_for_reviewer(context, candidate_id.as_str())
         .await
-        .expect_err("a sibling execution must not read another parent's candidate");
+        .expect_err("a forged execution must not read a real turn's candidate");
 
     assert!(
-        format!("{error:#}").contains("immutable reviewer intent"),
+        format!("{error:#}").contains("different AgentExecution"),
         "unexpected error: {error:#}"
     );
 }
@@ -2759,6 +2843,86 @@ async fn auto_accept_expired_review_candidates_accepts_pending_candidate_after_t
 }
 
 #[tokio::test]
+async fn explicit_review_stays_pending_after_timeout_and_runtime_reconstruction() {
+    let runtime = runtime_with_review_config().await;
+    let mut policy = TaskAgentReviewPolicy::parent_agent_default(5);
+    policy.disable_timeout_acceptance = true;
+    let (task_id, run_id, candidate_id) = create_waiting_review_agent_task_with_policy(
+        &runtime,
+        policy,
+        0,
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+    let store = runtime.service().store();
+    let before = store
+        .get_task_result_candidate(&candidate_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let restored = TaskRuntime::new_with_config(
+        store.clone(),
+        TaskRuntimeConfig {
+            review: TaskReviewRuntimeConfig {
+                enabled: true,
+                allow_task_create_review_policy: true,
+                default_max_revision_rounds: 2,
+                auto_accept_after_seconds: 300,
+            },
+        },
+    );
+    assert_eq!(
+        restored
+            .service()
+            .auto_accept_expired_review_candidates(before.created_at.saturating_add(3600), 1024)
+            .await
+            .unwrap(),
+        0
+    );
+    let response = restored
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: task_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.task.status, TaskStatus::WaitingReview);
+    assert_eq!(
+        response
+            .runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .unwrap()
+            .status,
+        TaskRunStatus::WaitingReview
+    );
+    assert_eq!(
+        response
+            .agent_specs
+            .last()
+            .unwrap()
+            .review_policy
+            .as_ref()
+            .unwrap()
+            .max_revision_rounds,
+        5
+    );
+    let after = store
+        .get_task_result_candidate(&candidate_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, before);
+    assert!(
+        store
+            .list_task_result_review_events(&candidate_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn auto_accept_expired_review_candidates_skips_extraction_failed_candidate() {
     let runtime = runtime_with_review_config().await;
     let (task_id, _run_id, candidate_id) = create_waiting_review_agent_task(
@@ -3005,6 +3169,7 @@ async fn accept_task_result_candidate_user_records_user_review_when_policy_allow
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 1,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     };
@@ -4844,145 +5009,159 @@ async fn run_all_missed_interval_respects_batch_limit_and_active_run_slots() {
 
 #[tokio::test]
 async fn failed_run_schedules_retry_and_defers_terminal_delivery_until_exhausted() {
-    let runtime = runtime().await;
-    runtime
-        .register_executor(Arc::new(FailingSystemExecutor))
-        .await;
-    let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.owner_kind = TaskOwnerKind::Thread;
-    params.owner_id = Some("thr_retry_owner".to_owned());
-    params.created_by_thread_id = Some("thr_retry_owner".to_owned());
-    params.retry_policy = Some(TaskRetryPolicy {
-        max_attempts: 2,
-        backoff: TaskRetryBackoffKind::Fixed,
-        initial_delay_seconds: Some(5),
-        max_delay_seconds: None,
-        retry_on: vec![TaskErrorClass::Internal],
-    });
-    params.delivery_policy = Some(TaskDeliveryPolicy {
-        mode: TaskDeliveryMode::Thread,
-        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
-        thread_id: Some("thr_retry_owner".to_owned()),
-        webhook_url: None,
-        include_result: true,
-        format: pioneer_protocol::TaskDeliveryFormat::Summary,
-    });
-
-    let response = runtime
-        .service()
-        .create_task(task_create_context_for(&params), params)
-        .await
-        .expect("retry task should create");
-
-    let after_first = runtime
-        .service()
-        .get_task(pioneer_protocol::TaskGetParams {
-            task_id: response.task.id.clone(),
-        })
-        .await
-        .expect("task should read after first failure");
-    assert_eq!(after_first.task.status, TaskStatus::Queued);
-    assert_eq!(after_first.runs.len(), 2);
-    let first_run = after_first
-        .runs
-        .iter()
-        .find(|run| run.attempt_number == 1)
-        .expect("first run should exist");
-    let retry_run = after_first
-        .runs
-        .iter()
-        .find(|run| run.attempt_number == 2)
-        .expect("retry run should exist");
-    assert_eq!(retry_run.status, TaskRunStatus::Queued);
-    assert_eq!(
-        retry_run.retry_of_run_id.as_deref(),
-        Some(first_run.id.as_str())
-    );
-    let retry_ready_at = retry_run.ready_at.expect("retry should have ready time");
-    assert_eq!(retry_ready_at, first_run.created_at.saturating_add(5));
-
-    let deliveries = runtime
-        .service()
-        .list_deliveries(TaskDeliveriesParams {
-            workspace_id: "ws_tasks".to_owned(),
-            task_id: Some(response.task.id.clone()),
-            run_id: None,
-            statuses: Vec::new(),
-            limit: Some(10),
-        })
-        .await
-        .expect("deliveries should read after first failure");
-    assert!(deliveries.deliveries.is_empty());
-
-    assert_eq!(
+    for delivery_mode in [TaskDeliveryMode::Thread, TaskDeliveryMode::None] {
+        let runtime = runtime().await;
         runtime
-            .process_due_once(retry_ready_at - 1)
+            .register_executor(Arc::new(FailingSystemExecutor))
+            .await;
+        let mut params = create_params(TaskTriggerSpec::Immediate);
+        params.owner_kind = TaskOwnerKind::Thread;
+        params.owner_id = Some("thr_retry_owner".to_owned());
+        params.created_by_thread_id = Some("thr_retry_owner".to_owned());
+        params.retry_policy = Some(TaskRetryPolicy {
+            max_attempts: 2,
+            backoff: TaskRetryBackoffKind::Fixed,
+            initial_delay_seconds: Some(5),
+            max_delay_seconds: None,
+            retry_on: vec![TaskErrorClass::Internal],
+        });
+        params.delivery_policy = Some(TaskDeliveryPolicy {
+            mode: delivery_mode,
+            thread_target: (delivery_mode == TaskDeliveryMode::Thread)
+                .then_some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+            thread_id: (delivery_mode == TaskDeliveryMode::Thread)
+                .then(|| "thr_retry_owner".to_owned()),
+            webhook_url: None,
+            include_result: true,
+            format: pioneer_protocol::TaskDeliveryFormat::Summary,
+        });
+
+        let response = runtime
+            .service()
+            .create_task(task_create_context_for(&params), params)
             .await
-            .expect("ordinary retry must still wait for its scheduled time"),
-        0
-    );
-    let before_ready = runtime
-        .service()
-        .get_task(pioneer_protocol::TaskGetParams {
-            task_id: response.task.id.clone(),
-        })
-        .await
-        .expect("task should read before retry becomes due");
-    assert_eq!(before_ready.runs.len(), 2);
-    assert_eq!(
-        before_ready
+            .expect("retry task should create");
+
+        let after_first = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: response.task.id.clone(),
+            })
+            .await
+            .expect("task should read after first failure");
+        assert_eq!(after_first.task.status, TaskStatus::Queued);
+        assert_eq!(after_first.runs.len(), 2);
+        let first_run = after_first
             .runs
             .iter()
-            .find(|run| run.id == retry_run.id)
-            .unwrap()
-            .status,
-        TaskRunStatus::Queued
-    );
-    assert!(before_ready.task.finish_request().is_none());
-
-    assert_eq!(
-        runtime
-            .process_due_once(retry_ready_at)
-            .await
-            .expect("retry attempt should dispatch"),
-        1
-    );
-    let after_second = runtime
-        .service()
-        .get_task(pioneer_protocol::TaskGetParams {
-            task_id: response.task.id.clone(),
-        })
-        .await
-        .expect("task should read after retry exhaustion");
-    assert_eq!(after_second.task.status, TaskStatus::Failed);
-    let events = runtime
-        .service()
-        .get_task_events(TaskEventsParams {
-            task_id: response.task.id.clone(),
-            after_sequence: None,
-            limit: None,
-        })
-        .await
-        .expect("task events should read");
-    assert!(
-        events
-            .events
+            .find(|run| run.attempt_number == 1)
+            .expect("first run should exist");
+        let retry_run = after_first
+            .runs
             .iter()
-            .any(|event| matches!(event.payload, TaskEventPayload::RunRetryExhausted { .. }))
-    );
+            .find(|run| run.attempt_number == 2)
+            .expect("retry run should exist");
+        assert_eq!(retry_run.status, TaskRunStatus::Queued);
+        assert_eq!(
+            retry_run.retry_of_run_id.as_deref(),
+            Some(first_run.id.as_str())
+        );
+        let retry_ready_at = retry_run.ready_at.expect("retry should have ready time");
+        assert_eq!(retry_ready_at, first_run.created_at.saturating_add(5));
 
-    let deliveries = runtime
-        .service()
-        .list_deliveries(TaskDeliveriesParams {
-            workspace_id: "ws_tasks".to_owned(),
-            task_id: Some(response.task.id),
-            run_id: None,
-            statuses: Vec::new(),
-            limit: Some(10),
-        })
-        .await
-        .expect("deliveries should read after exhaustion");
-    assert_eq!(deliveries.deliveries.len(), 1);
+        let deliveries = runtime
+            .service()
+            .list_deliveries(TaskDeliveriesParams {
+                workspace_id: "ws_tasks".to_owned(),
+                task_id: Some(response.task.id.clone()),
+                run_id: None,
+                statuses: Vec::new(),
+                limit: Some(10),
+            })
+            .await
+            .expect("deliveries should read after first failure");
+        assert!(deliveries.deliveries.is_empty());
+
+        assert_eq!(
+            runtime
+                .process_due_once(retry_ready_at - 1)
+                .await
+                .expect("ordinary retry must still wait for its scheduled time"),
+            0
+        );
+        let before_ready = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: response.task.id.clone(),
+            })
+            .await
+            .expect("task should read before retry becomes due");
+        assert_eq!(before_ready.runs.len(), 2);
+        assert_eq!(
+            before_ready
+                .runs
+                .iter()
+                .find(|run| run.id == retry_run.id)
+                .unwrap()
+                .status,
+            TaskRunStatus::Queued
+        );
+        assert!(before_ready.task.finish_request().is_none());
+
+        assert_eq!(
+            runtime
+                .process_due_once(retry_ready_at)
+                .await
+                .expect("retry attempt should dispatch"),
+            1
+        );
+        let after_second = runtime
+            .service()
+            .get_task(pioneer_protocol::TaskGetParams {
+                task_id: response.task.id.clone(),
+            })
+            .await
+            .expect("task should read after retry exhaustion");
+        assert_eq!(after_second.task.status, TaskStatus::Failed);
+        let events = runtime
+            .service()
+            .get_task_events(TaskEventsParams {
+                task_id: response.task.id.clone(),
+                after_sequence: None,
+                limit: None,
+            })
+            .await
+            .expect("task events should read");
+        assert!(
+            events
+                .events
+                .iter()
+                .any(|event| matches!(event.payload, TaskEventPayload::RunRetryExhausted { .. }))
+        );
+
+        let deliveries = runtime
+            .service()
+            .list_deliveries(TaskDeliveriesParams {
+                workspace_id: "ws_tasks".to_owned(),
+                task_id: Some(response.task.id),
+                run_id: None,
+                statuses: Vec::new(),
+                limit: Some(10),
+            })
+            .await
+            .expect("deliveries should read after exhaustion");
+        assert_eq!(
+            deliveries.deliveries.len(),
+            if delivery_mode == TaskDeliveryMode::None {
+                0
+            } else {
+                1
+            }
+        );
+        if let Some(delivery) = deliveries.deliveries.first() {
+            assert!(delivery.error_snapshot.is_some());
+        }
+    }
 }
 
 #[tokio::test]
@@ -9104,4 +9283,116 @@ async fn manual_queue_waits_for_scheduled_run_and_completion_keeps_next_fire() {
         before.triggers[0].next_fire_at
     );
     assert_eq!(after.task.status, TaskStatus::Scheduled);
+}
+
+#[tokio::test]
+async fn changing_trigger_preserves_explicit_review_and_the_current_run_snapshot() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let original = runtime
+        .service()
+        .store()
+        .get_task(&task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_spec = original
+        .agent_specs
+        .iter()
+        .find(|spec| spec.run_id.as_deref() == Some(run_id.as_str()))
+        .unwrap();
+    let original_candidate = runtime
+        .service()
+        .store()
+        .get_task_result_candidate(&candidate_id)
+        .await
+        .unwrap()
+        .unwrap();
+    for trigger in [
+        TaskTriggerSpec::ScheduledAt {
+            scheduled_at: 4_000_000_000,
+            timezone: None,
+            catch_up_policy: None,
+        },
+        TaskTriggerSpec::Interval {
+            interval_seconds: 10,
+            interval_anchor_at: Some(4_000_000_000),
+            catch_up_policy: None,
+        },
+        TaskTriggerSpec::Cron {
+            cron_expr: "0 7 * * *".into(),
+            timezone: "UTC".into(),
+            catch_up_policy: None,
+        },
+    ] {
+        runtime
+            .service()
+            .update_task(
+                TaskMutationContext::default(),
+                TaskUpdateParams {
+                    task_id: task_id.clone(),
+                    trigger: Some(TaskTriggerInput {
+                        spec: trigger.clone(),
+                    }),
+                    instructions: Some(vec!["Inspect current state and report evidence.".into()]),
+                    output_instructions: Some("Return evidence.".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .service()
+            .reschedule_task(
+                TaskMutationContext::default(),
+                TaskRescheduleParams {
+                    task_id: task_id.clone(),
+                    trigger: TaskTriggerInput {
+                        spec: trigger.clone(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let state = runtime
+            .service()
+            .store()
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.triggers.last().unwrap().spec, trigger);
+        assert_eq!(
+            state
+                .agent_specs
+                .iter()
+                .find(|spec| spec.run_id.as_deref() == Some(run_id.as_str()))
+                .unwrap(),
+            original_spec
+        );
+        assert!(
+            state
+                .agent_specs
+                .iter()
+                .rev()
+                .find(|spec| spec.run_id.is_none())
+                .unwrap()
+                .review_policy
+                .as_ref()
+                .unwrap()
+                .is_enabled()
+        );
+        assert_eq!(
+            runtime
+                .service()
+                .store()
+                .get_task_result_candidate(&candidate_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            original_candidate
+        );
+    }
 }

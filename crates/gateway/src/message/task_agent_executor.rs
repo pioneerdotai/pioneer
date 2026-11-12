@@ -14167,7 +14167,7 @@ mod tests {
         };
         let policy = TaskAgentReviewPolicy {
             mode: pioneer_protocol::TaskAgentReviewMode::ParentAgentWithReviewers, max_revision_rounds: 1,
-            require_explicit_acceptance: true, reviewers: vec![reviewer.clone()],
+            require_explicit_acceptance: true, disable_timeout_acceptance: false, reviewers: vec![reviewer.clone()],
             resolution_strategy: pioneer_protocol::TaskResultReviewResolutionStrategy::RequireAllRequiredReviewersThenParent,
         };
         response.agent_specs[0].review_policy = Some(policy.clone());
