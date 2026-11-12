@@ -884,9 +884,11 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
         // existing providers reject optional output parameters). Known limits
         // use the supported ChatRequest field, capped to remaining context.
         let max_output_tokens = limits.max_output.and(output_budget);
-        let raw_json =
-            request_post_turn_extractor_json(provider.as_ref(), model, prompt, max_output_tokens)
-                .await?;
+        let raw_json = pioneer_provider::usage::scope_causal_parent(
+            format!("turn:{}", context.turn_id),
+            request_post_turn_extractor_json(provider.as_ref(), model, prompt, max_output_tokens),
+        )
+        .await?;
         if raw_json.len() > MAX_POST_TURN_EXTRACTOR_FRESH_RAW_BYTES {
             return Err(memory_extractor_hook_error(
                 "memory.post_turn_extractor.response_too_large",
@@ -1419,6 +1421,7 @@ fn post_turn_extractor_chat_request(
         .and_then(|value| value.get("max_facts").and_then(serde_json::Value::as_u64))
         .unwrap_or(8) as usize;
     ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: model.to_owned(),
         messages: vec![
@@ -1642,6 +1645,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
         );
         let active = runtime
             .service()
+            .with_maintenance_access()
             .list(
                 operation_context.clone(),
                 MemoryListParams {
@@ -1656,6 +1660,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
             })?;
         let candidates = runtime
             .service()
+            .with_maintenance_access()
             .list_candidates(
                 operation_context,
                 MemoryCandidatesListParams {
@@ -1774,6 +1779,7 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
         }
         let response = runtime
             .service()
+            .with_maintenance_access()
             .write_semantic_memory(operation_context.clone(), params)
             .await
             .map_err(classify_memory_write_failure)?;

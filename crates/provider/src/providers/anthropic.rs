@@ -1706,6 +1706,35 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disclosed_tools_keep_prefix_in_serialized_payload() {
+        let render = |request: ChatRequest| {
+            let request = crate::tools::policy::prepare_request("anthropic", request).unwrap();
+            serde_json::to_value(
+                AnthropicProvider::build_chat_request_with_catalog(
+                    &request,
+                    None,
+                    Vec::new(),
+                    false,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut request = crate::tools::policy::test_request();
+        let before = render(request.clone());
+        let mut added = request.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        request.tools.as_mut().unwrap().push(added);
+        let body = render(request);
+        assert_eq!(
+            body["tools"][0], before["tools"][0],
+            "entire previously serialized definition must survive expansion"
+        );
+        assert_eq!(body["tools"][0]["name"], "lookup");
+        assert_eq!(body["tools"][1]["name"], "alpha");
+    }
 
     #[test]
     fn service_speed_preserves_existing_beta_and_resets_on_standard() {
@@ -1992,6 +2021,7 @@ mod tests {
         let mut req = request(vec![ChatMessage::user("first")]);
         req.model = "claude-sonnet-5-5".into();
         req.compiled_prompt = Some(CompiledPromptPayload {
+            observation_manifest: None,
             stable_system_text: "rules".into(),
             dynamic_system_text: "time=one".into(),
             boundary_marker: "boundary".into(),
@@ -2677,6 +2707,7 @@ mod tests {
     #[test]
     fn compiled_prompt_payload_overrides_raw_system_messages() {
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![
@@ -2690,6 +2721,7 @@ mod tests {
             parallel_tool_calls: None,
             reasoning: None,
             compiled_prompt: Some(CompiledPromptPayload {
+                observation_manifest: None,
                 stable_system_text: "Stable rules".to_owned(),
                 dynamic_system_text: "Dynamic runtime".to_owned(),
                 boundary_marker: "<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->".to_owned(),
@@ -2759,6 +2791,7 @@ mod tests {
     async fn chat_fails_without_valid_key() {
         let provider = AnthropicProvider::new("sk-ant-invalid-key");
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ChatMessage::user("Hello")],

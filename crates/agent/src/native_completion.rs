@@ -514,10 +514,7 @@ mod tests {
             .retiring_executions
             .insert("thread".into(), vec![plane.clone()]);
         let threads = vec!["thread".into()];
-        let owners = manager
-            .capture_native_stop_owners(&threads)
-            .await
-            .unwrap();
+        let owners = manager.capture_native_stop_owners(&threads).await.unwrap();
         let keys = owners
             .iter()
             .map(|owner| (owner.thread_id(), owner.turn_id(), owner.run_id()))
@@ -589,9 +586,7 @@ mod tests {
                 .is_err()
         );
         assert!(matches!(
-            manager
-                .capture_native_stop_owners(&["thread".into()])
-                .await,
+            manager.capture_native_stop_owners(&["thread".into()]).await,
             Err(StopError::UnknownOwner)
         ));
         assert!(plane.has_pending_cleanup());

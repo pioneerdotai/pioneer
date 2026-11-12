@@ -1838,98 +1838,6 @@ async fn explicit_authorization_header_never_starts_native_oauth() {
     h.service.shutdown().await;
 }
 
-// Stage A-04 regression source: NOT_RUN; no fixture or test target was started.
-#[tokio::test]
-async fn portable_configured_authorization_is_fallback_to_existing_managed_oauth() {
-    let h = Harness::new(true).await;
-    let mut installation = h.server.installation();
-    installation.source_ref = json!({"plugin_id":"parent", "member_key":"http"});
-    if let McpTransportConfig::StreamableHttp { headers, .. } = &mut installation.transport {
-        headers.insert(
-            "aUtHoRiZaTiOn".into(),
-            pioneer_mcp::McpConfigValue::Literal {
-                value: "Bearer fallback".into(),
-            },
-        );
-        headers.insert(
-            "X-Context".into(),
-            pioneer_mcp::McpConfigValue::Literal {
-                value: "keep".into(),
-            },
-        );
-    }
-    h.service
-        .synchronize("installation", &installation)
-        .await
-        .unwrap();
-    // Explicit sign-in is allowed without deleting the package's configured header.
-    h.service
-        .sign_in("installation", &installation, 10, REDIRECT)
-        .await
-        .unwrap();
-    let event = h.sink.browser().await;
-    h.service
-        .callback("installation", 10, h.callback(&event))
-        .await
-        .unwrap();
-    h.sink
-        .wait_state(event.flow_id.as_deref(), OAuthState::Authorized)
-        .await;
-    assert!(
-        h.service
-            .client("installation", &installation)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
-        h.service
-            .management_projection("installation", &installation)
-            .await
-            .0,
-        Some(OAuthState::Authorized)
-    );
-    let connector = RmcpRuntimeConnector::with_oauth(Arc::new(h.service.clone()));
-    let mut session = connector
-        .connect(
-            installation.clone(),
-            "installation".into(),
-            Arc::new(Empty),
-            0,
-        )
-        .await
-        .unwrap();
-    {
-        let requests = h.server.data.mcp_headers.lock().unwrap();
-        assert!(!requests.is_empty());
-        for headers in requests.iter() {
-            let auth = headers.get("authorization").unwrap().to_str().unwrap();
-            assert!(auth.starts_with("Bearer access-"));
-            assert_eq!(headers.get_all("authorization").iter().count(), 1);
-            assert_eq!(headers["x-context"], "keep");
-        }
-    }
-    session.shutdown().await;
-    // Removing only the fallback header must retain the same native OAuth binding.
-    let mut updated = installation.clone();
-    if let McpTransportConfig::StreamableHttp { headers, .. } = &mut updated.transport {
-        headers.remove("aUtHoRiZaTiOn");
-    }
-    assert!(McpOAuthService::same_configuration(&installation, &updated));
-    h.service
-        .synchronize("installation", &updated)
-        .await
-        .unwrap();
-    assert!(
-        h.service
-            .client("installation", &updated)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    h.service.shutdown().await;
-}
-
 #[tokio::test]
 async fn repeated_token_exchanges_are_rate_limited_without_erasing_credentials() {
     let h = Harness::new(true).await;
@@ -1969,31 +1877,68 @@ async fn repeated_token_exchanges_are_rate_limited_without_erasing_credentials()
 
 #[tokio::test]
 async fn replacing_native_oauth_with_explicit_header_clears_old_credentials() {
-    let h = Harness::new(true).await;
-    h.login().await;
-    let mut installation = h.server.installation();
-    if let McpTransportConfig::StreamableHttp { headers, .. } = &mut installation.transport {
-        headers.insert(
-            "Authorization".into(),
-            pioneer_mcp::McpConfigValue::Literal {
-                value: "Bearer explicit".into(),
-            },
-        );
-    }
-    h.service
-        .synchronize("installation", &installation)
-        .await
-        .unwrap();
-    assert!(h.persistence.read("installation").await.unwrap().is_none());
-    assert!(
+    // Package provenance never changes the header policy. Exercise the real
+    // credential transition and wire request so stale OAuth cannot take over.
+    for source_ref in [
+        json!({}),
+        json!({"plugin_id":"parent", "member_key":"http"}),
+    ] {
+        let h = Harness::new(true).await;
+        h.login().await;
+        let mut installation = h.server.installation();
+        installation.source_ref = source_ref;
+        if let McpTransportConfig::StreamableHttp { headers, .. } = &mut installation.transport {
+            headers.insert(
+                "aUtHoRiZaTiOn".into(),
+                pioneer_mcp::McpConfigValue::Literal {
+                    value: "Bearer explicit".into(),
+                },
+            );
+            headers.insert(
+                "X-Context".into(),
+                pioneer_mcp::McpConfigValue::Literal {
+                    value: "keep".into(),
+                },
+            );
+        }
         h.service
-            .client("installation", &installation)
+            .synchronize("installation", &installation)
             .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(h.sink.browsers(), 1);
-    h.service.shutdown().await;
+            .unwrap();
+        assert!(h.persistence.read("installation").await.unwrap().is_none());
+        assert!(
+            h.service
+                .client("installation", &installation)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            h.service
+                .sign_in("installation", &installation, 10, REDIRECT)
+                .await
+                .is_err()
+        );
+        // Observe only the new explicit-header connection.
+        h.server.data.mcp_headers.lock().unwrap().clear();
+        let mut session = RmcpRuntimeConnector::with_oauth(Arc::new(h.service.clone()))
+            .connect(installation, "installation".into(), Arc::new(Empty), 0)
+            .await
+            .unwrap();
+        {
+            let requests = h.server.data.mcp_headers.lock().unwrap();
+            assert!(!requests.is_empty());
+            for headers in requests.iter() {
+                assert_eq!(headers["authorization"], "Bearer explicit");
+                assert_eq!(headers.get_all("authorization").iter().count(), 1);
+                assert_eq!(headers["x-context"], "keep");
+            }
+        }
+        assert_eq!(h.sink.browsers(), 1);
+        assert_eq!(h.server.data.registrations.load(Ordering::SeqCst), 1);
+        session.shutdown().await;
+        h.service.shutdown().await;
+    }
 }
 
 #[tokio::test]

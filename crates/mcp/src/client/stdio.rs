@@ -1,5 +1,8 @@
 use crate::runtime::{MaterializedStdioTransport, StderrTail};
-use futures_util::{FutureExt, future::{BoxFuture, Shared}};
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
@@ -109,12 +112,23 @@ struct StdioChildState {
 impl StdioChildOwner {
     fn new(mut child: Box<dyn ChildWrapper>, tail: &StderrTail) -> Arc<Self> {
         let observation = pioneer_observability::resources::ChildRegistration::register(
-            child.id(), pioneer_observability::resources::ChildRole::Mcp, None);
-        let stderr_reader = child.inner_mut().stderr().take().map(|stderr| tail.spawn_reader(stderr));
+            child.id(),
+            pioneer_observability::resources::ChildRole::Mcp,
+            None,
+        );
+        let stderr_reader = child
+            .inner_mut()
+            .stderr()
+            .take()
+            .map(|stderr| tail.spawn_reader(stderr));
         Arc::new(Self {
             state: Arc::new(Mutex::new(StdioChildState {
-                child, stderr_reader, process_stopped: false,
-                process_error: None, observation, reader_error: None,
+                child,
+                stderr_reader,
+                process_stopped: false,
+                process_error: None,
+                observation,
+                reader_error: None,
             })),
             stop: Mutex::new(None),
         })
@@ -125,15 +139,21 @@ impl StdioChildOwner {
             let mut slot = self.stop.lock().await;
             slot.get_or_insert_with(|| {
                 let state = self.state.clone();
-                async move { Self::drain(state).await.map_err(Arc::new) }.boxed().shared()
-            }).clone()
+                async move { Self::drain(state).await.map_err(Arc::new) }
+                    .boxed()
+                    .shared()
+            })
+            .clone()
         };
         let result = completion.clone().await;
         if result.is_err() {
             // Retry a failed public stop call while retaining reader errors.
             // Cancellation never reaches this branch.
             let mut slot = self.stop.lock().await;
-            if slot.as_ref().is_some_and(|current| current.ptr_eq(&completion)) {
+            if slot
+                .as_ref()
+                .is_some_and(|current| current.ptr_eq(&completion))
+            {
                 *slot = None;
             }
         }
@@ -143,16 +163,44 @@ impl StdioChildOwner {
     async fn drain(state: Arc<Mutex<StdioChildState>>) -> std::io::Result<()> {
         let mut state = state.lock().await;
         if !state.process_stopped {
-            if let Err(error) = state.child.start_kill() {
+            let signal = state.child.start_kill();
+            #[cfg(unix)]
+            let signal = match signal {
+                Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                    // macOS rejects signals to a group containing only zombies.
+                    // Reap our retained leader, then signal the same group again:
+                    // a finished parent must not spare any remaining descendants.
+                    let parent = state.child.inner_mut();
+                    parent.start_kill()?;
+                    parent.wait().await?;
+                    state.child.start_kill()
+                }
+                result => result,
+            };
+            if let Err(error) = signal {
                 #[cfg(unix)]
                 let already_gone = error.raw_os_error() == Some(libc::ESRCH);
                 #[cfg(not(unix))]
                 let already_gone = false;
-                if !already_gone { return Err(error); }
+                if !already_gone {
+                    tracing::warn!(
+                        operation = "signal",
+                        error_kind = ?error.kind(),
+                        os_error = error.raw_os_error(),
+                        "MCP stdio cleanup failed"
+                    );
+                    return Err(error);
+                }
             }
             let status = match state.child.wait().await {
                 Ok(status) => status,
                 Err(error) => {
+                    tracing::warn!(
+                        operation = "wait",
+                        error_kind = ?error.kind(),
+                        os_error = error.raw_os_error(),
+                        "MCP stdio cleanup failed"
+                    );
                     state.process_error = Some("MCP process wait failed".into());
                     return Err(error);
                 }
@@ -167,6 +215,7 @@ impl StdioChildOwner {
             if let Err(error) = result
                 && !error.is_cancelled()
             {
+                tracing::warn!(operation = "stderr_join", "MCP stdio cleanup failed");
                 state.reader_error = Some("MCP stderr reader join failed".into());
             }
         }
@@ -216,13 +265,18 @@ pub(crate) fn build_stdio_transport(
     // Keep the wrapper and stderr reader together while taking the configured pipes.
     let owner = StdioChildOwner::new(child, &stderr_tail);
     let pipes = {
-        let mut state = owner.state.try_lock().expect("new stdio owner is unobserved");
+        let mut state = owner
+            .state
+            .try_lock()
+            .expect("new stdio owner is unobserved");
         let stdin = state.child.inner_mut().stdin().take();
         let stdout = state.child.inner_mut().stdout().take();
         (stdin, stdout)
     };
     let (Some(stdin), Some(stdout)) = pipes else {
-        return Err(std::io::Error::other("MCP stdio child stdin/stdout was not piped"));
+        return Err(std::io::Error::other(
+            "MCP stdio child stdin/stdout was not piped",
+        ));
     };
     let reader = BoundedLineReader::new(
         ManagedChildStdout {

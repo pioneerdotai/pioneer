@@ -1,8 +1,8 @@
 use crate::{CrudStore, repositories::plugins};
 use anyhow::{Result, bail};
 use pioneer_entity::{plugin_component, plugin_installation};
-use sea_orm::TransactionTrait;
 pub use plugins::{PluginNativeWrite, PluginOwnershipWrite};
+use sea_orm::TransactionTrait;
 
 impl CrudStore {
     pub async fn skill_plugin_owners(
@@ -410,9 +410,7 @@ impl CrudStore {
 
 fn validate_selection(snapshot: &pioneer_protocol::PluginSelectionSnapshot) -> Result<()> {
     use std::collections::HashSet;
-    if !matches!(snapshot.phase.as_str(), "prepared" | "ready")
-        || snapshot.parents.is_empty()
-    {
+    if !matches!(snapshot.phase.as_str(), "prepared" | "ready") || snapshot.parents.is_empty() {
         bail!("invalid plugin selection");
     }
     let mut parents = HashSet::new();
@@ -463,20 +461,25 @@ mod selection_tests {
         assert!(!selection_has_child(&snapshot, "skill", &"T".repeat(21)));
         snapshot.children.push(snapshot.children[0].clone());
         assert!(validate_selection(&snapshot).is_err());
-        snapshot.children = (0..256).map(|index| PluginSelectedChild {
-            kind: "skill".into(),
-            id: format!("S{index:020}"),
-            parent_id: snapshot.parents[0].id.clone(),
-        }).collect();
+        snapshot.children = (0..256)
+            .map(|index| PluginSelectedChild {
+                kind: "skill".into(),
+                id: format!("S{index:020}"),
+                parent_id: snapshot.parents[0].id.clone(),
+            })
+            .collect();
         assert!(validate_selection(&snapshot).is_ok());
         snapshot.children.push(PluginSelectedChild {
             kind: "skill".into(),
             id: format!("S{:020}", 256),
             parent_id: snapshot.parents[0].id.clone(),
         });
-        snapshot.parents.extend((1..65).map(|index| PluginSelectedParent {
-            id: format!("P{index:020}"), revision: 1,
-        }));
+        snapshot
+            .parents
+            .extend((1..65).map(|index| PluginSelectedParent {
+                id: format!("P{index:020}"),
+                revision: 1,
+            }));
         assert!(validate_selection(&snapshot).is_ok());
     }
 }
@@ -557,7 +560,8 @@ impl CrudStore {
                 db.commit().await?;
                 Ok(())
             }
-        }).await
+        })
+        .await
     }
     pub async fn replace_plugin_pending(
         &self,
@@ -634,14 +638,7 @@ impl CrudStore {
         let _: serde_json::Value = serde_json::from_str(pending)?;
         self.run_serialized_write(|| async move {
             let db = self.connection.begin().await?;
-            plugins::interrupt_mutation(
-                &db,
-                id,
-                revision,
-                pending.into(),
-                error.into(),
-            )
-            .await?;
+            plugins::interrupt_mutation(&db, id, revision, pending.into(), error.into()).await?;
             db.commit().await?;
             Ok(())
         })

@@ -26,7 +26,9 @@ impl MigratorTrait for PolicyFixtureMigrator {
         let storage = Migrator::migrations().into_iter().filter(|migration| {
             matches!(
                 migration.name(),
-                "m20261027_000001_portable_payload" | "m20261027_000003_portable_cli_mapping"
+                "m20261027_000001_portable_payload"
+                    | "m20261027_000003_portable_cli_mapping"
+                    | "m20261109_000001_execution_observability"
             )
         });
         migrations.splice(policy..policy, storage);

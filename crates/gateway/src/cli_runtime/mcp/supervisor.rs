@@ -779,6 +779,27 @@ impl CliMcpBridgeSupervisor {
         }
     }
 
+    async fn return_connection(
+        &self,
+        process_instance: &CliSessionInstanceId,
+        bound_grant: &CliMcpBoundGrant,
+        connection: &mut Option<PlatformConnection>,
+    ) -> Result<(), CliMcpBridgeSupervisorError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(process_instance)
+            .ok_or(CliMcpBridgeSupervisorError::UnknownSession)?;
+        if session.state != CliMcpBridgeSessionState::TransportOwned
+            || session.connection.is_some()
+            || session.bound_grant.as_ref() != Some(bound_grant)
+        {
+            return Err(CliMcpBridgeSupervisorError::InvalidTransition);
+        }
+        session.connection = connection.take();
+        session.state = CliMcpBridgeSessionState::Attached;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) async fn state(
         &self,
@@ -858,18 +879,13 @@ impl CliMcpBridgeTransport {
         if self.terminated {
             return Ok(());
         }
-        let mut sessions = self.supervisor.sessions.lock().await;
-        let session = sessions
-            .get_mut(&self.process_instance)
-            .ok_or(CliMcpBridgeSupervisorError::UnknownSession)?;
-        if session.state != CliMcpBridgeSessionState::TransportOwned
-            || session.connection.is_some()
-            || session.bound_grant.as_ref() != Some(&self.bound_grant)
-        {
-            return Err(CliMcpBridgeSupervisorError::InvalidTransition);
-        }
-        session.connection = self.connection.take();
-        session.state = CliMcpBridgeSessionState::Attached;
+        self.supervisor
+            .return_connection(
+                &self.process_instance,
+                &self.bound_grant,
+                &mut self.connection,
+            )
+            .await?;
         self.terminated = true;
         Ok(())
     }
@@ -882,22 +898,19 @@ impl Drop for CliMcpBridgeTransport {
         // Cancellation returns the connection to the same supervisor owner.
         // Grant/artifact cleanup still waits for the owning session to join.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            // Move the actual connection into the same retirement operation.
-            // Revoke rejects TransportOwned until retirement returns the socket
-            // to this exact entry. Suppress another Drop task if retirement fails.
-            let mut cleanup = Self {
-                supervisor: self.supervisor.clone(),
-                process_instance: self.process_instance.clone(),
-                bound_grant: self.bound_grant.clone(),
-                connection: self.connection.take(),
-                terminated: false,
-            };
+            let supervisor = self.supervisor.clone();
+            let process_instance = self.process_instance.clone();
+            let bound_grant = self.bound_grant.clone();
+            let mut connection = self.connection.take();
+            // Capture plain resources: cancellation during runtime shutdown must
+            // not drop another transport and recursively schedule this cleanup.
             runtime.spawn(async move {
-                if let Err(error) = cleanup.retire_connection().await {
+                if let Err(error) = supervisor
+                    .return_connection(&process_instance, &bound_grant, &mut connection)
+                    .await
+                {
                     tracing::warn!(error = %error, "CLI MCP connection return failed");
                 }
-                cleanup.terminated = true;
-                drop(cleanup);
             });
         }
     }
@@ -1181,10 +1194,20 @@ mod tests {
             assert!(launch_a.endpoint().address().len() <= 103);
         }
 
-        assert!(supervisor.revoke_session_result(launch_a.process_instance()).await.unwrap());
+        assert!(
+            supervisor
+                .revoke_session_result(launch_a.process_instance())
+                .await
+                .unwrap()
+        );
         assert!(!launch_a.bootstrap_path().exists());
         assert!(launch_b.bootstrap_path().exists());
-        assert!(supervisor.revoke_session_result(launch_b.process_instance()).await.unwrap());
+        assert!(
+            supervisor
+                .revoke_session_result(launch_b.process_instance())
+                .await
+                .unwrap()
+        );
         assert!(!launch_b.bootstrap_path().exists());
     }
 
@@ -1320,7 +1343,60 @@ mod tests {
                 .expect("helper EOF")
                 .is_none()
         );
+        transport
+            .retire_connection()
+            .await
+            .expect("return exact connection");
+        CLIAgentRuntimeSessionLifecycle::after_session_close_result(
+            supervisor.as_ref(),
+            launch.process_instance(),
+        )
+        .await
+        .expect("join cleanup");
+        assert!(launch.cancellation().is_cancelled());
         assert!(supervisor.state(launch.process_instance()).await.is_none());
+    }
+
+    #[test]
+    fn cli_mcp_transport_drop_during_runtime_shutdown_does_not_reschedule_cleanup() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = temporary_root();
+        let supervisor = CliMcpBridgeSupervisor::new(root.path().join("sessions"));
+        runtime.block_on(async {
+            let launch = supervisor
+                .prepare(scope(1), expiry())
+                .await
+                .expect("prepare");
+            supervisor
+                .associate_provider_process(
+                    launch.process_instance(),
+                    std::process::id(),
+                    Some(std::process::id()),
+                )
+                .await
+                .expect("associate");
+            let (attached, helper) = tokio::join!(
+                supervisor.await_attach(launch.process_instance(), Duration::from_secs(1)),
+                run_hidden_helper_with_io(
+                    launch.bootstrap_path(),
+                    tokio::io::empty(),
+                    tokio::io::sink()
+                ),
+            );
+            attached.expect("attach");
+            helper.expect("helper EOF");
+            let transport = supervisor
+                .take_transport(launch.process_instance())
+                .await
+                .expect("transport");
+            // No yield: shutdown cancels the queued return operation before its first poll.
+            drop(transport);
+        });
+        drop(runtime);
+        drop(supervisor);
     }
 
     #[tokio::test]

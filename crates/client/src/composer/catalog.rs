@@ -217,11 +217,15 @@ impl ClientCore {
         draft: DraftId,
         query: &str,
     ) -> Vec<crate::plugins::PluginPickerRow> {
-        let Some(input) = self.composer_snapshot(thread).filter(|p| p.draft_id() == draft)
+        let Some(input) = self
+            .composer_snapshot(thread)
+            .filter(|p| p.draft_id() == draft)
         else {
             return vec![];
         };
-        let catalog = self.composer_catalog_snapshot(thread).filter(|p| p.draft_id == draft);
+        let catalog = self
+            .composer_catalog_snapshot(thread)
+            .filter(|p| p.draft_id == draft);
         let selected = catalog
             .as_ref()
             .and_then(|p| p.session.as_ref())
@@ -541,9 +545,18 @@ impl ClientCore {
                     } else {
                         match picker {
                             ComposerPickerKind::Plugins => ComposerPickerSelection::Plugins {
-                                capabilities: draft.domain().capabilities.iter()
-                                    .filter(|c| matches!(c.kind, capabilities::ComposerCapabilityKind::Plugin { .. }))
-                                    .cloned().collect(),
+                                capabilities: draft
+                                    .domain()
+                                    .capabilities
+                                    .iter()
+                                    .filter(|c| {
+                                        matches!(
+                                            c.kind,
+                                            capabilities::ComposerCapabilityKind::Plugin { .. }
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect(),
                             },
                             ComposerPickerKind::Skills => ComposerPickerSelection::Skills {
                                 selections: draft.domain().skill_selections.clone(),
@@ -626,7 +639,11 @@ impl ClientCore {
         let session = next.session.as_mut().expect("matched session");
         let mut action = None;
         let ending_plugin_session = session.kind == ComposerPickerKind::Plugins
-            && matches!(&intent, ComposerCatalogIntent::CommitPicker { .. } | ComposerCatalogIntent::ClosePicker { .. });
+            && matches!(
+                &intent,
+                ComposerCatalogIntent::CommitPicker { .. }
+                    | ComposerCatalogIntent::ClosePicker { .. }
+            );
         match intent {
             ComposerCatalogIntent::ToggleSkill { selection, .. } => {
                 if session.kind != ComposerPickerKind::Skills {
@@ -671,7 +688,9 @@ impl ClientCore {
                     ) {
                         return self.reject_intent();
                     }
-                    let Some(capability) = next.plugins.iter()
+                    let Some(capability) = next
+                        .plugins
+                        .iter()
                         .find(|p| p.id == plugin_id)
                         .and_then(crate::plugins::plugin_capability)
                     else {
@@ -749,17 +768,31 @@ impl ClientCore {
                                 ),
                         })
                     }
-                    ComposerPickerSelection::Plugins { capabilities: selected } => {
+                    ComposerPickerSelection::Plugins {
+                        capabilities: selected,
+                    } => {
                         // Preserve pinned revisions and unrelated native capability edits.
                         // A provider change may still permit removals, but never new parents.
-                        if !crate::plugins::plugin_picker_target_supported(draft.domain().capability_target)
-                            && selected.iter().any(|c| !draft.domain().capabilities.contains(c))
+                        if !crate::plugins::plugin_picker_target_supported(
+                            draft.domain().capability_target,
+                        ) && selected
+                            .iter()
+                            .any(|c| !draft.domain().capabilities.contains(c))
                         {
                             return self.reject_intent();
                         }
-                        let mut capabilities: Vec<_> = draft.domain().capabilities.iter()
-                            .filter(|c| !matches!(c.kind, capabilities::ComposerCapabilityKind::Plugin { .. }))
-                            .cloned().collect();
+                        let mut capabilities: Vec<_> = draft
+                            .domain()
+                            .capabilities
+                            .iter()
+                            .filter(|c| {
+                                !matches!(
+                                    c.kind,
+                                    capabilities::ComposerCapabilityKind::Plugin { .. }
+                                )
+                            })
+                            .cloned()
+                            .collect();
                         capabilities.extend(selected.iter().cloned());
                         Some(ComposerDomainAction::SetCapabilities { capabilities })
                     }
@@ -825,7 +858,10 @@ impl ClientCore {
         if work.kind != ComposerCatalogKind::Plugins {
             return;
         }
-        let mut owner = self.composer_catalog_requests.lock().expect("composer catalogs poisoned");
+        let mut owner = self
+            .composer_catalog_requests
+            .lock()
+            .expect("composer catalogs poisoned");
         if owner.plugin_refreshes.get(&work.identity.thread_id) == Some(&work.identity.generation) {
             owner.plugin_refreshes.remove(&work.identity.thread_id);
         }
@@ -859,16 +895,20 @@ impl ClientCore {
         };
         let mut next = (*current).clone();
         let refresh = work.kind == ComposerCatalogKind::Plugins
-            && self.composer_catalog_requests
+            && self
+                .composer_catalog_requests
                 .lock()
                 .expect("composer catalogs poisoned")
                 .plugin_refreshes
-                .remove(&work.identity.thread_id) == Some(work.identity.generation);
+                .remove(&work.identity.thread_id)
+                == Some(work.identity.generation);
         if refresh {
             // Consume the obligation once, preserving warm rows and the session.
             // Reserve the follow-up under the same draft/generation lock so Close,
             // suspend or auth cancellation cannot be bridged by a later retry.
-            store.next_operation = store.next_operation.checked_add(1)
+            store.next_operation = store
+                .next_operation
+                .checked_add(1)
                 .expect("composer catalog generation exhausted");
             let mut fresh = work.clone();
             fresh.identity.generation = store.next_operation;
@@ -1252,8 +1292,9 @@ mod tests {
                 name: "Mixed".into(),
                 version: None,
                 description: None,
-            metadata: Default::default(),
-                enabled: true, allow_implicit_invocation: false,
+                metadata: Default::default(),
+                enabled: true,
+                allow_implicit_invocation: false,
                 state: "installed".into(),
                 revision,
                 status: "partial".into(),
@@ -1284,20 +1325,29 @@ mod tests {
             Ok(CatalogResult::Plugins(vec![parent('P', 8), parent('Q', 1)])),
         );
         let pending = core.composer_catalog_snapshot("a").unwrap();
-        assert_eq!(pending.plugin_request.state, ComposerCatalogRequestState::Loading);
+        assert_eq!(
+            pending.plugin_request.state,
+            ComposerCatalogRequestState::Loading
+        );
         assert_eq!(pending.plugins[0].revision, 7); // Do not publish stale Ready.
         assert_eq!(pending.session.as_ref().unwrap().identity, identity);
         let fresh = receiver.try_recv().unwrap(); // No new input/event after settlement.
         assert_ne!(fresh.identity.generation, stale.identity.generation);
         assert!(receiver.try_recv().is_err()); // Repeated invalidation coalesced.
         core.complete_composer_catalog(stale, Err("late duplicate".into()));
-        assert!(Arc::ptr_eq(&pending, &core.composer_catalog_snapshot("a").unwrap()));
+        assert!(Arc::ptr_eq(
+            &pending,
+            &core.composer_catalog_snapshot("a").unwrap()
+        ));
         core.complete_composer_catalog(
             fresh,
             Ok(CatalogResult::Plugins(vec![parent('P', 9), parent('Q', 1)])),
         );
         let ready = core.composer_catalog_snapshot("a").unwrap();
-        assert_eq!(ready.plugin_request.state, ComposerCatalogRequestState::Ready);
+        assert_eq!(
+            ready.plugin_request.state,
+            ComposerCatalogRequestState::Ready
+        );
         assert_eq!(ready.plugins[0].revision, 9);
         assert!(receiver.try_recv().is_err());
         // The same continuation is owed if the invalidated read settles with an error.
@@ -1342,15 +1392,37 @@ mod tests {
     // The existing immediate-toggle regression above owns its original contract.
     #[test]
     fn deferred_plugin_selection_preserves_pins_cancel_and_target_gates() {
-        for (skills, mcp) in [(false, false), (true, false), (false, true), (true, true)] {
-            let (core, receiver) = fixture();
+        for enabled in [false, true] {
+            let core = super::super::runtime_selection::tests::fixture();
+            let (sender, receiver) = mpsc::sync_channel(64);
+            core.composer_catalog_requests.lock().unwrap().sender = Some(sender);
+            let runtime = |enabled, skills, mcp| {
+                serde_json::from_value(serde_json::json!({
+                    "runtime_id": "codex", "kind": "codex", "display_name": "Codex",
+                    "enabled": enabled, "status": {"state": "ready"},
+                    "capabilities": RuntimeCapabilities {
+                        supports_threads: true, supports_model_list: true, supports_steer: true,
+                        supports_skills: skills, supports_mcp_tools: mcp, ..Default::default()
+                    }
+                }))
+                .unwrap()
+            };
+            let request = core.provider_runtime_request_for_test("ws").unwrap();
+            core.complete_provider_runtime_for_test(
+                request,
+                Ok(CLIRuntimeListResponse {
+                    revision: 1,
+                    runtimes: vec![runtime(true, true, true)],
+                }),
+            );
             let draft_id = core.composer_snapshot("a").unwrap().draft_id();
             let pinned = capabilities::ComposerCapability {
                 id: plugin_capability_key(&"P".repeat(21)),
                 label: "Pinned parent".into(),
                 kind: capabilities::ComposerCapabilityKind::Plugin {
                     plugin_id: "P".repeat(21),
-                    expected_revision: 7, icon: None,
+                    expected_revision: 7,
+                    icon: None,
                 },
             };
             core.composer_intent(ComposerIntent::Domain {
@@ -1368,8 +1440,9 @@ mod tests {
                     name: "New parent".into(),
                     version: None,
                     description: None,
-            metadata: Default::default(),
-                    enabled: true, allow_implicit_invocation: false,
+                    metadata: Default::default(),
+                    enabled: true,
+                    allow_implicit_invocation: false,
                     state: "installed".into(),
                     revision: 1,
                     status: "partial".into(),
@@ -1402,26 +1475,32 @@ mod tests {
                 identity: identity.clone(),
                 plugin_id: "Q".repeat(21),
             });
-            // Change target while the picker has a pending addition.
-            core.composer_intent(ComposerIntent::Domain {
-                thread_id: "a".into(),
-                draft_id,
-                action: ComposerDomainAction::SyncCapabilityTarget {
-                    provider: core
-                        .composer_snapshot("a")
+            // Technical capability changes are diagnostic, not a veto of an
+            // explicit selection. Disabling the runtime is a structural gate.
+            // Both arrive while the picker has a pending addition.
+            core.observe_provider_runtime_notification(
+                &GatewayNotification::CLIRuntimeStatusChanged(
+                    CLIRuntimeStatusChangedNotification {
+                        workspace_id: "ws".into(),
+                        revision: 2,
+                        runtime: runtime(enabled, false, false),
+                        removed: false,
+                    },
+                ),
+            );
+            assert_eq!(
+                crate::plugins::plugin_picker_target_supported(
+                    core.composer_snapshot("a")
                         .unwrap()
                         .domain()
-                        .selected_provider
-                        .clone(),
-                    target: capabilities::ComposerCapabilityTarget::cli(
-                        capabilities::ComposerCapabilityPolicy::cli(skills, mcp),
-                    ),
-                },
-            });
+                        .capability_target,
+                ),
+                enabled,
+            );
             let result = core.composer_catalog_intent(ComposerCatalogIntent::CommitPicker {
                 identity: identity.clone(),
             });
-            if skills && mcp {
+            if enabled {
                 assert_eq!(result.outcome(), ClientTransitionOutcome::Changed);
                 assert_eq!(
                     core.composer_snapshot("a").unwrap().domain().capabilities[0],
@@ -1766,7 +1845,11 @@ mod tests {
                     }
                 };
                 core.complete_composer_catalog(work.clone(), result());
-                assert_eq!(before, core.composer_catalog_snapshot("a"), "plugins={plugins}, scenario={scenario}");
+                assert_eq!(
+                    before,
+                    core.composer_catalog_snapshot("a"),
+                    "plugins={plugins}, scenario={scenario}"
+                );
                 assert!(receiver.try_recv().is_err()); // Cancellation cannot resurrect the obligation.
                 if plugins && scenario >= 9 {
                     // A new session must not inherit the old generation's dirty bit.
@@ -1775,9 +1858,18 @@ mod tests {
                     let fresh = receiver.try_recv().unwrap();
                     let pending = core.composer_catalog_snapshot("a").unwrap();
                     core.complete_composer_catalog(work, result());
-                    assert!(Arc::ptr_eq(&pending, &core.composer_catalog_snapshot("a").unwrap()));
+                    assert!(Arc::ptr_eq(
+                        &pending,
+                        &core.composer_catalog_snapshot("a").unwrap()
+                    ));
                     core.complete_composer_catalog(fresh, result());
-                    assert_eq!(core.composer_catalog_snapshot("a").unwrap().plugin_request.state, ComposerCatalogRequestState::Ready);
+                    assert_eq!(
+                        core.composer_catalog_snapshot("a")
+                            .unwrap()
+                            .plugin_request
+                            .state,
+                        ComposerCatalogRequestState::Ready
+                    );
                     assert!(receiver.try_recv().is_err());
                 }
             }

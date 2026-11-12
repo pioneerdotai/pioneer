@@ -52,7 +52,6 @@ keepawake.workspace = true
 libc.workspace = true
 process-wrap.workspace = true
 log.workspace = true
-memvid-core.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true

@@ -20,9 +20,9 @@ impl PackageAction {
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             matches!(
-                    self.kind.as_str(),
-                    "" | "install" | "update" | "retry" | "remove" | "retained"
-                ),
+                self.kind.as_str(),
+                "" | "install" | "update" | "retry" | "remove" | "retained"
+            ),
             "plugins.pending_invalid"
         );
         let mut keys = std::collections::BTreeSet::new();
@@ -48,7 +48,10 @@ fn key(component: &ComponentPlan) -> PluginComponentKey {
 fn matches_key(component: &PluginComponentKey, kind: &str, member: &str) -> bool {
     component.kind == kind && component.member_key == member
 }
-fn package_snapshot(root: &Path, limits: pioneer_plugins::Limits) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
+fn package_snapshot(
+    root: &Path,
+    limits: pioneer_plugins::Limits,
+) -> anyhow::Result<(Snapshot, LoadedPluginPlan)> {
     package_snapshot_cancellable(root, &tokio_util::sync::CancellationToken::new(), limits)
 }
 fn package_snapshot_cancellable(
@@ -97,7 +100,8 @@ impl MessageProcessor {
         let owner = AuthenticatedTransferOwner::from_request_context(context);
         {
             let _upload_lock = self.acquire_skill_upload_lock(&params.upload_id).await;
-            self.revalidate_plugin_upload(&owner, &params.workspace_id, &params.upload_id, request).await?;
+            self.revalidate_plugin_upload(&owner, &params.workspace_id, &params.upload_id, request)
+                .await?;
         }
         let runtime = self.package_delivery_context();
         let source = self
@@ -107,7 +111,7 @@ impl MessageProcessor {
                 &params.upload_id,
                 &runtime,
                 request,
-                        "plugin",
+                "plugin",
             )
             .await?;
         let (_source, candidate, plan) = load_uploaded_plugin(source)
@@ -207,7 +211,8 @@ impl MessageProcessor {
             .collect::<Vec<_>>();
         disclose_update_preview(&mut preview, &existing, &visible, administrative);
         let _upload_lock = self.acquire_skill_upload_lock(&params.upload_id).await;
-        self.revalidate_plugin_upload(&owner, &params.workspace_id, &params.upload_id, request).await?;
+        self.revalidate_plugin_upload(&owner, &params.workspace_id, &params.upload_id, request)
+            .await?;
         Ok(preview)
     }
     async fn plugin_update_changes(
@@ -237,7 +242,9 @@ impl MessageProcessor {
             })
             .collect();
         let limits = guard.limits;
-        let (snapshot, previous) = guard.fs_prepare(move |parent, cancellation| verified_package(parent, cancellation, limits)).await?;
+        let (snapshot, previous) = guard
+            .fs_prepare(move |parent, cancellation| verified_package(parent, cancellation, limits))
+            .await?;
         let mut authorization_changes = Vec::new();
         for component in &plan.components {
             if let ComponentPlan::Mcp { member_key, server } = component {
@@ -349,7 +356,13 @@ impl MessageProcessor {
                 let owner = AuthenticatedTransferOwner::from_request_context(context);
                 {
                     let _upload_lock = self.acquire_skill_upload_lock(&upload_id).await;
-                    self.revalidate_plugin_upload(&owner, &params.workspace_id, &upload_id, request).await?;
+                    self.revalidate_plugin_upload(
+                        &owner,
+                        &params.workspace_id,
+                        &upload_id,
+                        request,
+                    )
+                    .await?;
                 }
                 let runtime = self.package_delivery_context();
                 let source = self
@@ -424,8 +437,10 @@ impl MessageProcessor {
                             std::fs::remove_dir_all(&staged)?;
                         }
                         publish_package(&snapshot, &staged)?;
-                        anyhow::ensure!(Snapshot::capture(&staged, limits, || false)?.tree_digest() == expected,
-                            "plugins.package_changed");
+                        anyhow::ensure!(
+                            Snapshot::capture(&staged, limits, || false)?.tree_digest() == expected,
+                            "plugins.package_changed"
+                        );
                         Ok(())
                     })
                     .await
@@ -440,7 +455,8 @@ impl MessageProcessor {
                 let pending = serde_json::to_string(&action)
                     .map_err(|_| plugin_error(request, "plugins.plan_too_large"))?;
                 let _upload_lock = self.acquire_skill_upload_lock(&upload_id).await;
-                self.revalidate_plugin_upload(&owner, &params.workspace_id, &upload_id, request).await?;
+                self.revalidate_plugin_upload(&owner, &params.workspace_id, &upload_id, request)
+                    .await?;
                 let begin = self
                     .crud_store
                     .begin_plugin_package_update(
@@ -544,7 +560,9 @@ impl MessageProcessor {
                 }
                 let limits = guard.limits;
                 guard
-                    .fs_prepare(move |parent, cancellation| verified_package(parent, cancellation, limits))
+                    .fs_prepare(move |parent, cancellation| {
+                        verified_package(parent, cancellation, limits)
+                    })
                     .await
                     .map_err(|_| plugin_error(request, "plugins.package_changed"))?;
                 let action = PackageAction {
@@ -1318,7 +1336,11 @@ impl MessageProcessor {
 /// Caller has a confirmed execution stop and owns the parent mutex. The three
 /// fixed host paths plus target digest identify crash boundaries; no file in the
 /// used package is replaced before that ACK, including assets-only updates.
-fn swap_package_after_stop(package: &Path, target: &str, limits: pioneer_plugins::Limits) -> anyhow::Result<()> {
+fn swap_package_after_stop(
+    package: &Path,
+    target: &str,
+    limits: pioneer_plugins::Limits,
+) -> anyhow::Result<()> {
     let next = package.with_file_name("package-next");
     let backup = package.with_file_name("package-backup");
     match (package.exists(), next.exists(), backup.exists()) {
@@ -1444,8 +1466,13 @@ mod tests {
     // Regression sources only: NOT_RUN / NOT_COMPILED.
     use super::*;
     fn snapshot_limits() -> pioneer_plugins::Limits {
-        pioneer_plugins::Limits { expanded_bytes: 50 * 1024 * 1024, entry_bytes: 1024 * 1024,
-            entries: 2048, depth: 2048, components: 2048 }
+        pioneer_plugins::Limits {
+            expanded_bytes: 50 * 1024 * 1024,
+            entry_bytes: 1024 * 1024,
+            entries: 2048,
+            depth: 2048,
+            components: 2048,
+        }
     }
     #[test]
     fn assets_only_swap_resumes_a_crash_after_first_rename_and_checks_target() {

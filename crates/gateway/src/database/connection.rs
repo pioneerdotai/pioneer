@@ -162,6 +162,8 @@ async fn initialize_owned(
     let database_open_stage =
         startup.map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseOpen));
     let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
+    pioneer_sqlite::search::register_auto_extension_once()
+        .context("failed to register SQLite search extension")?;
     pioneer_sqlite::zstd::register_auto_extension_once()
         .context("failed to register sqlite-zstd gateway database extension")?;
 
@@ -379,6 +381,8 @@ pub(crate) async fn read_existing_for_operations(
         Err(error) if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() => {}
         Err(error) => return Err(error),
     }
+    pioneer_sqlite::search::register_auto_extension_once()
+        .context("failed to register SQLite search extension")?;
     pioneer_sqlite::zstd::register_auto_extension_once()
         .context("failed to register SQLite extensions for operator reads")?;
     let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;

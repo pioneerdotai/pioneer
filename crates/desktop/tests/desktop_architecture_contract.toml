@@ -23,8 +23,10 @@ custom_elements = ["desktop-thread/src/timeline/markdown.rs:MarkdownLinkText"]
 # CatalogBinding: MCP / Skills / Plugins scoped wakeups. PackageUploadView:
 # Skills / Plugins retained delivery presentation; domain decisions stay Client.
 # Catalog presentation: native MCP / Plugins headers and sidebar slots.
-foundation_modules = ["avatar", "binding", "catalog_binding", "identity", "package_upload", "catalog_presentation"]
-foundation_sources = ["avatar.rs", "binding.rs", "catalog_binding.rs", "catalog_presentation.rs", "identity.rs", "lib.rs", "package_upload.rs"]
+# ImageViews: shared plugin catalogue / composer / timeline presentation leases.
+# Image publication and bounded byte/disk caching remain owned by Client.
+foundation_modules = ["avatar", "image_surface", "binding", "catalog_binding", "identity", "package_upload", "catalog_presentation", "catalog_details_header", "catalog_card", "image_views", "catalog_summary_card"]
+foundation_sources = ["avatar.rs", "binding.rs", "catalog_binding.rs", "catalog_card.rs", "catalog_details_header.rs", "catalog_presentation.rs", "catalog_summary_card.rs", "identity.rs", "image_surface.rs", "image_views.rs", "lib.rs", "package_upload.rs"]
 # Framework creates this transient host through on_drag's Entity<W: Render> API.
 # Its value preview has no retained UI behavior or cache.
 framework_hosts = ["desktop-workspaces/src/drag_preview.rs:SidebarDragSession"]
@@ -167,7 +169,7 @@ edges = ["pioneer-client", "pioneer-desktop-foundation"]
 "TUI-48" = { kind = "Entity", owner = "PluginsView", symbol = "PluginsView", file = "desktop-plugins/src/lib.rs" }
 
 [caches]
-avatar_bytes = { owner = "Client AvatarStore", source = "client/src/avatars.rs", max_files = 2048, max_age_days = 30 }
+image_bytes = { owner = "Client ImageStore", source = "client/src/images/mod.rs", max_files = 2048, max_age_days = 30 }
 artifact_preview = { owner = "Client ArtifactRegistry", source = "client/src/artifacts/preview.rs", max_bytes = 536870912, max_input_bytes = 524288 }
 
 [divergence_owners]
@@ -229,3 +231,13 @@ artifact_preview = { owner = "Client ArtifactRegistry", source = "client/src/art
 "desktop-thread:PendingRequestView" = ["Render", "ThreadView", "TUI-26"]
 "desktop-thread:MemberPicker" = ["RenderOnce", "ThreadMembersView", "TUI-33"]
 "desktop-thread:TaskReviewActionView" = ["Render", "ThreadView", "TUI-26"]
+
+# Value-only catalogue composition shared across independent features.
+"desktop-foundation:CatalogCard" = ["RenderOnce", "SkillsCatalogView / PluginsView", "TUI-38"]
+"desktop-foundation:CatalogSummaryCard" = ["RenderOnce", "McpCatalogView / PluginsView", "TUI-37"]
+"desktop-foundation:CatalogDetailsHeader" = ["RenderOnce", "McpCatalogView / SkillsCatalogView / PluginsView", "TUI-37"]
+"desktop-foundation:ImageSurface" = ["RenderOnce", "owning image presentation", "TUI-46"]
+# Weak shared identities; each visible owner holds a lease, never image bytes.
+"desktop-foundation:ImageView" = ["Render", "PluginsView / ComposerView / TimelineRowView", "TUI-46"]
+"desktop-skills:SkillCard" = ["RenderOnce", "SkillsCatalogView", "TUI-38"]
+"desktop-mcp:McpServerCard" = ["RenderOnce", "McpCatalogView", "TUI-37"]

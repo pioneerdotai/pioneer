@@ -3,13 +3,8 @@ use super::{MessageProcessor, thread_read_tools::ThreadReadAuthority};
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use pioneer_agent::TurnToolContext;
-use pioneer_crud::{
-    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, ThreadEpisodicCapsuleStatus,
-    ThreadEpisodicRepairStatus,
-};
 use pioneer_memory::{
-    ThreadEpisodicMemvidSearchRequest, ThreadEpisodicMemvidSearchSegment,
-    ThreadEpisodicSearchProfile, ThreadEpisodicSearchProfileKind,
+    ThreadEpisodicSearchProfile, ThreadEpisodicSearchProfileKind, ThreadEpisodicSearchRequest,
 };
 use pioneer_protocol::ThreadsSearchParams;
 use pioneer_tools::{
@@ -25,7 +20,6 @@ use std::{
 };
 
 pub(super) const SEARCH_TOOL: &str = "threads_search";
-const CATALOG_QUANTUM: u64 = 100;
 const RETRIEVAL_QUANTUM: usize = 100;
 const PAGE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -33,7 +27,7 @@ pub(crate) fn thread_search_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![ConfiguredToolSpec::new(
         ToolSpec::new(
             SEARCH_TOOL,
-            "Search all accessible indexed conversations in this workspace. Results group matching fragments by conversation, with full current titles and real source references. limit counts fragments (1–100). Follow nextCursor until eof. Use source.turnId and source.itemId as a threads_history_read anchor. A pageFragment continues an oversized JSON card; concatenate its text until complete. Lexical and semantic retrieval are selected automatically.",
+            "Search all accessible indexed conversations in this workspace. Results group matching fragments by conversation, with full current titles and real source references. limit counts fragments (1–100). Follow nextCursor until eof. Use source.turnId and source.itemId as a threads_history_read anchor. A pageFragment continues an oversized JSON card; concatenate its text until complete. Combines word and semantic search; query punctuation and quotes are ordinary text.",
             json!({"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":["string","null"]}},"required":["query","limit"],"additionalProperties":false}),
             PayloadKind::Function,
         ),
@@ -42,7 +36,7 @@ pub(crate) fn thread_search_tool_specs() -> Vec<ConfiguredToolSpec> {
     )]
 }
 
-/// Backend-neutral query and range. Engine cursors stay inside the Memvid adapter.
+/// Backend-neutral query and range. Retrieval positions stay inside the search service.
 struct ThreadSearchRequest<'a> {
     query: &'a str,
     position: usize,
@@ -54,8 +48,8 @@ struct FoundSource {
     thread_id: String,
     title: Option<String>,
     fragment: Value,
-    canonical_key: (String, String, String),
     score: f32,
+    position: usize,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -73,7 +67,7 @@ struct CardFragmentCursor {
     version: String,
     byte_offset: usize,
     // The index snippet is small; bind the continuation to the already selected
-    // canonical source instead of re-running ANN to reconstruct a large title.
+    // canonical source instead of repeating retrieval to reconstruct a large title.
     text: String,
     score: f32,
     #[serde(default)]
@@ -101,197 +95,113 @@ impl MessageProcessor {
         &self,
         authority: &ThreadReadAuthority,
         request: ThreadSearchRequest<'_>,
-    ) -> Result<(Vec<FoundSource>, bool, bool)> {
-        let required = request
-            .position
-            .checked_add(request.limit)
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(|| anyhow!("invalid cursor position"))?;
+    ) -> Result<(Vec<FoundSource>, bool, bool, usize)> {
         let service = &self.thread_episodic_recall_service;
         let (embedding, mut incomplete) = match service
             .prepare_thread_search_embedding(&authority.workspace_id, request.query)
             .await
         {
             Ok(embedding) => (embedding, false),
-            Err(_) => (None, true),
+            Err(error) => {
+                tracing::warn!(
+                    failure_class = "embedding_provider",
+                    "thread search semantic branch unavailable"
+                );
+                let _ = error;
+                (None, true)
+            }
         };
-        let mut merged = BTreeMap::<(String, String, String), FoundSource>::new();
-        let mut after = None;
-        loop {
-            let capsules = self
-                .crud_store
-                .list_thread_episodic_capsules_for_workspace_after(
-                    &authority.workspace_id,
-                    after.as_deref(),
-                    CATALOG_QUANTUM,
+        let search = ThreadEpisodicSearchRequest {
+            workspace_id: authority.workspace_id.clone(),
+            thread_id: String::new(),
+            query: request.query.to_owned(),
+            profile: ThreadEpisodicSearchProfile::for_kind(
+                ThreadEpisodicSearchProfileKind::DefaultContext,
+            ),
+            access: authority.search_access(),
+        };
+        let mut position = request.position;
+        let mut found = Vec::with_capacity(request.limit + 1);
+        let mut seen = HashSet::new();
+        // Bound source validation work even if concurrent changes invalidate an
+        // entire candidate portion. Empty nonterminal pages still advance.
+        for _ in 0..4 {
+            let page = service
+                .thread_search_backend()
+                .search_page(
+                    search.clone(),
+                    RETRIEVAL_QUANTUM,
+                    Some(position.to_string()),
+                    embedding.clone(),
                 )
+                .await
+                .map_err(|error| anyhow!("thread search failed: {error}"))?;
+            incomplete |= !page.warnings.is_empty();
+            let sources = service
+                .resolve_thread_search_sources(&authority.workspace_id, &page.hits)
                 .await?;
-            let catalog_end = capsules.len() < CATALOG_QUANTUM as usize;
-            for capsule in capsules {
-                after = Some(capsule.id.clone());
-                if capsule.status == ThreadEpisodicCapsuleStatus::Deleted {
+            let mut readable = BTreeMap::new();
+            for hit in page.hits {
+                let candidate_position = position;
+                position = position
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("invalid retrieval position"))?;
+                let Some((item, title)) = sources.get(&hit.index_item_id) else {
+                    // A candidate passed SQL eligibility but lost its current
+                    // canonical source/version before disclosure. Do not report
+                    // complete coverage while reconciliation catches up.
+                    incomplete = true;
                     continue;
-                }
-                if capsule.thread_id != THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID
-                    && !self
-                        .thread_source_readable(authority, &capsule.thread_id)
-                        .await?
-                {
-                    continue;
-                }
-                if capsule.status != ThreadEpisodicCapsuleStatus::Active
-                    || capsule.repair_status != ThreadEpisodicRepairStatus::Ok
+                };
+                if item.thread_id != hit.thread_id
+                    || item.turn_id != hit.turn_id
+                    || item.item_id != hit.item_id
+                    || hit.metadata.get("pioneer.thread_episodic.source_text_hash")
+                        != Some(&item.source_text_hash)
                 {
                     incomplete = true;
                     continue;
                 }
-                let search = ThreadEpisodicMemvidSearchRequest {
-                    workspace_id: authority.workspace_id.clone(),
-                    thread_id: String::new(),
-                    query: request.query.to_owned(),
-                    scope: None,
-                    profile: ThreadEpisodicSearchProfile::for_kind(
-                        ThreadEpisodicSearchProfileKind::DefaultContext,
-                    ),
-                    segments: vec![ThreadEpisodicMemvidSearchSegment {
-                        capsule_id: capsule.id,
-                        capsule_ref: capsule.capsule_ref,
-                        storage_uri: capsule.storage_uri,
-                        segment_index: capsule.segment_index,
-                    }],
-                    exact_source: None,
+                let allowed = match readable.get(&item.thread_id) {
+                    Some(allowed) => *allowed,
+                    None => {
+                        let allowed = self
+                            .thread_source_readable(authority, &item.thread_id)
+                            .await?;
+                        readable.insert(item.thread_id.clone(), allowed);
+                        allowed
+                    }
                 };
-                let mut cursor = None;
-                let mut seen = HashSet::new();
-                let mut local_count = 0usize;
-                let mut segment_embedding = embedding.clone();
-                loop {
-                    let page = match service
-                        .thread_search_backend()
-                        .search_segment_page(
-                            search.clone(),
-                            RETRIEVAL_QUANTUM,
-                            cursor.clone(),
-                            segment_embedding.clone(),
-                        )
-                        .await
-                    {
-                        Ok(page) => page,
-                        Err(_) if segment_embedding.is_some() => {
-                            // A healthy lexical index remains searchable when
-                            // its vector projection is absent or incompatible.
-                            // Restart this file's retrieval in lexical mode;
-                            // canonical deduplication handles any earlier hits.
-                            incomplete = true;
-                            segment_embedding = None;
-                            cursor = None;
-                            continue;
-                        }
-                        Err(_) => {
-                            incomplete = true;
-                            break;
-                        }
-                    };
-                    incomplete |=
-                        !page.unavailable_segment_ids.is_empty() || !page.warnings.is_empty();
-                    let sources = service
-                        .resolve_thread_search_sources(&authority.workspace_id, &page.hits)
-                        .await?;
-                    // Request-local, bounded to this retrieval portion. Never reused by
-                    // the final disclosure check or by another request.
-                    let mut readable = BTreeMap::new();
-                    for hit in page.hits {
-                        let Some((item, title)) = sources.get(&hit.index_item_id) else {
-                            continue;
-                        };
-                        if hit.workspace_id != authority.workspace_id
-                            || item.thread_id != hit.thread_id
-                            || item.turn_id != hit.turn_id
-                            || item.item_id != hit.item_id
-                            || hit.metadata.get("pioneer.thread_episodic.source_text_hash")
-                                != Some(&item.source_text_hash)
-                        {
-                            continue;
-                        }
-                        let allowed = match readable.get(&item.thread_id) {
-                            Some(allowed) => *allowed,
-                            None => {
-                                let allowed = self
-                                    .thread_source_readable(authority, &item.thread_id)
-                                    .await?;
-                                readable.insert(item.thread_id.clone(), allowed);
-                                allowed
-                            }
-                        };
-                        if !allowed {
-                            continue;
-                        }
-                        let key = (
-                            item.thread_id.clone(),
-                            item.turn_id.clone(),
-                            item.item_id.clone(),
-                        );
-                        if !seen.insert(key.clone()) {
-                            continue;
-                        }
-                        let score = hit
-                            .memvid_score
-                            .filter(|s| s.is_finite())
-                            .unwrap_or_default();
-                        let found = FoundSource {
-                            thread_id: item.thread_id.clone(),
-                            title: title.clone(),
-                            fragment: json!({"text":hit.text,"score":score,"source":{
-                                "workspaceId":item.workspace_id,"threadId":item.thread_id,
-                                "turnId":item.turn_id,"itemId":item.item_id,"indexItemId":item.id,
-                                "sourceKind":item.source_context,"sourceVersion":item.source_text_hash}}),
-                            canonical_key: key.clone(),
-                            score,
-                        };
-                        if merged.get(&key).is_none_or(|old| score > old.score) {
-                            merged.insert(key, found);
-                        }
-                        local_count += 1;
-                        if local_count == required {
-                            break;
-                        }
-                    }
-                    // Keep only the globally necessary range, never corpus data.
-                    if merged.len() > required {
-                        let mut ranked = merged.into_values().collect::<Vec<_>>();
-                        ranked.sort_by(source_order);
-                        merged = ranked
-                            .into_iter()
-                            .take(required)
-                            .map(|f| (f.canonical_key.clone(), f))
-                            .collect();
-                    }
-                    if local_count >= required || page.next_cursor.is_none() {
-                        break;
-                    }
-                    ensure!(
-                        page.next_cursor != cursor,
-                        "index continuation did not advance"
-                    );
-                    cursor = page.next_cursor;
+                if !allowed {
+                    continue;
+                }
+                let key = (
+                    item.thread_id.clone(),
+                    item.turn_id.clone(),
+                    item.item_id.clone(),
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
+                let score = hit.rank_score();
+                found.push(FoundSource {
+                    thread_id: item.thread_id.clone(), title: title.clone(),
+                    fragment: json!({"text":hit.text,"score":score,"source":{
+                        "workspaceId":item.workspace_id,"threadId":item.thread_id,"turnId":item.turn_id,
+                        "itemId":item.item_id,"indexItemId":item.id,"sourceKind":item.source_context,
+                        "sourceVersion":item.source_text_hash}}),
+                    score, position: candidate_position,
+                });
+                if found.len() > request.limit {
+                    let continuation = found.pop().unwrap().position;
+                    return Ok((found, true, incomplete, continuation));
                 }
             }
-            if catalog_end {
-                break;
+            if page.next_cursor.is_none() {
+                return Ok((found, false, incomplete, position));
             }
         }
-        let mut found = merged.into_values().collect::<Vec<_>>();
-        found.sort_by(source_order);
-        let has_more = found.len() > request.position.saturating_add(request.limit);
-        Ok((
-            found
-                .into_iter()
-                .skip(request.position)
-                .take(request.limit)
-                .collect(),
-            has_more,
-            incomplete,
-        ))
+        Ok((found, true, incomplete, position))
     }
 
     pub(super) async fn search_threads_page(
@@ -334,7 +244,7 @@ impl MessageProcessor {
                 .continue_search_card(&authority, state.position, fragment, &codec, &scope)
                 .await;
         }
-        let (found, has_more, incomplete) = self
+        let (found, has_more, incomplete, next_position) = self
             .search_thread_sources(
                 &authority,
                 ThreadSearchRequest {
@@ -348,9 +258,9 @@ impl MessageProcessor {
         for source in found {
             let mut proposed = accepted.clone();
             proposed.push(source.clone());
-            let next_position = state
+            let next_position = source
                 .position
-                .checked_add(proposed.len())
+                .checked_add(1)
                 .ok_or_else(|| anyhow!("invalid cursor"))?;
             let cursor = codec.encode(
                 &SearchCursor {
@@ -374,18 +284,24 @@ impl MessageProcessor {
                         score: source.score,
                     };
                     return self
-                        .continue_search_card(&authority, state.position, fragment, &codec, &scope)
+                        .continue_search_card(&authority, source.position, fragment, &codec, &scope)
                         .await;
                 }
                 return Ok(search_response(
                     &accepted,
-                    Some(codec.encode(
-                        &SearchCursor {
-                            position: state.position + accepted.len(),
-                            fragment: None,
-                        },
-                        &scope,
-                    )?),
+                    Some(
+                        codec.encode(
+                            &SearchCursor {
+                                position: accepted
+                                    .last()
+                                    .map_or(next_position, |source: &FoundSource| {
+                                        source.position + 1
+                                    }),
+                                fragment: None,
+                            },
+                            &scope,
+                        )?,
+                    ),
                     false,
                     incomplete,
                 ));
@@ -396,7 +312,7 @@ impl MessageProcessor {
             .then(|| {
                 codec.encode(
                     &SearchCursor {
-                        position: state.position + accepted.len(),
+                        position: next_position,
                         fragment: None,
                     },
                     &scope,
@@ -561,12 +477,6 @@ fn search_page_fits_output(response: &Value) -> Result<bool> {
         return Ok(false);
     }
     Ok(pioneer_tools::builtin_json_llm_payload_size(SEARCH_TOOL, response)? <= PAGE_BYTES)
-}
-
-fn source_order(a: &FoundSource, b: &FoundSource) -> std::cmp::Ordering {
-    b.score
-        .total_cmp(&a.score)
-        .then_with(|| a.canonical_key.cmp(&b.canonical_key))
 }
 
 fn search_response(

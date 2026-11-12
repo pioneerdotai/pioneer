@@ -392,9 +392,7 @@ pub fn external_runtime_skill_is_current(
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Ok(false);
     }
-    if fs::read(destination.join("SKILL.md"))
-    .is_err()
-    {
+    if fs::read(destination.join("SKILL.md")).is_err() {
         return Ok(false);
     }
 

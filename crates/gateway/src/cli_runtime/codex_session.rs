@@ -410,9 +410,16 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
     }
     .await;
     let _ = rpc.shutdown().await;
-    let _ = process.terminate_with_grace(pioneer_cli_agent_runtime::process::DEFAULT_SHUTDOWN_GRACE).await;
+    let _ = process
+        .terminate_with_grace(pioneer_cli_agent_runtime::process::DEFAULT_SHUTDOWN_GRACE)
+        .await;
     let (probe_error, cleanup_error) = match probe_result {
-        Ok(mut server) => match tokio_timeout(pioneer_cli_agent_runtime::process::DEFAULT_SHUTDOWN_GRACE, &mut server).await {
+        Ok(mut server) => match tokio_timeout(
+            pioneer_cli_agent_runtime::process::DEFAULT_SHUTDOWN_GRACE,
+            &mut server,
+        )
+        .await
+        {
             Ok(Ok(Ok(()))) => (None, None),
             Ok(Ok(Err(error))) => (
                 None,
@@ -1202,9 +1209,11 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
             let (artifact, prepared) = match setup {
                 Ok(setup) => setup,
                 Err(error) => {
-                    if let Err(error) = self.bridge_supervisor
+                    if let Err(error) = self
+                        .bridge_supervisor
                         .revoke_session_result(process_instance)
-                        .await {
+                        .await
+                    {
                         tracing::warn!(error = %error, "CLI MCP cleanup retained");
                     }
                     return Err(error);
@@ -1234,8 +1243,12 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         process_config.args.extend(options.app_server_args.clone());
         process_config = process_config.with_environment(&options.env);
         startup.check_admission()?;
-        let process = spawn_cli_agent_process(&process_config)
-            .with_context(|| format!("failed to spawn Codex app-server for CLI runtime `{}`", instance.id))?;
+        let process = spawn_cli_agent_process(&process_config).with_context(|| {
+            format!(
+                "failed to spawn Codex app-server for CLI runtime `{}`",
+                instance.id
+            )
+        })?;
         let generation_overlay = overlay_guard.disarm();
         let process = Arc::new(Mutex::new(process));
         startup.retain_process(
@@ -2486,7 +2499,6 @@ impl Drop for CodexGenerationOverlayStartupGuard {
 
 #[cfg(test)]
 mod tests {
-
 
     use super::*;
     use crate::cli_runtime::manager::CLIAgentRuntimeSessionKey;
@@ -4007,7 +4019,12 @@ mod tests {
         bridge.fail_closed().await;
         assert!(bridge.failed.load(Ordering::Acquire));
         assert!(!bootstrap_path.exists());
-        assert!(!supervisor.revoke_session_result(&process_instance).await.unwrap());
+        assert!(
+            !supervisor
+                .revoke_session_result(&process_instance)
+                .await
+                .unwrap()
+        );
         assert!(matches!(
             *bridge.state.lock().await,
             CodexRequiredMcpBridgeState::Stopping {

@@ -1,9 +1,13 @@
 fn snapshot_limits() -> pioneer_plugins::Limits {
-    pioneer_plugins::Limits { expanded_bytes: 50 * 1024 * 1024, entry_bytes: 1024 * 1024,
-        entries: 2048, depth: 2048, components: 2048 }
+    pioneer_plugins::Limits {
+        expanded_bytes: 50 * 1024 * 1024,
+        entry_bytes: 1024 * 1024,
+        entries: 2048,
+        depth: 2048,
+        components: 2048,
+    }
 }
 
-//! Stage A coverage, NOT_RUN (test targets have not been compiled).
 use pioneer_plugins::*;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs};
@@ -40,11 +44,14 @@ fn zenmoney_host_manifests_import_both_skill_and_http_connector() {
     let plan = load(&source).unwrap();
     assert_eq!(plan.manifest.name, "zenmoney");
     assert_eq!(plan.manifest.version.as_deref(), Some("0.1.0"));
+    assert_eq!(
+        plan.manifest.metadata.display_name.as_deref(),
+        Some("Zenmoney")
+    );
     for (code, pointer) in [
         ("vendor_subset_import", ".codex-plugin/plugin.json"),
         ("ignored_vendor_manifest", ".claude-plugin/plugin.json"),
         ("ignored_vendor_feature", ".codex-plugin/plugin.json/hooks"),
-        ("ignored_vendor_feature", ".codex-plugin/plugin.json/interface"),
     ] {
         assert!(
             plan.diagnostics
@@ -172,15 +179,18 @@ fn bundled_skills_require_authored_fields_with_native_frontmatter_parsing() {
         let markdown = format!("---\n{fields}\n---\nRead bundled data.");
         let plan = load(&package(manifest(), &[("skills/good/SKILL.md", &markdown)])).unwrap();
         assert!(plan.components.is_empty(), "{fields}");
-        assert!(plan.diagnostics.iter().any(|d| {
-            d.code == "invalid_skill" && d.pointer == "skills/good/SKILL.md"
-        }));
+        assert!(
+            plan.diagnostics
+                .iter()
+                .any(|d| { d.code == "invalid_skill" && d.pointer == "skills/good/SKILL.md" })
+        );
     }
     for markdown in [
         SKILL.to_owned(),
         SKILL.replace('\n', "\r\n"),
         format!("\u{feff}{SKILL}"),
-        "---\nname: good\ndescription: |\n  Inspect data.\n  Keep context.\n---\nRead assets.\n".into(),
+        "---\nname: good\ndescription: |\n  Inspect data.\n  Keep context.\n---\nRead assets.\n"
+            .into(),
     ] {
         let plan = load(&package(manifest(), &[("skills/good/SKILL.md", &markdown)])).unwrap();
         assert_eq!(plan.components.len(), 1, "{markdown}");

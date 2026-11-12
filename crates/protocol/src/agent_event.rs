@@ -29,6 +29,16 @@ pub enum ProtocolEventClass {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentDurableEvent {
+    /// Cumulative financial snapshot. Updates one retained row; never a token
+    /// delta transcript event and never a second charge identity.
+    ProviderUsageSnapshot {
+        workspace_id: String,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        revision: i64,
+        usage: JsonValue,
+    },
     /// A unique output chunk on the acknowledged lane, retained across interruption.
     ToolOutputRecorded {
         id: String,
@@ -446,6 +456,7 @@ impl AgentDurableEvent {
             | Self::TurnCapabilitiesResolved { turn_id, .. }
             | Self::SkillAuditEvents { turn_id, .. }
             | Self::TurnLlmContextAppended { turn_id, .. }
+            | Self::ProviderUsageSnapshot { turn_id, .. }
             | Self::TurnProviderHistoryAppended { turn_id, .. }
             | Self::ProviderFailureDetected { turn_id, .. }
             | Self::RecoveryAttemptSucceeded { turn_id, .. }
@@ -531,6 +542,7 @@ impl AgentDurableEvent {
             | Self::TurnProviderHistoryAppended { .. }
             | Self::NativeCancellationContextPrepared { .. }
             | Self::NativeTerminalEffectsPrepared { .. }
+            | Self::ProviderUsageSnapshot { .. }
             | Self::ToolOutputRecorded { .. }
             | Self::ItemStarted { .. }
             | Self::ItemToolRetryScheduled { .. }

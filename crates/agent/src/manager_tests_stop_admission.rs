@@ -78,10 +78,7 @@ async fn accepted_registry(
 async fn published_owner(manager: &AgentManager, thread: &str, turn: &str) -> NativeTurnStopOwner {
     timeout(Duration::from_secs(3), async {
         loop {
-            if let Ok(owners) = manager
-                .capture_native_stop_owners(&[thread.into()])
-                .await
-            {
+            if let Ok(owners) = manager.capture_native_stop_owners(&[thread.into()]).await {
                 if let Some(owner) = owners
                     .into_iter()
                     .find(|owner| owner.turn_id() == turn && !owner.is_quiescent())
@@ -332,9 +329,7 @@ async fn drained_finish_is_unknown_until_real_actor_terminal_clear() {
             .is_quiescent()
     );
     assert!(matches!(
-        manager
-            .capture_native_stop_owners(&["finish".into()])
-            .await,
+        manager.capture_native_stop_owners(&["finish".into()]).await,
         Err(StopError::UnknownOwner)
     ));
     durable.acknowledge_last(Ok(()));

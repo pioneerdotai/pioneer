@@ -250,9 +250,8 @@ pub(crate) async fn build_cli_runtime_owned_skill_install_plans(
     resolved: &[pioneer_skills::ResolvedSkill],
     receipt_path: &Path,
 ) -> Result<Vec<CliRuntimeSkillInstallPlan>> {
-    let mut plans = build_cli_runtime_skill_install_plans(
-        runtime, runtime_kind, resolved, receipt_path,
-    )?;
+    let mut plans =
+        build_cli_runtime_skill_install_plans(runtime, runtime_kind, resolved, receipt_path)?;
     for plan in &mut plans {
         let Some(owner) = store.find_skill_plugin_owner(&plan.skill_id).await? else {
             continue;
@@ -929,10 +928,11 @@ pub(crate) fn prepend_cli_skill_delivery(
     let mut seen = std::collections::HashSet::new();
     for name in explicit_names {
         if let Some(skill) = installed.iter().find(|skill| &skill.install_name == name) {
-            let path =
-                skill.installed_path.join("SKILL.md")
-                    .to_string_lossy()
-                    .into_owned();
+            let path = skill
+                .installed_path
+                .join("SKILL.md")
+                .to_string_lossy()
+                .into_owned();
             if seen.insert(path.clone()) {
                 prefix.push(CLIRuntimeTurnInputItem::Skill {
                     name: skill.install_name.clone(),
@@ -1299,10 +1299,15 @@ mod tests {
             let mut installed = Vec::new();
             for plan in &plans {
                 assert_eq!(plan.install_name, format!("pioneer-system-{}", plan.slug));
-                let result =
-                    install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, plan, async { Ok(()) })
-                        .await
-                        .unwrap();
+                let result = install_one_cli_runtime_skill(
+                    &locks,
+                    &receipt_lock,
+                    &candidates,
+                    plan,
+                    async { Ok(()) },
+                )
+                .await
+                .unwrap();
                 assert_eq!(result.status, CliRuntimeSkillInstallStatus::Installed);
                 let exported = fs::read_to_string(result.installed_path.join("SKILL.md")).unwrap();
                 assert!(exported.starts_with(&format!("---\nname: {}\n", plan.install_name)));
@@ -1323,10 +1328,15 @@ mod tests {
             }
             let before = fs::read(&receipt_path).unwrap();
             for (plan, first) in plans.iter().zip(&installed) {
-                let again = install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, plan,
-                    async { anyhow::bail!("current exports must not stop native owners") })
-                    .await
-                    .unwrap();
+                let again = install_one_cli_runtime_skill(
+                    &locks,
+                    &receipt_lock,
+                    &candidates,
+                    plan,
+                    async { anyhow::bail!("current exports must not stop native owners") },
+                )
+                .await
+                .unwrap();
                 assert_eq!(again.status, CliRuntimeSkillInstallStatus::Current);
                 assert_eq!(
                     again.receipt_updated_at_unix_ms,
@@ -1337,12 +1347,20 @@ mod tests {
             let damaged = &plans[0];
             fs::write(damaged.destination.join("SKILL.md"), "damaged export").unwrap();
             let mut stopped = false;
-            let repaired = install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, damaged,
-                async { stopped = true; Ok(()) }).await.unwrap();
+            let repaired =
+                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, damaged, async {
+                    stopped = true;
+                    Ok(())
+                })
+                .await
+                .unwrap();
             assert!(stopped);
             assert_eq!(repaired.status, CliRuntimeSkillInstallStatus::Updated);
-            assert!(fs::read_to_string(damaged.destination.join("SKILL.md")).unwrap()
-                .starts_with(&format!("---\nname: {}\n", damaged.install_name)));
+            assert!(
+                fs::read_to_string(damaged.destination.join("SKILL.md"))
+                    .unwrap()
+                    .starts_with(&format!("---\nname: {}\n", damaged.install_name))
+            );
             // A stale ordinary-name receipt can coexist with the new export.
             // It cannot authorize cleanup or adoption of that directory.
             let mut receipt = read_external_runtime_receipt(&receipt_path).unwrap();
@@ -1478,9 +1496,11 @@ mod tests {
         let mut installed = Vec::new();
         for plan in &plans {
             installed.push(
-                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, plan, async { Ok(()) })
-                    .await
-                    .unwrap(),
+                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, plan, async {
+                    Ok(())
+                })
+                .await
+                .unwrap(),
             );
         }
         let initial = normalize_cli_runtime_selected_skills(
@@ -1540,7 +1560,8 @@ mod tests {
                 &new_cli_runtime_skill_destination_locks(),
                 &Arc::new(Mutex::new(())),
                 &[receipt_candidate(&plan)],
-                &plan, async { Ok(()) },
+                &plan,
+                async { Ok(()) },
             )
             .await
             .unwrap_err();
@@ -1716,7 +1737,8 @@ mod tests {
                 &new_cli_runtime_skill_destination_locks(),
                 &Arc::new(Mutex::new(())),
                 &candidates,
-                &plan, async { Ok(()) },
+                &plan,
+                async { Ok(()) },
             )
             .await
             .unwrap();
@@ -1740,7 +1762,8 @@ mod tests {
                     &new_cli_runtime_skill_destination_locks(),
                     &Arc::new(Mutex::new(())),
                     &candidates,
-                    &plan, async { Ok(()) },
+                    &plan,
+                    async { Ok(()) },
                 )
                 .await
                 .unwrap();
@@ -1829,7 +1852,8 @@ mod tests {
                 &prod_locks,
                 &prod_receipt_lock,
                 &candidates,
-                &prod_plan, async { Ok(()) },
+                &prod_plan,
+                async { Ok(()) },
             )
             .await
             .unwrap();
@@ -1839,7 +1863,8 @@ mod tests {
                 &new_cli_runtime_skill_destination_locks(),
                 &Arc::new(Mutex::new(())),
                 &candidates,
-                &dev_plan, async { Ok(()) },
+                &dev_plan,
+                async { Ok(()) },
             )
             .await
             .unwrap();
@@ -1858,7 +1883,8 @@ mod tests {
                 &prod_locks,
                 &prod_receipt_lock,
                 &candidates,
-                &prod_plan, async { Ok(()) },
+                &prod_plan,
+                async { Ok(()) },
             )
             .await
             .unwrap();
@@ -1913,7 +1939,10 @@ mod tests {
         let sentinel = plan.destination.join("node_modules/sentinel");
         fs::write(&sentinel, b"preserve user files").unwrap();
         let before = fs::read(&plan.receipt_path).unwrap();
-        let error = install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan, async { Ok(()) })
+        let error =
+            install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan, async {
+                Ok(())
+            })
             .await
             .unwrap_err();
         assert!(error.to_string().contains("unhashed directory"));
@@ -1960,9 +1989,15 @@ mod tests {
                         plan.native_skills_root.clone()
                     }
                     "nested" => {
-                        install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan, async { Ok(()) })
-                            .await
-                            .unwrap();
+                        install_one_cli_runtime_skill(
+                            &locks,
+                            &receipt_lock,
+                            &candidates,
+                            &plan,
+                            async { Ok(()) },
+                        )
+                        .await
+                        .unwrap();
                         let link = plan.destination.join("references/foreign");
                         symlink(&foreign, &link).unwrap();
                         link
@@ -1975,9 +2010,15 @@ mod tests {
                 };
                 let receipt_before = fs::read(&plan.receipt_path).ok();
                 assert!(
-                    install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
-                        .await
-                        .is_err()
+                    install_one_cli_runtime_skill(
+                        &locks,
+                        &receipt_lock,
+                        &candidates,
+                        &plan,
+                        async { Ok(()) }
+                    )
+                    .await
+                    .is_err()
                 );
                 assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
                 assert_eq!(fs::read(foreign.join("sentinel")).unwrap(), b"foreign");
@@ -2600,9 +2641,15 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 let candidates = [receipt_candidate(&plan)];
-                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan, async { Ok(()) })
-                    .await
-                    .unwrap()
+                install_one_cli_runtime_skill(
+                    &destination_locks,
+                    &receipt_lock,
+                    &candidates,
+                    &plan,
+                    async { Ok(()) },
+                )
+                .await
+                .unwrap()
             }));
         }
         barrier.wait().await;
@@ -2654,9 +2701,15 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 let candidates = [receipt_candidate(&plan)];
                 barrier.wait().await;
-                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan, async { Ok(()) })
-                    .await
-                    .unwrap()
+                install_one_cli_runtime_skill(
+                    &destination_locks,
+                    &receipt_lock,
+                    &candidates,
+                    &plan,
+                    async { Ok(()) },
+                )
+                .await
+                .unwrap()
             }));
         }
         barrier.wait().await;
@@ -2692,9 +2745,15 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 let candidates = [receipt_candidate(&plan)];
-                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan, async { Ok(()) })
-                    .await
-                    .unwrap()
+                install_one_cli_runtime_skill(
+                    &destination_locks,
+                    &receipt_lock,
+                    &candidates,
+                    &plan,
+                    async { Ok(()) },
+                )
+                .await
+                .unwrap()
             }));
         }
         barrier.wait().await;
@@ -2721,10 +2780,15 @@ mod tests {
         let destination_locks = new_cli_runtime_skill_destination_locks();
         let receipt_lock = Arc::new(Mutex::new(()));
         let candidates = [receipt_candidate(&plan)];
-        let installed =
-            install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan, async { Ok(()) })
-                .await
-                .unwrap();
+        let installed = install_one_cli_runtime_skill(
+            &destination_locks,
+            &receipt_lock,
+            &candidates,
+            &plan,
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
         let runtime = runtime_instance(
             GatewayCliAgentRuntimeKindConfig::Claude,
             temp.path()
@@ -2797,14 +2861,25 @@ mod tests {
         let receipt_lock = Arc::new(Mutex::new(()));
 
         let candidates = [receipt_candidate(&plan)];
-        install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan, async { Ok(()) })
-            .await
-            .unwrap();
+        install_one_cli_runtime_skill(
+            &destination_locks,
+            &receipt_lock,
+            &candidates,
+            &plan,
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
         fs::write(plan.source.join("changed"), b"changed").unwrap();
         symlink("loop", plan.source.join("loop")).unwrap();
-        let failed =
-            install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan, async { Ok(()) })
-                .await;
+        let failed = install_one_cli_runtime_skill(
+            &destination_locks,
+            &receipt_lock,
+            &candidates,
+            &plan,
+            async { Ok(()) },
+        )
+        .await;
         assert!(failed.is_err());
         assert!(
             read_external_runtime_receipt(&plan.receipt_path)
@@ -2814,11 +2889,15 @@ mod tests {
         );
 
         fs::remove_file(plan.source.join("loop")).unwrap();
-        let retried =
-            install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan, async { Ok(()) })
-                .await
-                .unwrap();
+        let retried = install_one_cli_runtime_skill(
+            &destination_locks,
+            &receipt_lock,
+            &candidates,
+            &plan,
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
         assert_eq!(retried.status, CliRuntimeSkillInstallStatus::Installed);
     }
-
 }

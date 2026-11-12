@@ -18,7 +18,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
+const DEFAULT_READ_MAX_BYTES: usize = 50 * 1024;
 const HARD_MAX_READ_PAGE_BYTES: usize = 1024 * 1024;
 const DEFAULT_READ_MAX_LINES: usize = 2000;
 const HARD_MAX_READ_LINES: usize = 20_000;
@@ -159,6 +159,14 @@ impl ToolHandler for ReadFileHandler {
             (None, None) => (0, None, args.cursor),
         };
         let requested_path = file_path.clone();
+        let budget_path = display_absolute_path(file_path.as_path());
+        let (call_id, tool_name, output_policy, output_projection) =
+            crate::context::model_result_framing().unwrap_or((
+                invocation.call_id,
+                invocation.tool_name,
+                crate::ToolOutputPolicySnapshot::for_tool_name("read_file"),
+                crate::ToolOutputProjectionKind::Builtin,
+            ));
         let page = pioneer_observability::work::spawn_blocking(move || {
             let _filesystem_slot = filesystem_slot;
             let file = capability
@@ -171,19 +179,58 @@ impl ToolHandler for ReadFileHandler {
                 },
                 AllowAllReadAccess,
             );
-            reader
-                .read_target_with_file(
+            let mut page_bytes = max_bytes;
+            loop {
+                let page = reader.read_target_with_file(
                     &target,
-                    file,
+                    file.try_clone()
+                        .map_err(|_| ReadError::new(ReadErrorCode::Io))?,
                     ReadRequest {
                         start_line,
                         start_byte,
                         max_lines,
-                        max_bytes,
+                        max_bytes: page_bytes,
                     },
                     cursor.as_deref(),
-                )
-                .map_err(|error| error)
+                )?;
+                let raw = serde_json::json!({
+                    "path": budget_path, "text": page.content,
+                    "start_line": page.start_line + 1,
+                    "end_line": if page.content.is_empty() { None } else {
+                        Some(page.start_line + split_lines_inclusive(&page.content).len() as u64)
+                    },
+                    "start_byte": page.start_byte,
+                    "range": {"start": page.start_byte, "end": page.end_byte, "unit": "bytes"},
+                    "partial_line": page.partial_line, "truncated": page.truncated,
+                    "continuation": page.cursor, "next_line": page.next_line.map(|line| line + 1),
+                });
+                let message = read_file_page_message(
+                    &raw,
+                    &call_id,
+                    &tool_name,
+                    &output_policy,
+                    &output_projection,
+                );
+                let delivered: JsonValue = serde_json::from_str(&message.content)
+                    .map_err(|_| ReadError::new(ReadErrorCode::TooLarge))?;
+                let exact = delivered.get("text") == raw.get("text")
+                    && delivered.get("continuation") == raw.get("continuation");
+                let size = pioneer_compaction::estimator::json_size(&message)
+                    .map_err(|_| ReadError::new(ReadErrorCode::TooLarge))?;
+                if exact
+                    && size.bytes <= pioneer_compaction::RESULT_BYTES
+                    && size.tokens() <= pioneer_compaction::RESULT_TOKENS
+                {
+                    break Ok(page);
+                }
+                // Retry the exact same authorized descriptor/offset. Only the
+                // final page's version-bound continuation is ever published.
+                let smaller = (page.content.len() as u64).min(page_bytes) / 2;
+                if smaller == 0 {
+                    break Err(ReadError::new(ReadErrorCode::TooLarge));
+                }
+                page_bytes = smaller;
+            }
         })
         .await
         .map_err(|error| ToolError::execution_failed(format!("read worker failed: {error}")))?
@@ -219,6 +266,7 @@ impl ToolHandler for ReadFileHandler {
             "authorized_root": display_absolute_path(resolved.authorized_root.as_path()),
             "start_line": page.start_line.saturating_add(1),
             "start_byte": page.start_byte,
+            "partial_line": page.partial_line,
             "end_line": if page.content.is_empty() { JsonValue::Null } else { serde_json::json!(page.start_line.saturating_add(selected_line_count as u64)) },
             "max_lines": max_lines,
             "max_bytes": max_bytes,
@@ -241,6 +289,29 @@ impl ToolHandler for ReadFileHandler {
             rendered, true, payload,
         )))
     }
+}
+
+fn read_file_page_message(
+    raw: &JsonValue,
+    call_id: &str,
+    tool_name: &str,
+    policy: &crate::ToolOutputPolicySnapshot,
+    projection: &crate::ToolOutputProjectionKind,
+) -> pioneer_provider::ChatMessage {
+    let outcome = crate::classifier::read_file_page_outcome(raw["truncated"] == true);
+    crate::project_tool_result(crate::ToolProjectionInput {
+        call_id,
+        tool_name,
+        arguments: &JsonValue::Null,
+        raw_output_text: "",
+        raw_output_json: raw,
+        success: true,
+        outcome: &outcome,
+        output_policy: policy,
+        output_projection: projection,
+    })
+    .to_model_input_item(call_id, tool_name)
+    .into_chat_message()
 }
 
 fn split_lines_inclusive(text: &str) -> Vec<&str> {
@@ -1312,6 +1383,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_fits_the_configured_projection_cap_before_publishing_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("capped.txt"), "λ".repeat(5000)).unwrap();
+        let security = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+        let mut policy = crate::ToolOutputPolicySnapshot::for_tool_name("read_file");
+        policy.llm = crate::LlmOutputPolicy::Full { max_bytes: 2048 };
+        let output = crate::with_model_result_framing(
+            "provider".into(),
+            "read_file".into(),
+            policy.clone(),
+            crate::ToolOutputProjectionKind::Builtin,
+            ReadFileHandler.handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({"path":"capped.txt", "max_bytes":50000}),
+                    },
+                    root.path(),
+                    security,
+                ),
+                crate::ToolEventBus::default().start_trace("capped", "call", "read_file"),
+            ),
+        )
+        .await
+        .unwrap();
+        let raw = output.raw_json();
+        let message = read_file_page_message(
+            &raw,
+            "provider",
+            "read_file",
+            &policy,
+            &crate::ToolOutputProjectionKind::Builtin,
+        );
+        let payload: JsonValue = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(payload["text"], raw["text"]);
+        assert_eq!(payload["continuation"], raw["continuation"]);
+        assert_eq!(raw["truncated"], true);
+        assert!(raw["text"].as_str().unwrap().len() < 10000);
+        assert!(!raw["text"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_file_pages_reassemble_long_escaped_unicode_line_and_crlf() {
+        let root = tempfile::tempdir().unwrap();
+        let text = format!("{}\r\nlast\r\n", "界🌍\"\\\t".repeat(20000));
+        std::fs::write(root.path().join("long.txt"), format!("\u{feff}{text}")).unwrap();
+        let security = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+        let bus = crate::events::ToolEventBus::default();
+        for explicit in [false, true] {
+            let provider_call_id = if explicit {
+                "\"".repeat(12000)
+            } else {
+                "call".into()
+            };
+            let model_name = if explicit {
+                "skill.fixture.read_file"
+            } else {
+                "read_file"
+            };
+            let projection = if explicit {
+                crate::ToolOutputProjectionKind::DynamicFunctionProxy {
+                    target_tool_name: "read_file".into(),
+                    target_policy: crate::ToolOutputPolicySnapshot::for_tool_name("read_file"),
+                    target_projection_kind: Box::new(crate::ToolOutputProjectionKind::Builtin),
+                }
+            } else {
+                crate::ToolOutputProjectionKind::Builtin
+            };
+            let mut cursor = JsonValue::Null;
+            let mut rebuilt = String::new();
+            let mut next_byte = 3;
+            let mut partial = false;
+            for _ in 0..200 {
+                let mut args = serde_json::json!({"path":"long.txt"});
+                if explicit {
+                    args["max_bytes"] = (1024 * 1024).into();
+                }
+                if !cursor.is_null() {
+                    args["cursor"] = cursor;
+                }
+                let output = crate::with_model_result_framing(
+                    provider_call_id.clone(),
+                    model_name.into(),
+                    crate::ToolOutputPolicySnapshot::for_tool_name("read_file"),
+                    projection.clone(),
+                    ReadFileHandler.handle(
+                        invocation(
+                            "read_file",
+                            ToolPayload::Function { arguments: args },
+                            root.path(),
+                            security.clone(),
+                        ),
+                        bus.start_trace("turn_pages", "call_pages", "read_file"),
+                    ),
+                )
+                .await
+                .unwrap();
+                let raw = output.raw_json();
+                assert_eq!(raw["start_byte"].as_u64(), Some(next_byte));
+                let content = raw["text"].as_str().unwrap();
+                assert!(!content.is_empty());
+                rebuilt.push_str(content);
+                next_byte = raw["range"]["end"].as_u64().unwrap();
+                partial |= raw["partial_line"] == true;
+                let message = read_file_page_message(
+                    &raw,
+                    &provider_call_id,
+                    model_name,
+                    &crate::ToolOutputPolicySnapshot::for_tool_name("read_file"),
+                    &projection,
+                );
+                let delivered: JsonValue = serde_json::from_str(&message.content).unwrap();
+                assert_eq!(delivered["text"], raw["text"]);
+                assert_eq!(delivered["continuation"], raw["continuation"]);
+                let encoded = serde_json::to_string(&message).unwrap();
+                assert!(encoded.len() <= 65536);
+                assert!(pioneer_compaction::text_tokens(&encoded) <= 8192);
+                cursor = raw["continuation"].clone();
+                if cursor.is_null() {
+                    break;
+                }
+            }
+            assert!(partial);
+            assert!(cursor.is_null());
+            assert_eq!(rebuilt, text);
+        }
+    }
+
+    #[tokio::test]
     async fn read_file_prefers_start_line_when_both_offsets_are_supplied() {
         let root = tempfile::tempdir().expect("workspace root");
         std::fs::write(root.path().join("lines.txt"), "alpha\nbeta\ngamma\n")
@@ -1813,7 +2019,7 @@ mod tests {
         let root = tempfile::tempdir().expect("workspace root");
         std::fs::write(
             root.path().join("long.rs"),
-            format!("{}needle_at_tail\n", "x".repeat(600)),
+            format!("{}Needle_at_tail42\nneedle_at_tail7\n", "界".repeat(6000)),
         )
         .expect("long line fixture");
         let security = TurnExecutionSecuritySnapshot::unrestricted_full_access(
@@ -1826,13 +2032,14 @@ mod tests {
                     "grep_files",
                     ToolPayload::Function {
                         arguments: serde_json::json!({
-                            "pattern": "needle_at_tail",
+                            "pattern": "needle_at_tail[0-9]+",
+                            "case_sensitive": false,
                             "path": root.path(),
                             "glob": "*.rs",
                         }),
                     },
                     root.path(),
-                    security,
+                    security.clone(),
                 ),
                 crate::events::ToolEventBus::default().start_trace(
                     "turn_long_grep",
@@ -1847,8 +2054,214 @@ mod tests {
             output.raw_json()["stdout"]
                 .as_str()
                 .unwrap()
-                .contains("needle_at_tail")
+                .contains("Needle_at_tail42")
         );
+        let raw = output.raw_json();
+        assert_eq!(raw["match_count"], 2);
+        let text = raw["stdout"].as_str().unwrap();
+        assert!(text.contains("needle_at_tail7"));
+        assert!(text.contains("line preview shortened"));
+        let offset: u64 = text
+            .split("read_file start_byte=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let read = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({"path":"long.rs", "start_byte":offset}),
+                    },
+                    root.path(),
+                    security,
+                ),
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn_long_grep",
+                    "call_read_preview",
+                    "read_file",
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read.raw_json()["text"]
+                .as_str()
+                .unwrap()
+                .contains("Needle_at_tail42")
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_files_crlf_matches_keep_raw_spans_and_read_addresses() {
+        let root = tempfile::tempdir().unwrap();
+        // Independent raw fixture: short match at 0, long-line match at 18005.
+        let fixture = format!("foo\r\n{}foo\r\n", "界".repeat(6000));
+        let path = root.path().join("crlf.rs");
+        std::fs::write(&path, &fixture).unwrap();
+        let security = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+        let output = GrepHandler
+            .handle(
+                invocation(
+                    "grep_files",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({"path":"crlf.rs", "pattern":r"foo\r"}),
+                    },
+                    root.path(),
+                    security.clone(),
+                ),
+                crate::ToolEventBus::default().start_trace("crlf", "grep", "grep_files"),
+            )
+            .await
+            .unwrap();
+        let raw = output.raw_json();
+        assert_eq!(raw["status"], "ok");
+        assert_eq!(raw["match_count"], 2);
+        assert_eq!(
+            raw["truncated"], false,
+            "shortened line is not an omitted match"
+        );
+        let text = raw["stdout"].as_str().unwrap();
+        let projected = crate::project_tool_result(crate::ToolProjectionInput {
+            call_id: "grep",
+            tool_name: "grep_files",
+            arguments: &JsonValue::Null,
+            raw_output_text: text,
+            raw_output_json: &raw,
+            success: true,
+            outcome: &crate::ToolOutcome::ok(),
+            output_policy: &crate::ToolOutputPolicySnapshot::for_tool_name("grep_files"),
+            output_projection: &crate::ToolOutputProjectionKind::Builtin,
+        })
+        .to_model_input_item("grep", "grep_files")
+        .into_chat_message();
+        let model: JsonValue = serde_json::from_str(&projected.content).unwrap();
+        assert_eq!(
+            model["output"], text,
+            "projection must preserve CR-containing previews and addresses"
+        );
+        let absolute = display_absolute_path(&path);
+        assert!(text.starts_with(&format!("{absolute}:1:foo\r\n [source preview includes line terminator; read_file start_byte=0 (match byte=0) or start_line=1]\n")));
+        let long = text.split_once(&format!("{absolute}:2:")).unwrap().1;
+        let (preview, address) = long
+            .split_once(" [line preview shortened; read_file start_byte=")
+            .unwrap();
+        assert!(preview.ends_with("foo\r\n"));
+        assert!(preview.chars().count() <= 2000);
+        assert!(address.contains("(match byte=18005) or start_line=2]"));
+        let preview_start: usize = address.split_whitespace().next().unwrap().parse().unwrap();
+        assert_eq!(
+            &fixture.as_bytes()[preview_start..preview_start + preview.len()],
+            preview.as_bytes()
+        );
+        // Both addresses must read the original CR-containing match through
+        // the public file handler, not through the grep verification helper.
+        for offset in [0u64, 18005] {
+            let read = ReadFileHandler.handle(invocation("read_file", ToolPayload::Function {
+                arguments: serde_json::json!({"path":"crlf.rs", "start_byte":offset, "max_bytes":5}),
+            }, root.path(), security.clone()),
+                crate::ToolEventBus::default().start_trace("crlf", format!("read-{offset}"), "read_file"),
+            ).await.unwrap();
+            let page = read.raw_json();
+            assert_eq!(page["text"], "foo\r\n");
+            assert_eq!(page["range"]["start"], offset);
+            assert_eq!(page["range"]["end"], offset + 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_files_assertions_keep_backend_search_origins() {
+        let root = tempfile::tempdir().unwrap();
+        let security = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+        let fixtures = [
+            (
+                "long.rs",
+                format!("other\nfoo{} bar\n", "x".repeat(6000)),
+                1u64,
+            ),
+            ("passes.rs", "bar\nfoo".to_owned(), 2u64),
+            (
+                "multiline.rs",
+                format!("bar foo\nfoo\nfoo{} bar\n", "x".repeat(6000)),
+                2u64,
+            ),
+        ];
+        for (name, fixture, count) in fixtures {
+            let path = root.path().join(name);
+            std::fs::write(&path, &fixture).unwrap();
+            let pattern = if name == "multiline.rs" {
+                r"\Afoo|bar|never\nhit"
+            } else {
+                r"\Afoo|bar"
+            };
+            let output = GrepHandler
+                .handle(
+                    invocation(
+                        "grep_files",
+                        ToolPayload::Function {
+                            arguments: serde_json::json!({"path":name, "pattern":pattern}),
+                        },
+                        root.path(),
+                        security.clone(),
+                    ),
+                    crate::ToolEventBus::default().start_trace("origins", name, "grep_files"),
+                )
+                .await
+                .unwrap();
+            let raw = output.raw_json();
+            assert_eq!(raw["status"], "ok");
+            assert_eq!(raw["match_count"], count);
+            assert_eq!(raw["truncated"], false);
+            let text = raw["stdout"].as_str().unwrap();
+            let absolute = display_absolute_path(&path);
+            if name == "passes.rs" {
+                // Core advances to row end; its next slice starts with foo.
+                assert_eq!(text, format!("{absolute}:1:bar\n{absolute}:2:foo\n"));
+            } else {
+                // The literal-LF strategy advances at span end, not row end.
+                let (row, match_byte) = if name == "multiline.rs" {
+                    (3, 6016u64)
+                } else {
+                    (2, 6010u64)
+                };
+                let line = text.split_once(&format!("{absolute}:{row}:")).unwrap().1;
+                let (preview, address) = line
+                    .split_once(" [line preview shortened; read_file start_byte=")
+                    .unwrap();
+                assert!(
+                    preview.contains("bar"),
+                    "preview must contain the backend match"
+                );
+                assert!(preview.chars().count() <= 2000);
+                assert!(
+                    address.contains(&format!("(match byte={match_byte}) or start_line={row}]"))
+                );
+                let start: usize = address.split_whitespace().next().unwrap().parse().unwrap();
+                assert_eq!(
+                    &fixture.as_bytes()[start..start + preview.len()],
+                    preview.as_bytes()
+                );
+                let read = ReadFileHandler.handle(invocation("read_file", ToolPayload::Function {
+                    arguments: serde_json::json!({"path":name,"start_byte":match_byte,"max_bytes":4}),
+                }, root.path(), security.clone()),
+                    crate::ToolEventBus::default().start_trace("origins", "read-real-match", "read_file"),
+                ).await.unwrap();
+                let page = read.raw_json();
+                assert_eq!(page["text"], "bar\n");
+                assert_eq!(page["range"]["start"], match_byte);
+                assert_eq!(page["range"]["end"], match_byte + 4);
+            }
+        }
     }
 
     #[cfg(unix)]

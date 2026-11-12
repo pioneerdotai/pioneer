@@ -78,6 +78,7 @@ impl NativeSummarizer {
             })
             .transpose()?;
         Ok(ChatRequest {
+            tool_declarations: None,
             service_mode: self.service_mode.clone(),
             model: request.selection.model.clone(),
             messages: vec![
@@ -519,6 +520,18 @@ mod tests {
         );
         assert!(provider.calls.lock().unwrap().is_empty());
     }
+}
+
+/// First delivery after a terminal-only crash uses the same shell policy and
+/// control-field-preserving budget as ordinary Agent delivery.
+pub fn recovered_shell_result_message(
+    message: pioneer_provider::ChatMessage,
+    policy: &pioneer_protocol::ToolOutputPolicySnapshot,
+    saved_output_available: bool,
+    reference: &str,
+) -> Result<pioneer_provider::ChatMessage> {
+    crate::chat::prepare_shell_model_message(message, policy, saved_output_available, reference)
+        .map_err(|error| anyhow::anyhow!("cannot prepare recovered shell result: {error:?}"))
 }
 
 /// Rebuild the same bounded model representation when restoring a durable tool

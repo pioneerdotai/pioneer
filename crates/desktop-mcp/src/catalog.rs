@@ -495,7 +495,12 @@ impl McpCatalogView {
             });
             if let Some(publication) = self.client.plugin_details_publication(workspace, parent) {
                 if let Some(operation) = publication.operations.get(parent) {
-                    if operation.busy || (operation.uncertain && !self.client.plugin_parent_recovery_available(workspace, parent)) {
+                    if operation.busy
+                        || (operation.uncertain
+                            && !self
+                                .client
+                                .plugin_parent_recovery_available(workspace, parent))
+                    {
                         next.pending.insert(child.clone());
                     }
                     let error = if operation.uncertain {
@@ -663,8 +668,9 @@ mod tests {
                 name: "Parent".into(),
                 version: None,
                 description: None,
-            metadata: Default::default(),
-                enabled: true, allow_implicit_invocation: false,
+                metadata: Default::default(),
+                enabled: true,
+                allow_implicit_invocation: false,
                 state: "installed".into(),
                 revision: 1,
                 status: "installed".into(),

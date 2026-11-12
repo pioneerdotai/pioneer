@@ -1,11 +1,11 @@
 mod auth;
 mod avatars;
 mod content;
-mod images;
-mod plugins;
 mod errors;
 pub(crate) mod header_policy;
 mod health;
+mod images;
+mod plugins;
 mod router;
 mod state;
 pub(crate) mod streams;

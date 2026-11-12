@@ -209,16 +209,8 @@ async fn generate_cli_title(
             &usage,
         )
         .await;
-    if let Err(error) = recorded {
-        return Err(
-            if result.as_ref().is_err_and(|failure| {
-                failure.is::<pioneer_cli_agent_runtime::service::CodexServiceDeadline>()
-            }) {
-                error.context(pioneer_cli_agent_runtime::service::CodexServiceDeadline)
-            } else {
-                error
-            },
-        );
+    if recorded.is_err() {
+        tracing::warn!("external title usage settlement commit unconfirmed");
     }
     result.map(|(text, _)| text)
 }
@@ -229,6 +221,7 @@ fn title_instructions() -> &'static str {
 
 fn title_generation_chat_request(model: &str, prompt: String) -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: model.to_owned(),
         messages: vec![ChatMessage::user(prompt)],

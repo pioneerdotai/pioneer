@@ -42,6 +42,18 @@ async fn tracker_projector_store() -> CrudStore {
     let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
     add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
     add_thread_unread_column_to_legacy_fixture(&store).await;
+    // Current canonical append atomically persists content-free observations.
+    // Install only its orthogonal tables; preserve the tracker receipt/down boundary.
+    let tx = store.connection.begin().await.unwrap();
+    let schema = migration::SchemaManager::new(&*tx);
+    Migrator::migrations()
+        .into_iter()
+        .find(|m| m.name() == "m20261109_000001_execution_observability")
+        .unwrap()
+        .up(&schema)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let transaction = store.connection.begin().await.unwrap();
     let schema = migration::SchemaManager::new(&*transaction);
     schema

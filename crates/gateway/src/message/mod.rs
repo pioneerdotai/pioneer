@@ -14,6 +14,7 @@ mod cli_runtime;
 mod compaction_background;
 mod control_work;
 mod dispatch;
+mod execution_observability;
 pub(crate) mod html_tools;
 mod invitation_handlers;
 mod invitation_lifecycle;
@@ -185,9 +186,7 @@ use pioneer_crud::{
     TurnFinalizationReconciliationSummary,
 };
 use pioneer_hooks::{HookRecoveryOptions, HookRuntime};
-use pioneer_memory::{
-    MemvidThreadEpisodicBackend, ThreadEpisodicMemvidBackend, thread_episodic_storage_uri_from_path,
-};
+use pioneer_memory::{SqliteThreadEpisodicBackend, ThreadEpisodicSearchBackend};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ArtifactBindingDirection, ArtifactBindingKind,
     ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactKind, ArtifactRole,
@@ -314,14 +313,14 @@ use crate::workspace::{WorkspaceError, WorkspaceManager};
 static TEST_EPISODIC_STORAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
-fn isolated_test_thread_episodic_storage_root(runtime_home: &std::path::Path) -> PathBuf {
+fn isolated_test_thread_episodic_lock_root(runtime_home: &std::path::Path) -> PathBuf {
     let sequence = TEST_EPISODIC_STORAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     runtime_home.join("memory").join(format!(
-        "capsules-{}-{now_nanos}-{sequence}",
+        "locks-{}-{now_nanos}-{sequence}",
         std::process::id()
     ))
 }
@@ -593,14 +592,14 @@ pub struct MessageProcessor {
     pending_delivery_order: Arc<crate::thread::replay::PendingDeliveryOrder>,
     #[cfg(test)]
     execution_auth_fault: Arc<std::sync::Mutex<Option<notifications::ExecutionAuthFault>>>,
-    artifact_stream_invalidation:
-        Arc<StdRwLock<Option<Weak<dyn ArtifactStreamInvalidation>>>>,
+    artifact_stream_invalidation: Arc<StdRwLock<Option<Weak<dyn ArtifactStreamInvalidation>>>>,
     view_grant_service: Arc<StdRwLock<Option<Weak<crate::view_grants::ViewGrantService>>>>,
     auth_service: Option<Arc<GatewayAuthService>>,
     epic5_rate_limits: Arc<crate::epic5_observability::Epic5RateLimits>,
     cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
     remote_access_supervisor: Option<Arc<pioneer_tunnel::RemoteAccessSupervisor>>,
-    thread_episodic_vector_refill_status_tx: crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender,
+    thread_episodic_vector_refill_status_tx:
+        crate::database::startup::thread_episodic_refill::ThreadEpisodicWorkspaceRefillStatusSender,
     thread_episodic_workspace_refill_supervisor:
         Arc<crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor>,
     workspace_manager: Arc<WorkspaceManager>,
@@ -612,7 +611,8 @@ pub struct MessageProcessor {
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
     task_child_point_cursor: Arc<Mutex<tasks::ChildDiscoveryPass<(i64, String)>>>,
     task_child_scope_cursor: Arc<Mutex<tasks::ChildDiscoveryPass<(i64, String, String)>>>,
-    completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
+    completed_history_checks:
+        Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
     compaction_lifecycle_not_before: Arc<StdRwLock<Option<tokio::time::Instant>>>,
     #[cfg(test)]
     completed_history_preparation_barrier:
@@ -621,8 +621,7 @@ pub struct MessageProcessor {
     turn_execution_heartbeat_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
     #[cfg(test)]
-    recovery_due_wait_barrier:
-        Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    recovery_due_wait_barrier: Arc<compaction_background::CompletedHistoryPreparationBarrier>,
     #[cfg(test)]
     task_history_preparation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
     #[cfg(test)]
@@ -654,12 +653,16 @@ pub struct MessageProcessor {
     #[cfg(test)]
     claude_boundary_write_failures: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
-    native_cancellation_finish_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    native_cancellation_finish_barrier:
+        Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     #[cfg(test)]
     native_cancellation_materialization_failure: Arc<Mutex<Option<sea_orm::DbErr>>>,
     #[cfg(test)]
-    native_cancellation_materialization_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
-    workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
+    native_cancellation_materialization_barrier:
+        Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    workspace_compaction_settings: Arc<
+        StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>,
+    >,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
     agent_message_buffers: Arc<Mutex<HashMap<String, AgentMarkdownBuffer>>>,
@@ -680,8 +683,14 @@ pub struct MessageProcessor {
     cli_runtime_proxy_cache: Arc<Mutex<HashMap<(String, String), Option<String>>>>,
     provider_readiness: Arc<provider_readiness::ProviderReadinessSupervisor>,
     cli_runtime_pending_turn_activity_sequence: Arc<AtomicU64>,
-    cli_runtime_event_hubs:
-        Arc<Mutex<HashMap<crate::cli_runtime::session_instance::CliSessionInstanceId, Arc<ExecutionEventHub>>>>,
+    cli_runtime_event_hubs: Arc<
+        Mutex<
+            HashMap<
+                crate::cli_runtime::session_instance::CliSessionInstanceId,
+                Arc<ExecutionEventHub>,
+            >,
+        >,
+    >,
     cli_runtime_turn_binding_cache:
         Arc<Mutex<HashMap<CLIRuntimeNativeTurnKey, pioneer_crud::CliRuntimeTurnBindingRecord>>>,
     cli_runtime_session_turn_mutexes: Arc<
@@ -692,8 +701,17 @@ pub struct MessageProcessor {
             >,
         >,
     >,
-    cli_runtime_session_turn_leases:
-        Arc<Mutex<HashMap<String, (tokio::sync::OwnedMutexGuard<()>, crate::cli_runtime::manager::CLIAgentRuntimeSessionHandle)>>>,
+    cli_runtime_session_turn_leases: Arc<
+        Mutex<
+            HashMap<
+                String,
+                (
+                    tokio::sync::OwnedMutexGuard<()>,
+                    crate::cli_runtime::manager::CLIAgentRuntimeSessionHandle,
+                ),
+            >,
+        >,
+    >,
     cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
     artifact_output_dirs: Arc<Mutex<HashMap<String, pioneer_artifacts::ArtifactOutputDir>>>,
@@ -701,11 +719,13 @@ pub struct MessageProcessor {
     native_permission_pending_requests:
         Arc<Mutex<HashMap<String, PendingNativePermissionApprovalRequest>>>,
     native_permission_approval_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    artifact_finalization_retry_turns: Arc<Mutex<HashMap<String, Option<artifact_tools::ArtifactClosing>>>>,
+    artifact_finalization_retry_turns:
+        Arc<Mutex<HashMap<String, Option<artifact_tools::ArtifactClosing>>>>,
     title_job_runtime: Arc<Mutex<HashMap<String, ThreadTitleJobState>>>,
     thread_title_publication_mutexes: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     #[cfg(test)]
-    thread_title_publication_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    thread_title_publication_barrier:
+        Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     #[cfg(test)]
     thread_title_publication_attempted: Arc<tokio::sync::Notify>,
     timeout_supervisor: Arc<TimeoutSupervisor>,
@@ -742,7 +762,7 @@ pub struct MessageProcessor {
     hook_recovery_config: Arc<RwLock<GatewayHookRecoveryConfig>>,
     keepawake: Arc<GatewayKeepAwake>,
     artifact_runtime_home: PathBuf,
-    thread_episodic_storage_root: PathBuf,
+    thread_episodic_lock_root: PathBuf,
     pub(crate) artifact_service: Arc<ArtifactService>,
     artifact_uploads: Arc<artifacts::upload::ArtifactUploadSessionManager>,
     thread_episodic_ingestor: Arc<RwLock<Arc<dyn ThreadEpisodicIngestor>>>,
@@ -751,11 +771,13 @@ pub struct MessageProcessor {
         Arc<ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver>,
     thread_episodic_recall_service: Arc<ThreadEpisodicRecallService>,
     voice_input_supervisor: Option<Arc<VoiceInputSupervisor>>,
-    self_improvement_supervisor: Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
+    self_improvement_supervisor:
+        Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
     gateway_settings_update_lock: Arc<Mutex<()>>,
     pub(crate) voice_finalizations: crate::voice::finalization::VoiceFinalizations,
     #[cfg(test)]
-    pub(crate) voice_test_transcriber: Option<crate::voice::transcription::TestVoiceSpeechTranscriber>,
+    pub(crate) voice_test_transcriber:
+        Option<crate::voice::transcription::TestVoiceSpeechTranscriber>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
 }
@@ -1080,8 +1102,7 @@ impl MessageProcessor {
         runtime_home: PathBuf,
         artifacts_config: GatewayArtifactsConfig,
     ) -> Self {
-        let thread_episodic_storage_root =
-            isolated_test_thread_episodic_storage_root(&runtime_home);
+        let thread_episodic_lock_root = isolated_test_thread_episodic_lock_root(&runtime_home);
         Self::new_with_memory_runtime_and_task_config(
             thread_manager,
             provider_registry,
@@ -1093,7 +1114,7 @@ impl MessageProcessor {
             tool_loop_config,
             memory_runtime,
             runtime_home,
-            thread_episodic_storage_root,
+            thread_episodic_lock_root,
             artifacts_config,
             TaskRuntimeConfig::default(),
             ThreadEpisodicRuntimeConfig::default(),
@@ -1112,7 +1133,7 @@ impl MessageProcessor {
         tool_loop_config: ToolLoopConfig,
         memory_runtime: Arc<GatewayMemoryRuntime>,
         runtime_home: PathBuf,
-        thread_episodic_storage_root: PathBuf,
+        thread_episodic_lock_root: PathBuf,
         artifacts_config: GatewayArtifactsConfig,
         task_runtime_config: TaskRuntimeConfig,
         thread_episodic_runtime_config: ThreadEpisodicRuntimeConfig,
@@ -1196,8 +1217,8 @@ impl MessageProcessor {
         let artifact_uploads = Arc::new(artifacts::upload::ArtifactUploadSessionManager::new(
             runtime_home.join("artifacts").join("upload_sessions"),
         ));
-        let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
-            Arc::new(MemvidThreadEpisodicBackend::new());
+        let thread_episodic_backend: Arc<dyn ThreadEpisodicSearchBackend> =
+            Arc::new(SqliteThreadEpisodicBackend::new(crud_store.clone()));
         let thread_episodic_embedding_provider_resolver = Arc::new(
             ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
                 provider_registry.clone(),
@@ -1214,16 +1235,13 @@ impl MessageProcessor {
                 Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                     Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                         maintenance_crud_store.clone(),
-                        thread_episodic_storage_uri_from_path(
-                            thread_episodic_storage_root.as_path(),
-                        ),
                     )),
                     thread_episodic_embedding_provider_resolver.clone(),
                     maintenance_crud_store,
                 )),
             )
             .with_projection_runtime(
-                thread_episodic_storage_root.clone(),
+                thread_episodic_lock_root.clone(),
                 thread_episodic_embedding_provider_resolver.clone(),
                 thread_episodic_workspace_refill_supervisor.clone(),
             ),
@@ -1425,7 +1443,7 @@ impl MessageProcessor {
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
             keepawake: Arc::new(GatewayKeepAwake::default()),
             artifact_runtime_home: runtime_home,
-            thread_episodic_storage_root,
+            thread_episodic_lock_root,
             artifact_service,
             artifact_uploads,
             thread_episodic_ingestor: Arc::new(RwLock::new(Arc::new(
@@ -1629,7 +1647,8 @@ impl MessageProcessor {
 
     pub(crate) fn thread_episodic_vector_refill_status_sender(
         &self,
-    ) -> crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender{
+    ) -> crate::database::startup::thread_episodic_refill::ThreadEpisodicWorkspaceRefillStatusSender
+    {
         self.thread_episodic_vector_refill_status_tx.clone()
     }
 
@@ -4950,7 +4969,9 @@ impl MessageProcessor {
         self.skills_write_lock.clone().lock_owned().await
     }
 
-    pub(crate) async fn install_one_cli_runtime_skill<F: std::future::Future<Output = anyhow::Result<()>>>(
+    pub(crate) async fn install_one_cli_runtime_skill<
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    >(
         &self,
         plan: &crate::cli_runtime::skills::CliRuntimeSkillInstallPlan,
         before_replace: F,
@@ -5771,10 +5792,10 @@ impl MessageProcessor {
         );
         let memory_loop_config =
             Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
-        let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
-            Arc::new(MemvidThreadEpisodicBackend::new());
-        let thread_episodic_storage_root =
-            isolated_test_thread_episodic_storage_root(&artifact_runtime_home);
+        let thread_episodic_backend: Arc<dyn ThreadEpisodicSearchBackend> =
+            Arc::new(SqliteThreadEpisodicBackend::new(crud_store.clone()));
+        let thread_episodic_lock_root =
+            isolated_test_thread_episodic_lock_root(&artifact_runtime_home);
         let thread_episodic_embedding_provider_resolver = Arc::new(
             ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
                 provider_registry.clone(),
@@ -5791,16 +5812,13 @@ impl MessageProcessor {
                 Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                     Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                         maintenance_crud_store.clone(),
-                        thread_episodic_storage_uri_from_path(
-                            thread_episodic_storage_root.as_path(),
-                        ),
                     )),
                     thread_episodic_embedding_provider_resolver.clone(),
                     maintenance_crud_store,
                 )),
             )
             .with_projection_runtime(
-                thread_episodic_storage_root.clone(),
+                thread_episodic_lock_root.clone(),
                 thread_episodic_embedding_provider_resolver.clone(),
                 thread_episodic_workspace_refill_supervisor.clone(),
             ),
@@ -5984,7 +6002,7 @@ impl MessageProcessor {
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
             keepawake: Arc::new(GatewayKeepAwake::default()),
             artifact_runtime_home,
-            thread_episodic_storage_root,
+            thread_episodic_lock_root,
             artifact_service,
             artifact_uploads,
             thread_episodic_ingestor: Arc::new(RwLock::new(Arc::new(

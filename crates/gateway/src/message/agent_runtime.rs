@@ -410,6 +410,7 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnCapabilitiesResolved { thread_id, .. }
         | AgentDurableEvent::SkillAuditEvents { thread_id, .. }
         | AgentDurableEvent::TurnLlmContextAppended { thread_id, .. }
+        | AgentDurableEvent::ProviderUsageSnapshot { thread_id, .. }
         | AgentDurableEvent::TurnProviderHistoryAppended { thread_id, .. }
         | AgentDurableEvent::ProviderFailureDetected { thread_id, .. }
         | AgentDurableEvent::RecoveryAttemptSucceeded { thread_id, .. }
@@ -470,6 +471,7 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnCapabilitiesResolved { turn_id, .. }
         | AgentDurableEvent::SkillAuditEvents { turn_id, .. }
         | AgentDurableEvent::TurnLlmContextAppended { turn_id, .. }
+        | AgentDurableEvent::ProviderUsageSnapshot { turn_id, .. }
         | AgentDurableEvent::TurnProviderHistoryAppended { turn_id, .. }
         | AgentDurableEvent::ProviderFailureDetected { turn_id, .. }
         | AgentDurableEvent::RecoveryAttemptSucceeded { turn_id, .. }
@@ -2180,7 +2182,12 @@ impl MessageProcessor {
                 );
                 // A captured control cancellation proves authority at its
                 // generation-bound writer, even after the work graph is fenced.
-                let already_committed = if initial_stop {
+                // Numeric late evidence refines an already prepared attempt;
+                // its source/physical identity is revalidated in the writer.
+                // It neither activates nor mutates execution lifecycle state.
+                let financial_refinement =
+                    matches!(&event, AgentDurableEvent::ProviderUsageSnapshot { .. });
+                let already_committed = if initial_stop || financial_refinement {
                     false
                 } else if let Some(turn_id) = durable_event_turn_id(&event) {
                     match self.guard_execution_commit(turn_id).await {
@@ -5575,11 +5582,17 @@ impl MessageProcessor {
                         return false;
                     }
                 };
-                let delivery_key = turn_llm_context_delivery_key(&[
-                    "tool_result",
-                    item_id.as_str(),
-                    attempt_id.as_deref().unwrap_or(""),
-                ]);
+                // A control-only receipt and the final canonical result belong
+                // to the same item, but are distinct acknowledged deliveries.
+                let delivery_key = if source == "shell_control_v1" {
+                    turn_llm_context_delivery_key(&["shell_control_v1", item_id.as_str()])
+                } else {
+                    turn_llm_context_delivery_key(&[
+                        "tool_result",
+                        item_id.as_str(),
+                        attempt_id.as_deref().unwrap_or(""),
+                    ])
+                };
                 let entry = pioneer_crud::NewTurnLlmContextEntry {
                     turn_id: turn_id.clone(),
                     item_id: Some(item_id),
@@ -5664,6 +5677,26 @@ impl MessageProcessor {
                     return false;
                 }
                 true
+            }),
+            AgentDurableEvent::ProviderUsageSnapshot {
+                workspace_id,
+                thread_id,
+                turn_id,
+                item_id,
+                revision,
+                usage,
+            } => message_future(async move {
+                self.crud_store
+                    .record_native_provider_usage(
+                        &workspace_id,
+                        &thread_id,
+                        &turn_id,
+                        &item_id,
+                        revision,
+                        usage,
+                    )
+                    .await
+                    .is_ok()
             }),
             AgentDurableEvent::ToolOutputRecorded { id, notification } => {
                 message_future(async move {
@@ -8338,6 +8371,7 @@ impl MessageProcessor {
     /// in-memory Turn from the authoritative transaction. Bootstrap performs
     /// the same database repair before threads are loaded; this path covers a
     /// listener/agent task loss while the Gateway process keeps running.
+    #[cfg(test)]
     pub(super) async fn reconcile_prepared_native_turn_finalizations(
         &self,
         now_unix: i64,
@@ -10228,6 +10262,24 @@ impl MessageProcessor {
             }
         }
 
+        // Recovery job settlement follows the first cleanup attempt. Retry the
+        // existing cleanup boundary now, so an aborted receipt needs no timer.
+        if task_reconciliation_succeeded {
+            let cleanup_store = self.crud_store.with_maintenance_access();
+            if let Err(_error) = cleanup_store
+                .release_settled_shell_controls(turn_id.as_str())
+                .await
+            {
+                warn!("failed to release settled shell controls");
+            }
+            if let Err(_error) = cleanup_store
+                .cleanup_terminal_task_child_capsule(thread_id.as_str(), turn_id.as_str())
+                .await
+            {
+                warn!("terminal child control cleanup remains pending");
+            }
+        }
+
         self.observe_cli_terminal_phase(&turn_id, "retire_terminal_actor")
             .await;
         if task_reconciliation_succeeded
@@ -10752,36 +10804,57 @@ impl MessageProcessor {
             let threads = [thread.to_owned()];
             // Inventory rejects accepted/unpublished starts and unresolved
             // recovery. Terminal DB state or a missing owner is never proof.
-            let captured = self.agent_manager.capture_native_stop_owners(&threads)
-                .await?.into_iter().collect::<std::collections::HashSet<_>>();
-            let exact = self.agent_manager.capture_turn_stop_owner(thread, &turn.id).await?;
-            anyhow::ensure!(captured.contains(&exact), "native fallback owner changed before stop");
+            let captured = self
+                .agent_manager
+                .capture_native_stop_owners(&threads)
+                .await?
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            let exact = self
+                .agent_manager
+                .capture_turn_stop_owner(thread, &turn.id)
+                .await?;
+            anyhow::ensure!(
+                captured.contains(&exact),
+                "native fallback owner changed before stop"
+            );
             let pending = turn.status == pioneer_protocol::TurnStatus::InProgress;
             // Its normal completion path drains its captured predecessors;
             // do that before examining the rest of the unordered inventory.
             if pending || !exact.is_quiescent() {
-                self.await_native_graph_owner(&exact, reason, deadline).await?;
+                self.await_native_graph_owner(&exact, reason, deadline)
+                    .await?;
             }
             for owner in &captured {
                 if owner == &exact {
                     continue;
                 }
                 if owner.turn_id() != turn.id {
-                    anyhow::ensure!(owner.is_quiescent(), "outstanding native fallback predecessor or replacement");
+                    anyhow::ensure!(
+                        owner.is_quiescent(),
+                        "outstanding native fallback predecessor or replacement"
+                    );
                     continue;
                 }
                 // Preserve the outcome of an outstanding or pending run. A
                 // later independent mutation needs only a historical run's
                 // actual quiescence, not replay of its command failure.
                 if pending || !owner.is_quiescent() {
-                    self.await_native_graph_owner(owner, reason, deadline).await?;
+                    self.await_native_graph_owner(owner, reason, deadline)
+                        .await?;
                 }
             }
-            let remaining = self.agent_manager.capture_native_stop_owners(&threads).await?;
+            let remaining = self
+                .agent_manager
+                .capture_native_stop_owners(&threads)
+                .await?;
             validate_native_graph_stop_snapshot(&captured, &remaining)?;
             Ok::<(), anyhow::Error>(())
-        }).await.map_err(|_| anyhow::anyhow!("native fallback stop deadline expired; cleanup unconfirmed"))?
-
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("native fallback stop deadline expired; cleanup unconfirmed")
+        })?
     }
 
     pub(super) async fn await_native_graph_owner(
@@ -12355,6 +12428,24 @@ impl MessageProcessor {
             }
         }
 
+        // Recovery job settlement follows the first cleanup attempt. Retry the
+        // existing cleanup boundary now, so an aborted receipt needs no timer.
+        if task_reconciliation_succeeded {
+            let cleanup_store = self.crud_store.with_maintenance_access();
+            if let Err(_error) = cleanup_store
+                .release_settled_shell_controls(turn_id.as_str())
+                .await
+            {
+                warn!("failed to release settled shell controls");
+            }
+            if let Err(_error) = cleanup_store
+                .cleanup_terminal_task_child_capsule(thread_id.as_str(), turn_id.as_str())
+                .await
+            {
+                warn!("terminal child control cleanup remains pending");
+            }
+        }
+
         if task_reconciliation_succeeded
             && self
                 .thread_manager
@@ -12590,6 +12681,24 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to mark active recovery jobs failed"
                 );
+            }
+        }
+
+        // Recovery job settlement follows the first cleanup attempt. Retry the
+        // existing cleanup boundary now, so an aborted receipt needs no timer.
+        if task_reconciliation_succeeded {
+            let cleanup_store = self.crud_store.with_maintenance_access();
+            if let Err(_error) = cleanup_store
+                .release_settled_shell_controls(turn_id.as_str())
+                .await
+            {
+                warn!("failed to release settled shell controls");
+            }
+            if let Err(_error) = cleanup_store
+                .cleanup_terminal_task_child_capsule(thread_id.as_str(), turn_id.as_str())
+                .await
+            {
+                warn!("terminal child control cleanup remains pending");
             }
         }
 

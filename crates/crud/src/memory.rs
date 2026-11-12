@@ -59,11 +59,7 @@ pub struct AgentMemoryControlRecord {
     pub confidence: f64,
     pub importance: f64,
     pub content_preview: Option<String>,
-    pub capsule_id: Option<String>,
-    pub capsule_ref: Option<String>,
-    pub frame_id: Option<i64>,
-    pub frame_uri: Option<String>,
-    pub frame_version: i64,
+    pub payload_version: i64,
     pub source_context_kind: Option<MemorySourceContextKind>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
@@ -94,11 +90,7 @@ pub struct NewAgentMemoryControlRecord {
     pub confidence: f64,
     pub importance: f64,
     pub content_preview: Option<String>,
-    pub capsule_id: Option<String>,
-    pub capsule_ref: Option<String>,
-    pub frame_id: Option<i64>,
-    pub frame_uri: Option<String>,
-    pub frame_version: i64,
+    pub payload_version: i64,
     pub source_context_kind: Option<MemorySourceContextKind>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
@@ -266,28 +258,6 @@ pub struct AgentMemoryCandidateRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentMemoryCapsuleRecord {
-    pub id: Option<String>,
-    pub scope: MemoryScope,
-    pub scope_key_hash: Option<String>,
-    pub workspace_id: Option<String>,
-    pub scope_slot: Option<String>,
-    pub capsule_ref: String,
-    pub storage_uri: String,
-    pub backend: String,
-    pub format: String,
-    pub encrypted: bool,
-    pub status: String,
-    pub repair_status: String,
-    pub content_hash: Option<String>,
-    pub active_record_count: i64,
-    pub metadata_json: Option<String>,
-    pub created_at_unix: Option<i64>,
-    pub updated_at_unix: Option<i64>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAgentMemoryPolicyDecision {
     pub memory_id: Option<String>,
     pub candidate_id: Option<String>,
@@ -380,7 +350,6 @@ pub struct NewAgentMemoryRepairJob {
     pub scope_kind: Option<MemoryScopeKind>,
     pub scope_key_hash: Option<String>,
     pub memory_id: Option<String>,
-    pub capsule_id: Option<String>,
     pub priority: i64,
     pub max_attempts: i32,
     pub scheduled_at_unix: i64,
@@ -396,7 +365,6 @@ pub struct AgentMemoryRepairJobRecord {
     pub scope_kind: Option<MemoryScopeKind>,
     pub scope_key_hash: Option<String>,
     pub memory_id: Option<String>,
-    pub capsule_id: Option<String>,
     pub priority: i64,
     pub attempts: i64,
     pub max_attempts: i64,
@@ -573,11 +541,7 @@ pub(crate) fn agent_memory_control_record_from_model(
         confidence: model.confidence,
         importance: model.importance,
         content_preview: model.content_preview,
-        capsule_id: model.capsule_id,
-        capsule_ref: model.capsule_ref,
-        frame_id: model.frame_id,
-        frame_uri: model.frame_uri,
-        frame_version: model.frame_version,
+        payload_version: model.payload_version,
         source_context_kind: model
             .source_context_kind
             .as_deref()
@@ -688,35 +652,6 @@ pub(crate) fn agent_memory_candidate_record_from_model(
     })
 }
 
-pub(crate) fn agent_memory_capsule_record_from_model(
-    model: pioneer_entity::agent_memory_capsule::Model,
-) -> Result<AgentMemoryCapsuleRecord> {
-    let scope_kind = memory_scope_kind_from_db(model.scope_kind.as_str())?;
-    Ok(AgentMemoryCapsuleRecord {
-        id: Some(model.id),
-        scope: MemoryScope {
-            kind: scope_kind,
-            key: model.scope_key,
-        },
-        scope_key_hash: Some(model.scope_key_hash),
-        workspace_id: model.workspace_id,
-        scope_slot: Some(model.scope_slot),
-        capsule_ref: model.capsule_ref,
-        storage_uri: model.storage_uri,
-        backend: model.backend,
-        format: model.format,
-        encrypted: model.encrypted,
-        status: model.status,
-        repair_status: model.repair_status,
-        content_hash: model.content_hash,
-        active_record_count: model.active_record_count,
-        metadata_json: model.metadata_json,
-        created_at_unix: Some(model.created_at.timestamp()),
-        updated_at_unix: Some(model.updated_at.timestamp()),
-        last_error: model.last_error,
-    })
-}
-
 pub(crate) fn agent_memory_policy_decision_record_from_model(
     model: pioneer_entity::agent_memory_policy_decision::Model,
 ) -> Result<AgentMemoryPolicyDecisionRecord> {
@@ -782,7 +717,6 @@ pub(crate) fn agent_memory_repair_job_record_from_model(
             .transpose()?,
         scope_key_hash: model.scope_key_hash,
         memory_id: model.memory_id,
-        capsule_id: model.capsule_id,
         priority: model.priority,
         attempts: model.attempts,
         max_attempts: model.max_attempts,

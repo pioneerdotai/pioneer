@@ -74,6 +74,15 @@ pub trait Provider: Send + Sync {
         Ok(crate::catalog::model_catalog()?.limits(self.name(), model))
     }
 
+    /// Exact embeddings adapter route; absence never inherits a chat endpoint.
+    fn embedding_usage_profile(&self) -> crate::ProviderUsageProfile {
+        crate::ProviderUsageProfile {
+            api: "embeddings".into(),
+            api_version: None,
+            route: None,
+        }
+    }
+
     /// Context pricing metadata for the selected authority; never technical limits.
     async fn model_context_tiers(
         &self,
@@ -306,6 +315,7 @@ mod tests {
         // Default preparation must not require a catalog entry or discovery.
         provider.prepare_model("test-model").await.unwrap();
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "test-model".into(),
             messages: vec![ChatMessage::user("hello")],
@@ -380,6 +390,7 @@ mod tests {
             ambiguous_input_aliases: vec![],
         });
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "target-model".into(),
             messages: vec![message.clone()],

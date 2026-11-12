@@ -18,4 +18,4 @@ pub use upload::{UploadView as SkillsUploadView, UploadVisibility as SkillsUploa
 mod identity;
 
 mod card;
-pub use card::SkillCard;
+pub(crate) use card::SkillCard;

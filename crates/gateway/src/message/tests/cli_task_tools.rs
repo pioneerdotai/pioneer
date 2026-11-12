@@ -737,16 +737,13 @@ fn cli_accepted_nested_result_keeps_substantive_final_without_another_attempt() 
             CLIAgentRuntimeKind::Claude,
             CLIAgentRuntimeKind::OpenCode,
         ] {
-            let mut config = review_enabled_task_runtime_config();
-            config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks = true;
+            let config = review_enabled_task_runtime_config();
             let (harness, processor, root) =
                 start_task_cli_fixture_with_task_config(kind, config).await;
             *harness.cli_session.next_native_turn_id.lock().await =
                 Some(format!("middle_{kind:?}"));
             let parent = invoke_task(&processor, &root, "parent-create", "task_create", json!({
-                "title":"Integrate research", "goal":"Review research and provide the final explanation",
+                "requireReview":true, "title":"Integrate research", "goal":"Review research and provide the final explanation",
                 "outputInstructions":"Return the complete explanation."
             })).await.unwrap().structured_content.unwrap();
             let middle =
@@ -754,7 +751,7 @@ fn cli_accepted_nested_result_keeps_substantive_final_without_another_attempt() 
             *harness.cli_session.next_native_turn_id.lock().await =
                 Some(format!("researcher_{kind:?}"));
             let child = invoke_task(&processor, &middle.turn_id, "child-create", "task_create", json!({
-                "title":"Research", "goal":"Return specific evidence", "outputInstructions":"Return all evidence."
+                "requireReview":true, "title":"Research", "goal":"Return specific evidence", "outputInstructions":"Return all evidence."
             })).await.unwrap().structured_content.unwrap();
             let researcher =
                 wait_for_task_cli_child(&processor, child["runId"].as_str().unwrap(), None).await;
@@ -1640,17 +1637,14 @@ fn cli_recovery_delivers_exact_task_facts_and_preserves_substantive_final() {
         ] {
             // 0: fresh recovery, 1: committed receipt before marker, 2: marker before provider start.
             for window in 0..3 {
-                let mut config = review_enabled_task_runtime_config();
-                config
-                    .review
-                    .default_parent_review_for_immediate_attached_agent_tasks = true;
+                let config = review_enabled_task_runtime_config();
                 let (harness, processor, root) =
                     start_task_cli_fixture_with_task_config(kind, config).await;
                 harness
                     .cli_session
                     .set_next_native_turn_id("payload_middle")
                     .await;
-                let parent = invoke_task(&processor, &root, "payload-parent", "task_create", json!({"title":"Integrate recovered work","goal":"Return the full explanation"})).await.unwrap().structured_content.unwrap();
+                let parent = invoke_task(&processor, &root, "payload-parent", "task_create", json!({"requireReview":true, "title":"Integrate recovered work","goal":"Return the full explanation"})).await.unwrap().structured_content.unwrap();
                 let middle =
                     wait_for_task_cli_child(&processor, parent["runId"].as_str().unwrap(), None)
                         .await;
@@ -1664,7 +1658,7 @@ fn cli_recovery_delivers_exact_task_facts_and_preserves_substantive_final() {
                     &turn_id,
                     "payload-create",
                     "task_create",
-                    json!({"title":"Payload child","goal":"Inspect the project"}),
+                    json!({"requireReview":true, "title":"Payload child","goal":"Inspect the project"}),
                 )
                 .await
                 .unwrap()
@@ -3754,16 +3748,13 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             CLIAgentRuntimeKind::Claude,
             CLIAgentRuntimeKind::OpenCode,
         ] {
-            let mut task_config = review_enabled_task_runtime_config();
-            task_config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks = true;
+            let task_config = review_enabled_task_runtime_config();
             let (harness, processor, turn_id) =
                 start_task_cli_fixture_with_task_config(kind, task_config).await;
             *harness.cli_session.next_native_turn_id.lock().await =
                 Some(format!("review_child_{kind:?}"));
             let created = invoke_task(&processor, &turn_id, "review-create", "task_create", json!({
-                "title":"Reviewable work", "goal":"Inspect and return evidence", "outputInstructions":"Return a concise report."
+                "requireReview":true, "title":"Reviewable work", "goal":"Inspect and return evidence", "outputInstructions":"Return a concise report."
             })).await.unwrap();
             assert!(!created.is_error, "{created:?}");
             let created = created.structured_content.unwrap();
@@ -3826,6 +3817,28 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             .await
             .unwrap();
             assert!(!review.is_error, "{review:?}");
+            let pending = processor
+                .crud_store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let candidate = pending
+                .result_candidates
+                .iter()
+                .find(|c| c.status == pioneer_protocol::TaskResultCandidateStatus::PendingReview)
+                .unwrap();
+            assert_eq!(
+                processor
+                    .task_runtime
+                    .service()
+                    .auto_accept_expired_review_candidates(candidate.created_at + 3600, 64)
+                    .await
+                    .unwrap(),
+                0,
+                "explicit attached review must survive the legacy timeout"
+            );
+
             let early_detach = invoke_task(
                 &processor,
                 &turn_id,
@@ -3925,7 +3938,7 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
                 &turn_id,
                 "detach-create",
                 "task_create",
-                json!({"title":"Continue separately","goal":"Inspect another part of the project"}),
+                json!({"requireReview": false, "title":"Continue separately","goal":"Inspect another part of the project"}),
             )
             .await
             .unwrap();
@@ -3953,6 +3966,13 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             assert_eq!(
                 current.task.lifecycle_policy.unwrap().attachment,
                 pioneer_protocol::TaskAttachmentMode::Detached
+            );
+            assert!(
+                current.agent_specs.iter().all(|spec| spec
+                    .review_policy
+                    .as_ref()
+                    .is_none_or(|policy| !policy.is_enabled())),
+                "explicit false must preserve automatic completion"
             );
             let cancelled = invoke_task(
                 &processor,
@@ -4138,50 +4158,42 @@ fn cli_frozen_reader_catalog_does_not_gain_search_after_upgrade() {
 // Record both legacy and paginated retrieval at the existing backend boundary,
 // while retaining real indexes and source/authorization checks.
 struct RecordingRecallSearchBackend {
-    inner: pioneer_memory::MemvidThreadEpisodicBackend,
+    inner: pioneer_memory::SqliteThreadEpisodicBackend,
     calls: AtomicUsize,
 }
 
 #[async_trait::async_trait]
-impl pioneer_memory::ThreadEpisodicMemvidBackend for RecordingRecallSearchBackend {
-    fn capabilities(&self) -> pioneer_memory::ThreadEpisodicMemvidBackendCapabilities {
-        self.inner.capabilities()
-    }
-
-    async fn index_item(
+impl pioneer_memory::ThreadEpisodicSearchBackend for RecordingRecallSearchBackend {
+    async fn validate_document(
         &self,
-        request: pioneer_memory::ThreadEpisodicMemvidIndexRequest,
+        request: pioneer_memory::ThreadEpisodicIndexDocument,
     ) -> Result<
-        pioneer_memory::ThreadEpisodicMemvidIndexOutput,
-        pioneer_memory::ThreadEpisodicMemvidError,
+        pioneer_memory::ThreadEpisodicValidationResult,
+        pioneer_memory::ThreadEpisodicSearchError,
     > {
-        self.inner.index_item(request).await
+        self.inner.validate_document(request).await
     }
 
     async fn search(
         &self,
-        request: pioneer_memory::ThreadEpisodicMemvidSearchRequest,
-    ) -> Result<
-        pioneer_memory::ThreadEpisodicMemvidSearchOutput,
-        pioneer_memory::ThreadEpisodicMemvidError,
-    > {
+        request: pioneer_memory::ThreadEpisodicSearchRequest,
+    ) -> Result<pioneer_memory::ThreadEpisodicSearchOutput, pioneer_memory::ThreadEpisodicSearchError>
+    {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.search(request).await
     }
 
-    async fn search_segment_page(
+    async fn search_page(
         &self,
-        request: pioneer_memory::ThreadEpisodicMemvidSearchRequest,
+        request: pioneer_memory::ThreadEpisodicSearchRequest,
         page_size: usize,
         cursor: Option<String>,
-        embedding: Option<pioneer_memory::ThreadEpisodicMemvidIndexEmbedding>,
-    ) -> Result<
-        pioneer_memory::ThreadEpisodicMemvidSearchPage,
-        pioneer_memory::ThreadEpisodicMemvidError,
-    > {
+        embedding: Option<pioneer_memory::ThreadEpisodicIndexEmbedding>,
+    ) -> Result<pioneer_memory::ThreadEpisodicSearchPage, pioneer_memory::ThreadEpisodicSearchError>
+    {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner
-            .search_segment_page(request, page_size, cursor, embedding)
+            .search_page(request, page_size, cursor, embedding)
             .await
     }
 }
@@ -4190,12 +4202,11 @@ impl pioneer_memory::ThreadEpisodicMemvidBackend for RecordingRecallSearchBacken
 fn admitted_cli_prompt_context_does_not_recall_and_keeps_explicit_history_search() {
     run_standard_stack_message_test("no automatic recall and explicit history search", async {
         use crate::thread_episodic::ThreadEpisodicRecallService;
-        use pioneer_crud::ThreadEpisodicWorkspaceActiveWriteSegmentRequest;
         use pioneer_hooks::*;
         let (_harness, processor, turn_id) =
             start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
         let backend = Arc::new(RecordingRecallSearchBackend {
-            inner: pioneer_memory::MemvidThreadEpisodicBackend::new(),
+            inner: pioneer_memory::SqliteThreadEpisodicBackend::new(processor.crud_store.clone()),
             calls: AtomicUsize::new(0),
         });
         let mut configured = processor.as_ref().clone();
@@ -4221,18 +4232,7 @@ fn admitted_cli_prompt_context_does_not_recall_and_keeps_explicit_history_search
         processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
             "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,'Other indexed conversation','',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
             [other.into(),binding.thread_id.clone().into()])).await.unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let capsule = processor
-            .crud_store
-            .resolve_thread_episodic_workspace_active_write_segment(
-                ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
-                    workspace_id: binding.workspace_id.clone(),
-                    storage_uri_root: format!("file://{}", temp.path().display()),
-                },
-                1_800_000_000,
-            )
-            .await
-            .unwrap();
+        let capsule = binding.workspace_id.clone();
         crate::message::thread_search_tools::tests::seed(
             &processor,
             &capsule,
@@ -4547,22 +4547,26 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
             .await
             .unwrap()
             .unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let capsule = processor
-            .crud_store
-            .resolve_thread_episodic_workspace_active_write_segment(
-                pioneer_crud::ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
-                    workspace_id: binding.workspace_id.clone(),
-                    storage_uri_root: format!("file://{}", temp.path().display()),
-                },
-                1_800_000_000,
-            )
-            .await
-            .unwrap();
+        let capsule = binding.workspace_id.clone();
         let mut titles = ["A".to_owned(), "B".to_owned(), "C".to_owned()];
-        for (n, thread) in ["byte-boundary-a", "byte-boundary-b", "byte-boundary-c"]
-            .into_iter()
-            .enumerate()
+        // Give the three sources distinct lexical relevance. Equal documents
+        // are ordered by generated occurrence IDs, not by their thread names.
+        for (n, (thread, text)) in [
+            (
+                "byte-boundary-a",
+                "boundaryneedle boundaryneedle boundaryneedle saved decision",
+            ),
+            (
+                "byte-boundary-b",
+                "boundaryneedle boundaryneedle ordinary saved decision",
+            ),
+            (
+                "byte-boundary-c",
+                "boundaryneedle ordinary ordinary saved decision",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
         {
             processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
                 "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,?,'',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
@@ -4572,7 +4576,7 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
                 &capsule,
                 thread,
                 &format!("byte-source-{n}"),
-                "boundaryneedle saved decision",
+                text,
             )
             .await;
         }
@@ -4600,6 +4604,8 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
             raw.as_object_mut().unwrap().remove(key);
         }
         assert_eq!(raw["threads"].as_array().unwrap().len(), 2);
+        assert_eq!(raw["threads"][0]["threadId"], "byte-boundary-a");
+        assert_eq!(raw["threads"][1]["threadId"], "byte-boundary-b");
         assert!(raw["nextCursor"].is_string());
         let limit = 2 * 1024 * 1024;
         let overhead = serde_json::to_vec(&raw).unwrap().len() - titles[0].len();

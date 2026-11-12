@@ -109,3 +109,26 @@ restarting = "Перезапускается"
 stopping = "Останавливается"
 
 supporting_files_changed = "Изменены общие файлы или описание пакета"
+
+[plugins.mcp_status]
+not_started = "Не запущен"
+disabled = "Выключен"
+starting = "Запускается"
+ready = "Готов"
+degraded = "Частично работает"
+auth_required = "Нужна авторизация"
+failed = "Ошибка"
+stopping = "Останавливается"
+stopped = "Остановлен"
+restarting = "Перезапускается"
+
+[plugins.mcp_capabilities]
+tools = "инструментов"
+resources = "ресурсов"
+templates = "шаблонов"
+prompts = "промптов"
+
+[plugins.skill_status]
+active = "Активен"
+blocked = "Заблокирован"
+disabled = "Выключен"

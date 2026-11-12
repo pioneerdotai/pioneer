@@ -337,9 +337,14 @@ impl CLIAgentProcess {
                 let already_gone = error.raw_os_error() == Some(libc::ESRCH);
                 #[cfg(not(unix))]
                 let already_gone = false;
-                if !already_gone { return Err(error).context("failed to stop CLI descendants"); }
+                if !already_gone {
+                    return Err(error).context("failed to stop CLI descendants");
+                }
             }
-            self.child.wait().await.context("failed to wait for stopped CLI process")?;
+            self.child
+                .wait()
+                .await
+                .context("failed to wait for stopped CLI process")?;
         }
         // Descendant signals release inherited pipes before joining our reader.
         self.wait_for_stderr().await?;
@@ -436,9 +441,15 @@ impl CLIAgentProcess {
         }
         #[cfg(windows)]
         {
-            anyhow::ensure!(self.process_group_requested, "owned Windows job is unavailable");
-            self.child.start_kill().context("failed to terminate owned Windows job")?;
-            tokio::time::timeout_at(deadline, self.child.wait()).await
+            anyhow::ensure!(
+                self.process_group_requested,
+                "owned Windows job is unavailable"
+            );
+            self.child
+                .start_kill()
+                .context("failed to terminate owned Windows job")?;
+            tokio::time::timeout_at(deadline, self.child.wait())
+                .await
                 .context("Windows job cleanup deadline exhausted")??;
             self.wait_for_stderr().await?;
             Ok(())
@@ -612,8 +623,9 @@ pub fn spawn_prepared_cli_agent_process(
         wrapped.wrap(JobObject);
     }
 
-    let mut child = wrapped.spawn().with_context(||
-        format!("failed to spawn CLI process `{}`", prepared.executable))?;
+    let mut child = wrapped
+        .spawn()
+        .with_context(|| format!("failed to spawn CLI process `{}`", prepared.executable))?;
     let observation = pioneer_observability::resources::ChildRegistration::register(
         child.id(),
         pioneer_observability::resources::ChildRole::CliAgent,
@@ -939,42 +951,75 @@ sleep 30
     async fn normal_termination_stops_descendants_before_joining_stderr() {
         let root = unique_temp_dir("open-stderr-descendant");
         let script = root.join("parent");
-        write_unix_script(&script, "#!/bin/sh\n(exec </dev/null >/dev/null; echo inherited-stderr >&2; exec sleep 60) &\necho $! > descendant\nexit 0\n");
+        write_unix_script(
+            &script,
+            "#!/bin/sh\n(exec </dev/null >/dev/null; echo inherited-stderr >&2; exec sleep 60) &\necho $! > descendant\nexit 0\n",
+        );
         let mut process = spawn_cli_agent_process(
             &CLIAgentProcessSpawnConfig::codex_app_server(
-                script.to_string_lossy(), root.join("home").to_string_lossy())
-                .with_cwd(root.clone())
-                .with_process_generation(43).unwrap(),
-        ).unwrap();
+                script.to_string_lossy(),
+                root.join("home").to_string_lossy(),
+            )
+            .with_cwd(root.clone())
+            .with_process_generation(43)
+            .unwrap(),
+        )
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while process.try_wait().unwrap().is_none() {
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         // Natural wait preserves the inherited pipe; stop signals descendants
         // before joining the real stderr reader, without waiting for external reap.
-        assert!(tokio::time::timeout(Duration::from_millis(100), process.wait()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), process.wait())
+                .await
+                .is_err()
+        );
         assert!(process.stderr_reader.is_some());
-        let status = tokio::time::timeout(Duration::from_secs(5),
-            process.terminate_with_grace(Duration::from_secs(2)))
-            .await.expect("descendant signals must precede inherited pipe join").unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(5),
+            process.terminate_with_grace(Duration::from_secs(2)),
+        )
+        .await
+        .expect("descendant signals must precede inherited pipe join")
+        .unwrap();
         assert!(status.success());
         assert!(process.try_wait().unwrap().is_some());
-        assert!(process.stderr_reader.is_none(), "actual reader join consumed");
+        assert!(
+            process.stderr_reader.is_none(),
+            "actual reader join consumed"
+        );
         assert_eq!(process.stderr().process_generation(), Some(43));
-        assert!(process.terminate_with_grace(Duration::from_secs(2)).await.unwrap().success());
+        assert!(
+            process
+                .terminate_with_grace(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .success()
+        );
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn normal_windows_cli_stop_uses_public_wrapper() {
         let root = unique_temp_dir("windows-job-completion");
-        let mut config = CLIAgentProcessSpawnConfig::codex_app_server("cmd.exe", root.to_string_lossy());
+        let mut config =
+            CLIAgentProcessSpawnConfig::codex_app_server("cmd.exe", root.to_string_lossy());
         config.args = vec!["/D".into(), "/C".into(), "exit 0".into()];
         let mut process = spawn_cli_agent_process(&config).unwrap();
-        process.terminate_with_grace(Duration::from_secs(2)).await.unwrap();
+        process
+            .terminate_with_grace(Duration::from_secs(2))
+            .await
+            .unwrap();
         assert!(process.try_wait().unwrap().is_some());
-        process.terminate_with_grace(Duration::from_secs(2)).await.unwrap();
+        process
+            .terminate_with_grace(Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 
     #[cfg(unix)]

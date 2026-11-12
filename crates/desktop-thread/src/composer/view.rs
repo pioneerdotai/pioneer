@@ -842,21 +842,18 @@ impl ComposerView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
-                        match plugin_icon {
-                            Some(icon) => {
-                                self.plugin_images
-                                    .element(icon.as_ref())
-                                    .size_3()
-                                    .into_any_element()
-                            }
-                            None => Icon::new(icon)
-                                .size_3()
-                                .opacity(0.8)
-                                .text_color(cx.theme().foreground)
-                                .into_any_element(),
-                        },
-                    ),
+                    .child(match plugin_icon {
+                        Some(icon) => self
+                            .plugin_images
+                            .element(icon.as_ref())
+                            .size_3()
+                            .into_any_element(),
+                        None => Icon::new(icon)
+                            .size_3()
+                            .opacity(0.8)
+                            .text_color(cx.theme().foreground)
+                            .into_any_element(),
+                    }),
             )
             .child(
                 div()

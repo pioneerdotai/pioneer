@@ -1,12 +1,13 @@
 #![allow(dead_code)]
 
-use memvid_core::{LocalTextEmbedder, TextEmbedConfig};
+mod local;
+use local::{LocalRuntimeConfig, OnnxLocalEmbeddingRuntimeFactory};
 use pioneer_config::{
     GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
 use pioneer_memory::{
     ThreadEpisodicEmbeddingError, ThreadEpisodicEmbeddingFailureClass,
-    ThreadEpisodicEmbeddingProvider, ThreadEpisodicMemvidEmbedder,
+    ThreadEpisodicEmbeddingProvider,
 };
 use pioneer_protocol::{
     GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
@@ -254,7 +255,7 @@ fn prepare_embedding_batch(
 fn load_local_preparation_tokenizer(path: &Path) -> Result<Tokenizer, String> {
     let mut tokenizer = Tokenizer::from_file(path)
         .map_err(|error| format!("failed to read installed embedding tokenizer: {error}"))?;
-    // Measure the full actual input, including special tokens. Memvid separately
+    // Measure the full actual input, including special tokens. Local inference
     // enables truncation at 512; preparation must never rely on that truncation.
     tokenizer
         .with_truncation(None)
@@ -1318,54 +1319,8 @@ trait LocalEmbeddingRuntime: Send + Sync {
 trait LocalEmbeddingRuntimeFactory: Send + Sync {
     fn create(
         &self,
-        config: TextEmbedConfig,
+        config: LocalRuntimeConfig,
     ) -> Result<Arc<dyn LocalEmbeddingRuntime>, ThreadEpisodicEmbeddingError>;
-}
-
-struct MemvidLocalEmbeddingRuntime {
-    inner: LocalTextEmbedder,
-    model: String,
-}
-
-impl LocalEmbeddingRuntime for MemvidLocalEmbeddingRuntime {
-    fn embed_text(&self, text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
-        self.inner.encode_text(text).map_err(|error| {
-            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                LOCAL_PROVIDER_ID,
-                self.model.as_str(),
-                format!("local embedding failed: {error}"),
-            )
-        })
-    }
-
-    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ThreadEpisodicEmbeddingError> {
-        self.inner.encode_batch(texts).map_err(|error| {
-            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                LOCAL_PROVIDER_ID,
-                self.model.as_str(),
-                format!("local embedding batch failed: {error}"),
-            )
-        })
-    }
-}
-
-struct MemvidLocalEmbeddingRuntimeFactory;
-
-impl LocalEmbeddingRuntimeFactory for MemvidLocalEmbeddingRuntimeFactory {
-    fn create(
-        &self,
-        config: TextEmbedConfig,
-    ) -> Result<Arc<dyn LocalEmbeddingRuntime>, ThreadEpisodicEmbeddingError> {
-        let model = config.model_name.clone();
-        let inner = LocalTextEmbedder::new(config).map_err(|error| {
-            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                LOCAL_PROVIDER_ID,
-                model.as_str(),
-                format!("failed to initialize local embedding provider: {error}"),
-            )
-        })?;
-        Ok(Arc::new(MemvidLocalEmbeddingRuntime { inner, model }))
-    }
 }
 
 #[derive(Clone)]
@@ -1394,7 +1349,7 @@ impl LocalEmbeddingProvider {
             normalized,
             use_search_instructions,
             runtime: Arc::new(Mutex::new(None)),
-            runtime_factory: Arc::new(MemvidLocalEmbeddingRuntimeFactory),
+            runtime_factory: Arc::new(OnnxLocalEmbeddingRuntimeFactory),
         })
     }
 
@@ -1410,10 +1365,6 @@ impl LocalEmbeddingProvider {
             Self::from_runtime_home(runtime_home, model, normalized, use_search_instructions)?;
         provider.runtime_factory = runtime_factory;
         Ok(provider)
-    }
-
-    pub(crate) fn memvid_embedder(self: Arc<Self>) -> ThreadEpisodicMemvidEmbedder {
-        ThreadEpisodicMemvidEmbedder::new(self)
     }
 
     fn runtime_initialized(&self) -> bool {
@@ -1467,12 +1418,9 @@ impl LocalEmbeddingProvider {
             return Ok(runtime.clone());
         }
 
-        let created = self.runtime_factory.create(TextEmbedConfig {
+        let created = self.runtime_factory.create(LocalRuntimeConfig {
             model_name: self.model_info.id.to_owned(),
             models_dir: self.models_dir.clone(),
-            offline: true,
-            enable_cache: true,
-            cache_capacity: 1000,
         })?;
         *runtime = Some(created.clone());
         Ok(created)
@@ -1779,10 +1727,6 @@ impl RemoteEmbeddingProvider {
             use_search_instructions,
             provider,
         })
-    }
-
-    pub(crate) fn memvid_embedder(self: Arc<Self>) -> ThreadEpisodicMemvidEmbedder {
-        ThreadEpisodicMemvidEmbedder::new(self)
     }
 
     pub(crate) fn max_input_tokens(&self) -> usize {
@@ -2282,7 +2226,6 @@ impl RemoteEmbeddingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use memvid_core::types::ask::VecEmbedder;
     use std::io::Cursor;
     use std::sync::Mutex;
 
@@ -3876,7 +3819,7 @@ mod tests {
     impl LocalEmbeddingRuntimeFactory for FakeLocalEmbeddingRuntimeFactory {
         fn create(
             &self,
-            _config: TextEmbedConfig,
+            _config: LocalRuntimeConfig,
         ) -> Result<Arc<dyn LocalEmbeddingRuntime>, ThreadEpisodicEmbeddingError> {
             self.create_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4003,27 +3946,6 @@ mod tests {
         ));
         assert!(inputs[0].ends_with("\nQuery: find my travel plans"));
         assert_eq!(inputs[1], "stored chat");
-    }
-
-    #[test]
-    fn local_embedding_provider_memvid_embedder_uses_same_identity() {
-        let runtime_home = tempfile::tempdir().expect("runtime home");
-        install_fake_local_model_files(runtime_home.path(), "gte-large");
-        let provider = Arc::new(
-            LocalEmbeddingProvider::with_runtime_factory(
-                runtime_home.path(),
-                "gte-large",
-                true,
-                false,
-                Arc::new(FakeLocalEmbeddingRuntimeFactory::new(1024)),
-            )
-            .expect("provider"),
-        );
-
-        let embedder = provider.clone().memvid_embedder();
-        assert_eq!(embedder.identity(), provider.identity());
-        assert_eq!(embedder.embedding_dimension(), 1024);
-        assert_eq!(embedder.embed_query("query").unwrap().len(), 1024);
     }
 
     #[test]

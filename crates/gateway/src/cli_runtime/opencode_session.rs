@@ -758,9 +758,13 @@ impl OpenCodeServerProcess {
 impl Drop for OpenCodeServerProcess {
     fn drop(&mut self) {
         if let Ok(reader) = self.stdout_reader.try_lock() {
-            if let Some(reader) = reader.as_ref() { reader.abort(); }
+            if let Some(reader) = reader.as_ref() {
+                reader.abort();
+            }
         }
-        if let Ok(mut process) = self.process.try_lock() { process.abort_service(); }
+        if let Ok(mut process) = self.process.try_lock() {
+            process.abort_service();
+        }
     }
 }
 
@@ -795,10 +799,13 @@ impl OpenCodeStartupOwner {
         owner
     }
 
-    async fn failed_attempt(&self, mut failure: OpenCodeStartupFailure, deadline: Instant)
-        -> OpenCodeStartupFailure
-    {
-        self.process_cleanup_confirmed.store(failure.cleanup_error.is_none(), Ordering::Release);
+    async fn failed_attempt(
+        &self,
+        mut failure: OpenCodeStartupFailure,
+        deadline: Instant,
+    ) -> OpenCodeStartupFailure {
+        self.process_cleanup_confirmed
+            .store(failure.cleanup_error.is_none(), Ordering::Release);
         let mut reader = self.stdout_reader.lock().await;
         if let Some(task) = reader.as_mut() {
             task.abort();
@@ -806,16 +813,23 @@ impl OpenCodeStartupOwner {
                 Ok(result) => {
                     reader.take();
                     if result.is_err_and(|error| !error.is_cancelled()) {
-                        failure.cleanup_error.get_or_insert("OpenCode startup stdout worker failed".into());
+                        failure
+                            .cleanup_error
+                            .get_or_insert("OpenCode startup stdout worker failed".into());
                     }
                 }
                 Err(_) => {
-                    failure.cleanup_error.get_or_insert("startup stdout cleanup deadline exhausted".into());
+                    failure
+                        .cleanup_error
+                        .get_or_insert("startup stdout cleanup deadline exhausted".into());
                 }
             }
         }
         if let Some(error) = &failure.cleanup_error {
-            self.failure.lock().expect("OpenCode startup failure poisoned").get_or_insert(error.clone());
+            self.failure
+                .lock()
+                .expect("OpenCode startup failure poisoned")
+                .get_or_insert(error.clone());
         }
         failure
     }
@@ -824,36 +838,54 @@ impl OpenCodeStartupOwner {
 impl CLIAgentRuntimeSession for OpenCodeStartupOwner {
     async fn close(&self) -> Result<()> {
         let mut reader = self.stdout_reader.lock().await;
-        if let Some(task) = reader.as_ref() { task.abort(); }
+        if let Some(task) = reader.as_ref() {
+            task.abort();
+        }
         self.stdin.lock().await.take();
         if !self.process_cleanup_confirmed.load(Ordering::Acquire) {
             let mut process = self.process.lock().await;
             let deadline = Instant::now() + OPENCODE_SHUTDOWN_GRACE;
-            let result = timeout_at(deadline, terminate_opencode_process(&mut process, OPENCODE_SHUTDOWN_GRACE))
-                .await.map_err(|_| anyhow!("OpenCode startup cleanup deadline expired"))
-                .and_then(|result| result);
+            let result = timeout_at(
+                deadline,
+                terminate_opencode_process(&mut process, OPENCODE_SHUTDOWN_GRACE),
+            )
+            .await
+            .map_err(|_| anyhow!("OpenCode startup cleanup deadline expired"))
+            .and_then(|result| result);
             if let Err(error) = &result {
-                self.failure.lock().expect("OpenCode startup failure poisoned")
+                self.failure
+                    .lock()
+                    .expect("OpenCode startup failure poisoned")
                     .get_or_insert(format!("OpenCode startup cleanup failed: {error:#}"));
             }
             let group = process.terminate_service_group(deadline).await;
             if let Err(error) = &group {
-                self.failure.lock().expect("OpenCode startup failure poisoned")
+                self.failure
+                    .lock()
+                    .expect("OpenCode startup failure poisoned")
                     .get_or_insert(format!("OpenCode startup group cleanup failed: {error:#}"));
             }
             if result.is_ok() && group.is_ok() {
-                self.process_cleanup_confirmed.store(true, Ordering::Release);
+                self.process_cleanup_confirmed
+                    .store(true, Ordering::Release);
             }
         }
         if let Some(task) = reader.as_mut() {
             let result = task.await;
             reader.take();
             if result.is_err_and(|error| !error.is_cancelled()) {
-                self.failure.lock().expect("OpenCode startup failure poisoned")
+                self.failure
+                    .lock()
+                    .expect("OpenCode startup failure poisoned")
                     .get_or_insert("OpenCode startup stdout worker failed".into());
             }
         }
-        match self.failure.lock().expect("OpenCode startup failure poisoned").clone() {
+        match self
+            .failure
+            .lock()
+            .expect("OpenCode startup failure poisoned")
+            .clone()
+        {
             Some(error) => Err(anyhow!("{error}")),
             None => Ok(()),
         }
@@ -865,9 +897,13 @@ impl Drop for OpenCodeStartupOwner {
         // must not abort that live handoff. Drop alone is never strict proof.
         if Arc::strong_count(&self.process) == 1 {
             if let Ok(reader) = self.stdout_reader.try_lock() {
-                if let Some(reader) = reader.as_ref() { reader.abort(); }
+                if let Some(reader) = reader.as_ref() {
+                    reader.abort();
+                }
             }
-            if let Ok(mut process) = self.process.try_lock() { process.abort_service(); }
+            if let Ok(mut process) = self.process.try_lock() {
+                process.abort_service();
+            }
         }
     }
 }
@@ -1591,7 +1627,15 @@ pub(crate) async fn probe_opencode_instance(
     }
     let managed_home = opencode_managed_data_home(cwd, instance);
     let startup = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup::default();
-    let server = match spawn_opencode_server(instance, cwd, environment, None, &managed_home, &startup).await
+    let server = match spawn_opencode_server(
+        instance,
+        cwd,
+        environment,
+        None,
+        &managed_home,
+        &startup,
+    )
+    .await
     {
         Ok(server) => server,
         Err(error) => {
@@ -3711,9 +3755,11 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                 {
                     Ok(reservation) => reservation,
                     Err(error) => {
-                        if let Err(error) = self.bridge_supervisor
+                        if let Err(error) = self
+                            .bridge_supervisor
                             .revoke_session_result(process_instance)
-                            .await {
+                            .await
+                        {
                             tracing::warn!(error = %error, "CLI MCP cleanup retained");
                         }
                         return Err(anyhow!(
@@ -3810,7 +3856,10 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                     facade_limits: self.mcp_limits.facade_limits(),
                     state: Mutex::new(OpenCodeRequiredMcpBridgeState::Pending),
                 });
-                *retained.bridge.lock().expect("OpenCode startup bridge poisoned") = Some(bridge.clone());
+                *retained
+                    .bridge
+                    .lock()
+                    .expect("OpenCode startup bridge poisoned") = Some(bridge.clone());
                 let helper = crate::cli_runtime::config::resolve_current_pioneer_cli_mcp_helper()?;
                 let add = server.api.add_pioneer_mcp(
                     helper.as_path(),
@@ -3907,30 +3956,51 @@ struct OpenCodeStartupSession {
 impl CLIAgentRuntimeSession for OpenCodeStartupSession {
     async fn close(&self) -> Result<()> {
         self.cancellation.cancel();
-        let bridge = self.bridge.lock().expect("OpenCode startup bridge poisoned").clone();
-        if let Some(bridge) = &bridge { bridge.request_stop().await; }
+        let bridge = self
+            .bridge
+            .lock()
+            .expect("OpenCode startup bridge poisoned")
+            .clone();
+        if let Some(bridge) = &bridge {
+            bridge.request_stop().await;
+        }
         let mut stream = self.event_stream.lock().await;
         if let Some(task) = stream.as_mut() {
             task.abort();
             let result = task.await;
             stream.take();
             if result.is_err_and(|error| !error.is_cancelled()) {
-                *self.event_stream_failure.lock().expect("OpenCode stream failure poisoned") =
+                *self
+                    .event_stream_failure
+                    .lock()
+                    .expect("OpenCode stream failure poisoned") =
                     Some("OpenCode event stream worker failed".into());
             }
         }
         if let Err(error) = self.server.close().await {
-            self.failure.lock().expect("OpenCode startup failure poisoned")
+            self.failure
+                .lock()
+                .expect("OpenCode startup failure poisoned")
                 .get_or_insert(error.to_string());
         }
         if let Some(bridge) = bridge {
             if let Err(error) = bridge.stop_and_wait().await {
-                self.failure.lock().expect("OpenCode startup failure poisoned")
+                self.failure
+                    .lock()
+                    .expect("OpenCode startup failure poisoned")
                     .get_or_insert(error.to_string());
             }
         }
-        let mut failure = self.failure.lock().expect("OpenCode startup failure poisoned");
-        if let Some(error) = self.event_stream_failure.lock().expect("OpenCode stream failure poisoned").clone() {
+        let mut failure = self
+            .failure
+            .lock()
+            .expect("OpenCode startup failure poisoned");
+        if let Some(error) = self
+            .event_stream_failure
+            .lock()
+            .expect("OpenCode stream failure poisoned")
+            .clone()
+        {
             failure.get_or_insert(error);
         }
         match failure.clone() {

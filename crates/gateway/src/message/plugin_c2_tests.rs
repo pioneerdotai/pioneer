@@ -16,7 +16,11 @@ async fn seed_owned_c2_skill(
     let member = root.join("skills/bundled");
     std::fs::create_dir_all(&member).unwrap();
     std::fs::create_dir_all(member.join("scripts")).unwrap();
-    std::fs::write(member.join("SKILL.md"), "---\nname: bundled\ndescription: Selected packaged skill\n---\nRead scripts/helper.txt\n").unwrap();
+    std::fs::write(
+        member.join("SKILL.md"),
+        "---\nname: bundled\ndescription: Selected packaged skill\n---\nRead scripts/helper.txt\n",
+    )
+    .unwrap();
     std::fs::write(member.join("scripts/helper.txt"), "supporting file").unwrap();
     let now = chrono::Utc::now().fixed_offset();
     store
@@ -29,30 +33,31 @@ async fn seed_owned_c2_skill(
             package_path: root.to_string_lossy().into(),
             data_path: root.with_extension("data").to_string_lossy().into(),
             package_fingerprint: "context".into(),
-            enabled: true, allow_implicit_invocation: false,
+            enabled: true,
+            allow_implicit_invocation: false,
             state: "installing".into(),
             revision: 1,
-        display_name: None,
-        short_description: None,
-        description: None,
-        long_description: None,
-        developer_name: None,
-        author_name: None,
-        author_email: None,
-        author_url: None,
-        homepage: None,
-        repository: None,
-        documentation_url: None,
-        support_url: None,
-        privacy_policy_url: None,
-        terms_of_service_url: None,
-        license: None,
-        category: None,
-        brand_color: None,
-        logo_path: None,
-        logo_revision: None,
-        composer_icon_path: None,
-        composer_icon_revision: None,
+            display_name: None,
+            short_description: None,
+            description: None,
+            long_description: None,
+            developer_name: None,
+            author_name: None,
+            author_email: None,
+            author_url: None,
+            homepage: None,
+            repository: None,
+            documentation_url: None,
+            support_url: None,
+            privacy_policy_url: None,
+            terms_of_service_url: None,
+            license: None,
+            category: None,
+            brand_color: None,
+            logo_path: None,
+            logo_revision: None,
+            composer_icon_path: None,
+            composer_icon_revision: None,
             pending_json: None,
             last_error: None,
             created_at: now,
@@ -482,7 +487,10 @@ fn ordinary_owned_cli_start_uses_native_skill_and_ready_parent_for_both_provider
                     .unwrap();
                 assert_eq!(installed.install_name, install_name);
                 let context = std::path::PathBuf::from(&installed.install_path);
-                assert_eq!(context, harness.native_home.join("skills").join(install_name));
+                assert_eq!(
+                    context,
+                    harness.native_home.join("skills").join(install_name)
+                );
                 assert_eq!(
                     std::fs::read(context.join("scripts/helper.txt")).unwrap(),
                     b"supporting file"
@@ -522,117 +530,310 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
     let root = unique_temp_dir("plugin-transfer-owner");
     let package = root.join("parent/package");
     std::fs::create_dir_all(&package).unwrap();
-    std::fs::write(package.join("plugin.json"), serde_json::to_vec(&json!({
+    let manifest = serde_json::to_vec(&json!({
         "$schema": pioneer_plugins::PLUGIN_SCHEMA, "name": "owned-transfer"
-    })).unwrap()).unwrap();
-    let snapshot = pioneer_plugins::Snapshot::capture(&package, harness.processor.package_delivery_context().plugin_limits(), || false).unwrap();
+    }))
+    .unwrap();
+    std::fs::write(package.join("plugin.json"), &manifest).unwrap();
+    let snapshot = pioneer_plugins::Snapshot::capture(
+        &package,
+        harness.processor.package_delivery_context().plugin_limits(),
+        || false,
+    )
+    .unwrap();
     let plan = pioneer_plugins::load(&snapshot).unwrap();
     let archive = build_test_directory_archive(&package);
-    let payload = root.join("valid.tar.gz");
+    let upload_id = "U".repeat(21);
+    let payload = root.join("uploads").join(&upload_id).join("payload.tar.gz");
+    std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
     std::fs::write(&payload, &archive).unwrap();
     let now = now_timestamp_secs();
-    let upload_id = "U".repeat(21);
-    harness.crud_store.insert_skill_upload_session(&pioneer_crud::SkillUploadSessionRecord {
-        purpose: "plugin".into(), upload_id: upload_id.clone(), workspace_id: harness.workspace_id.clone(),
-        connection_id: harness.connection_id, status: "finalized".into(), file_name: "valid.tar.gz".into(),
-        archive_format: "tar_gz".into(), compressed_size_bytes: archive.len() as u64, received_bytes: archive.len() as u64,
-        sha256: hex::encode(Sha256::digest(&archive)), payload_path: payload.to_string_lossy().into(),
-        created_at_unix: now, expires_at_unix: now + 3600, finalized_at_unix: Some(now), consumed_at_unix: None, aborted_at_unix: None,
-    }).await.unwrap();
+    harness
+        .crud_store
+        .insert_skill_upload_session(&pioneer_crud::SkillUploadSessionRecord {
+            purpose: "plugin".into(),
+            upload_id: upload_id.clone(),
+            workspace_id: harness.workspace_id.clone(),
+            connection_id: harness.connection_id,
+            status: "finalized".into(),
+            file_name: "valid.tar.gz".into(),
+            archive_format: "tar_gz".into(),
+            compressed_size_bytes: archive.len() as u64,
+            received_bytes: archive.len() as u64,
+            sha256: hex::encode(Sha256::digest(&archive)),
+            payload_path: payload.to_string_lossy().into(),
+            created_at_unix: now,
+            expires_at_unix: now + 3600,
+            finalized_at_unix: Some(now),
+            consumed_at_unix: None,
+            aborted_at_unix: None,
+        })
+        .await
+        .unwrap();
     let parent = "P".repeat(21);
     let timestamp = chrono::Utc::now().fixed_offset();
-    harness.crud_store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
-        id: parent.clone(), workspace_id: harness.workspace_id.clone(), name: plan.manifest.name.clone(), version: None,
-        source_upload_id: "old-source".into(), package_path: package.to_string_lossy().into(),
-        data_path: root.join("parent/data").to_string_lossy().into(), package_fingerprint: plan.tree_digest.clone(), enabled: true, allow_implicit_invocation: false,
-        state: "installing".into(), revision: 1,
-        display_name: None,
-        short_description: None,
-        description: None,
-        long_description: None,
-        developer_name: None,
-        author_name: None,
-        author_email: None,
-        author_url: None,
-        homepage: None,
-        repository: None,
-        documentation_url: None,
-        support_url: None,
-        privacy_policy_url: None,
-        terms_of_service_url: None,
-        license: None,
-        category: None,
-        brand_color: None,
-        logo_path: None,
-        logo_revision: None,
-        composer_icon_path: None,
-        composer_icon_revision: None, pending_json: None, last_error: None, created_at: timestamp, updated_at: timestamp,
-    }).await.unwrap();
-    harness.crud_store.settle_plugin_installation(&parent, 1, "installed", None).await.unwrap();
-    let context = registered_request_context(&harness.processor, harness.connection_id, methods::PLUGINS_PREVIEW).await;
+    harness
+        .crud_store
+        .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+            id: parent.clone(),
+            workspace_id: harness.workspace_id.clone(),
+            name: plan.manifest.name.clone(),
+            version: None,
+            source_upload_id: "old-source".into(),
+            package_path: package.to_string_lossy().into(),
+            data_path: root.join("parent/data").to_string_lossy().into(),
+            package_fingerprint: plan.tree_digest.clone(),
+            enabled: true,
+            allow_implicit_invocation: false,
+            state: "installing".into(),
+            revision: 1,
+            display_name: None,
+            short_description: None,
+            description: None,
+            long_description: None,
+            developer_name: None,
+            author_name: None,
+            author_email: None,
+            author_url: None,
+            homepage: None,
+            repository: None,
+            documentation_url: None,
+            support_url: None,
+            privacy_policy_url: None,
+            terms_of_service_url: None,
+            license: None,
+            category: None,
+            brand_color: None,
+            logo_path: None,
+            logo_revision: None,
+            composer_icon_path: None,
+            composer_icon_revision: None,
+            pending_json: None,
+            last_error: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        })
+        .await
+        .unwrap();
+    harness
+        .crud_store
+        .settle_plugin_installation(&parent, 1, "installed", None)
+        .await
+        .unwrap();
+    let context = registered_request_context(
+        &harness.processor,
+        harness.connection_id,
+        methods::PLUGINS_PREVIEW,
+    )
+    .await;
     let owner = AuthenticatedTransferOwner::from_request_context(&context);
     // A genuine finalized archive and full owner form the positive control.
     // Missing/foreign owner negatives below keep all archive facts valid.
     let runtime = harness.processor.package_delivery_context();
-    harness.processor.skill_upload_owners.lock().await.insert(upload_id.clone(), owner.clone());
-    let source = harness.processor.materialize_uploaded_archive_source(
-        &owner, &harness.workspace_id, &upload_id, &runtime,
-        &RequestId::new(generate_test_request_id("transfer", "archive-control")).unwrap(), "plugin",
-    ).await.unwrap();
+    harness
+        .processor
+        .skill_upload_owners
+        .lock()
+        .await
+        .insert(upload_id.clone(), owner.clone());
+    let source = harness
+        .processor
+        .materialize_uploaded_archive_source(
+            &owner,
+            &harness.workspace_id,
+            &upload_id,
+            &runtime,
+            &RequestId::new(generate_test_request_id("transfer", "archive-control")).unwrap(),
+            "plugin",
+        )
+        .await
+        .unwrap();
     assert_eq!(source.upload.status, "finalized");
     drop(source);
     // Positive control through the actual preview RPC, with the same archive.
-    harness.processor.skill_upload_owners.lock().await.insert(upload_id.clone(), owner.clone());
+    harness
+        .processor
+        .skill_upload_owners
+        .lock()
+        .await
+        .insert(upload_id.clone(), owner.clone());
     let preview_id = generate_test_request_id("transfer", "owned-preview");
     let request = json!({"jsonrpc":"2.0","id":preview_id,"method":methods::PLUGINS_PREVIEW,
         "params":{"workspace_id":harness.workspace_id,"upload_id":upload_id}});
-    harness.processor.process_request_for_connection(harness.connection_id, &request.to_string()).await;
+    harness
+        .processor
+        .process_request_for_connection(harness.connection_id, &request.to_string())
+        .await;
     let preview = recv_response_by_id(&mut harness.rx, &preview_id).await;
     let fingerprint = preview.result["fingerprint"].as_str().unwrap().to_owned();
     for foreign in [false, true] {
-        harness.processor.skill_upload_owners.lock().await.remove(&upload_id);
+        harness
+            .processor
+            .skill_upload_owners
+            .lock()
+            .await
+            .remove(&upload_id);
         if foreign {
             let mut foreign_owner = owner.clone();
-            foreign_owner.auth_session_id = pioneer_protocol::AuthSessionId::new("F".repeat(21)).unwrap();
-            harness.processor.skill_upload_owners.lock().await.insert(upload_id.clone(), foreign_owner);
+            foreign_owner.auth_session_id =
+                pioneer_protocol::AuthSessionId::new("F".repeat(21)).unwrap();
+            harness
+                .processor
+                .skill_upload_owners
+                .lock()
+                .await
+                .insert(upload_id.clone(), foreign_owner);
         }
         for (suffix, method, params) in [
-            ("preview", methods::PLUGINS_PREVIEW, json!({"workspace_id":harness.workspace_id,"upload_id":upload_id})),
-            ("update-preview", methods::PLUGINS_PREVIEW, json!({"workspace_id":harness.workspace_id,"upload_id":upload_id,"target":{"plugin_id":parent,"expected_revision":1}})),
-            ("update", methods::PLUGINS_UPDATE, json!({"workspace_id":harness.workspace_id,"plugin_id":parent,"expected_revision":1,"upload_id":upload_id,"expected_fingerprint":fingerprint,"confirm_changes":true})),
+            (
+                "preview",
+                methods::PLUGINS_PREVIEW,
+                json!({"workspace_id":harness.workspace_id,"upload_id":upload_id}),
+            ),
+            (
+                "update-preview",
+                methods::PLUGINS_PREVIEW,
+                json!({"workspace_id":harness.workspace_id,"upload_id":upload_id,"target":{"plugin_id":parent,"expected_revision":1}}),
+            ),
+            (
+                "update",
+                methods::PLUGINS_UPDATE,
+                json!({"workspace_id":harness.workspace_id,"plugin_id":parent,"expected_revision":1,"upload_id":upload_id,"expected_fingerprint":fingerprint,"confirm_changes":true}),
+            ),
         ] {
             let id = generate_test_request_id(&format!("transfer-{foreign}"), suffix);
             let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-            harness.processor.process_request_for_connection(harness.connection_id, &request.to_string()).await;
+            harness
+                .processor
+                .process_request_for_connection(harness.connection_id, &request.to_string())
+                .await;
             let _rejected = recv_error_by_id(&mut harness.rx, &id).await;
-            let current = harness.crud_store.find_plugin_installation(&parent).await.unwrap().unwrap();
+            let current = harness
+                .crud_store
+                .find_plugin_installation(&parent)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(current.revision, 1);
             assert!(current.pending_json.is_none());
-            assert_eq!(harness.crud_store.find_skill_upload_session(&upload_id).await.unwrap().unwrap().status, "finalized");
+            assert_eq!(
+                harness
+                    .crud_store
+                    .find_skill_upload_session(&upload_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "finalized"
+            );
         }
     }
     // Alternate Skills entry must not read/abort a foreign malformed Plugin
     // transfer even when its persisted numeric owner matches this connection.
     let bad_id = "B".repeat(21);
-    let bad_payload = root.join("malformed.tar.gz");
+    let bad_payload = root.join("uploads").join(&bad_id).join("payload.tar.gz");
+    std::fs::create_dir_all(bad_payload.parent().unwrap()).unwrap();
     std::fs::write(&bad_payload, b"finalized but not gzip").unwrap();
-    let mut bad = harness.crud_store.find_skill_upload_session(&upload_id).await.unwrap().unwrap();
-    bad.upload_id = bad_id.clone(); bad.payload_path = bad_payload.to_string_lossy().into();
+    let mut bad = harness
+        .crud_store
+        .find_skill_upload_session(&upload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    bad.upload_id = bad_id.clone();
+    bad.payload_path = bad_payload.to_string_lossy().into();
     bad.sha256 = hex::encode(Sha256::digest(b"finalized but not gzip"));
-    bad.compressed_size_bytes = b"finalized but not gzip".len() as u64; bad.received_bytes = bad.compressed_size_bytes;
-    harness.crud_store.insert_skill_upload_session(&bad).await.unwrap();
-    let request_id = RequestId::new(generate_test_request_id("transfer", "alternate-entry")).unwrap();
-    assert!(harness.processor.materialize_uploaded_skill_source(&owner, &harness.workspace_id, &bad_id, &request_id).await.is_err());
-    assert_eq!(harness.crud_store.find_skill_upload_session(&bad_id).await.unwrap().unwrap().status, "finalized");
-    assert_eq!(std::fs::read(&bad_payload).unwrap(), b"finalized but not gzip");
+    bad.compressed_size_bytes = b"finalized but not gzip".len() as u64;
+    bad.received_bytes = bad.compressed_size_bytes;
+    harness
+        .crud_store
+        .insert_skill_upload_session(&bad)
+        .await
+        .unwrap();
+    let request_id =
+        RequestId::new(generate_test_request_id("transfer", "alternate-entry")).unwrap();
+    assert!(
+        harness
+            .processor
+            .materialize_uploaded_skill_source(&owner, &harness.workspace_id, &bad_id, &request_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        harness
+            .crud_store
+            .find_skill_upload_session(&bad_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "finalized"
+    );
+    assert_eq!(
+        std::fs::read(&bad_payload).unwrap(),
+        b"finalized but not gzip"
+    );
     // Matching owner with wrong purpose is also rejected before extraction.
-    harness.processor.skill_upload_owners.lock().await.insert(bad_id.clone(), owner.clone());
-    assert!(harness.processor.materialize_uploaded_skill_pack_source(&owner, &harness.workspace_id, &bad_id, &request_id).await.is_err());
-    assert_eq!(harness.crud_store.find_skill_upload_session(&bad_id).await.unwrap().unwrap().status, "finalized");
+    harness
+        .processor
+        .skill_upload_owners
+        .lock()
+        .await
+        .insert(bad_id.clone(), owner.clone());
+    assert!(
+        harness
+            .processor
+            .materialize_uploaded_skill_pack_source(
+                &owner,
+                &harness.workspace_id,
+                &bad_id,
+                &request_id
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        harness
+            .crud_store
+            .find_skill_upload_session(&bad_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "finalized"
+    );
     // Genuine owner + matching Plugin purpose reaches extraction and may abort
     // its own invalid bytes; no competing transfer is touched.
-    assert!(harness.processor.materialize_uploaded_archive_source(&owner, &harness.workspace_id, &bad_id, &runtime, &request_id, "plugin").await.is_err());
-    assert_eq!(harness.crud_store.find_skill_upload_session(&bad_id).await.unwrap().unwrap().status, "aborted");
+    assert!(
+        harness
+            .processor
+            .materialize_uploaded_archive_source(
+                &owner,
+                &harness.workspace_id,
+                &bad_id,
+                &runtime,
+                &request_id,
+                "plugin"
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        harness
+            .crud_store
+            .find_skill_upload_session(&bad_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "aborted"
+    );
+    assert!(!bad_payload.parent().unwrap().exists());
+    assert_eq!(std::fs::read(&payload).unwrap(), archive);
+    assert_eq!(
+        std::fs::read(package.join("plugin.json")).unwrap(),
+        manifest
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -645,8 +846,11 @@ async fn plugin_policy_rpc_preserves_independent_toggles_and_frozen_task_grants(
     let mut frozen = task_parent_launch(selected.clone()).execution;
     frozen.skill_ids.clear();
     frozen.selected_capabilities.clear();
-    let initial = harness.processor
-        .normalize_turn_skill_capabilities(&harness.workspace_id, &[]).await.unwrap();
+    let initial = harness
+        .processor
+        .normalize_turn_skill_capabilities(&harness.workspace_id, &[])
+        .await
+        .unwrap();
     assert!(initial.execution.is_empty());
     // These are the same RPC payloads as the two header buttons. The enabled
     // button deliberately omits implicit to preserve that independent setting.
@@ -672,32 +876,52 @@ async fn plugin_policy_rpc_preserves_independent_toggles_and_frozen_task_grants(
         assert_eq!(item.enabled, enabled);
         assert_eq!(item.allow_implicit_invocation, revision != 4);
         assert_eq!(item.revision, revision + 1);
-        let stored = harness.crud_store.find_plugin_installation(&parent).await.unwrap().unwrap();
+        let stored = harness
+            .crud_store
+            .find_plugin_installation(&parent)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.enabled, enabled);
         assert_eq!(stored.allow_implicit_invocation, revision != 4);
-        let automatic = harness.processor
-            .normalize_turn_skill_capabilities(&harness.workspace_id, &[]).await.unwrap();
+        let automatic = harness
+            .processor
+            .normalize_turn_skill_capabilities(&harness.workspace_id, &[])
+            .await
+            .unwrap();
         if enabled && revision != 4 {
             assert!(automatic.execution.iter().any(|cap| matches!(&cap.kind,
                 TurnCapabilityKind::Skill { skill_id, .. } if skill_id == &skill)));
-            assert_eq!(automatic.plugin_selection.unwrap().parents[0].revision, revision + 1);
+            assert_eq!(
+                automatic.plugin_selection.unwrap().parents[0].revision,
+                revision + 1
+            );
         } else {
             assert!(automatic.execution.is_empty());
             assert!(automatic.plugin_selection.is_none());
         }
         // Opting into a plugin cannot widen an already persisted task ceiling.
-        let restored = harness.processor
-            .normalize_task_launch_capabilities(&harness.workspace_id, &frozen).await.unwrap();
+        let restored = harness
+            .processor
+            .normalize_task_launch_capabilities(&harness.workspace_id, &frozen)
+            .await
+            .unwrap();
         assert!(restored.execution.is_empty());
         assert!(restored.plugin_selection.is_none());
     }
     // Turning implicit off keeps explicit selection available.
     let mut current = selected;
-    if let TurnCapabilityKind::Plugin { expected_revision, .. } = &mut current.kind {
+    if let TurnCapabilityKind::Plugin {
+        expected_revision, ..
+    } = &mut current.kind
+    {
         *expected_revision = 5;
     }
-    let explicit = harness.processor
-        .normalize_turn_skill_capabilities(&harness.workspace_id, &[current]).await.unwrap();
+    let explicit = harness
+        .processor
+        .normalize_turn_skill_capabilities(&harness.workspace_id, &[current])
+        .await
+        .unwrap();
     assert!(explicit.execution.iter().any(|cap| matches!(&cap.kind,
         TurnCapabilityKind::Skill { skill_id, .. } if skill_id == &skill)));
     std::fs::remove_dir_all(root).unwrap();

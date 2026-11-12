@@ -135,8 +135,7 @@ pub(crate) async fn load_skills_catalog_from_store(
                     && p.state == "installed"
                     && p.pending_json.is_none()
                     && owner.status == "installed"
-            })
-            {
+            }) {
                 skill.availability = pioneer_skills::SkillAvailability::Unavailable {
                     reason: pioneer_skills::SkillUnavailableReason::HostPolicy,
                 };

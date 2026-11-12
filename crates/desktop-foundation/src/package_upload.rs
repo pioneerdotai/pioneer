@@ -212,8 +212,8 @@ impl<T: UploadText> Render for UploadView<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::core::prelude::v1::test;
     use crate::{ClientBindingRegistration, ClientPublicationSink};
+    use ::core::prelude::v1::test;
     use std::{cell::Cell, rc::Rc, sync::Weak};
     struct Text;
     impl UploadText for Text {

@@ -31,13 +31,13 @@ mod client_projection;
 mod gateway_endpoint;
 mod id;
 mod identity;
+mod images;
 mod invitation;
 mod jsonrpc;
 mod markdown;
 mod mcp;
 mod member;
-mod images;
-pub use images::{ImageMediaType, ImageReference, IMAGE_MAX_BYTES, IMAGE_MAX_DIMENSION};
+pub use images::{IMAGE_MAX_BYTES, IMAGE_MAX_DIMENSION, ImageMediaType, ImageReference};
 mod memory;
 mod notification;
 mod patch_history;
@@ -520,21 +520,21 @@ pub use turn::{
     TimelineLane, TimelineOrigin, TimelineOriginKind, TimelineOutputPolicy, ToolCallStatus,
     ToolDisplayPayload, ToolErrorClass, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
     ToolMetadata, ToolMetadataRawKind, ToolMetadataValue, ToolObservation, ToolOutcome,
-    ToolOutcomeStatus, ToolOutputPolicySnapshot, ToolOutputSummary, ToolPermissionPolicySnapshot,
-    ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
-    ToolRecoveryView, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
-    ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-    TurnApprovalScopePolicySnapshot, TurnAuthorSnapshot, TurnBlockedNotification,
-    TurnBlockedResumeMetadata, TurnCLIRuntimeOptions, TurnCancelParams, TurnCancelResponse,
-    TurnCapability, TurnCapabilityKind, TurnCommandRiskPolicy, TurnCompletedNotification,
-    TurnEnvironmentPolicy, TurnExecutionSecuritySnapshot, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
-    TurnFilesystemSandboxKind, TurnFilesystemSandboxPath, TurnFilesystemSandboxPolicy,
-    TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus, TurnItemEvent,
-    TurnItemEventPayload, TurnItemExecutionClass, TurnItemTimeoutReason, TurnItemType,
-    TurnItemsParams, TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary,
+    ToolOutcomeStatus, ToolOutputMeasurements, ToolOutputPolicySnapshot, ToolOutputSummary,
+    ToolPermissionPolicySnapshot, ToolPhaseBoundary, ToolRecoveryIdempotencyMode,
+    ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind,
+    ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution,
+    ToolStoragePayload, Turn, TurnApprovalScopePolicySnapshot, TurnAuthorSnapshot,
+    TurnBlockedNotification, TurnBlockedResumeMetadata, TurnCLIRuntimeOptions, TurnCancelParams,
+    TurnCancelResponse, TurnCapability, TurnCapabilityKind, TurnCommandRiskPolicy,
+    TurnCompletedNotification, TurnEnvironmentPolicy, TurnExecutionSecuritySnapshot,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnFilesystemAccess,
+    TurnFilesystemSandboxEntry, TurnFilesystemSandboxKind, TurnFilesystemSandboxPath,
+    TurnFilesystemSandboxPolicy, TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus,
+    TurnItemEvent, TurnItemEventPayload, TurnItemExecutionClass, TurnItemTimeoutReason,
+    TurnItemType, TurnItemsParams, TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary,
     TurnMcpToolCapabilitySummary, TurnMention, TurnMessageDeleteParams, TurnMessageDeleteResponse,
     TurnMessageDeletedEvent, TurnMessageEditParams, TurnMessageEditResponse,
     TurnMessageEditedEvent, TurnMessageErrorReason, TurnMessageParamsError, TurnMessageRevision,
@@ -599,6 +599,8 @@ pub use model_selection::{GatewayModelSelection, ModelSelectionTransport};
 
 pub use artifact::{HtmlPublication, compact_html_timeline_item, compact_html_timeline_value};
 
+mod execution_observability;
+pub use execution_observability::*;
 mod service_mode;
 pub use service_mode::{
     NativeServiceModePlan, NativeServiceModeSelection, OpenAiTier, ServiceModeDescriptor,

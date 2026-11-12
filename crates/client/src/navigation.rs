@@ -785,7 +785,10 @@ mod tests {
             let mut permissions = core.authorization_snapshot(None, None).unwrap();
             permissions.authorization_revision += 1;
             permissions.global.can_manage_gateway_settings = true;
-            core.accept_authorization_projection(generation, connection, permissions.clone());
+            assert_eq!(
+                core.accept_authorization_projection(generation, connection, permissions.clone()),
+                crate::authorization::AuthorizationProjectionAcceptance::Accepted
+            );
             let protected = SemanticDestination::Settings { route };
             let parent = SemanticDestination::Plugin {
                 plugin_id: "parent".into(),
@@ -819,8 +822,19 @@ mod tests {
                 .get();
             permissions.authorization_revision += 1;
             permissions.global.can_manage_gateway_settings = false;
-            core.accept_authorization_projection(generation, connection, permissions);
-            assert_eq!(core.current_auth_ticket(), (generation, connection));
+            let (current_generation, current_connection) = core.current_auth_ticket();
+            assert_eq!(current_connection, connection);
+            assert_eq!(
+                core.accept_authorization_projection(
+                    current_generation,
+                    current_connection,
+                    permissions
+                ),
+                crate::authorization::AuthorizationProjectionAcceptance::Accepted
+            );
+            let (next_generation, next_connection) = core.current_auth_ticket();
+            assert!(next_generation > current_generation);
+            assert_eq!(next_connection, connection);
             assert_eq!(
                 core.navigate(NavigationIntent::BackFromPlugin, Some(old_revision))
                     .outcome(),

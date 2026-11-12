@@ -923,7 +923,8 @@ impl ClientCore {
                 }
             }
         }
-        let plugin_install_uncertain = plugin_install_dispatched && upload.flow.publication.mutation_uncertain;
+        let plugin_install_uncertain =
+            plugin_install_dispatched && upload.flow.publication.mutation_uncertain;
         self.publish_skill_upload(workspace, upload);
         let succeeded = upload.flow.publication.state == SkillUploadState::Succeeded;
         let cleanup = upload.flow.take_cleanup();
@@ -1127,12 +1128,29 @@ mod tests {
     fn authorization_publication_and_native_settlement_both_make_progress() {
         for failure in [false, true].into_iter().cycle().take(32) {
             let (core, receiver) = fixture();
-            core.skills_intent("workspace", SkillsIntent::Policy { skill_id: skill('A').skill_id, enabled: false, allow_implicit_invocation: false }).unwrap();
-            let Work::Action(work) = receiver.try_recv().unwrap().value else { panic!("expected native action") };
+            core.skills_intent(
+                "workspace",
+                SkillsIntent::Policy {
+                    skill_id: skill('A').skill_id,
+                    enabled: false,
+                    allow_implicit_invocation: false,
+                },
+            )
+            .unwrap();
+            let Work::Action(work) = receiver.try_recv().unwrap().value else {
+                panic!("expected native action")
+            };
             assert!(core.skills_action_current(&work));
             let target = work.target.clone();
-            assert_eq!(core.skills_action_snapshot("workspace", &target).unwrap().state, SkillsActionState::Pending);
-            let publication = core.snapshot(&ClientScope::Administration { workspace_id: None }).unwrap();
+            assert_eq!(
+                core.skills_action_snapshot("workspace", &target)
+                    .unwrap()
+                    .state,
+                SkillsActionState::Pending
+            );
+            let publication = core
+                .snapshot(&ClientScope::Administration { workspace_id: None })
+                .unwrap();
             let mut revoked = (*publication.snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
             revoked.authorization_change_sequence += 1;
             revoked.capabilities.clear_epoch();
@@ -1143,7 +1161,14 @@ mod tests {
             let worker_finished = finished.clone();
             let worker = std::thread::spawn(move || {
                 worker_start.wait();
-                worker_core.complete_skills_action(work, if failure { Err(anyhow::anyhow!("native failure")) } else { Ok(()) });
+                worker_core.complete_skills_action(
+                    work,
+                    if failure {
+                        Err(anyhow::anyhow!("native failure"))
+                    } else {
+                        Ok(())
+                    },
+                );
                 worker_finished.send(()).unwrap();
             });
             let publisher_core = core.clone();
@@ -1152,14 +1177,19 @@ mod tests {
                 let _identity = publisher_core.identity_authorization.lock().unwrap();
                 publisher_start.wait();
                 publisher_core.publish_identity_authorization(
-                    &revoked, crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
+                    &revoked,
+                    crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
                 );
                 finished.send(()).unwrap();
             });
             start.wait();
             // Bound a deadlock failure, but require actual publication AND
             // settlement acknowledgements plus joins, not a timeout as success.
-            for _ in 0..2 { observed.recv_timeout(std::time::Duration::from_secs(5)).expect("publisher/settlement cycle"); }
+            for _ in 0..2 {
+                observed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("publisher/settlement cycle");
+            }
             publisher.join().unwrap();
             worker.join().unwrap();
             assert!(!core.capability_management_allowed("workspace"));
@@ -1284,7 +1314,8 @@ mod tests {
     #[test]
     fn skill_policy_remove_failure_retry_and_access_fence_share_one_controller() {
         let (core, receiver) = fixture();
-        let (_plugins, assert_plugins_quiet) = crate::plugins::runtime::tests::watch_plugin_reads(&core);
+        let (_plugins, assert_plugins_quiet) =
+            crate::plugins::runtime::tests::watch_plugin_reads(&core);
         let id = skill('A').skill_id;
         let intent = || SkillsIntent::Policy {
             skill_id: id.clone(),
@@ -1483,7 +1514,8 @@ mod tests {
     #[test]
     fn upload_update_completes_once_and_stale_effect_errors_do_not_cancel_next_chunk() {
         let (core, receiver) = fixture();
-        let (_plugins, assert_plugins_quiet) = crate::plugins::runtime::tests::watch_plugin_reads(&core);
+        let (_plugins, assert_plugins_quiet) =
+            crate::plugins::runtime::tests::watch_plugin_reads(&core);
         let before = core.skills_catalog_snapshot("workspace").unwrap();
         let id = skill('A').skill_id;
         let operation = core
@@ -1701,11 +1733,16 @@ mod tests {
                     .next_skill_upload_effect("workspace", operation.id())
                     .unwrap();
                 core.complete_skill_upload_effect(
-                    "workspace", operation.id(), generation, Ok(completion),
+                    "workspace",
+                    operation.id(),
+                    generation,
+                    Ok(completion),
                 );
             }
             assert_eq!(
-                core.skill_upload_snapshot("workspace", operation.id()).unwrap().state,
+                core.skill_upload_snapshot("workspace", operation.id())
+                    .unwrap()
+                    .state,
                 SkillUploadState::Applying,
             );
             core.start_skills_operation_controller();
@@ -1739,12 +1776,14 @@ mod tests {
                 assert_ne!(core.provider_runtime_epoch(), epoch);
                 assert_eq!(core.provider_runtime_epoch().2, epoch.2);
                 assert!(core.capability_management_allowed("workspace"));
-                assert!(!core
-                    .capability_operations
-                    .lock()
-                    .unwrap()
-                    .uploads
-                    .contains_key(&("workspace".into(), operation.id())));
+                assert!(
+                    !core
+                        .capability_operations
+                        .lock()
+                        .unwrap()
+                        .uploads
+                        .contains_key(&("workspace".into(), operation.id()))
+                );
             }
             // The original socket/response is still live: rejection must come
             // from the retired operation, not a disconnected test transport.
@@ -1760,9 +1799,11 @@ mod tests {
             // Identity publishers retain this mutex while fencing the upload
             // owner. The live continuation must admit and dispatch using the
             // committed projection without waiting for that mutex in reverse.
-            let identity = (!retire_during_preview)
-                .then(|| core.identity_authorization.lock().unwrap());
-            reply.send(Ok(serde_json::to_value(preview).unwrap())).unwrap();
+            let identity =
+                (!retire_during_preview).then(|| core.identity_authorization.lock().unwrap());
+            reply
+                .send(Ok(serde_json::to_value(preview).unwrap()))
+                .unwrap();
             let install = if retire_during_preview {
                 None
             } else {
@@ -1776,7 +1817,8 @@ mod tests {
                     "retired preview dispatched another RPC",
                 );
             } else {
-                let (install, _) = install.unwrap()
+                let (install, _) = install
+                    .unwrap()
                     .expect("current preview must dispatch while identity is held");
                 assert_eq!(install.method, methods::PLUGINS_INSTALL);
                 let params = install.params.unwrap();

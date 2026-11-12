@@ -104,3 +104,26 @@ restarting = "फिर शुरू हो रहा है"
 stopping = "रोका जा रहा है"
 
 supporting_files_changed = "साझा फ़ाइलें या पैकेज मेटाडेटा बदला है"
+
+[plugins.mcp_status]
+not_started = "शुरू नहीं हुआ"
+disabled = "अक्षम"
+starting = "शुरू हो रहा है"
+ready = "तैयार"
+degraded = "आंशिक रूप से उपलब्ध"
+auth_required = "अनुमति आवश्यक"
+failed = "विफल"
+stopping = "रोका जा रहा है"
+stopped = "रुका हुआ"
+restarting = "फिर शुरू हो रहा है"
+
+[plugins.mcp_capabilities]
+tools = "टूल"
+resources = "संसाधन"
+templates = "टेम्पलेट"
+prompts = "प्रॉम्प्ट"
+
+[plugins.skill_status]
+active = "सक्रिय"
+blocked = "ब्लॉक किया गया"
+disabled = "अक्षम"

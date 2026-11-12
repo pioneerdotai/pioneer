@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{
-    thread, thread_episodic_capsules, thread_episodic_embedding_artifacts,
-    thread_episodic_exclusions, thread_episodic_index_jobs, thread_episodic_items,
-    thread_episodic_recall_events, thread_episodic_thread_directory, turn, turn_event,
+    thread, thread_episodic_embedding_artifacts, thread_episodic_exclusions,
+    thread_episodic_index_jobs, thread_episodic_items, thread_episodic_recall_events,
+    thread_episodic_thread_directory, turn, turn_event,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict, Query};
@@ -15,130 +15,22 @@ use std::mem::size_of;
 
 use crate::convention::DB_ID_LEN;
 use crate::thread_episodic::{
-    NewThreadEpisodicCapsuleRecord, NewThreadEpisodicEmbeddingArtifactRecord,
-    NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
+    NewThreadEpisodicEmbeddingArtifactRecord, NewThreadEpisodicExclusionRecord,
+    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
     NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
     THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR,
     THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,
-    THREAD_EPISODIC_USER_EXCLUDED_ERROR, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
-    ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleStatus,
-    ThreadEpisodicCapsuleWriteState, ThreadEpisodicIndexAttemptOutcome,
+    THREAD_EPISODIC_USER_EXCLUDED_ERROR, ThreadEpisodicIndexAttemptOutcome,
     ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
     ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemStatus,
     ThreadEpisodicItemVisibility, ThreadEpisodicRefillSourceCounts, ThreadEpisodicRefillThread,
     ThreadEpisodicSourceReconcileOutcome, ThreadEpisodicThreadDirectorySelection,
     ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
-    capsule_status_to_db, capsule_write_state_to_db, exclusion_reason_to_db,
-    graph_enrichment_state_to_db, index_job_status_from_db, index_job_status_to_db,
-    item_status_to_db, item_visibility_to_db, repair_status_to_db, source_actor_role_to_db,
-    source_runtime_kind_to_db, thread_directory_status_to_db, thread_directory_visibility_from_db,
+    exclusion_reason_to_db, index_job_status_from_db, index_job_status_to_db, item_status_to_db,
+    item_visibility_to_db, source_actor_role_to_db, source_runtime_kind_to_db,
+    thread_directory_status_to_db, thread_directory_visibility_from_db,
     thread_directory_visibility_to_db,
 };
-
-pub async fn find_active_write_capsule<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-    thread_id: &str,
-) -> Result<Option<thread_episodic_capsules::Model>> {
-    thread_episodic_capsules::Entity::find()
-        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread_episodic_capsules::Column::ThreadId.eq(thread_id.to_owned()))
-        .filter(
-            thread_episodic_capsules::Column::WriteState.eq(capsule_write_state_to_db(
-                ThreadEpisodicCapsuleWriteState::ActiveWrite,
-            )),
-        )
-        .filter(
-            thread_episodic_capsules::Column::Status
-                .ne(capsule_status_to_db(ThreadEpisodicCapsuleStatus::Deleted)),
-        )
-        .order_by_desc(thread_episodic_capsules::Column::SegmentIndex)
-        .one(db)
-        .await
-        .with_context(|| {
-            format!("failed to find active thread episodic capsule for thread `{thread_id}`")
-        })
-}
-
-pub async fn find_active_write_workspace_capsule<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-) -> Result<Option<thread_episodic_capsules::Model>> {
-    find_active_write_capsule(
-        db,
-        workspace_id,
-        THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "failed to find active workspace thread episodic capsule for workspace `{workspace_id}`"
-        )
-    })
-}
-
-pub async fn max_segment_index_for_thread<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-    thread_id: &str,
-) -> Result<Option<i64>> {
-    let row = thread_episodic_capsules::Entity::find()
-        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread_episodic_capsules::Column::ThreadId.eq(thread_id.to_owned()))
-        .order_by_desc(thread_episodic_capsules::Column::SegmentIndex)
-        .one(db)
-        .await
-        .with_context(|| {
-            format!("failed to find latest thread episodic segment for thread `{thread_id}`")
-        })?;
-    Ok(row.map(|row| row.segment_index))
-}
-
-pub async fn insert_capsule_if_absent<C: ConnectionTrait>(
-    db: &C,
-    capsule: NewThreadEpisodicCapsuleRecord,
-    now: DateTimeWithTimeZone,
-) -> Result<()> {
-    thread_episodic_capsules::Entity::insert(thread_episodic_capsules::ActiveModel {
-        id: Set(capsule.id),
-        workspace_id: Set(capsule.workspace_id),
-        workspace_key_hash: Set(capsule.workspace_key_hash),
-        thread_id: Set(capsule.thread_id),
-        thread_key_hash: Set(capsule.thread_key_hash),
-        segment_index: Set(capsule.segment_index),
-        write_state: Set(capsule_write_state_to_db(capsule.write_state).to_owned()),
-        capsule_ref: Set(capsule.capsule_ref),
-        storage_uri: Set(capsule.storage_uri),
-        backend: Set(capsule.backend),
-        format: Set(capsule.format),
-        encrypted: Set(capsule.encrypted),
-        status: Set(capsule_status_to_db(capsule.status).to_owned()),
-        repair_status: Set(repair_status_to_db(capsule.repair_status).to_owned()),
-        active_frame_count: Set(capsule.active_frame_count),
-        capacity_bytes: Set(capsule.capacity_bytes),
-        size_bytes: Set(capsule.size_bytes),
-        utilization_percent: Set(capsule.utilization_percent),
-        last_capacity_check_at: Set(None),
-        near_capacity_at: Set(None),
-        capacity_exceeded_at: Set(None),
-        last_vacuumed_at: Set(None),
-        last_compacted_at: Set(None),
-        content_hash: Set(capsule.content_hash),
-        metadata_json: Set(capsule.metadata_json),
-        last_error: Set(capsule.last_error),
-        created_at: Set(now),
-        updated_at: Set(now),
-    })
-    .on_conflict(
-        OnConflict::column(thread_episodic_capsules::Column::Id)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    .context("failed to insert thread episodic capsule")?;
-    Ok(())
-}
 
 pub async fn upsert_item_by_source_identity<C: ConnectionTrait>(
     db: &C,
@@ -180,13 +72,9 @@ pub async fn upsert_item_by_source_identity<C: ConnectionTrait>(
         source_text_hash: Set(item.source_text_hash),
         projection_group_id: Set(Some(item.projection_group_id)),
         embedding_artifact_id: Set(None),
+        search_text: Set(None),
         language_hint: Set(item.language_hint),
         token_estimate: Set(item.token_estimate),
-        capsule_id: Set(item.capsule_id),
-        capsule_ref: Set(item.capsule_ref),
-        segment_index: Set(item.segment_index),
-        frame_id: Set(item.frame_id),
-        frame_uri: Set(item.frame_uri),
         indexed_at: Set(item.indexed_at),
         created_at: Set(now),
         updated_at: Set(now),
@@ -297,11 +185,6 @@ pub async fn reconcile_item_source_version<C: ConnectionTrait>(
             .to_owned());
             active.deleted_at = Set(None);
             if completed_job.is_none() {
-                active.capsule_id = Set(None);
-                active.capsule_ref = Set(None);
-                active.segment_index = Set(None);
-                active.frame_id = Set(None);
-                active.frame_uri = Set(None);
                 active.indexed_at = Set(None);
                 active.embedding_artifact_id = Set(None);
             }
@@ -360,13 +243,8 @@ pub async fn reconcile_item_source_version<C: ConnectionTrait>(
                         workspace_id: item.workspace_id.clone(),
                         thread_id: item.thread_id.clone(),
                         index_item_id: current.id.clone(),
-                        capsule_id: None,
-                        capsule_ref: None,
-                        segment_index: None,
-                        frame_uri: None,
                         status: ThreadEpisodicIndexJobStatus::Queued,
-                        graph_enrichment_state:
-                            crate::thread_episodic::ThreadEpisodicGraphEnrichmentState::NotSupported,
+
                         next_run_at: now,
                         last_error: None,
                     },
@@ -391,6 +269,9 @@ pub async fn reconcile_item_source_version<C: ConnectionTrait>(
         .context("failed to list bounded stale thread episodic source versions")?;
     for stale in stale_rows {
         let mut active = stale.clone().into_active_model();
+        // A completed projection can be reused if the canonical source returns
+        // to this version. Search excludes Superseded rows; reset, exclusion
+        // and deletion still clear the cached text and embedding reference.
         active.status = Set(item_status_to_db(ThreadEpisodicItemStatus::Superseded).to_owned());
         active.deleted_at = Set(Some(now));
         active.updated_at = Set(now);
@@ -424,13 +305,8 @@ pub async fn reconcile_item_source_version<C: ConnectionTrait>(
                     workspace_id: item.workspace_id.clone(),
                     thread_id: item.thread_id.clone(),
                     index_item_id: stale.id,
-                    capsule_id: None,
-                    capsule_ref: None,
-                    segment_index: None,
-                    frame_uri: None,
                     status: ThreadEpisodicIndexJobStatus::Canceled,
-                    graph_enrichment_state:
-                        crate::thread_episodic::ThreadEpisodicGraphEnrichmentState::NotSupported,
+
                     next_run_at: now,
                     last_error: Some(THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR.to_owned()),
                 },
@@ -477,6 +353,8 @@ async fn reconcile_excluded_source_occurrence<C: ConnectionTrait>(
         {
             let mut active = row.clone().into_active_model();
             active.status = Set(item_status_to_db(ThreadEpisodicItemStatus::Excluded).to_owned());
+            active.search_text = Set(None);
+            active.embedding_artifact_id = Set(None);
             active.updated_at = Set(now);
             active
                 .update(db)
@@ -748,6 +626,8 @@ pub async fn retire_source_occurrence<C: ConnectionTrait>(
     let processed = rows.len();
     for row in rows {
         let mut active = row.clone().into_active_model();
+        // Preserve a completed projection for a later return to indexable
+        // source content, under the same eligibility rules as version changes.
         active.status = Set(item_status_to_db(ThreadEpisodicItemStatus::Superseded).to_owned());
         active.deleted_at = Set(Some(now));
         active.updated_at = Set(now);
@@ -780,13 +660,8 @@ pub async fn retire_source_occurrence<C: ConnectionTrait>(
                     workspace_id: workspace_id.to_owned(),
                     thread_id: thread_id.to_owned(),
                     index_item_id: row.id,
-                    capsule_id: None,
-                    capsule_ref: None,
-                    segment_index: None,
-                    frame_uri: None,
                     status: ThreadEpisodicIndexJobStatus::Canceled,
-                    graph_enrichment_state:
-                        crate::thread_episodic::ThreadEpisodicGraphEnrichmentState::NotSupported,
+
                     next_run_at: now,
                     last_error: Some(THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR.to_owned()),
                 },
@@ -829,44 +704,103 @@ pub async fn find_embedding_artifact_by_id<C: ConnectionTrait>(
         })
 }
 
-pub async fn insert_embedding_artifact_if_absent<C: ConnectionTrait>(
-    db: &C,
+#[derive(Clone)]
+pub(crate) struct PreparedEmbeddingArtifact {
+    id: String,
+    model: thread_episodic_embedding_artifacts::ActiveModel,
+    identity: (String, String, String, String, String, i64, bool),
+}
+
+/// Validate and encode the SQLite representation before writer admission. The
+/// identity is immutable; a conflicting insert is checked against the durable
+/// row without accepting a different workspace/model under the same cache key.
+pub(crate) fn prepare_embedding_artifact(
     artifact: NewThreadEpisodicEmbeddingArtifactRecord,
     now: DateTimeWithTimeZone,
-) -> Result<thread_episodic_embedding_artifacts::Model> {
+) -> Result<PreparedEmbeddingArtifact> {
+    anyhow::ensure!(
+        artifact.dimension > 0
+            && artifact.vector.len() == artifact.dimension
+            && artifact.vector.iter().all(|value| value.is_finite())
+            && artifact.vector.iter().any(|value| *value != 0.0),
+        "invalid embedding artifact vector"
+    );
     let dimension = i64::try_from(artifact.dimension)
         .context("thread episodic embedding dimension exceeds i64")?;
-    let vector_bytes = encode_embedding_vector(artifact.vector.as_slice());
-    let artifact_id = artifact.id.clone();
-    thread_episodic_embedding_artifacts::Entity::insert(
-        thread_episodic_embedding_artifacts::ActiveModel {
-            id: Set(artifact.id),
-            workspace_id: Set(artifact.workspace_id),
-            pipeline_identity_hash: Set(artifact.pipeline_identity_hash),
-            input_hash: Set(artifact.input_hash),
-            provider_id: Set(artifact.provider_id),
-            model: Set(artifact.model),
-            dimension: Set(dimension),
-            normalized: Set(artifact.normalized),
-            vector_bytes: Set(vector_bytes),
-            created_at: Set(now),
-            last_used_at: Set(now),
-        },
-    )
-    .on_conflict(
-        OnConflict::column(thread_episodic_embedding_artifacts::Column::Id)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    .with_context(|| {
-        format!("failed to insert thread episodic embedding artifact `{artifact_id}`")
-    })?;
+    let vector_bytes = encode_embedding_vector(&artifact.vector);
+    let identity = (
+        artifact.workspace_id.clone(),
+        artifact.pipeline_identity_hash.clone(),
+        artifact.input_hash.clone(),
+        artifact.provider_id.clone(),
+        artifact.model.clone(),
+        dimension,
+        artifact.normalized,
+    );
+    let id = artifact.id.clone();
+    let model = thread_episodic_embedding_artifacts::ActiveModel {
+        id: Set(artifact.id),
+        workspace_id: Set(artifact.workspace_id),
+        pipeline_identity_hash: Set(artifact.pipeline_identity_hash),
+        input_hash: Set(artifact.input_hash),
+        provider_id: Set(artifact.provider_id),
+        model: Set(artifact.model),
+        dimension: Set(dimension),
+        normalized: Set(artifact.normalized),
+        vector_bytes: Set(vector_bytes),
+        created_at: Set(now),
+        last_used_at: Set(now),
+    };
+    Ok(PreparedEmbeddingArtifact {
+        id,
+        model,
+        identity,
+    })
+}
 
-    find_embedding_artifact_by_id(db, artifact_id.as_str())
+pub(crate) async fn insert_embedding_artifact_if_absent<C: ConnectionTrait>(
+    db: &C,
+    artifact: PreparedEmbeddingArtifact,
+) -> Result<thread_episodic_embedding_artifacts::Model> {
+    let PreparedEmbeddingArtifact {
+        id,
+        model,
+        identity,
+    } = artifact;
+    thread_episodic_embedding_artifacts::Entity::insert(model)
+        .on_conflict(
+            OnConflict::column(thread_episodic_embedding_artifacts::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .try_insert()
+        .exec(db)
+        .await
+        .context("failed to insert thread episodic embedding artifact")?;
+    let row = find_embedding_artifact_by_id(db, &id)
         .await?
-        .context("thread episodic embedding artifact missing after insert")
+        .context("thread episodic embedding artifact missing after insert")?;
+    anyhow::ensure!(
+        (
+            &row.workspace_id,
+            &row.pipeline_identity_hash,
+            &row.input_hash,
+            &row.provider_id,
+            &row.model,
+            row.dimension,
+            row.normalized
+        ) == (
+            &identity.0,
+            &identity.1,
+            &identity.2,
+            &identity.3,
+            &identity.4,
+            identity.5,
+            identity.6
+        ),
+        "embedding artifact identity conflict"
+    );
+    Ok(row)
 }
 
 pub async fn touch_embedding_artifact<C: ConnectionTrait>(
@@ -917,125 +851,6 @@ pub async fn find_item_by_source_identity<C: ConnectionTrait>(
                 "failed to find thread episodic item `{workspace_id}/{thread_id}/{turn_id}/{item_id}`"
             )
         })
-}
-
-pub async fn find_capsule_by_id<C: ConnectionTrait>(
-    db: &C,
-    capsule_id: &str,
-) -> Result<Option<thread_episodic_capsules::Model>> {
-    thread_episodic_capsules::Entity::find_by_id(capsule_id.to_owned())
-        .one(db)
-        .await
-        .with_context(|| format!("failed to find thread episodic capsule `{capsule_id}`"))
-}
-
-pub async fn list_capsules_for_thread<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-    thread_id: &str,
-    limit: u64,
-) -> Result<Vec<thread_episodic_capsules::Model>> {
-    thread_episodic_capsules::Entity::find()
-        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread_episodic_capsules::Column::ThreadId.eq(thread_id.to_owned()))
-        .order_by_asc(thread_episodic_capsules::Column::SegmentIndex)
-        .limit(limit)
-        .all(db)
-        .await
-        .with_context(|| {
-            format!("failed to list thread episodic capsules for thread `{thread_id}`")
-        })
-}
-
-pub async fn list_workspace_capsules<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-    limit: u64,
-) -> Result<Vec<thread_episodic_capsules::Model>> {
-    thread_episodic_capsules::Entity::find()
-        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(
-            thread_episodic_capsules::Column::ThreadId
-                .eq(THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID.to_owned()),
-        )
-        .order_by_asc(thread_episodic_capsules::Column::SegmentIndex)
-        .limit(limit)
-        .all(db)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to list workspace thread episodic capsules for workspace `{workspace_id}`"
-            )
-        })
-}
-
-pub async fn list_all_capsules<C: ConnectionTrait>(
-    db: &C,
-) -> Result<Vec<thread_episodic_capsules::Model>> {
-    thread_episodic_capsules::Entity::find()
-        .order_by_asc(thread_episodic_capsules::Column::WorkspaceId)
-        .order_by_asc(thread_episodic_capsules::Column::ThreadId)
-        .order_by_asc(thread_episodic_capsules::Column::SegmentIndex)
-        .all(db)
-        .await
-        .context("failed to list thread episodic capsules")
-}
-
-pub async fn list_all_capsules_for_workspace<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-) -> Result<Vec<thread_episodic_capsules::Model>> {
-    thread_episodic_capsules::Entity::find()
-        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .order_by_asc(thread_episodic_capsules::Column::ThreadId)
-        .order_by_asc(thread_episodic_capsules::Column::SegmentIndex)
-        .all(db)
-        .await
-        .with_context(|| {
-            format!("failed to list thread episodic capsules for workspace `{workspace_id}`")
-        })
-}
-
-/// Read the complete catalog in bounded quanta, releasing the reader between pages.
-pub async fn list_capsules_for_workspace_after<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-    after: Option<&str>,
-    limit: u64,
-) -> Result<Vec<thread_episodic_capsules::Model>> {
-    let mut query = thread_episodic_capsules::Entity::find()
-        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()));
-    if let Some(after) = after {
-        query = query.filter(thread_episodic_capsules::Column::Id.gt(after.to_owned()));
-    }
-    query
-        .order_by_asc(thread_episodic_capsules::Column::Id)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("failed to page thread episodic index catalog")
-}
-
-pub async fn delete_all_capsules<C: ConnectionTrait>(db: &C) -> Result<u64> {
-    let result = thread_episodic_capsules::Entity::delete_many()
-        .exec(db)
-        .await
-        .context("failed to delete thread episodic capsule rows")?;
-    Ok(result.rows_affected)
-}
-
-pub async fn delete_capsules_for_workspace<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-) -> Result<u64> {
-    let result = thread_episodic_capsules::Entity::delete_many()
-        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .exec(db)
-        .await
-        .with_context(|| {
-            format!("failed to delete thread episodic capsule rows for workspace `{workspace_id}`")
-        })?;
-    Ok(result.rows_affected)
 }
 
 pub async fn delete_all_items<C: ConnectionTrait>(db: &C) -> Result<u64> {
@@ -1426,7 +1241,7 @@ pub async fn list_refill_indexable_items_for_workspace<C: ConnectionTrait>(
 }
 
 fn saturating_i64_from_usize(value: usize) -> i64 {
-    value.min(i64::MAX as usize) as i64
+    std::cmp::min(value, i64::MAX as usize) as i64
 }
 
 pub async fn count_incomplete_index_jobs<C: ConnectionTrait>(db: &C) -> Result<u64> {
@@ -1514,131 +1329,6 @@ pub async fn count_canceled_index_jobs_for_workspace<C: ConnectionTrait>(
         })
 }
 
-pub async fn transition_capsule_write_state<C: ConnectionTrait>(
-    db: &C,
-    capsule_id: &str,
-    from_state: ThreadEpisodicCapsuleWriteState,
-    to_state: ThreadEpisodicCapsuleWriteState,
-    now: DateTimeWithTimeZone,
-) -> Result<Option<thread_episodic_capsules::Model>> {
-    thread_episodic_capsules::Entity::update_many()
-        .col_expr(
-            thread_episodic_capsules::Column::WriteState,
-            Expr::value(capsule_write_state_to_db(to_state)),
-        )
-        .col_expr(
-            thread_episodic_capsules::Column::UpdatedAt,
-            Expr::value(now),
-        )
-        .filter(thread_episodic_capsules::Column::Id.eq(capsule_id.to_owned()))
-        .filter(
-            thread_episodic_capsules::Column::WriteState.eq(capsule_write_state_to_db(from_state)),
-        )
-        .exec(db)
-        .await
-        .with_context(|| format!("failed to transition thread episodic capsule `{capsule_id}`"))?;
-
-    thread_episodic_capsules::Entity::find_by_id(capsule_id.to_owned())
-        .one(db)
-        .await
-        .with_context(|| {
-            format!("failed to reload transitioned thread episodic capsule `{capsule_id}`")
-        })
-}
-
-pub async fn update_capsule_capacity_metadata<C: ConnectionTrait>(
-    db: &C,
-    capsule_id: &str,
-    update: ThreadEpisodicCapsuleCapacityUpdate,
-    now: DateTimeWithTimeZone,
-) -> Result<Option<thread_episodic_capsules::Model>> {
-    let mut query = thread_episodic_capsules::Entity::update_many()
-        .col_expr(
-            thread_episodic_capsules::Column::CapacityBytes,
-            Expr::value(update.capacity_bytes),
-        )
-        .col_expr(
-            thread_episodic_capsules::Column::SizeBytes,
-            Expr::value(update.size_bytes),
-        )
-        .col_expr(
-            thread_episodic_capsules::Column::UtilizationPercent,
-            Expr::value(update.utilization_percent),
-        )
-        .col_expr(
-            thread_episodic_capsules::Column::LastCapacityCheckAt,
-            Expr::value(now),
-        )
-        .col_expr(
-            thread_episodic_capsules::Column::NearCapacityAt,
-            Expr::value(update.near_capacity_at),
-        )
-        .col_expr(
-            thread_episodic_capsules::Column::CapacityExceededAt,
-            Expr::value(update.capacity_exceeded_at),
-        )
-        .col_expr(
-            thread_episodic_capsules::Column::LastError,
-            Expr::value(update.last_error),
-        )
-        .col_expr(
-            thread_episodic_capsules::Column::UpdatedAt,
-            Expr::value(now),
-        );
-    if let Some(active_frame_count) = update.active_frame_count {
-        query = query.col_expr(
-            thread_episodic_capsules::Column::ActiveFrameCount,
-            Expr::value(active_frame_count),
-        );
-    }
-    query
-        .filter(thread_episodic_capsules::Column::Id.eq(capsule_id.to_owned()))
-        .exec(db)
-        .await
-        .with_context(|| {
-            format!("failed to update thread episodic capsule capacity `{capsule_id}`")
-        })?;
-
-    thread_episodic_capsules::Entity::find_by_id(capsule_id.to_owned())
-        .one(db)
-        .await
-        .with_context(|| {
-            format!("failed to reload capacity-updated thread episodic capsule `{capsule_id}`")
-        })
-}
-
-pub async fn update_capsule_metadata_json<C: ConnectionTrait>(
-    db: &C,
-    capsule_id: &str,
-    metadata_json: String,
-    now: DateTimeWithTimeZone,
-) -> Result<Option<thread_episodic_capsules::Model>> {
-    thread_episodic_capsules::Entity::update_many()
-        .col_expr(
-            thread_episodic_capsules::Column::MetadataJson,
-            Expr::value(metadata_json),
-        )
-        .col_expr(
-            thread_episodic_capsules::Column::UpdatedAt,
-            Expr::value(now),
-        )
-        .filter(thread_episodic_capsules::Column::Id.eq(capsule_id.to_owned()))
-        .exec(db)
-        .await
-        .with_context(|| {
-            format!("failed to update thread episodic capsule metadata `{capsule_id}`")
-        })?;
-
-    thread_episodic_capsules::Entity::find_by_id(capsule_id.to_owned())
-        .one(db)
-        .await
-        .with_context(|| {
-            format!("failed to reload metadata-updated thread episodic capsule `{capsule_id}`")
-        })
-}
-
-/// Bounded preliminary source snapshot. No connection or stream escapes this call.
-/// Each page is independent; callers must still revalidate selected sources.
 pub async fn search_source_batch<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
@@ -1910,16 +1600,8 @@ pub async fn insert_index_job_if_absent<C: ConnectionTrait>(
         workspace_id: Set(job.workspace_id),
         thread_id: Set(job.thread_id),
         index_item_id: Set(job.index_item_id.clone()),
-        capsule_id: Set(job.capsule_id),
-        capsule_ref: Set(job.capsule_ref),
-        segment_index: Set(job.segment_index),
-        frame_uri: Set(job.frame_uri),
         status: Set(index_job_status_to_db(job.status).to_owned()),
-        graph_enrichment_state: Set(
-            graph_enrichment_state_to_db(job.graph_enrichment_state).to_owned()
-        ),
         attempt_count: Set(0),
-        capacity_error_count: Set(0),
         last_attempt_latency_ms: Set(None),
         next_run_at: Set(job.next_run_at),
         last_error: Set(job.last_error),
@@ -1995,7 +1677,7 @@ pub async fn upsert_thread_directory_entry<C: ConnectionTrait>(
             thread_created_at: Set(record.thread_created_at),
             thread_updated_at: Set(record.thread_updated_at),
             last_indexed_at: Set(record.last_indexed_at),
-            indexed_item_count: Set(record.indexed_item_count),
+            indexed_item_count: Set(0),
             task_affinity_json: Set(record.task_affinity_json),
             project_affinity_json: Set(record.project_affinity_json),
             visibility: Set(thread_directory_visibility_to_db(record.visibility).to_owned()),
@@ -2016,7 +1698,6 @@ pub async fn upsert_thread_directory_entry<C: ConnectionTrait>(
             thread_episodic_thread_directory::Column::ThreadCreatedAt,
             thread_episodic_thread_directory::Column::ThreadUpdatedAt,
             thread_episodic_thread_directory::Column::LastIndexedAt,
-            thread_episodic_thread_directory::Column::IndexedItemCount,
             thread_episodic_thread_directory::Column::TaskAffinityJson,
             thread_episodic_thread_directory::Column::ProjectAffinityJson,
             thread_episodic_thread_directory::Column::Visibility,
@@ -2138,12 +1819,13 @@ pub async fn count_active_items_for_thread<C: ConnectionTrait>(
             thread_episodic_items::Column::Status
                 .eq(item_status_to_db(ThreadEpisodicItemStatus::Active)),
         )
+        .filter(thread_episodic_items::Column::SearchText.is_not_null())
         .count(db)
         .await
         .with_context(|| {
             format!("failed to count active thread episodic items for thread `{thread_id}`")
         })?;
-    Ok(count.min(i64::MAX as u64) as i64)
+    Ok(std::cmp::min(count, i64::MAX as u64) as i64)
 }
 
 pub async fn list_failed_or_stale_index_jobs_for_thread<C: ConnectionTrait>(
@@ -2458,28 +2140,10 @@ pub(crate) async fn confirm_index_job_if_indexed<C: ConnectionTrait>(
         && crate::thread_episodic::item_status_from_db(item.status.as_str())?
             == ThreadEpisodicItemStatus::Active
     {
-        if let (
-            Some(capsule_id),
-            Some(capsule_ref),
-            Some(segment_index),
-            Some(_frame_id),
-            Some(frame_uri),
-            Some(_indexed_at),
-        ) = (
-            item.capsule_id,
-            item.capsule_ref,
-            item.segment_index,
-            item.frame_id,
-            item.frame_uri,
-            item.indexed_at,
-        ) {
+        if item.search_text.is_some() && item.indexed_at.is_some() {
             let workspace_id = row.workspace_id.clone();
             let thread_id = row.thread_id.clone();
             let mut active = row.clone().into_active_model();
-            active.capsule_id = Set(Some(capsule_id));
-            active.capsule_ref = Set(Some(capsule_ref));
-            active.segment_index = Set(Some(segment_index));
-            active.frame_uri = Set(Some(frame_uri));
             active.status =
                 Set(index_job_status_to_db(ThreadEpisodicIndexJobStatus::Completed).to_owned());
             active.last_error = Set(None);
@@ -2602,10 +2266,6 @@ pub async fn mark_index_job_completed<C: ConnectionTrait>(
         return Ok(None);
     }
     let mut active = row.into_active_model();
-    active.capsule_id = Set(Some(update.capsule_id));
-    active.capsule_ref = Set(Some(update.capsule_ref));
-    active.segment_index = Set(Some(update.segment_index));
-    active.frame_uri = Set(Some(update.frame_uri));
     active.status = Set(index_job_status_to_db(ThreadEpisodicIndexJobStatus::Completed).to_owned());
     active.last_error = Set(None);
     active.last_attempt_latency_ms = Set(update.last_attempt_latency_ms);
@@ -2641,9 +2301,6 @@ pub async fn mark_index_job_failed<C: ConnectionTrait>(
         .unwrap_or(now));
     active.last_error = Set(update.last_error);
     active.last_attempt_latency_ms = Set(update.last_attempt_latency_ms);
-    if update.capacity_error {
-        active.capacity_error_count = Set(active_capacity_error_count(&active).saturating_add(1));
-    }
     active.updated_at = Set(now);
     active.completed_at = Set(if update.retryable { None } else { Some(now) });
     let row = active
@@ -2690,16 +2347,33 @@ pub async fn complete_index_attempt<C: ConnectionTrait>(
     if !index_attempt_source_matches(db, &item, expected_source_payload).await? {
         return Ok(ThreadEpisodicIndexAttemptOutcome::SourceChanged);
     }
+    if let Some(guard) = &item_update.projection_guard {
+        let reset = crate::find_projection_meta(db, &guard.reset_checkpoint_key).await?;
+        let projection = crate::find_projection_meta(db, &guard.projection_key).await?;
+        if reset.is_some_and(|row| row.status == crate::PROJECTION_META_STATUS_PENDING)
+            || !projection.is_some_and(|row| {
+                row.projection_version == guard.projection_version
+                    && row.projection_config_hash.as_deref() == Some(guard.config_hash.as_str())
+                    && row.projection_config_json.as_deref() == Some(guard.config_json.as_str())
+                    && matches!(
+                        row.status.as_str(),
+                        crate::PROJECTION_META_STATUS_COMPLETE
+                            | crate::PROJECTION_META_STATUS_BACKFILLING
+                            | crate::PROJECTION_META_STATUS_FAILED
+                    )
+                    && (row.status == crate::PROJECTION_META_STATUS_COMPLETE
+                        || row.backfill_started_at.is_some())
+            })
+        {
+            return Ok(ThreadEpisodicIndexAttemptOutcome::ProjectionChanged);
+        }
+    }
     let item_status = crate::thread_episodic::item_status_from_db(item.status.as_str())?;
     let workspace_id = item.workspace_id.clone();
     let thread_id = item.thread_id.clone();
     let already_persisted = item_status == ThreadEpisodicItemStatus::Active
-        && item.capsule_id.as_deref() == Some(item_update.capsule_id.as_str())
-        && item.capsule_ref.as_deref() == Some(item_update.capsule_ref.as_str())
-        && item.segment_index == Some(item_update.segment_index)
-        && item.frame_id == Some(item_update.frame_id)
-        && item.frame_uri.as_deref() == Some(item_update.frame_uri.as_str())
-        && item.embedding_artifact_id == item_update.embedding_artifact_id;
+        && item.embedding_artifact_id == item_update.embedding_artifact_id
+        && item.search_text.as_deref() == Some(item_update.search_text.as_str());
     if !already_persisted
         && !matches!(
             item_status,
@@ -2727,7 +2401,6 @@ async fn refresh_thread_directory_after_index<C: ConnectionTrait>(
     thread_id: &str,
     now: DateTimeWithTimeZone,
 ) -> Result<()> {
-    let indexed_item_count = count_active_items_for_thread(db, workspace_id, thread_id).await?;
     let existing = find_thread_directory_entry(db, workspace_id, thread_id).await?;
     upsert_thread_directory_entry(
         db,
@@ -2743,7 +2416,8 @@ async fn refresh_thread_directory_after_index<C: ConnectionTrait>(
                 .and_then(|row| row.thread_created_at.to_owned()),
             thread_updated_at: Some(now),
             last_indexed_at: Some(now),
-            indexed_item_count,
+            // The SQLite projection maintains this derived count atomically.
+            indexed_item_count: existing.as_ref().map_or(0, |row| row.indexed_item_count),
             task_affinity_json: existing
                 .as_ref()
                 .and_then(|row| row.task_affinity_json.clone()),
@@ -2941,6 +2615,7 @@ async fn index_attempt_source_matches<C: ConnectionTrait>(
     if turn::Entity::find()
         .filter(turn::Column::ThreadId.eq(item.thread_id.clone()))
         .filter(turn::Column::Id.eq(item.turn_id.clone()))
+        .filter(turn::Column::MessageDeletedAt.is_null())
         .one(db)
         .await?
         .is_none()
@@ -3146,12 +2821,8 @@ pub async fn mark_item_indexed<C: ConnectionTrait>(
     }
     let mut active = row.into_active_model();
     active.status = Set(item_status_to_db(ThreadEpisodicItemStatus::Active).to_owned());
-    active.capsule_id = Set(Some(update.capsule_id));
-    active.capsule_ref = Set(Some(update.capsule_ref));
-    active.segment_index = Set(Some(update.segment_index));
-    active.frame_id = Set(Some(update.frame_id));
-    active.frame_uri = Set(Some(update.frame_uri));
     active.embedding_artifact_id = Set(update.embedding_artifact_id);
+    active.search_text = Set(Some(update.search_text));
     active.indexed_at = Set(Some(now));
     active.updated_at = Set(now);
     let row = active.update(db).await.with_context(|| {
@@ -3239,6 +2910,8 @@ async fn mark_item_rows_deleted<C: ConnectionTrait>(
         } else {
             let mut active = row.into_active_model();
             active.status = Set(item_status_to_db(ThreadEpisodicItemStatus::Deleted).to_owned());
+            active.search_text = Set(None);
+            active.embedding_artifact_id = Set(None);
             active.deleted_at = Set(Some(now));
             active.updated_at = Set(now);
             active.update(db).await.with_context(|| {
@@ -3270,13 +2943,6 @@ async fn mark_item_rows_deleted<C: ConnectionTrait>(
 
 fn active_attempt_count(active: &thread_episodic_index_jobs::ActiveModel) -> i64 {
     match &active.attempt_count {
-        sea_orm::ActiveValue::Set(value) | sea_orm::ActiveValue::Unchanged(value) => *value,
-        sea_orm::ActiveValue::NotSet => 0,
-    }
-}
-
-fn active_capacity_error_count(active: &thread_episodic_index_jobs::ActiveModel) -> i64 {
-    match &active.capacity_error_count {
         sea_orm::ActiveValue::Set(value) | sea_orm::ActiveValue::Unchanged(value) => *value,
         sea_orm::ActiveValue::NotSet => 0,
     }
@@ -3376,6 +3042,14 @@ pub async fn apply_exclusion_to_item<C: ConnectionTrait>(
         .col_expr(
             thread_episodic_items::Column::Status,
             Expr::value(item_status_to_db(ThreadEpisodicItemStatus::Excluded)),
+        )
+        .col_expr(
+            thread_episodic_items::Column::SearchText,
+            Expr::value(None::<String>),
+        )
+        .col_expr(
+            thread_episodic_items::Column::EmbeddingArtifactId,
+            Expr::value(None::<String>),
         )
         .col_expr(thread_episodic_items::Column::UpdatedAt, Expr::value(now))
         .filter(thread_episodic_items::Column::WorkspaceId.eq(item.workspace_id))
@@ -3642,6 +3316,78 @@ pub(crate) async fn list_projection_reset_sources<C: ConnectionTrait>(
         .context("failed to page episodic projection reset sources")
 }
 
+/// Reader-side discovery: grouping may visit the workspace backlog and must
+/// finish before the reset owner reserves writer capacity.
+pub(crate) async fn find_duplicate_projection_source<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<Option<String>> {
+    use sea_orm::sea_query::ExprTrait;
+    Ok(thread_episodic_index_jobs::Entity::find()
+        .select_only()
+        .column(thread_episodic_index_jobs::Column::IndexItemId)
+        .filter(thread_episodic_index_jobs::Column::WorkspaceId.eq(workspace_id))
+        .group_by(thread_episodic_index_jobs::Column::IndexItemId)
+        .having(
+            Expr::col(thread_episodic_index_jobs::Column::Id)
+                .count()
+                .gt(1),
+        )
+        .order_by_asc(thread_episodic_index_jobs::Column::IndexItemId)
+        .limit(1)
+        .into_tuple::<String>()
+        .one(db)
+        .await?)
+}
+
+/// Drain at most 64 redundant identities for the discovered source. The caller
+/// holds the reset-checkpoint transaction; fresh peer reads preserve any durable
+/// user outcome even if discovery became stale before writer admission.
+pub(crate) async fn prune_duplicate_projection_jobs<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    source: &str,
+) -> Result<u64> {
+    let peers = || {
+        thread_episodic_index_jobs::Entity::find()
+            .filter(thread_episodic_index_jobs::Column::WorkspaceId.eq(workspace_id))
+            .filter(thread_episodic_index_jobs::Column::IndexItemId.eq(source))
+    };
+    let user_outcome = peers()
+        .filter(thread_episodic_index_jobs::Column::LastError.is_in([
+            THREAD_EPISODIC_USER_DELETED_ERROR,
+            THREAD_EPISODIC_USER_EXCLUDED_ERROR,
+        ]))
+        .order_by_asc(thread_episodic_index_jobs::Column::Id)
+        .one(db)
+        .await?;
+    let keeper = match user_outcome {
+        Some(job) => job,
+        None => match peers()
+            .order_by_asc(thread_episodic_index_jobs::Column::Id)
+            .one(db)
+            .await?
+        {
+            Some(job) => job,
+            None => return Ok(0),
+        },
+    };
+    let victims = peers()
+        .select_only()
+        .column(thread_episodic_index_jobs::Column::Id)
+        .filter(thread_episodic_index_jobs::Column::Id.ne(keeper.id))
+        .order_by_asc(thread_episodic_index_jobs::Column::Id)
+        .limit(64)
+        .into_tuple::<String>()
+        .all(db)
+        .await?;
+    Ok(thread_episodic_index_jobs::Entity::delete_many()
+        .filter(thread_episodic_index_jobs::Column::Id.is_in(victims))
+        .exec(db)
+        .await?
+        .rows_affected)
+}
+
 /// A true projection replacement gets a fresh job identity and retry budget.
 /// The caller commits these short write sets with its source cursor. Ordinary
 /// retries do not call this helper. User outcomes and Superseded remain closed.
@@ -3699,13 +3445,9 @@ pub(crate) async fn reset_projection_batch<C: ConnectionTrait>(
         if !superseded {
             item.status = Set(item_status_to_db(ThreadEpisodicItemStatus::PendingIndex).to_owned());
         }
-        item.capsule_id = Set(None);
-        item.capsule_ref = Set(None);
-        item.segment_index = Set(None);
-        item.frame_id = Set(None);
-        item.frame_uri = Set(None);
         item.indexed_at = Set(None);
         item.embedding_artifact_id = Set(None);
+        item.search_text = Set(None);
         item.updated_at = Set(now);
         item.update(db).await?;
         if let Some(old_job) = old_job {
@@ -3723,16 +3465,11 @@ pub(crate) async fn reset_projection_batch<C: ConnectionTrait>(
                 workspace_id: workspace_id.to_owned(),
                 thread_id,
                 index_item_id: item_id,
-                capsule_id: None,
-                capsule_ref: None,
-                segment_index: None,
-                frame_uri: None,
                 status: if superseded {
                     ThreadEpisodicIndexJobStatus::Canceled
                 } else {
                     ThreadEpisodicIndexJobStatus::Queued
                 },
-                graph_enrichment_state: crate::ThreadEpisodicGraphEnrichmentState::NotSupported,
                 next_run_at: now,
                 last_error: superseded
                     .then(|| THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR.to_owned()),

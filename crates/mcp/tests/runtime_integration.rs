@@ -28,22 +28,37 @@ struct HttpSessionFixture {
 }
 impl HttpSessionFixture {
     fn new() -> Arc<Self> {
-        Arc::new(Self { deleting: Default::default(), release_delete: Default::default(), deleted: false.into(), sse_opened: Default::default(), sse_seen: false.into() })
+        Arc::new(Self {
+            deleting: Default::default(),
+            release_delete: Default::default(),
+            deleted: false.into(),
+            sse_opened: Default::default(),
+            sse_seen: false.into(),
+        })
     }
 }
-async fn startup_http(State(state): State<Arc<HttpSessionFixture>>, Json(body): Json<Value>) -> Response {
+async fn startup_http(
+    State(state): State<Arc<HttpSessionFixture>>,
+    Json(body): Json<Value>,
+) -> Response {
     let method = body["method"].as_str().unwrap_or_default();
     if method == "tools/list" && !state.sse_seen.load(std::sync::atomic::Ordering::SeqCst) {
         state.sse_opened.notified().await;
     }
     let initializing = method == "initialize";
     let mut response = mcp_http_handler(Json(body)).await;
-    if initializing { response.headers_mut().insert("mcp-session-id", "startup-fixture".parse().unwrap()); }
+    if initializing {
+        response
+            .headers_mut()
+            .insert("mcp-session-id", "startup-fixture".parse().unwrap());
+    }
     response
 }
 async fn startup_sse(State(state): State<Arc<HttpSessionFixture>>) -> impl IntoResponse {
     let opened = futures_util::stream::once(async move {
-        state.sse_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .sse_seen
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         state.sse_opened.notify_one();
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().comment("open"))
     });
@@ -52,7 +67,9 @@ async fn startup_sse(State(state): State<Arc<HttpSessionFixture>>) -> impl IntoR
 async fn startup_delete(State(state): State<Arc<HttpSessionFixture>>) -> StatusCode {
     state.deleting.notify_one();
     state.release_delete.notified().await;
-    state.deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .deleted
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     StatusCode::NO_CONTENT
 }
 
@@ -71,60 +88,85 @@ impl McpSecretResolver for EmptyResolver {
 
 #[tokio::test]
 async fn stdio_server_reaches_ready_and_cleans_up() -> anyhow::Result<()> {
+    pioneer_observability::init_tracing_to_stderr(false);
     let Some(python) = python_command() else {
         eprintln!("skipping stdio MCP integration test: python3 not found");
         return Ok(());
     };
     let script = write_stdio_fixture()?;
-    let installation = installation(McpTransportConfig::Stdio {
-        command: python.clone(),
-        args: vec![script.display().to_string()],
-        cwd: None,
-        env: BTreeMap::new(),
-        startup_timeout_ms: 5_000,
-        tool_timeout_ms: 5_000,
-    });
+    // Exercise transport-driven shutdown and an already exited native child.
+    for exit_after_call in [false, true] {
+        let installation = installation(McpTransportConfig::Stdio {
+            command: python.clone(),
+            args: vec![script.display().to_string()],
+            cwd: None,
+            env: BTreeMap::from([(
+                "MCP_EXIT_AFTER_CALL".into(),
+                pioneer_mcp::McpConfigValue::Literal {
+                    value: if exit_after_call { "1" } else { "0" }.into(),
+                },
+            )]),
+            startup_timeout_ms: 5_000,
+            tool_timeout_ms: 5_000,
+        });
 
-    let connector = RmcpRuntimeConnector::new();
-    let mut session = connector
-        .connect(
-            installation,
-            "stdio-fixture".to_owned(),
-            Arc::new(EmptyResolver),
-            unix_timestamp_secs(),
-        )
-        .await?;
+        let connector = RmcpRuntimeConnector::new();
+        let mut session = connector
+            .connect(
+                installation,
+                "stdio-fixture".to_owned(),
+                Arc::new(EmptyResolver),
+                unix_timestamp_secs(),
+            )
+            .await?;
 
-    assert_eq!(session.initial_catalog().tools_count(), 2);
-    let result = session
-        .call_tool(
-            "send",
-            json!({"message":"hello"}),
-            McpInvocationBudget::default(),
-            Duration::from_secs(5),
-            CancellationToken::new(),
-        )
-        .await?;
-    assert!(!result.is_error);
-    assert_eq!(
-        result
-            .structured_content
-            .as_ref()
-            .and_then(|value| value.get("ok")),
-        Some(&json!(true))
-    );
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown_result()).await??;
-    session.shutdown_result().await?;
+        assert_eq!(session.initial_catalog().tools_count(), 2);
+        let result = session
+            .call_tool(
+                "send",
+                json!({"message":"hello"}),
+                McpInvocationBudget::default(),
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await?;
+        assert!(!result.is_error);
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("ok")),
+            Some(&json!(true))
+        );
+        tokio::time::timeout(Duration::from_secs(5), session.shutdown_result()).await??;
+        session.shutdown_result().await?;
+    }
     for exit in ["initialize", "catalog"] {
         let installation = crate::installation(McpTransportConfig::Stdio {
-            command: python.clone(), args: vec![script.display().to_string()], cwd: None,
-            env: BTreeMap::from([("MCP_STARTUP_EXIT".into(), pioneer_mcp::McpConfigValue::Literal { value: exit.into() })]),
-            startup_timeout_ms: 5_000, tool_timeout_ms: 1_000,
+            command: python.clone(),
+            args: vec![script.display().to_string()],
+            cwd: None,
+            env: BTreeMap::from([(
+                "MCP_STARTUP_EXIT".into(),
+                pioneer_mcp::McpConfigValue::Literal { value: exit.into() },
+            )]),
+            startup_timeout_ms: 5_000,
+            tool_timeout_ms: 1_000,
         });
-        let result = tokio::time::timeout(Duration::from_secs(5),
-            RmcpRuntimeConnector::new().connect(installation, "startup-error".into(),
-                Arc::new(EmptyResolver), unix_timestamp_secs())).await?;
-        assert!(result.is_err(), "completed native cleanup preserves the startup error");
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            RmcpRuntimeConnector::new().connect(
+                installation,
+                "startup-error".into(),
+                Arc::new(EmptyResolver),
+                unix_timestamp_secs(),
+            ),
+        )
+        .await?;
+        assert!(
+            result.is_err(),
+            "completed native cleanup preserves the startup error"
+        );
     }
     let _ = fs::remove_file(script);
     Ok(())
@@ -137,7 +179,12 @@ async fn streamable_http_server_reaches_ready() -> anyhow::Result<()> {
     let state = HttpSessionFixture::new();
     let serving = state.clone();
     let server = tokio::spawn(async move {
-        let app = axum::Router::new().route("/mcp", post(startup_http).get(startup_sse).delete(startup_delete)).with_state(serving);
+        let app = axum::Router::new()
+            .route(
+                "/mcp",
+                post(startup_http).get(startup_sse).delete(startup_delete),
+            )
+            .with_state(serving);
         let _ = axum::serve(listener, app).await;
     });
     let installation = installation(McpTransportConfig::StreamableHttp {
@@ -742,7 +789,7 @@ for line in sys.stdin:
             "structuredContent":{"ok":True,"tool":name},
             "isError":False
         }})
-        if directory:
+        if os.environ.get("MCP_EXIT_AFTER_CALL") == "1":
             break
     else:
         send({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"method not found"}})

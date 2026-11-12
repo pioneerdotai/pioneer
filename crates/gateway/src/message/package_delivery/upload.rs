@@ -761,7 +761,8 @@ impl MessageProcessor {
                 Ok(materialized)
             }
             Err(error) => {
-                self.abort_invalid_materialized_upload(owner, &materialized, request_id).await;
+                self.abort_invalid_materialized_upload(owner, &materialized, request_id)
+                    .await;
                 Err(invalid_materialized_archive_error(request_id, error))
             }
         }
@@ -792,7 +793,8 @@ impl MessageProcessor {
         }) {
             Ok(validated) => Ok((materialized, validated)),
             Err(error) => {
-                self.abort_invalid_materialized_upload(owner, &materialized, request_id).await;
+                self.abort_invalid_materialized_upload(owner, &materialized, request_id)
+                    .await;
                 Err(invalid_materialized_archive_error(request_id, error))
             }
         }
@@ -809,9 +811,14 @@ impl MessageProcessor {
     ) -> Result<MaterializedSkillSource, JsonRpcErrorResponse> {
         let upload = {
             let _guard = self.acquire_skill_upload_lock(upload_id).await;
-            let upload = self.revalidate_finalized_upload_locked(owner, workspace_id, upload_id, request_id).await?;
+            let upload = self
+                .revalidate_finalized_upload_locked(owner, workspace_id, upload_id, request_id)
+                .await?;
             if upload.purpose != purpose {
-                return Err(invalid_materialized_archive_error(request_id, anyhow!("upload purpose mismatch")));
+                return Err(invalid_materialized_archive_error(
+                    request_id,
+                    anyhow!("upload purpose mismatch"),
+                ));
             }
             upload
         };
@@ -826,7 +833,8 @@ impl MessageProcessor {
             .materialized_root
             .join(pioneer_protocol::generate_id(21));
         let limits = context.clone();
-        let cleanup = super::TemporaryDirectory::new().map_err(|error| invalid_materialized_archive_error(request_id, error))?;
+        let cleanup = super::TemporaryDirectory::new()
+            .map_err(|error| invalid_materialized_archive_error(request_id, error))?;
         let prepared = crate::message::package_delivery::prepare_cancellable(move |cancellation| {
             let mut source = MaterializedSkillSource {
                 source_dir: cleanup_root.clone(),
@@ -864,7 +872,8 @@ impl MessageProcessor {
         let materialized = match prepared {
             Ok(source) => source,
             Err((source, error)) => {
-                self.abort_invalid_materialized_upload(owner, &source, request_id).await;
+                self.abort_invalid_materialized_upload(owner, &source, request_id)
+                    .await;
                 return Err(invalid_materialized_archive_error(request_id, error));
             }
         };
@@ -873,16 +882,30 @@ impl MessageProcessor {
         Ok(materialized)
     }
 
-    async fn abort_invalid_materialized_upload(&self, owner: &AuthenticatedTransferOwner, materialized: &MaterializedSkillSource, request_id: &RequestId) {
+    async fn abort_invalid_materialized_upload(
+        &self,
+        owner: &AuthenticatedTransferOwner,
+        materialized: &MaterializedSkillSource,
+        request_id: &RequestId,
+    ) {
         let _guard = self
             .acquire_skill_upload_lock(materialized.upload.upload_id.as_str())
             .await;
         // A failed preparation is not authority to abort a different transfer.
-        let Ok(current) = self.revalidate_finalized_upload_locked(
-            owner, &materialized.upload.workspace_id, &materialized.upload.upload_id,
-            request_id,
-        ).await else { return; };
-        if current.purpose != materialized.upload.purpose { return; }
+        let Ok(current) = self
+            .revalidate_finalized_upload_locked(
+                owner,
+                &materialized.upload.workspace_id,
+                &materialized.upload.upload_id,
+                request_id,
+            )
+            .await
+        else {
+            return;
+        };
+        if current.purpose != materialized.upload.purpose {
+            return;
+        }
         let now = now_timestamp_secs();
         match self
             .crud_store
@@ -1673,15 +1696,22 @@ fn extract_archive_with_purpose(
 }
 // A hard decoded-stream limit includes hidden GNU/PAX extension bodies,
 // padding and skips performed by tar before it returns logical entries.
-struct DecodedBudget<R> { inner: R, remaining: usize }
+struct DecodedBudget<R> {
+    inner: R,
+    remaining: usize,
+}
 impl<R: io::Read> io::Read for DecodedBudget<R> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        if bytes.is_empty() { return Ok(0); }
+        if bytes.is_empty() {
+            return Ok(0);
+        }
         if self.remaining == 0 {
             let mut probe = [0];
             return match self.inner.read(&mut probe)? {
                 0 => Ok(0),
-                _ => Err(io::Error::other("archive decoded size exceeds configured limit")),
+                _ => Err(io::Error::other(
+                    "archive decoded size exceeds configured limit",
+                )),
             };
         }
         let length = bytes.len().min(self.remaining);
@@ -1707,12 +1737,18 @@ fn extract_archive_with_purpose_cancellable(
     // Payload budget + 512-byte header/padding per admitted logical entry +
     // 1 MiB shared metadata/trailer allowance. Ordinary archives retain their
     // payload limits; pathological hidden extension bodies are bounded too.
-    let decoded_budget = max_entries.checked_mul(1024)
+    let decoded_budget = max_entries
+        .checked_mul(1024)
         .and_then(|overhead| max_uncompressed_bytes.checked_add(overhead))
         .and_then(|bytes| bytes.checked_add(1024 * 1024))
         .context("archive decoded budget overflow")?;
     let mut archive = Archive::new(super::preparation_reader(
-        DecodedBudget { inner: decoder, remaining: decoded_budget }, cancellation));
+        DecodedBudget {
+            inner: decoder,
+            remaining: decoded_budget,
+        },
+        cancellation,
+    ));
     let mut root_name: Option<std::ffi::OsString> = None;
     let mut seen_paths = HashSet::new();
     let mut total_uncompressed = 0usize;
@@ -1776,7 +1812,6 @@ fn extract_archive_with_purpose_cancellable(
             continue;
         }
 
-
         if !entry_type.is_file() {
             bail!(
                 "archive contains unsupported entry `{}`",
@@ -1784,8 +1819,7 @@ fn extract_archive_with_purpose_cancellable(
             );
         }
 
-        let file_size =
-            usize::try_from(entry.size()).unwrap_or(usize::MAX);
+        let file_size = usize::try_from(entry.size()).unwrap_or(usize::MAX);
         if file_size > max_file_bytes {
             bail!(
                 "archive file `{}` exceeds per-file limit",
@@ -2011,13 +2045,18 @@ mod tests {
     fn package_archives_reject_links_for_both_purposes() {
         let case = TempCase::new("package-links");
         let archive = case.path.join("plugin.tar.gz");
-        write_archive(&archive, &[
-            TestEntry::dir("plugin"),
-            TestEntry::file("plugin/plugin.json", br#"{"name":"mixed"}"#),
-            TestEntry::file("plugin/bin/helper", b"data"),
-            TestEntry::symlink("plugin/bin/contained", "helper"),
-        ]);
-        let error = extract_archive_with_purpose(&archive, &case.materialized, 4096, 16, 1024, true).unwrap_err();
+        write_archive(
+            &archive,
+            &[
+                TestEntry::dir("plugin"),
+                TestEntry::file("plugin/plugin.json", br#"{"name":"mixed"}"#),
+                TestEntry::file("plugin/bin/helper", b"data"),
+                TestEntry::symlink("plugin/bin/contained", "helper"),
+            ],
+        );
+        let error =
+            extract_archive_with_purpose(&archive, &case.materialized, 4096, 16, 1024, true)
+                .unwrap_err();
         assert!(error.to_string().contains("unsupported entry"));
         let native = TempCase::new("native-links");
         assert!(extract_archive_secure(&archive, &native.materialized, 4096, 16, 1024).is_err());
@@ -2264,38 +2303,74 @@ mod tests {
         // differ from the following regular header, as accepted by tar itself.
         let write_raw = |path: &Path, entries: &[(Header, Vec<u8>)]| {
             use std::io::Write;
-            let mut gzip = GzBuilder::new().mtime(0).write(fs::File::create(path).unwrap(), Compression::default());
+            let mut gzip = GzBuilder::new()
+                .mtime(0)
+                .write(fs::File::create(path).unwrap(), Compression::default());
             for (header, body) in entries {
                 gzip.write_all(header.as_bytes()).unwrap();
                 gzip.write_all(body).unwrap();
-                gzip.write_all(&vec![0; (512 - body.len() % 512) % 512]).unwrap();
+                gzip.write_all(&vec![0; (512 - body.len() % 512) % 512])
+                    .unwrap();
             }
             gzip.write_all(&[0; 1024]).unwrap();
             gzip.finish().unwrap();
         };
         let header = |path: &str, kind: u8, length: u64| {
-            let mut h = if kind == b'L' { Header::new_gnu() } else { Header::new_ustar() }; h.set_path(path).unwrap();
-            h.set_entry_type(EntryType::new(kind)); h.set_size(length); h.set_mode(0o644); h.set_cksum(); h
+            let mut h = if kind == b'L' {
+                Header::new_gnu()
+            } else {
+                Header::new_ustar()
+            };
+            h.set_path(path).unwrap();
+            h.set_entry_type(EntryType::new(kind));
+            h.set_size(length);
+            h.set_mode(0o644);
+            h.set_cksum();
+            h
         };
         let pax = TempCase::new("pax-effective-size");
         let path = pax.path.join("pax.tar.gz");
-        write_raw(&path, &[(header("PaxHeaders/data", b'x', 12), b"12 size=128\n".to_vec()),
-            (header("skill/data", b'0', 1), vec![b'x'; 128])]);
+        write_raw(
+            &path,
+            &[
+                (
+                    header("PaxHeaders/data", b'x', 12),
+                    b"12 size=128\n".to_vec(),
+                ),
+                (header("skill/data", b'0', 1), vec![b'x'; 128]),
+            ],
+        );
         let error = extract_archive_secure(&path, &pax.materialized, 1024, 8, 8).unwrap_err();
         assert!(format!("{error:#}").contains("per-file limit"));
         let valid = TempCase::new("pax-effective-positive");
         assert!(extract_archive_secure(&path, &valid.materialized, 1024, 8, 128).is_ok());
-        assert_eq!(fs::read(valid.materialized.join("skill/data")).unwrap().len(), 128);
+        assert_eq!(
+            fs::read(valid.materialized.join("skill/data"))
+                .unwrap()
+                .len(),
+            128
+        );
 
         let extension = TempCase::new("hidden-extension");
         let path = extension.path.join("extension.tar.gz");
         let long_name = [b"skill/".as_slice(), &[b'a'; 100], &[0]].concat();
-        write_raw(&path, &[(header("././@LongLink", b'L', long_name.len() as u64), long_name),
-            (header("skill/data", b'0', 3), b"abc".to_vec())]);
+        write_raw(
+            &path,
+            &[
+                (
+                    header("././@LongLink", b'L', long_name.len() as u64),
+                    long_name,
+                ),
+                (header("skill/data", b'0', 3), b"abc".to_vec()),
+            ],
+        );
         let positive = TempCase::new("extension-positive");
         assert!(extract_archive_secure(&path, &positive.materialized, 64, 4, 8).is_ok());
         let hidden = vec![b'a'; 2 * 1024 * 1024];
-        write_raw(&path, &[(header("././@LongLink", b'L', hidden.len() as u64), hidden)]);
+        write_raw(
+            &path,
+            &[(header("././@LongLink", b'L', hidden.len() as u64), hidden)],
+        );
         let error = extract_archive_secure(&path, &extension.materialized, 64, 4, 8).unwrap_err();
         assert!(format!("{error:#}").contains("decoded size exceeds"));
     }

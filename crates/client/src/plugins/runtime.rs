@@ -227,25 +227,50 @@ impl PluginController {
         parent: &str,
         epoch: (u64, u64, Option<u64>),
     ) -> bool {
-        let Some((generation, Some(revision))) = self.recovery_reads.get(&(workspace.into(), parent.into())) else { return false; };
-        self.requests.get(&(workspace.into(), String::new())).is_some_and(|request| {
-            matches!(request.status(), crate::request_state::RequestStatus::Ready { .. })
-        }) && self.publications.get(workspace).is_some_and(|publication| {
-            publication.loaded && publication.error.is_none() && publication.connection_id == epoch.2
-                && publication.plugins.iter().any(|item| item.id == parent && item.revision == *revision)
-                && publication.operations.get(parent).is_some_and(|operation| {
-                    operation.generation == *generation && operation.origin.epoch() == epoch
-                        && operation.uncertain && !operation.busy
-                })
-        })
+        let Some((generation, Some(revision))) =
+            self.recovery_reads.get(&(workspace.into(), parent.into()))
+        else {
+            return false;
+        };
+        self.requests
+            .get(&(workspace.into(), String::new()))
+            .is_some_and(|request| {
+                matches!(
+                    request.status(),
+                    crate::request_state::RequestStatus::Ready { .. }
+                )
+            })
+            && self.publications.get(workspace).is_some_and(|publication| {
+                publication.loaded
+                    && publication.error.is_none()
+                    && publication.connection_id == epoch.2
+                    && publication
+                        .plugins
+                        .iter()
+                        .any(|item| item.id == parent && item.revision == *revision)
+                    && publication.operations.get(parent).is_some_and(|operation| {
+                        operation.generation == *generation
+                            && operation.origin.epoch() == epoch
+                            && operation.uncertain
+                            && !operation.busy
+                    })
+            })
     }
     fn reconcile_recovery_reads(&mut self, workspace: &str) {
-        let Some(publication) = self.publications.get(workspace) else { return; };
+        let Some(publication) = self.publications.get(workspace) else {
+            return;
+        };
         for ((ws, parent), (generation, revision)) in &mut self.recovery_reads {
-            if ws == workspace && publication.operations.get(parent).is_some_and(|operation| {
-                operation.generation == *generation && operation.uncertain && !operation.busy
-            }) {
-                *revision = publication.plugins.iter().find(|item| &item.id == parent).map(|item| item.revision);
+            if ws == workspace
+                && publication.operations.get(parent).is_some_and(|operation| {
+                    operation.generation == *generation && operation.uncertain && !operation.busy
+                })
+            {
+                *revision = publication
+                    .plugins
+                    .iter()
+                    .find(|item| &item.id == parent)
+                    .map(|item| item.revision);
             }
         }
     }
@@ -367,7 +392,11 @@ impl ClientCore {
             .insert(identity, plugin_id.map(str::to_owned));
         owner.suspended.remove(workspace);
         let dirty = owner.refresh_requested.remove(workspace);
-        let pending = owner.pending_observations.remove(workspace).filter(|(_, origin)| origin.epoch() == epoch).map(|(id, _)| id);
+        let pending = owner
+            .pending_observations
+            .remove(workspace)
+            .filter(|(_, origin)| origin.epoch() == epoch)
+            .map(|(id, _)| id);
         let refresh = dirty
             || pending.is_some()
             || owner.publications.get(workspace).is_none_or(|p| {
@@ -541,7 +570,14 @@ impl ClientCore {
         intent: PluginIntent,
     ) -> ClientTransition {
         let managing = self.plugins_management_allowed(workspace);
-        self.plugin_intent_bound(workspace, intent, managing, Some(plugin_id.to_owned()), None, false)
+        self.plugin_intent_bound(
+            workspace,
+            intent,
+            managing,
+            Some(plugin_id.to_owned()),
+            None,
+            false,
+        )
     }
     pub fn plugin_intent(&self, workspace: &str, intent: PluginIntent) -> ClientTransition {
         let managing = self.plugins_management_allowed(workspace);
@@ -565,7 +601,10 @@ impl ClientCore {
         continuing_read: bool,
     ) -> ClientTransition {
         // I -> P matches identity publication. No RPC runs in this guard.
-        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
+        let _identity = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
         let managing = managing && self.plugins_management_allowed(workspace);
         if matches!(&intent, PluginIntent::Observe { .. })
             && (self.is_stopped() || self.committed_capability_snapshot(workspace).is_none())
@@ -574,21 +613,37 @@ impl ClientCore {
         }
         let epoch = self.provider_runtime_epoch();
         let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
-        if origin.is_some_and(|origin| origin.epoch() != epoch || self.provider_runtime_epoch() != epoch) {
+        if origin
+            .is_some_and(|origin| origin.epoch() != epoch || self.provider_runtime_epoch() != epoch)
+        {
             return self.reject_intent();
         }
         // Updates must retain an upload-owner operation for confirmation and
         // exact fingerprint recovery. A raw Update bypasses that ownership.
-        if matches!(&intent, PluginIntent::Mutate { intent: PluginManagementIntent::Update { .. }, .. }) {
+        if matches!(
+            &intent,
+            PluginIntent::Mutate {
+                intent: PluginManagementIntent::Update { .. },
+                ..
+            }
+        ) {
             return self.reject_intent();
         }
         let observing = matches!(intent, PluginIntent::Observe { .. });
         if continuing_read {
-            let PluginIntent::Observe { plugin_id } = &intent else { return self.reject_intent(); };
+            let PluginIntent::Observe { plugin_id } = &intent else {
+                return self.reject_intent();
+            };
             // Recheck under the same lock as admission: Close/auth/release or a
             // newer selection may have superseded the captured continuation.
-            if owner.pending_observations.get(workspace).is_some_and(|(pending, captured)| pending != plugin_id || captured.epoch() != epoch)
-                || (!owner.pending_observations.contains_key(workspace) && !owner.refresh_requested.contains(workspace))
+            if owner
+                .pending_observations
+                .get(workspace)
+                .is_some_and(|(pending, captured)| {
+                    pending != plugin_id || captured.epoch() != epoch
+                })
+                || (!owner.pending_observations.contains_key(workspace)
+                    && !owner.refresh_requested.contains(workspace))
             {
                 return self.reject_intent();
             }
@@ -598,9 +653,10 @@ impl ClientCore {
         }
         if observing && owner.publications.get(workspace).is_some_and(|p| p.busy) {
             if let PluginIntent::Observe { plugin_id } = &intent {
-                owner
-                    .pending_observations
-                    .insert(workspace.into(), (plugin_id.clone(), PluginCommandOrigin::from_epoch(epoch)));
+                owner.pending_observations.insert(
+                    workspace.into(),
+                    (plugin_id.clone(), PluginCommandOrigin::from_epoch(epoch)),
+                );
             }
             let p = owner.publications.get_mut(workspace).unwrap();
             return self.publish_plugins(workspace, p);
@@ -630,7 +686,10 @@ impl ClientCore {
             return out;
         }
         let empty_publication = PluginPublication::default();
-        let p = owner.publications.get(workspace).unwrap_or(&empty_publication);
+        let p = owner
+            .publications
+            .get(workspace)
+            .unwrap_or(&empty_publication);
         let operation_parent = match &intent {
             PluginIntent::Install { .. } => None,
             PluginIntent::Observe { plugin_id } => plugin_id.clone(),
@@ -640,7 +699,10 @@ impl ClientCore {
             }),
             _ => parent.clone().or_else(|| p.plugin_id.clone()),
         };
-        if parent.as_ref().is_some_and(|parent| operation_parent.as_ref() != Some(parent)) {
+        if parent
+            .as_ref()
+            .is_some_and(|parent| operation_parent.as_ref() != Some(parent))
+        {
             return self.reject_intent();
         }
         let key = if observing {
@@ -699,11 +761,21 @@ impl ClientCore {
             }
             _ => {}
         }
-        let ordinary_parent_command = matches!(&intent, PluginIntent::SetEnabled { .. } | PluginIntent::Mutate {
-            intent: PluginManagementIntent::Continue | PluginManagementIntent::Retry { .. }
-                | PluginManagementIntent::Remove { .. }, ..
-        });
-        let uncertain_origin = p.operations.get(&key).filter(|operation| operation.uncertain).map(|operation| operation.origin.epoch());
+        let ordinary_parent_command = matches!(
+            &intent,
+            PluginIntent::SetEnabled { .. }
+                | PluginIntent::Mutate {
+                    intent: PluginManagementIntent::Continue
+                        | PluginManagementIntent::Retry { .. }
+                        | PluginManagementIntent::Remove { .. },
+                    ..
+                }
+        );
+        let uncertain_origin = p
+            .operations
+            .get(&key)
+            .filter(|operation| operation.uncertain)
+            .map(|operation| operation.origin.epoch());
         if let Some(uncertain_origin) = uncertain_origin {
             // Check before replacing generation, read evidence or the outcome.
             // Observe never acknowledges the old mutation; it only permits an
@@ -718,7 +790,10 @@ impl ClientCore {
                 _ => None,
             };
             let recovery = owner.parent_recovery_available(workspace, &key, epoch)
-                && owner.recovery_reads.get(&(workspace.into(), key.clone())).is_some_and(|(_, revision)| *revision == recovery_revision);
+                && owner
+                    .recovery_reads
+                    .get(&(workspace.into(), key.clone()))
+                    .is_some_and(|(_, revision)| *revision == recovery_revision);
             let upload_retry = uncertain_origin == epoch
                 && !owner.recovery_reads.contains_key(&(workspace.into(), key.clone()))
                 && match &intent {
@@ -740,7 +815,11 @@ impl ClientCore {
         }
         // Reserve only a prospective request locally. Failed enqueue exposes
         // no generation; a worker cannot pass its fence until this lock releases.
-        let mut request = owner.requests.get(&(workspace.into(), key.clone())).cloned().unwrap_or_default();
+        let mut request = owner
+            .requests
+            .get(&(workspace.into(), key.clone()))
+            .cloned()
+            .unwrap_or_default();
         let generation = request.start().get();
         let observed_parent = match &intent {
             PluginIntent::Observe { plugin_id } => Some(plugin_id.clone()),
@@ -775,7 +854,10 @@ impl ClientCore {
         .is_err()
         {
             if let Some(plugin_id) = observed_parent {
-                owner.pending_observations.insert(workspace.into(), (plugin_id, PluginCommandOrigin::from_epoch(epoch)));
+                owner.pending_observations.insert(
+                    workspace.into(),
+                    (plugin_id, PluginCommandOrigin::from_epoch(epoch)),
+                );
             }
             return self.reject_intent();
         }
@@ -785,10 +867,16 @@ impl ClientCore {
             owner.pending_observations.remove(workspace);
             owner.refresh_requested.remove(workspace);
         }
-        owner.requests.insert((workspace.into(), key.clone()), request);
-        owner.recovery_reads.remove(&(workspace.into(), key.clone()));
+        owner
+            .requests
+            .insert((workspace.into(), key.clone()), request);
+        owner
+            .recovery_reads
+            .remove(&(workspace.into(), key.clone()));
         if ordinary_parent_command {
-            owner.recovery_reads.insert((workspace.into(), key.clone()), (generation, None));
+            owner
+                .recovery_reads
+                .insert((workspace.into(), key.clone()), (generation, None));
         }
         let p = owner.publications.entry(workspace.into()).or_default();
         // Observing during a mutation cannot supersede its completion. A screen
@@ -961,8 +1049,13 @@ impl ClientCore {
     }
     pub(crate) fn invalidate_plugin_publications(&self) {
         let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
-        let workspaces = owner.publications.keys().chain(owner.pending_observations.keys())
-            .chain(owner.consumers.keys()).cloned().collect::<std::collections::BTreeSet<_>>();
+        let workspaces = owner
+            .publications
+            .keys()
+            .chain(owner.pending_observations.keys())
+            .chain(owner.consumers.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         // Old authorization must not carry a deferred selected read forward.
         owner.pending_observations.clear();
         owner.recovery_reads.clear();
@@ -1033,7 +1126,11 @@ impl ClientCore {
         }
         owner.suspended.remove(workspace_id);
         let dirty = owner.refresh_requested.remove(workspace_id);
-        let pending = owner.pending_observations.remove(workspace_id).filter(|(_, origin)| origin.epoch() == epoch).map(|(id, _)| id);
+        let pending = owner
+            .pending_observations
+            .remove(workspace_id)
+            .filter(|(_, origin)| origin.epoch() == epoch)
+            .map(|(id, _)| id);
         let publication = owner.publications.get(workspace_id);
         let refresh = dirty
             || pending.is_some()
@@ -1048,26 +1145,51 @@ impl ClientCore {
     // retain their obligation; a full queue guarantees another receiver turn.
     fn resume_pending_plugin_reads(&self) {
         let origin = self.plugin_command_origin();
-        if self.is_stopped() || origin.connection_id.is_none() { return; }
+        if self.is_stopped() || origin.connection_id.is_none() {
+            return;
+        }
         let reads = {
             let owner = self.plugins_controller.lock().expect("plugins poisoned");
-            owner.pending_observations.keys().chain(owner.refresh_requested.iter())
+            owner
+                .pending_observations
+                .keys()
+                .chain(owner.refresh_requested.iter())
                 .filter(|workspace| !owner.suspended.contains(*workspace))
                 .filter_map(|workspace| {
                     let publication = owner.publications.get(workspace);
-                    if owner.pending_observations.get(workspace).is_some_and(|(_, captured)| captured != &origin)
-                        || publication.is_some_and(|p| p.busy) { return None; }
+                    if owner
+                        .pending_observations
+                        .get(workspace)
+                        .is_some_and(|(_, captured)| captured != &origin)
+                        || publication.is_some_and(|p| p.busy)
+                    {
+                        return None;
+                    }
                     // Auth invalidation's refresh marker is resumed explicitly
                     // after identity commit, never by an old receiver turn.
                     if !owner.pending_observations.contains_key(workspace)
-                        && publication.is_none_or(|p| p.connection_id != origin.connection_id) { return None; }
-                    let selected = owner.pending_observations.get(workspace).map(|(selected, _)| selected.clone())
+                        && publication.is_none_or(|p| p.connection_id != origin.connection_id)
+                    {
+                        return None;
+                    }
+                    let selected = owner
+                        .pending_observations
+                        .get(workspace)
+                        .map(|(selected, _)| selected.clone())
                         .unwrap_or_else(|| publication.and_then(|p| p.plugin_id.clone()));
                     Some((workspace.clone(), selected))
-                }).collect::<BTreeMap<_, _>>()
+                })
+                .collect::<BTreeMap<_, _>>()
         };
         for (workspace, plugin_id) in reads {
-            self.plugin_intent_bound(&workspace, PluginIntent::Observe { plugin_id }, false, None, Some(&origin), true);
+            self.plugin_intent_bound(
+                &workspace,
+                PluginIntent::Observe { plugin_id },
+                false,
+                None,
+                Some(&origin),
+                true,
+            );
         }
     }
     fn settle_plugin_work(
@@ -1078,29 +1200,58 @@ impl ClientCore {
         catalog_read_succeeded: Option<bool>,
     ) {
         let succeeded = result.is_ok();
-        let _identity=self.identity_authorization.lock().expect("identity owner poisoned");
-        if !self.plugin_work_current(work){return;}
-        let mut owner=self.plugins_controller.lock().expect("plugins poisoned");
-        if !owner.requests.get(&(work.workspace.clone(),work.key.clone())).is_some_and(|r| matches!(r.status(),crate::request_state::RequestStatus::Pending { generation,.. } if generation.get()==work.generation)){return;}
-        let retained_parents=owner.consumers.get(&work.workspace).into_iter().flat_map(|c|c.values()).filter_map(|id|id.clone()).collect::<std::collections::BTreeSet<_>>();
-        let observed = matches!(&work.intent, PluginIntent::Observe { .. }) && result.is_ok();
-        if let Some(p)=owner.publications.get_mut(&work.workspace){
-            p.settle_operation(&work.key,result,mutation_dispatched,catalog_read_succeeded,&retained_parents);
+        let _identity = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if !self.plugin_work_current(work) {
+            return;
         }
-        if observed { owner.reconcile_recovery_reads(&work.workspace); }
-        if let Some(p)=owner.publications.get_mut(&work.workspace){ self.publish_plugins(&work.workspace,p); }
-        if let Some(request)=owner.requests.get_mut(&(work.workspace.clone(),work.key.clone())) {
-            let generation=crate::core::ClientGeneration::new(work.generation);
+        let mut owner = self.plugins_controller.lock().expect("plugins poisoned");
+        if !owner.requests.get(&(work.workspace.clone(),work.key.clone())).is_some_and(|r| matches!(r.status(),crate::request_state::RequestStatus::Pending { generation,.. } if generation.get()==work.generation)){return;}
+        let retained_parents = owner
+            .consumers
+            .get(&work.workspace)
+            .into_iter()
+            .flat_map(|c| c.values())
+            .filter_map(|id| id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let observed = matches!(&work.intent, PluginIntent::Observe { .. }) && result.is_ok();
+        if let Some(p) = owner.publications.get_mut(&work.workspace) {
+            p.settle_operation(
+                &work.key,
+                result,
+                mutation_dispatched,
+                catalog_read_succeeded,
+                &retained_parents,
+            );
+        }
+        if observed {
+            owner.reconcile_recovery_reads(&work.workspace);
+        }
+        if let Some(p) = owner.publications.get_mut(&work.workspace) {
+            self.publish_plugins(&work.workspace, p);
+        }
+        if let Some(request) = owner
+            .requests
+            .get_mut(&(work.workspace.clone(), work.key.clone()))
+        {
+            let generation = crate::core::ClientGeneration::new(work.generation);
             if succeeded {
                 request.succeed(generation, ());
             } else {
-                request.fail(generation, crate::request_state::ClientRequestFailure::new("plugin_request_failed").unwrap());
+                request.fail(
+                    generation,
+                    crate::request_state::ClientRequestFailure::new("plugin_request_failed")
+                        .unwrap(),
+                );
             }
         }
         drop(owner);
     }
     pub(crate) fn start_plugins_controller(self: &Arc<Self>) {
-        let (sender, receiver) = mpsc::sync_channel::<Work>(crate::request_state::CONTROLLER_QUEUE_CAPACITY);
+        let (sender, receiver) =
+            mpsc::sync_channel::<Work>(crate::request_state::CONTROLLER_QUEUE_CAPACITY);
         let queue_observer = pioneer_observability::queues::QueueObserver::new(
             pioneer_observability::queues::QueueKind::ClientController,
             Some(crate::request_state::CONTROLLER_QUEUE_CAPACITY),
@@ -1253,8 +1404,10 @@ pub(crate) mod tests {
     // a live Plugins consumer without exposing private work or production hooks.
     pub(crate) fn watch_plugin_reads(core: &Arc<ClientCore>) -> (PluginDemand, impl Fn()) {
         let mut ready = PluginPublication {
-            loaded: true, connection_id: core.plugin_command_origin().connection_id,
-            plugins: vec![], ..Default::default()
+            loaded: true,
+            connection_id: core.plugin_command_origin().connection_id,
+            plugins: vec![],
+            ..Default::default()
         };
         core.publish_plugins("workspace", &mut ready);
         let (sender, receiver) = mpsc::sync_channel(4);
@@ -1267,7 +1420,10 @@ pub(crate) mod tests {
         let core = core.clone();
         (demand, move || {
             core.resume_pending_plugin_reads();
-            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)), "standalone completion requested a Plugins read");
+            assert!(
+                matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "standalone completion requested a Plugins read"
+            );
         })
     }
     #[test]
@@ -1280,10 +1436,17 @@ pub(crate) mod tests {
         assert!(core.plugin_work_current(&before));
         let old_epoch = before.epoch;
         let old_generation = before.generation;
-        let scope = ClientScope::Plugins { workspace_id: "workspace".into() };
+        let scope = ClientScope::Plugins {
+            workspace_id: "workspace".into(),
+        };
         let subscription = core.subscribe(scope.clone(), std::num::NonZeroUsize::new(64).unwrap());
-        let original = (*core.snapshot(&ClientScope::Administration { workspace_id: None }).unwrap()
-            .snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
+        let original = (*core
+            .snapshot(&ClientScope::Administration { workspace_id: None })
+            .unwrap()
+            .snapshot()
+            .payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>()
+            .unwrap())
+        .clone();
         let mut denied = original.clone();
         denied.authorization_change_sequence += 1;
         denied.capabilities.clear_epoch();
@@ -1292,13 +1455,22 @@ pub(crate) mod tests {
         let publisher_core = core.clone();
         let publisher = std::thread::spawn(move || {
             crate::core::IDENTITY_BEFORE_COMMIT.with_borrow_mut(|hook| {
-                *hook = Some(Box::new(move || { paused.send(()).unwrap(); committed.recv_timeout(std::time::Duration::from_secs(5)).unwrap(); }));
+                *hook = Some(Box::new(move || {
+                    paused.send(()).unwrap();
+                    committed
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }));
             });
             let _identity = publisher_core.identity_authorization.lock().unwrap();
-            publisher_core.publish_identity_authorization(&denied,
-                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate);
+            publisher_core.publish_identity_authorization(
+                &denied,
+                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
+            );
         });
-        pause.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        pause
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         let (attempted, attempt) = mpsc::channel();
         let (claimed, claim) = mpsc::channel();
         let (respond, response_ready) = mpsc::channel();
@@ -1308,22 +1480,46 @@ pub(crate) mod tests {
             reader_core.resume_plugin_publications();
             reader_core.plugin_intent("workspace", PluginIntent::Observe { plugin_id: None });
             let next = requests.try_recv().ok();
-            claimed.send(next.as_ref().map(|work| (work.epoch, work.generation))).unwrap();
-            response_ready.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            let result = |work: &Work| Ok(PluginPublication {
-                loaded: true, connection_id: work.epoch.2, generation: work.generation,
-                plugins: vec![PluginItem { id: "P".repeat(21), name: "response".into(), version: None,
-                    description: None,
-            metadata: Default::default(), enabled: true, allow_implicit_invocation: false, state: "installed".into(), revision: 1,
-                    status: "installed".into(), components: vec![], diagnostics: vec![] }],
-                ..Default::default()
-            });
+            claimed
+                .send(next.as_ref().map(|work| (work.epoch, work.generation)))
+                .unwrap();
+            response_ready
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let result = |work: &Work| {
+                Ok(PluginPublication {
+                    loaded: true,
+                    connection_id: work.epoch.2,
+                    generation: work.generation,
+                    plugins: vec![PluginItem {
+                        id: "P".repeat(21),
+                        name: "response".into(),
+                        version: None,
+                        description: None,
+                        metadata: Default::default(),
+                        enabled: true,
+                        allow_implicit_invocation: false,
+                        state: "installed".into(),
+                        revision: 1,
+                        status: "installed".into(),
+                        components: vec![],
+                        diagnostics: vec![],
+                    }],
+                    ..Default::default()
+                })
+            };
             reader_core.settle_plugin_work(&before, result(&before), false, Some(true));
-            if let Some(work) = next { reader_core.settle_plugin_work(&work, result(&work), false, Some(true)); }
+            if let Some(work) = next {
+                reader_core.settle_plugin_work(&work, result(&work), false, Some(true));
+            }
             requests
         });
-        attempt.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        if let Ok(Some((epoch, generation))) = claim.recv_timeout(std::time::Duration::from_millis(100)) {
+        attempt
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        if let Ok(Some((epoch, generation))) =
+            claim.recv_timeout(std::time::Duration::from_millis(100))
+        {
             assert_eq!(epoch, old_epoch);
             assert_ne!(generation, old_generation);
         }
@@ -1332,31 +1528,57 @@ pub(crate) mod tests {
         while subscription.try_next().is_some() {}
         respond.send(()).unwrap();
         let requests = reader.join().unwrap();
-        let current = || core.snapshot(&scope).and_then(|p| p.snapshot().payload::<PluginPublication>());
+        let current = || {
+            core.snapshot(&scope)
+                .and_then(|p| p.snapshot().payload::<PluginPublication>())
+        };
         assert!(current().is_none_or(|p| p.plugins.is_empty()));
         while let Some(event) = subscription.try_next() {
             if let ClientSubscriptionEvent::Publication { publication, .. } = event {
-                if let Some(value) = publication.snapshot().payload::<PluginPublication>() { assert!(value.plugins.is_empty()); }
+                if let Some(value) = publication.snapshot().payload::<PluginPublication>() {
+                    assert!(value.plugins.is_empty());
+                }
             }
         }
         let mut granted = original;
         granted.authorization_change_sequence += 2;
         {
             let _identity = core.identity_authorization.lock().unwrap();
-            core.publish_identity_authorization(&granted,
-                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate);
+            core.publish_identity_authorization(
+                &granted,
+                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
+            );
         }
         core.resume_plugin_publications();
-        let fresh = requests.try_recv().expect("current regrant must produce a fresh parent Observe");
+        let fresh = requests
+            .try_recv()
+            .expect("current regrant must produce a fresh parent Observe");
         assert_ne!(fresh.epoch, old_epoch);
-        core.settle_plugin_work(&fresh, Ok(PluginPublication {
-            loaded: true, connection_id: fresh.epoch.2, generation: fresh.generation,
-            plugins: vec![PluginItem { id: "F".repeat(21), name: "fresh".into(), version: None,
-                description: None,
-            metadata: Default::default(), enabled: true, allow_implicit_invocation: false, state: "installed".into(), revision: 1,
-                status: "installed".into(), components: vec![], diagnostics: vec![] }],
-            ..Default::default()
-        }), false, Some(true));
+        core.settle_plugin_work(
+            &fresh,
+            Ok(PluginPublication {
+                loaded: true,
+                connection_id: fresh.epoch.2,
+                generation: fresh.generation,
+                plugins: vec![PluginItem {
+                    id: "F".repeat(21),
+                    name: "fresh".into(),
+                    version: None,
+                    description: None,
+                    metadata: Default::default(),
+                    enabled: true,
+                    allow_implicit_invocation: false,
+                    state: "installed".into(),
+                    revision: 1,
+                    status: "installed".into(),
+                    components: vec![],
+                    diagnostics: vec![],
+                }],
+                ..Default::default()
+            }),
+            false,
+            Some(true),
+        );
         assert_eq!(current().unwrap().plugins[0].name, "fresh");
     }
     // NOT_RUN / NOT_COMPILED. No transport/app/fixture is started.
@@ -1366,7 +1588,8 @@ pub(crate) mod tests {
         let params = PluginIntent::SetEnabled {
             plugin_id: "P".repeat(21),
             expected_revision: 7,
-            enabled: false, allow_implicit_invocation: None,
+            enabled: false,
+            allow_implicit_invocation: None,
         };
         assert_eq!(
             core.plugin_intent("workspace", params.clone()).outcome(),
@@ -1518,7 +1741,8 @@ pub(crate) mod tests {
             version: None,
             description: None,
             metadata: Default::default(),
-            enabled: true, allow_implicit_invocation: false,
+            enabled: true,
+            allow_implicit_invocation: false,
             state: "installed".into(),
             revision: 3,
             status: "installed".into(),
@@ -1534,8 +1758,13 @@ pub(crate) mod tests {
             ..Default::default()
         };
         ready.plugins[0].components.push(PluginComponentItem {
-            kind: "mcp".into(), member_key: "member".into(), status: "installed".into(),
-            diagnostic: None, skill_id: None, mcp_installation_id: Some("member".into()), runtime_status: None,
+            kind: "mcp".into(),
+            member_key: "member".into(),
+            status: "installed".into(),
+            diagnostic: None,
+            skill_id: None,
+            mcp_installation_id: Some("member".into()),
+            runtime_status: None,
         });
         ready.details = Some(ready.plugins[0].clone());
         core.publish_plugins("workspace", &mut ready);
@@ -1598,19 +1827,53 @@ pub(crate) mod tests {
         drop(same_request);
         drop(resumed);
         assert!(core.plugin_work_current(&request));
-        let native_event = |server: &str| GatewayNotification::McpOAuthChanged(McpOAuthNotification {
-            workspace_id: "workspace".into(), server_id: server.into(), name: server.into(),
-            scope_kind: McpScopeKind::Workspace, flow_id: None, state: McpOAuthState::Authorized,
-            authorization_url: None, diagnostic: None,
-        });
+        let native_event = |server: &str| {
+            GatewayNotification::McpOAuthChanged(McpOAuthNotification {
+                workspace_id: "workspace".into(),
+                server_id: server.into(),
+                name: server.into(),
+                scope_kind: McpScopeKind::Workspace,
+                flow_id: None,
+                state: McpOAuthState::Authorized,
+                authorization_url: None,
+                diagnostic: None,
+            })
+        };
         core.refresh_plugins_for_native_notification(&native_event("standalone"));
-        assert!(!core.plugins_controller.lock().unwrap().refresh_requested.contains("workspace"));
+        assert!(
+            !core
+                .plugins_controller
+                .lock()
+                .unwrap()
+                .refresh_requested
+                .contains("workspace")
+        );
         core.refresh_plugins_for_native_notification(&native_event("member"));
-        assert!(core.plugins_controller.lock().unwrap().refresh_requested.contains("workspace"));
+        assert!(
+            core.plugins_controller
+                .lock()
+                .unwrap()
+                .refresh_requested
+                .contains("workspace")
+        );
         {
             let mut owner = core.plugins_controller.lock().unwrap();
-            owner.publications.get_mut("workspace").unwrap().settle_operation(&request.key, Ok(ready.clone()), false, Some(true), &Default::default());
-            owner.requests.get_mut(&("workspace".into(), request.key.clone())).unwrap().succeed(crate::core::ClientGeneration::new(request.generation), ());
+            owner
+                .publications
+                .get_mut("workspace")
+                .unwrap()
+                .settle_operation(
+                    &request.key,
+                    Ok(ready.clone()),
+                    false,
+                    Some(true),
+                    &Default::default(),
+                );
+            owner
+                .requests
+                .get_mut(&("workspace".into(), request.key.clone()))
+                .unwrap()
+                .succeed(crate::core::ClientGeneration::new(request.generation), ());
         }
         let owned_demand = core.acquire_plugin_demand("workspace", Some(&plugin.id));
         let owned_read = requests.try_recv().unwrap();
@@ -1622,7 +1885,10 @@ pub(crate) mod tests {
         // X has real active/queued commands while W needs its first or fresh read.
         for initial in [false, true] {
             let core = crate::catalog_test_support::client();
-            let other = PluginItem { id: "B".repeat(21), ..plugin.clone() };
+            let other = PluginItem {
+                id: "B".repeat(21),
+                ..plugin.clone()
+            };
             let mut inventory = ready.clone();
             inventory.plugins.push(other.clone());
             let (sender, receiver) = mpsc::sync_channel(1);
@@ -1630,28 +1896,53 @@ pub(crate) mod tests {
                 let mut owner = core.plugins_controller.lock().unwrap();
                 owner.sender = Some(sender);
                 owner.publications.insert("X".into(), inventory.clone());
-                if !initial { owner.publications.insert("W".into(), inventory.clone()); }
+                if !initial {
+                    owner.publications.insert("W".into(), inventory.clone());
+                }
             }
             let origin = core.plugin_command_origin();
             for (index, parent) in [&plugin, &other].into_iter().enumerate() {
-                core.submit_plugin_command("X", &parent.id, PluginIntent::SetEnabled {
-                    plugin_id: parent.id.clone(), expected_revision: parent.revision, enabled: false, allow_implicit_invocation: None,
-                }, &origin).unwrap();
+                core.submit_plugin_command(
+                    "X",
+                    &parent.id,
+                    PluginIntent::SetEnabled {
+                        plugin_id: parent.id.clone(),
+                        expected_revision: parent.revision,
+                        enabled: false,
+                        allow_implicit_invocation: None,
+                    },
+                    &origin,
+                )
+                .unwrap();
                 if index == 0 {
                     let active = receiver.try_recv().unwrap();
                     assert!(core.plugin_work_current(&active)); // X RPC is in flight.
                 }
             }
             let demand = core.acquire_plugin_demand("W", Some(&plugin.id));
-            if !initial { core.refresh_plugin_publication("W"); }
+            if !initial {
+                core.refresh_plugin_publication("W");
+            }
             for _ in 0..2 {
-                assert_eq!(core.plugin_intent("W", PluginIntent::Observe { plugin_id: Some(other.id.clone()) }).outcome(), crate::core::ClientTransitionOutcome::Rejected);
+                assert_eq!(
+                    core.plugin_intent(
+                        "W",
+                        PluginIntent::Observe {
+                            plugin_id: Some(other.id.clone())
+                        }
+                    )
+                    .outcome(),
+                    crate::core::ClientTransitionOutcome::Rejected
+                );
                 core.resume_pending_plugin_reads(); // Still Full, never drop the obligation.
             }
             {
                 let owner = core.plugins_controller.lock().unwrap();
                 assert_eq!(owner.pending_observations.len(), 1);
-                assert_eq!(owner.pending_observations["W"], (Some(other.id.clone()), origin.clone()));
+                assert_eq!(
+                    owner.pending_observations["W"],
+                    (Some(other.id.clone()), origin.clone())
+                );
                 assert!(!owner.publications.get("W").is_some_and(|p| p.busy));
             }
             let queued_x = receiver.try_recv().unwrap();
@@ -1666,7 +1957,10 @@ pub(crate) mod tests {
             assert_eq!(read.plugin_id, Some(other.id.clone()));
             assert_eq!(read.epoch, origin.epoch());
             assert!(matches!(read.intent, PluginIntent::Observe { .. }));
-            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
             let complete_read = |work: &Work| {
                 assert!(core.plugin_work_current(work));
                 let mut owner = core.plugins_controller.lock().unwrap();
@@ -1675,27 +1969,65 @@ pub(crate) mod tests {
                 observed.plugin_id = work.plugin_id.clone();
                 observed.plugins[1].revision += 1;
                 observed.connection_id = work.epoch.2;
-                publication.settle_operation(&work.key, Ok(observed), false, Some(true), &Default::default());
+                publication.settle_operation(
+                    &work.key,
+                    Ok(observed),
+                    false,
+                    Some(true),
+                    &Default::default(),
+                );
                 owner.reconcile_recovery_reads("W");
-                owner.requests.get_mut(&("W".into(), work.key.clone())).unwrap().succeed(crate::core::ClientGeneration::new(work.generation), ());
+                owner
+                    .requests
+                    .get_mut(&("W".into(), work.key.clone()))
+                    .unwrap()
+                    .succeed(crate::core::ClientGeneration::new(work.generation), ());
                 core.publish_plugins("W", owner.publications.get_mut("W").unwrap());
             };
             complete_read(&read);
             core.resume_pending_plugin_reads();
-            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
-            assert_eq!(core.plugin_details_publication("W", &other.id).unwrap().details.unwrap().revision, other.revision + 1);
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                core.plugin_details_publication("W", &other.id)
+                    .unwrap()
+                    .details
+                    .unwrap()
+                    .revision,
+                other.revision + 1
+            );
             // A newer explicitly admitted selection supersedes an older Full
             // obligation; its completion must not revive the old selection.
-            core.plugin_intent("selection-blocker", PluginIntent::Observe { plugin_id: None });
-            core.plugin_intent("W", PluginIntent::Observe { plugin_id: Some(other.id.clone()) });
+            core.plugin_intent(
+                "selection-blocker",
+                PluginIntent::Observe { plugin_id: None },
+            );
+            core.plugin_intent(
+                "W",
+                PluginIntent::Observe {
+                    plugin_id: Some(other.id.clone()),
+                },
+            );
             assert_eq!(receiver.try_recv().unwrap().workspace, "selection-blocker");
-            core.plugin_intent("W", PluginIntent::Observe { plugin_id: Some(plugin.id.clone()) });
+            core.plugin_intent(
+                "W",
+                PluginIntent::Observe {
+                    plugin_id: Some(plugin.id.clone()),
+                },
+            );
             let selected = receiver.try_recv().unwrap();
             assert_eq!(selected.plugin_id, Some(plugin.id.clone()));
             complete_read(&selected);
             core.resume_pending_plugin_reads();
-            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
-            if initial { continue; } // Lifecycle boundaries need one owner proof.
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            if initial {
+                continue;
+            } // Lifecycle boundaries need one owner proof.
 
             // A released demand suspends a retained obligation until reacquire.
             core.refresh_plugin_publication("W");
@@ -1704,45 +2036,116 @@ pub(crate) mod tests {
             drop(demand);
             complete_read(&in_flight);
             core.resume_pending_plugin_reads();
-            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
             let resumed = core.acquire_plugin_demand("W", Some(&other.id));
             let resumed_read = receiver.try_recv().unwrap();
             complete_read(&resumed_read);
             drop(resumed);
             core.plugin_intent("W", PluginIntent::Close);
-            assert_eq!(core.plugin_intent_bound("W", PluginIntent::Observe { plugin_id: Some(other.id.clone()) }, false, None, Some(&origin), true).outcome(), crate::core::ClientTransitionOutcome::Rejected);
+            assert_eq!(
+                core.plugin_intent_bound(
+                    "W",
+                    PluginIntent::Observe {
+                        plugin_id: Some(other.id.clone())
+                    },
+                    false,
+                    None,
+                    Some(&origin),
+                    true
+                )
+                .outcome(),
+                crate::core::ClientTransitionOutcome::Rejected
+            );
             core.resume_pending_plugin_reads();
-            assert!(!core.plugins_controller.lock().unwrap().publications.contains_key("W"));
-            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert!(
+                !core
+                    .plugins_controller
+                    .lock()
+                    .unwrap()
+                    .publications
+                    .contains_key("W")
+            );
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
 
             // Initial demand with no publication also survives auth invalidation;
             // old captured selection/origin cannot authorize its continuation.
             core.plugin_intent("auth-blocker", PluginIntent::Observe { plugin_id: None });
             let resumed = core.acquire_plugin_demand("W", Some(&other.id));
-            assert!(!core.plugins_controller.lock().unwrap().publications.contains_key("W"));
+            assert!(
+                !core
+                    .plugins_controller
+                    .lock()
+                    .unwrap()
+                    .publications
+                    .contains_key("W")
+            );
             let old_read = receiver.try_recv().unwrap();
             core.invalidate_plugin_publications();
-            assert!(core.plugins_controller.lock().unwrap().pending_observations.is_empty());
+            assert!(
+                core.plugins_controller
+                    .lock()
+                    .unwrap()
+                    .pending_observations
+                    .is_empty()
+            );
             crate::catalog_test_support::replace_connection(&core, 8);
             assert!(!core.plugin_work_current(&old_read));
-            assert_eq!(core.plugin_intent_bound("W", PluginIntent::Observe { plugin_id: Some(plugin.id.clone()) }, false, None, Some(&origin), true).outcome(), crate::core::ClientTransitionOutcome::Rejected);
+            assert_eq!(
+                core.plugin_intent_bound(
+                    "W",
+                    PluginIntent::Observe {
+                        plugin_id: Some(plugin.id.clone())
+                    },
+                    false,
+                    None,
+                    Some(&origin),
+                    true
+                )
+                .outcome(),
+                crate::core::ClientTransitionOutcome::Rejected
+            );
             core.resume_pending_plugin_reads();
-            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
             core.resume_plugin_publications();
             let mut fresh_w = None;
-            for _ in 0..4 { // Each dequeue releases capacity for one retained scope.
+            for _ in 0..4 {
+                // Each dequeue releases capacity for one retained scope.
                 let work = receiver.try_recv().unwrap();
-                if work.workspace == "W" { fresh_w = Some(work); break; }
+                if work.workspace == "W" {
+                    fresh_w = Some(work);
+                    break;
+                }
                 core.resume_pending_plugin_reads();
             }
             let fresh_w = fresh_w.unwrap();
             assert_eq!(fresh_w.epoch, core.plugin_command_origin().epoch());
-            assert!(fresh_w.plugin_id.is_none(), "old authorization selection was discarded");
+            assert!(
+                fresh_w.plugin_id.is_none(),
+                "old authorization selection was discarded"
+            );
             core.plugins_controller.lock().unwrap().stop();
             core.resume_pending_plugin_reads();
             assert!(!core.plugin_work_current(&fresh_w));
-            assert!(core.plugins_controller.lock().unwrap().pending_observations.is_empty());
-            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+            assert!(
+                core.plugins_controller
+                    .lock()
+                    .unwrap()
+                    .pending_observations
+                    .is_empty()
+            );
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
             drop(resumed);
         }
     }
@@ -1755,7 +2158,8 @@ pub(crate) mod tests {
             version: None,
             description: None,
             metadata: Default::default(),
-            enabled: true, allow_implicit_invocation: false,
+            enabled: true,
+            allow_implicit_invocation: false,
             state: "installed".into(),
             revision: 7,
             status: "installed".into(),
@@ -1792,7 +2196,8 @@ pub(crate) mod tests {
                 PluginIntent::SetEnabled {
                     plugin_id: a.id.clone(),
                     expected_revision: 7,
-                    enabled: false, allow_implicit_invocation: None,
+                    enabled: false,
+                    allow_implicit_invocation: None,
                 },
                 &foreign
             )
@@ -1804,10 +2209,25 @@ pub(crate) mod tests {
         let rejected_without_replacement = |intent| {
             let (before, reads, requests) = {
                 let owner = core.plugins_controller.lock().unwrap();
-                (owner.publications["workspace"].clone(), owner.recovery_reads.clone(), owner.requests.clone())
+                (
+                    owner.publications["workspace"].clone(),
+                    owner.recovery_reads.clone(),
+                    owner.requests.clone(),
+                )
             };
-            assert!(core.submit_plugin_command("workspace", &a.id, intent, &core.plugin_command_origin()).is_err());
-            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert!(
+                core.submit_plugin_command(
+                    "workspace",
+                    &a.id,
+                    intent,
+                    &core.plugin_command_origin()
+                )
+                .is_err()
+            );
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
             let owner = core.plugins_controller.lock().unwrap();
             assert_eq!(owner.publications["workspace"], before);
             assert_eq!(owner.recovery_reads, reads);
@@ -1816,8 +2236,13 @@ pub(crate) mod tests {
         // Normal valid A@7, managing origin and a live empty sender: a raw
         // Update must not become admitted work without an upload recovery owner.
         rejected_without_replacement(PluginIntent::Mutate {
-            plugin_id: a.id.clone(), expected_revision: 7,
-            intent: PluginManagementIntent::Update { upload_id: "raw-upload".into(), expected_fingerprint: "raw-fingerprint".into(), confirm_changes: true },
+            plugin_id: a.id.clone(),
+            expected_revision: 7,
+            intent: PluginManagementIntent::Update {
+                upload_id: "raw-upload".into(),
+                expected_fingerprint: "raw-fingerprint".into(),
+                confirm_changes: true,
+            },
         });
         let receipts = [&a, &b].map(|parent| {
             core.submit_plugin_command(
@@ -1826,7 +2251,8 @@ pub(crate) mod tests {
                 PluginIntent::SetEnabled {
                     plugin_id: parent.id.clone(),
                     expected_revision: 7,
-                    enabled: false, allow_implicit_invocation: None,
+                    enabled: false,
+                    allow_implicit_invocation: None,
                 },
                 &origin,
             )
@@ -1935,7 +2361,11 @@ pub(crate) mod tests {
             core.publish_plugins("workspace", &mut publication);
             let a_view = core.plugin_details_publication("workspace", &a.id).unwrap();
             let b_view = core.plugin_details_publication("workspace", &b.id).unwrap();
-            assert_eq!(a_view.operations[&a.id].result, Some(a_result.clone()), "{label}");
+            assert_eq!(
+                a_view.operations[&a.id].result,
+                Some(a_result.clone()),
+                "{label}"
+            );
             assert!(!a_view.busy && !a_view.mutation_uncertain, "{label}");
             let shared_error = if read == Some(false) {
                 Some("B failed")
@@ -2001,56 +2431,120 @@ pub(crate) mod tests {
         {
             let mut owner = core.plugins_controller.lock().unwrap();
             let publication = owner.publications.get_mut("workspace").unwrap();
-            publication.settle_operation(&first_work.key, Err(anyhow::anyhow!("lost response")), true, None, &retained);
+            publication.settle_operation(
+                &first_work.key,
+                Err(anyhow::anyhow!("lost response")),
+                true,
+                None,
+                &retained,
+            );
             let mut next = publication.clone();
-            next.operations.get_mut(&b.id).unwrap().result = Some(PluginsMutationResponse { plugin: Some(b.clone()), removed: false });
-            publication.operations.get_mut(&b.id).unwrap().result = next.operations[&b.id].result.clone();
+            next.operations.get_mut(&b.id).unwrap().result = Some(PluginsMutationResponse {
+                plugin: Some(b.clone()),
+                removed: false,
+            });
+            publication.operations.get_mut(&b.id).unwrap().result =
+                next.operations[&b.id].result.clone();
             publication.settle_operation(&second_work.key, Ok(next), true, Some(true), &retained);
-            owner.requests.get_mut(&("workspace".into(), a.id.clone())).unwrap().fail(
-                crate::core::ClientGeneration::new(first_work.generation),
-                crate::request_state::ClientRequestFailure::new("lost_response").unwrap(),
-            );
-            owner.requests.get_mut(&("workspace".into(), b.id.clone())).unwrap().succeed(
-                crate::core::ClientGeneration::new(second_work.generation), (),
-            );
+            owner
+                .requests
+                .get_mut(&("workspace".into(), a.id.clone()))
+                .unwrap()
+                .fail(
+                    crate::core::ClientGeneration::new(first_work.generation),
+                    crate::request_state::ClientRequestFailure::new("lost_response").unwrap(),
+                );
+            owner
+                .requests
+                .get_mut(&("workspace".into(), b.id.clone()))
+                .unwrap()
+                .succeed(
+                    crate::core::ClientGeneration::new(second_work.generation),
+                    (),
+                );
         }
         let set_enabled = |revision| PluginIntent::SetEnabled {
-            plugin_id: a.id.clone(), expected_revision: revision, enabled: false, allow_implicit_invocation: None,
+            plugin_id: a.id.clone(),
+            expected_revision: revision,
+            enabled: false,
+            allow_implicit_invocation: None,
         };
         assert!(!core.plugin_parent_recovery_available("workspace", &a.id));
         rejected_without_replacement(set_enabled(7));
         rejected_without_replacement(PluginIntent::Mutate {
-            plugin_id: a.id.clone(), expected_revision: 7, intent: PluginManagementIntent::Continue,
+            plugin_id: a.id.clone(),
+            expected_revision: 7,
+            intent: PluginManagementIntent::Continue,
         });
         rejected_without_replacement(PluginIntent::Mutate {
-            plugin_id: a.id.clone(), expected_revision: 7,
-            intent: PluginManagementIntent::Update { upload_id: "upload".into(), expected_fingerprint: "fingerprint".into(), confirm_changes: true },
+            plugin_id: a.id.clone(),
+            expected_revision: 7,
+            intent: PluginManagementIntent::Update {
+                upload_id: "upload".into(),
+                expected_fingerprint: "fingerprint".into(),
+                confirm_changes: true,
+            },
         });
         // Successful/failed read inputs at the real Observe enqueue/reducer
         // boundary. No RPC completion or upload-engine execution is fabricated.
         let observe = |revision: Option<i64>| {
-            let transition = core.plugin_intent("workspace", PluginIntent::Observe { plugin_id: Some(a.id.clone()) });
-            assert_ne!(transition.outcome(), crate::core::ClientTransitionOutcome::Rejected);
+            let transition = core.plugin_intent(
+                "workspace",
+                PluginIntent::Observe {
+                    plugin_id: Some(a.id.clone()),
+                },
+            );
+            assert_ne!(
+                transition.outcome(),
+                crate::core::ClientTransitionOutcome::Rejected
+            );
             let work = receiver.try_recv().unwrap();
             assert!(matches!(work.intent, PluginIntent::Observe { .. }));
-            let cached_revision = core.plugins_controller.lock().unwrap().publications["workspace"].plugins.iter().find(|item| item.id == a.id).unwrap().revision;
+            let cached_revision = core.plugins_controller.lock().unwrap().publications["workspace"]
+                .plugins
+                .iter()
+                .find(|item| item.id == a.id)
+                .unwrap()
+                .revision;
             rejected_without_replacement(set_enabled(cached_revision));
             let mut owner = core.plugins_controller.lock().unwrap();
             let publication = owner.publications.get_mut("workspace").unwrap();
             let result = match revision {
                 Some(revision) => {
                     let mut observed = publication.clone();
-                    observed.plugins.iter_mut().find(|item| item.id == a.id).unwrap().revision = revision;
+                    observed
+                        .plugins
+                        .iter_mut()
+                        .find(|item| item.id == a.id)
+                        .unwrap()
+                        .revision = revision;
                     Ok(observed)
                 }
                 None => Err(anyhow::anyhow!("read failed")),
             };
-            publication.settle_operation(&work.key, result, false, Some(revision.is_some()), &retained);
-            if revision.is_some() { owner.reconcile_recovery_reads("workspace"); }
-            let request = owner.requests.get_mut(&("workspace".into(), work.key)).unwrap();
+            publication.settle_operation(
+                &work.key,
+                result,
+                false,
+                Some(revision.is_some()),
+                &retained,
+            );
+            if revision.is_some() {
+                owner.reconcile_recovery_reads("workspace");
+            }
+            let request = owner
+                .requests
+                .get_mut(&("workspace".into(), work.key))
+                .unwrap();
             let generation = crate::core::ClientGeneration::new(work.generation);
-            if revision.is_some() { request.succeed(generation, ()); }
-            else { request.fail(generation, crate::request_state::ClientRequestFailure::new("read_failed").unwrap()); }
+            if revision.is_some() {
+                request.succeed(generation, ());
+            } else {
+                request.fail(
+                    generation,
+                    crate::request_state::ClientRequestFailure::new("read_failed").unwrap(),
+                );
+            }
             let publication = owner.publications.get_mut("workspace").unwrap();
             assert!(publication.operations[&a.id].uncertain);
             assert!(publication.operations[&a.id].result.is_none());
@@ -2062,17 +2556,32 @@ pub(crate) mod tests {
         rejected_without_replacement(set_enabled(7)); // Stale CAS.
         let read_identity = {
             let mut owner = core.plugins_controller.lock().unwrap();
-            let evidence = owner.recovery_reads.get_mut(&("workspace".into(), a.id.clone())).unwrap();
+            let evidence = owner
+                .recovery_reads
+                .get_mut(&("workspace".into(), a.id.clone()))
+                .unwrap();
             let saved = *evidence;
             evidence.0 += 1;
             saved
         };
         rejected_without_replacement(set_enabled(8)); // Evidence for another operation generation.
-        core.plugins_controller.lock().unwrap().recovery_reads.insert(("workspace".into(), a.id.clone()), read_identity);
+        core.plugins_controller
+            .lock()
+            .unwrap()
+            .recovery_reads
+            .insert(("workspace".into(), a.id.clone()), read_identity);
         // A later inventory revision cannot reuse an older recovery read.
         {
             let mut owner = core.plugins_controller.lock().unwrap();
-            owner.publications.get_mut("workspace").unwrap().plugins.iter_mut().find(|item| item.id == a.id).unwrap().revision = 9;
+            owner
+                .publications
+                .get_mut("workspace")
+                .unwrap()
+                .plugins
+                .iter_mut()
+                .find(|item| item.id == a.id)
+                .unwrap()
+                .revision = 9;
         }
         rejected_without_replacement(set_enabled(9));
         observe(None);
@@ -2084,40 +2593,88 @@ pub(crate) mod tests {
         // Fill the bounded queue with actual admitted B work, then attempt an
         // otherwise eligible A recovery. No worker/transport timing is needed.
         let (bounded_sender, bounded_receiver) = mpsc::sync_channel(1);
-        let previous_sender = core.plugins_controller.lock().unwrap().sender.replace(bounded_sender).unwrap();
-        let blocker = core.submit_plugin_command("workspace", &b.id, PluginIntent::SetEnabled {
-            plugin_id: b.id.clone(), expected_revision: 7, enabled: false, allow_implicit_invocation: None,
-        }, &origin).unwrap();
+        let previous_sender = core
+            .plugins_controller
+            .lock()
+            .unwrap()
+            .sender
+            .replace(bounded_sender)
+            .unwrap();
+        let blocker = core
+            .submit_plugin_command(
+                "workspace",
+                &b.id,
+                PluginIntent::SetEnabled {
+                    plugin_id: b.id.clone(),
+                    expected_revision: 7,
+                    enabled: false,
+                    allow_implicit_invocation: None,
+                },
+                &origin,
+            )
+            .unwrap();
         assert!(core.plugin_parent_recovery_available("workspace", &a.id));
-        let prior_generation = core.plugins_controller.lock().unwrap().requests[&("workspace".into(), a.id.clone())].latest_generation().get();
+        let prior_generation = core.plugins_controller.lock().unwrap().requests
+            [&("workspace".into(), a.id.clone())]
+            .latest_generation()
+            .get();
         rejected_without_replacement(set_enabled(8));
         assert!(core.plugin_parent_recovery_available("workspace", &a.id));
         let blocking_work = bounded_receiver.try_recv().unwrap();
         assert_eq!(blocking_work.key, b.id);
         assert_eq!(blocking_work.generation, blocker.generation);
-        assert!(matches!(bounded_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
-        let recovery = core.submit_plugin_command("workspace", &a.id, set_enabled(8), &origin).unwrap();
+        assert!(matches!(
+            bounded_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let recovery = core
+            .submit_plugin_command("workspace", &a.id, set_enabled(8), &origin)
+            .unwrap();
         let recovery_work = bounded_receiver.try_recv().unwrap();
         assert_eq!(recovery_work.generation, prior_generation + 1);
         assert!(core.plugin_work_current(&recovery_work));
-        assert!(matches!(bounded_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            bounded_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         {
             let mut owner = core.plugins_controller.lock().unwrap();
             owner.sender = Some(previous_sender);
             let publication = owner.publications.get_mut("workspace").unwrap();
-            publication.operations.get_mut(&b.id).unwrap().result = Some(PluginsMutationResponse { plugin: Some(b.clone()), removed: false });
+            publication.operations.get_mut(&b.id).unwrap().result = Some(PluginsMutationResponse {
+                plugin: Some(b.clone()),
+                removed: false,
+            });
             let next = publication.clone();
             publication.settle_operation(&blocking_work.key, Ok(next), true, Some(true), &retained);
-            owner.requests.get_mut(&("workspace".into(), b.id.clone())).unwrap().succeed(crate::core::ClientGeneration::new(blocking_work.generation), ());
+            owner
+                .requests
+                .get_mut(&("workspace".into(), b.id.clone()))
+                .unwrap()
+                .succeed(
+                    crate::core::ClientGeneration::new(blocking_work.generation),
+                    (),
+                );
         }
-        assert!(matches!(recovery_work.intent, PluginIntent::SetEnabled { expected_revision: 8, enabled: false, .. }));
+        assert!(matches!(
+            recovery_work.intent,
+            PluginIntent::SetEnabled {
+                expected_revision: 8,
+                enabled: false,
+                ..
+            }
+        ));
         assert_eq!(recovery.generation, recovery_work.generation);
         assert!(!core.plugin_parent_recovery_available("workspace", &a.id));
         {
             let mut owner = core.plugins_controller.lock().unwrap();
             let publication = owner.publications.get_mut("workspace").unwrap();
             publication.operations.get_mut(&a.id).unwrap().result = Some(PluginsMutationResponse {
-                plugin: Some(PluginItem { revision: 8, ..a.clone() }), removed: false,
+                plugin: Some(PluginItem {
+                    revision: 8,
+                    ..a.clone()
+                }),
+                removed: false,
             });
             let next = publication.clone();
             publication.settle_operation(&recovery_work.key, Ok(next), true, Some(true), &retained);
@@ -2125,32 +2682,89 @@ pub(crate) mod tests {
         // Retained upload-owner publications are inputs to this runtime boundary.
         // The upload owner's own regression covers confirmation/fingerprint
         // retention; here protect admission of that exact retry after ApplyUpdate.
-        use crate::package_delivery::{operations::SkillUploadTarget, upload_flow::{SkillUploadPublication, SkillUploadState, PluginUpdatePreviewPublication}};
+        use crate::package_delivery::{
+            operations::SkillUploadTarget,
+            upload_flow::{
+                PluginUpdatePreviewPublication, SkillUploadPublication, SkillUploadState,
+            },
+        };
         let mut upload = SkillUploadPublication {
-            operation_id: 42, generation: 1, revision: 0,
-            mutation_uncertain: false, failure: None, plugin_preview: None, plugin_result: None,
+            operation_id: 42,
+            generation: 1,
+            revision: 0,
+            mutation_uncertain: false,
+            failure: None,
+            plugin_preview: None,
+            plugin_result: None,
             plugin_update_preview: Some(PluginUpdatePreviewPublication {
                 upload_id: "exact-upload".into(),
                 preview: PluginsUpdatePreviewResponse {
-                    package: PluginsPreviewResponse { name: "A".into(), version: None, description: None, fingerprint: "exact-fingerprint".into(), components: vec![], diagnostics: vec![] },
+                    package: PluginsPreviewResponse {
+                        name: "A".into(),
+                        version: None,
+                        description: None,
+                        fingerprint: "exact-fingerprint".into(),
+                        components: vec![],
+                        diagnostics: vec![],
+                    },
                     supporting_files_changed: false,
-                    added: vec![], updated: vec![], identity_resets: vec![], removed: vec![], authorization_changes: vec![],
+                    added: vec![],
+                    updated: vec![],
+                    identity_resets: vec![],
+                    removed: vec![],
+                    authorization_changes: vec![],
                 },
             }),
-            state: SkillUploadState::Succeeded, sent_bytes: 1, total_bytes: 1,
-            target: SkillUploadTarget::PluginUpdatePreview { plugin_id: a.id.clone(), expected_revision: 8 }, pack: false,
+            state: SkillUploadState::Succeeded,
+            sent_bytes: 1,
+            total_bytes: 1,
+            target: SkillUploadTarget::PluginUpdatePreview {
+                plugin_id: a.id.clone(),
+                expected_revision: 8,
+            },
+            pack: false,
         };
         let publish_upload = |mut upload: SkillUploadPublication| {
-            let scope = ClientScope::SkillsUpload { workspace_id: "workspace".into(), operation_id: upload.operation_id };
-            upload.revision = core.snapshot(&scope).map_or(1, |snapshot| snapshot.revisions().scoped().get() + 1);
-            core.publish(&ClientMutationAuthority { _private: () }, scope, crate::threads::registry::revisions(upload.revision), Arc::new(upload), vec![]);
+            let scope = ClientScope::SkillsUpload {
+                workspace_id: "workspace".into(),
+                operation_id: upload.operation_id,
+            };
+            upload.revision = core
+                .snapshot(&scope)
+                .map_or(1, |snapshot| snapshot.revisions().scoped().get() + 1);
+            core.publish(
+                &ClientMutationAuthority { _private: () },
+                scope,
+                crate::threads::registry::revisions(upload.revision),
+                Arc::new(upload),
+                vec![],
+            );
         };
         publish_upload(upload.clone());
-        core.submit_plugin_command("workspace", &a.id, PluginIntent::ApplyUpdate { upload_operation: 42, confirm_changes: true }, &origin).unwrap();
+        core.submit_plugin_command(
+            "workspace",
+            &a.id,
+            PluginIntent::ApplyUpdate {
+                upload_operation: 42,
+                confirm_changes: true,
+            },
+            &origin,
+        )
+        .unwrap();
         let update_work = receiver.try_recv().unwrap();
         {
             let mut owner = core.plugins_controller.lock().unwrap();
-            owner.publications.get_mut("workspace").unwrap().settle_operation(&update_work.key, Err(anyhow::anyhow!("update lost response")), true, None, &retained);
+            owner
+                .publications
+                .get_mut("workspace")
+                .unwrap()
+                .settle_operation(
+                    &update_work.key,
+                    Err(anyhow::anyhow!("update lost response")),
+                    true,
+                    None,
+                    &retained,
+                );
         }
         upload.mutation_uncertain = true;
         publish_upload(upload.clone());
@@ -2158,18 +2772,50 @@ pub(crate) mod tests {
         observe(Some(8));
         assert!(!core.plugin_parent_recovery_available("workspace", &a.id));
         rejected_without_replacement(set_enabled(8));
-        rejected_without_replacement(PluginIntent::ConfigureMcp { server_id: "native-child".into(), body: "{}".into() });
+        rejected_without_replacement(PluginIntent::ConfigureMcp {
+            server_id: "native-child".into(),
+            body: "{}".into(),
+        });
         let mut new_upload = upload.clone();
         new_upload.operation_id = 43;
         new_upload.mutation_uncertain = false;
         publish_upload(new_upload);
-        rejected_without_replacement(PluginIntent::ApplyUpdate { upload_operation: 43, confirm_changes: true });
-        core.submit_plugin_command("workspace", &a.id, PluginIntent::ApplyUpdate { upload_operation: 42, confirm_changes: true }, &origin).unwrap();
-        assert!(matches!(receiver.try_recv().unwrap().intent, PluginIntent::ApplyUpdate { upload_operation: 42, confirm_changes: true }));
+        rejected_without_replacement(PluginIntent::ApplyUpdate {
+            upload_operation: 43,
+            confirm_changes: true,
+        });
+        core.submit_plugin_command(
+            "workspace",
+            &a.id,
+            PluginIntent::ApplyUpdate {
+                upload_operation: 42,
+                confirm_changes: true,
+            },
+            &origin,
+        )
+        .unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap().intent,
+            PluginIntent::ApplyUpdate {
+                upload_operation: 42,
+                confirm_changes: true
+            }
+        ));
         let exact = core.skill_upload_snapshot("workspace", 42).unwrap();
-        assert_eq!(exact.plugin_update_preview.as_ref().unwrap().upload_id, "exact-upload");
-        assert_eq!(exact.plugin_update_preview.as_ref().unwrap().preview.package.fingerprint, "exact-fingerprint");
+        assert_eq!(
+            exact.plugin_update_preview.as_ref().unwrap().upload_id,
+            "exact-upload"
+        );
+        assert_eq!(
+            exact
+                .plugin_update_preview
+                .as_ref()
+                .unwrap()
+                .preview
+                .package
+                .fingerprint,
+            "exact-fingerprint"
+        );
         drop(second);
-
     }
 }

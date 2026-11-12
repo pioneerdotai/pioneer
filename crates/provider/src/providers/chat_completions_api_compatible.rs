@@ -1933,6 +1933,31 @@ impl crate::traits::Provider for ChatCompletionsApiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn disclosed_tools_keep_prefix_in_serialized_payload() {
+        let render = |request: ChatRequest| {
+            let provider = ChatCompletionsApiCompatibleProvider::new(
+                "openai",
+                "https://fixture.invalid",
+                "unused",
+                AuthStyle::Bearer,
+            );
+            provider.render_chat_request_for_test(request).unwrap()
+        };
+        let mut request = crate::tools::policy::test_request();
+        let before = render(request.clone());
+        let mut added = request.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        request.tools.as_mut().unwrap().push(added);
+        let body = render(request);
+        assert_eq!(
+            body["tools"][0], before["tools"][0],
+            "entire previously serialized definition must survive expansion"
+        );
+        assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(body["tools"][1]["function"]["name"], "alpha");
+    }
+
+    #[test]
     fn stock_chat_discovery_accepts_equivalent_completion_urls_only() {
         use super::*;
         use crate::traits::Provider;
@@ -2775,6 +2800,7 @@ mod tests {
             Some("artifact-file")
         );
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture-media".into(),
             messages: messages.clone(),
@@ -3212,6 +3238,7 @@ mod tests {
             Some(replay_state),
         );
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "compatible-model".to_owned(),
             messages: vec![
@@ -3275,6 +3302,7 @@ mod tests {
         );
         assert!(replay.model.is_none());
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "compatible-model".to_owned(),
             messages: vec![ChatMessage::assistant_tool_calls_with_provider_state(
@@ -3485,6 +3513,7 @@ mod tests {
     fn merge_mode_uses_compiled_prompt_full_text() {
         let provider = test_provider().with_merge_system_into_user(true);
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "test-model".to_owned(),
             messages: vec![
@@ -3498,6 +3527,7 @@ mod tests {
             parallel_tool_calls: None,
             reasoning: None,
             compiled_prompt: Some(crate::types::CompiledPromptPayload {
+                observation_manifest: None,
                 stable_system_text: "Stable rules".to_owned(),
                 dynamic_system_text: "Dynamic runtime".to_owned(),
                 boundary_marker: "<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->".to_owned(),
@@ -3567,6 +3597,7 @@ mod tests {
     fn unknown_compatible_model_rejects_explicit_unverified_reasoning() {
         let provider = test_provider();
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "custom-compatible-model".to_owned(),
             messages: vec![ChatMessage::user("Hello")],

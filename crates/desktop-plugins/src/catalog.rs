@@ -253,14 +253,23 @@ impl PluginsView {
             || self.input.error != next.error
             || self.input.operations != next.operations;
         self.input = next;
-        let icons = self.input.plugins.iter().chain(self.input.details.iter())
+        let icons = self
+            .input
+            .plugins
+            .iter()
+            .chain(self.input.details.iter())
             .filter(|_| self.demand.is_some() && self.route_child.is_none())
-            .filter_map(|plugin| plugin.metadata.logo.clone()).collect::<Vec<_>>();
+            .filter_map(|plugin| plugin.metadata.logo.clone())
+            .collect::<Vec<_>>();
         self.plugin_images.reconcile(icons, cx);
         // Navigate only after the selected parent's acknowledged removal. A
         // missing row during a refresh is not proof that deletion completed.
         if self.operation().is_some_and(|operation| {
-            !operation.busy && operation.result.as_ref().is_some_and(|result| result.removed)
+            !operation.busy
+                && operation
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.removed)
         }) {
             self.select_plugin(None, cx);
             return;

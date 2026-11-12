@@ -1828,7 +1828,7 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
                 asset_path.display()
             )
         })?;
-        let name = entry.name();
+        let name = entry.name()?.into_owned();
         anyhow::ensure!(
             !name.contains('\\')
                 && !name.contains(':')
@@ -1903,7 +1903,7 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
         if relative.components().count() != 1 {
             bail!("unexpected Gateway archive member outside CUA payload");
         }
-        let file_name = Path::new(entry.name())
+        let file_name = Path::new(&name)
             .file_name()
             .and_then(OsStr::to_str)
             .unwrap_or_default()

@@ -513,6 +513,8 @@ async fn resolve_recovery_episode<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to resolve recovery episode")?;
+    super::turn_llm_context::settle_shell_controls_for_recovery_jobs(db, &[job_id.to_owned()])
+        .await?;
     Ok(())
 }
 
@@ -535,5 +537,6 @@ async fn resolve_recovery_episodes<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to resolve recovery episode batch")?;
+    super::turn_llm_context::settle_shell_controls_for_recovery_jobs(db, job_ids).await?;
     Ok(())
 }

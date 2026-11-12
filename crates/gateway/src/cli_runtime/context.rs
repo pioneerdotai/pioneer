@@ -1073,6 +1073,7 @@ mod tests {
         let native_request = pioneer_provider::history::project_request_for_provider(
             "deepseek",
             pioneer_provider::ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "deepseek-chat".into(),
                 messages: vec![

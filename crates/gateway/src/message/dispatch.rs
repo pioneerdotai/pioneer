@@ -1593,6 +1593,8 @@ impl MessageProcessor {
                 if matches!(
                     request.method.as_str(),
                     methods::WORKSPACE_PUSH
+                        | methods::WORKSPACE_EXECUTION_OBSERVABILITY
+                        | methods::WORKSPACE_EXECUTION_RECONCILE
                         | methods::ARTIFACT_CAPABILITIES
                         | methods::ARTIFACT_LIST
                         | methods::SKILLS_LIST
@@ -1623,6 +1625,18 @@ impl MessageProcessor {
                 };
                 let params = request.params.clone().unwrap_or_else(empty_object_value);
                 let workspace_id = match request.method.as_str() {
+                    methods::WORKSPACE_EXECUTION_RECONCILE => serde_json::from_value::<
+                        pioneer_protocol::WorkspaceExecutionReconcileParams,
+                    >(params)
+                    .map_err(|_| invalid_params())?
+                    .workspace_id,
+                    methods::WORKSPACE_EXECUTION_OBSERVABILITY => {
+                        serde_json::from_value::<
+                            pioneer_protocol::WorkspaceExecutionObservabilityParams,
+                        >(params)
+                        .map_err(|_| invalid_params())?
+                        .workspace_id
+                    }
                     methods::WORKSPACE_PUSH => {
                         serde_json::from_value::<pioneer_protocol::WorkspacePushParams>(params)
                             .map_err(|_| invalid_params())?
@@ -1950,6 +1964,8 @@ impl MessageProcessor {
                     methods::THREAD_OPEN
                         | methods::THREAD_GET
                         | methods::THREADS_TOOLS_RESULT_READ
+                        | methods::THREAD_EXECUTION_RECONCILE
+                        | methods::THREAD_EXECUTION_OBSERVABILITY
                         | methods::THREAD_TIMELINE_PAGE
                         | methods::THREAD_PATCH_STEPS_PAGE
                         | methods::THREAD_FILE_PATCH_HISTORY_PAGE
@@ -4882,6 +4898,36 @@ impl MessageProcessor {
                             )
                             .await;
                         }
+                    }
+                }
+                // Keep the observation/reconciliation state machines off the shared
+                // dispatcher future, which is also polled by ordinary turn RPCs.
+                methods::WORKSPACE_EXECUTION_OBSERVABILITY => {
+                    let proof=admission.workspace().expect("central admission supplies workspace proof");
+                    match serde_json::from_value::<pioneer_protocol::WorkspaceExecutionObservabilityParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params)=>self.workspace_execution_observability(&context,proof,request.id,params).await,
+                        Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid workspace execution observability params")).await,
+                    }
+                }
+                methods::WORKSPACE_EXECUTION_RECONCILE => {
+                    let proof=admission.workspace().expect("central admission supplies workspace proof");
+                    match serde_json::from_value::<pioneer_protocol::WorkspaceExecutionReconcileParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params)=>self.workspace_execution_reconcile(&context,proof,request.id,params).await,
+                        Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid workspace reconciliation params")).await,
+                    }
+                }
+                methods::THREAD_EXECUTION_RECONCILE => {
+                    let proof=admission.thread().expect("central admission supplies thread proof");
+                    match serde_json::from_value::<pioneer_protocol::ExecutionReconcileParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params)=>self.execution_reconcile(&context,proof,request.id,params).await,
+                        Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid execution reconciliation params")).await,
+                    }
+                }
+                methods::THREAD_EXECUTION_OBSERVABILITY => {
+                    let proof=admission.thread().expect("central admission supplies thread proof");
+                    match serde_json::from_value::<pioneer_protocol::ExecutionObservabilityParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params)=>self.execution_observability(&context,proof,request.id,params).await,
+                        Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid execution observability params")).await,
                     }
                 }
                 methods::THREAD_TIMELINE_PAGE => {
@@ -8114,14 +8160,15 @@ impl MessageProcessor {
                             &config.gateway.thread_episodic,
                             Some(workspace_id),
                         );
-                    crate::database::startup::spawn_thread_episodic_workspace_capsule_refill_for_workspace(
+                    crate::database::startup::spawn_thread_episodic_refill_for_workspace(
                         self.crud_store.clone(),
                         workspace_thread_episodic_settings.enabled
                             && workspace_thread_episodic_settings.indexing_enabled,
                         crate::thread_episodic_runtime_config_from_gateway_settings(
                             &workspace_thread_episodic_settings,
-                        ).index_executor,
-                        self.thread_episodic_storage_root.clone(),
+                        )
+                        .index_executor,
+                        self.thread_episodic_lock_root.clone(),
                         workspace_id.to_owned(),
                         workspace_thread_episodic_settings.vector_search,
                         thread_episodic_settings.vector_search.clone(),
@@ -8134,7 +8181,7 @@ impl MessageProcessor {
                     .await;
                     vector_refill_started = true;
                 } else {
-                    crate::database::startup::spawn_thread_episodic_workspace_capsule_refill(
+                    crate::database::startup::spawn_thread_episodic_refill(
                         self.crud_store.clone(),
                         thread_episodic_settings.enabled
                             && thread_episodic_settings.indexing_enabled,
@@ -8142,7 +8189,7 @@ impl MessageProcessor {
                             &thread_episodic_settings,
                         )
                         .index_executor,
-                        self.thread_episodic_storage_root.clone(),
+                        self.thread_episodic_lock_root.clone(),
                         thread_episodic_settings.vector_search.clone(),
                         workspace_vector_search_configs,
                         self.provider_registry.clone(),
@@ -8309,11 +8356,11 @@ impl MessageProcessor {
             return Ok(());
         };
         let projection_target =
-            crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+            crate::database::startup::thread_episodic_refill::ThreadEpisodicWorkspaceProjectionTarget::from_vector_search_config(
                 &thread_episodic_settings.vector_search,
             );
         let marker_status =
-            crate::database::startup::thread_episodic_workspace_capsule_refill::refill_status_for_workspace_target(
+            crate::database::startup::thread_episodic_refill::refill_status_for_workspace_target(
                 self.crud_store.as_ref(),
                 workspace_id,
                 &projection_target,

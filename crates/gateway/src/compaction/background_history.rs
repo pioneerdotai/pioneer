@@ -485,6 +485,7 @@ pub(crate) async fn prepare_completed_history_owned(
             None
         };
         let request = ChatRequest {
+            tool_declarations: None,
             service_mode: if current.transport == Transport::Api {
                 saved_context.and_then(|saved| saved.service_mode.clone())
             } else {
@@ -504,6 +505,7 @@ pub(crate) async fn prepare_completed_history_owned(
             pioneer_provider::history::project_request_for_provider(&catalog, request)?
         } else {
             ChatRequest {
+                tool_declarations: None,
                 messages: request
                     .messages
                     .iter()
@@ -871,7 +873,10 @@ pub(crate) async fn prepare_completed_history_owned(
     }
     let exit = tokio::select! { biased;
         _ = clock.sleep_until(operation_deadline) => CompactionExit::Reconcile(FailureKind::Deadline),
-        result = runner.run(cancellation) => result?,
+        result = pioneer_provider::usage::scope_causal_parent(
+            pioneer_provider::usage::current_causal_parent().unwrap_or_else(||format!("turn:{turn}")),
+            runner.run(cancellation),
+        ) => result?,
     };
     if suspending.load(std::sync::atomic::Ordering::Acquire)
         && matches!(exit, CompactionExit::Reconcile(FailureKind::Cancelled))

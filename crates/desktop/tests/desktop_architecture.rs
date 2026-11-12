@@ -209,9 +209,14 @@ fn desktop_foundation_is_narrow() {
     let manifest: toml::Value = toml::from_str(&source("desktop-foundation/Cargo.toml")).unwrap();
     assert_eq!(
         dependencies(&manifest),
-        ["gpui-kit".into(), "pioneer-client".into(), "tokio".into()]
-            .into_iter()
-            .collect()
+        [
+            "gpui-kit".into(),
+            "pioneer-client".into(),
+            "tokio".into(),
+            "tokio-util".into()
+        ]
+        .into_iter()
+        .collect()
     );
     let modules: Vec<_> = ast(&dir.join("lib.rs"))
         .items
@@ -232,10 +237,11 @@ fn desktop_foundation_is_narrow() {
         for forbidden in ["ClientIntent", "ClientEffectPlan", "impl Element for"] {
             assert!(!text.contains(forbidden), "Foundation: {forbidden}");
         }
-        // Only the two-consumer upload view retains a Client delivery handle.
-        // Other foundation modules remain value/registration seams. This is a
-        // closed exception, not permission for arbitrary current feature edges.
-        if name != "package_upload.rs" {
+        // These two shared presentation owners retain typed Client handles:
+        // package delivery (Skills / Plugins), imagery (catalogue / thread).
+        // Neither owns domain policy, transport or byte caching. Every other
+        // module remains a value/registration seam; exceptions stay closed.
+        if !["package_upload.rs", "image_views.rs"].contains(&name.as_str()) {
             assert!(
                 !text.contains("Entity<") && !text.contains("ClientCore"),
                 "Foundation: {name}"
@@ -251,7 +257,22 @@ fn desktop_foundation_is_narrow() {
             ] {
                 assert!(
                     !text.contains(forbidden),
-                    "Upload presentation owns {forbidden}"
+                    "Shared presentation {name} owns {forbidden}"
+                );
+            }
+        }
+        if name == "image_views.rs" {
+            for forbidden in [
+                "std::fs",
+                "tokio::fs",
+                "reqwest",
+                "base64",
+                "ImageStore",
+                "ImageCacheService",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "Image presentation owns {forbidden}"
                 );
             }
         }
@@ -769,17 +790,14 @@ fn unit_identity_cache_and_cross_shell_policies_match_the_contract() {
             })
             .expect("cache limit constant")
     };
-    let avatars = &c.caches["avatar_bytes"];
+    let images = &c.caches["image_bytes"];
     assert_eq!(
-        limit(
-            avatars["source"].as_str().unwrap(),
-            "AVATAR_CACHE_MAX_FILES"
-        ),
-        avatars["max_files"].as_integer().unwrap() as u64
+        limit(images["source"].as_str().unwrap(), "IMAGE_CACHE_MAX_FILES"),
+        images["max_files"].as_integer().unwrap() as u64
     );
     assert_eq!(
-        limit(avatars["source"].as_str().unwrap(), "AVATAR_CACHE_MAX_AGE"),
-        avatars["max_age_days"].as_integer().unwrap() as u64 * 24 * 60 * 60
+        limit(images["source"].as_str().unwrap(), "IMAGE_CACHE_MAX_AGE"),
+        images["max_age_days"].as_integer().unwrap() as u64 * 24 * 60 * 60
     );
     let previews = &c.caches["artifact_preview"];
     assert_eq!(

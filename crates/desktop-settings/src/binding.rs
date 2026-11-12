@@ -70,10 +70,7 @@ impl SettingsBinding {
                 })
             });
         let scope = request.as_ref().map(|request| ClientScope::Image {
-            key: avatar_identity_key(
-                request.principal_id.as_str(),
-                &request.avatar_revision,
-            ),
+            key: avatar_identity_key(request.principal_id.as_str(), &request.avatar_revision),
         });
         let authority = config
             .client

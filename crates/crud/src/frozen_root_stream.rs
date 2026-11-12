@@ -581,6 +581,8 @@ mod tests {
     fn inline_history_retains_last_fields_and_validates_discarded_json() {
         for json in [
             r#"[]"#,
+            // Arbitrary-precision JSON numbers remain valid in ignored fields.
+            r#"[{"role":"user","content":"ok","ignored":1e999}]"#,
             r#"[{"role":"bad","role":"user","content":null,"content":"ok"}]"#,
             r#"[{"role":"\u0075ser","content":"я\uD83D\uDE00","ignored":{"x":[false,null,-1.25e+2]}}]"#,
         ] {
@@ -591,7 +593,6 @@ mod tests {
             br#"[{"role":"user","content":"ok"},null]"#,
             br#"[{"role":"user","content":"ok","ignored":"\uD800"}]"#,
             br#"[{"role":"user","content":"ok","ignored":"\uDC00"}]"#,
-            br#"[{"role":"user","content":"ok","ignored":1e999}]"#,
             br#"[{"role":"user","content":"ok","ignored":01}]"#,
             b"[{\"role\":\"user\",\"content\":\"\xc0\x80\"}]",
             br#"[{"role":"user","content":"ok",}]"#,

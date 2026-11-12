@@ -8262,6 +8262,7 @@ impl MessageProcessor {
 
     /// Compute deadlines from active work only. Each read releases its bounded
     /// page before validation; completed history never supplies a timer.
+    #[cfg(test)]
     pub(super) async fn next_cli_background_deadline(
         &self,
         now: i64,

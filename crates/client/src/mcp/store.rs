@@ -330,7 +330,10 @@ impl ClientCore {
     ) -> McpDemand {
         // Identity transaction precedes every domain guard. A previous resume
         // or response cannot cross a later fence/commit/protected eviction.
-        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
+        let _identity = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
         let now = self.timeline_started.elapsed();
         let epoch = self.provider_runtime_epoch();
         let allowed = self.mcp_allowed(workspace);
@@ -678,7 +681,10 @@ impl ClientCore {
     fn next_mcp_read(&self) -> Option<ReadRequest> {
         // Identity transaction precedes every domain guard. A previous resume
         // or response cannot cross a later fence/commit/protected eviction.
-        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
+        let _identity = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
         let epoch = self.provider_runtime_epoch();
         let now = self.timeline_started.elapsed();
         let mut owner = self.mcp_store.lock().expect("MCP store poisoned");
@@ -773,7 +779,10 @@ impl ClientCore {
     ) {
         // Identity transaction precedes every domain guard. A previous resume
         // or response cannot cross a later fence/commit/protected eviction.
-        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
+        let _identity = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
         if self.provider_runtime_epoch() != request.epoch || !self.mcp_allowed(&request.workspace) {
             return;
         }
@@ -894,7 +903,10 @@ impl ClientCore {
     ) {
         // Identity transaction precedes every domain guard. A previous resume
         // or response cannot cross a later fence/commit/protected eviction.
-        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
+        let _identity = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
         if self.provider_runtime_epoch() != request.epoch || !self.mcp_allowed(&request.workspace) {
             return;
         }
@@ -949,7 +961,10 @@ impl ClientCore {
     pub(crate) fn resume_mcp_demand(&self) {
         // Identity transaction precedes every domain guard. A previous resume
         // or response cannot cross a later fence/commit/protected eviction.
-        let _identity = self.identity_authorization.lock().expect("identity owner poisoned");
+        let _identity = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
         self.mcp_controller
             .lock()
             .expect("Mcp controller poisoned")
@@ -1154,10 +1169,17 @@ mod tests {
         let before = core.next_mcp_read().unwrap();
         let old_epoch = before.epoch;
         let old_generation = before.generation;
-        let scope = ClientScope::Mcp { workspace_id: Some("workspace".into()) };
+        let scope = ClientScope::Mcp {
+            workspace_id: Some("workspace".into()),
+        };
         let subscription = core.subscribe(scope.clone(), std::num::NonZeroUsize::new(64).unwrap());
-        let original = (*core.snapshot(&ClientScope::Administration { workspace_id: None }).unwrap()
-            .snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
+        let original = (*core
+            .snapshot(&ClientScope::Administration { workspace_id: None })
+            .unwrap()
+            .snapshot()
+            .payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>()
+            .unwrap())
+        .clone();
         let mut denied = original.clone();
         denied.authorization_change_sequence += 1;
         denied.capabilities.clear_epoch();
@@ -1166,11 +1188,16 @@ mod tests {
         let publisher_core = core.clone();
         let publisher = std::thread::spawn(move || {
             crate::core::IDENTITY_BEFORE_COMMIT.with_borrow_mut(|hook| {
-                *hook = Some(Box::new(move || { paused.send(()).unwrap(); committed.recv_timeout(Duration::from_secs(5)).unwrap(); }));
+                *hook = Some(Box::new(move || {
+                    paused.send(()).unwrap();
+                    committed.recv_timeout(Duration::from_secs(5)).unwrap();
+                }));
             });
             let _identity = publisher_core.identity_authorization.lock().unwrap();
-            publisher_core.publish_identity_authorization(&denied,
-                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate);
+            publisher_core.publish_identity_authorization(
+                &denied,
+                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
+            );
         });
         pause.recv_timeout(Duration::from_secs(5)).unwrap(); // All domain fences ran, Q is still A0.
         let (started, starting) = std::sync::mpsc::channel();
@@ -1181,9 +1208,13 @@ mod tests {
             started.send(()).unwrap();
             reader_core.resume_mcp_demand(); // A delayed resume belonging to the previous acceptance.
             let next = reader_core.next_mcp_read();
-            claimed.send(next.as_ref().map(|r| (r.epoch, r.generation))).unwrap();
+            claimed
+                .send(next.as_ref().map(|r| (r.epoch, r.generation)))
+                .unwrap();
             response_ready.recv_timeout(Duration::from_secs(5)).unwrap();
-            if let Some(request) = next { reader_core.complete_mcp_catalog(request, Ok(response(&["old-after-fence"]))); }
+            if let Some(request) = next {
+                reader_core.complete_mcp_catalog(request, Ok(response(&["old-after-fence"])));
+            }
         });
         starting.recv_timeout(Duration::from_secs(5)).unwrap();
         // An implementation may block on I without holding a domain guard.
@@ -1197,10 +1228,14 @@ mod tests {
         while subscription.try_next().is_some() {} // Begin the post-eviction event interval.
         respond.send(()).unwrap();
         reader.join().unwrap();
-        if let Some(value) = core.mcp_catalog_snapshot("workspace") { assert!(value.servers().is_empty()); }
+        if let Some(value) = core.mcp_catalog_snapshot("workspace") {
+            assert!(value.servers().is_empty());
+        }
         while let Some(event) = subscription.try_next() {
             if let ClientSubscriptionEvent::Publication { publication, .. } = event {
-                if let Some(value) = publication.snapshot().payload::<McpCatalogPublication>() { assert!(value.servers().is_empty()); }
+                if let Some(value) = publication.snapshot().payload::<McpCatalogPublication>() {
+                    assert!(value.servers().is_empty());
+                }
             }
         }
         assert!(core.next_mcp_read().is_none());
@@ -1208,14 +1243,24 @@ mod tests {
         granted.authorization_change_sequence += 2;
         {
             let _identity = core.identity_authorization.lock().unwrap();
-            core.publish_identity_authorization(&granted,
-                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate);
+            core.publish_identity_authorization(
+                &granted,
+                crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
+            );
         }
         core.resume_mcp_demand();
-        let fresh = core.next_mcp_read().expect("real regrant must admit a fresh read");
+        let fresh = core
+            .next_mcp_read()
+            .expect("real regrant must admit a fresh read");
         assert_ne!(fresh.epoch, old_epoch);
         core.complete_mcp_catalog(fresh, Ok(response(&["fresh"])));
-        assert!(!core.mcp_catalog_snapshot("workspace").unwrap().servers().is_empty());
+        assert!(
+            !core
+                .mcp_catalog_snapshot("workspace")
+                .unwrap()
+                .servers()
+                .is_empty()
+        );
     }
     #[test]
     fn equal_catalog_and_duplicate_completion_preserve_publication_and_rows() {
@@ -1500,7 +1545,9 @@ mod tests {
             let core = crate::catalog_test_support::client();
             let _lease = core.acquire_mcp_demand("workspace", None);
             let stale = core.next_mcp_read().unwrap();
-            let publication = core.snapshot(&ClientScope::Administration { workspace_id: None }).unwrap();
+            let publication = core
+                .snapshot(&ClientScope::Administration { workspace_id: None })
+                .unwrap();
             let mut revoked = (*publication.snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
             revoked.authorization_change_sequence += 1;
             revoked.capabilities.clear_epoch();
@@ -1513,7 +1560,8 @@ mod tests {
                 let _identity = publisher_core.identity_authorization.lock().unwrap();
                 publisher_start.wait();
                 publisher_core.publish_identity_authorization(
-                    &revoked, crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
+                    &revoked,
+                    crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
                 );
                 publisher_finished.send(()).unwrap();
             });
@@ -1531,12 +1579,15 @@ mod tests {
                 finished.send(()).unwrap();
             });
             start.wait();
-            for _ in 0..2 { observed.recv_timeout(Duration::from_secs(5)).expect("publisher/read-owner cycle"); }
+            for _ in 0..2 {
+                observed
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("publisher/read-owner cycle");
+            }
             worker.join().unwrap();
             publisher.join().unwrap();
             assert!(core.next_mcp_read().is_none());
             assert!(!core.mcp_allowed("workspace"));
         }
-
     }
 }

@@ -124,10 +124,12 @@ pub(crate) fn catalog_provider(provider: &str) -> String {
 
 pub struct ModelCatalog {
     models: BTreeMap<String, BTreeMap<String, CatalogModel>>,
+    billing_models: BTreeMap<String, BTreeMap<String, CatalogModel>>,
     origins: BTreeMap<String, BTreeMap<String, ModelOrigins>>,
     context_tiers: BTreeMap<String, BTreeMap<String, pioneer_protocol::ProviderContextTiers>>,
     service_modes: BTreeMap<String, BTreeMap<String, service::SourceServiceModes>>,
     snapshot_id: String,
+    retained_pricing: BTreeMap<String, BTreeMap<String, String>>,
     tool_capabilities: Option<ToolCapabilities>,
 }
 
@@ -181,8 +183,34 @@ impl ModelCatalog {
         origins: &str,
         tool_capabilities: Option<ToolCapabilities>,
     ) -> anyhow::Result<Self> {
+        // Retain only financial members verbatim from the captured JSON, not
+        // model descriptions/prompts or connection credentials. This is evidence
+        // retention; it does not change catalog normalization or picker content.
+        let raw: BTreeMap<
+            String,
+            BTreeMap<String, BTreeMap<String, Box<serde_json::value::RawValue>>>,
+        > = serde_json::from_str(models)?;
+        let retained_pricing = raw
+            .into_iter()
+            .map(|(provider, entries)| {
+                let entries = entries
+                    .into_iter()
+                    .map(|(id, fields)| {
+                        let evidence = format!(
+                            "{{\"cost\":{},\"source\":{}}}",
+                            fields.get("cost").map_or("null", |v| v.get()),
+                            fields.get("pricingSource").map_or("null", |v| v.get())
+                        );
+                        (id, evidence)
+                    })
+                    .collect();
+                (provider, entries)
+            })
+            .collect();
         let mut catalog = Self {
             models: serde_json::from_str(models)?,
+            billing_models: BTreeMap::new(),
+            retained_pricing,
             origins: serde_json::from_str(origins)?,
             snapshot_id: {
                 use sha2::{Digest, Sha256};
@@ -286,6 +314,51 @@ impl ModelCatalog {
             })
             .collect();
         Ok(catalog)
+    }
+
+    pub fn with_billing_models(
+        mut self,
+        models: BTreeMap<String, BTreeMap<String, Value>>,
+    ) -> anyhow::Result<Self> {
+        use sha2::{Digest, Sha256};
+        let mut snapshot = Sha256::new();
+        snapshot.update(self.snapshot_id.as_bytes());
+        snapshot.update(serde_json::to_vec(&models)?);
+        self.snapshot_id = hex::encode(snapshot.finalize());
+        for (provider, entries) in models {
+            for (id, value) in entries {
+                let entry: CatalogModel = serde_json::from_value(value)?;
+                anyhow::ensure!(
+                    entry.id == id
+                        && entry.provider == provider
+                        && entry.api == "openai-embeddings",
+                    "invalid non-chat billing identity"
+                );
+                let evidence = serde_json::json!({"cost":entry.cost,"source":entry.metadata.get("pricingSource")});
+                self.retained_pricing
+                    .entry(provider.clone())
+                    .or_default()
+                    .insert(id.clone(), serde_json::to_string(&evidence)?);
+                self.billing_models
+                    .entry(provider.clone())
+                    .or_default()
+                    .insert(id, entry);
+            }
+        }
+        Ok(self)
+    }
+    pub fn billing_model(&self, provider: &str, id: &str) -> Option<&CatalogModel> {
+        self.model(provider, id).or_else(|| {
+            self.billing_models
+                .get(&catalog_provider(provider))?
+                .get(id)
+        })
+    }
+    pub fn retained_pricing_json(&self, provider: &str, model: &str) -> Option<&str> {
+        self.retained_pricing
+            .get(&catalog_provider(provider))?
+            .get(model)
+            .map(String::as_str)
     }
 
     pub fn snapshot_id(&self) -> &str {

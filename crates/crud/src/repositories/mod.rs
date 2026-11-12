@@ -3,7 +3,6 @@ pub mod agent_domain;
 pub mod agent_identity_catalog;
 pub mod agent_memory;
 pub mod agent_memory_candidate;
-pub mod agent_memory_capsule;
 pub mod agent_memory_event;
 pub(crate) mod agent_memory_identity;
 pub mod agent_memory_policy_decision;
@@ -153,4 +152,6 @@ pub mod task_child_work;
 
 pub(crate) mod task_occurrence_producers;
 
+pub mod execution_observability;
 pub(crate) mod plugin_metadata;
+pub(crate) mod thread_episodic_search;

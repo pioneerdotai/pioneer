@@ -104,3 +104,26 @@ restarting = "再起動中"
 stopping = "停止中"
 
 supporting_files_changed = "共有ファイルまたはパッケージのメタデータが変更されました"
+
+[plugins.mcp_status]
+not_started = "未起動"
+disabled = "無効"
+starting = "起動中"
+ready = "準備完了"
+degraded = "一部機能低下"
+auth_required = "認証が必要"
+failed = "失敗"
+stopping = "停止中"
+stopped = "停止済み"
+restarting = "再起動中"
+
+[plugins.mcp_capabilities]
+tools = "ツール"
+resources = "リソース"
+templates = "テンプレート"
+prompts = "プロンプト"
+
+[plugins.skill_status]
+active = "有効"
+blocked = "ブロック済み"
+disabled = "無効"

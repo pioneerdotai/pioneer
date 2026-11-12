@@ -70,6 +70,19 @@ pub(super) struct ThreadReadAuthority {
     observe_workspace: bool,
 }
 impl ThreadReadAuthority {
+    pub(super) fn search_access(&self) -> pioneer_crud::ThreadEpisodicSearchAccess {
+        use crate::authorization::RuntimePrincipalPolicy;
+        let absolute = AuthorizationService::new()
+            .runtime_principal_policy(self.principal.kind, self.principal.role_key.as_ref())
+            == Some(RuntimePrincipalPolicy::Absolute);
+        pioneer_crud::ThreadEpisodicSearchAccess {
+            principal_id: (!absolute).then(|| self.principal.principal_id.to_string()),
+            root_thread_id: (!self.observe_workspace).then(|| self.root_thread_id.clone()),
+            include_internal: self.observe_children,
+            current_thread_id: Some(self.current_thread_id.clone()),
+        }
+    }
+
     fn list_scope(&self, limit: u32) -> String {
         json!([
             self.scope("list-conversations-created-desc-v2", "", false, limit),

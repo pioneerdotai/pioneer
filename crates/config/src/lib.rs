@@ -190,8 +190,6 @@ pub struct GatewayTaskReviewConfig {
     pub enabled: bool,
     #[serde(default = "default_tasks_review_allow_task_create_review_policy")]
     pub allow_task_create_review_policy: bool,
-    #[serde(default = "default_tasks_review_parent_review_for_attached_agent_tasks")]
-    pub default_parent_review_for_immediate_attached_agent_tasks: bool,
     #[serde(default = "default_tasks_review_max_revision_rounds")]
     pub default_max_revision_rounds: u32,
     #[serde(default = "default_tasks_review_auto_accept_after_seconds")]
@@ -270,8 +268,6 @@ impl Default for GatewayTaskReviewConfig {
         Self {
             enabled: default_tasks_review_enabled(),
             allow_task_create_review_policy: default_tasks_review_allow_task_create_review_policy(),
-            default_parent_review_for_immediate_attached_agent_tasks:
-                default_tasks_review_parent_review_for_attached_agent_tasks(),
             default_max_revision_rounds: default_tasks_review_max_revision_rounds(),
             auto_accept_after_seconds: default_tasks_review_auto_accept_after_seconds(),
         }
@@ -284,10 +280,6 @@ const fn default_tasks_review_enabled() -> bool {
 
 const fn default_tasks_review_allow_task_create_review_policy() -> bool {
     false
-}
-
-const fn default_tasks_review_parent_review_for_attached_agent_tasks() -> bool {
-    true
 }
 
 const fn default_tasks_review_max_revision_rounds() -> u32 {
@@ -808,9 +800,6 @@ pub struct GatewayMemoryConfig {
     /// Enables the durable memory product surface for the gateway.
     #[serde(default = "default_gateway_memory_enabled")]
     pub enabled: bool,
-    /// Relative runtime-home directory where memvid capsules are stored.
-    #[serde(default = "default_gateway_memory_capsules_dir")]
-    pub capsules_dir: String,
     /// Allows user/global memories to be used when a request has no narrower workspace scope.
     #[serde(default = "default_gateway_memory_allow_global_user")]
     pub allow_global_user_by_default: bool,
@@ -841,7 +830,6 @@ impl Default for GatewayMemoryConfig {
     fn default() -> Self {
         Self {
             enabled: default_gateway_memory_enabled(),
-            capsules_dir: default_gateway_memory_capsules_dir(),
             allow_global_user_by_default: default_gateway_memory_allow_global_user(),
             allow_global_agent_by_default: default_gateway_memory_allow_global_agent(),
             tools_enabled: default_gateway_memory_tools_enabled(),
@@ -851,14 +839,6 @@ impl Default for GatewayMemoryConfig {
             debug_trace_enabled: false,
             strict_diagnostics_enabled: false,
         }
-    }
-}
-
-impl GatewayMemoryConfig {
-    pub fn resolve_capsules_root(&self, runtime_home: &Path) -> Result<PathBuf> {
-        let capsules_dir =
-            normalize_runtime_dir_path(self.capsules_dir.as_str(), "gateway.memory.capsules_dir")?;
-        Ok(runtime_home.join(capsules_dir))
     }
 }
 
@@ -888,16 +868,13 @@ pub struct GatewayThreadEpisodicConfig {
     /// Hard cap for backend candidate work.
     #[serde(default = "default_gateway_thread_episodic_max_candidate_work")]
     pub max_candidate_work: u32,
-    /// Maximum current-thread segments searched per recall.
-    #[serde(default = "default_gateway_thread_episodic_max_segments")]
-    pub max_segments: u64,
     /// Adaptive retrieval minimum relevancy cutoff.
     #[serde(default = "default_gateway_thread_episodic_min_relevancy")]
     pub min_relevancy: f32,
     /// Adaptive retrieval minimum result count.
     #[serde(default = "default_gateway_thread_episodic_min_results")]
     pub min_results: u32,
-    /// Snippet chars requested from memvid search.
+    /// Maximum characters returned per search snippet.
     #[serde(default = "default_gateway_thread_episodic_snippet_chars")]
     pub snippet_chars: u32,
     /// Index worker batch limit.
@@ -912,10 +889,7 @@ pub struct GatewayThreadEpisodicConfig {
     /// Max retry attempts before terminal failure.
     #[serde(default = "default_gateway_thread_episodic_max_attempts")]
     pub max_attempts: i64,
-    /// Segment rotation threshold based on memvid utilization stats.
-    #[serde(default = "default_gateway_thread_episodic_near_capacity_percent")]
-    pub near_capacity_percent: f64,
-    /// Opt-in vector search projection settings for thread episodic workspace capsules.
+    /// Vector search settings for the workspace episodic projection.
     #[serde(default)]
     pub vector_search: GatewayThreadEpisodicVectorSearchConfig,
 }
@@ -931,7 +905,6 @@ impl Default for GatewayThreadEpisodicConfig {
             max_hit_chars: default_gateway_thread_episodic_max_hit_chars(),
             default_max_candidates: default_gateway_thread_episodic_max_candidates(),
             max_candidate_work: default_gateway_thread_episodic_max_candidate_work(),
-            max_segments: default_gateway_thread_episodic_max_segments(),
             min_relevancy: default_gateway_thread_episodic_min_relevancy(),
             min_results: default_gateway_thread_episodic_min_results(),
             snippet_chars: default_gateway_thread_episodic_snippet_chars(),
@@ -939,7 +912,6 @@ impl Default for GatewayThreadEpisodicConfig {
             retry_base_delay_secs: default_gateway_thread_episodic_retry_base_delay_secs(),
             retry_max_delay_secs: default_gateway_thread_episodic_retry_max_delay_secs(),
             max_attempts: default_gateway_thread_episodic_max_attempts(),
-            near_capacity_percent: default_gateway_thread_episodic_near_capacity_percent(),
             vector_search: GatewayThreadEpisodicVectorSearchConfig::default(),
         }
     }
@@ -2139,10 +2111,6 @@ const fn default_gateway_memory_enabled() -> bool {
     true
 }
 
-fn default_gateway_memory_capsules_dir() -> String {
-    "memory/capsules".to_owned()
-}
-
 const fn default_gateway_memory_allow_global_user() -> bool {
     true
 }
@@ -2195,10 +2163,6 @@ const fn default_gateway_thread_episodic_max_candidate_work() -> u32 {
     128
 }
 
-const fn default_gateway_thread_episodic_max_segments() -> u64 {
-    16
-}
-
 const fn default_gateway_thread_episodic_min_relevancy() -> f32 {
     0.25
 }
@@ -2225,10 +2189,6 @@ const fn default_gateway_thread_episodic_retry_max_delay_secs() -> i64 {
 
 const fn default_gateway_thread_episodic_max_attempts() -> i64 {
     5
-}
-
-const fn default_gateway_thread_episodic_near_capacity_percent() -> f64 {
-    85.0
 }
 
 const fn default_gateway_thread_episodic_vector_normalized() -> bool {
@@ -4018,13 +3978,6 @@ service_name = "com.pioneer.gateway.env"
         assert!(!config.gateway.keepawake);
         assert!(config.gateway.tasks.review.enabled);
         assert!(!config.gateway.tasks.review.allow_task_create_review_policy);
-        assert!(
-            config
-                .gateway
-                .tasks
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(config.gateway.tasks.review.default_max_revision_rounds, 5);
         assert_eq!(config.gateway.tasks.review.auto_accept_after_seconds, 300);
         assert!(!config.gateway.cli_agent_runtime.enabled);
@@ -4672,7 +4625,6 @@ recovery_grace_secs = 1801
         assert_eq!(execution_windows.total.max_windows_per_turn, None);
         assert_eq!(execution_windows.total.max_tool_calls_per_turn, None);
         assert!(config.gateway.memory.enabled);
-        assert_eq!(config.gateway.memory.capsules_dir, "memory/capsules");
         assert!(config.gateway.memory.allow_global_user_by_default);
         assert!(!config.gateway.memory.allow_global_agent_by_default);
         assert!(config.gateway.memory.tools_enabled);
@@ -4687,14 +4639,7 @@ recovery_grace_secs = 1801
         );
         assert!(!config.gateway.memory.debug_trace_enabled);
         assert!(!config.gateway.memory.strict_diagnostics_enabled);
-        assert_eq!(
-            config
-                .gateway
-                .memory
-                .resolve_capsules_root(PathBuf::from("/tmp/pioneer-runtime").as_path())
-                .expect("memory capsules root should resolve"),
-            PathBuf::from("/tmp/pioneer-runtime/memory/capsules")
-        );
+
         assert_eq!(config.gateway.voice.models_dir, "models/voice");
         assert_eq!(
             config.gateway.voice.transcription_strategy,
@@ -4719,7 +4664,6 @@ recovery_grace_secs = 1801
         assert_eq!(config.gateway.thread_episodic.max_hit_chars, 1_200);
         assert_eq!(config.gateway.thread_episodic.default_max_candidates, 32);
         assert_eq!(config.gateway.thread_episodic.max_candidate_work, 128);
-        assert_eq!(config.gateway.thread_episodic.max_segments, 16);
         assert_eq!(config.gateway.thread_episodic.min_relevancy, 0.25);
         assert_eq!(config.gateway.thread_episodic.min_results, 1);
         assert_eq!(config.gateway.thread_episodic.snippet_chars, 360);
@@ -4727,7 +4671,6 @@ recovery_grace_secs = 1801
         assert_eq!(config.gateway.thread_episodic.retry_base_delay_secs, 30);
         assert_eq!(config.gateway.thread_episodic.retry_max_delay_secs, 900);
         assert_eq!(config.gateway.thread_episodic.max_attempts, 5);
-        assert_eq!(config.gateway.thread_episodic.near_capacity_percent, 85.0);
         assert!(!config.gateway.thread_episodic.vector_search.enabled);
         assert_eq!(config.gateway.thread_episodic.vector_search.provider, None);
         assert_eq!(config.gateway.thread_episodic.vector_search.model, None);
@@ -4749,23 +4692,6 @@ recovery_grace_secs = 1801
                 .vector_search
                 .use_search_instructions
         );
-    }
-
-    #[test]
-    fn gateway_memory_config_rejects_unsafe_capsule_dirs() {
-        for capsules_dir in ["", "/tmp/memory", "../memory", "memory/../capsules", "."] {
-            let config = super::GatewayMemoryConfig {
-                capsules_dir: capsules_dir.to_owned(),
-                ..super::GatewayMemoryConfig::default()
-            };
-
-            assert!(
-                config
-                    .resolve_capsules_root(PathBuf::from("/tmp/pioneer-runtime").as_path())
-                    .is_err(),
-                "capsules_dir `{capsules_dir}` must be rejected"
-            );
-        }
     }
 
     #[test]
@@ -4856,7 +4782,6 @@ recovery_grace_secs = 1801
         assert_eq!(config.max_hit_chars, 1_200);
         assert_eq!(config.default_max_candidates, 32);
         assert_eq!(config.max_candidate_work, 128);
-        assert_eq!(config.max_segments, 16);
         assert_eq!(config.min_relevancy, 0.25);
         assert_eq!(config.min_results, 1);
         assert_eq!(config.snippet_chars, 360);
@@ -4864,7 +4789,6 @@ recovery_grace_secs = 1801
         assert_eq!(config.retry_base_delay_secs, 30);
         assert_eq!(config.retry_max_delay_secs, 900);
         assert_eq!(config.max_attempts, 5);
-        assert_eq!(config.near_capacity_percent, 85.0);
         assert!(!config.vector_search.enabled);
         assert_eq!(config.vector_search.provider, None);
         assert_eq!(config.vector_search.model, None);
@@ -4889,7 +4813,6 @@ default_prompt_chars = 1000
         assert_eq!(config.default_prompt_chars, 1_000);
         assert_eq!(config.max_prompt_chars, 12_000);
         assert_eq!(config.index_batch_limit, 16);
-        assert_eq!(config.near_capacity_percent, 85.0);
         assert!(!config.vector_search.enabled);
         assert_eq!(config.vector_search.provider, None);
         assert_eq!(config.vector_search.model, None);
@@ -5119,11 +5042,6 @@ enabled = false
 
         assert!(!config.review.enabled);
         assert!(!config.review.allow_task_create_review_policy);
-        assert!(
-            config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(config.review.default_max_revision_rounds, 5);
         assert_eq!(config.review.auto_accept_after_seconds, 300);
     }
@@ -5133,13 +5051,11 @@ enabled = false
         let config = toml::from_str::<GatewayMemoryConfig>(
             r#"
 enabled = false
-capsules_dir = "memory/custom-capsules"
 "#,
         )
         .expect("gateway memory config should deserialize with defaults");
 
         assert!(!config.enabled);
-        assert_eq!(config.capsules_dir, "memory/custom-capsules");
         assert!(config.allow_global_user_by_default);
         assert!(!config.allow_global_agent_by_default);
         assert!(config.tools_enabled);
@@ -5251,7 +5167,6 @@ model = " claude-sonnet "
     fn gateway_memory_product_config_serializes_stable_field_names() {
         let config = GatewayMemoryConfig {
             enabled: true,
-            capsules_dir: "memory/capsules".to_owned(),
             allow_global_user_by_default: true,
             allow_global_agent_by_default: false,
             tools_enabled: false,
@@ -5267,7 +5182,7 @@ model = " claude-sonnet "
 
         let serialized = toml::to_string(&config).expect("gateway memory config should serialize");
         assert!(serialized.contains("enabled = true"));
-        assert!(serialized.contains("capsules_dir = \"memory/capsules\""));
+
         assert!(serialized.contains("allow_global_user_by_default = true"));
         assert!(serialized.contains("allow_global_agent_by_default = false"));
         assert!(serialized.contains("tools_enabled = false"));

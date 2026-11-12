@@ -560,7 +560,8 @@ impl ClientCore {
         }
     }
     pub(crate) fn start_mcp_operation_controller(self: &Arc<Self>) {
-        let (sender, receiver) = mpsc::sync_channel::<Work>(crate::request_state::CONTROLLER_QUEUE_CAPACITY);
+        let (sender, receiver) =
+            mpsc::sync_channel::<Work>(crate::request_state::CONTROLLER_QUEUE_CAPACITY);
         let queue_observer = pioneer_observability::queues::QueueObserver::new(
             pioneer_observability::queues::QueueKind::ClientController,
             Some(crate::request_state::CONTROLLER_QUEUE_CAPACITY),
@@ -763,12 +764,27 @@ mod tests {
     fn authorization_publication_and_native_settlement_both_make_progress() {
         for _ in 0..32 {
             let (core, receiver) = fixture();
-            core.mcp_intent("workspace", McpIntent::Policy { server_id: "a".into(), enabled: false, allow_implicit_invocation: false }).unwrap();
+            core.mcp_intent(
+                "workspace",
+                McpIntent::Policy {
+                    server_id: "a".into(),
+                    enabled: false,
+                    allow_implicit_invocation: false,
+                },
+            )
+            .unwrap();
             let work = receiver.try_recv().unwrap();
             assert!(core.mcp_action_current(&work));
             let target = work.target.clone();
-            assert_eq!(core.mcp_action_snapshot("workspace", &target).unwrap().state, McpActionState::Pending);
-            let publication = core.snapshot(&ClientScope::Administration { workspace_id: None }).unwrap();
+            assert_eq!(
+                core.mcp_action_snapshot("workspace", &target)
+                    .unwrap()
+                    .state,
+                McpActionState::Pending
+            );
+            let publication = core
+                .snapshot(&ClientScope::Administration { workspace_id: None })
+                .unwrap();
             let mut revoked = (*publication.snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
             revoked.authorization_change_sequence += 1;
             revoked.capabilities.clear_epoch();
@@ -788,14 +804,19 @@ mod tests {
                 let _identity = publisher_core.identity_authorization.lock().unwrap();
                 publisher_start.wait();
                 publisher_core.publish_identity_authorization(
-                    &revoked, crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
+                    &revoked,
+                    crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
                 );
                 finished.send(()).unwrap();
             });
             start.wait();
             // Bound a deadlock failure, but require actual publication AND
             // settlement acknowledgements plus joins, not a timeout as success.
-            for _ in 0..2 { observed.recv_timeout(std::time::Duration::from_secs(5)).expect("publisher/settlement cycle"); }
+            for _ in 0..2 {
+                observed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("publisher/settlement cycle");
+            }
             publisher.join().unwrap();
             worker.join().unwrap();
             assert!(!core.capability_management_allowed("workspace"));
@@ -1050,7 +1071,8 @@ mod tests {
     #[test]
     fn actions_have_one_generation_and_optimistic_policy_rolls_back_only_matching_server() {
         let (core, receiver) = fixture();
-        let (_plugins, assert_plugins_quiet) = crate::plugins::runtime::tests::watch_plugin_reads(&core);
+        let (_plugins, assert_plugins_quiet) =
+            crate::plugins::runtime::tests::watch_plugin_reads(&core);
         let b = core.mcp_catalog_snapshot("workspace").unwrap().servers()[1].clone();
         let intent = || McpIntent::Policy {
             server_id: "a".into(),
@@ -1125,7 +1147,8 @@ mod tests {
     fn configuration_partial_result_keeps_validation_open_and_redacts_input_values() {
         use pioneer_protocol::*;
         let (core, receiver) = fixture();
-        let (_plugins, assert_plugins_quiet) = crate::plugins::runtime::tests::watch_plugin_reads(&core);
+        let (_plugins, assert_plugins_quiet) =
+            crate::plugins::runtime::tests::watch_plugin_reads(&core);
         core.mcp_intent("workspace",McpIntent::Configure{config_json:r#"{"mcpServers":{"synthetic":{"command":"fake","env":{"TOKEN":"private-value"}}}}"#.into()}).unwrap();
         let work = receiver.try_recv().unwrap();
         core.complete_mcp_configuration(

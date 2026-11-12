@@ -73,7 +73,9 @@ impl SkillUploadFailure {
                 "source_unavailable" | "source_kind" => return Self::SourceUnavailable,
                 "source_changed" => return Self::SourceChanged,
                 "invalid_upload_archive" => return Self::InvalidPackage,
-                "entry_limit" | "entry_size_limit" | "expanded_limit" => return Self::SourceTooLarge,
+                "entry_limit" | "entry_size_limit" | "expanded_limit" => {
+                    return Self::SourceTooLarge;
+                }
                 "gateway_not_connected" | "client_stopped" => return Self::GatewayUnavailable,
                 "capability_access_denied" | "capability_read_denied" => return Self::AccessDenied,
                 "skill_upload_pending" | "skills_upload_backpressure" => return Self::Busy,

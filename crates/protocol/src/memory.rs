@@ -253,7 +253,7 @@ pub enum MemoryLifecycleReasonCode {
     VisibilityRankingSuppression,
     QualityTerminalDecision,
     BackendPayloadStaleOrMissing,
-    MemvidStaleVector,
+    StaleEmbeddingProjection,
     ManualDeveloperAdminQuarantine,
     RepairReconciliation,
     ExplicitRestore,

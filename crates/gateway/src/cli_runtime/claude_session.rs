@@ -828,7 +828,8 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
                 {
                     Ok(reservation) => reservation,
                     Err(error) => {
-                        if let Err(error) = supervisor.revoke_session_result(process_instance).await {
+                        if let Err(error) = supervisor.revoke_session_result(process_instance).await
+                        {
                             tracing::warn!(error = %error, "CLI MCP cleanup retained");
                         }
                         return Err(anyhow!(
@@ -4752,7 +4753,12 @@ pub(crate) mod tests {
         required.fail_closed().await;
         drop(provider_writer);
         let _ = tokio_timeout(Duration::from_secs(1), helper).await;
-        assert!(!supervisor.revoke_session_result(&process_instance).await.unwrap());
+        assert!(
+            !supervisor
+                .revoke_session_result(&process_instance)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -6589,6 +6595,4 @@ done
 
         let _ = child.kill().await;
     }
-
-
 }

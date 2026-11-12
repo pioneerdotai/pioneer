@@ -5,7 +5,7 @@ use crate::error::ToolError;
 use crate::registry::ToolHandler;
 use crate::shell_format::{
     ExecModelPayload, ExecOutputStats, ExecPayloadInput, ExecStreamOutputStats,
-    build_exec_model_payload, build_exec_model_payload_with_stats, render_exec_ui_text,
+    build_exec_model_payload_with_stats, render_exec_ui_text,
 };
 use crate::{
     NativeSandboxPrepareOutcome, NativeSandboxRequest, NonoSandboxBackend, ProcessSpawnPlan,
@@ -14,6 +14,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use pioneer_protocol::{SandboxBackendKind, TurnExecutionSecuritySnapshot};
+use process_wrap::tokio::ChildWrapper;
 use std::collections::{BTreeMap, HashMap};
 use std::future::pending;
 use std::path::Path;
@@ -21,11 +22,10 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{ChildStdin, Command};
-use process_wrap::tokio::ChildWrapper;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 #[cfg(not(windows))]
 use tokio::process::Child;
+use tokio::process::{ChildStdin, Command};
 #[cfg(windows)]
 type Child = Box<dyn ChildWrapper>;
 use tokio::sync::{Mutex, mpsc};
@@ -39,6 +39,10 @@ const ONE_SHOT_MAX_STREAM_BYTES: usize = 512 * 1024;
 const ONE_SHOT_MAX_TOTAL_BYTES: usize = 1024 * 1024;
 const ONE_SHOT_ABSOLUTE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const ONE_SHOT_CHUNK_CHANNEL_CAPACITY: usize = 64;
+const SOURCE_DIAGNOSTIC_CHARS: usize = 512;
+const SHELL_CHUNK_BYTES: usize = 4096;
+// Private staging frame: stream tag, raw byte count, UTF-8 text byte count.
+const SESSION_FRAME_BYTES: usize = 9;
 const SESSION_TTL_MS: u64 = if cfg!(test) { 500 } else { 10 * 60 * 1000 };
 const PROCESS_KILL_GRACE_MS: u64 = 300;
 const ONE_SHOT_PIPE_DRAIN_GRACE_MS: u64 = 5_000;
@@ -124,11 +128,14 @@ struct ExecSession {
     stdin: Option<ChildStdin>,
     stdout: Arc<Mutex<SessionBuffer>>,
     stderr: Arc<Mutex<SessionBuffer>>,
+    spool: Arc<Mutex<SessionSpool>>,
     stdout_cursor: usize,
     stderr_cursor: usize,
     command: Vec<String>,
     started_at: Instant,
     last_touched: Instant,
+    reader_shutdown: tokio_util::sync::CancellationToken,
+    poll: Arc<Mutex<()>>,
     _runtime_temp_dir: Option<Arc<crate::process_policy::ProcessRuntimeTempDir>>,
 }
 
@@ -150,7 +157,10 @@ fn spawn_shell_command(command: Command) -> std::io::Result<Child> {
         wrapped.spawn()
     }
     #[cfg(not(windows))]
-    { let mut command = command; command.spawn() }
+    {
+        let mut command = command;
+        command.spawn()
+    }
 }
 
 fn shell_parent_try_wait(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
@@ -160,10 +170,13 @@ fn shell_parent_try_wait(child: &mut Child) -> std::io::Result<Option<ExitStatus
         // drop its wrapper. The owner still uses the public wrapper wait
         // when stopping the Windows job.
         unsafe { child.try_inner_child_mut() }
-            .ok_or_else(|| std::io::Error::other("shell parent unavailable"))?.try_wait()
+            .ok_or_else(|| std::io::Error::other("shell parent unavailable"))?
+            .try_wait()
     }
     #[cfg(not(windows))]
-    { child.try_wait() }
+    {
+        child.try_wait()
+    }
 }
 
 async fn shell_parent_wait(child: &mut Child) -> std::io::Result<ExitStatus> {
@@ -172,10 +185,20 @@ async fn shell_parent_wait(child: &mut Child) -> std::io::Result<ExitStatus> {
         // SAFETY: the borrow ends with parent wait; the captured job wrapper
         // remains in the owner for the public wrapper stop/wait.
         unsafe { child.try_inner_child_mut() }
-            .ok_or_else(|| std::io::Error::other("shell parent unavailable"))?.wait().await
+            .ok_or_else(|| std::io::Error::other("shell parent unavailable"))?
+            .wait()
+            .await
     }
     #[cfg(not(windows))]
-    { child.wait().await }
+    {
+        child.wait().await
+    }
+}
+
+impl Drop for ExecSession {
+    fn drop(&mut self) {
+        self.reader_shutdown.cancel();
+    }
 }
 
 impl Default for UnifiedExecHandler {
@@ -217,6 +240,144 @@ struct SessionBuffer {
     read_error: Option<String>,
 }
 
+/// Ordered, anonymous session staging. Only the existing durable output log is
+/// published; this bounded file is released with its session/readers.
+struct SessionSpool {
+    file: Option<tokio::fs::File>,
+    end: usize,
+    delivered: usize,
+    seen: [usize; 2],
+    acknowledged: [usize; 2],
+    used: [usize; 2],
+    limits: OneShotOutputLimits,
+    writable: bool,
+    lossy: bool,
+    error: Option<String>,
+}
+
+impl SessionSpool {
+    fn new(limits: OneShotOutputLimits) -> Self {
+        let (file, error) = match tempfile::tempfile() {
+            Ok(file) => (Some(tokio::fs::File::from_std(file)), None),
+            Err(error) => (None, Some(format!("output spool unavailable: {error}"))),
+        };
+        Self {
+            file,
+            end: 0,
+            delivered: 0,
+            seen: [0; 2],
+            acknowledged: [0; 2],
+            used: [0; 2],
+            limits,
+            writable: error.is_none(),
+            lossy: false,
+            error,
+        }
+    }
+
+    async fn append(
+        &mut self,
+        stream: usize,
+        seen: usize,
+        raw_bytes: usize,
+        text: &str,
+        lossy: bool,
+    ) {
+        self.seen[stream] = self.seen[stream].saturating_add(seen);
+        self.lossy |= lossy;
+        if text.is_empty() || !self.writable {
+            return;
+        }
+        let available = self
+            .limits
+            .stream_bytes
+            .saturating_sub(self.used[stream])
+            .min(self.limits.total_bytes.saturating_sub(self.end));
+        let mut length = text
+            .len()
+            .min(available.saturating_sub(SESSION_FRAME_BYTES));
+        while !text.is_char_boundary(length) {
+            length -= 1;
+        }
+        if length < text.len() {
+            self.error
+                .get_or_insert("output storage quota reached; source incomplete".into());
+        }
+        if length == 0 {
+            return;
+        }
+        // Lossy decoding cannot claim a precise raw-byte prefix after clipping.
+        let raw = if length == text.len() {
+            raw_bytes
+        } else if !lossy {
+            length
+        } else {
+            0
+        };
+        let mut header = [0u8; SESSION_FRAME_BYTES];
+        header[0] = stream as u8;
+        header[1..5].copy_from_slice(&(raw as u32).to_be_bytes());
+        header[5..9].copy_from_slice(&(length as u32).to_be_bytes());
+        let offset = self.end as u64;
+        let result = if let Some(file) = &mut self.file {
+            async {
+                file.seek(std::io::SeekFrom::Start(offset)).await?;
+                file.write_all(&header).await?;
+                file.write_all(&text.as_bytes()[..length]).await
+            }
+            .await
+        } else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                self.end += SESSION_FRAME_BYTES + length;
+                self.used[stream] += SESSION_FRAME_BYTES + length;
+            }
+            Err(error) => {
+                self.error = Some(format!(
+                    "output spool write failed; source incomplete: {error}"
+                ));
+                self.writable = false;
+            }
+        }
+    }
+
+    async fn next_frame(
+        &mut self,
+        through: usize,
+    ) -> std::io::Result<(usize, usize, String, usize)> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("output spool unavailable"))?;
+        file.seek(std::io::SeekFrom::Start(self.delivered as u64))
+            .await?;
+        let mut header = [0u8; SESSION_FRAME_BYTES];
+        file.read_exact(&mut header).await?;
+        let stream = header[0] as usize;
+        let raw = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+        let length = u32::from_be_bytes(header[5..9].try_into().unwrap()) as usize;
+        let end = self
+            .delivered
+            .saturating_add(SESSION_FRAME_BYTES)
+            .saturating_add(length);
+        if stream > 1
+            || length == 0
+            || length > 3 * (SHELL_CHUNK_BYTES + 3)
+            || raw > SHELL_CHUNK_BYTES + 3
+            || end > through
+        {
+            return Err(std::io::Error::other("invalid bounded output spool frame"));
+        }
+        let mut bytes = vec![0; length];
+        file.read_exact(&mut bytes).await?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| std::io::Error::other("invalid UTF-8 output spool frame"))?;
+        Ok((stream, raw, text, end))
+    }
+}
+
 impl SessionBuffer {
     fn append(&mut self, chunk: &[u8]) {
         self.bytes.extend_from_slice(chunk);
@@ -246,6 +407,39 @@ impl SessionBuffer {
     }
 }
 
+/// Keep only a UTF-8 tail in RAM. Full admitted bytes use the durable log.
+fn append_preview_tail(target: &mut String, text: &str, limit: usize) -> bool {
+    target.push_str(text);
+    if target.len() <= limit {
+        return false;
+    }
+    let mut start = target.len() - limit;
+    while !target.is_char_boundary(start) {
+        start += 1;
+    }
+    target.drain(..start);
+    true
+}
+
+fn retained_exec_payload(
+    mut input: ExecPayloadInput,
+    stats: Option<ExecOutputStats>,
+) -> ExecModelPayload {
+    let limit = input
+        .max_output_tokens
+        .map_or(pioneer_compaction::PAGE_BYTES / 4, |tokens| {
+            tokens
+                .saturating_mul(2)
+                .min(pioneer_compaction::PAGE_BYTES / 4)
+        });
+    input.force_truncated_stdout |= append_preview_tail(&mut input.stdout, "", limit);
+    input.force_truncated_stderr |= append_preview_tail(&mut input.stderr, "", limit);
+    // Aggregate is built from these exact previews. The common projector can
+    // remove that identical aggregate, including after caller preview limits.
+    input.max_output_tokens = None;
+    build_exec_model_payload_with_stats(input, stats)
+}
+
 struct ExecToolOutput {
     success: bool,
     ui_text: String,
@@ -253,6 +447,15 @@ struct ExecToolOutput {
 }
 
 impl ToolOutput for ExecToolOutput {
+    fn retained_output_log(&self) -> bool {
+        self.payload.output_stats.as_ref().is_some_and(|stats| {
+            matches!(
+                stats.truncation_method.as_str(),
+                "retained_output_log" | "retained_output_log_delta"
+            )
+        })
+    }
+
     fn success(&self) -> bool {
         self.success
     }
@@ -320,7 +523,8 @@ impl UnifiedExecHandler {
                 let status = terminate_child_process(&mut retained.child).await?;
                 retained.confirm_group().await?;
                 Ok(status)
-            }.await;
+            }
+            .await;
             observe_shell_status(
                 &mut retained.observation,
                 process_result.as_ref().ok().copied(),
@@ -397,7 +601,11 @@ impl UnifiedExecHandler {
     // A terminal command result and strict group cleanup are separate outcomes.
     // Normal completion may report its result on platforms without group
     // observation, while retaining the same owner and failed cleanup obligation.
-    async fn close_session_inner(&self, id: u64, require_group_completion: bool) -> Result<(), ToolError> {
+    async fn close_session_inner(
+        &self,
+        id: u64,
+        require_group_completion: bool,
+    ) -> Result<(), ToolError> {
         let session = self
             .sessions
             .lock()
@@ -507,8 +715,9 @@ impl UnifiedExecHandler {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let mut child = spawn_shell_command(command)
-            .map_err(|error| ToolError::execution_failed(format!("failed to spawn command: {error}")))?;
+        let mut child = spawn_shell_command(command).map_err(|error| {
+            ToolError::execution_failed(format!("failed to spawn command: {error}"))
+        })?;
 
         let observation = pioneer_observability::resources::ChildRegistration::register(
             child.id(),
@@ -525,13 +734,29 @@ impl UnifiedExecHandler {
         let stdout_buffer = Arc::new(Mutex::new(SessionBuffer::default()));
         let stderr_buffer = Arc::new(Mutex::new(SessionBuffer::default()));
         let mut readers = Vec::new();
+        let reader_shutdown = tokio_util::sync::CancellationToken::new();
+        let spool = Arc::new(Mutex::new(SessionSpool::new(self.one_shot_limits)));
         if let Some(stdout) = stdout {
-            readers.push(spawn_reader(stdout, stdout_buffer.clone()));
+            readers.push(spawn_retained_reader(
+                stdout,
+                stdout_buffer.clone(),
+                spool.clone(),
+                0,
+                reader_shutdown.child_token(),
+            ));
         }
         if let Some(stderr) = stderr {
-            readers.push(spawn_reader(stderr, stderr_buffer.clone()));
+            readers.push(spawn_retained_reader(
+                stderr,
+                stderr_buffer.clone(),
+                spool.clone(),
+                1,
+                reader_shutdown.child_token(),
+            ));
         }
 
+        let poll = Arc::new(Mutex::new(()));
+        let _poll = poll.lock().await;
         let session = Arc::new(Mutex::new(ExecSession {
             process_id: child.id(),
             process_correlation: pioneer_observability::scenario::Correlation::capture(),
@@ -542,11 +767,14 @@ impl UnifiedExecHandler {
             stdin,
             stdout: stdout_buffer,
             stderr: stderr_buffer,
+            spool,
             stdout_cursor: 0,
             stderr_cursor: 0,
             command: command_preview.clone(),
             started_at: session_started_at,
             last_touched: Instant::now(),
+            reader_shutdown,
+            poll: poll.clone(),
             _runtime_temp_dir: process_plan.runtime_temp_dir.clone(),
         }));
 
@@ -554,7 +782,6 @@ impl UnifiedExecHandler {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session_id, session.clone());
-
 
         let session_cancelled = tokio::select! {
             _ = cancellation.cancelled() => true,
@@ -574,30 +801,14 @@ impl UnifiedExecHandler {
                     );
                 }
             }
+            drain_session_pipes(&session).await;
+            let _ = save_session_output(&session, &trace).await;
             self.close_session(session_id).await?;
-            return Err(ToolError::cancelled("command cancelled"));
+            return Err(ToolError::cancelled(
+                "command cancelled; only acknowledged output can be recovered",
+            ));
         }
 
-        let initial = read_session_chunk(session.clone()).await?;
-        let output_commit = tokio::select! {
-            result = async {
-                emit_shell_chunk_delta(&trace, &initial.stdout, "stdout").await?;
-                emit_shell_chunk_delta(&trace, &initial.stderr, "stderr").await?;
-                match initial.read_error.as_ref() {
-                    Some(error) => Err(ToolError::execution_failed(error.clone())),
-                    None => Ok(()),
-                }
-            } => result,
-            _ = cancellation.cancelled() => Err(ToolError::cancelled("shell cancelled while saving output")),
-        };
-        if let Err(error) = output_commit {
-            let mut guard = session.lock().await;
-            let terminated = terminate_child_process(&mut guard.child).await;
-            observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
-            drop(guard);
-            self.close_session(session_id).await?;
-            return Err(error);
-        }
         let state = {
             let mut guard = session.lock().await;
             let status = shell_parent_try_wait(&mut guard.child).map_err(|error| {
@@ -608,23 +819,51 @@ impl UnifiedExecHandler {
             }
             ProcessState::from_status(status)
         };
+        if state.finished {
+            drain_session_pipes(&session).await;
+        }
+        let initial = read_session_chunk(session.clone()).await?;
+        let output_commit = tokio::select! {
+            result = async {
+                let stats = save_session_output(&session, &trace).await?;
+                match initial.read_error.as_ref() {
+                    Some(error) => Err(ToolError::execution_failed(error.clone())),
+                    None => Ok(stats),
+                }
+            } => result,
+            _ = cancellation.cancelled() => Err(ToolError::cancelled("shell cancelled while saving output")),
+        };
+        let output_stats = match output_commit {
+            Ok(stats) => stats,
+            Err(error) => {
+                let mut guard = session.lock().await;
+                let terminated = terminate_child_process(&mut guard.child).await;
+                observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
+                drop(guard);
+                self.close_session(session_id).await?;
+                return Err(error);
+            }
+        };
 
         if state.finished {
             self.close_session_inner(session_id, false).await?;
         }
 
-        let payload = build_exec_model_payload(ExecPayloadInput {
-            exit_code: state.exit_code,
-            timed_out: false,
-            duration_ms: session_started_at.elapsed().as_millis() as u64,
-            stdout: initial.stdout,
-            stderr: initial.stderr,
-            session_id: Some(session_id),
-            command: command_preview,
-            max_output_tokens: args.max_output_tokens,
-            force_truncated_stdout: initial.stdout_lost_output,
-            force_truncated_stderr: initial.stderr_lost_output,
-        });
+        let payload = retained_exec_payload(
+            ExecPayloadInput {
+                exit_code: state.exit_code,
+                timed_out: false,
+                duration_ms: session_started_at.elapsed().as_millis() as u64,
+                stdout: initial.stdout,
+                stderr: initial.stderr,
+                session_id: Some(session_id),
+                command: command_preview,
+                max_output_tokens: args.max_output_tokens,
+                force_truncated_stdout: initial.stdout_lost_output,
+                force_truncated_stderr: initial.stderr_lost_output,
+            },
+            Some(output_stats),
+        );
 
         Ok(Box::new(ExecToolOutput {
             success: state.success,
@@ -650,6 +889,11 @@ impl UnifiedExecHandler {
                 ToolError::NotFound(format!("session {} was not found", args.session_id))
             })?;
 
+        let poll = session.lock().await.poll.clone();
+        let _poll = tokio::select! {
+            guard = poll.lock() => guard,
+            _ = cancellation.cancelled() => return Err(ToolError::cancelled("write_stdin cancelled while waiting for session")),
+        };
         if let Some(chars) = args.chars.as_deref() {
             let mut guard = session.lock().await;
             guard.last_touched = Instant::now();
@@ -672,30 +916,10 @@ impl UnifiedExecHandler {
 
         tokio::select! {
             _ = cancellation.cancelled() => {
-                return Err(ToolError::cancelled("write_stdin cancelled"));
+                let _ = save_session_output(&session, &trace).await;
+                return Err(ToolError::cancelled("write_stdin cancelled; session remains active; only acknowledged output can be recovered"));
             }
             _ = sleep(Duration::from_millis(args.yield_time_ms.unwrap_or(DEFAULT_YIELD_MS))) => {}
-        }
-
-        let chunk = read_session_chunk(session.clone()).await?;
-        let output_commit = tokio::select! {
-            result = async {
-                emit_shell_chunk_delta(&trace, &chunk.stdout, "stdout").await?;
-                emit_shell_chunk_delta(&trace, &chunk.stderr, "stderr").await?;
-                match chunk.read_error.as_ref() {
-                    Some(error) => Err(ToolError::execution_failed(error.clone())),
-                    None => Ok(()),
-                }
-            } => result,
-            _ = cancellation.cancelled() => Err(ToolError::cancelled("shell cancelled while saving output")),
-        };
-        if let Err(error) = output_commit {
-            let mut guard = session.lock().await;
-            let terminated = terminate_child_process(&mut guard.child).await;
-            observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
-            drop(guard);
-            self.close_session(args.session_id).await?;
-            return Err(error);
         }
 
         let (state, command_preview, started_at, process_correlation) = {
@@ -714,6 +938,31 @@ impl UnifiedExecHandler {
                 guard.process_correlation.clone(),
             )
         };
+        if state.finished {
+            drain_session_pipes(&session).await;
+        }
+        let chunk = read_session_chunk(session.clone()).await?;
+        let output_commit = tokio::select! {
+            result = async {
+                let stats = save_session_output(&session, &trace).await?;
+                match chunk.read_error.as_ref() {
+                    Some(error) => Err(ToolError::execution_failed(error.clone())),
+                    None => Ok(stats),
+                }
+            } => result,
+            _ = cancellation.cancelled() => Err(ToolError::cancelled("shell cancelled while saving output")),
+        };
+        let output_stats = match output_commit {
+            Ok(stats) => stats,
+            Err(error) => {
+                let mut guard = session.lock().await;
+                let terminated = terminate_child_process(&mut guard.child).await;
+                observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
+                drop(guard);
+                self.close_session(args.session_id).await?;
+                return Err(error);
+            }
+        };
 
         let mut process_observation = pioneer_observability::tool_call::Measurement::start_linked(
             pioneer_observability::tool_call::Phase::ShellProcessState,
@@ -731,18 +980,21 @@ impl UnifiedExecHandler {
             self.close_session_inner(args.session_id, false).await?;
         }
 
-        let payload = build_exec_model_payload(ExecPayloadInput {
-            exit_code: state.exit_code,
-            timed_out: false,
-            duration_ms: started_at.elapsed().as_millis() as u64,
-            stdout: chunk.stdout,
-            stderr: chunk.stderr,
-            session_id: Some(args.session_id),
-            command: command_preview,
-            max_output_tokens: args.max_output_tokens,
-            force_truncated_stdout: chunk.stdout_lost_output,
-            force_truncated_stderr: chunk.stderr_lost_output,
-        });
+        let payload = retained_exec_payload(
+            ExecPayloadInput {
+                exit_code: state.exit_code,
+                timed_out: false,
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                stdout: chunk.stdout,
+                stderr: chunk.stderr,
+                session_id: Some(args.session_id),
+                command: command_preview,
+                max_output_tokens: args.max_output_tokens,
+                force_truncated_stdout: chunk.stdout_lost_output,
+                force_truncated_stderr: chunk.stderr_lost_output,
+            },
+            Some(output_stats),
+        );
 
         Ok(Box::new(ExecToolOutput {
             success: state.success,
@@ -767,7 +1019,8 @@ impl UnifiedExecHandler {
                     let cleanup = async {
                         terminate_child_process(&mut retained.child).await?;
                         retained.confirm_group().await
-                    }.await;
+                    }
+                    .await;
                     if let Err(error) = cleanup {
                         self.remember_cleanup_error(&error);
                         continue;
@@ -808,7 +1061,9 @@ impl UnifiedExecHandler {
             let finished = status.is_some();
             observe_shell_status(&mut guard.observation, status);
 
-            if finished || expired {
+            // Finished sessions may still own unpolled spool data. Their final
+            // poll drains and releases it; the existing TTL bounds abandoned ones.
+            if expired {
                 if !finished {
                     let terminated = terminate_child_process(&mut guard.child).await;
                     observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
@@ -961,8 +1216,9 @@ async fn run_one_shot(
     let timeout_ms = process_plan.timeout_ms;
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    let child = spawn_shell_command(command)
-        .map_err(|error| ToolError::execution_failed(format!("failed to spawn command: {error}")))?;
+    let child = spawn_shell_command(command).map_err(|error| {
+        ToolError::execution_failed(format!("failed to spawn command: {error}"))
+    })?;
     let observation = pioneer_observability::resources::ChildRegistration::register(
         child.id(),
         pioneer_observability::resources::ChildRole::Shell,
@@ -1001,8 +1257,10 @@ async fn run_one_shot(
         ToolError::internal("stderr pipe was unexpectedly unavailable".to_owned())
     })?;
 
-    let (stream_limit, total_limit) =
-        one_shot_output_limits(args.max_output_tokens, configured_limits);
+    let (stream_limit, total_limit) = (
+        configured_limits.stream_bytes,
+        configured_limits.total_bytes,
+    );
     let output_budget = Arc::new(OneShotOutputBudget::new(stream_limit, total_limit));
     let reader_shutdown = tokio_util::sync::CancellationToken::new();
     let (chunk_tx, mut chunk_rx) =
@@ -1052,7 +1310,14 @@ async fn run_one_shot(
     let mut status_opt: Option<ExitStatus> = None;
     let mut timed_out = false;
     let mut cancelled = false;
-    let mut limit_termination_started = false;
+    let mut source_failed = !trace.has_durable_consumer();
+    let mut source_lossy = false;
+    let mut stdout_saved_pending = Vec::new();
+    let mut stderr_saved_pending = Vec::new();
+    let mut stdout_admitted = 0usize;
+    let mut stderr_admitted = 0usize;
+    let mut stdout_saved = 0usize;
+    let mut stderr_saved = 0usize;
     let mut stdout_truncated = false;
     let mut stderr_truncated = false;
     let mut pipe_drain_deadline: Option<TokioInstant> = None;
@@ -1105,29 +1370,33 @@ async fn run_one_shot(
             }
             chunk = chunk_rx.recv() => {
                 match chunk {
-                    Some(ShellChunkEvent::Data { stream, text }) => {
+                    Some(ShellChunkEvent::Data { stream, text, retained }) => {
+                        let admitted = if stream == "stdout" { &mut stdout_admitted } else { &mut stderr_admitted };
+                        *admitted = admitted.saturating_add(retained);
+                        let saved_pending = if stream == "stdout" { &mut stdout_saved_pending } else { &mut stderr_saved_pending };
+                        let (saved, lossy) = decode_shell_bytes_with_loss(saved_pending, &text[..retained], retained < text.len());
+                        source_lossy |= lossy;
+                        let pending_bytes = saved_pending.len();
                         let pending = if stream == "stdout" { &mut stdout_pending } else { &mut stderr_pending };
-                        let text = decode_shell_bytes(pending, &text, false);
-                        if text.is_empty() { continue; }
-                        if stream == "stdout" {
-                            stdout_buf.push_str(text.as_str());
+                        let preview = decode_shell_bytes(pending, &text, false);
+                        let shortened = if stream == "stdout" {
+                            append_preview_tail(&mut stdout_buf, &preview, pioneer_compaction::PAGE_BYTES / 4)
                         } else {
-                            stderr_buf.push_str(text.as_str());
-                        }
-                        let commit = tokio::select! {
-                            result = trace.emit_output_chunk_delta(1, shell_delta_stream(stream), text, false) => result,
-                            _ = cancellation.cancelled() => Err(ToolError::cancelled("command cancelled while saving output")),
-                            _ = &mut wait_deadline, if status_opt.is_none() => Err(ToolError::execution_failed("command timed out while saving output")),
+                            append_preview_tail(&mut stderr_buf, &preview, pioneer_compaction::PAGE_BYTES / 4)
                         };
-                        if let Err(error) = commit {
-                            // Do not leave descendants or blocked reader tasks alive
-                            // when the consumer rejects output or cancellation wins.
-                            kill_process_tree(process_id, true);
-                            let _ = child.start_kill();
-                            let _ = shell_parent_wait(child).await;
-                            reader_shutdown.cancel();
-                            stdout_task.abort(); stderr_task.abort();
-                            return Err(error);
+                        if stream == "stdout" { stdout_truncated |= shortened; } else { stderr_truncated |= shortened; }
+                        if !source_failed && !saved.is_empty() {
+                            // Durable lane supplies backpressure. A failed save
+                            // never expands capture RAM or silently kills a command.
+                            source_failed = tokio::select! {
+                                result = trace.emit_output_chunk_delta(1, shell_delta_stream(stream), saved, false) => result.is_err(),
+                                _ = cancellation.cancelled() => true,
+                                _ = &mut wait_deadline, if status_opt.is_none() => true,
+                            };
+                            if !source_failed {
+                                if stream == "stdout" { stdout_saved = stdout_admitted.saturating_sub(pending_bytes); }
+                                else { stderr_saved = stderr_admitted.saturating_sub(pending_bytes); }
+                            }
                         }
                     }
                     Some(ShellChunkEvent::LimitExceeded { stream }) => {
@@ -1136,22 +1405,27 @@ async fn run_one_shot(
                         } else {
                             stderr_truncated = true;
                         }
-                        if status_opt.is_none() && !limit_termination_started {
-                            limit_termination_started = true;
-                            status_opt = Some(terminate_child_process(child).await?);
-                    observe_shell_status(observation, status_opt);
-                            pipe_drain_deadline.get_or_insert_with(|| {
-                                TokioInstant::now()
-                                    + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
-                            });
-                        }
+                        // Storage admission is distinct from execution. Continue
+                        // draining for useful late diagnostics under the same deadline.
                     }
                     Some(ShellChunkEvent::Closed { stream }) => {
                         let pending = if stream == "stdout" { &mut stdout_pending } else { &mut stderr_pending };
                         let text = decode_shell_bytes(pending, &[], true);
-                        if stream == "stdout" { stdout_buf.push_str(&text); } else { stderr_buf.push_str(&text); }
-                        // Only an incomplete final byte sequence can remain here;
-                        // the terminal result retains its replacement character.
+                        if stream == "stdout" { append_preview_tail(&mut stdout_buf, &text, pioneer_compaction::PAGE_BYTES / 4); }
+                        else { append_preview_tail(&mut stderr_buf, &text, pioneer_compaction::PAGE_BYTES / 4); }
+                        let saved_pending = if stream == "stdout" { &mut stdout_saved_pending } else { &mut stderr_saved_pending };
+                        let (saved, lossy) = decode_shell_bytes_with_loss(saved_pending, &[], true);
+                        source_lossy |= lossy;
+                        if !source_failed && !saved.is_empty() {
+                            source_failed = tokio::select! {
+                                result = trace.emit_output_chunk_delta(1, shell_delta_stream(stream), saved, false) => result.is_err(),
+                                _ = cancellation.cancelled() => true,
+                                _ = &mut wait_deadline, if status_opt.is_none() => true,
+                            };
+                            if !source_failed {
+                                if stream == "stdout" { stdout_saved = stdout_admitted; } else { stderr_saved = stderr_admitted; }
+                            }
+                        }
                     }
                     None => {
                         if status_opt.is_some() && stdout_task.is_finished() && stderr_task.is_finished() {
@@ -1181,7 +1455,11 @@ async fn run_one_shot(
     }
 
     if cancelled {
-        return Err(ToolError::cancelled("command cancelled"));
+        // Do not wait for another storage ACK after cancellation. Already
+        // acknowledged chunks remain readable; unacknowledged bytes are unknown.
+        return Err(ToolError::cancelled(
+            "command cancelled; only acknowledged output can be recovered",
+        ));
     }
 
     let stdout_summary = stdout_result
@@ -1220,22 +1498,46 @@ async fn run_one_shot(
     let output_stats = ExecOutputStats {
         stdout: ExecStreamOutputStats {
             bytes_seen: stdout_summary.bytes_seen,
-            bytes_retained: stdout_summary.bytes_retained,
-            bytes_dropped: stdout_summary
-                .bytes_seen
-                .saturating_sub(stdout_summary.bytes_retained),
+            bytes_retained: stdout_saved,
+            bytes_dropped: stdout_summary.bytes_seen.saturating_sub(stdout_saved),
         },
         stderr: ExecStreamOutputStats {
             bytes_seen: stderr_summary.bytes_seen,
-            bytes_retained: stderr_summary.bytes_retained,
-            bytes_dropped: stderr_summary
-                .bytes_seen
-                .saturating_sub(stderr_summary.bytes_retained),
+            bytes_retained: stderr_saved,
+            bytes_dropped: stderr_summary.bytes_seen.saturating_sub(stderr_saved),
         },
-        truncation_method: "bounded_head_then_drain".to_owned(),
-        full_output_available: false,
+        truncation_method: if source_failed {
+            "retained_output_log_unavailable"
+        } else {
+            "retained_output_log"
+        }
+        .to_owned(),
+        full_output_available: !source_failed
+            && !source_lossy
+            && !stdout_summary.truncated
+            && !stderr_summary.truncated,
     };
-    let payload = build_exec_model_payload_with_stats(
+    let mut output_stats = output_stats;
+    if trace
+        .emit_progress_delta(
+            1,
+            "retained_output_log",
+            Some(serde_json::json!({
+                "full_output_available": output_stats.full_output_available,
+                "incomplete": !output_stats.full_output_available,
+                "decoding_replaced_bytes": source_lossy,
+            })),
+        )
+        .await
+        .is_err()
+    {
+        output_stats.full_output_available = false;
+        output_stats.truncation_method = "retained_output_log_unavailable".into();
+    }
+    if trace.has_saved_output_log() {
+        output_stats.truncation_method = "retained_output_log".into();
+    }
+    let payload = retained_exec_payload(
         ExecPayloadInput {
             exit_code: status.code(),
             timed_out,
@@ -1262,9 +1564,17 @@ async fn run_one_shot(
 }
 
 enum ShellChunkEvent {
-    Data { stream: &'static str, text: Vec<u8> },
-    LimitExceeded { stream: &'static str },
-    Closed { stream: &'static str },
+    Data {
+        stream: &'static str,
+        text: Vec<u8>,
+        retained: usize,
+    },
+    LimitExceeded {
+        stream: &'static str,
+    },
+    Closed {
+        stream: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1303,17 +1613,6 @@ impl OneShotOutputBudget {
     }
 }
 
-fn one_shot_output_limits(
-    max_output_tokens: Option<usize>,
-    configured: OneShotOutputLimits,
-) -> (usize, usize) {
-    let token_limit = max_output_tokens
-        .map(|tokens| tokens.saturating_mul(4))
-        .unwrap_or(usize::MAX);
-    let total_limit = configured.total_bytes.min(token_limit);
-    (configured.stream_bytes.min(total_limit), total_limit)
-}
-
 async fn read_stream_with_chunks<R>(
     mut reader: R,
     stream: &'static str,
@@ -1325,7 +1624,7 @@ where
     R: AsyncRead + Unpin,
 {
     let mut summary = StreamReadSummary::default();
-    let mut chunk = [0u8; 4096];
+    let mut chunk = [0u8; SHELL_CHUNK_BYTES];
     loop {
         let read = tokio::select! {
             biased;
@@ -1341,12 +1640,13 @@ where
         }
         summary.bytes_seen = summary.bytes_seen.saturating_add(read);
         let (retained, exceeded) = budget.claim(summary.bytes_seen.saturating_sub(read), read);
-        if retained > 0 {
+        {
             if !send_shell_chunk(
                 &tx,
                 ShellChunkEvent::Data {
                     stream,
-                    text: chunk[..retained].to_vec(),
+                    text: chunk[..read].to_vec(),
+                    retained,
                 },
                 &shutdown,
             )
@@ -1568,8 +1868,11 @@ async fn terminate_child_process(child: &mut Child) -> Result<ExitStatus, ToolEr
         let _ = terminate_windows_process_tree(pid, false);
     }
 
-    let waited =
-        tokio::time::timeout(Duration::from_millis(PROCESS_KILL_GRACE_MS), shell_parent_wait(child)).await;
+    let waited = tokio::time::timeout(
+        Duration::from_millis(PROCESS_KILL_GRACE_MS),
+        shell_parent_wait(child),
+    )
+    .await;
     match waited {
         Ok(Ok(status)) => {
             // The parent can exit on SIGTERM while a descendant ignores it.
@@ -1595,31 +1898,48 @@ async fn terminate_child_process(child: &mut Child) -> Result<ExitStatus, ToolEr
 // None is published only after confirmed disappearance. Every spawned shell
 // captures its group leader before the first await and retains it across waits.
 async fn confirm_shell_group(child: &mut Child, group: &mut Option<u32>) -> Result<(), ToolError> {
-    let Some(pid) = *group else { return Ok(()); };
+    let Some(pid) = *group else {
+        return Ok(());
+    };
     #[cfg(unix)]
     let _ = &child;
     #[cfg(unix)]
     {
-        let pgid = i32::try_from(pid).ok().filter(|pid| *pid > 0)
+        let pgid = i32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
             .ok_or_else(|| ToolError::internal("shell process group identity unavailable"))?;
         let gone = || -> Result<bool, ToolError> {
-            if unsafe { libc::kill(-pgid, 0) } == 0 { return Ok(false); }
+            if unsafe { libc::kill(-pgid, 0) } == 0 {
+                return Ok(false);
+            }
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) { Ok(true) }
-            else { Err(ToolError::execution_failed(format!("failed to observe shell group: {error}"))) }
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(true)
+            } else {
+                Err(ToolError::execution_failed(format!(
+                    "failed to observe shell group: {error}"
+                )))
+            }
         };
         if !gone()? {
             if unsafe { libc::kill(-pgid, libc::SIGKILL) } != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(ToolError::execution_failed(format!("failed to kill shell group: {error}")));
+                    return Err(ToolError::execution_failed(format!(
+                        "failed to kill shell group: {error}"
+                    )));
                 }
             }
             let deadline = TokioInstant::now() + Duration::from_millis(PROCESS_KILL_GRACE_MS);
             loop {
-                if gone()? { break; }
+                if gone()? {
+                    break;
+                }
                 if TokioInstant::now() >= deadline {
-                    return Err(ToolError::execution_failed("shell group cleanup deadline exhausted"));
+                    return Err(ToolError::execution_failed(
+                        "shell group cleanup deadline exhausted",
+                    ));
                 }
                 sleep(Duration::from_millis(10)).await;
             }
@@ -1630,9 +1950,12 @@ async fn confirm_shell_group(child: &mut Child, group: &mut Option<u32>) -> Resu
     #[cfg(windows)]
     {
         let _ = pid;
-        child.start_kill().map_err(|e| ToolError::execution_failed(format!("failed to terminate shell job: {e}")))?;
+        child.start_kill().map_err(|e| {
+            ToolError::execution_failed(format!("failed to terminate shell job: {e}"))
+        })?;
         tokio::time::timeout(Duration::from_millis(PROCESS_KILL_GRACE_MS), child.wait())
-            .await.map_err(|_| ToolError::execution_failed("shell job cleanup deadline exhausted"))?
+            .await
+            .map_err(|_| ToolError::execution_failed("shell job cleanup deadline exhausted"))?
             .map_err(|e| ToolError::execution_failed(format!("failed to drain shell job: {e}")))?;
         *group = None;
         Ok(())
@@ -1640,7 +1963,9 @@ async fn confirm_shell_group(child: &mut Child, group: &mut Option<u32>) -> Resu
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (child, pid);
-        Err(ToolError::execution_failed("shell group completion observation unavailable"))
+        Err(ToolError::execution_failed(
+            "shell group completion observation unavailable",
+        ))
     }
 }
 
@@ -1718,39 +2043,191 @@ fn complete_utf8_prefix(bytes: &[u8]) -> usize {
     offset
 }
 fn decode_shell_bytes(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> String {
+    decode_shell_bytes_with_loss(pending, bytes, eof).0
+}
+
+fn decode_shell_bytes_with_loss(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> (String, bool) {
     pending.extend_from_slice(bytes);
     let length = if eof {
         pending.len()
     } else {
         complete_utf8_prefix(pending)
     };
+    let lossy = std::str::from_utf8(&pending[..length]).is_err();
     let text = String::from_utf8_lossy(&pending[..length]).into_owned();
     pending.drain(..length);
-    text
+    (text, lossy)
 }
 
-fn spawn_reader<R>(mut reader: R, target: Arc<Mutex<SessionBuffer>>) -> tokio::task::JoinHandle<()>
+fn spawn_retained_reader<R>(
+    mut reader: R,
+    target: Arc<Mutex<SessionBuffer>>,
+    spool: Arc<Mutex<SessionSpool>>,
+    stream: usize,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut chunk = vec![0u8; 4096];
+        let mut chunk = [0u8; SHELL_CHUNK_BYTES];
+        let mut pending = Vec::new();
         loop {
-            let read = match reader.read(&mut chunk).await {
+            let read = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    spool.lock().await.error.get_or_insert("pipe drain interrupted; source incomplete".into());
+                    target.lock().await.closed = true;
+                    return;
+                },
+                read = reader.read(&mut chunk) => read,
+            };
+            let read = match read {
                 Ok(read) => read,
                 Err(error) => {
+                    spool
+                        .lock()
+                        .await
+                        .error
+                        .get_or_insert(format!("pipe read failed; source incomplete: {error}"));
                     let mut buffer = target.lock().await;
                     buffer.closed = true;
                     buffer.read_error = Some(error.to_string());
                     return;
                 }
             };
+            let before = pending.len();
+            let (text, lossy) =
+                decode_shell_bytes_with_loss(&mut pending, &chunk[..read], read == 0);
+            let consumed = before + read - pending.len();
+            // Serial append is the observed decoded-chunk capture order, not
+            // a claim about the process's total order across independent pipes.
+            spool
+                .lock()
+                .await
+                .append(stream, read, consumed, &text, lossy)
+                .await;
+            let mut buffer = target.lock().await;
             if read == 0 {
-                target.lock().await.closed = true;
+                buffer.closed = true;
                 return;
             }
-            target.lock().await.append(&chunk[..read]);
+            buffer.append(&chunk[..read]);
         }
+    })
+}
+
+async fn drain_session_pipes(session: &Arc<Mutex<ExecSession>>) {
+    let (stdout, stderr, spool, shutdown) = {
+        let guard = session.lock().await;
+        (
+            guard.stdout.clone(),
+            guard.stderr.clone(),
+            guard.spool.clone(),
+            guard.reader_shutdown.clone(),
+        )
+    };
+    let deadline = TokioInstant::now() + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS);
+    loop {
+        if stdout.lock().await.closed && stderr.lock().await.closed {
+            break;
+        }
+        if TokioInstant::now() >= deadline {
+            shutdown.cancel();
+            spool
+                .lock()
+                .await
+                .error
+                .get_or_insert("pipe drain deadline; source incomplete".into());
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Copy a finite ordered staging snapshot into the existing durable chunk lane.
+/// Drop the file mutex before each ACK wait; no DB capacity spans file I/O.
+async fn save_session_output(
+    session: &Arc<Mutex<ExecSession>>,
+    trace: &crate::events::ToolEventTrace,
+) -> Result<ExecOutputStats, ToolError> {
+    let spool = session.lock().await.spool.clone();
+    let (end, seen) = {
+        let guard = spool.lock().await;
+        (guard.end, guard.seen)
+    };
+    let mut save_failed = !trace.has_durable_consumer();
+    loop {
+        let frame = {
+            let mut guard = spool.lock().await;
+            if guard.delivered >= end {
+                break;
+            }
+            match guard.next_frame(end).await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    guard.error = Some(format!(
+                        "output spool read failed; source incomplete: {error}"
+                    ));
+                    break;
+                }
+            }
+        };
+        let (stream, raw, text, next) = frame;
+        if emit_shell_chunk_delta(trace, &text, if stream == 0 { "stdout" } else { "stderr" })
+            .await
+            .is_err()
+        {
+            save_failed = true;
+            spool
+                .lock()
+                .await
+                .error
+                .get_or_insert("durable output save failed; source incomplete".into());
+            break;
+        }
+        let mut guard = spool.lock().await;
+        guard.delivered = next;
+        guard.acknowledged[stream] += raw;
+    }
+    let (acknowledged, mut complete, diagnostic) = {
+        let guard = spool.lock().await;
+        (
+            guard.acknowledged,
+            !save_failed
+                && guard.error.is_none()
+                && !guard.lossy
+                && guard.delivered == end
+                && guard.acknowledged == seen,
+            guard.error.as_ref().map(|error| {
+                error
+                    .chars()
+                    .take(SOURCE_DIAGNOSTIC_CHARS)
+                    .collect::<String>()
+            }),
+        )
+    };
+    if trace.emit_progress_delta(1, "retained_output_log_delta", Some(serde_json::json!({
+        "full_output_available":complete,
+        "scope":"delta since the preceding poll; statistics are cumulative session counters",
+        "stream_order":"observed decoded-chunk capture order; independent pipes have no process total order",
+        "diagnostic":diagnostic,
+        "incomplete_reason":if complete { None } else { Some("storage quota, I/O/pipe error, replaced non-UTF-8 bytes, or pending UTF-8 suffix") },
+    }))).await.is_err() { complete = false; }
+    let stats = |stream: usize| ExecStreamOutputStats {
+        bytes_seen: seen[stream],
+        bytes_retained: acknowledged[stream],
+        bytes_dropped: seen[stream].saturating_sub(acknowledged[stream]),
+    };
+    Ok(ExecOutputStats {
+        stdout: stats(0),
+        stderr: stats(1),
+        truncation_method: if trace.has_saved_output_log() {
+            "retained_output_log_delta"
+        } else {
+            "retained_output_log_unavailable"
+        }
+        .into(),
+        full_output_available: complete,
     })
 }
 
@@ -1852,38 +2329,62 @@ mod tests {
             while !root.path().join("descendant").exists() {
                 sleep(Duration::from_millis(5)).await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let mut status = 0;
-                let observed = unsafe { libc::waitpid(pgid as i32, &mut status, libc::WNOHANG | libc::WUNTRACED) };
-                if observed == pgid as i32 && libc::WIFSTOPPED(status) { break; }
+                let observed = unsafe {
+                    libc::waitpid(pgid as i32, &mut status, libc::WNOHANG | libc::WUNTRACED)
+                };
+                if observed == pgid as i32 && libc::WIFSTOPPED(status) {
+                    break;
+                }
                 sleep(Duration::from_millis(5)).await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let descendant: i32 = std::fs::read_to_string(root.path().join("descendant"))
-            .unwrap().trim().parse().unwrap();
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert_eq!(unsafe { libc::getpgid(descendant) }, pgid as i32);
         let handler = UnifiedExecHandler::default();
         let retained = Arc::new(Mutex::new(RetainedOneShot {
             observation: pioneer_observability::resources::ChildRegistration::register(
-                Some(pgid), pioneer_observability::resources::ChildRole::Shell, None),
-            child, readers: Vec::new(), reader_error: None, process_id: Some(pgid),
+                Some(pgid),
+                pioneer_observability::resources::ChildRole::Shell,
+                None,
+            ),
+            child,
+            readers: Vec::new(),
+            reader_error: None,
+            process_id: Some(pgid),
             _runtime_temp_dir: None,
         }));
-        handler.one_shots.lock().unwrap().insert(1, retained.clone());
+        handler
+            .one_shots
+            .lock()
+            .unwrap()
+            .insert(1, retained.clone());
         {
             let mut observer = Box::pin(handler.stop_and_wait());
             std::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(observer.as_mut(), cx).is_pending());
                 std::task::Poll::Ready(())
-            }).await;
+            })
+            .await;
         }
         assert!(!handler.cleanup_is_quiescent());
         assert_eq!(retained.lock().await.process_id, Some(pgid));
         // Resuming allows the pending TERM to reap the parent. Actual group
         // disappearance, including orphan reaping by the OS, is independent.
-        unsafe { libc::kill(pgid as i32, libc::SIGCONT); }
+        unsafe {
+            libc::kill(pgid as i32, libc::SIGCONT);
+        }
         let result = handler.stop_and_wait().await;
         let gone = unsafe { libc::kill(-(pgid as i32), 0) } == -1
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
@@ -2214,7 +2715,16 @@ mod tests {
             }
         }
         let buffer = Arc::new(Mutex::new(SessionBuffer::default()));
-        spawn_reader(BrokenReader(false), buffer.clone());
+        spawn_retained_reader(
+            BrokenReader(false),
+            buffer.clone(),
+            Arc::new(Mutex::new(SessionSpool::new(OneShotOutputLimits {
+                stream_bytes: 1024,
+                total_bytes: 2048,
+            }))),
+            0,
+            tokio_util::sync::CancellationToken::new(),
+        );
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if buffer.lock().await.closed {
@@ -2236,10 +2746,15 @@ mod tests {
         let mut pending = Vec::new();
         let mut decoded = String::new();
         for byte in original.as_bytes() {
-            decoded.push_str(&decode_shell_bytes(&mut pending, &[*byte], false));
+            let (text, lossy) = decode_shell_bytes_with_loss(&mut pending, &[*byte], false);
+            assert!(!lossy, "a split scalar is pending, not invalid");
+            decoded.push_str(&text);
         }
         decoded.push_str(&decode_shell_bytes(&mut pending, &[], true));
         assert_eq!(decoded, original);
+        let (replacement, lossy) = decode_shell_bytes_with_loss(&mut pending, &[0xff], true);
+        assert_eq!(replacement, "\u{fffd}");
+        assert!(lossy, "replacement must make full-source claims incomplete");
         let mut buffer = SessionBuffer::default();
         let mut cursor = 0;
         let mut decoded = String::new();
@@ -2254,9 +2769,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_output_commit_is_cancellable_and_rejection_stops_process() {
-        for reject in [false, true] {
-            let handler = UnifiedExecHandler::default();
+    async fn command_output_commit_is_cancellable_without_a_storage_ack() {
+        for tty in [false, true] {
+            let handler = Arc::new(UnifiedExecHandler::default());
             let cancellation = tokio_util::sync::CancellationToken::new();
             let mut invocation = invocation(
                 "exec_command",
@@ -2269,15 +2784,17 @@ mod tests {
                     workdir: None,
                     timeout_ms: None,
                     max_output_tokens: None,
-                    yield_time_ms: None,
-                    tty: Some(false),
+                    yield_time_ms: Some(50),
+                    tty: Some(tty),
                 })),
             );
             invocation.cancellation = cancellation.clone();
             let bus = ToolEventBus::new(8);
             let mut durable = bus.take_durable_receiver().unwrap();
             let trace = bus.start_trace("turn", "call", "exec_command");
-            let task = tokio::spawn(async move { handler.handle(invocation, trace).await });
+            let proof = trace.clone();
+            let running = handler.clone();
+            let task = tokio::spawn(async move { running.handle(invocation, trace).await });
             let chunk = tokio::time::timeout(Duration::from_secs(5), durable.recv())
                 .await
                 .unwrap()
@@ -2287,37 +2804,50 @@ mod tests {
                 crate::events::ToolEventPayload::OutputDelta(_)
             ));
             assert!(!task.is_finished());
-            if reject {
-                chunk.acknowledge(Err("disk unavailable".into()));
-            } else {
-                cancellation.cancel();
-            }
+            cancellation.cancel();
             let result = tokio::time::timeout(Duration::from_secs(3), task)
                 .await
                 .expect("output wait must not block cancellation")
                 .unwrap();
-            let error = match result {
-                Err(error) => error,
-                Ok(_) => panic!("must fail"),
-            };
-            if reject {
-                assert!(error.to_string().contains("disk unavailable"));
-            } else {
-                assert!(matches!(error, ToolError::Cancelled(_)));
-            }
+            assert!(matches!(result, Err(ToolError::Cancelled(_))));
+            assert!(
+                !proof.has_saved_output_log(),
+                "no positive storage ACK was received"
+            );
+            assert!(
+                handler
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "cancelled initial delivery must release its session owner"
+            );
         }
     }
 
     #[tokio::test]
     async fn exec_command_receives_invocation_environment() {
         // Exercise ordinary command completion for both supported Windows modes.
-        let modes: &[bool] = if cfg!(windows) { &[false, true] } else { &[false] };
+        let modes: &[bool] = if cfg!(windows) {
+            &[false, true]
+        } else {
+            &[false]
+        };
         for &tty in modes {
             let handler = UnifiedExecHandler::default();
             #[cfg(windows)]
-            let command = vec!["cmd.exe".into(), "/D".into(), "/C".into(), "echo %PIONEER_TEST_OUTPUT_DIR%".into()];
+            let command = vec![
+                "cmd.exe".into(),
+                "/D".into(),
+                "/C".into(),
+                "echo %PIONEER_TEST_OUTPUT_DIR%".into(),
+            ];
             #[cfg(not(windows))]
-            let command = vec!["sh".into(), "-c".into(), "printf %s \"$PIONEER_TEST_OUTPUT_DIR\"".into()];
+            let command = vec![
+                "sh".into(),
+                "-c".into(),
+                "printf %s \"$PIONEER_TEST_OUTPUT_DIR\"".into(),
+            ];
             let mut tool_invocation = invocation(
                 "exec_command",
                 ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
@@ -2333,28 +2863,50 @@ mod tests {
                 "PIONEER_TEST_OUTPUT_DIR".to_owned(),
                 "/tmp/pioneer-output-test".to_owned(),
             );
-            let mut output = handler.handle(tool_invocation, trace("exec_command"))
-                .await.expect("exec command should execute");
+            let mut output = handler
+                .handle(tool_invocation, trace("exec_command"))
+                .await
+                .expect("exec command should execute");
             let mut text = output.raw_text();
             if cfg!(windows) && tty {
                 let session_id = parse_session_id(&text);
                 tokio::time::timeout(Duration::from_secs(5), async {
                     while output.raw_json()["exit_code"].is_null() {
-                        output = handler.handle(invocation("write_stdin",
-                            ToolPayload::LocalShell(LocalShellPayload::WriteStdin(WriteStdinArgs {
-                                session_id, chars: None, yield_time_ms: Some(10), max_output_tokens: None,
-                            }))), trace("write_stdin")).await.unwrap();
+                        output = handler
+                            .handle(
+                                invocation(
+                                    "write_stdin",
+                                    ToolPayload::LocalShell(LocalShellPayload::WriteStdin(
+                                        WriteStdinArgs {
+                                            session_id,
+                                            chars: None,
+                                            yield_time_ms: Some(10),
+                                            max_output_tokens: None,
+                                        },
+                                    )),
+                                ),
+                                trace("write_stdin"),
+                            )
+                            .await
+                            .unwrap();
                         text.push_str(&output.raw_text());
                     }
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
             }
             assert!(output.success(), "full access output should succeed");
             assert_eq!(output.raw_json()["exit_code"], 0);
-            assert!(text.contains("/tmp/pioneer-output-test"),
-                "expected invocation env in command output: {text}");
+            assert!(
+                text.contains("/tmp/pioneer-output-test"),
+                "expected invocation env in command output: {text}"
+            );
             #[cfg(windows)]
             {
-                assert!(handler.cleanup_is_quiescent(), "normal stop releases the shell owner");
+                assert!(
+                    handler.cleanup_is_quiescent(),
+                    "normal stop releases the shell owner"
+                );
                 for _ in 0..2 {
                     handler.stop_and_wait().await.unwrap();
                     assert!(handler.cleanup_is_quiescent());
@@ -2746,7 +3298,8 @@ mod tests {
                         command: Some(vec![
                             "sh".to_owned(),
                             "-c".to_owned(),
-                            "head -c 2000000 /dev/zero".to_owned(),
+                            "head -c 2000000 /dev/zero; printf late-stderr-error >&2; exit 7"
+                                .to_owned(),
                         ]),
                         workdir: None,
                         timeout_ms: Some(5_000),
@@ -2761,6 +3314,13 @@ mod tests {
             .expect("bounded output should return a structured result");
 
         let payload = output.raw_json();
+        assert_eq!(payload["exit_code"], 7);
+        assert!(
+            payload["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("late-stderr-error")
+        );
         let stdout = payload
             .get("stdout")
             .and_then(serde_json::Value::as_str)
@@ -2772,13 +3332,6 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true),
             "oversized one-shot stdout must carry truncation metadata: {payload}"
-        );
-        assert_eq!(
-            payload
-                .pointer("/output_stats/stdout/bytes_retained")
-                .and_then(serde_json::Value::as_u64),
-            Some(ONE_SHOT_MAX_STREAM_BYTES as u64),
-            "the retained head must stay at the per-stream hard limit: {payload}"
         );
         assert!(
             payload
@@ -2792,18 +3345,235 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_output_hint_can_only_narrow_deployment_limits() {
-        let configured = OneShotOutputLimits {
-            stream_bytes: 2_000,
-            total_bytes: 3_000,
+    #[tokio::test]
+    async fn one_shot_durable_source_is_separate_from_preview_and_save_failure_keeps_exit() {
+        use crate::events::{ToolDeltaPayload, ToolEventPayload};
+        for fail in [false, true] {
+            let bus = ToolEventBus::new(8);
+            let mut receiver = bus.take_durable_receiver().unwrap();
+            let trace = bus.start_trace("source-turn", "source-call", "exec_command");
+            let reader = tokio::spawn(async move {
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                let mut rejected = false;
+                while let Some(envelope) = receiver.recv().await {
+                    let mut done = false;
+                    if let ToolEventPayload::OutputDelta(delta) = &envelope.event.payload {
+                        match &delta.delta {
+                            ToolDeltaPayload::OutputChunk { stream, text, .. } => {
+                                if fail && !rejected {
+                                    rejected = true;
+                                    envelope.acknowledge(Err("fixture disk failure".into()));
+                                    continue;
+                                }
+                                match stream {
+                                    pioneer_protocol::ItemDeltaStream::Stdout => {
+                                        stdout.push_str(text)
+                                    }
+                                    pioneer_protocol::ItemDeltaStream::Stderr => {
+                                        stderr.push_str(text)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            ToolDeltaPayload::Progress { stage, .. } => {
+                                done = stage == "retained_output_log"
+                            }
+                            _ => {}
+                        }
+                    }
+                    envelope.acknowledge(Ok(()));
+                    if done {
+                        break;
+                    }
+                }
+                (stdout, stderr)
+            });
+            let output = UnifiedExecHandler::default()
+                .handle(
+                    invocation(
+                        "exec_command",
+                        ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                            command: Some(vec![
+                                "sh".into(),
+                                "-c".into(),
+                                "head -c 100000 /dev/zero; printf late-error >&2; exit 7".into(),
+                            ]),
+                            workdir: None,
+                            timeout_ms: Some(5000),
+                            max_output_tokens: Some(20),
+                            yield_time_ms: None,
+                            tty: Some(false),
+                        })),
+                    ),
+                    trace,
+                )
+                .await
+                .unwrap();
+            let raw = output.raw_json();
+            assert_eq!(raw["exit_code"], 7);
+            assert!(!output.success());
+            assert!(raw["stdout"].as_str().unwrap().len() < 100000);
+            assert!(raw["stderr"].as_str().unwrap().ends_with("late-error"));
+            assert_eq!(raw["output_stats"]["full_output_available"], !fail);
+            // Even a rejected data chunk may leave an acknowledged incomplete
+            // status record. Availability does not imply full output retention.
+            assert!(output.retained_output_log());
+            let (stdout, stderr) = reader.await.unwrap();
+            if !fail {
+                assert_eq!(stdout, "\0".repeat(100000));
+                assert_eq!(stderr, "late-error");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_poll_sources_reassemble_output_larger_than_the_ring_and_release_owner() {
+        use crate::events::{ToolDeltaPayload, ToolEventPayload};
+        let mut handler = UnifiedExecHandler::default();
+        handler.one_shot_limits = OneShotOutputLimits {
+            stream_bytes: 2 * 1024 * 1024,
+            total_bytes: 4 * 1024 * 1024,
         };
-        assert_eq!(one_shot_output_limits(None, configured), (2_000, 3_000));
-        assert_eq!(one_shot_output_limits(Some(100), configured), (400, 400));
-        assert_eq!(
-            one_shot_output_limits(Some(100_000), configured),
-            (2_000, 3_000)
+        let bus = ToolEventBus::new(8);
+        let mut receiver = bus.take_durable_receiver().unwrap();
+        let reader = tokio::spawn(async move {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            while let Some(envelope) = receiver.recv().await {
+                if let ToolEventPayload::OutputDelta(delta) = &envelope.event.payload {
+                    if let ToolDeltaPayload::OutputChunk { stream, text, .. } = &delta.delta {
+                        match stream {
+                            pioneer_protocol::ItemDeltaStream::Stdout => stdout.push_str(text),
+                            pioneer_protocol::ItemDeltaStream::Stderr => stderr.push_str(text),
+                            _ => {}
+                        }
+                    }
+                }
+                envelope.acknowledge(Ok(()));
+            }
+            (stdout, stderr)
+        });
+        let first = handler
+            .handle(
+                invocation(
+                    "exec_command",
+                    ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                        command: Some(vec![
+                            "sh".into(),
+                            "-c".into(),
+                            "head -c 700000 /dev/zero; printf late-session-error >&2; exit 9"
+                                .into(),
+                        ]),
+                        workdir: None,
+                        timeout_ms: Some(5000),
+                        max_output_tokens: Some(100),
+                        yield_time_ms: Some(20),
+                        tty: Some(true),
+                    })),
+                ),
+                bus.start_trace("session-source", "initial", "exec_command"),
+            )
+            .await
+            .unwrap();
+        let mut last = first.raw_json();
+        let session_id = last["session_id"].as_u64().unwrap();
+        for index in 0..40 {
+            if !last["exit_code"].is_null() {
+                break;
+            }
+            let next = handler
+                .handle(
+                    invocation(
+                        "write_stdin",
+                        ToolPayload::LocalShell(LocalShellPayload::WriteStdin(WriteStdinArgs {
+                            session_id,
+                            chars: None,
+                            yield_time_ms: Some(50),
+                            max_output_tokens: Some(100),
+                        })),
+                    ),
+                    bus.start_trace("session-source", format!("poll-{index}"), "write_stdin"),
+                )
+                .await
+                .unwrap();
+            last = next.raw_json();
+            assert!(last["stdout"].as_str().unwrap().len() <= 200);
+        }
+        assert_eq!(last["exit_code"], 9);
+        assert!(
+            handler
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
         );
+        bus.close_durable_lane();
+        let (stdout, stderr) = reader.await.unwrap();
+        assert_eq!(stdout, "\0".repeat(700000));
+        assert_eq!(stderr, "late-session-error");
+    }
+
+    #[tokio::test]
+    async fn staging_frames_preserve_observed_stream_order_and_bound_storage_failures() {
+        let limits = OneShotOutputLimits {
+            stream_bytes: 1_000_000,
+            total_bytes: 1_000_000,
+        };
+        let mut spool = SessionSpool::new(limits);
+        spool.append(0, 7, 7, "out🦀", false).await;
+        spool.append(1, 4, 4, "err1", false).await;
+        spool.append(0, 4, 4, "out2", false).await;
+        let end = spool.end;
+        for (stream, expected) in [(0, "out🦀"), (1, "err1"), (0, "out2")] {
+            let (actual, raw, text, next) = spool.next_frame(end).await.unwrap();
+            assert_eq!(actual, stream);
+            assert_eq!(raw, expected.len());
+            assert_eq!(text, expected);
+            spool.delivered = next;
+        }
+        assert_eq!(spool.delivered, end);
+        let mut failed = SessionSpool::new(limits);
+        let readonly = tempfile::NamedTempFile::new().unwrap();
+        failed.file = Some(tokio::fs::File::from_std(
+            std::fs::File::open(readonly.path()).unwrap(),
+        ));
+        failed.append(0, 10, 10, "0123456789", false).await;
+        assert_eq!(failed.end, 0);
+        assert_eq!(failed.seen[0], 10);
+        assert!(!failed.writable);
+        assert!(failed.error.as_deref().unwrap().contains("write failed"));
+        let mut limited = SessionSpool::new(OneShotOutputLimits {
+            stream_bytes: 100,
+            total_bytes: 100,
+        });
+        limited
+            .append(0, 4200, 4200, &"界".repeat(1400), false)
+            .await;
+        assert!(limited.end <= 100);
+        assert!(limited.error.is_some());
+        let (_, raw, text, _) = limited.next_frame(limited.end).await.unwrap();
+        assert_eq!(raw, text.len());
+        assert!(raw < 100);
+        let payload = retained_exec_payload(
+            ExecPayloadInput {
+                exit_code: Some(7),
+                timed_out: false,
+                duration_ms: 1,
+                stdout: format!("{}late-error🌍", "α".repeat(20000)),
+                stderr: "late-error🌍".into(),
+                session_id: Some(23),
+                command: vec!["fixture".into()],
+                max_output_tokens: Some(100),
+                force_truncated_stdout: false,
+                force_truncated_stderr: false,
+            },
+            None,
+        );
+        assert!(payload.stdout.ends_with("late-error🌍"));
+        assert!(payload.truncated.stdout);
+        assert_eq!(payload.exit_code, Some(7));
+        assert_eq!(payload.session_id, Some(23));
     }
 
     #[cfg(unix)]

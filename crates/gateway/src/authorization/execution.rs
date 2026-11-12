@@ -2321,6 +2321,46 @@ impl ExecutionAuthorizationContext {
                     .get_task_actor_contract(run.task_id.as_str())
                     .await?
                     .context("agent-authored Task child has no exact actor contract")?;
+                // Revision input is authored by the exact requesting reviewer,
+                // while the worker keeps its original execution and admission.
+                // Prove that review edge before validating the creator lineage.
+                let creator_execution_id;
+                let execution_id =
+                    if task_run_turn.kind == pioneer_protocol::TaskRunTurnKind::Revision {
+                        let review = store
+                            .get_task_result_review_event(
+                                task_run_turn
+                                    .requested_by_review_event_id
+                                    .as_deref()
+                                    .context("Task revision has no requesting review event")?,
+                            )
+                            .await?
+                            .context("Task revision review event is missing")?;
+                        if review.task_id != run.task_id
+                            || review.run_id != run.id
+                            || Some(review.candidate_id.as_str())
+                                != task_run_turn.requested_by_candidate_id.as_deref()
+                            || review.next_task_run_turn_id.as_deref()
+                                != Some(task_run_turn.id.as_str())
+                            || review.decision
+                                != pioneer_protocol::TaskResultReviewDecision::RequestChanges
+                            || review.reviewer
+                                != pioneer_protocol::TaskResultReviewerRef::AgentExecution(
+                                    execution_id.clone(),
+                                )
+                        {
+                            bail!("Task revision input differs from its requesting review event");
+                        }
+                        let pioneer_protocol::PersistedActorRef::AgentExecution(creator) =
+                            &actor_contract.creator
+                        else {
+                            bail!("agent-authored Task revision has no exact creator execution");
+                        };
+                        creator_execution_id = creator.clone();
+                        &creator_execution_id
+                    } else {
+                        execution_id
+                    };
                 if actor_contract.creator
                     != pioneer_protocol::PersistedActorRef::AgentExecution(execution_id.clone())
                 {

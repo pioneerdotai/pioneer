@@ -433,23 +433,26 @@ impl ComposerView {
                 t!("chat.composer.add_menu.skills").to_string(),
                 picker_state.downgrade(),
             )
-                .footer(capability_picker_footer(picker_state.downgrade(), picker_state.read(cx).skill_selections().is_empty()))
-                .child(
-                    v_flex()
-                        .w_full()
-                        .gap_1p5()
-                        .py_4()
-                        .child(render_picker_filter_form(&picker_state.read(cx).search))
-                        .child(render_skill_rows(
-                            picker,
-                            selections,
-                            expanded_pack_ids,
-                            loading,
-                            error,
-                            picker_state.downgrade(),
-                            cx,
-                        )),
-                )
+            .footer(capability_picker_footer(
+                picker_state.downgrade(),
+                picker_state.read(cx).skill_selections().is_empty(),
+            ))
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .py_4()
+                    .child(render_picker_filter_form(&picker_state.read(cx).search))
+                    .child(render_skill_rows(
+                        picker,
+                        selections,
+                        expanded_pack_ids,
+                        loading,
+                        error,
+                        picker_state.downgrade(),
+                        cx,
+                    )),
+            )
         });
         picker_state.update(cx, |state, cx| {
             state.dialog_open.set(true);
@@ -530,28 +533,31 @@ impl ComposerView {
                 t!("chat.composer.add_menu.mcp").to_string(),
                 picker_state.downgrade(),
             )
-                .footer(capability_picker_footer(picker_state.downgrade(), selected_mcp_composer_capabilities(&picker_state.read(cx)).is_empty()))
-                .child(
-                    v_flex()
-                        .w_full()
-                        .gap_1p5()
-                        .py_4()
-                        .child(render_picker_filter_form(&picker_state.read(cx).search))
-                        .child(render_mcp_rows(
-                            server_rows,
-                            tool_rows,
-                            has_query,
-                            active_server_id,
-                            selected,
-                            loading_server_id,
-                            tool_error,
-                            server_loading,
-                            server_error,
-                            loaded_tool_server_ids,
-                            picker_state.downgrade(),
-                            cx,
-                        )),
-                )
+            .footer(capability_picker_footer(
+                picker_state.downgrade(),
+                selected_mcp_composer_capabilities(&picker_state.read(cx)).is_empty(),
+            ))
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .py_4()
+                    .child(render_picker_filter_form(&picker_state.read(cx).search))
+                    .child(render_mcp_rows(
+                        server_rows,
+                        tool_rows,
+                        has_query,
+                        active_server_id,
+                        selected,
+                        loading_server_id,
+                        tool_error,
+                        server_loading,
+                        server_error,
+                        loaded_tool_server_ids,
+                        picker_state.downgrade(),
+                        cx,
+                    )),
+            )
         });
         picker_state.update(cx, |state, cx| {
             state.dialog_open.set(true);
@@ -707,7 +713,11 @@ fn picker_leaf_frame(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stat
         .gap_3()
         .rounded_md()
         .border_1()
-        .border_color(if selected { cx.theme().blue } else { cx.theme().border })
+        .border_color(if selected {
+            cx.theme().blue
+        } else {
+            cx.theme().border
+        })
         .bg(cx.theme().background)
         .p_2()
 }
@@ -764,7 +774,11 @@ fn render_skill_picker_leaf_row(
         })
         .child(picker_leaf_content(
             row.label,
-            if row.description.trim().is_empty() { row.slug } else { row.description },
+            if row.description.trim().is_empty() {
+                row.slug
+            } else {
+                row.description
+            },
             disabled_reason,
             cx,
         ))
@@ -1543,7 +1557,6 @@ fn render_plugin_picker_row(
         .into_any_element()
 }
 
-
 impl ComposerView {
     pub(super) fn open_composer_plugins_picker(
         &mut self,
@@ -1567,11 +1580,14 @@ impl ComposerView {
             );
             let input = state.input();
             let search = state.search.clone();
-            let loading = input.as_ref().is_some_and(|p| {
-                p.plugin_request.state == ComposerCatalogRequestState::Loading
-            });
+            let loading = input
+                .as_ref()
+                .is_some_and(|p| p.plugin_request.state == ComposerCatalogRequestState::Loading);
             let failed = input.as_ref().is_some_and(|p| {
-                matches!(p.plugin_request.state, ComposerCatalogRequestState::Failed { .. })
+                matches!(
+                    p.plugin_request.state,
+                    ComposerCatalogRequestState::Failed { .. }
+                )
             });
             let mut list = v_flex().max_h(px(360.)).overflow_y_scrollbar();
             if loading {
@@ -1581,24 +1597,30 @@ impl ComposerView {
                 let retry = picker.downgrade();
                 list = list
                     .child(picker_error_banner(t!("plugins.error").to_string(), cx))
-                    .child(default_outline_button("composer-plugin-retry")
-                        .label(t!("plugins.retry").to_string())
-                        .on_click(move |_, _, cx| {
-                            let _ = retry.update(cx, |state, cx| {
-                                state.send(ComposerCatalogIntent::Retry {
-                                    thread_id: state.identity.thread_id.clone(),
-                                    draft_id: state.identity.draft_id,
-                                    catalog: ComposerCatalogKind::Plugins,
-                                }, cx);
-                            });
-                        }));
+                    .child(
+                        default_outline_button("composer-plugin-retry")
+                            .label(t!("plugins.retry").to_string())
+                            .on_click(move |_, _, cx| {
+                                let _ = retry.update(cx, |state, cx| {
+                                    state.send(
+                                        ComposerCatalogIntent::Retry {
+                                            thread_id: state.identity.thread_id.clone(),
+                                            draft_id: state.identity.draft_id,
+                                            catalog: ComposerCatalogKind::Plugins,
+                                        },
+                                        cx,
+                                    );
+                                });
+                            }),
+                    );
             }
             if rows.is_empty() && !loading && !failed {
                 list = list.child(empty_picker_state(t!("plugins.empty").to_string(), cx));
             }
             let row_count = rows.len();
             list = list.children(rows.into_iter().enumerate().map(|(index, row)| {
-                div().w_full()
+                div()
+                    .w_full()
                     .when(index + 1 < row_count, |container| container.pb_2())
                     .child(render_plugin_picker_row(row, picker.downgrade(), cx))
             }));
@@ -1616,9 +1638,14 @@ impl ComposerView {
                 }
             })
             .footer(capability_picker_footer(picker.downgrade(), false))
-            .child(v_flex().w_full().gap_1p5().py_4()
-                .child(render_picker_filter_form(&search))
-                .child(list))
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .py_4()
+                    .child(render_picker_filter_form(&search))
+                    .child(list),
+            )
         });
         picker.update(cx, |state, cx| {
             state.dialog_open.set(true);

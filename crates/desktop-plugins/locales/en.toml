@@ -109,3 +109,26 @@ restarting = "Restarting"
 stopping = "Stopping"
 
 supporting_files_changed = "Shared files or package metadata changed"
+
+[plugins.mcp_status]
+not_started = "Not started"
+disabled = "Disabled"
+starting = "Starting"
+ready = "Ready"
+degraded = "Degraded"
+auth_required = "Auth required"
+failed = "Failed"
+stopping = "Stopping"
+stopped = "Stopped"
+restarting = "Restarting"
+
+[plugins.mcp_capabilities]
+tools = "tools"
+resources = "resources"
+templates = "templates"
+prompts = "prompts"
+
+[plugins.skill_status]
+active = "Active"
+blocked = "Blocked"
+disabled = "Disabled"

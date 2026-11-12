@@ -47,7 +47,9 @@ fn technical_system_event(item: &TurnItem, service_filter: bool) -> bool {
             "agent_runtime_item_updated"
             | "cli_runtime_turn_steer"
             | "task.finalization.snapshot"
-            | "provider_usage",
+            | "provider_usage"
+            | "provider_phase"
+            | "runtime_operation",
         ) if service_filter => true,
         Some("agent_runtime_event") => {
             details
@@ -704,6 +706,7 @@ mod tests {
             "agent_runtime_item_updated",
             "cli_runtime_turn_steer",
             "task.finalization.snapshot",
+            "runtime_operation",
         ] {
             let item = system(code, Some(serde_json::json!({"synthetic": true})));
             assert!(canonical_item_model_projection(&item).is_omitted());

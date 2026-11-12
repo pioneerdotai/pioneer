@@ -55,6 +55,7 @@ pub struct ExecPayloadInput {
     pub force_truncated_stderr: bool,
 }
 
+#[cfg(test)]
 pub fn build_exec_model_payload(input: ExecPayloadInput) -> ExecModelPayload {
     build_exec_model_payload_with_stats(input, None)
 }
@@ -90,6 +91,97 @@ pub fn build_exec_model_payload_with_stats(
         session_id: input.session_id,
         command: input.command,
     }
+}
+
+/// Bound only shell text fields. The caller measures its actual envelope. Metadata
+/// is indivisible: None means the operation must block rather than lose control data.
+pub fn bound_shell_output(
+    value: &serde_json::Value,
+    fits: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    if fits(value) {
+        return Some(value.clone());
+    }
+    let fields = ["stdout", "stderr", "aggregated_output", "output"];
+    let mut minimal = value.clone();
+    let object = minimal.as_object_mut()?;
+    let mut longest = 0;
+    for field in fields {
+        if let Some(text) = value.get(field).and_then(serde_json::Value::as_str) {
+            longest = longest.max(text.chars().count());
+            object.insert(field.into(), "".into());
+            if !text.is_empty() {
+                match object.get_mut("truncated") {
+                    Some(serde_json::Value::Object(flags)) => {
+                        flags.insert(field.into(), true.into());
+                    }
+                    _ => {
+                        object.insert("truncated".into(), true.into());
+                    }
+                }
+            }
+        }
+    }
+    object.insert("model_output_truncated".into(), true.into());
+    if !fits(&minimal) {
+        return None;
+    }
+    let candidate = |count: usize| {
+        let mut candidate = minimal.clone();
+        for field in fields {
+            if let Some(text) = value.get(field).and_then(serde_json::Value::as_str) {
+                let head: String = text.chars().take(count / 2).collect();
+                let tail: String = text
+                    .chars()
+                    .rev()
+                    .take(count - count / 2)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                let excerpt = if text.chars().count() <= count {
+                    text.to_owned()
+                } else if count == 0 {
+                    String::new()
+                } else {
+                    format!("{head}\n... [model output truncated]\n{tail}")
+                };
+                candidate[field] = excerpt.into();
+                if text.chars().count() <= count {
+                    if let Some(flags) = candidate
+                        .get_mut("truncated")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        flags.insert(
+                            field.into(),
+                            value
+                                .get("truncated")
+                                .and_then(|flags| flags.get(field))
+                                .cloned()
+                                .unwrap_or(false.into()),
+                        );
+                    }
+                }
+            }
+        }
+        candidate
+    };
+    let mut low = 0;
+    let mut high = longest;
+    let mut best = minimal.clone();
+    while low <= high {
+        let count = low + (high - low) / 2;
+        let current = candidate(count);
+        if fits(&current) {
+            best = current;
+            low = count + 1;
+        } else if count == 0 {
+            break;
+        } else {
+            high = count - 1;
+        }
+    }
+    Some(best)
 }
 
 pub fn render_exec_ui_text(payload: &ExecModelPayload) -> String {

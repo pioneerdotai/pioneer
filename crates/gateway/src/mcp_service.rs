@@ -8607,7 +8607,8 @@ mod tests {
                 }
             }
             let _server = Server(server);
-            let mut id = seed_mcp_installation(&store, &workspace, "real-recovery", true, false).await;
+            let mut id =
+                seed_mcp_installation(&store, &workspace, "real-recovery", true, false).await;
             let mut row = store
                 .find_mcp_server_installation("workspace", &workspace, "real-recovery")
                 .await
@@ -8632,48 +8633,88 @@ mod tests {
                 row.name = "pplugin_retained_failure".into();
                 let now = chrono::Utc::now().fixed_offset();
                 let parent = "P".repeat(21);
-                store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
-                    id: parent.clone(), workspace_id: workspace.clone(), name: "oauth-parent".into(),
-                    version: None, source_upload_id: "oauth-source".into(),
-                    package_path: "/unused/package".into(), data_path: "/unused/data".into(),
-                    package_fingerprint: "tree".into(), enabled: true, allow_implicit_invocation: false, state: "installing".into(),
-                    revision: 1,
-        display_name: None,
-        short_description: None,
-        description: None,
-        long_description: None,
-        developer_name: None,
-        author_name: None,
-        author_email: None,
-        author_url: None,
-        homepage: None,
-        repository: None,
-        documentation_url: None,
-        support_url: None,
-        privacy_policy_url: None,
-        terms_of_service_url: None,
-        license: None,
-        category: None,
-        brand_color: None,
-        logo_path: None,
-        logo_revision: None,
-        composer_icon_path: None,
-        composer_icon_revision: None, pending_json: Some("{}".into()), last_error: None,
-                    created_at: now, updated_at: now,
-                }).await.unwrap();
+                store
+                    .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+                        id: parent.clone(),
+                        workspace_id: workspace.clone(),
+                        name: "oauth-parent".into(),
+                        version: None,
+                        source_upload_id: "oauth-source".into(),
+                        package_path: "/unused/package".into(),
+                        data_path: "/unused/data".into(),
+                        package_fingerprint: "tree".into(),
+                        enabled: true,
+                        allow_implicit_invocation: false,
+                        state: "installing".into(),
+                        revision: 1,
+                        display_name: None,
+                        short_description: None,
+                        description: None,
+                        long_description: None,
+                        developer_name: None,
+                        author_name: None,
+                        author_email: None,
+                        author_url: None,
+                        homepage: None,
+                        repository: None,
+                        documentation_url: None,
+                        support_url: None,
+                        privacy_policy_url: None,
+                        terms_of_service_url: None,
+                        license: None,
+                        category: None,
+                        brand_color: None,
+                        logo_path: None,
+                        logo_revision: None,
+                        composer_icon_path: None,
+                        composer_icon_revision: None,
+                        pending_json: Some("{}".into()),
+                        last_error: None,
+                        created_at: now,
+                        updated_at: now,
+                    })
+                    .await
+                    .unwrap();
                 let write = pioneer_crud::PluginOwnershipWrite {
-                    plugin_id: parent.clone(), expected_revision: 1, member_key: "one".into(),
-                    member_path: None, package_fingerprint: "tree".into(), child_id: id.clone(),
+                    plugin_id: parent.clone(),
+                    expected_revision: 1,
+                    member_key: "one".into(),
+                    member_path: None,
+                    package_fingerprint: "tree".into(),
+                    child_id: id.clone(),
                 };
                 let audit = pioneer_crud::McpAuditEventRecord {
-                    turn_id: None, server_installation_id: Some(id.clone()), server_name: row.name.clone(),
-                    raw_tool_name: None, callable_name: None, catalog_version: None,
-                    action: "install".into(), decision: "allowed".into(), reason_code: None,
-                    details_json: "{}".into(), created_at_unix: 1,
+                    turn_id: None,
+                    server_installation_id: Some(id.clone()),
+                    server_name: row.name.clone(),
+                    raw_tool_name: None,
+                    callable_name: None,
+                    catalog_version: None,
+                    action: "install".into(),
+                    decision: "allowed".into(),
+                    reason_code: None,
+                    details_json: "{}".into(),
+                    created_at_unix: 1,
                 };
-                store.upsert_mcp_server_installation_with_audit_and_ownership(&row, &audit, Some(&write), 1).await.unwrap();
-                store.settle_plugin_installation(&parent, 1, "installed", None).await.unwrap();
-                assert!(service.plugin_start_available(&store, &row, None).await.unwrap());
+                store
+                    .upsert_mcp_server_installation_with_audit_and_ownership(
+                        &row,
+                        &audit,
+                        Some(&write),
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .settle_plugin_installation(&parent, 1, "installed", None)
+                    .await
+                    .unwrap();
+                assert!(
+                    service
+                        .plugin_start_available(&store, &row, None)
+                        .await
+                        .unwrap()
+                );
             }
             let installation = installation_from_record(&row).unwrap();
             let entered = Arc::new(tokio::sync::Notify::new());
@@ -8731,7 +8772,9 @@ mod tests {
             let effect_completed = Arc::new(tokio::sync::Notify::new());
             if failed_predecessor {
                 *service.inner.oauth_effect_barrier.lock().unwrap() = Some((
-                    effect_entered.clone(), effect_release.clone(), effect_completed.clone(),
+                    effect_entered.clone(),
+                    effect_release.clone(),
+                    effect_completed.clone(),
                 ));
             }
             service
@@ -8752,32 +8795,67 @@ mod tests {
             if failed_predecessor {
                 // The real callback emitted current Authorized. Hold its existing
                 // Gateway effect boundary, then install an actual failed actor join.
-                tokio::time::timeout(Duration::from_secs(5), effect_entered.notified()).await.unwrap();
-                assert_eq!(service.oauth().state(&id).await, Some(pioneer_mcp_oauth::OAuthState::Authorized));
+                tokio::time::timeout(Duration::from_secs(5), effect_entered.notified())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    service.oauth().state(&id).await,
+                    Some(pioneer_mcp_oauth::OAuthState::Authorized)
+                );
                 let (shutdown_tx, shutdown_rx) = oneshot::channel();
                 let (call_tx, _call_rx) = mpsc::channel(1);
                 let completed = Arc::new(CancellationToken::new());
                 let completion = McpTaskCompletion(completed.clone());
                 let join = McpTaskJoin::new(tokio::spawn(async move {
                     let _completion = completion;
-                    shutdown_rx.await.expect("Authorized must request predecessor drain");
+                    shutdown_rx
+                        .await
+                        .expect("Authorized must request predecessor drain");
                     anyhow::bail!("retained predecessor cleanup failed")
                 }));
-                service.inner.tasks.lock().await.insert(id.clone(), McpServerTaskHandle {
-                    name: row.name.clone(), scope_kind: row.scope_kind.clone(), scope_key: row.scope_key.clone(),
-                    fingerprint: row.fingerprint.clone(), effective_secret_fingerprint: "old".into(),
-                    call_tx, oauth_failure_revision: Arc::new(AtomicU64::new(0)),
-                    recovery: Arc::new(OAuthRecoveryMailbox::default()), shutdown_tx: Some(shutdown_tx),
-                    completed: completed.clone(), join, session: Arc::new(Mutex::new(None)),
-                });
-                service.inner.runtime_generations.lock().await.insert(id.clone(), 42);
+                service.inner.tasks.lock().await.insert(
+                    id.clone(),
+                    McpServerTaskHandle {
+                        name: row.name.clone(),
+                        scope_kind: row.scope_kind.clone(),
+                        scope_key: row.scope_key.clone(),
+                        fingerprint: row.fingerprint.clone(),
+                        effective_secret_fingerprint: "old".into(),
+                        call_tx,
+                        oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                        recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                        shutdown_tx: Some(shutdown_tx),
+                        completed: completed.clone(),
+                        join,
+                        session: Arc::new(Mutex::new(None)),
+                    },
+                );
+                service
+                    .inner
+                    .runtime_generations
+                    .lock()
+                    .await
+                    .insert(id.clone(), 42);
                 effect_release.notify_one();
-                tokio::time::timeout(Duration::from_secs(5), effect_completed.notified()).await.unwrap();
-                assert!(completed.is_cancelled(), "real actor must have finished its failed drain");
-                assert!(Arc::ptr_eq(&service.inner.tasks.lock().await[&id].completed, &completed));
+                tokio::time::timeout(Duration::from_secs(5), effect_completed.notified())
+                    .await
+                    .unwrap();
+                assert!(
+                    completed.is_cancelled(),
+                    "real actor must have finished its failed drain"
+                );
+                assert!(Arc::ptr_eq(
+                    &service.inner.tasks.lock().await[&id].completed,
+                    &completed
+                ));
                 assert_eq!(service.inner.runtime_generations.lock().await[&id], 42);
                 assert_eq!(connects.load(Ordering::SeqCst), 0);
-                assert!(service.stop_task_result(&id, DomainRuntimeState::Stopped).await.is_err());
+                assert!(
+                    service
+                        .stop_task_result(&id, DomainRuntimeState::Stopped)
+                        .await
+                        .is_err()
+                );
                 *service.inner.oauth_effect_barrier.lock().unwrap() = None;
                 service.shutdown().await;
                 continue;
@@ -10116,30 +10194,31 @@ mod tests {
                 package_path: "/unused/package".into(),
                 data_path: "/unused/data".into(),
                 package_fingerprint: "tree".into(),
-                enabled: true, allow_implicit_invocation: false,
+                enabled: true,
+                allow_implicit_invocation: false,
                 state: "installing".into(),
                 revision: 1,
-        display_name: None,
-        short_description: None,
-        description: None,
-        long_description: None,
-        developer_name: None,
-        author_name: None,
-        author_email: None,
-        author_url: None,
-        homepage: None,
-        repository: None,
-        documentation_url: None,
-        support_url: None,
-        privacy_policy_url: None,
-        terms_of_service_url: None,
-        license: None,
-        category: None,
-        brand_color: None,
-        logo_path: None,
-        logo_revision: None,
-        composer_icon_path: None,
-        composer_icon_revision: None,
+                display_name: None,
+                short_description: None,
+                description: None,
+                long_description: None,
+                developer_name: None,
+                author_name: None,
+                author_email: None,
+                author_url: None,
+                homepage: None,
+                repository: None,
+                documentation_url: None,
+                support_url: None,
+                privacy_policy_url: None,
+                terms_of_service_url: None,
+                license: None,
+                category: None,
+                brand_color: None,
+                logo_path: None,
+                logo_revision: None,
+                composer_icon_path: None,
+                composer_icon_revision: None,
                 pending_json: Some("{}".into()),
                 last_error: None,
                 created_at: now,

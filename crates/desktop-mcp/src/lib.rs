@@ -77,4 +77,4 @@ mod boundary_tests {
 }
 
 mod card;
-pub use card::McpServerCard;
+pub(crate) use card::McpServerCard;

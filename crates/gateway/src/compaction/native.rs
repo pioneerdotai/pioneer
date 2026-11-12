@@ -11,7 +11,7 @@ use pioneer_agent::compaction::{
     request::NativeRequestProjection,
 };
 use pioneer_compaction::{
-    CompactionMode, CompactionSettings, CoverageDomain, ModelBudget, ModelSelection, Transport,
+    CompactionMode, CompactionSettings, CoverageDomain, ModelSelection, Transport,
     coverage_domain_for, effective_selection, plan_compaction,
 };
 use pioneer_provider::{ChatRequest, MessageProvenance, MessageSourceRef, ProviderRegistry};
@@ -1253,12 +1253,14 @@ fn replace_completed_history(
 #[cfg(test)]
 mod completed_request_tests {
     use super::*;
+    use pioneer_compaction::ModelBudget;
     use pioneer_provider::ChatMessage;
 
     #[test]
     fn completed_history_keeps_system_instructions_in_full_request_budget() {
         let instructions = "Required runtime instruction. ".repeat(500);
         let mut request = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![

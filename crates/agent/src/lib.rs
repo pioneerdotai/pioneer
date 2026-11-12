@@ -4322,7 +4322,8 @@ impl AgentManager {
 
     /// Share the configured native control budget across management operations.
     pub fn control_operation_deadline(&self) -> tokio::time::Instant {
-        tokio::time::Instant::now() + self.control_plane_config.enqueue_timeout
+        tokio::time::Instant::now()
+            + self.control_plane_config.enqueue_timeout
             + self.control_plane_config.acknowledgement_timeout
     }
 

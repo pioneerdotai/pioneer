@@ -68,8 +68,9 @@ fn scoped_publications_update_plugin_details_without_redrawing_unchanged_content
         name: "Before".into(),
         version: None,
         description: None,
-            metadata: Default::default(),
-        enabled: true, allow_implicit_invocation: false,
+        metadata: Default::default(),
+        enabled: true,
+        allow_implicit_invocation: false,
         state: "installed".into(),
         revision: 1,
         status: "installed".into(),
@@ -181,8 +182,9 @@ fn parent(id: &str) -> PluginItem {
         name: id.into(),
         version: None,
         description: None,
-            metadata: Default::default(),
-        enabled: true, allow_implicit_invocation: false,
+        metadata: Default::default(),
+        enabled: true,
+        allow_implicit_invocation: false,
         state: "installed".into(),
         revision: 1,
         status: "installed".into(),
@@ -198,14 +200,19 @@ fn select_workspace(client: &ClientCore) {
         None,
     );
     assert_eq!(transition.outcome(), ClientTransitionOutcome::Changed);
-    assert_eq!(client.navigation_snapshot().workspace_id(), Some("workspace"));
+    assert_eq!(
+        client.navigation_snapshot().workspace_id(),
+        Some("workspace")
+    );
 }
 fn set_origin(client: &ClientCore) {
     let mut session = (*client.gateway_session()).clone();
     session.startup.connection_id = Some(7); // Existing catalog_test_support origin.
-    publish_value(client, ClientScope::Session, |authority, scope, revisions| {
-        authority.publication(scope, revisions, Arc::new(session))
-    });
+    publish_value(
+        client,
+        ClientScope::Session,
+        |authority, scope, revisions| authority.publication(scope, revisions, Arc::new(session)),
+    );
     assert_eq!(client.gateway_session().startup.connection_id, Some(7));
 }
 fn set_connected(client: &ClientCore) {
@@ -216,11 +223,18 @@ fn set_connected(client: &ClientCore) {
         connection_state: pioneer_client::state::client_state::GatewayConnectionState::Connected,
         clear_gateway_error: false,
     });
-    publish_value(client, ClientScope::Session, |authority, scope, revisions| {
-        authority.publication(scope, revisions, Arc::new(session))
-    });
+    publish_value(
+        client,
+        ClientScope::Session,
+        |authority, scope, revisions| authority.publication(scope, revisions, Arc::new(session)),
+    );
     assert_eq!(
-        client.gateway_session().status.as_ref().unwrap().connection_state,
+        client
+            .gateway_session()
+            .status
+            .as_ref()
+            .unwrap()
+            .connection_state,
         pioneer_client::state::client_state::GatewayConnectionState::Connected,
     );
 }
@@ -255,7 +269,9 @@ fn workspace_access(client: &ClientCore, allowed: bool) {
         client.accept_authorization_projection(generation, connection, authorization),
         pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted,
     );
-    let accepted = client.authorization_snapshot(Some("workspace"), None).unwrap();
+    let accepted = client
+        .authorization_snapshot(Some("workspace"), None)
+        .unwrap();
     let capabilities = &accepted.workspace.as_ref().unwrap().capabilities;
     assert_eq!(capabilities.can_use_skills, allowed);
     assert_eq!(capabilities.can_use_mcp, allowed);
@@ -322,7 +338,7 @@ fn accepted_update_keeps_exact_upload_through_other_parent_and_uncertain_settlem
             upload_id: "exact-upload".into(),
             preview: PluginsUpdatePreviewResponse {
                 supporting_files_changed: false,
-                
+
                 package: PluginsPreviewResponse {
                     name: "A".into(),
                     version: None,
@@ -357,9 +373,13 @@ fn accepted_update_keeps_exact_upload_through_other_parent_and_uncertain_settlem
         workspace_id: "workspace".into(),
         operation_id: 71,
     };
-    publish_value(&client, upload_scope.clone(), |authority, scope, revisions| {
-        authority.publication(scope, revisions, Arc::new(upload.clone()))
-    });
+    publish_value(
+        &client,
+        upload_scope.clone(),
+        |authority, scope, revisions| {
+            authority.publication(scope, revisions, Arc::new(upload.clone()))
+        },
+    );
     publish(&client, &scope, publication.clone());
     cx.update(|_, cx| {
         view.update(cx, |v, cx| {
@@ -377,9 +397,13 @@ fn accepted_update_keeps_exact_upload_through_other_parent_and_uncertain_settlem
     publication.revision += 1;
     upload.mutation_uncertain = true;
     upload.revision += 1;
-    publish_value(&client, upload_scope.clone(), |authority, scope, revisions| {
-        authority.publication(scope, revisions, Arc::new(upload.clone()))
-    });
+    publish_value(
+        &client,
+        upload_scope.clone(),
+        |authority, scope, revisions| {
+            authority.publication(scope, revisions, Arc::new(upload.clone()))
+        },
+    );
     publish(&client, &scope, publication.clone());
     cx.update(|_, cx| view.update(cx, |v, cx| v.sync_publications(cx)));
     assert!(view.read_with(cx, |v, _| v.applying_update.is_some()));
@@ -600,7 +624,9 @@ fn missing_parent_uses_admission_authorization_and_connection_states(cx: &mut Te
             Arc::make_mut(&mut v.input).error = Some("read failed".into());
         })
     });
-    assert!(view.read_with(cx, |v, _| v.connected() && !v.readable() && v.input.error.is_some()));
+    assert!(view.read_with(cx, |v, _| v.connected()
+        && !v.readable()
+        && v.input.error.is_some()));
     assert_eq!(
         view.read_with(cx, |v, _| v.missing_parent_label()),
         t!("plugins.forbidden").to_string()
@@ -614,7 +640,9 @@ fn missing_parent_uses_admission_authorization_and_connection_states(cx: &mut Te
             p.error = None;
         })
     });
-    assert!(view.read_with(cx, |v, _| v.connected() && v.readable() && v.initial_loading()));
+    assert!(view.read_with(cx, |v, _| v.connected()
+        && v.readable()
+        && v.initial_loading()));
     assert_eq!(
         view.read_with(cx, |v, _| v.missing_parent_label()),
         t!("plugins.loading").to_string()

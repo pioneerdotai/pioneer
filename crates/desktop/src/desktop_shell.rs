@@ -333,7 +333,8 @@ impl DesktopShellView {
         };
         if !cx.has_global::<pioneer_desktop_foundation::ImageViewConfig>() {
             cx.set_global(pioneer_desktop_foundation::ImageViewConfig::new(
-                client.clone(), registrar.clone(),
+                client.clone(),
+                registrar.clone(),
                 Arc::new(crate::platform::images::DesktopImageViews(client.clone())),
             ));
         }

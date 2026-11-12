@@ -99,7 +99,8 @@ mod tests {
             version: None,
             description: None,
             metadata: Default::default(),
-            enabled: true, allow_implicit_invocation: false,
+            enabled: true,
+            allow_implicit_invocation: false,
             state: state.into(),
             revision: 7,
             status: "partial".into(),
@@ -168,8 +169,8 @@ mod tests {
 }
 
 pub use pioneer_protocol::{
-    PluginComponentItem, PluginComponentKey, PluginItem, PluginManagementIntent, PluginIcon, PluginMetadata,
-    PluginsMutateParams, PluginsSetEnabledParams, PluginsUpdatePreviewResponse,
+    PluginComponentItem, PluginComponentKey, PluginIcon, PluginItem, PluginManagementIntent,
+    PluginMetadata, PluginsMutateParams, PluginsSetEnabledParams, PluginsUpdatePreviewResponse,
 };
 
 pub mod runtime;
@@ -284,7 +285,8 @@ mod picker_regressions {
             version: None,
             description: None,
             metadata: Default::default(),
-            enabled: true, allow_implicit_invocation: false,
+            enabled: true,
+            allow_implicit_invocation: false,
             state: "installed".into(),
             revision: 7,
             status: "partial".into(),

@@ -145,7 +145,7 @@ fn extract_archive(input: File, runtime: &Path) -> Result<()> {
     let mut total = 0u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let name = entry.name().to_owned();
+        let name = entry.name()?.into_owned();
         let normalized = name.strip_suffix('/').unwrap_or(&name);
         ensure!(
             !normalized.is_empty()

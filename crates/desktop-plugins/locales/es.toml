@@ -104,3 +104,26 @@ restarting = "Reiniciando"
 stopping = "Deteniendo"
 
 supporting_files_changed = "Han cambiado archivos compartidos o metadatos del paquete"
+
+[plugins.mcp_status]
+not_started = "No iniciado"
+disabled = "Desactivado"
+starting = "Iniciando"
+ready = "Listo"
+degraded = "Degradado"
+auth_required = "Requiere autorización"
+failed = "Falló"
+stopping = "Deteniendo"
+stopped = "Detenido"
+restarting = "Reiniciando"
+
+[plugins.mcp_capabilities]
+tools = "herramientas"
+resources = "recursos"
+templates = "plantillas"
+prompts = "prompts"
+
+[plugins.skill_status]
+active = "Activa"
+blocked = "Bloqueada"
+disabled = "Desactivada"

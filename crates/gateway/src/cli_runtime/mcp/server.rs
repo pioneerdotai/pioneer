@@ -481,8 +481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_return_and_facade_join_precede_supervisor_cleanup()
-    {
+    async fn transport_return_and_facade_join_precede_supervisor_cleanup() {
         use super::super::supervisor::{CliMcpBridgeSessionState, CliMcpBridgeSupervisor};
 
         for mode in ["drop", "invalid", "joined-owned"] {
@@ -593,7 +592,8 @@ mod tests {
                 }
             }
             timeout(Duration::from_secs(2), async {
-                while supervisor.state(&old).await == Some(CliMcpBridgeSessionState::TransportOwned) {
+                while supervisor.state(&old).await == Some(CliMcpBridgeSessionState::TransportOwned)
+                {
                     tokio::task::yield_now().await;
                 }
                 supervisor.revoke_session_result(&old).await.unwrap();

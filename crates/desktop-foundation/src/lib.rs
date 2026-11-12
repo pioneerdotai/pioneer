@@ -2,7 +2,9 @@
 //!
 //! This crate has no concrete router, feature policy, platform adapter, store,
 //! or cache. PackageUploadView retains only shared Client delivery presentation
-//! and a delivery lease; feature adapters supply localized copy. CatalogBinding
+//! and a delivery lease; ImageViews retain shared image presentation leases.
+//! Image bytes, disk caching and authorization remain in Client; native I/O is
+//! supplied by the shell port. Feature adapters supply localized copy. CatalogBinding
 //! owns scoped registrations, not domain requests. A future use of GPUI `.cached(...)` remains valid only when the
 //! caller supplies definite bounds and explicitly updates the element and
 //! notifies its retained owner whenever any application cache-key component
@@ -48,3 +50,6 @@ pub use catalog_presentation::{catalog_empty_state, catalog_list_header};
 
 mod image_views;
 pub use image_views::{ImageViewConfig, ImageViewPort, ImageViews};
+
+mod catalog_summary_card;
+pub use catalog_summary_card::CatalogSummaryCard;

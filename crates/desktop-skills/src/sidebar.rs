@@ -45,7 +45,9 @@ impl CatalogSidebar {
                                         .child({
                                             let icon_bg_hover = cx.theme().foreground.opacity(0.1);
                                             pioneer_desktop_foundation::catalog_sidebar_icon(
-                                                IconName::Plus, true, cx,
+                                                IconName::Plus,
+                                                true,
+                                                cx,
                                             )
                                             .id("skills-sidebar-install-icon")
                                             .group_hover(
@@ -53,11 +55,9 @@ impl CatalogSidebar {
                                                 move |style| style.bg(icon_bg_hover),
                                             )
                                         })
-                                        .child(
-                                            pioneer_desktop_foundation::catalog_sidebar_label(
-                                                t!("skills.button.install").to_string(),
-                                            ),
-                                        )
+                                        .child(pioneer_desktop_foundation::catalog_sidebar_label(
+                                            t!("skills.button.install").to_string(),
+                                        ))
                                 })
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
@@ -84,14 +84,15 @@ impl CatalogSidebar {
                                     .gap_2()
                                     .child(
                                         pioneer_desktop_foundation::catalog_sidebar_menu_icon(
-                                                PioneerIconName::RefreshCw,
-                                            )
-                                            .id("skills-sidebar-update-icon"),
+                                            PioneerIconName::RefreshCw,
+                                        )
+                                        .id("skills-sidebar-update-icon"),
                                     )
                                     .child(
                                         pioneer_desktop_foundation::catalog_sidebar_label(
-                                                t!("skills.button.update").to_string(),
-                                            ).flex_none(),
+                                            t!("skills.button.update").to_string(),
+                                        )
+                                        .flex_none(),
                                     )
                             })
                             .on_click(cx.listener(|view, _, _, cx| {
@@ -171,11 +172,9 @@ impl CatalogSidebar {
                                                         .opacity(SIDEBAR_MENU_ITEM_OPACITY),
                                                 )
                                         })
-                                        .child(
-                                            pioneer_desktop_foundation::catalog_sidebar_label(
-                                                t!("buttons.back").to_string(),
-                                            ),
-                                        )
+                                        .child(pioneer_desktop_foundation::catalog_sidebar_label(
+                                            t!("buttons.back").to_string(),
+                                        ))
                                 })
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
@@ -209,11 +208,9 @@ impl CatalogSidebar {
                                             )
                                             .id("skills-details-sidebar-update-icon"),
                                         )
-                                        .child(
-                                            pioneer_desktop_foundation::catalog_sidebar_label(
-                                                t!("skills.button.update").to_string(),
-                                            ),
-                                        )
+                                        .child(pioneer_desktop_foundation::catalog_sidebar_label(
+                                            t!("skills.button.update").to_string(),
+                                        ))
                                 })
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
@@ -254,11 +251,9 @@ impl CatalogSidebar {
                                             )
                                             .id("skills-details-sidebar-uninstall-icon"),
                                         )
-                                        .child(
-                                            pioneer_desktop_foundation::catalog_sidebar_label(
-                                                t!("skills.button.uninstall").to_string(),
-                                            ),
-                                        )
+                                        .child(pioneer_desktop_foundation::catalog_sidebar_label(
+                                            t!("skills.button.uninstall").to_string(),
+                                        ))
                                 })
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();

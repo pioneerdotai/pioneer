@@ -25,6 +25,7 @@ pub use messages::{
 pub mod providers;
 pub mod registry;
 pub mod selection;
+pub mod tool_declarations;
 pub mod tools;
 pub mod traits;
 pub mod types;

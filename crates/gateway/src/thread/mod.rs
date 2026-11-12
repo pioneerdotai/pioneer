@@ -3802,6 +3802,9 @@ mod plugin_expansion_tests {
             },
         };
         let mut params = TurnStartParams {
+            context_authority: None,
+            context_window: None,
+            service_mode: None,
             thread_id: "thread".into(),
             turn_id: "turn".into(),
             input: vec![],

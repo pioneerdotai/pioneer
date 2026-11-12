@@ -4,7 +4,7 @@ use pioneer_client::skills::{presentation as skill_presentation, types::SkillLis
 
 /// Shared catalogue card. Navigation and domain commands belong to the caller.
 #[derive(gpui_kit::IntoElement)]
-pub struct SkillCard {
+pub(crate) struct SkillCard {
     title: String,
     owner: Option<String>,
     description: String,
@@ -29,26 +29,8 @@ impl SkillCard {
         }
     }
 
-    /// Preserve the card shape for a component without an installed native record.
-    pub fn missing(title: String, status_label: String, status_color: Hsla) -> Self {
-        Self {
-            title,
-            owner: None,
-            description: String::new(),
-            version: "-".into(),
-            status_label,
-            status_color,
-            pending: false,
-        }
-    }
     pub fn pending(mut self, pending: bool) -> Self {
         self.pending = pending;
-        self
-    }
-
-    pub fn status(mut self, label: String, color: Hsla) -> Self {
-        self.status_label = label;
-        self.status_color = color;
         self
     }
 

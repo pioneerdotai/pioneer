@@ -89,6 +89,129 @@ pub(super) fn summary_status(plugin: &PluginItem) -> Option<&str> {
 }
 
 impl PluginsView {
+    fn skill_component_card(
+        &self,
+        component: &PluginComponentItem,
+        busy: bool,
+        cx: &mut App,
+    ) -> pioneer_desktop_foundation::CatalogCard {
+        use pioneer_client::skills::presentation::{self, SkillDiagnosticsTone, SkillStatus};
+        let skill = self
+            .input
+            .skills
+            .iter()
+            .find(|skill| component.skill_id.as_ref() == Some(&skill.skill_id));
+        let card = if let Some(skill) = skill {
+            let summary = presentation::skill_summary_presentation(skill);
+            let label = match summary.status {
+                SkillStatus::Active => t!("plugins.skill_status.active").to_string(),
+                SkillStatus::Blocked => t!("plugins.skill_status.blocked").to_string(),
+                SkillStatus::Disabled => t!("plugins.skill_status.disabled").to_string(),
+                SkillStatus::Other(value) => value,
+            };
+            let color = match summary.status_tone {
+                SkillDiagnosticsTone::Success => cx.theme().success,
+                SkillDiagnosticsTone::Warning => cx.theme().warning,
+                _ => cx.theme().foreground,
+            };
+            pioneer_desktop_foundation::CatalogCard::new(skill.slug.clone())
+                .when_some(summary.slug.owner, |card, owner| card.owner(owner))
+                .description(skill.description.clone())
+                .metadata(format!(
+                    "{} {}",
+                    t!("plugins.version"),
+                    summary.version.as_deref().unwrap_or("-")
+                ))
+                .status(label, color)
+        } else {
+            pioneer_desktop_foundation::CatalogCard::new(component.member_key.clone())
+                .metadata(format!("{} -", t!("plugins.version")))
+                .status(
+                    status_label(component_status(component)),
+                    status_color(component_status(component), cx),
+                )
+        };
+        card.pending(busy)
+            .when(component.status != "installed", |card| {
+                card.status(
+                    status_label(component_status(component)),
+                    status_color(component_status(component), cx),
+                )
+            })
+    }
+
+    fn mcp_component_card(
+        &self,
+        component: &PluginComponentItem,
+        busy: bool,
+        cx: &mut App,
+    ) -> pioneer_desktop_foundation::CatalogSummaryCard {
+        use pioneer_client::mcp::presentation::{
+            self, McpCapabilityKind, McpPresentationTone, McpStatusLabel,
+        };
+        let server = self
+            .input
+            .mcp
+            .iter()
+            .find(|server| component.mcp_installation_id.as_ref() == Some(&server.id));
+        let card = if let Some(server) = server {
+            let labels = presentation::mcp_capability_counts(server)
+                .iter()
+                .map(|count| {
+                    let label = match count.kind {
+                        McpCapabilityKind::Tools => t!("plugins.mcp_capabilities.tools"),
+                        McpCapabilityKind::Resources => t!("plugins.mcp_capabilities.resources"),
+                        McpCapabilityKind::ResourceTemplates => {
+                            t!("plugins.mcp_capabilities.templates")
+                        }
+                        McpCapabilityKind::Prompts => t!("plugins.mcp_capabilities.prompts"),
+                    };
+                    format!("{} {label}", count.count)
+                })
+                .collect();
+            let label = match presentation::mcp_status_label(server.status) {
+                McpStatusLabel::NotStarted => t!("plugins.mcp_status.not_started"),
+                McpStatusLabel::Disabled => t!("plugins.mcp_status.disabled"),
+                McpStatusLabel::Starting => t!("plugins.mcp_status.starting"),
+                McpStatusLabel::Ready => t!("plugins.mcp_status.ready"),
+                McpStatusLabel::Degraded => t!("plugins.mcp_status.degraded"),
+                McpStatusLabel::AuthRequired => t!("plugins.mcp_status.auth_required"),
+                McpStatusLabel::Failed => t!("plugins.mcp_status.failed"),
+                McpStatusLabel::Stopping => t!("plugins.mcp_status.stopping"),
+                McpStatusLabel::Stopped => t!("plugins.mcp_status.stopped"),
+                McpStatusLabel::Restarting => t!("plugins.mcp_status.restarting"),
+            }
+            .to_string();
+            let color = match presentation::mcp_status_tone(server.status) {
+                McpPresentationTone::Success => cx.theme().success,
+                McpPresentationTone::Warning => cx.theme().warning,
+                McpPresentationTone::Danger => cx.theme().danger,
+                McpPresentationTone::Muted => cx.theme().muted_foreground,
+                McpPresentationTone::Default => cx.theme().foreground.opacity(0.84),
+            };
+            pioneer_desktop_foundation::CatalogSummaryCard::new(
+                presentation::mcp_display_name(server),
+                labels,
+                label,
+                color,
+            )
+        } else {
+            pioneer_desktop_foundation::CatalogSummaryCard::new(
+                component.member_key.clone(),
+                vec![],
+                status_label(component_status(component)),
+                status_color(component_status(component), cx),
+            )
+        };
+        card.pending(busy)
+            .when(component.status != "installed", |card| {
+                card.status(
+                    status_label(component_status(component)),
+                    status_color(component_status(component), cx),
+                )
+            })
+    }
+
     pub(super) fn render_details(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(plugin) = self.selected_plugin() else {
             return v_flex()
@@ -247,63 +370,13 @@ impl PluginsView {
                         .iter()
                         .filter(|component| component.kind == kind)
                         .map(|component| {
-                            let status = component_status(component);
                             let card = match component.kind.as_str() {
-                                "skill" => {
-                                    let card = self
-                                        .input
-                                        .skills
-                                        .iter()
-                                        .find(|skill| {
-                                            component.skill_id.as_ref() == Some(&skill.skill_id)
-                                        })
-                                        .map(|skill| {
-                                            pioneer_desktop_skills::SkillCard::new(skill, cx)
-                                        })
-                                        .unwrap_or_else(|| {
-                                            pioneer_desktop_skills::SkillCard::missing(
-                                                component.member_key.clone(),
-                                                status_label(status),
-                                                status_color(status, cx),
-                                            )
-                                        });
-                                    card.pending(busy)
-                                        .when(component.status != "installed", |card| {
-                                            card.status(
-                                                status_label(status),
-                                                status_color(status, cx),
-                                            )
-                                        })
-                                        .into_any_element()
-                                }
-                                "mcp" => {
-                                    let card = self
-                                        .input
-                                        .mcp
-                                        .iter()
-                                        .find(|server| {
-                                            component.mcp_installation_id.as_ref()
-                                                == Some(&server.id)
-                                        })
-                                        .map(|server| {
-                                            pioneer_desktop_mcp::McpServerCard::new(server, cx)
-                                        })
-                                        .unwrap_or_else(|| {
-                                            pioneer_desktop_mcp::McpServerCard::missing(
-                                                component.member_key.clone(),
-                                                status_label(status),
-                                                status_color(status, cx),
-                                            )
-                                        });
-                                    card.pending(busy)
-                                        .when(component.status != "installed", |card| {
-                                            card.status(
-                                                status_label(status),
-                                                status_color(status, cx),
-                                            )
-                                        })
-                                        .into_any_element()
-                                }
+                                "skill" => self
+                                    .skill_component_card(component, busy, cx)
+                                    .into_any_element(),
+                                "mcp" => self
+                                    .mcp_component_card(component, busy, cx)
+                                    .into_any_element(),
                                 _ => unreachable!("component groups contain only skills and MCP"),
                             };
                             let can_open = component.skill_id.is_some()

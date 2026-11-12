@@ -104,3 +104,26 @@ restarting = "重启中"
 stopping = "停止中"
 
 supporting_files_changed = "共享文件或软件包元数据已更改"
+
+[plugins.mcp_status]
+not_started = "未启动"
+disabled = "已禁用"
+starting = "启动中"
+ready = "就绪"
+degraded = "降级"
+auth_required = "需要授权"
+failed = "失败"
+stopping = "停止中"
+stopped = "已停止"
+restarting = "重启中"
+
+[plugins.mcp_capabilities]
+tools = "工具"
+resources = "资源"
+templates = "模板"
+prompts = "提示"
+
+[plugins.skill_status]
+active = "活跃"
+blocked = "已阻止"
+disabled = "已禁用"

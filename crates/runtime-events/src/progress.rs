@@ -198,7 +198,11 @@ struct ProgressCoalescerInner {
 
 impl Drop for ProgressCoalescerInner {
     fn drop(&mut self) {
-        self.flush_worker.get_mut().expect("progress worker ownership poisoned").wake.notify_one();
+        self.flush_worker
+            .get_mut()
+            .expect("progress worker ownership poisoned")
+            .wake
+            .notify_one();
     }
 }
 
@@ -740,7 +744,9 @@ impl ProgressCoalescer {
                     task: Some(tokio::spawn(timer.scope(async move {
                         loop {
                             wake.notified().await;
-                            let Some(inner) = owner.upgrade() else { break; };
+                            let Some(inner) = owner.upgrade() else {
+                                break;
+                            };
                             let coalescer = ProgressCoalescer { inner };
                             if coalescer
                                 .inner
@@ -757,7 +763,9 @@ impl ProgressCoalescer {
                                     tokio::time::sleep(coalescer.inner.config.flush_interval),
                                 )
                                 .await;
-                                let (events, has_more) = coalescer.drain_batch(pioneer_observability::updates::FlushReason::Timer);
+                                let (events, has_more) = coalescer.drain_batch(
+                                    pioneer_observability::updates::FlushReason::Timer,
+                                );
                                 coalescer.send_live_events(events);
                                 if coalescer
                                     .inner

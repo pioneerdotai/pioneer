@@ -3063,6 +3063,14 @@ async fn forget_tombstone_suppresses_stale_backend_search_hit() {
 
     let raw = backend
         .raw_search(BackendSearchRequest {
+            filter: pioneer_crud::AgentMemoryListFilter::default(),
+            allowed_sensitivities: vec![
+                MemorySensitivity::Normal,
+                MemorySensitivity::Personal,
+                MemorySensitivity::SecretLike,
+                MemorySensitivity::Regulated,
+            ],
+            now_unix: 300,
             query: "Tbilisi".to_owned(),
             scopes: vec![scope(MemoryScopeKind::User, "default")],
             resolved_scopes: Vec::new(),
@@ -4493,7 +4501,6 @@ async fn repair_job_helpers_roundtrip() {
                 scope_kind: Some(MemoryScopeKind::User),
                 scope_key_hash: Some("hash_one".to_owned()),
                 memory_id: Some("mem_repair_one".to_owned()),
-                capsule_id: None,
                 priority: 10,
                 max_attempts: 3,
                 scheduled_at_unix: 1000,
@@ -4523,7 +4530,6 @@ async fn repair_job_helpers_roundtrip() {
                 scope_kind: Some(MemoryScopeKind::User),
                 scope_key_hash: Some("hash_two".to_owned()),
                 memory_id: Some("mem_repair_two".to_owned()),
-                capsule_id: None,
                 priority: 10,
                 max_attempts: 2,
                 scheduled_at_unix: 1010,
@@ -4948,7 +4954,14 @@ async fn repair_worker_processes_quarantine_cleanup_and_restore_reindex() {
         .await
         .expect("process reindex")
         .expect("completed reindex");
-    assert_eq!(completed_reindex.status, "completed");
+    assert_eq!(completed_reindex.status, "pending");
+    assert!(
+        completed_reindex
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("full memory payload unavailable")
+    );
 
     let search = service
         .search(
@@ -4960,7 +4973,10 @@ async fn repair_worker_processes_quarantine_cleanup_and_restore_reindex() {
         )
         .await
         .expect("search");
-    assert_eq!(search.hits.len(), 1);
+    assert!(
+        search.hits.is_empty(),
+        "cleanup removed the full payload; preview cannot recreate it"
+    );
 }
 
 #[tokio::test]

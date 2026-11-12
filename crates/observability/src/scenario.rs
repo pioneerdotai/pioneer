@@ -3,8 +3,8 @@
 use opentelemetry::{
     Context, KeyValue,
     trace::{
-        Span as _, SpanBuilder, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags,
-        TraceId, TraceState, Tracer as _,
+        SpanBuilder, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags, TraceId,
+        TraceState, Tracer as _,
     },
 };
 use std::{

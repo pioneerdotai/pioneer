@@ -49,6 +49,7 @@ Common cron task:
 ```json
 {
   "title": "Repository release monitor",
+  "requireReview": false,
   "goal": "Check for new releases and post a product-facing summary when there is a new release.",
   "trigger": {
     "kind": "cron",
@@ -326,3 +327,19 @@ Do not call `task_wait` after creating scheduled future work unless the returned
 For active attached work, `timedOut:true` means only the requested wait window expired. It does not stop or diagnose a run; waiting again with `taskIds` or `runIds` is allowed. A run's own timeout is reported in its status and error.
 
 Scheduled, interval, and cron tasks often return `waitable:false` or `runId:null` at creation. Confirm the schedule instead of waiting.
+
+### Review option
+
+`requireReview` defaults to false for every task type and attachment mode.
+Normally pass false. Set true explicitly when each run result requires acceptance
+or same-worker revision; this also applies to scheduled, interval, cron and
+webhook tasks. True has no timeout acceptance and uses the configured saved
+revision budget. The built-in choice requires review to be enabled; arbitrary
+advanced policies retain their existing admission gate.
+
+Read exact candidate references through task_get.reviewRequired or task_wait,
+then page task_result by candidateId. Accept/revise the exact run/candidate under
+current capsule permissions. False completes automatically; task_revise does not
+reopen a completed result. For reviewed background, omitted deliveryPolicy means
+none; explicit permitted policy overrides it for results and terminal errors.
+Background without review and scheduled tasks keep their existing delivery defaults.

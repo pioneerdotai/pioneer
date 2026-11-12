@@ -1,3 +1,4 @@
+use crate::tests::episodic_projection::PersistedProjection;
 impl super::MessageProcessor {
     // Test callers await the same owned request used by the production socket pump.
     pub(crate) async fn process_owned_request(
@@ -12,6 +13,9 @@ impl super::MessageProcessor {
         }
     }
 }
+
+#[path = "tests/execution_observability.rs"]
+mod execution_observability;
 
 #[path = "tests/control_rpc.rs"]
 mod control_rpc;
@@ -1752,7 +1756,8 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
         package_path: package.to_string_lossy().into(),
         data_path: fixture.join("data").to_string_lossy().into(),
         package_fingerprint: "tree".into(),
-        enabled: true, allow_implicit_invocation: false,
+        enabled: true,
+        allow_implicit_invocation: false,
         state: "installing".into(),
         revision: 1,
         display_name: None,
@@ -2855,7 +2860,7 @@ where
 {
     let runtime = crate::build_gateway_runtime()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
-    let result = runtime.block_on(async move { tokio::spawn(future).await });
+    let result = runtime.block_on(async move { tokio::spawn(Box::pin(future)).await });
     // Test futures may leave best-effort blocking index work behind. Give it
     // a bounded grace period instead of waiting indefinitely during shutdown.
     runtime.shutdown_timeout(Duration::from_secs(5));
@@ -5463,9 +5468,12 @@ impl Provider for GuardAwareProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        if let Some(response) =
-            request_optional_fixture_tools(&request, &["task_create", "task_wait"])
-        {
+        let next_tools: &[&str] = match self.next_index.load(Ordering::SeqCst) {
+            0 => &["task_create"],
+            2 => &["task_detach"],
+            _ => &[],
+        };
+        if let Some(response) = request_optional_fixture_tools(&request, next_tools) {
             return Ok(response);
         }
         if request.messages.iter().any(|message| {
@@ -7525,7 +7533,9 @@ impl Provider for SequencedToolProvider {
             .tool_call_rounds
             .as_ref()
             .and_then(|rounds| rounds.get(index))
-            .unwrap_or(&self.first_tool_calls);
+            .or_else(|| (index == 0).then_some(&self.first_tool_calls))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let names = next_calls
             .iter()
             .map(|call| call.name.as_str())
@@ -8623,6 +8633,7 @@ async fn partial_base_url_write_failure_reconciles_only_its_workspace_authority(
     assert!(
         old_a
             .chat(pioneer_provider::ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "fixture".into(),
                 messages: vec![pioneer_provider::ChatMessage::user("hello")],
@@ -9110,7 +9121,24 @@ async fn complete_recorded_cli_task_turn_with_recovery(
                 .await
                 .expect("native Task binding lookup should succeed")
             {
-                break binding;
+                // Native ownership is persisted before admission confirms the
+                // provider context. Wait for that confirmation before injecting
+                // terminal events, just as the ordinary buffered consumer does.
+                let thread_binding = processor
+                    .crud_store
+                    .get_cli_runtime_thread_binding(binding.continuation_thread_id.as_str())
+                    .await
+                    .expect("native Task context receipt lookup should succeed");
+                if let Some(thread_binding) = thread_binding {
+                    let cursor: serde_json::Value =
+                        serde_json::from_str(&thread_binding.resume_cursor_json)
+                            .expect("native Task context receipt should decode");
+                    if cursor["pioneerContext"]["acceptedTurnId"].as_str()
+                        == Some(binding.turn_id.as_str())
+                    {
+                        break binding;
+                    }
+                }
             }
             tokio::task::yield_now().await;
         }
@@ -9505,7 +9533,7 @@ async fn create_task_for_test(
             .and_then(|spec| spec.model.as_deref())
             .unwrap_or(root_thread.model.as_str())
             .to_owned();
-        let (canonical_launch, resolved_launch) =
+        let (mut canonical_launch, resolved_launch) =
             super::agent_action_tools::resolve_workspace_task_launch(
                 processor,
                 params.workspace_id.as_str(),
@@ -9517,6 +9545,12 @@ async fn create_task_for_test(
                     .created_by_turn_id
                     .as_deref()
                     .unwrap_or("task-test-launch"),
+            )
+            .await?;
+        let normalized_launch = processor
+            .normalize_new_task_launch_capabilities(
+                params.workspace_id.as_str(),
+                &mut canonical_launch,
             )
             .await?;
         params.launch = Some(canonical_launch.clone());
@@ -9533,6 +9567,7 @@ async fn create_task_for_test(
             root_thread.model.as_str(),
             None,
         )?;
+        request.capabilities = normalized_launch.execution;
         if !matches!(
             request.execution_backend,
             Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
@@ -9919,7 +9954,6 @@ fn review_enabled_task_runtime_config() -> pioneer_tasks::TaskRuntimeConfig {
         review: pioneer_tasks::TaskReviewRuntimeConfig {
             enabled: true,
             allow_task_create_review_policy: true,
-            default_parent_review_for_immediate_attached_agent_tasks: false,
             default_max_revision_rounds: 2,
             auto_accept_after_seconds: 300,
         },
@@ -9931,6 +9965,22 @@ fn review_enabled_processor(
     session_manager: Arc<SessionManager>,
     workspace_manager: Arc<WorkspaceManager>,
     crud_store: Arc<CrudStore>,
+) -> Arc<MessageProcessor> {
+    processor_with_review_config(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store,
+        review_enabled_task_runtime_config(),
+    )
+}
+
+fn processor_with_review_config(
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+    session_manager: Arc<SessionManager>,
+    workspace_manager: Arc<WorkspaceManager>,
+    crud_store: Arc<CrudStore>,
+    task_runtime_config: pioneer_tasks::TaskRuntimeConfig,
 ) -> Arc<MessageProcessor> {
     let runtime_home = unique_temp_dir("message-review");
     let capsule_root = runtime_home.join("memory").join("capsules");
@@ -9949,7 +9999,7 @@ fn review_enabled_processor(
         runtime_home,
         capsule_root,
         pioneer_config::GatewayArtifactsConfig::default(),
-        review_enabled_task_runtime_config(),
+        task_runtime_config,
         crate::thread_episodic::ThreadEpisodicRuntimeConfig {
             enabled: false,
             indexing_enabled: false,
@@ -25656,7 +25706,7 @@ where
 {
     let runtime = crate::build_gateway_runtime()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
-    let result = runtime.block_on(async move { tokio::spawn(future).await });
+    let result = runtime.block_on(async move { tokio::spawn(Box::pin(future)).await });
     runtime.shutdown_timeout(Duration::from_secs(5));
     result.unwrap_or_else(|error| panic!("{name} task should finish: {error}"));
 }
@@ -25800,6 +25850,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -26073,6 +26124,7 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -26105,6 +26157,7 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -26258,6 +26311,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 1,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -26457,6 +26511,7 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -26611,6 +26666,7 @@ async fn task_revise_restart_reuses_in_progress_revision_turn_impl() {
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -41534,23 +41590,20 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "task_list",
         "task_reschedule",
         "task_pause",
+        "task_result",
+        "task_accept",
+        "task_revise",
     ] {
         assert!(
             tool_names.contains(&expected),
             "agent mode should expose {expected}"
         );
     }
-    for hidden_until_review in ["task_accept", "task_revise"] {
-        assert!(
-            !tool_names.contains(&hidden_until_review),
-            "agent mode should expose {hidden_until_review} only after a review-required candidate is observed"
-        );
-    }
     assert!(
         tool_names
             .iter()
             .all(|name| !name.contains("review") && !name.contains("approval")),
-        "review-disabled Phase 3 must not expose review/approval tools"
+        "the task domain must not expose a separate review/approval tool family"
     );
 
     // Start at the text response; Chat has no initial tool round to execute.
@@ -43164,7 +43217,8 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let (_database_dir, workspace_manager, crud_store, workspace_id) =
+            setup_pooled_file_workspace_manager().await;
         let provider = Arc::new(GuardAwareProvider::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
@@ -45858,11 +45912,10 @@ async fn thread_episodic_store_ingestor_creates_items_and_jobs_idempotently() {
         .await
         .expect("index jobs should be readable");
     assert_eq!(jobs.len(), 2);
-    assert!(jobs.iter().all(|job| {
-        job.status == pioneer_crud::ThreadEpisodicIndexJobStatus::Queued
-            && job.graph_enrichment_state
-                == pioneer_crud::ThreadEpisodicGraphEnrichmentState::NotSupported
-    }));
+    assert!(
+        jobs.iter()
+            .all(|job| { job.status == pioneer_crud::ThreadEpisodicIndexJobStatus::Queued })
+    );
 }
 
 // Exercise canonical commit -> durable episodic delivery -> ingestion -> the
@@ -45932,7 +45985,7 @@ async fn save_and_deliver_episodic_wake_for_test(
 #[tokio::test]
 async fn production_episodic_wakes_drain_batches_and_survive_busy_idle_race_and_delivery_cancellation()
  {
-    use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+    use crate::database::startup::thread_episodic_refill as refill;
     use crate::thread_episodic::{
         RuntimeVectorThreadEpisodicIndexPayloadProvider,
         SharedThreadEpisodicIndexEmbeddingProviderResolver,
@@ -45952,12 +46005,11 @@ async fn production_episodic_wakes_drain_batches_and_survive_busy_idle_race_and_
     let executor = Arc::new(
         ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(pioneer_memory::MemvidThreadEpisodicBackend::new()),
+            Arc::new(pioneer_memory::SqliteThreadEpisodicBackend::new(
+                store.clone(),
+            )),
             Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    store.clone(),
-                    pioneer_memory::thread_episodic_storage_uri_from_path(root.path()),
-                )),
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                 resolver.clone(),
                 store.clone(),
             )),
@@ -45980,7 +46032,7 @@ async fn production_episodic_wakes_drain_batches_and_survive_busy_idle_race_and_
         store.clone(),
         root.path(),
         &workspace,
-        refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+        refill::ThreadEpisodicWorkspaceProjectionTarget::lexical_only(),
         None,
     )
     .await
@@ -46133,7 +46185,6 @@ async fn production_snapshot_save_wakes_idle_runner_and_preserves_draft_unchange
         StoreThreadEpisodicIndexPayloadProvider, ThreadEpisodicIndexExecutor,
     };
     let (workspace_manager, store, workspace) = setup_workspace_manager().await;
-    let root = tempfile::tempdir().unwrap();
     let session_manager = Arc::new(SessionManager::new());
     let (tx, mut rx) = crate::session::test_support::outbound_channel(64);
     let connection = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -46149,11 +46200,10 @@ async fn production_snapshot_save_wakes_idle_runner_and_preserves_draft_unchange
     );
     let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
         store.clone(),
-        Arc::new(pioneer_memory::MemvidThreadEpisodicBackend::new()),
-        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+        Arc::new(pioneer_memory::SqliteThreadEpisodicBackend::new(
             store.clone(),
-            pioneer_memory::thread_episodic_storage_uri_from_path(root.path()),
         )),
+        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
     ));
     processor.thread_episodic_index_executor = executor.clone();
     let thread = "snapshot_wake_thread";
@@ -46391,15 +46441,15 @@ impl crate::thread_episodic::ThreadEpisodicIndexEmbeddingProviderResolver
 }
 
 #[tokio::test]
-async fn production_settings_recovery_transitions_projection_before_new_source_capsule_write() {
-    use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+async fn production_settings_recovery_transitions_projection_before_new_source_publication() {
+    use crate::database::startup::thread_episodic_refill as refill;
     use crate::thread_episodic::{
         RuntimeVectorThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIndexPayloadProvider,
         ThreadEpisodicIndexExecutor, ThreadEpisodicRuntimeConfig,
     };
     use pioneer_memory::ThreadEpisodicEmbeddingProvider;
     let (workspace_manager, store, _) = setup_workspace_manager().await;
-    // Capsule ownership is process-wide and keyed by workspace ID. Separate
+    // Refill ownership is process-wide and keyed by workspace ID. Separate
     // databases/storage roots alone do not isolate the default workspace lock
     // from other concurrently running Gateway fixtures.
     let workspace = workspace_manager
@@ -46430,12 +46480,11 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
     let executor = Arc::new(
         ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(pioneer_memory::MemvidThreadEpisodicBackend::new()),
+            Arc::new(pioneer_memory::SqliteThreadEpisodicBackend::new(
+                store.clone(),
+            )),
             Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    store.clone(),
-                    pioneer_memory::thread_episodic_storage_uri_from_path(root.path()),
-                )),
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                 resolver.clone(),
                 store.clone(),
             )),
@@ -46472,12 +46521,17 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
             .list_thread_episodic_index_jobs_for_thread(&workspace, "wake_thread", 100)
             .await
             .unwrap();
-        let old_capsules = store
-            .list_all_thread_episodic_capsules_for_workspace(&workspace)
-            .await
-            .unwrap();
-        let old_bytes =
-            std::fs::read(old_capsules[0].storage_uri.strip_prefix("file://").unwrap()).unwrap();
+        let mut old_projections = Vec::new();
+        for old in &old_items {
+            let artifact = store
+                .find_thread_episodic_embedding_artifact(
+                    old.embedding_artifact_id.as_deref().unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            old_projections.push((old.projection_text(&store).await, artifact));
+        }
         *resolver.provider.write().unwrap() = None;
         let config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
             enabled: true,
@@ -46499,9 +46553,7 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
             std::collections::BTreeMap::from([(workspace.clone(), config.clone())]),
         );
         let selected =
-            refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
-                &config,
-            );
+            refill::ThreadEpisodicWorkspaceProjectionTarget::from_vector_search_config(&config);
         assert!(
             refill::refill_once_with_projection_resolver(
                 store.clone(),
@@ -46538,10 +46590,17 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
                 .attempt_count,
             0
         );
-        assert_eq!(
-            std::fs::read(old_capsules[0].storage_uri.strip_prefix("file://").unwrap()).unwrap(),
-            old_bytes
-        );
+        for (old, (text, artifact)) in old_items.iter().zip(&old_projections) {
+            assert_eq!(old.projection_text(&store).await, *text);
+            assert_eq!(
+                store
+                    .find_thread_episodic_embedding_artifact(&artifact.id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(artifact)
+            );
+        }
         for old in &old_jobs {
             assert_eq!(
                 store
@@ -46602,29 +46661,17 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
             .list_thread_episodic_items_for_thread(&workspace, "wake_thread", 100)
             .await
             .unwrap();
-        let capsules = store
-            .list_all_thread_episodic_capsules_for_workspace(&workspace)
-            .await
-            .unwrap();
-        let capsule = memvid_core::Memvid::open_read_only(
-            capsules[0].storage_uri.strip_prefix("file://").unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            capsule.effective_vec_index_dimension().unwrap(),
-            Some(u32::try_from(dimension).unwrap())
-        );
         for source in current_items {
-            let frame = capsule
-                .frame_by_uri(source.frame_uri.as_deref().unwrap())
+            assert!(source.projection_text(&store).await.is_some());
+            let artifact = store
+                .find_thread_episodic_embedding_artifact(
+                    source.embedding_artifact_id.as_deref().unwrap(),
+                )
+                .await
+                .unwrap()
                 .unwrap();
-            assert_eq!(
-                frame
-                    .extra_metadata
-                    .get("pioneer.thread_episodic.embedding.model")
-                    .map(String::as_str),
-                Some(model)
-            );
+            assert_eq!(artifact.dimension, dimension);
+            assert_eq!(artifact.model, model);
             let job = store
                 .find_thread_episodic_index_job_by_item(&source.id)
                 .await
@@ -66250,7 +66297,7 @@ where
         .build()
         .expect("test runtime should build");
     let result = runtime.block_on(async move { tokio::spawn(test()).await });
-    // Message tests can leave best-effort Memvid indexing on spawn_blocking.
+    // Message tests may leave provider preparation on spawn_blocking.
     // Runtime::drop waits for blocking tasks without a deadline, even after
     // the test future and all of its assertions have completed.
     runtime.shutdown_timeout(Duration::from_secs(5));
@@ -79673,6 +79720,7 @@ async fn mcp_install_itemizes_valid_and_invalid_servers() {
 }
 
 async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    pioneer_sqlite::search::register_auto_extension_once().unwrap();
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("must connect to sqlite memory");
@@ -79699,6 +79747,7 @@ async fn setup_pooled_file_workspace_manager_with_observer(
 ) {
     use sea_orm::{ConnectOptions, ConnectionTrait};
 
+    pioneer_sqlite::search::register_auto_extension_once().unwrap();
     let directory = tempfile::tempdir().expect("isolated Gateway database directory");
     let path = directory.path().join("gateway.sqlite");
     let url = format!("sqlite://{}?mode=rwc", path.display());
@@ -80163,6 +80212,7 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
             .unwrap();
         let projected_message = crate::compaction::event_message(event).unwrap().unwrap();
         let request = |message| ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "gpt-4".into(),
             messages: vec![
@@ -80765,7 +80815,6 @@ async fn setup_memory_gateway_harness_with_backend(
         .await;
     let runtime_home = unique_temp_dir(&format!("memory_{case_id}"));
     std::fs::create_dir_all(runtime_home.as_path()).expect("create memory runtime home");
-    let uses_memvid = backend.is_none();
     let memory_runtime = Arc::new(match backend {
         Some(backend) => {
             assert!(enabled, "custom memory backend requires an enabled runtime");
@@ -80773,10 +80822,8 @@ async fn setup_memory_gateway_harness_with_backend(
         }
         None => GatewayMemoryRuntime::from_config(
             crud_store.clone(),
-            runtime_home.as_path(),
             &GatewayMemoryConfig {
                 enabled,
-                capsules_dir: "memory/capsules".to_owned(),
                 allow_global_user_by_default: true,
                 allow_global_agent_by_default: false,
                 ..GatewayMemoryConfig::default()
@@ -80787,14 +80834,6 @@ async fn setup_memory_gateway_harness_with_backend(
 
     if enabled {
         assert!(memory_runtime.is_enabled());
-    }
-    if enabled && uses_memvid {
-        assert!(
-            memory_runtime
-                .capsules_root()
-                .expect("enabled runtime should expose capsules root")
-                .starts_with(runtime_home.as_path())
-        );
     }
 
     let processor = Arc::new(MessageProcessor::new_with_memory_runtime(
@@ -80869,10 +80908,8 @@ async fn setup_memory_agent_e2e_harness_on_workspace(
     let memory_runtime = Arc::new(
         GatewayMemoryRuntime::from_config(
             crud_store.clone(),
-            runtime_home.as_path(),
             &GatewayMemoryConfig {
                 enabled: true,
-                capsules_dir: "memory/capsules".to_owned(),
                 allow_global_user_by_default: true,
                 allow_global_agent_by_default: false,
                 ..GatewayMemoryConfig::default()
@@ -81352,7 +81389,7 @@ async fn memory_remember_get_list_roundtrip() {
 }
 
 #[tokio::test]
-async fn memory_search_returns_memvid_backed_hits_filtered_by_control_plane() {
+async fn memory_search_returns_sqlite_hits_filtered_by_control_plane() {
     let mut harness = setup_memory_gateway_harness("search_filter", true).await;
     let request_context = harness.request_context().await;
     let scope = workspace_memory_scope(harness.workspace_id.as_str());
@@ -81494,7 +81531,7 @@ async fn memory_search_returns_memvid_backed_hits_filtered_by_control_plane() {
             .hits
             .iter()
             .any(|hit| hit.record.id == target_payload.record.id),
-        "deleted memory must not leak through memvid search"
+        "deleted memory must not leak through search"
     );
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
@@ -82289,8 +82326,8 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
 #[tokio::test]
 async fn supervised_memory_mutations_prompt_before_real_database_side_effects() {
     // Exercise the real approval broker, tools, memory service and SQLite writes.
-    // Memvid indexing is covered separately; its Tantivy writer lifecycle must
-    // not make this permission regression depend on filesystem lock timing.
+    // Storage adapter behavior is covered separately; this fixture isolates
+    // approval and publication through the existing memory service contract.
     let harness = setup_memory_gateway_harness_with_backend(
         "tool_supervised_consent",
         true,
@@ -83334,7 +83371,7 @@ async fn wait_for_cli_runtime_turn_starts(
     session: &RecordingCliRuntimeSession,
     expected: usize,
 ) -> Vec<CLIAgentRuntimeTurnStartParams> {
-    // The gateway crate runs a large number of SQLite/memvid tests in parallel.
+    // The gateway crate runs a large number of SQLite tests in parallel.
     // A valid child dispatch can therefore be delayed by scheduler and I/O
     // contention even though the runtime contract is healthy. Keep this test
     // observation bounded, but do not turn that transient contention into a
@@ -83947,9 +83984,13 @@ async fn compaction_result_reader_pages_exact_source_and_rejects_cross_scope() {
     let mut small = params.clone();
     small.max_tokens = Some(100);
     small.max_bytes = Some(200);
-    let small_page = processor.read_thread_tool_result(small).await.unwrap();
-    assert!(!small_page.text.is_empty());
-    assert!(serde_json::to_string(&small_page).unwrap().len() <= 200);
+    let error = processor.read_thread_tool_result(small).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot make progress within budget"),
+        "a budget smaller than the delivery envelope must be rejected"
+    );
     let mut restored = String::new();
     loop {
         let page: ThreadToolResultReadResponse = processor
@@ -85248,6 +85289,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         cancellation: cancel.clone(),
     };
     let registration_request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "test-model".into(),
         messages: vec![pioneer_provider::ChatMessage::user(
@@ -85596,6 +85638,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "test-model".into(),
         messages: vec![pioneer_provider::ChatMessage::user(
@@ -87515,6 +87558,7 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 "",
             ));
             let request = ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "gpt-4o".into(),
                 messages: vec![input],
@@ -87555,6 +87599,7 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 .prepare(
                     &context,
                     ChatRequest {
+                        tool_declarations: None,
                         model: "gpt-4".into(),
                         ..request
                     },
@@ -87826,6 +87871,7 @@ async fn check_completed_history(
                 cancellation: tokio_util::sync::CancellationToken::new(),
             };
             let request = ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "test-model".into(),
                 messages: vec![
@@ -88913,6 +88959,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
             effort: effort.map(str::to_owned),
         };
         let original = ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: model.into(),
             messages: captured.messages.clone(),
@@ -90536,10 +90583,18 @@ async fn persisted_interrupted_turn_cannot_hide_accepted_direct_checkpoint_start
         stopped.is_err(),
         "persisted Interrupted cannot acknowledge accepted unpublished startup"
     );
-    assert!(processor.cancel_root_agent_work_graph_for_turn_and_wait(
-        thread, &persisted, "new Plugin stop during accepted unpublished startup",
-        tokio::time::Instant::now() + Duration::from_secs(1),
-    ).await.is_err(), "the Gateway no-root consumer must retain the same UnknownOwner refusal");
+    assert!(
+        processor
+            .cancel_root_agent_work_graph_for_turn_and_wait(
+                thread,
+                &persisted,
+                "new Plugin stop during accepted unpublished startup",
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .is_err(),
+        "the Gateway no-root consumer must retain the same UnknownOwner refusal"
+    );
     assert!(matches!(
         processor
             .agent_manager
@@ -90605,122 +90660,398 @@ async fn native_snapshot_after_publication(
 
 #[tokio::test]
 async fn failed_drained_selected_plugin_task_child_does_not_block_a_new_mutation() {
+    for tool_calling in [false, true] {
+        failed_drained_selected_plugin_task_child(tool_calling).await;
+    }
+}
+
+async fn failed_drained_selected_plugin_task_child(tool_calling: bool) {
+    use pioneer_agent::TaskToolProvider;
+
     struct PanicChild {
+        parent_entered: Arc<tokio::sync::Notify>,
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        tool_calling: bool,
     }
     #[async_trait::async_trait]
     impl Provider for PanicChild {
-        fn name(&self) -> &str { "openai" }
+        fn name(&self) -> &str {
+            "openai"
+        }
         fn capabilities(&self) -> ProviderCapabilities {
-            DelayedProvider { delay: Duration::ZERO, text: String::new() }.capabilities()
+            let mut capabilities = DelayedProvider {
+                delay: Duration::ZERO,
+                text: String::new(),
+            }
+            .capabilities();
+            capabilities.tool_calling = self.tool_calling;
+            capabilities
         }
         async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
-            DelayedProvider { delay: Duration::ZERO, text: String::new() }.list_models().await
+            let mut models = DelayedProvider {
+                delay: Duration::ZERO,
+                text: String::new(),
+            }
+            .list_models()
+            .await?;
+            for model in &mut models {
+                model.capabilities.tool_calling = Some(self.tool_calling);
+            }
+            Ok(models)
         }
-        async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+        async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+            if !is_child_task_main_request(&request) {
+                return Ok(text_response("auxiliary request complete"));
+            }
+            assert_eq!(
+                request
+                    .tools
+                    .as_ref()
+                    .is_some_and(|tools| !tools.is_empty()),
+                self.tool_calling,
+                "the actual child request must exercise the selected provider branch"
+            );
+            if !request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Fail after native publication"))
+            {
+                self.parent_entered.notify_one();
+                return futures_util::future::pending().await;
+            }
             self.entered.notify_one();
             self.release.notified().await;
             panic!("actual native Task provider panic");
         }
-        async fn stream_chat(&self, request: ChatRequest) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
-            let _ = self.chat(request).await?;
-            unreachable!("provider always panics after its release gate")
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let response = self.chat(request).await?;
+            Ok(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(response.text)),
+                Ok(StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
+            ])
+            .boxed())
         }
     }
+    let parent_entered = Arc::new(tokio::sync::Notify::new());
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider("openai", Arc::new(PanicChild {
-        entered: entered.clone(), release: release.clone(),
-    })));
+    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        Arc::new(PanicChild {
+            parent_entered: parent_entered.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+            tool_calling,
+        }),
+    ));
     let (workspaces, store, workspace) = setup_workspace_manager().await;
     let processor = Arc::new(MessageProcessor::new(
-        Arc::new(ThreadManager::new("test-model", "openai")), registry,
-        Arc::new(SessionManager::new()), workspaces, store.clone(), test_gateway_secrets(),
-        test_summary_config(), test_tool_loop_config(),
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        registry,
+        Arc::new(SessionManager::new()),
+        workspaces,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(&workspace, "openai", "fixture-key")
+        .unwrap();
     let temporary = tempfile::tempdir().unwrap();
     let package = temporary.path().join("package");
     std::fs::create_dir(&package).unwrap();
     let parent = "P".repeat(21);
     let now = chrono::Utc::now().fixed_offset();
-    store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
-        id: parent.clone(), workspace_id: workspace.clone(), name: "empty-selected".into(),
-        version: None, source_upload_id: "failed-child-source".into(),
-        package_path: package.to_string_lossy().into(), data_path: temporary.path().join("data").to_string_lossy().into(),
-        package_fingerprint: "empty-tree".into(), enabled: true, allow_implicit_invocation: false, state: "installing".into(),
-        revision: 1,
-        display_name: None,
-        short_description: None,
-        description: None,
-        long_description: None,
-        developer_name: None,
-        author_name: None,
-        author_email: None,
-        author_url: None,
-        homepage: None,
-        repository: None,
-        documentation_url: None,
-        support_url: None,
-        privacy_policy_url: None,
-        terms_of_service_url: None,
-        license: None,
-        category: None,
-        brand_color: None,
-        logo_path: None,
-        logo_revision: None,
-        composer_icon_path: None,
-        composer_icon_revision: None, pending_json: None, last_error: None, created_at: now, updated_at: now,
-    }).await.unwrap();
-    store.settle_plugin_installation(&parent, 1, "installed", None).await.unwrap();
-    let mut params = test_task_create_params(&workspace, "failed-child-parent", "failed-child-parent-turn", "Fail after native publication", 3);
-    ensure_task_create_parent_turn_for_test(&processor, &params).await.unwrap();
+    store
+        .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+            id: parent.clone(),
+            workspace_id: workspace.clone(),
+            name: "empty-selected".into(),
+            version: None,
+            source_upload_id: "failed-child-source".into(),
+            package_path: package.to_string_lossy().into(),
+            data_path: temporary.path().join("data").to_string_lossy().into(),
+            package_fingerprint: "empty-tree".into(),
+            enabled: true,
+            allow_implicit_invocation: false,
+            state: "installing".into(),
+            revision: 1,
+            display_name: None,
+            short_description: None,
+            description: None,
+            long_description: None,
+            developer_name: None,
+            author_name: None,
+            author_email: None,
+            author_url: None,
+            homepage: None,
+            repository: None,
+            documentation_url: None,
+            support_url: None,
+            privacy_policy_url: None,
+            terms_of_service_url: None,
+            license: None,
+            category: None,
+            brand_color: None,
+            logo_path: None,
+            logo_revision: None,
+            composer_icon_path: None,
+            composer_icon_revision: None,
+            pending_json: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    store
+        .settle_plugin_installation(&parent, 1, "installed", None)
+        .await
+        .unwrap();
+    let mut params = test_task_create_params(
+        &workspace,
+        "failed-child-parent",
+        "failed-child-parent-turn",
+        "Hold the parent while its selected-plugin child runs",
+        3,
+    );
+    ensure_task_create_parent_turn_for_test(&processor, &params)
+        .await
+        .unwrap();
     let (mut launch, _) = super::agent_action_tools::resolve_workspace_task_launch(
-        &processor, &workspace, "openai", "test-model", None, None, "failed-child-parent-turn",
-    ).await.unwrap();
+        &processor,
+        &workspace,
+        "openai",
+        "test-model",
+        None,
+        None,
+        "failed-child-parent-turn",
+    )
+    .await
+    .unwrap();
     launch.execution.selected_capabilities = vec![pioneer_protocol::TurnCapability {
-        id: pioneer_protocol::plugin_capability_key(&parent), label: Some("empty-selected".into()),
-        kind: pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent.clone(), expected_revision: 1 },
+        id: pioneer_protocol::plugin_capability_key(&parent),
+        label: Some("empty-selected".into()),
+        kind: pioneer_protocol::TurnCapabilityKind::Plugin {
+            plugin_id: parent.clone(),
+            expected_revision: 1,
+        },
     }];
-    processor.normalize_new_task_launch_capabilities(&workspace, &mut launch).await.unwrap();
     params.launch = Some(launch);
-    let task = create_task_for_test(&processor, params).await.unwrap();
-    let run = task.run.unwrap();
-    let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
-    tokio::time::timeout(Duration::from_secs(5), entered.notified()).await.unwrap();
-    let selection = store.get_plugin_selection(&lineage.child_turn_id).await.unwrap().expect("real Task launch must persist Selected Plugin");
+    let parent_task = create_task_for_test(&processor, params).await.unwrap();
+    let parent_run = parent_task.run.unwrap();
+    let parent_lineage = wait_for_child_lineage_for_run(store.clone(), &parent_run.id).await;
+    tokio::time::timeout(Duration::from_secs(5), parent_entered.notified())
+        .await
+        .unwrap();
+    let parent_response = pioneer_crud::load_agent_turn_response(
+        &store.database_connection(),
+        &parent_lineage.child_turn_id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Create the nested occurrence through the actual execution-bound handler:
+    // a human-authored Task with created_by_turn_id still owns a fresh root.
+    let task_tools = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&processor))
+        .materialize_task_tools(pioneer_agent::TaskTurnContext {
+            workspace_id: workspace.clone(),
+            thread_id: parent_lineage.child_thread_id.clone(),
+            turn_id: parent_lineage.child_turn_id.clone(),
+        })
+        .await
+        .unwrap();
+    let create = task_tools
+        .bundles
+        .into_iter()
+        .flat_map(|bundle| bundle.handlers)
+        .find(|(name, _)| name == "task_create")
+        .expect("the running parent must expose its authorized Task handler")
+        .1;
+    let call_id = "create-failing-plugin-child";
+    let trace = pioneer_tools::ToolEventBus::new(16).start_trace(
+        parent_lineage.child_turn_id.clone(),
+        call_id,
+        "task_create",
+    );
+    let output = create
+        .handle(
+            pioneer_tools::ToolInvocation {
+                call_id: call_id.into(),
+                tool_name: "task_create".into(),
+                source: pioneer_tools::ToolCallSource::Model,
+                payload: pioneer_tools::ToolPayload::Function {
+                    arguments: json!({
+                        "title": "Failing selected-plugin child",
+                        "goal": "Fail after native publication",
+                        "instructions": ["Return a concise final result."]
+                    }),
+                },
+                workdir: Default::default(),
+                environment: Default::default(),
+                attempt_id: 0,
+                idempotency_key: None,
+                recovery: Default::default(),
+                permission_metadata: Default::default(),
+                execution_security_snapshot: None,
+                apply_patch_preflight: None,
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            },
+            trace,
+        )
+        .await
+        .unwrap();
+    assert!(output.success(), "{}", output.raw_text());
+    let created = output.raw_json();
+    let run_id = created["runId"].as_str().unwrap();
+    let lineage = wait_for_child_lineage_for_run(store.clone(), run_id).await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    let selection = store
+        .get_plugin_selection(&lineage.child_turn_id)
+        .await
+        .unwrap()
+        .expect("real Task launch must persist Selected Plugin");
     assert_eq!(selection.phase, "ready");
     assert_eq!(selection.parents[0].id, parent);
-    let response = pioneer_crud::load_agent_turn_response(&store.database_connection(), &lineage.child_turn_id).await.unwrap().unwrap();
-    let execution = pioneer_crud::load_agent_execution(&store.database_connection(), &response.execution_id).await.unwrap().unwrap();
-    assert!(execution.parent_execution_id.is_some());
-    assert_ne!(execution.id, execution.work_graph_root_execution_id, "must exercise the legitimate nonroot fallback");
-    let owner = processor.agent_manager.capture_turn_stop_owner(&lineage.child_thread_id, &lineage.child_turn_id).await.unwrap();
+    let response = pioneer_crud::load_agent_turn_response(
+        &store.database_connection(),
+        &lineage.child_turn_id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let execution =
+        pioneer_crud::load_agent_execution(&store.database_connection(), &response.execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        execution.parent_execution_id.as_deref(),
+        Some(parent_response.execution_id.as_str())
+    );
+    assert_eq!(
+        execution.work_graph_root_execution_id,
+        parent_response.execution_id
+    );
+    assert_ne!(
+        execution.id, execution.work_graph_root_execution_id,
+        "must exercise the legitimate nonroot fallback"
+    );
+    let owner = processor
+        .agent_manager
+        .capture_turn_stop_owner(&lineage.child_thread_id, &lineage.child_turn_id)
+        .await
+        .unwrap();
     assert!(!owner.is_quiescent());
     release.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Native RuntimeFailure opens recovery; it does not immediately mark the
+    // logical Turn Failed. Observe that durable outcome before joining its run.
+    let recovery = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if store.get_turn(&lineage.child_thread_id, &lineage.child_turn_id).await.unwrap().unwrap().1.status == TurnStatus::Failed { break; }
+            let jobs = store
+                .find_open_recovery_jobs_for_turn(&lineage.child_turn_id)
+                .await
+                .unwrap();
+            if !jobs.is_empty() {
+                break jobs;
+            }
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
+    assert_eq!(recovery.len(), 1);
+    assert_eq!(
+        recovery[0].trigger,
+        pioneer_protocol::RecoveryTrigger::RuntimeFailure
+    );
+    assert_eq!(
+        recovery[0].action,
+        pioneer_protocol::RecoveryAction::RestartTurn
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    assert!(processor.await_native_graph_owner(&owner, "initial captured failed run", deadline).await.is_err());
-    assert!(owner.is_quiescent(), "only actual finish/join can establish the historical proof");
-    assert!(processor.await_native_graph_owner(&owner, "same captured run remains sticky", deadline).await.is_err());
-    assert!(processor.agent_manager.native_stop_turn_candidates(&[lineage.child_thread_id.clone()]).await.unwrap()
-        .contains(&(lineage.child_thread_id.clone(), lineage.child_turn_id.clone())), "real Plugin stop inventory must include this historical child");
-    let inventory = processor.agent_manager.capture_native_stop_owners(&[lineage.child_thread_id.clone()]).await.unwrap();
-    assert!(inventory.iter().any(|run| run.turn_id() == lineage.child_turn_id && run.run_id() == owner.run_id() && run.is_quiescent()));
-    let mutation = processor.acquire_plugin_mutation(&workspace, &parent, 1).await.unwrap();
-    processor.stop_plugin_execution(&mutation, deadline).await.expect("a new mutation must not replay the drained child's historical error");
-    let disabled = store.begin_plugin_mutation(&workspace, &parent, 1, "updating", false,
-        "{\"kind\":\"set_enabled\",\"enabled\":false}").await.unwrap();
+    assert!(
+        processor
+            .await_native_graph_owner(&owner, "initial captured failed run", deadline)
+            .await
+            .is_err()
+    );
+    assert!(
+        owner.is_quiescent(),
+        "only actual finish/join can establish the historical proof"
+    );
+    assert!(
+        processor
+            .await_native_graph_owner(&owner, "same captured run remains sticky", deadline)
+            .await
+            .is_err()
+    );
+    let inventory = native_snapshot_after_publication(
+        &processor.agent_manager,
+        &[lineage.child_thread_id.clone()],
+    )
+    .await;
+    assert!(
+        processor
+            .agent_manager
+            .native_stop_turn_candidates(&[lineage.child_thread_id.clone()])
+            .await
+            .unwrap()
+            .contains(&(
+                lineage.child_thread_id.clone(),
+                lineage.child_turn_id.clone()
+            )),
+        "real Plugin stop inventory must include this historical child"
+    );
+    assert!(
+        inventory
+            .iter()
+            .any(|run| run.turn_id() == lineage.child_turn_id
+                && run.run_id() == owner.run_id()
+                && run.is_quiescent())
+    );
+    let mutation = processor
+        .acquire_plugin_mutation(&workspace, &parent, 1)
+        .await
+        .unwrap();
+    processor
+        .stop_plugin_execution(&mutation, deadline)
+        .await
+        .expect("a new mutation must not replay the drained child's historical error");
+    let disabled = store
+        .begin_plugin_mutation(
+            &workspace,
+            &parent,
+            1,
+            "updating",
+            false,
+            "{\"kind\":\"set_enabled\",\"enabled\":false}",
+        )
+        .await
+        .unwrap();
     assert!(!disabled.enabled);
     assert!(owner.is_quiescent());
     drop(mutation);
-    processor.agent_manager.remove_thread(&lineage.child_thread_id).await;
+    processor
+        .agent_manager
+        .remove_thread(&lineage.child_thread_id)
+        .await;
+    processor
+        .agent_manager
+        .remove_thread(&parent_lineage.child_thread_id)
+        .await;
 }
 
 #[tokio::test]
@@ -90743,7 +91074,8 @@ async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barri
         package_path: package.to_string_lossy().into(),
         data_path: temporary.path().join("data").to_string_lossy().into(),
         package_fingerprint: "empty-tree".into(),
-        enabled: true, allow_implicit_invocation: false,
+        enabled: true,
+        allow_implicit_invocation: false,
         state: "installing".into(),
         revision: 1,
         display_name: None,
@@ -91102,6 +91434,7 @@ async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
     );
     let response = provider
         .chat(ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![ChatMessage::user("fixture prompt")],
@@ -91122,7 +91455,18 @@ async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, "completed");
     let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
-    assert_eq!(Some(retained), response.usage);
+    let mut returned = response.usage.unwrap();
+    // Retention omits an absent tariff rather than retaining its null placeholder.
+    if let Some(accounting) = returned
+        .accounting
+        .as_mut()
+        .and_then(JsonValue::as_object_mut)
+    {
+        if accounting.get("pricing").is_some_and(JsonValue::is_null) {
+            accounting.remove("pricing");
+        }
+    }
+    assert_eq!(retained, returned);
     assert!(!rows[0].usage_json.contains("fixture prompt"));
 }
 
@@ -91181,6 +91525,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     );
     let mut stream = provider
         .stream_chat(ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![],
@@ -91201,6 +91546,15 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert_eq!(started[0].status, "started");
     let metadata: serde_json::Value = serde_json::from_str(&started[0].usage_json).unwrap();
     assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
+    let prepared_attempt = metadata["physical_attempt_id"].as_str().unwrap().to_owned();
+    assert!(metadata["accounting"].is_object());
+    assert_eq!(
+        metadata["_pioneer_observation"]["context_manifest"]["layer"],
+        "application_canonical"
+    );
+    assert!(serde_json::Value::is_null(
+        &metadata["_pioneer_observation"]["timing"]["dispatch_at"]
+    ));
     assert!(stream.next().await.unwrap().unwrap().is_final);
     assert_eq!(
         stream
@@ -91221,6 +91575,10 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, "completed");
     let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(
+        retained.physical_attempt_id.as_deref(),
+        Some(prepared_attempt.as_str())
+    );
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
     assert_eq!(
@@ -91241,6 +91599,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     );
     let mut stream = failed
         .stream_chat(ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![],
@@ -91287,6 +91646,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     );
     let mut stream = legacy
         .stream_chat(ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "fixture".into(),
             messages: vec![],
@@ -91360,6 +91720,7 @@ async fn auxiliary_stream_partial_usage_survives_drop_and_retry_without_holding_
         "partial-owner",
     );
     let request = || ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "fixture".into(),
         messages: vec![],
@@ -91604,6 +91965,7 @@ async fn auxiliary_metadata_only_header_survives_failure_without_inventing_count
         "header-owner",
     );
     let request = ChatRequest {
+        tool_declarations: None,
         service_mode: None,
         model: "requested".into(),
         messages: vec![],
@@ -93227,6 +93589,7 @@ async fn neutral_provider_preparation_and_delivery_survive_registry_and_journal(
     assert!(provider.capabilities().tool_calling);
     let response = provider
         .stream_chat_with_diagnostics(pioneer_provider::ChatRequest {
+            tool_declarations: None,
             service_mode: None,
             model: "private/model".into(),
             messages: vec![pioneer_provider::ChatMessage::user("hello")],

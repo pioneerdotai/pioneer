@@ -1,8 +1,6 @@
-use memvid_core::{MemvidError, VecEmbedder};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadEpisodicEmbeddingIdentity {
@@ -41,13 +39,6 @@ impl ThreadEpisodicEmbeddingIdentity {
             self.dimension,
             actual_dimension,
         ))
-    }
-
-    pub fn memvid_model_id(&self) -> String {
-        format!(
-            "{}:{}:{}:normalized={}",
-            self.provider_id, self.model, self.dimension, self.normalized
-        )
     }
 }
 
@@ -218,22 +209,6 @@ impl ThreadEpisodicEmbeddingError {
             retryable: self.is_retryable(),
         }
     }
-
-    fn into_memvid_error(self) -> MemvidError {
-        if let ThreadEpisodicEmbeddingErrorKind::DimensionMismatch { expected, actual } = &self.kind
-        {
-            if let Ok(expected) = u32::try_from(*expected) {
-                return MemvidError::VecDimensionMismatch {
-                    expected,
-                    actual: *actual,
-                };
-            }
-        }
-
-        MemvidError::EmbeddingFailed {
-            reason: self.to_string().into_boxed_str(),
-        }
-    }
 }
 
 impl Display for ThreadEpisodicEmbeddingError {
@@ -298,50 +273,35 @@ pub trait ThreadEpisodicEmbeddingProvider: Send + Sync {
     fn embed_text_checked(&self, text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
         let embedding = self.embed_text(text)?;
         self.identity().validate_embedding(embedding.len())?;
+        if embedding.iter().any(|value| !value.is_finite())
+            || !embedding.iter().any(|value| *value != 0.0)
+        {
+            return Err(
+                ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                    self.provider_id(),
+                    self.model(),
+                    "embedding must be finite and nonzero",
+                ),
+            );
+        }
         Ok(embedding)
     }
 
     fn embed_query_checked(&self, text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
         let embedding = self.embed_query(text)?;
         self.identity().validate_embedding(embedding.len())?;
+        if embedding.iter().any(|value| !value.is_finite())
+            || !embedding.iter().any(|value| *value != 0.0)
+        {
+            return Err(
+                ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                    self.provider_id(),
+                    self.model(),
+                    "embedding must be finite and nonzero",
+                ),
+            );
+        }
         Ok(embedding)
-    }
-}
-
-#[derive(Clone)]
-pub struct ThreadEpisodicMemvidEmbedder {
-    provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
-}
-
-impl ThreadEpisodicMemvidEmbedder {
-    pub fn new(provider: Arc<dyn ThreadEpisodicEmbeddingProvider>) -> Self {
-        Self { provider }
-    }
-
-    pub fn provider(&self) -> &dyn ThreadEpisodicEmbeddingProvider {
-        self.provider.as_ref()
-    }
-
-    pub fn identity(&self) -> ThreadEpisodicEmbeddingIdentity {
-        self.provider.identity()
-    }
-}
-
-impl VecEmbedder for ThreadEpisodicMemvidEmbedder {
-    fn embed_query(&self, text: &str) -> memvid_core::Result<Vec<f32>> {
-        self.provider
-            .embed_query_checked(text)
-            .map_err(ThreadEpisodicEmbeddingError::into_memvid_error)
-    }
-
-    fn embed_chunks(&self, texts: &[&str]) -> memvid_core::Result<Vec<Vec<f32>>> {
-        self.provider
-            .embed_batch(texts)
-            .map_err(ThreadEpisodicEmbeddingError::into_memvid_error)
-    }
-
-    fn embedding_dimension(&self) -> usize {
-        self.provider.dimension()
     }
 }
 
@@ -417,42 +377,6 @@ mod tests {
                 actual: 3
             }
         );
-    }
-
-    #[test]
-    fn memvid_embedder_delegates_query_and_dimension() {
-        let provider = Arc::new(MockEmbeddingProvider {
-            provider_id: "local",
-            model: "bge-small-en-v1.5",
-            dimension: 384,
-            returned_dimension: 384,
-        });
-        let embedder = ThreadEpisodicMemvidEmbedder::new(provider);
-
-        assert_eq!(embedder.embedding_dimension(), 384);
-        assert_eq!(embedder.embed_query("query").unwrap().len(), 384);
-    }
-
-    #[test]
-    fn memvid_embedder_maps_dimension_mismatch_to_memvid_error() {
-        let provider = Arc::new(MockEmbeddingProvider {
-            provider_id: "local",
-            model: "bge-small-en-v1.5",
-            dimension: 384,
-            returned_dimension: 768,
-        });
-        let embedder = ThreadEpisodicMemvidEmbedder::new(provider);
-
-        let error = embedder
-            .embed_query("query")
-            .expect_err("wrong dimension must fail");
-        assert!(matches!(
-            error,
-            MemvidError::VecDimensionMismatch {
-                expected: 384,
-                actual: 768
-            }
-        ));
     }
 
     #[test]

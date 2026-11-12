@@ -2221,6 +2221,7 @@ enum LoopDurableCommitOutcome {
 
 fn loop_durable_event_kind(event: &AgentDurableEvent) -> &'static str {
     match event {
+        AgentDurableEvent::ProviderUsageSnapshot { .. } => "provider_usage_snapshot",
         AgentDurableEvent::ToolOutputRecorded { .. } => "tool_output_recorded",
         AgentDurableEvent::PromptManifestCompiled { .. } => "prompt_manifest_compiled",
         AgentDurableEvent::TurnSkillsResolved { .. } => "turn_skills_resolved",

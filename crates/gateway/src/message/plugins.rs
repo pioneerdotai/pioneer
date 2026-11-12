@@ -91,7 +91,8 @@ pub(super) fn plugin_icon_links(
         .into_iter()
         .flatten()
     {
-        *icon = ImageReference::plugin_icon(&parent.workspace_id, &parent.id, icon.revision.clone());
+        *icon =
+            ImageReference::plugin_icon(&parent.workspace_id, &parent.id, icon.revision.clone());
     }
 }
 
@@ -215,8 +216,13 @@ async fn load_uploaded_plugin(
             cancellation.is_cancelled()
         })?;
         super::package_delivery::check_preparation(cancellation)?;
-        anyhow::ensure!(!snapshot.entries().values().any(|entry| matches!(entry, Entry::Denied)),
-            "plugins.package_rejected");
+        anyhow::ensure!(
+            !snapshot
+                .entries()
+                .values()
+                .any(|entry| matches!(entry, Entry::Denied)),
+            "plugins.package_rejected"
+        );
         let plan = pioneer_plugins::load(&snapshot)
             .map_err(|_| anyhow::anyhow!("plugins.package_rejected"))?;
         Ok((source, snapshot, plan))
@@ -234,8 +240,13 @@ fn publish_package_cancellable(
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     super::package_delivery::check_preparation(cancellation)?;
-    anyhow::ensure!(!snapshot.entries().values().any(|entry| matches!(entry, Entry::Denied)),
-        "plugins.package_rejected");
+    anyhow::ensure!(
+        !snapshot
+            .entries()
+            .values()
+            .any(|entry| matches!(entry, Entry::Denied)),
+        "plugins.package_rejected"
+    );
     std::fs::create_dir(root)?;
     let result = (|| {
         for (key, entry) in snapshot.entries() {
@@ -539,17 +550,13 @@ impl MessageProcessor {
                 let owner = AuthenticatedTransferOwner::from_request_context(context);
                 {
                     let _upload_guard = self.acquire_skill_upload_lock(&upload_id).await;
-                    self.revalidate_plugin_upload(&owner, &workspace, &upload_id, id).await?;
+                    self.revalidate_plugin_upload(&owner, &workspace, &upload_id, id)
+                        .await?;
                 }
                 let runtime = self.package_delivery_context();
                 let source = self
                     .materialize_uploaded_archive_source(
-                        &owner,
-                        &workspace,
-                        &upload_id,
-                        &runtime,
-                        id,
-                        "plugin",
+                        &owner, &workspace, &upload_id, &runtime, id, "plugin",
                     )
                     .await
                     .map_err(|error| {
@@ -613,7 +620,8 @@ impl MessageProcessor {
                     // Revalidate after preparation too: a concurrent abort/consume
                     // must not return a preview for a no-longer-owned transfer.
                     let _upload_guard = self.acquire_skill_upload_lock(&upload_id).await;
-                    self.revalidate_plugin_upload(&owner, &workspace, &upload_id, id).await?;
+                    self.revalidate_plugin_upload(&owner, &workspace, &upload_id, id)
+                        .await?;
                     Ok(json!(PluginsPreviewResponse {
                         name: plan.manifest.name.clone(),
                         version: plan.manifest.version.clone(),
@@ -692,7 +700,8 @@ impl MessageProcessor {
             package_path: package.to_string_lossy().into(),
             data_path: data.to_string_lossy().into(),
             package_fingerprint: plan.tree_digest.clone(),
-            enabled: true, allow_implicit_invocation: false,
+            enabled: true,
+            allow_implicit_invocation: false,
             state: "installing".into(),
             revision: 1,
             display_name: plan.manifest.metadata.display_name.clone(),
@@ -712,10 +721,30 @@ impl MessageProcessor {
             license: plan.manifest.metadata.license.clone(),
             category: plan.manifest.metadata.category.clone(),
             brand_color: plan.manifest.metadata.brand_color.clone(),
-            logo_path: plan.manifest.metadata.logo.as_ref().map(|icon| icon.path.clone()),
-            logo_revision: plan.manifest.metadata.logo.as_ref().map(|icon| icon.revision.clone()),
-            composer_icon_path: plan.manifest.metadata.composer_icon.as_ref().map(|icon| icon.path.clone()),
-            composer_icon_revision: plan.manifest.metadata.composer_icon.as_ref().map(|icon| icon.revision.clone()),
+            logo_path: plan
+                .manifest
+                .metadata
+                .logo
+                .as_ref()
+                .map(|icon| icon.path.clone()),
+            logo_revision: plan
+                .manifest
+                .metadata
+                .logo
+                .as_ref()
+                .map(|icon| icon.revision.clone()),
+            composer_icon_path: plan
+                .manifest
+                .metadata
+                .composer_icon
+                .as_ref()
+                .map(|icon| icon.path.clone()),
+            composer_icon_revision: plan
+                .manifest
+                .metadata
+                .composer_icon
+                .as_ref()
+                .map(|icon| icon.revision.clone()),
             pending_json: Some(pending_json),
             last_error: None,
             created_at: now,
@@ -787,18 +816,18 @@ impl MessageProcessor {
                 } => {
                     ownership.member_path = Some(member_path.clone());
                     ownership.package_fingerprint = tree_digest.clone();
-                        self.install_skill_source(
-                            context,
-                            request_id.clone(),
-                            workspace.into(),
-                            "user".into(),
-                            skills::SkillInstallSource::PackageMember(
-                                ownership.clone(),
-                                parent_guard._lock.clone(),
-                            ),
-                        )
-                        .await
-                        .map(|_| ())
+                    self.install_skill_source(
+                        context,
+                        request_id.clone(),
+                        workspace.into(),
+                        "user".into(),
+                        skills::SkillInstallSource::PackageMember(
+                            ownership.clone(),
+                            parent_guard._lock.clone(),
+                        ),
+                    )
+                    .await
+                    .map(|_| ())
                 }
                 ComponentPlan::Mcp { server, .. } => {
                     match mcp::portable::portable_install_plan(
@@ -1537,7 +1566,10 @@ impl MessageProcessor {
             return Err(plugin_error(request, "plugins.interrupted"));
         }
         if guard.parent.enabled == params.enabled
-            && params.allow_implicit_invocation.is_none_or(|implicit| implicit == guard.parent.allow_implicit_invocation) {
+            && params
+                .allow_implicit_invocation
+                .is_none_or(|implicit| implicit == guard.parent.allow_implicit_invocation)
+        {
             return self
                 .plugin_item(context, &guard.parent)
                 .await
@@ -1746,10 +1778,7 @@ impl MessageProcessor {
             override_fields_json: serde_json::to_string(&overrides)?,
             pending_after: serde_json::to_string(&pending)?,
         };
-        Ok(Some(NativePluginMutation {
-            guard,
-            write,
-        }))
+        Ok(Some(NativePluginMutation { guard, write }))
     }
     pub(super) async fn finish_native_plugin_change(
         &self,

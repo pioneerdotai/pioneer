@@ -463,7 +463,10 @@ mod tests {
                 HeaderValue::from_static("keep"),
             ),
         ]);
-        for source in [serde_json::json!({}), serde_json::json!({"plugin_id":"parent"})] {
+        for source in [
+            serde_json::json!({}),
+            serde_json::json!({"plugin_id":"parent"}),
+        ] {
             client.installation.source_ref = source;
             assert!(client.installation.explicit_authorization_overrides_oauth());
             assert_eq!(client.request_headers(None, headers.clone()), headers);

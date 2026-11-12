@@ -62,8 +62,13 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                 None::<String>,
                 calls.clone(),
             ));
-            history.push(ChatMessage::tool_result(&calls[0].id, &calls[0].name, "ok"));
+            history.push(ChatMessage::tool_result(
+                &calls[0].id,
+                &calls[0].name,
+                crate::providers::history_test_support::COMPACT_SHELL_RESULT,
+            ));
             let request = ChatRequest {
+                tool_declarations: None,
                 service_mode: None,
                 model: "fixture-model".into(),
                 messages: history.clone(),
@@ -105,6 +110,10 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                         assert_eq!(call["id"], original_id);
                     }
                     assert_eq!(result["role"], "tool");
+                    assert_eq!(
+                        result["content"],
+                        crate::providers::history_test_support::COMPACT_SHELL_RESULT
+                    );
                     assert_eq!(result["tool_call_id"], call["id"]);
                 }
             }

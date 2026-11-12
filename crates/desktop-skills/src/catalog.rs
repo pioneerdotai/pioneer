@@ -485,7 +485,12 @@ impl SkillsCatalogView {
             });
             if let Some(publication) = self.client.plugin_details_publication(workspace, parent) {
                 if let Some(operation) = publication.operations.get(parent) {
-                    if operation.busy || (operation.uncertain && !self.client.plugin_parent_recovery_available(workspace, parent)) {
+                    if operation.busy
+                        || (operation.uncertain
+                            && !self
+                                .client
+                                .plugin_parent_recovery_available(workspace, parent))
+                    {
                         next.pending.insert(child.clone());
                     }
                     let error = if operation.uncertain {

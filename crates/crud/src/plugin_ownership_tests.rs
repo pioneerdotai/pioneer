@@ -977,13 +977,20 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
     // while A's accepted r2 is not committed yet. An app mutex is not involved.
     use pioneer_sqlite::{SqliteDatabase, SqliteWriteEvent, SqliteWriteObserver};
     use sea_orm::{ConnectOptions, Database, Set, TransactionTrait};
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     #[derive(Default)]
-    struct QueueBoundary { armed: AtomicBool, enqueued: tokio::sync::Notify }
+    struct QueueBoundary {
+        armed: AtomicBool,
+        enqueued: tokio::sync::Notify,
+    }
     impl SqliteWriteObserver for QueueBoundary {
         fn observe(&self, event: SqliteWriteEvent) {
             if matches!(event, SqliteWriteEvent::Enqueued { .. })
-                && self.armed.swap(false, Ordering::SeqCst) {
+                && self.armed.swap(false, Ordering::SeqCst)
+            {
                 self.enqueued.notify_one();
             }
         }
@@ -994,54 +1001,171 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
     options.max_connections(1);
     let writer = Database::connect(options).await.unwrap();
     let boundary = Arc::new(QueueBoundary::default());
-    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer.clone(), boundary.clone());
-    executor.run_migrations::<migration::Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None).await.unwrap();
+    let executor =
+        pioneer_sqlite::SqliteWriteExecutor::with_observer(writer.clone(), boundary.clone());
+    executor
+        .run_migrations::<migration::Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
+        .await
+        .unwrap();
     // Runtime settings, applied only to this disposable fixture database.
-    writer.execute_unprepared("PRAGMA journal_mode=WAL").await.unwrap();
-    writer.execute_unprepared("PRAGMA foreign_keys=OFF").await.unwrap();
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    writer
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
     let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options.max_connections(2).map_sqlx_sqlite_opts(|options| options.read_only(true).create_if_missing(false).pragma("query_only", "ON"));
+    options.max_connections(2).map_sqlx_sqlite_opts(|options| {
+        options
+            .read_only(true)
+            .create_if_missing(false)
+            .pragma("query_only", "ON")
+    });
     let reader = Database::connect(options).await.unwrap();
     let database = SqliteDatabase::from_executor(reader, executor);
     database.validate_reader().await.unwrap();
     let store = CrudStore::new(database);
     let db = store.database_connection().begin().await.unwrap();
     pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
-        id: Set("ws".into()), name: Set("CAS fixture".into()), is_active: Set(true),
-        is_current: Set(true), created_at: Set(util::unix_to_datetime(1)), updated_at: Set(util::unix_to_datetime(1)),
-    }).exec(&db).await.unwrap();
+        id: Set("ws".into()),
+        name: Set("CAS fixture".into()),
+        is_active: Set(true),
+        is_current: Set(true),
+        created_at: Set(util::unix_to_datetime(1)),
+        updated_at: Set(util::unix_to_datetime(1)),
+    })
+    .exec(&db)
+    .await
+    .unwrap();
     db.commit().await.unwrap();
-    store.insert_plugin_installation(&parent("cas-parent", "ws")).await.unwrap();
-    store.settle_plugin_installation("cas-parent", 1, "installed", None).await.unwrap();
+    store
+        .insert_plugin_installation(&parent("cas-parent", "ws"))
+        .await
+        .unwrap();
+    store
+        .settle_plugin_installation("cas-parent", 1, "installed", None)
+        .await
+        .unwrap();
     let db = store.database_connection().begin().await.unwrap();
-    let first = repositories::plugins::begin_mutation(&db, "ws", "cas-parent", 1, "updating", true, "{\"owner\":\"A\"}".into(), None).await.unwrap();
+    let first = repositories::plugins::begin_mutation(
+        &db,
+        "ws",
+        "cas-parent",
+        1,
+        "updating",
+        true,
+        "{\"owner\":\"A\"}".into(),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(first.revision, 2);
     // A owns a dispatched transition whose commit is still outstanding.
-    assert_eq!(store.find_plugin_installation("cas-parent").await.unwrap().unwrap().revision, 1);
+    assert_eq!(
+        store
+            .find_plugin_installation("cas-parent")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        1
+    );
     let maintenance = store.with_maintenance_access();
-    let mut second = Box::pin(maintenance.begin_plugin_mutation("ws", "cas-parent", 1, "updating", true, "{\"owner\":\"B\"}"));
+    let mut second = Box::pin(maintenance.begin_plugin_mutation(
+        "ws",
+        "cas-parent",
+        1,
+        "updating",
+        true,
+        "{\"owner\":\"B\"}",
+    ));
     boundary.armed.store(true, Ordering::SeqCst);
     tokio::select! {
         result = &mut second => panic!("writer is still held: {result:?}"),
         _ = boundary.enqueued.notified() => {}
     }
     db.commit().await.unwrap();
-    assert!(second.await.unwrap_err().to_string().contains("plugins.stale"));
-    let retained = store.find_plugin_installation("cas-parent").await.unwrap().unwrap();
+    assert!(
+        second
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("plugins.stale")
+    );
+    let retained = store
+        .find_plugin_installation("cas-parent")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(retained.revision, 2);
     assert_eq!(retained.pending_json.as_deref(), Some("{\"owner\":\"A\"}"));
-    let next = store.resume_plugin_mutation("ws", "cas-parent", 2, retained.pending_json.as_deref().unwrap(), "{\"owner\":\"C\"}", "updating").await.unwrap();
+    let next = store
+        .resume_plugin_mutation(
+            "ws",
+            "cas-parent",
+            2,
+            retained.pending_json.as_deref().unwrap(),
+            "{\"owner\":\"C\"}",
+            "updating",
+        )
+        .await
+        .unwrap();
     assert_eq!(next.revision, 3);
-    assert!(store.finish_plugin_mutation("cas-parent", 2, "installed", None).await.is_err());
-    assert!(store.replace_plugin_pending("cas-parent", 2, "{}").await.is_err());
-    assert!(store.interrupt_plugin_mutation("cas-parent", 2, "{}", "late").await.is_err());
+    assert!(
+        store
+            .finish_plugin_mutation("cas-parent", 2, "installed", None)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .replace_plugin_pending("cas-parent", 2, "{}")
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .interrupt_plugin_mutation("cas-parent", 2, "{}", "late")
+            .await
+            .is_err()
+    );
     assert!(store.prepare_plugin_reload("cas-parent", 2).await.is_err());
-    assert!(store.publish_plugin_package("cas-parent", 2, "late", None, "late", None).await.is_err());
-    assert!(store.forget_plugin_component("cas-parent", 2, "skill", "absent").await.is_err());
-    assert_eq!(store.find_plugin_installation("cas-parent").await.unwrap().unwrap().pending_json, next.pending_json);
-    store.finish_plugin_mutation("cas-parent", 3, "installed", None).await.unwrap();
-    assert!(store.find_plugin_installation("cas-parent").await.unwrap().unwrap().pending_json.is_none());
-
+    assert!(
+        store
+            .publish_plugin_package("cas-parent", 2, "late", None, "late", None)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .forget_plugin_component("cas-parent", 2, "skill", "absent")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .find_plugin_installation("cas-parent")
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_json,
+        next.pending_json
+    );
+    store
+        .finish_plugin_mutation("cas-parent", 3, "installed", None)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .find_plugin_installation("cas-parent")
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_json
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1151,15 +1275,18 @@ async fn standalone_mcp_names_work_while_owned_adoption_is_rejected() {
     let mut name_collision = attempt.clone();
     name_collision.id = Some("another-child".into());
     let another_owner = ownership("plugin-b", "another-child", "server");
-    assert!(store
-        .upsert_mcp_server_installation_with_audit_and_ownership(
-            &name_collision,
-            &mcp_audit(&name_collision),
-            Some(&another_owner),
-            4,
-        )
-        .await
-        .is_err(), "a second plugin cannot overwrite the same ordinary MCP name");
+    assert!(
+        store
+            .upsert_mcp_server_installation_with_audit_and_ownership(
+                &name_collision,
+                &mcp_audit(&name_collision),
+                Some(&another_owner),
+                4,
+            )
+            .await
+            .is_err(),
+        "a second plugin cannot overwrite the same ordinary MCP name"
+    );
     assert_eq!(
         store
             .find_mcp_server_installation("workspace", "ws", "zenmoney")
@@ -1252,7 +1379,6 @@ async fn plugin_reservation_consumes_only_its_finalized_owned_upload_atomically(
             .await
             .is_err()
     );
-
 }
 
 #[tokio::test]
@@ -1938,7 +2064,14 @@ async fn startup_reconciliation_finishes_more_than_one_thousand_parents_and_is_i
             .await
             .unwrap();
     }
-    assert_eq!(store.list_plugin_installations("ws-startup-batches").await.unwrap().len(), 1001);
+    assert_eq!(
+        store
+            .list_plugin_installations("ws-startup-batches")
+            .await
+            .unwrap()
+            .len(),
+        1001
+    );
     store.interrupt_unfinished_plugins().await.unwrap();
     for index in 0..1001 {
         let row = store

@@ -37,8 +37,11 @@ pub fn build_plugin_upload_archive(source: &Path) -> Result<SkillUploadArchive> 
     if source.is_file() {
         let bytes = fs::read(source)?;
         return Ok(SkillUploadArchive {
-            file_name: source.file_name().and_then(|s| s.to_str())
-                .unwrap_or("plugin.tar.gz").into(),
+            file_name: source
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("plugin.tar.gz")
+                .into(),
             sha256: hex::encode(Sha256::digest(&bytes)),
             bytes,
             uncompressed_size_bytes: 0,

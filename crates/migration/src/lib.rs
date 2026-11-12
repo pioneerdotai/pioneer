@@ -7,6 +7,8 @@ mod m20261101_000102_idle_task_occurrence_tracking_cutover;
 mod m20261101_000103_idle_html_preview_io_work;
 mod m20261104_000001_capsule_bound_routes;
 mod m20261105_000001_portable_pending_indexes;
+mod m20261108_000001_sqlite_memory_search;
+mod m20261109_000001_execution_observability;
 pub use sea_orm_migration::prelude::*;
 
 mod m20261023_000001_task_webhook;
@@ -245,6 +247,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261105_000001_portable_pending_indexes::Migration),
             Box::new(m20261104_000001_capsule_bound_routes::Migration),
             Box::new(m20261106_000001_agent_ledger_deadline_index::Migration),
+            Box::new(m20261109_000001_execution_observability::Migration),
+            Box::new(m20261108_000001_sqlite_memory_search::Migration),
             Box::new(m20261111_000001_plugin_ownership::Migration),
         ]
     }

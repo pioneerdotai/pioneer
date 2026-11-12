@@ -738,10 +738,7 @@ pub(crate) fn agent_bound_task_tool_visible(
             capabilities.contains(&AgentToolCapability::TaskObserve)
                 || capabilities.contains(&AgentToolCapability::ResultRead)
         }
-        TASK_RESULT_TOOL => {
-            capabilities.contains(&AgentToolCapability::ResultRead)
-                && capabilities.contains(&AgentToolCapability::TaskReview)
-        }
+        TASK_RESULT_TOOL => capabilities.contains(&AgentToolCapability::ResultRead),
         TASK_ACCEPT_TOOL | TASK_REVISE_TOOL => {
             capabilities.contains(&AgentToolCapability::TaskReview)
         }
@@ -1544,8 +1541,9 @@ fn inherits_task_capabilities(
 }
 
 impl TaskToolHandler {
-    async fn reviewer_result_read_context(
+    async fn bound_task_actor_context(
         &self,
+        capability: AgentToolCapability,
     ) -> Result<Option<pioneer_tasks::TaskMutationContext>, ToolError> {
         let Some(binding) = self
             .processor
@@ -1554,21 +1552,14 @@ impl TaskToolHandler {
         else {
             return Ok(None);
         };
-        if !binding
-            .capabilities
-            .contains(&AgentToolCapability::ResultRead)
-            || !binding
-                .capabilities
-                .contains(&AgentToolCapability::TaskReview)
-        {
+        if !binding.capabilities.contains(&capability) {
             return Ok(None);
         }
 
         let adapter = binding.adapter.lock().await;
         // Callers have already authorized capsule-level observation. This is
-        // only a proposed reviewer identity: TaskService checks it against
-        // each immutable candidate. Do not reject an entire summary-only wait
-        // merely because some targets were created by another execution graph.
+        // the actual acting identity; TaskService verifies the turn/execution
+        // binding and capsule independently of the historical creator.
         let mut context = pioneer_tasks::TaskMutationContext::parent_agent(
             self.context.thread_id.clone(),
             self.context.turn_id.clone(),
@@ -1584,7 +1575,10 @@ impl TaskToolHandler {
         if response.review_required.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let Some(context) = self.reviewer_result_read_context().await? else {
+        let Some(context) = self
+            .bound_task_actor_context(AgentToolCapability::ResultRead)
+            .await?
+        else {
             return Ok(BTreeMap::new());
         };
 
@@ -1714,7 +1708,6 @@ impl TaskToolHandler {
         tool: AgentModelToolName,
         arguments: JsonValue,
         required_capability: AgentToolCapability,
-        task_ids: &[String],
     ) -> Result<Option<crate::authorization::AgentActionCommitPlan>, ToolError> {
         let Some(binding) = self
             .processor
@@ -1726,25 +1719,9 @@ impl TaskToolHandler {
         if !binding.capabilities.contains(&required_capability) {
             return Err(task_tool_authorization_error());
         }
-        let (execution_id, root_execution_id) = {
-            let adapter = binding.adapter.lock().await;
-            (
-                adapter.execution_id().clone(),
-                adapter.work_graph_root_execution_id().clone(),
-            )
-        };
-        // Task ownership is durable within its authorized capsule, not tied to
-        // the AgentExecution which happened to create it. Review is different:
-        // the task service also enforces the exact immutable reviewer intent.
-        if required_capability == AgentToolCapability::TaskReview {
-            crate::message::agent_action_tools::authorize_task_observations(
-                self.processor.as_ref(),
-                &execution_id,
-                &root_execution_id,
-                task_ids,
-            )
-            .await?;
-        }
+        let execution_id = binding.adapter.lock().await.execution_id().clone();
+        // Capsule access and current grants were checked by the operation's
+        // shared authorizer. The commit plan still binds the actual actor.
         let source_fence = crate::message::agent_action_tools::current_agent_identity_source_fence(
             self.processor.as_ref(),
             execution_id.as_str(),
@@ -2421,7 +2398,6 @@ impl TaskToolHandler {
                     ToolError::internal(format!("failed to encode task_accept action: {error}"))
                 })?,
                 AgentToolCapability::TaskReview,
-                std::slice::from_ref(&params.task_id),
             )
             .await?;
 
@@ -2506,7 +2482,6 @@ impl TaskToolHandler {
                     ToolError::internal(format!("failed to encode task_revise action: {error}"))
                 })?,
                 AgentToolCapability::TaskReview,
-                std::slice::from_ref(&params.task_id),
             )
             .await?;
 
@@ -2583,7 +2558,6 @@ impl TaskToolHandler {
                     ToolError::internal(format!("failed to encode task_cancel action: {error}"))
                 })?,
                 AgentToolCapability::TaskControl,
-                std::slice::from_ref(&params.task_id),
             )
             .await?;
         let mut mutation_context = authorization.mutation_context(&self.context);
@@ -2655,7 +2629,6 @@ impl TaskToolHandler {
                     ToolError::internal(format!("failed to encode task_finish action: {error}"))
                 })?,
                 AgentToolCapability::TaskControl,
-                std::slice::from_ref(&params.task_id),
             )
             .await?;
         let mut mutation_context = authorization.mutation_context(&self.context);
@@ -2727,7 +2700,6 @@ impl TaskToolHandler {
                 })
                 .map_err(|_| ToolError::internal("task control encoding failed"))?,
                 AgentToolCapability::TaskControl,
-                std::slice::from_ref(&params.task_id),
             )
             .await?;
         let mut mutation_context = authorization.mutation_context(&self.context);
@@ -2780,7 +2752,6 @@ impl TaskToolHandler {
                     ToolError::internal(format!("failed to encode task_detach action: {error}"))
                 })?,
                 AgentToolCapability::TaskControl,
-                std::slice::from_ref(&params.task_id),
             )
             .await?;
         let mut mutation_context = authorization.mutation_context(&self.context);
@@ -2913,6 +2884,62 @@ impl TaskToolHandler {
             &observations,
             now_timestamp_secs(),
         )?;
+        if let Some(reviews) = payload
+            .get_mut("reviewRequired")
+            .and_then(JsonValue::as_array_mut)
+        {
+            let review_allowed = authorization
+                .authorize_task(
+                    self.processor.crud_store.as_ref(),
+                    &response.task.id,
+                    crate::authorization::ResourceAction::TaskReview,
+                )
+                .await
+                .is_ok();
+            let context = self
+                .bound_task_actor_context(AgentToolCapability::TaskReview)
+                .await?;
+            let cancel_allowed = self
+                .bound_task_actor_context(AgentToolCapability::TaskControl)
+                .await?
+                .is_some()
+                && authorization
+                    .authorize_task(
+                        self.processor.crud_store.as_ref(),
+                        &response.task.id,
+                        crate::authorization::ResourceAction::TaskCancel,
+                    )
+                    .await
+                    .is_ok();
+            for review in reviews {
+                let candidate = review["candidate"]["id"]
+                    .as_str()
+                    .and_then(|id| response.result_candidates.iter().find(|c| c.id == id));
+                let mut actions = if review_allowed {
+                    if let (Some(context), Some(candidate)) = (context.clone(), candidate) {
+                        self.processor
+                            .task_runtime
+                            .service()
+                            .candidate_review_actions(context, candidate)
+                            .await
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                if cancel_allowed {
+                    actions.push(pioneer_protocol::TaskWaitReviewAction::TaskCancel);
+                }
+                if !actions.contains(&pioneer_protocol::TaskWaitReviewAction::TaskRevise)
+                    && review["revisionBlockedReason"].is_null()
+                {
+                    review["revisionBlockedReason"] = json!("review_not_allowed");
+                }
+                review["allowedActions"] = serde_json::to_value(actions)
+                    .map_err(|_| ToolError::internal("failed to project review actions"))?;
+            }
+        }
         enrich_task_webhook_output(self.processor.as_ref(), &response.triggers, &mut payload)
             .await
             .map_err(|_| ToolError::execution_failed("task_operation_failed"))?;
@@ -2944,7 +2971,7 @@ impl TaskToolHandler {
             .acquire_observation_page(self.processor.as_ref())
             .await?;
         let context = self
-            .reviewer_result_read_context()
+            .bound_task_actor_context(AgentToolCapability::ResultRead)
             .await?
             .ok_or_else(task_tool_authorization_error)?;
         let candidate = self
@@ -3004,7 +3031,6 @@ impl TaskToolHandler {
                 })
                 .map_err(|_| ToolError::internal("task control encoding failed"))?,
                 AgentToolCapability::TaskControl,
-                std::slice::from_ref(&params.task_id),
             )
             .await?;
         if action_plan.is_none() {
@@ -3066,7 +3092,6 @@ impl TaskToolHandler {
                 })
                 .map_err(|_| ToolError::internal("task control encoding failed"))?,
                 AgentToolCapability::TaskControl,
-                std::slice::from_ref(&params.task_id),
             )
             .await?;
         let mut mutation_context = authorization.mutation_context(&self.context);
@@ -3120,7 +3145,6 @@ impl TaskToolHandler {
                 })
                 .map_err(|_| ToolError::internal("task control encoding failed"))?,
                 AgentToolCapability::TaskControl,
-                std::slice::from_ref(&params.task_id),
             )
             .await?;
         let mut mutation_context = authorization.mutation_context(&self.context);
@@ -3177,7 +3201,6 @@ impl TaskToolHandler {
                     ToolError::internal(format!("failed to encode task_resume action: {error}"))
                 })?,
                 AgentToolCapability::TaskControl,
-                std::slice::from_ref(&params.task_id),
             )
             .await?;
         let execution_admission = self
@@ -3241,9 +3264,11 @@ impl TaskToolHandler {
             ));
         }
         let trigger_kind = trigger.spec.kind();
+        let require_review = input.require_review;
         let lifecycle_policy =
             task_create_lifecycle_policy(input.background, trigger_kind, input.lifecycle_policy)?;
-        let delivery_policy = task_create_delivery_policy(input.background, input.delivery_policy)?;
+        let delivery_policy =
+            task_create_delivery_policy(input.background, require_review, input.delivery_policy)?;
         let durable_prompt =
             requires_durable_agent_prompt(trigger_kind) || is_webhook_trigger(&trigger.spec);
         let instructions = normalize_task_instructions(input.instructions, durable_prompt)?;
@@ -3269,7 +3294,12 @@ impl TaskToolHandler {
             permission_cap: Some(permission_cap),
             security_cap: Some(security_cap),
             result_contract: input.result_contract,
-            review_policy: None,
+            review_policy: require_review.then(|| {
+                self.processor
+                    .task_runtime
+                    .service()
+                    .explicit_review_policy()
+            }),
             depth: 0,
             max_depth: requested_max_depth,
         });
@@ -3634,8 +3664,13 @@ struct TaskCreateToolInput {
     /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields. For incoming HTTP POST choose trigger kind external and source webhook; creation waits for requests and returns webhookUrl/webhookScope.
     trigger: Option<TaskTriggerToolInput>,
     #[serde(default)]
-    /// Set true only when the user explicitly asks to run immediate work in the background. Omit trigger (or use kind "immediate"). This creates an Immediate + Detached Task that keeps running after the parent turn, delivers its result to the origin thread, and must not be joined with task_wait.
+    /// Set true only when the user explicitly asks to run immediate work in the background. Omit trigger (or use kind "immediate"). This creates an Immediate + Detached Task that keeps running after the parent turn and must not be joined with task_wait. All tasks default to requireReview=false. Background work completes automatically with origin_thread delivery unless review is explicitly enabled. Reviewed background defaults to no delivery. An explicit permitted deliveryPolicy takes precedence for reviewed background work.
     background: bool,
+    #[serde(default)]
+    /// Defaults to false for every task, including attached/background, scheduled, interval, cron and webhook work.
+    /// Set true when each run result must wait for explicit review without timeout acceptance.
+    /// False disables review; background and trigger do not change this choice.
+    require_review: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Model-facing task tools currently create agent tasks only. Omit this field unless explicitly setting "agent".
     executor_kind: Option<TaskToolExecutorKind>,
@@ -3677,7 +3712,7 @@ struct TaskCreateToolInput {
     /// Advanced lifecycle policy. Omit for normal attached work and when background=true. background=true already selects Detached + KeepRunning + CompleteOnTerminalRun.
     lifecycle_policy: Option<TaskLifecyclePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Advanced delivery policy for scheduled or detached work. Omit for attached subagent work and for background=true, which defaults to mode=thread, threadTarget=origin_thread, includeResult=true. Use current_thread for the executing agent's thread, collaboration_root for the durable collaboration root, or exact_thread with an explicit threadId. Gateway resolves semantic targets.
+    /// Advanced delivery policy for scheduled or detached work. Omit for attached subagent work. Background defaults to requireReview=false with mode=thread, threadTarget=origin_thread, includeResult=true. For background=true plus requireReview=true, omission selects mode=none; an explicit permitted policy, including none, overrides that default. Terminal errors follow the same policy. Use current_thread for the executing agent's thread, collaboration_root for the durable collaboration root, or exact_thread with an explicit threadId. Gateway resolves semantic targets.
     delivery_policy: Option<TaskDeliveryPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Advanced retry policy. Omit to use the task service default.
@@ -3730,10 +3765,23 @@ fn task_create_lifecycle_policy(
 
 fn task_create_delivery_policy(
     background: bool,
+    require_review: bool,
     delivery_policy: Option<TaskDeliveryPolicy>,
 ) -> Result<Option<TaskDeliveryPolicy>, ToolError> {
     if !background {
         return Ok(delivery_policy);
+    }
+    if require_review {
+        // Persist the choice before actor/occurrence contracts are frozen.
+        // Explicit policies still pass through the shared validation and authorization.
+        return Ok(Some(delivery_policy.unwrap_or(TaskDeliveryPolicy {
+            mode: TaskDeliveryMode::None,
+            thread_target: None,
+            thread_id: None,
+            webhook_url: None,
+            include_result: true,
+            format: pioneer_protocol::TaskDeliveryFormat::Summary,
+        })));
     }
     match delivery_policy {
         None => Ok(None),
@@ -3980,7 +4028,7 @@ impl TaskWaitToolInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for reading the full, reviewer-safe content of one immutable result candidate.
 struct TaskResultToolInput {
-    /// Exact candidate id returned by task_wait reviewRequired.
+    /// Exact candidate id returned by task_get or task_wait reviewRequired.
     #[schemars(length(min = 1, max = 128))]
     candidate_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3995,7 +4043,7 @@ struct TaskResultToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// Model-facing input for task_accept. Use this only for a candidate returned by task_wait reviewRequired.
+/// Model-facing input for task_accept. Use this only for a candidate returned by task_get or task_wait reviewRequired.
 struct TaskAcceptToolInput {
     /// Task id that owns the candidate. Pioneer entity ids are exactly 21 characters.
     #[schemars(length(min = 21, max = 21))]
@@ -4003,7 +4051,7 @@ struct TaskAcceptToolInput {
     /// Task run id that produced the candidate. Pioneer entity ids are exactly 21 characters.
     #[schemars(length(min = 21, max = 21))]
     run_id: String,
-    /// Candidate id to accept. Use the exact candidateId returned by task_wait reviewRequired.
+    /// Candidate id to accept. Use the exact candidateId returned by task_get or task_wait reviewRequired.
     #[schemars(length(min = 1, max = 128))]
     candidate_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4031,7 +4079,7 @@ impl TaskAcceptToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// Model-facing input for task_revise. Use this only for a candidate returned by task_wait reviewRequired.
+/// Model-facing input for task_revise. Use this only for a candidate returned by task_get or task_wait reviewRequired.
 struct TaskReviseToolInput {
     /// Task id that owns the candidate. Pioneer entity ids are exactly 21 characters.
     #[schemars(length(min = 21, max = 21))]
@@ -4039,7 +4087,7 @@ struct TaskReviseToolInput {
     /// Task run id that produced the candidate. Pioneer entity ids are exactly 21 characters.
     #[schemars(length(min = 21, max = 21))]
     run_id: String,
-    /// Candidate id to reject and revise. Use the exact candidateId returned by task_wait reviewRequired.
+    /// Candidate id to reject and revise. Use the exact candidateId returned by task_get or task_wait reviewRequired.
     #[schemars(length(min = 1, max = 128))]
     candidate_id: String,
     /// Concrete feedback explaining what is wrong and what the child must fix.
@@ -4422,7 +4470,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. For explicit launch or destination selection, call threads_start_options from the task domain; inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the origin thread. For incoming HTTP POST requests, choose trigger kind external and source webhook; creation returns webhookUrl and webhookScope, waits without launching an agent, and each POST creates its own run. Use the full returned URL; authorized task_get retrieves its current address later. For scheduled, interval, cron, and webhook work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. For explicit launch or destination selection, call threads_start_options from the task domain; inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and defaults to automatic completion with origin_thread delivery. requireReview defaults to false for every task type and attachment. Set requireReview=true when each run result needs explicit acceptance or same-worker revision, including scheduled, interval, cron and webhook runs; enabled review has no timeout acceptance. For reviewed background, the default delivery is none; an explicit permitted deliveryPolicy takes precedence. Review-required work remains observable through task_get/task_result; its delivery policy also governs terminal errors. For incoming HTTP POST requests, choose trigger kind external and source webhook; creation returns webhookUrl and webhookScope, waits without launching an agent, and each POST creates its own run. Use the full returned URL; authorized task_get retrieves its current address later. For scheduled, interval, cron, and webhook work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -4434,7 +4482,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_WAIT_TOOL,
-            "Wait for one or more active attached task ids or run ids using the task event bus. By default it returns as soon as any target is terminal or ready for review. For an authorized reviewer, each reviewRequired item includes reviewer-safe reviewContent from the exact immutable candidate. Inspect that content before task_accept or task_revise. If reviewContent is truncated, or must be read again after recovery/compaction, call task_result with the returned candidateId and continue with nextCursor. Then handle the candidate and call task_wait again for remaining active runs. Use all_terminal only when an intentional barrier without intermediate result handling is required. timeoutMs limits only this observation window: timedOut=true does not cancel, stop, or diagnose a child, and active targets may be waited on again after a timeout. A run's own timeout appears in its run status and error. When timeoutMs is omitted, confirmed target activity keeps the durable wait alive until its condition is satisfied. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead.",
+            "Wait for one or more active attached task ids or run ids using the task event bus. By default it returns as soon as any target is terminal or ready for review. For an authorized result reader, each reviewRequired item includes reviewer-safe reviewContent from the exact immutable candidate. Inspect that content before task_accept or task_revise. If reviewContent is truncated, or must be read again after recovery/compaction, call task_result with the returned candidateId and continue with nextCursor. Then handle the candidate and call task_wait again for remaining active runs. Use all_terminal only when an intentional barrier without intermediate result handling is required. timeoutMs limits only this observation window: timedOut=true does not cancel, stop, or diagnose a child, and active targets may be waited on again after a timeout. A run's own timeout appears in its run status and error. When timeoutMs is omitted, confirmed target activity keeps the durable wait alive until its condition is satisfied. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead.",
             task_wait_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Transient,
@@ -4449,19 +4497,19 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_RESULT_TOOL,
-            "Read reviewer-safe content for the exact immutable candidate returned by task_wait. Use candidateId, not taskId, so a revision round cannot race with the result being inspected. If truncated=true, call task_result again with nextCursor until the content is complete. This tool never returns extraction diagnostics, source runtime ids, host paths, or task configuration.",
+            "Read reviewer-safe content for the exact immutable candidate returned by task_get or task_wait. Use candidateId, not taskId, so a revision round cannot race with the result being inspected. If truncated=true, call task_result again with nextCursor until the content is complete. This tool never returns extraction diagnostics, source runtime ids, host paths, or task configuration.",
             task_result_schema(),
             safe_read_recovery(),
         ),
         task_tool_spec(
             TASK_ACCEPT_TOOL,
-            "Accept a pending review candidate returned by task_wait. This records the parent-agent approval, makes the candidate final, and completes the child task/run with that result.",
+            "Accept a pending review candidate returned by task_get or task_wait. This records the parent-agent approval, makes the candidate final, and completes the child task/run with that result.",
             task_accept_schema(),
             safe_mutation_recovery(),
         ),
         task_tool_spec(
             TASK_REVISE_TOOL,
-            "Reject a review candidate returned by task_wait and send concrete feedback to the same child thread for another revision turn.",
+            "Reject a review candidate returned by task_get or task_wait and send concrete feedback to the same child thread for another revision turn.",
             task_revise_schema(),
             safe_mutation_recovery(),
         ),
@@ -4697,13 +4745,13 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
             "Expected fields: taskIds or runIds, with optional timeoutMs. Use taskIds or runIds arrays, not a single taskId. Example timeoutMs value: 180000."
         }
         TASK_RESULT_TOOL => {
-            "Expected field: candidateId from task_wait reviewRequired. To continue truncated content, also pass the exact nextCursor returned by the previous task_result call."
+            "Expected field: candidateId from task_get or task_wait reviewRequired. To continue truncated content, also pass the exact nextCursor returned by the previous task_result call."
         }
         TASK_ACCEPT_TOOL => {
-            "Expected fields: taskId, runId, candidateId, and optional reason. Use candidate ids returned by task_wait reviewRequired."
+            "Expected fields: taskId, runId, candidateId, and optional reason. Use candidate ids returned by task_get or task_wait reviewRequired."
         }
         TASK_REVISE_TOOL => {
-            "Expected fields: taskId, runId, candidateId, and feedback. Use candidate ids returned by task_wait reviewRequired and provide concrete fix instructions."
+            "Expected fields: taskId, runId, candidateId, and feedback. Use candidate ids returned by task_get or task_wait reviewRequired and provide concrete fix instructions."
         }
         TASK_CANCEL_TOOL | TASK_FINISH_TOOL | TASK_DETACH_TOOL | TASK_GET_TOOL
         | TASK_PAUSE_TOOL | TASK_RESUME_TOOL | TASK_RUN_NOW_TOOL => {
@@ -5650,7 +5698,16 @@ fn task_create_wait_recommendation(response: &TaskCreateResponse, waitable: bool
         TaskTriggerKind::Immediate
             if task_create_response_attachment(response) == TaskAttachmentMode::Detached =>
         {
-            "do_not_call_task_wait_background_result_delivers_to_origin"
+            if response
+                .task
+                .delivery_policy
+                .as_ref()
+                .is_some_and(task_delivery_policy_targets_origin_thread)
+            {
+                "do_not_call_task_wait_background_result_delivers_to_origin"
+            } else {
+                "do_not_call_task_wait_observe_detached_task"
+            }
         }
         _ => "do_not_call_task_wait_unless_an_active_run_exists",
     }
@@ -5687,6 +5744,7 @@ fn task_delivery_thread_target_label(
 
 fn task_delivery_policy_targets_origin_thread(policy: &TaskDeliveryPolicy) -> bool {
     policy.mode == TaskDeliveryMode::Thread
+        && policy.include_result
         && policy.thread_target == Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread)
 }
 
@@ -5876,6 +5934,7 @@ fn wait_revision_blocked_reason_label(
         pioneer_protocol::TaskWaitRevisionBlockedReason::MaxRevisionRoundsReached => {
             "max_revision_rounds_reached"
         }
+        pioneer_protocol::TaskWaitRevisionBlockedReason::ReviewNotAllowed => "review_not_allowed",
         pioneer_protocol::TaskWaitRevisionBlockedReason::CandidateNotRevisable => {
             "candidate_not_revisable"
         }
@@ -7367,7 +7426,7 @@ mod tests {
     }
 
     #[test]
-    fn task_result_requires_both_result_read_and_review_capabilities() {
+    fn task_result_requires_read_without_final_review_capability() {
         let observe_only = BTreeSet::from([AgentToolCapability::TaskObserve]);
         let result_only = BTreeSet::from([AgentToolCapability::ResultRead]);
         let reviewer = BTreeSet::from([
@@ -7379,7 +7438,7 @@ mod tests {
             TASK_RESULT_TOOL,
             &observe_only
         ));
-        assert!(!agent_bound_task_tool_visible(
+        assert!(agent_bound_task_tool_visible(
             TASK_RESULT_TOOL,
             &result_only
         ));
@@ -7403,7 +7462,7 @@ mod tests {
             idempotency_key: None,
         }
         .into_params()
-        .expect("review candidate ids returned by task_wait should be valid");
+        .expect("review candidate ids returned by task_get or task_wait should be valid");
 
         assert_eq!(params.candidate_id, candidate_id);
     }
@@ -7421,7 +7480,7 @@ mod tests {
             idempotency_key: None,
         }
         .into_params()
-        .expect("review candidate ids returned by task_wait should be valid");
+        .expect("review candidate ids returned by task_get or task_wait should be valid");
 
         assert_eq!(params.candidate_id, candidate_id);
     }
@@ -7731,7 +7790,7 @@ mod tests {
             include_result: true,
             format: pioneer_protocol::TaskDeliveryFormat::Summary,
         });
-        let response = TaskCreateResponse {
+        let mut response = TaskCreateResponse {
             webhook_url: None,
             webhook_scope: None,
             task,
@@ -7775,6 +7834,40 @@ mod tests {
             assert!(
                 hints.iter().any(|hint| hint == expected),
                 "missing background hint `{expected}` in {hints:?}"
+            );
+        }
+        for (mode, target, include_result) in [
+            (TaskDeliveryMode::None, None, true),
+            (
+                TaskDeliveryMode::Thread,
+                Some(pioneer_protocol::TaskDeliveryThreadTarget::CurrentThread),
+                true,
+            ),
+            (
+                TaskDeliveryMode::Thread,
+                Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+                false,
+            ),
+        ] {
+            response.task.delivery_policy = Some(TaskDeliveryPolicy {
+                mode,
+                thread_target: target,
+                thread_id: target.map(|_| "thread_12345678901234".to_owned()),
+                webhook_url: None,
+                include_result,
+                format: pioneer_protocol::TaskDeliveryFormat::Summary,
+            });
+            let output = task_create_tool_output(&response, &anchor);
+            assert_eq!(output["waitable"], false);
+            assert_eq!(
+                output["waitRecommendation"],
+                "do_not_call_task_wait_observe_detached_task"
+            );
+            assert!(
+                !output["validationHints"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("result_will_be_delivered_to_origin_thread"))
             );
         }
     }
@@ -7850,13 +7943,14 @@ mod tests {
             "scheduled Tasks are already detached and must not combine with background=true"
         );
         assert!(
-            task_create_delivery_policy(true, None)
+            task_create_delivery_policy(true, false, None)
                 .expect("background delivery should use the service default")
                 .is_none()
         );
         assert!(
             task_create_delivery_policy(
                 true,
+                false,
                 Some(TaskDeliveryPolicy {
                     mode: TaskDeliveryMode::None,
                     thread_target: None,
@@ -7868,6 +7962,18 @@ mod tests {
             )
             .is_err(),
             "background=true must not silently discard parent result delivery"
+        );
+        let explicit_none = TaskDeliveryPolicy {
+            mode: TaskDeliveryMode::None,
+            thread_target: None,
+            thread_id: None,
+            webhook_url: None,
+            include_result: false,
+            format: pioneer_protocol::TaskDeliveryFormat::FullResult,
+        };
+        assert_eq!(
+            task_create_delivery_policy(true, true, Some(explicit_none.clone())).unwrap(),
+            Some(explicit_none)
         );
     }
 
@@ -8032,7 +8138,7 @@ mod tests {
         for expected in [
             "Do not pass runtime-owned fields",
             "background=true",
-            "delivers its result to the origin thread",
+            "All tasks default to requireReview=false",
             "self-contained for future runs",
             "currently available tools/skills/MCP/built-ins",
             "Final result format and delivery contract",
@@ -8076,7 +8182,7 @@ mod tests {
         );
         let accept_schema = accept_schema_value.to_string();
         for expected in [
-            "candidate returned by task_wait reviewRequired",
+            "candidate returned by task_get or task_wait reviewRequired",
             "taskId",
             "runId",
             "candidateId",

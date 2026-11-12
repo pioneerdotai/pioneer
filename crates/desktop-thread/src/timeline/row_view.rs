@@ -140,17 +140,26 @@ impl RowPresentation {
                 _ => String::new(),
             })
             .unwrap_or_default();
-        let mut plugin_images = slot.view.as_ref()
+        let mut plugin_images = slot
+            .view
+            .as_ref()
             .map(|row| row.read(cx).presentation.plugin_images.clone())
             .unwrap_or_else(|| {
                 pioneer_desktop_foundation::ImageViews::new().placeholder("icons/box.svg")
             });
-        let icons = slot.snapshot().item().map(|item| match &item.item {
-            pioneer_client::timeline::types::TurnItem::UserMessage { attachments, .. } =>
-                pioneer_client::timeline::labels::parse_user_attachments(attachments)
-                    .into_iter().filter_map(|attachment| attachment.plugin_icon).collect::<Vec<_>>(),
-            _ => Vec::new(),
-        }).unwrap_or_default();
+        let icons = slot
+            .snapshot()
+            .item()
+            .map(|item| match &item.item {
+                pioneer_client::timeline::types::TurnItem::UserMessage { attachments, .. } => {
+                    pioneer_client::timeline::labels::parse_user_attachments(attachments)
+                        .into_iter()
+                        .filter_map(|attachment| attachment.plugin_icon)
+                        .collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
         plugin_images.reconcile(icons, cx);
         let (dino, elapsed) = (None, None);
         let presentation = Self {

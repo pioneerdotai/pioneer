@@ -415,7 +415,11 @@ pub async fn replace_pending(
     Ok(())
 }
 
-pub async fn delete_parent(db: &pioneer_sqlite::SqliteTransaction, id: &str, revision: i64) -> Result<()> {
+pub async fn delete_parent(
+    db: &pioneer_sqlite::SqliteTransaction,
+    id: &str,
+    revision: i64,
+) -> Result<()> {
     let parent = find(db, id).await?.context("plugins.not_found")?;
     if parent.revision != revision
         || !matches!(parent.state.as_str(), "removing" | "interrupted")
@@ -507,7 +511,11 @@ pub async fn interrupt_mutation(
 
 /// Allow the native reload after all child/file work, retaining the execution
 /// fence until the caller acknowledges reload and clears pending atomically.
-pub async fn prepare_reload(db: &pioneer_sqlite::SqliteTransaction, id: &str, revision: i64) -> Result<()> {
+pub async fn prepare_reload(
+    db: &pioneer_sqlite::SqliteTransaction,
+    id: &str,
+    revision: i64,
+) -> Result<()> {
     let parent = find(db, id).await?.context("plugins.not_found")?;
     if parent.revision != revision
         || parent.pending_json.is_none()

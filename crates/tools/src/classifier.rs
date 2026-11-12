@@ -5,6 +5,17 @@ use crate::spec::ToolRetryClass;
 use crate::web::{DownloadModelPayload, WebFetchModelPayload, WebSearchModelPayload};
 use serde_json::Value as JsonValue;
 
+pub(crate) fn read_file_page_outcome(truncated: bool) -> ToolOutcome {
+    if truncated {
+        ToolOutcome::partial(
+            "tool output was truncated",
+            "Run the tool again with narrower scope or a larger result limit.",
+        )
+    } else {
+        ToolOutcome::ok()
+    }
+}
+
 pub trait ErrorClassifier: Send + Sync {
     fn classify_result(
         &self,
@@ -108,6 +119,10 @@ impl ErrorClassifier for DefaultErrorClassifier {
         // they must not turn a valid list_dir call into a failed tool attempt.
         if invocation.tool_name == "list_dir" && success {
             return ToolOutcome::ok();
+        }
+
+        if invocation.tool_name == "read_file" && success && !is_mcp_invocation(invocation) {
+            return read_file_page_outcome(output_is_truncated(raw_output_json));
         }
 
         if is_mcp_invocation(invocation) {

@@ -48,10 +48,6 @@
           "type": "number",
           "format": "float"
         },
-        "native_memvid_adaptive_used": {
-          "type": "boolean",
-          "default": false
-        },
         "results_returned": {
           "type": "integer",
           "format": "uint32",
@@ -159,13 +155,6 @@
     "ThreadEpisodicScoreBreakdown": {
       "type": "object",
       "properties": {
-        "exact_source_boost": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "float"
-        },
         "final_score": {
           "type": "number",
           "format": "float"
@@ -177,14 +166,7 @@
           ],
           "format": "float"
         },
-        "memvid_score": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "float"
-        },
-        "recency_boost": {
+        "rank_score": {
           "type": [
             "number",
             "null"
@@ -192,13 +174,6 @@
           "format": "float"
         },
         "semantic_score": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "float"
-        },
-        "source_role_boost": {
           "type": [
             "number",
             "null"

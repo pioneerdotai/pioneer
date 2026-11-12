@@ -212,8 +212,12 @@ pub(super) fn guard_skill_tooling(
     provider: std::sync::Arc<dyn crate::TurnToolProvider>,
     context: crate::TurnToolContext,
 ) {
-    let read_index = std::sync::Arc::new(plan.read_skill_index.iter()
-        .map(|(key, entry)| (key.clone(), entry.skill_id.clone())).collect::<HashMap<_, _>>());
+    let read_index = std::sync::Arc::new(
+        plan.read_skill_index
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.skill_id.clone()))
+            .collect::<HashMap<_, _>>(),
+    );
     for bundle in &mut materialized.bundles {
         for (name, handler) in &mut bundle.handlers {
             let skill_id = plan
@@ -226,7 +230,11 @@ pub(super) fn guard_skill_tooling(
                 provider: provider.clone(),
                 context: context.clone(),
                 skill_id: skill_id.clone(),
-                read_index: if skill_id.is_none() { Some(read_index.clone()) } else { None },
+                read_index: if skill_id.is_none() {
+                    Some(read_index.clone())
+                } else {
+                    None
+                },
             });
         }
     }
@@ -258,7 +266,9 @@ impl pioneer_tools::ToolHandler for GatedSkillHandler {
                         .map(|v| v.strip_prefix('$').unwrap_or(v))
                         .and_then(|key| {
                             self.read_index.as_ref().and_then(|index| {
-                                index.get(key).or_else(|| index.get(&format!("skill:{key}")))
+                                index
+                                    .get(key)
+                                    .or_else(|| index.get(&format!("skill:{key}")))
                             })
                         })
                         .cloned()
@@ -335,7 +345,10 @@ mod late_gate_tests {
                 provider: provider.clone(),
                 context: context.clone(),
                 skill_id: skill_id.clone(),
-                read_index: Some(std::sync::Arc::new(HashMap::from([(format!("skill:{id}"), id.clone())]))),
+                read_index: Some(std::sync::Arc::new(HashMap::from([(
+                    format!("skill:{id}"),
+                    id.clone(),
+                )]))),
             };
             let invocation = || pioneer_tools::ToolInvocation {
                 call_id: "call".into(),

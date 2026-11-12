@@ -4,9 +4,9 @@ use axum::routing::{get, post};
 
 use super::GatewayHttpState;
 use super::avatars::{agent_avatar_route, member_avatar_route};
-use super::plugins::plugin_icon_route;
 use super::content::{artifact_content_route, artifact_projection_route};
 use super::health::{health, native_diagnostics, ready};
+use super::plugins::plugin_icon_route;
 use super::views::view_grant_route;
 
 pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
