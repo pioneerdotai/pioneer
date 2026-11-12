@@ -13,6 +13,9 @@ sha2.workspace = true
 hex.workspace = true
 http.workspace = true
 url.workspace = true
+semver.workspace = true
+icu_locale_core = "2.4"
+libc.workspace = true
 pioneer-skills.workspace = true
 pioneer-protocol.workspace = true
 

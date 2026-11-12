@@ -1,5 +1,6 @@
 //! Bounded offline Agent Plugins 1.0.0 loading and Codex/Claude/Cursor package import. No component execution,
 //! installation, database, network or OAuth operations belong here.
+pub mod app;
 pub mod containment;
 mod diagnostic;
 mod discovery;

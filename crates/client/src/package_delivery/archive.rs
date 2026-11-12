@@ -190,6 +190,67 @@ fn build_upload_archive(source_root: &Path, root_name: String) -> Result<SkillUp
     })
 }
 
+/// Archive immutable, selectively captured App bytes, never reread the source project.
+/// Integration prerequisite: the Apps upload controller must retain this snapshot's
+/// fingerprint through preview/install and use an App-purpose Gateway upload.
+/// Ready archives continue through bounded Gateway extraction and independent validation.
+pub fn build_app_snapshot_archive(
+    snapshot: &pioneer_plugins::Snapshot,
+    cancelled: impl Fn() -> bool,
+) -> Result<SkillUploadArchive> {
+    use pioneer_plugins::{Entry, app::SelectionPlan};
+    let manifest = SelectionPlan::validate_package(snapshot)?;
+    let encoder = GzBuilder::new()
+        .mtime(0)
+        .write(Vec::new(), Compression::default());
+    let mut builder = Builder::new(encoder);
+    let root = manifest.slug();
+    let mut root_header = Header::new_gnu();
+    root_header.set_entry_type(tar::EntryType::Directory);
+    root_header.set_mode(snapshot.root_mode());
+    root_header.set_size(0);
+    root_header.set_mtime(0);
+    root_header.set_cksum();
+    builder.append_data(&mut root_header, root, io::empty())?;
+    let mut total = 0u64;
+    for (path, entry) in snapshot.entries() {
+        if cancelled() {
+            bail!("cancelled");
+        }
+        let mut header = Header::new_gnu();
+        let bytes = match entry {
+            Entry::Directory { mode } => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_mode(*mode);
+                &[][..]
+            }
+            Entry::File { bytes, mode } => {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(*mode);
+                total = total
+                    .checked_add(bytes.len() as u64)
+                    .context("expanded_limit")?;
+                bytes.as_slice()
+            }
+            Entry::Denied => bail!("denied_entry"),
+        };
+        header.set_size(bytes.len() as u64);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder.append_data(&mut header, format!("{root}/{path}"), bytes)?;
+    }
+    if cancelled() {
+        bail!("cancelled");
+    }
+    let bytes = builder.into_inner()?.finish()?;
+    Ok(SkillUploadArchive {
+        file_name: format!("{root}.tar.gz"),
+        sha256: hex::encode(Sha256::digest(&bytes)),
+        bytes,
+        uncompressed_size_bytes: total,
+    })
+}
+
 fn collect_archive_entries(
     root: &Path,
     current: &Path,

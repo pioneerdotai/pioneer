@@ -343,3 +343,229 @@ fn mode(metadata: &fs::Metadata) -> u32 {
         }
     }
 }
+
+impl Snapshot {
+    /// Selective capture shared by App folder packaging and offline validation.
+    /// Unlike Plugin capture this rejects all selected symlinks and special files.
+    pub(crate) fn capture_selected(
+        root: &Path,
+        limits: Limits,
+        selected: &BTreeMap<String, crate::app::SelectionKind>,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Self> {
+        use crate::app::SelectionKind;
+        if fs::symlink_metadata(root)?.file_type().is_symlink() {
+            bail!("selected_symlink");
+        }
+        let root = root.canonicalize()?;
+        let root_before = fs::symlink_metadata(&root)?;
+        if !root_before.is_dir() {
+            bail!("source_kind");
+        }
+        let mut entries = BTreeMap::new();
+        let mut observed = BTreeMap::new();
+        let mut total = 0;
+        for (key, kind) in selected {
+            validate_key(key, limits.depth)?;
+            // Read only the ancestor chain, never its siblings.
+            let mut parent = Path::new(key).parent();
+            let mut parents = Vec::new();
+            while let Some(p) = parent.filter(|p| !p.as_os_str().is_empty()) {
+                parents.push(p);
+                parent = p.parent();
+            }
+            for p in parents.into_iter().rev() {
+                let key = p.to_str().context("invalid_path")?;
+                if !entries.contains_key(key) {
+                    let metadata = selected_metadata(&root, key)?;
+                    if !metadata.is_dir() {
+                        bail!("selected_path_kind: {key}");
+                    }
+                    if entries.len() >= limits.entries {
+                        bail!("entry_limit");
+                    }
+                    entries.insert(
+                        key.into(),
+                        Entry::Directory {
+                            mode: mode(&metadata),
+                        },
+                    );
+                    observed.insert(key.into(), metadata);
+                }
+            }
+            let metadata = selected_metadata(&root, key)?;
+            if (*kind == SelectionKind::File && !metadata.is_file())
+                || (*kind == SelectionKind::Directory && !metadata.is_dir())
+            {
+                bail!("selected_path_kind: {key}");
+            }
+            visit_selected(
+                &root,
+                key,
+                limits,
+                cancelled,
+                &mut entries,
+                &mut observed,
+                &mut total,
+            )?;
+        }
+        // Detect replacement or edits of any captured member/ancestor, including directory membership.
+        for (key, before) in &observed {
+            if cancelled() {
+                bail!("cancelled");
+            }
+            if !same_file(before, &selected_metadata(&root, key)?) {
+                bail!("source_changed: {key}");
+            }
+        }
+        // Root sibling edits are excluded from the package; only root identity/mode matter.
+        let root_after = fs::symlink_metadata(&root)?;
+        if !root_after.is_dir()
+            || !same_identity(&root_before, &root_after)
+            || mode(&root_before) != mode(&root_after)
+        {
+            bail!("source_changed");
+        }
+        let mut snapshot = Self::from_entries(entries, limits)?;
+        snapshot.root_mode = mode(&root_before);
+        Ok(snapshot)
+    }
+}
+fn selected_metadata(root: &Path, key: &str) -> Result<fs::Metadata> {
+    let mut path = root.to_path_buf();
+    // Reject symlinks in ancestors as well as the final selected entry.
+    for part in key.split('/') {
+        path.push(part);
+        let m = fs::symlink_metadata(&path)?;
+        if m.file_type().is_symlink() {
+            bail!("selected_symlink: {key}");
+        }
+        if !m.is_file() && !m.is_dir() {
+            bail!("selected_special_file: {key}");
+        }
+    }
+    if !path.canonicalize()?.starts_with(root) {
+        bail!("package_path_escape");
+    }
+    Ok(fs::symlink_metadata(path)?)
+}
+#[allow(clippy::too_many_arguments)]
+fn visit_selected(
+    root: &Path,
+    key: &str,
+    limits: Limits,
+    cancelled: &impl Fn() -> bool,
+    entries: &mut BTreeMap<String, Entry>,
+    observed: &mut BTreeMap<String, fs::Metadata>,
+    total: &mut usize,
+) -> Result<()> {
+    if cancelled() {
+        bail!("cancelled");
+    }
+    validate_key(key, limits.depth)?;
+    // Already captured subtrees are deduplicated, preserving the first immutable bytes.
+    if observed.contains_key(key) && matches!(entries.get(key), Some(Entry::File { .. })) {
+        return Ok(());
+    }
+    let metadata = selected_metadata(root, key)?;
+    if !entries.contains_key(key) && entries.len() >= limits.entries {
+        bail!("entry_limit");
+    }
+    if metadata.is_dir() {
+        entries.insert(
+            key.into(),
+            Entry::Directory {
+                mode: mode(&metadata),
+            },
+        );
+        observed.entry(key.into()).or_insert(metadata);
+        let mut children = fs::read_dir(root.join(key))?
+            .take(limits.entries + 1)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if children.len() > limits.entries {
+            bail!("entry_limit");
+        }
+        children.sort_by_key(|e| e.file_name());
+        for child in children {
+            let name = child
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("invalid_path"))?;
+            visit_selected(
+                root,
+                &format!("{key}/{name}"),
+                limits,
+                cancelled,
+                entries,
+                observed,
+                total,
+            )?;
+        }
+    } else {
+        if metadata.len() > limits.entry_bytes as u64 {
+            bail!("entry_size_limit");
+        }
+        let mut options = File::options();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A raced symlink/FIFO must not escape or block capture.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = options.open(root.join(key))?;
+        if !same_file(&metadata, &file.metadata()?) {
+            bail!("source_changed: {key}");
+        }
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 64 * 1024];
+        loop {
+            if cancelled() {
+                bail!("cancelled");
+            }
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            if bytes
+                .len()
+                .checked_add(read)
+                .is_none_or(|n| n > limits.entry_bytes)
+                || total
+                    .checked_add(bytes.len())
+                    .and_then(|n| n.checked_add(read))
+                    .is_none_or(|n| n > limits.expanded_bytes)
+            {
+                bail!("expanded_limit");
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        if !same_file(&metadata, &file.metadata()?)
+            || !same_file(&metadata, &selected_metadata(root, key)?)
+        {
+            bail!("source_changed: {key}");
+        }
+        *total += bytes.len();
+        entries.insert(
+            key.into(),
+            Entry::File {
+                bytes,
+                mode: mode(&metadata),
+            },
+        );
+        observed.insert(key.into(), metadata);
+    }
+    Ok(())
+}
+
+fn same_identity(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        a.created().ok() == b.created().ok()
+    }
+}
