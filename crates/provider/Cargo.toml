@@ -10,7 +10,7 @@ pioneer-compaction.workspace = true
 pioneer-observability.workspace = true
 pioneer-protocol.workspace = true
 anyhow.workspace = true
-chrono.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 async-trait.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
