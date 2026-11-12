@@ -2972,6 +2972,9 @@ mod tests {
         let context = context();
         let timestamp = 1_700_030_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: context.workspace_id.clone(),
             id: context.thread_id.clone(),
             name: None,
@@ -3007,6 +3010,19 @@ mod tests {
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
+        {
+            use sea_orm::EntityTrait;
+            pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+                id: sea_orm::Set(thread.workspace_id.clone()),
+                name: sea_orm::Set("Observation fixture".to_owned()),
+                is_active: sea_orm::Set(true),
+                is_current: sea_orm::Set(true),
+                ..Default::default()
+            })
+            .exec(&store.database_connection())
+            .await
+            .expect("observation workspace should exist");
+        }
         store
             .upsert_thread_model(&thread, PersistedActorRef::System)
             .await

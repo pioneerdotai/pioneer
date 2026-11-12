@@ -22,6 +22,7 @@ pub struct NativeSummarizer {
     provider: Arc<dyn Provider>,
     selection: ModelSelection,
     budget: ModelBudget,
+    service_mode: Option<pioneer_protocol::NativeServiceModePlan>,
 }
 impl NativeSummarizer {
     /// The integration layer resolves this exact provider instance with the
@@ -43,7 +44,15 @@ impl NativeSummarizer {
             provider,
             selection,
             budget,
+            service_mode: None,
         })
+    }
+    pub fn with_service_mode(
+        mut self,
+        plan: Option<pioneer_protocol::NativeServiceModePlan>,
+    ) -> Self {
+        self.service_mode = plan;
+        self
     }
     fn prepare(&self, request: &SummaryRequest) -> Result<ChatRequest> {
         ensure!(
@@ -69,6 +78,8 @@ impl NativeSummarizer {
             })
             .transpose()?;
         Ok(ChatRequest {
+            tool_declarations: None,
+            service_mode: self.service_mode.clone(),
             model: request.selection.model.clone(),
             messages: vec![
                 ChatMessage::system(INSTRUCTIONS),
@@ -90,6 +101,8 @@ impl NativeSummarizer {
             messages: &'a [ChatMessage],
             max_tokens: Option<u32>,
             reasoning: &'a Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            service_mode: Option<&'a pioneer_protocol::NativeServiceModePlan>,
         }
         // JSON escaping and complete role/option framing are included without
         // allocating a second full JSON string or cloning message Values.
@@ -98,6 +111,7 @@ impl NativeSummarizer {
             messages: &prepared.messages,
             max_tokens: prepared.max_tokens,
             reasoning: &request.selection.effort,
+            service_mode: prepared.service_mode.as_ref(),
         })?
         .tokens()
         .saturating_add(32))
@@ -280,6 +294,9 @@ mod tests {
     }
     fn selection() -> ModelSelection {
         ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "fixture-instance".into(),
             model: "fixture-model".into(),
@@ -398,12 +415,22 @@ mod tests {
 
     #[tokio::test]
     async fn native_summary_uses_exact_selection_cap_and_fresh_tool_free_request() {
-        for (effort, expected) in [
-            (None, None),
-            (Some("none"), Some(ReasoningConfig::Disabled)),
+        use pioneer_protocol::{NativeServiceModePlan, ServiceModeParameters};
+        for (effort, expected, mode) in [
+            (None, None, None),
+            (Some("none"), Some(ReasoningConfig::Disabled), None),
             (
                 Some("high"),
                 Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                None,
+            ),
+            (
+                Some("high"),
+                Some(ReasoningConfig::Effort(ReasoningEffort::High)),
+                Some(NativeServiceModePlan {
+                    id: "pro".into(),
+                    parameters: ServiceModeParameters::OpenAiPro,
+                }),
             ),
         ] {
             let provider = fake(ProviderTermination::Complete, false);
@@ -414,7 +441,8 @@ mod tests {
                 request.selection.clone(),
                 ModelBudget::new(Some(128_000), None, Some(16_384)),
             )
-            .unwrap();
+            .unwrap()
+            .with_service_mode(mode.clone());
             let result = service.summarize(request.clone()).await.unwrap();
             validate_summary(&result, 500).unwrap();
             {
@@ -424,6 +452,7 @@ mod tests {
                 assert_eq!(sent.model, "fixture-model");
                 assert_eq!(sent.max_tokens, Some(500));
                 assert_eq!(sent.reasoning, expected);
+                assert_eq!(sent.service_mode, mode);
                 assert!(sent.tools.is_none() && sent.compiled_prompt.is_none());
                 assert_eq!(sent.messages.len(), 2);
                 assert_eq!(sent.messages[0].content, INSTRUCTIONS);
@@ -491,6 +520,18 @@ mod tests {
         );
         assert!(provider.calls.lock().unwrap().is_empty());
     }
+}
+
+/// First delivery after a terminal-only crash uses the same shell policy and
+/// control-field-preserving budget as ordinary Agent delivery.
+pub fn recovered_shell_result_message(
+    message: pioneer_provider::ChatMessage,
+    policy: &pioneer_protocol::ToolOutputPolicySnapshot,
+    saved_output_available: bool,
+    reference: &str,
+) -> Result<pioneer_provider::ChatMessage> {
+    crate::chat::prepare_shell_model_message(message, policy, saved_output_available, reference)
+        .map_err(|error| anyhow::anyhow!("cannot prepare recovered shell result: {error:?}"))
 }
 
 /// Rebuild the same bounded model representation when restoring a durable tool

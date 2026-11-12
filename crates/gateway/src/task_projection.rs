@@ -35,6 +35,35 @@ pub(crate) fn project_task_get_with_configuration(
     PublicTaskGetResponse {
         webhook_url: None,
         webhook_scope: None,
+        review_required: response
+            .runs
+            .iter()
+            .filter(|run| run.status == pioneer_protocol::TaskRunStatus::WaitingReview)
+            .filter_map(|run| {
+                let candidate = response
+                    .result_candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.run_id == run.id
+                            && matches!(
+                                candidate.status,
+                                pioneer_protocol::TaskResultCandidateStatus::PendingReview
+                                    | pioneer_protocol::TaskResultCandidateStatus::ExtractionFailed
+                            )
+                    })
+                    .max_by_key(|candidate| (candidate.round, candidate.created_at))?;
+                let item = TaskWaitItem {
+                    task: response.task.clone(),
+                    run: Some(run.clone()),
+                    child_thread_id: None,
+                    child_turn_id: None,
+                    permission_profile: None,
+                };
+                let review =
+                    pioneer_tasks::task_review_wait_item(response, item, candidate.clone());
+                Some(project_review_item(&review, None))
+            })
+            .collect(),
         task: project_task(&response.task),
         triggers: response.triggers.iter().map(project_trigger).collect(),
         runs: response.runs.iter().map(project_run).collect(),
@@ -227,6 +256,20 @@ pub(crate) fn project_task_deliveries(
     }
 }
 
+fn project_review_item(
+    review: &pioneer_protocol::TaskWaitReviewItem,
+    content: Option<PublicTaskReviewContent>,
+) -> PublicTaskWaitReviewItem {
+    PublicTaskWaitReviewItem {
+        item: project_wait_item(&review.item),
+        candidate: project_candidate(&review.candidate),
+        review_content: content,
+        remaining_revision_rounds: review.remaining_revision_rounds,
+        allowed_actions: review.allowed_actions.clone(),
+        revision_blocked_reason: review.revision_blocked_reason,
+    }
+}
+
 pub(crate) fn project_task_wait(response: &TaskWaitResponse) -> PublicTaskWaitResponse {
     project_task_wait_with_review_content(response, &BTreeMap::new())
 }
@@ -243,13 +286,11 @@ pub(crate) fn project_task_wait_with_review_content(
         review_required: response
             .review_required
             .iter()
-            .map(|review| PublicTaskWaitReviewItem {
-                item: project_wait_item(&review.item),
-                candidate: project_candidate(&review.candidate),
-                review_content: review_content.get(review.candidate.id.as_str()).cloned(),
-                remaining_revision_rounds: review.remaining_revision_rounds,
-                allowed_actions: review.allowed_actions.clone(),
-                revision_blocked_reason: review.revision_blocked_reason,
+            .map(|review| {
+                project_review_item(
+                    review,
+                    review_content.get(review.candidate.id.as_str()).cloned(),
+                )
             })
             .collect(),
         pending: response.pending.iter().map(project_wait_item).collect(),

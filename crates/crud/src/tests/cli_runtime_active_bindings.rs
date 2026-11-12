@@ -1810,6 +1810,7 @@ async fn addressed_timeout_pages_keep_turn_scope_and_revisit_changes_behind_curs
         .unwrap();
     let at = 1_700_000_000;
     let thread = sample_thread("ws_addressed_control", "thread_addressed_control", at);
+    seed_observation_workspace(&store, &thread.workspace_id).await;
     for turn_id in ["api_addressed", "other_addressed"] {
         store
             .materialize_turn_start(

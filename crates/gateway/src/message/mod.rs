@@ -14,6 +14,7 @@ mod cli_runtime;
 mod compaction_background;
 mod control_work;
 mod dispatch;
+mod execution_observability;
 pub(crate) mod html_tools;
 mod invitation_handlers;
 mod invitation_lifecycle;
@@ -1347,6 +1348,9 @@ impl MessageProcessor {
                     || summary_config.summary_model_provider.is_some()
                 {
                     Some(pioneer_compaction::ModelSelection {
+                        service_mode: None,
+                        context_authority: None,
+                        context_window: None,
                         transport: pioneer_compaction::Transport::Api,
                         instance: summary_config
                             .summary_model_provider

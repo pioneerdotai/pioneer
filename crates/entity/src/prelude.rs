@@ -220,3 +220,5 @@ pub use super::task_child_reconcile_pending::Entity as TaskChildReconcilePending
 pub use super::task_child_reconcile_scope::Entity as TaskChildReconcileScope;
 
 pub use super::agent_memory_payloads::Entity as AgentMemoryPayloads;
+pub use super::execution_observation::Entity as ExecutionObservation;
+pub use super::execution_tariff::Entity as ExecutionTariff;

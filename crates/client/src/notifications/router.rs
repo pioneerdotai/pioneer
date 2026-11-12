@@ -903,6 +903,9 @@ mod tests {
 
     fn thread(id: &str, workspace_id: &str) -> Thread {
         Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: id.to_owned(),
             name: None,

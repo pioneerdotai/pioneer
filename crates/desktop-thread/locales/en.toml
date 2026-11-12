@@ -336,3 +336,14 @@
 "timeline.html.loading" = "Loading page…"
 "timeline.html.failed" = "Couldn’t display this page"
 "chat.composer.preparing_send" = "Preparing message"
+
+"chat.composer.model.context_label" = "Context window"
+"chat.composer.model.context_auto" = "Auto — up to %{tokens} tokens"
+"chat.composer.model.context_up_to" = "Up to %{tokens} tokens"
+"chat.composer.model.context_invalid" = "Saved context choice is unavailable. Choose Auto or another window."
+
+"chat.composer.model.service_label" = "Service tier"
+
+"chat.composer.model.service_standard" = "Standard"
+
+"chat.composer.model.service_invalid" = "Saved service tier is unavailable. Choose Standard or reselect a mode."

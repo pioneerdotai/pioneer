@@ -39,6 +39,8 @@ pub struct TaskAgentAuthorizationGrantSeed {
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskCreateContext {
+    pub native_context: Option<pioneer_protocol::NativeContextBudget>,
+    pub native_summary: Option<pioneer_protocol::NativeSummaryContext>,
     /// Provisioned by Gateway before task creation; never contains the secret.
     pub webhook_secret_ref: Option<String>,
     /// Capture handoff until the atomic Task/root commit; no database capacity.

@@ -1290,6 +1290,9 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
     };
 
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: model_id,
         name: m.model_name,
         description: None,
@@ -1312,6 +1315,60 @@ mod signing_tests;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn native_service_tier_is_nested_without_modifying_inference_config() {
+        use pioneer_protocol::{NativeServiceModePlan, ServiceModeParameters as P};
+        let mut req = crate::generation::test_request("openai.service-fixture");
+        req.service_mode = Some(NativeServiceModePlan {
+            id: "ultrafast".into(),
+            parameters: P::BedrockNestedUltrafast,
+        });
+        let prepared = prepared_for(&req.messages);
+        let body = serde_json::to_value(
+            BedrockProvider::build_request_with_catalog(&req, &prepared, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["additionalModelRequestFields"]["service_tier"],
+            "ultrafast"
+        );
+        assert!(body.get("service_tier").is_none());
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 1024);
+        req.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+        assert!(BedrockProvider::build_request_with_catalog(&req, &prepared, None).is_err());
+        assert_eq!(
+            req.reasoning,
+            Some(ReasoningConfig::Effort(ReasoningEffort::High))
+        );
+    }
+    #[test]
+    fn disclosed_tools_keep_prefix_in_serialized_payload() {
+        let render = |request: ChatRequest| {
+            let provider = BedrockProvider::new("unused", "unused", "us-east-1");
+            let prepared = prepare_messages_for_provider(
+                "bedrock",
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            serde_json::to_value(BedrockProvider::build_request(&request, &prepared).unwrap())
+                .unwrap()
+        };
+        let mut request = crate::tools::policy::test_request();
+        let before = render(request.clone());
+        let mut added = request.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        request.tools.as_mut().unwrap().push(added);
+        let body = render(request);
+        assert_eq!(
+            body["toolConfig"]["tools"][0], before["toolConfig"]["tools"][0],
+            "entire previously serialized definition must survive expansion"
+        );
+        assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "lookup");
+        assert_eq!(body["toolConfig"]["tools"][1]["toolSpec"]["name"], "alpha");
+    }
+
     #[test]
     fn confirmed_opus_45_effort_includes_required_beta_in_converse_body() {
         let template = "anthropic.claude-opus-4-5-20251101-v1:0";
@@ -1719,6 +1776,8 @@ mod tests {
         ] {
             let provider = BedrockProvider::new("dummy-access", "dummy-secret", region);
             let request = ChatRequest {
+                tool_declarations: None,
+                service_mode: None,
                 model: "model:0".into(),
                 messages: vec![ChatMessage::user("dummy")],
                 temperature: None,
@@ -1843,6 +1902,8 @@ mod tests {
             ambiguous_input_aliases: vec![],
         });
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "anthropic.claude-target".into(),
             messages: vec![message],
             temperature: None,
@@ -1898,6 +1959,8 @@ mod tests {
             ambiguous_input_aliases: vec![],
         });
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "different-model".into(),
             messages: vec![canonical.clone()],
             temperature: None,
@@ -1920,6 +1983,7 @@ mod tests {
         assert_eq!(json.matches("first second").count(), 1);
         assert!(!json.contains("opaque-one"));
         let same_request = ChatRequest {
+            tool_declarations: None,
             model: "source-model".into(),
             ..request.clone()
         };
@@ -2138,6 +2202,8 @@ mod tests {
     #[test]
     fn convert_messages_uses_compiled_prompt_sections_in_order() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "anthropic.claude-3-sonnet-20240229-v1:0".to_owned(),
             messages: vec![
                 ChatMessage::system("legacy prompt should be ignored"),
@@ -2150,6 +2216,7 @@ mod tests {
             parallel_tool_calls: None,
             reasoning: None,
             compiled_prompt: Some(CompiledPromptPayload {
+                observation_manifest: None,
                 stable_system_text: "Stable rules".to_owned(),
                 dynamic_system_text: "Dynamic runtime".to_owned(),
                 boundary_marker: "<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->".to_owned(),
@@ -2246,6 +2313,8 @@ mod tests {
     #[test]
     fn bedrock_non_claude_rejects_unimplemented_reasoning_setting() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "amazon.nova-pro-v1:0".to_owned(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,

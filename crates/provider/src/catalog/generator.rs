@@ -105,6 +105,9 @@ impl SourceSnapshot {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GeneratedCatalog {
     pub models: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Financial contracts for existing non-chat operations; never picker entries.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub billing_models: BTreeMap<String, BTreeMap<String, Value>>,
     pub provenance: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_capabilities: Option<super::ToolCapabilities>,
@@ -126,7 +129,8 @@ impl GeneratedCatalog {
             &serde_json::to_string(&self.models)?,
             &serde_json::to_string(&self.provenance)?,
             self.tool_capabilities.clone(),
-        )?;
+        )?
+        .with_billing_models(self.billing_models.clone())?;
         for (provider, models) in &self.models {
             ensure!(
                 !provider.is_empty()
@@ -360,6 +364,7 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
     compatibility::fallbacks(&mut candidates);
     let mut output = GeneratedCatalog {
         models: BTreeMap::new(),
+        billing_models: sources::billing_models(snapshot),
         provenance: BTreeMap::new(),
         tool_capabilities: Some(sources::tool_capabilities(snapshot)),
         diagnostics: SOURCE_URLS
@@ -403,6 +408,7 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
         // for persisted catalogs. One malformed remote record cannot poison
         // unrelated models, while strict fixture validation still fails closed.
         let record = GeneratedCatalog {
+            billing_models: BTreeMap::new(),
             models: BTreeMap::from([(
                 provider.clone(),
                 BTreeMap::from([(id.clone(), candidate.model.clone())]),

@@ -26,21 +26,65 @@ pub(super) async fn make_summarizer(
     workspace: &str,
     thread: &str,
     selection: ModelSelection,
+    native_context: bool,
+    saved: Option<&pioneer_protocol::NativeContextBudget>,
 ) -> Result<Arc<dyn Summarizer>> {
     if selection.transport == Transport::Api {
         let provider = providers.get_or_create_for_workspace(workspace, &selection.instance)?;
         let provider = crate::usage_journal::observe(provider, store, workspace, "summary", thread);
-        let limits = provider.model_limits(&selection.model).await?;
-        return Ok(Arc::new(NativeSummarizer::new(
-            provider,
-            selection,
+        let budget = if native_context {
+            if saved.is_none() {
+                super::native_budget::validate_manual_authority(
+                    provider.as_ref(),
+                    &selection.model,
+                    selection.context_window,
+                    selection.context_authority.as_deref(),
+                )?;
+            }
+            super::native_budget::effective(
+                provider.as_ref(),
+                &selection.instance,
+                &selection.model,
+                saved,
+                selection.context_window,
+            )
+            .await?
+        } else {
+            let limits = provider.model_limits(&selection.model).await?;
             ModelBudget::new(
                 Some(limits.context_window),
                 limits.max_input,
                 limits.max_output,
-            ),
-        )?));
+            )
+        };
+        let plan = if native_context {
+            match saved.and_then(|budget| budget.service_mode.clone()) {
+                Some(plan) => {
+                    pioneer_provider::catalog::service::validate_plan(
+                        provider.as_ref(),
+                        &selection.model,
+                        &plan,
+                    )
+                    .await?;
+                    Some(plan)
+                }
+                None => Some(
+                    pioneer_provider::catalog::service::capture_plan(
+                        provider.as_ref(),
+                        &selection.model,
+                        None, // missing admitted summary plan is legacy Standard, not current settings
+                    )
+                    .await?,
+                ),
+            }
+        } else {
+            None
+        };
+        return Ok(Arc::new(
+            NativeSummarizer::new(provider, selection, budget)?.with_service_mode(plan),
+        ));
     }
+
     let processor =
         processor.ok_or_else(|| anyhow::anyhow!("CLI service instance catalog is unavailable"))?;
     let instance = processor
@@ -57,7 +101,7 @@ pub(super) async fn make_summarizer(
         instance,
         selection,
         crate::cli_runtime::config::proxy_env(proxy.as_deref()),
-        Some((store.clone(), workspace.into())),
+        Some((store.clone(), workspace.into(), thread.into())),
         opencode_data_home,
     )
 }
@@ -66,7 +110,7 @@ fn make_cli_summarizer(
     instance: pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
     selection: ModelSelection,
     environment: pioneer_cli_agent_runtime::process::SensitiveEnvironment,
-    usage_scope: Option<(pioneer_crud::CrudStore, String)>,
+    usage_scope: Option<(pioneer_crud::CrudStore, String, String)>,
     opencode_data_home: Option<std::path::PathBuf>,
 ) -> Result<Arc<dyn Summarizer>> {
     ensure!(
@@ -144,7 +188,7 @@ enum CliService {
     OpenCode(crate::cli_runtime::opencode_session::OpenCodeSummaryService),
 }
 struct CliSummarizer {
-    usage_scope: Option<(pioneer_crud::CrudStore, String)>,
+    usage_scope: Option<(pioneer_crud::CrudStore, String, String)>,
     selection: ModelSelection,
     budget: ModelBudget,
     service: CliService,
@@ -375,13 +419,11 @@ impl Summarizer for CliSummarizer {
             ),
             ..Default::default()
         };
-        let call = if let Some((store, workspace)) = &self.usage_scope {
+        let call = if let Some((store, workspace, thread)) = &self.usage_scope {
             Some(
-                crate::usage_journal::Call::start(
-                    store, workspace, "summary", workspace, &observed,
-                )
-                .await
-                .map_err(failure)?,
+                crate::usage_journal::Call::start(store, workspace, "summary", thread, &observed)
+                    .await
+                    .map_err(failure)?,
             )
         } else {
             None
@@ -433,16 +475,20 @@ impl Summarizer for CliSummarizer {
         Ok(finish_cli_summary(&mut observed, text, input_tokens, output_tokens, &raw))
         }.await;
         if let Some(call) = call {
-            call.record(
-                if completion.is_ok() {
-                    "completed"
-                } else {
-                    "failed"
-                },
-                &observed,
-            )
-            .await
-            .map_err(failure)?;
+            if call
+                .record(
+                    if completion.is_ok() {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    &observed,
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!("external summary usage settlement commit unconfirmed");
+            }
         }
         completion
     }
@@ -842,8 +888,42 @@ mod tests {
     }
 
     #[test]
+    fn cli_owned_api_summary_retains_legacy_selection_identity() {
+        let api: ModelSelection = serde_json::from_value(serde_json::json!({
+            "transport":"api", "instance":"fixture", "model":"fixture-model", "effort":"high"
+        }))
+        .unwrap();
+        let legacy_identity = serde_json::to_vec(&api).unwrap();
+        let mut settings = pioneer_compaction::CompactionSettings {
+            selection: Some(api.clone()),
+        };
+        settings.selection.as_mut().unwrap().service_mode =
+            Some(pioneer_protocol::NativeServiceModeSelection {
+                id: "pro".into(),
+                authority: "native-scope".into(),
+            });
+        let mut current = api;
+        current.transport = Transport::Codex;
+        let mut cli_override = None;
+        crate::compaction::isolate_cli_summary_service_modes(
+            &mut current,
+            &mut settings,
+            &mut cli_override,
+        );
+        let admission = settings.admit(&current, None, 0).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&admission.selection).unwrap(),
+            legacy_identity
+        );
+        assert!(current.service_mode.is_none());
+    }
+
+    #[test]
     fn cli_summary_input_keeps_projected_command_output_once() {
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Claude,
             instance: "fixture".into(),
             model: "fixture-model".into(),
@@ -942,6 +1022,9 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
             debug_native_events: false,
         };
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Claude,
             instance: "selected-cli".into(),
             model: "claude-sonnet-4-6".into(),

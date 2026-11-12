@@ -319,6 +319,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct TurnStartParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_mode: Option<crate::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_authority: Option<String>,
+    /// User-owned model choice; absent means Auto, not inheritance of a wider override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// Explicit, bounded cross-capsule delegations requested for this root
     /// Agent execution. These are authorization inputs, never prompt content.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -418,6 +425,11 @@ pub struct TurnAgentAuthorityCapSnapshot {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct TurnExecutionSecuritySnapshot {
+    /// Financial context authorization for this exact Native/API execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_context: Option<crate::NativeContextBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_summary: Option<crate::NativeSummaryContext>,
     pub schema_version: u32,
     pub version: u32,
     pub source: TurnSecuritySnapshotSource,
@@ -448,6 +460,8 @@ impl TurnExecutionSecuritySnapshot {
         let process = TurnProcessPolicySnapshot::unrestricted();
         let approval = TurnApprovalScopePolicySnapshot::full_access();
         Self {
+            native_context: None,
+            native_summary: None,
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
             source: TurnSecuritySnapshotSource::ComposerSelection,
@@ -490,6 +504,8 @@ impl TurnExecutionSecuritySnapshot {
         let process = TurnProcessPolicySnapshot::restricted();
         let approval = TurnApprovalScopePolicySnapshot::supervised();
         Self {
+            native_context: None,
+            native_summary: None,
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
             source: TurnSecuritySnapshotSource::ComposerSelection,
@@ -540,6 +556,8 @@ impl TurnExecutionSecuritySnapshot {
         let process = TurnProcessPolicySnapshot::restricted();
         let approval = TurnApprovalScopePolicySnapshot::auto_accept_edits();
         Self {
+            native_context: None,
+            native_summary: None,
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
             source: TurnSecuritySnapshotSource::ComposerSelection,
@@ -4812,9 +4830,40 @@ pub enum SystemEventLevel {
     Error,
 }
 
+/// Content-free source boundaries, bounded per invocation. All mono_ns values
+/// belong to the enclosing observation's process_run_id.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolPhaseBoundary {
+    pub phase: String,
+    pub attempt_id: u32,
+    pub ts_unix_ms: i64,
+    pub mono_ns: u64,
+    pub local_sequence: u64,
+}
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolOutputMeasurements {
+    pub captured_text_bytes: u64,
+    /// Prepared handler representation; persistence is a separate acknowledged fact.
+    pub prepared_source_bytes: u64,
+    pub model_projection_text_bytes: u64,
+    pub basis: String,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolObservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_boundaries: Vec<ToolPhaseBoundary>,
+    #[serde(default, skip_serializing_if = "no_omitted_tool_phases")]
+    pub omitted_phase_boundaries: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_sizes: Option<ToolOutputMeasurements>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_run_id: Option<String>,
     pub trace_id: String,
     pub turn_id: String,
     pub tool_call_id: String,
@@ -4823,6 +4872,10 @@ pub struct ToolObservation {
     pub ts_unix_ms: i64,
     pub mono_ns: u64,
     pub event_seq: u64,
+}
+
+fn no_omitted_tool_phases(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -6848,6 +6901,9 @@ mod tests {
     #[test]
     fn turn_start_params_encode_user_input_tagged_enum() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thr_123".to_owned(),
             turn_id: "turn_123".to_owned(),
@@ -6915,6 +6971,9 @@ mod tests {
     #[test]
     fn turn_start_params_encode_extended_attachment_input_variants() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thr_123".to_owned(),
             turn_id: "turn_123".to_owned(),

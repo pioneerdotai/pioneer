@@ -190,8 +190,6 @@ pub struct GatewayTaskReviewConfig {
     pub enabled: bool,
     #[serde(default = "default_tasks_review_allow_task_create_review_policy")]
     pub allow_task_create_review_policy: bool,
-    #[serde(default = "default_tasks_review_parent_review_for_attached_agent_tasks")]
-    pub default_parent_review_for_immediate_attached_agent_tasks: bool,
     #[serde(default = "default_tasks_review_max_revision_rounds")]
     pub default_max_revision_rounds: u32,
     #[serde(default = "default_tasks_review_auto_accept_after_seconds")]
@@ -270,8 +268,6 @@ impl Default for GatewayTaskReviewConfig {
         Self {
             enabled: default_tasks_review_enabled(),
             allow_task_create_review_policy: default_tasks_review_allow_task_create_review_policy(),
-            default_parent_review_for_immediate_attached_agent_tasks:
-                default_tasks_review_parent_review_for_attached_agent_tasks(),
             default_max_revision_rounds: default_tasks_review_max_revision_rounds(),
             auto_accept_after_seconds: default_tasks_review_auto_accept_after_seconds(),
         }
@@ -284,10 +280,6 @@ const fn default_tasks_review_enabled() -> bool {
 
 const fn default_tasks_review_allow_task_create_review_policy() -> bool {
     false
-}
-
-const fn default_tasks_review_parent_review_for_attached_agent_tasks() -> bool {
-    true
 }
 
 const fn default_tasks_review_max_revision_rounds() -> u32 {
@@ -1056,27 +1048,63 @@ pub struct GatewayThreadConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(from = "GatewayProviderConfigWire")]
 pub struct GatewayProviderConfig {
-    #[serde(
-        default = "default_provider_non_stream_request_timeout_secs",
-        alias = "default_timeout_secs"
-    )]
     pub non_stream_request_timeout_secs: u64,
-    #[serde(default = "default_provider_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
-    #[serde(default = "default_provider_first_chunk_timeout_secs")]
     pub first_chunk_timeout_secs: u64,
-    #[serde(default = "default_provider_inter_chunk_idle_timeout_secs")]
     pub inter_chunk_idle_timeout_secs: u64,
-    #[serde(default)]
     pub max_stream_duration_secs: Option<u64>,
-    #[serde(default)]
     pub attachments: GatewayProviderAttachmentsConfig,
+    /// Provenance only, not a configurable override. Explicit timeout settings
+    /// remain authoritative even when numerically equal to built-in defaults.
+    pub use_default_flex_timeouts: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct GatewayProviderConfigWire {
+    #[serde(default, alias = "default_timeout_secs")]
+    non_stream_request_timeout_secs: Option<u64>,
+    #[serde(default)]
+    connect_timeout_secs: Option<u64>,
+    #[serde(default)]
+    first_chunk_timeout_secs: Option<u64>,
+    #[serde(default)]
+    inter_chunk_idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_stream_duration_secs: Option<u64>,
+    #[serde(default)]
+    attachments: GatewayProviderAttachmentsConfig,
+}
+impl From<GatewayProviderConfigWire> for GatewayProviderConfig {
+    fn from(wire: GatewayProviderConfigWire) -> Self {
+        let use_default_flex_timeouts = wire.non_stream_request_timeout_secs.is_none()
+            && wire.first_chunk_timeout_secs.is_none()
+            && wire.inter_chunk_idle_timeout_secs.is_none();
+        Self {
+            non_stream_request_timeout_secs: wire
+                .non_stream_request_timeout_secs
+                .unwrap_or_else(default_provider_non_stream_request_timeout_secs),
+            connect_timeout_secs: wire
+                .connect_timeout_secs
+                .unwrap_or_else(default_provider_connect_timeout_secs),
+            first_chunk_timeout_secs: wire
+                .first_chunk_timeout_secs
+                .unwrap_or_else(default_provider_first_chunk_timeout_secs),
+            inter_chunk_idle_timeout_secs: wire
+                .inter_chunk_idle_timeout_secs
+                .unwrap_or_else(default_provider_inter_chunk_idle_timeout_secs),
+            max_stream_duration_secs: wire.max_stream_duration_secs,
+            attachments: wire.attachments,
+            use_default_flex_timeouts,
+        }
+    }
 }
 
 impl Default for GatewayProviderConfig {
     fn default() -> Self {
         Self {
+            use_default_flex_timeouts: true,
             non_stream_request_timeout_secs: default_provider_non_stream_request_timeout_secs(),
             connect_timeout_secs: default_provider_connect_timeout_secs(),
             first_chunk_timeout_secs: default_provider_first_chunk_timeout_secs(),
@@ -3521,6 +3549,25 @@ fn user_config_directory_name() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn native_flex_distinguishes_omitted_timeouts_from_explicit_default_values() {
+        let implicit: super::GatewayProviderConfig = toml::from_str("").unwrap();
+        assert!(implicit.use_default_flex_timeouts);
+        assert_eq!(implicit.non_stream_request_timeout_secs, 120);
+        for input in [
+            "first_chunk_timeout_secs = 180",
+            "non_stream_request_timeout_secs = 120",
+            "inter_chunk_idle_timeout_secs = 180",
+            "default_timeout_secs = 120",
+        ] {
+            let explicit: super::GatewayProviderConfig = toml::from_str(input).unwrap();
+            assert!(!explicit.use_default_flex_timeouts);
+        }
+        let embedded = load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).unwrap();
+        assert!(embedded.gateway.provider.use_default_flex_timeouts);
+        assert_eq!(embedded.gateway.provider.first_chunk_timeout_secs, 180);
+    }
     use super::{
         DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeKindConfig,
         GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, GatewayResilienceConfig,
@@ -3931,13 +3978,6 @@ service_name = "com.pioneer.gateway.env"
         assert!(!config.gateway.keepawake);
         assert!(config.gateway.tasks.review.enabled);
         assert!(!config.gateway.tasks.review.allow_task_create_review_policy);
-        assert!(
-            config
-                .gateway
-                .tasks
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(config.gateway.tasks.review.default_max_revision_rounds, 5);
         assert_eq!(config.gateway.tasks.review.auto_accept_after_seconds, 300);
         assert!(!config.gateway.cli_agent_runtime.enabled);
@@ -5002,11 +5042,6 @@ enabled = false
 
         assert!(!config.review.enabled);
         assert!(!config.review.allow_task_create_review_policy);
-        assert!(
-            config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(config.review.default_max_revision_rounds, 5);
         assert_eq!(config.review.auto_accept_after_seconds, 300);
     }

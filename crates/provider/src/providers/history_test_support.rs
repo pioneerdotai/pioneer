@@ -4,6 +4,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(super) fn request(messages: Vec<ChatMessage>) -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: "fixture".into(),
         messages,
         temperature: None,
@@ -52,3 +54,6 @@ pub(super) async fn serve_sse(body: &'static str) -> (String, tokio::task::JoinH
     });
     (url, task)
 }
+
+// Contract input for serializers: two independent streams, no redundant aggregate.
+pub(super) const COMPACT_SHELL_RESULT: &str = r#"{"stdout":"唯一\nline\nline","stderr":"warning","session_id":7,"truncated":{"stdout":false,"stderr":false},"output_stats":{"full_output_available":true,"truncation_method":"retained_output_log"},"saved_source":{"read_tool":"threads_tools_result_read","reference":{"workspace_id":"w","thread_id":"t","turn_id":"turn","item_id":"shell","output_log":true}}}"#;

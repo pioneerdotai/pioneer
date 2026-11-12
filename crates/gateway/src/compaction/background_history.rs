@@ -194,6 +194,10 @@ pub(crate) async fn prepare_completed_history_owned(
     root_check_revision: Option<i64>,
     diagnostic: &mut HistoryCheckDiagnostic,
 ) -> Result<HistoryCheckOutcome> {
+    let (mut current, mut settings, mut cli_override) =
+        (current.clone(), settings.clone(), cli_override.cloned());
+    super::isolate_cli_summary_service_modes(&mut current, &mut settings, &mut cli_override);
+    let (current, settings, cli_override) = (&current, &settings, cli_override.as_ref());
     // The owner chooses the database class: foreground transfer is part of
     // turn startup; the completed-turn worker passes a maintenance handle.
     let store = scoped_store.clone();
@@ -376,11 +380,88 @@ pub(crate) async fn prepare_completed_history_owned(
         } else {
             pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model)
         };
-        let budget = ModelBudget::new(
-            Some(limits.context_window),
-            limits.max_input,
-            limits.max_output,
-        );
+        let saved = if current.transport == Transport::Api {
+            let mut record = store.get_turn_execution_security_snapshot(turn).await?;
+            if record.as_ref().is_some_and(|record| {
+                record
+                    .snapshot
+                    .native_context
+                    .as_ref()
+                    .is_none_or(|budget| budget.service_mode.is_none())
+            }) {
+                let provider = processor
+                    .provider_registry()
+                    .get_or_create_for_workspace(workspace, &current.instance)?;
+                // Legacy launches had no user-authorized expansion. Pin Auto once,
+                // before building any runner identity or reusing a fits proof.
+                let budget = if let Some(budget) = record
+                    .as_ref()
+                    .and_then(|record| record.snapshot.native_context.clone())
+                {
+                    budget
+                } else {
+                    super::native_budget::capture(
+                        provider.as_ref(),
+                        &current.instance,
+                        catalog_model,
+                        None,
+                    )
+                    .await?
+                };
+                let summary = if record
+                    .as_ref()
+                    .is_some_and(|record| record.snapshot.native_context.is_some())
+                {
+                    record
+                        .as_ref()
+                        .and_then(|record| record.snapshot.native_summary.clone())
+                } else {
+                    super::native_budget::capture_summary_legacy(processor, workspace, &budget)
+                        .await?
+                };
+                let (budget, summary) =
+                    super::native_budget::legacy_modes(processor, workspace, budget, summary)
+                        .await?;
+                store
+                    .pin_turn_native_context(workspace, turn, &budget, summary.as_ref())
+                    .await?;
+                record = store.get_turn_execution_security_snapshot(turn).await?;
+                anyhow::ensure!(
+                    record
+                        .as_ref()
+                        .is_some_and(|record| record.snapshot.native_context.is_some()),
+                    "Native execution context could not be pinned"
+                );
+            }
+            record.map(|record| record.snapshot)
+        } else {
+            None
+        };
+        let saved_context = saved
+            .as_ref()
+            .and_then(|saved| saved.native_context.as_ref());
+        let saved_summary = saved
+            .as_ref()
+            .and_then(|saved| saved.native_summary.as_ref());
+        let budget = if current.transport == Transport::Api {
+            let provider = processor
+                .provider_registry()
+                .get_or_create_for_workspace(workspace, &current.instance)?;
+            super::native_budget::effective(
+                provider.as_ref(),
+                &current.instance,
+                catalog_model,
+                saved_context,
+                current.context_window,
+            )
+            .await?
+        } else {
+            ModelBudget::new(
+                Some(limits.context_window),
+                limits.max_input,
+                limits.max_output,
+            )
+        };
         // This estimates only the retained Pioneer history. It makes no claim
         // about hidden CLI instructions/tokens and never controls its context.
         // Every later native call still budgets its own complete request.
@@ -404,6 +485,12 @@ pub(crate) async fn prepare_completed_history_owned(
             None
         };
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: if current.transport == Transport::Api {
+                saved_context.and_then(|saved| saved.service_mode.clone())
+            } else {
+                None
+            },
             model: current.model.clone(),
             messages,
             temperature: None,
@@ -418,6 +505,7 @@ pub(crate) async fn prepare_completed_history_owned(
             pioneer_provider::history::project_request_for_provider(&catalog, request)?
         } else {
             ChatRequest {
+                tool_declarations: None,
                 messages: request
                     .messages
                     .iter()
@@ -515,8 +603,16 @@ pub(crate) async fn prepare_completed_history_owned(
             diagnostic.code = "history_fits".into();
             return Ok(None);
         }
-        let selection =
-            effective_selection(current, settings.selection.as_ref(), cli_override).clone();
+        let selection = saved_summary
+            .as_ref()
+            .map(|saved| super::native_budget::summary_selection(saved, current.effort.clone()))
+            .unwrap_or_else(|| {
+                effective_selection(current, settings.selection.as_ref(), cli_override).clone()
+            });
+        let native_summary_settings =
+            (current.transport == Transport::Api).then(|| CompactionSettings {
+                selection: Some(selection.clone()),
+            });
         diagnostic.stage = "summary_configuration".into();
         if let Some(revision) = authorization_revision {
             if processor.initialize_authorization_generation().await? != revision {
@@ -544,6 +640,17 @@ pub(crate) async fn prepare_completed_history_owned(
             workspace,
             thread,
             selection,
+            current.transport == Transport::Api,
+            saved_summary
+                .as_ref()
+                .map(|saved| &saved.budget)
+                .or_else(|| {
+                    if settings.selection.is_none() {
+                        saved_context
+                    } else {
+                        None
+                    }
+                }),
         )
         .await?;
         diagnostic.stage = "planning".into();
@@ -682,7 +789,7 @@ pub(crate) async fn prepare_completed_history_owned(
             &store,
             workspace,
             thread,
-            settings,
+            native_summary_settings.as_ref().unwrap_or(settings),
             current,
             cli_override,
             summarizer.as_ref(),
@@ -766,7 +873,10 @@ pub(crate) async fn prepare_completed_history_owned(
     }
     let exit = tokio::select! { biased;
         _ = clock.sleep_until(operation_deadline) => CompactionExit::Reconcile(FailureKind::Deadline),
-        result = runner.run(cancellation) => result?,
+        result = pioneer_provider::usage::scope_causal_parent(
+            pioneer_provider::usage::current_causal_parent().unwrap_or_else(||format!("turn:{turn}")),
+            runner.run(cancellation),
+        ) => result?,
     };
     if suspending.load(std::sync::atomic::Ordering::Acquire)
         && matches!(exit, CompactionExit::Reconcile(FailureKind::Cancelled))

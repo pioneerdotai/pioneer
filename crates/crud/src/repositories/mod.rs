@@ -150,4 +150,5 @@ pub mod task_child_work;
 
 pub(crate) mod task_occurrence_producers;
 
+pub mod execution_observability;
 pub(crate) mod thread_episodic_search;

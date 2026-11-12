@@ -39,7 +39,7 @@ use pioneer_protocol::{
 pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Clone, Copy)]
-pub(super) struct OpenAiEmbeddingModelDefinition {
+pub(crate) struct OpenAiEmbeddingModelDefinition {
     pub(super) id: &'static str,
     pub(super) dimension: usize,
     name: &'static str,
@@ -67,7 +67,7 @@ const OPENAI_EMBEDDING_MODELS: &[OpenAiEmbeddingModelDefinition] = &[
     },
 ];
 
-pub(super) fn embedding_model_definition(
+pub(crate) fn embedding_model_definition(
     id: &str,
 ) -> Option<&'static OpenAiEmbeddingModelDefinition> {
     OPENAI_EMBEDDING_MODELS.iter().find(|model| model.id == id)
@@ -556,9 +556,13 @@ impl OpenAiProvider {
             .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&api_request);
-        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
-            .send()
-            .await?;
+        let response = crate::http::non_stream_request(
+            request_builder,
+            self.timeout_policy
+                .for_service_mode(request.service_mode.as_ref()),
+        )
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -649,8 +653,12 @@ impl OpenAiProvider {
             .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&api_request);
-        let response =
-            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
+        let response = crate::http::send_stream_request(
+            request_builder,
+            self.timeout_policy
+                .for_service_mode(request.service_mode.as_ref()),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -853,7 +861,12 @@ impl OpenAiProvider {
                     let response = crate::http::non_stream_request(request_builder, timeout_policy)
                         .send()
                         .await
-                        .map_err(Self::classify_upload_reqwest_error)?;
+                        .map_err(|error| match error.downcast::<reqwest::Error>() {
+                            Ok(error) => Self::classify_upload_reqwest_error(error),
+                            Err(_) => AttachmentOperationError::non_retryable(anyhow!(
+                                "request observation commit unconfirmed"
+                            )),
+                        })?;
 
                     let status = response.status();
                     if !status.is_success() {
@@ -1429,6 +1442,14 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl crate::traits::Provider for OpenAiProvider {
+    fn embedding_usage_profile(&self) -> crate::ProviderUsageProfile {
+        crate::ProviderUsageProfile {
+            api: "embeddings".into(),
+            api_version: None,
+            route: crate::usage::route(&self.base_url, "/embeddings"),
+        }
+    }
+
     fn usage_api(&self) -> &'static str {
         "responses"
     }
@@ -1620,30 +1641,53 @@ impl crate::traits::Provider for OpenAiProvider {
                 .map(|seconds| seconds.saturating_mul(1000));
             let status = response.status().as_u16();
             let mut failure = OpenAiEmbeddingHttpFailure::new(status, retry_after_ms);
+            let request_id = crate::usage::native_id(
+                response
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok()),
+            );
+            let body =
+                crate::http::read_response_text_bounded(response, 16 * 1024, "provider_error_body")
+                    .await
+                    .ok();
             if status == 400 {
-                // A generic bad request can carry a context-limit rejection.
-                // Classify the bounded body here, then discard it before the
-                // error crosses observability or endpoint-redaction boundaries.
-                if let Ok(body) = crate::http::read_response_text_bounded(
-                    response,
-                    16 * 1024,
-                    "provider_error_body",
-                )
-                .await
-                {
-                    failure.0.class = super::embedding::classify_input_failure(status, &body);
+                if let Some(body) = &body {
+                    failure.0.class = super::embedding::classify_input_failure(status, body);
                 }
             }
-            return Err(failure.into());
+            let usage = body
+                .as_deref()
+                .and_then(|body| {
+                    crate::usage::http_error_usage(body, "embeddings", request_id.as_deref())
+                })
+                .or_else(|| {
+                    request_id.map(|request_id| crate::TokenUsage {
+                        request_id: Some(request_id),
+                        ..Default::default()
+                    })
+                });
+            let error = failure.into();
+            return Err(if let Some(usage) = usage {
+                crate::usage::with_error_usage(error, &usage)
+            } else {
+                error
+            });
         }
 
+        let request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
         let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
             response,
             Default::default(),
             "provider_response",
         )
         .await?;
-        response.into_response(expected_count)
+        super::embedding::with_request_id(response.into_response(expected_count), request_id)
     }
 }
 
@@ -1651,6 +1695,9 @@ fn provider_model_from_openai_model_entry(m: ApiModelEntry) -> ProviderModelInfo
     let capabilities = ProviderModelCapabilities::default();
 
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: m.id.clone(),
         name: None,
         description: None,
@@ -1669,6 +1716,9 @@ fn provider_model_from_openai_model_entry(m: ApiModelEntry) -> ProviderModelInfo
 
 fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> ProviderModelInfo {
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: model.id.to_owned(),
         name: Some(model.name.to_owned()),
         description: Some(model.description.to_owned()),
@@ -1690,6 +1740,72 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn service_tiers_reach_chat_body_but_pro_and_ultrafast_do_not() {
+        use pioneer_protocol::{NativeServiceModePlan, OpenAiTier, ServiceModeParameters as P};
+        let catalog = crate::generation::test_catalog_model(
+            "openai",
+            "chat-fixture",
+            "gpt-5.4",
+            serde_json::json!({"api":"openai-completions"}),
+        );
+        let mut req = crate::generation::test_request("chat-fixture");
+        for (parameters, wire) in [
+            (P::OpenAiStandard, "default"),
+            (
+                P::OpenAiTier {
+                    tier: OpenAiTier::Priority,
+                },
+                "priority",
+            ),
+            (
+                P::OpenAiTier {
+                    tier: OpenAiTier::Flex,
+                },
+                "flex",
+            ),
+        ] {
+            req.service_mode = Some(NativeServiceModePlan {
+                id: wire.into(),
+                parameters,
+            });
+            for stream in [false, true] {
+                let body = serde_json::to_value(
+                    OpenAiProvider::build_chat_request_with_catalog(
+                        &req,
+                        vec![],
+                        stream,
+                        Some(&catalog),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body["service_tier"], wire);
+                assert_eq!(body["model"], "chat-fixture");
+            }
+        }
+        for parameters in [
+            P::OpenAiPro,
+            P::OpenAiTier {
+                tier: OpenAiTier::Ultrafast,
+            },
+        ] {
+            req.service_mode = Some(NativeServiceModePlan {
+                id: "unsupported".into(),
+                parameters,
+            });
+            assert!(
+                OpenAiProvider::build_chat_request_with_catalog(
+                    &req,
+                    vec![],
+                    false,
+                    Some(&catalog)
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn native_openai_honors_negative_fresh_source_temperature() {

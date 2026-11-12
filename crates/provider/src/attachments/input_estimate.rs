@@ -22,8 +22,10 @@ pub struct PreparedInputBudget {
 pub(crate) async fn prepare(
     provider: &str,
     capabilities: &crate::ProviderCapabilities,
-    request: ChatRequest,
+    mut request: ChatRequest,
 ) -> Result<PreparedInputBudget> {
+    // Service-default serializers send full definitions, never positional items.
+    request.tool_declarations = None;
     prepare_with_profile(
         provider,
         capabilities,
@@ -802,6 +804,8 @@ mod tests {
                 "image/png",
             )));
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gpt-4o".into(),
             messages: vec![message],
             temperature: None,

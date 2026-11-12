@@ -486,17 +486,17 @@ impl MessageProcessor {
         false
     }
 
-    /// Resolves operator disclosure against the exact Task. An action-level
+    /// Resolves projection permissions against the exact Task. An action-level
     /// grant is final only for an absolute role; a future scoped operator role
     /// must pass the same authoritative Task facts as every mutation/read.
-    async fn task_operator_projection_allowed(
+    async fn task_projection_action_allowed(
         &self,
         request_context: &RequestContext,
         task_id: Option<&str>,
         workspace_id: Option<&str>,
+        action: ResourceAction,
     ) -> bool {
         let service = crate::authorization::AuthorizationService::new();
-        let action = ResourceAction::TaskReadOperator;
         let gate = service.authorize_action(
             request_context.principal().kind,
             request_context.principal().role_key.as_ref(),
@@ -1138,6 +1138,25 @@ impl MessageProcessor {
             context.resolved_launch_identity = Some(identity);
             context.resolved_launch_profile = Some(profile);
         }
+        if let Err(error) = crate::compaction::native_budget::freeze_task_context(
+            self,
+            &params.workspace_id,
+            None,
+            &mut context,
+        )
+        .await
+        {
+            self.send_error(
+                connection_id,
+                task_public_error(
+                    Some(request_id),
+                    pioneer_protocol::PublicErrorStage::Preparation,
+                    format!("Native Task context: {error:#}"),
+                ),
+            )
+            .await;
+            return;
+        }
         context.agent_authorization_grant = task_agent_authorization_grant;
         context.execution_admission = task_execution_admission;
         if let Some(seed) = context.execution_admission.as_ref()
@@ -1265,12 +1284,67 @@ impl MessageProcessor {
         };
         let connection_id = request_context.connection_id();
         let operator_allowed = self
-            .task_operator_projection_allowed(request_context, Some(params.task_id.as_str()), None)
+            .task_projection_action_allowed(
+                request_context,
+                Some(params.task_id.as_str()),
+                None,
+                ResourceAction::TaskReadOperator,
+            )
             .await;
         match self.task_runtime.service().get_task(params).await {
             Ok(response_payload) => {
-                let projected =
+                let mut projected =
                     crate::task_projection::project_task_get(&response_payload, operator_allowed);
+                let review_allowed = self
+                    .task_projection_action_allowed(
+                        request_context,
+                        Some(&response_payload.task.id),
+                        None,
+                        ResourceAction::TaskReview,
+                    )
+                    .await;
+                let cancel_allowed = self
+                    .task_projection_action_allowed(
+                        request_context,
+                        Some(&response_payload.task.id),
+                        None,
+                        ResourceAction::TaskCancel,
+                    )
+                    .await;
+                for review in &mut projected.review_required {
+                    review.allowed_actions = if review_allowed {
+                        if let Some(candidate) = response_payload
+                            .result_candidates
+                            .iter()
+                            .find(|candidate| candidate.id == review.candidate.id)
+                        {
+                            self.task_runtime
+                                .service()
+                                .candidate_review_actions(
+                                    Self::task_mutation_context(request_context),
+                                    candidate,
+                                )
+                                .await
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    if cancel_allowed {
+                        review
+                            .allowed_actions
+                            .push(pioneer_protocol::TaskWaitReviewAction::TaskCancel);
+                    }
+                    if !review
+                        .allowed_actions
+                        .contains(&pioneer_protocol::TaskWaitReviewAction::TaskRevise)
+                        && review.revision_blocked_reason.is_none()
+                    {
+                        review.revision_blocked_reason =
+                            Some(pioneer_protocol::TaskWaitRevisionBlockedReason::ReviewNotAllowed);
+                    }
+                }
                 let output = async {
                     let mut output = serde_json::to_value(&projected)?;
                     crate::task_tools::enrich_task_webhook_output(
@@ -1424,7 +1498,12 @@ impl MessageProcessor {
         };
         let connection_id = request_context.connection_id();
         let operator_allowed = self
-            .task_operator_projection_allowed(request_context, Some(params.task_id.as_str()), None)
+            .task_projection_action_allowed(
+                request_context,
+                Some(params.task_id.as_str()),
+                None,
+                ResourceAction::TaskReadOperator,
+            )
             .await;
         match self
             .task_runtime
@@ -1492,7 +1571,12 @@ impl MessageProcessor {
         };
         let connection_id = request_context.connection_id();
         let operator_allowed = self
-            .task_operator_projection_allowed(request_context, Some(params.task_id.as_str()), None)
+            .task_projection_action_allowed(
+                request_context,
+                Some(params.task_id.as_str()),
+                None,
+                ResourceAction::TaskReadOperator,
+            )
             .await;
         match self
             .task_runtime
@@ -2177,10 +2261,11 @@ impl MessageProcessor {
         let operator_task_id = params.task_id.clone();
         let operator_workspace_id = params.workspace_id.clone();
         let operator_allowed = self
-            .task_operator_projection_allowed(
+            .task_projection_action_allowed(
                 request_context,
                 operator_task_id.as_deref(),
                 Some(operator_workspace_id.as_str()),
+                ResourceAction::TaskReadOperator,
             )
             .await;
         let access = match self

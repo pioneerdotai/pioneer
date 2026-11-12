@@ -800,11 +800,22 @@ fn expand_skill_asset_placeholders(value: &str, skill_asset_root: &str) -> Strin
 
 /// Owns the real nested runtime result, preserving typed media and no-replay outcome.
 struct ForwardedToolOutput {
+    source_item: String,
     output: Box<dyn ToolOutput>,
     outcome: crate::ToolOutcome,
     parts: Vec<pioneer_provider::MessageContentPart>,
 }
 impl ToolOutput for ForwardedToolOutput {
+    fn retained_output_log(&self) -> bool {
+        self.output.retained_output_log()
+    }
+    fn retained_output_log_item(&self) -> Option<&str> {
+        self.retained_output_log().then(|| {
+            self.output
+                .retained_output_log_item()
+                .unwrap_or(&self.source_item)
+        })
+    }
     fn delivery_receipt(&self) -> Option<Arc<dyn crate::context::ToolDeliveryReceipt>> {
         self.output.delivery_receipt()
     }
@@ -887,6 +898,7 @@ impl ToolHandler for SkillFunctionProxyHandler {
             .into_chat_message()
             .content_parts;
         Ok(Box::new(ForwardedToolOutput {
+            source_item: nested.call_id,
             output: nested.output,
             outcome: nested.outcome,
             parts,

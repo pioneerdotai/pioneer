@@ -27,7 +27,7 @@ fn canonical_tool_rounds_keep_native_block_ids_and_object_inputs() {
             assert_eq!(input["metric"], true);
         } else { assert_eq!(input, serde_json::json!({})); }
         history.push(ChatMessage::assistant_tool_calls(None::<String>, response.tool_calls.clone()));
-        history.push(ChatMessage::tool_result(&call.id, &call.name, "ok"));
+        history.push(ChatMessage::tool_result(&call.id, &call.name, crate::providers::history_test_support::COMPACT_SHELL_RESULT));
         let prepared = prepare_messages_for_provider_model(provider.name(), "claude-sonnet-4-5", &provider.capabilities(), &history).unwrap();
         let (system, messages) = AnthropicProvider::prepare_messages(&prepared).unwrap();
         let wire = serde_json::to_value(ApiChatRequest {
@@ -47,6 +47,7 @@ fn canonical_tool_rounds_keep_native_block_ids_and_object_inputs() {
             if previous == round { assert_eq!(assistant["content"][0]["input"], input); }
             assert_eq!(result["role"], "user");
             assert_eq!(result["content"][0]["type"], "tool_result");
+            assert_eq!(result["content"][0]["content"], crate::providers::history_test_support::COMPACT_SHELL_RESULT);
             assert_eq!(result["content"][0]["tool_use_id"], assistant["content"][0]["id"]);
         }
     }

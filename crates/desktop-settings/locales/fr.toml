@@ -355,6 +355,13 @@ reason_cancelled = "L’exécution a été annulée."
 reason_unknown = "L’opération ne s’est pas terminée comme prévu. Consultez les journaux du gateway."
 
 [chat.composer.model]
+service_label = "Niveau de service"
+service_standard = "Standard"
+service_invalid = "Le niveau enregistré est indisponible. Choisissez Standard ou un autre mode."
+context_label = "Fenêtre de contexte"
+context_auto = "Auto — jusqu’à %{tokens} tokens"
+context_up_to = "Jusqu’à %{tokens} tokens"
+context_invalid = "Le choix enregistré est indisponible. Choisissez Auto ou une autre fenêtre."
 select_label = "Sélectionner le modèle"
 dialog_title = "Sélectionner le modèle"
 provider_label = "Fournisseur"

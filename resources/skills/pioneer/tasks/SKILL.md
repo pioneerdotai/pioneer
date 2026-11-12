@@ -3,7 +3,7 @@ name: tasks
 slug: tasks
 owner: pioneer
 description: "Use this skill when Pioneer should create, inspect, update, reschedule, pause, resume, finish, cancel, troubleshoot, or configure delivery for durable tasks, scheduled tasks, recurring tasks, interval tasks, cron jobs, background work, or existing task state."
-version: "0.1.3"
+version: "0.1.4"
 user-invocable: true
 disable-model-invocation: false
 implicit-invocation: required
@@ -32,7 +32,7 @@ Return the run result in the execution thread and let the configured delivery po
 
 ## Quick Start
 
-Before using durable task tools, decide what kind of task work this is.
+Before using durable task tools, decide what kind of task work this is. Normally set requireReview:false. Set true explicitly only when each result must wait for an authorized reviewer, for any trigger type.
 
 1. If work should run later or repeatedly, use `task_create` to create a scheduled, interval, or cron task with self-contained future-run instructions.
 2. If existing task behavior must change, inspect it first with `task_get` or `task_list`.
@@ -174,3 +174,28 @@ Do not invent a run result for a scheduled task that has not run yet.
 - Scheduled task instructions must be self-contained.
 - Do not claim a task was created, updated, paused, resumed, rescheduled, cancelled, or delivered unless the relevant tool succeeded.
 - A successful `task_finish` confirms the stop decision; report work completion and delivery only from their own observed state.
+
+## Review choice and later executions
+
+Use `requireReview:false` for ordinary task/subagent work; it is the default for
+all types and attachment modes, including scheduled, interval, cron and webhook.
+Set `requireReview:true` explicitly when each run result must wait for acceptance
+and may need same-worker revisions. The meaning does not depend on the trigger.
+Enabled review has no timeout acceptance. The saved policy supplies the revision
+budget (normally five); acceptance is final. Detaching a task or changing its
+schedule does not silently change its saved review choice.
+
+Later authorized executions in the same capsule can inspect and review saved
+workers under current grants, without creator/graph ownership or adoption.
+`task_get.reviewRequired` exposes current candidate references and available
+actions; read full content through `task_result(candidateId)` and all pages.
+For recurring/webhook work, decisions target the exact run and candidate, even
+when another run is queued or running. Read access does not require TaskReview;
+self-review, policy eligibility, finality and stale-candidate guards still apply.
+
+Background work without review defaults to origin_thread delivery. For
+`background:true` plus `requireReview:true`, omitted deliveryPolicy selects none;
+an explicit permitted policy wins. Results, errors and blocked/exhausted outcomes
+follow that same policy. None keeps results/history available without delivery.
+Scheduled work retains its existing delivery defaults and requires self-contained
+instructions and available Skills/MCP; capability inheritance is not promised.

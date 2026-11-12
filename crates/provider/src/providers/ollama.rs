@@ -1003,6 +1003,9 @@ impl crate::traits::Provider for OllamaProvider {
                 });
 
                 ProviderModelInfo {
+                    service_modes: None,
+                    context_authority: None,
+                    context_tiers: None,
                     id: id.clone(),
                     name: m.name,
                     description,
@@ -1056,6 +1059,35 @@ impl crate::traits::Provider for OllamaProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disclosed_tools_keep_prefix_in_serialized_payload() {
+        let render = |request: ChatRequest| {
+            let request = crate::tools::policy::prepare_request("ollama", request).unwrap();
+            let prepared = crate::attachments::prepare_messages_for_provider(
+                "ollama",
+                &OllamaProvider::new().capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            serde_json::to_value(
+                OllamaProvider::build_chat_request(&request, &prepared, false, None).unwrap(),
+            )
+            .unwrap()
+        };
+        let mut request = crate::tools::policy::test_request();
+        let before = render(request.clone());
+        let mut added = request.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        request.tools.as_mut().unwrap().push(added);
+        let body = render(request);
+        assert_eq!(
+            body["tools"][0], before["tools"][0],
+            "entire previously serialized definition must survive expansion"
+        );
+        assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(body["tools"][1]["function"]["name"], "alpha");
+    }
+
     #[test]
     fn native_think_selector_and_catalog_fallback_agree_with_discovery_and_both_wires() {
         use crate::{ReasoningConfig, ReasoningEffort};
@@ -1522,6 +1554,8 @@ mod tests {
     #[test]
     fn build_options_none_when_no_temperature() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "llama3".into(),
             messages: vec![ChatMessage::user("hi")],
             temperature: None,
@@ -1538,6 +1572,8 @@ mod tests {
     #[test]
     fn build_options_some_when_temperature_set() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "llama3".into(),
             messages: vec![ChatMessage::user("hi")],
             temperature: Some(0.5),

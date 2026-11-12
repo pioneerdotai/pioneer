@@ -308,6 +308,8 @@ async fn published_human_answer_prepares_root_once_and_next_cli_and_native_reuse
     );
     let events = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
     let context = NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: false,
         recovery_deadline_ms: None,
         workspace_id: harness.workspace_id.clone(),
@@ -324,6 +326,8 @@ async fn published_human_answer_prepares_root_once_and_next_cli_and_native_reuse
             .prepare(
                 &context,
                 ChatRequest {
+                    tool_declarations: None,
+                    service_mode: None,
                     model: "test-model".into(),
                     messages: vec![pioneer_provider::ChatMessage::user("uncovered-next-input")],
                     temperature: None,
@@ -628,6 +632,7 @@ async fn reviewed_task_in(
         mode: TaskAgentReviewMode::UserApproval,
         max_revision_rounds: 2,
         require_explicit_acceptance: true,
+        disable_timeout_acceptance: false,
         reviewers: vec![],
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
     });
@@ -1546,6 +1551,9 @@ async fn real_composer_native_start_preempts_background_owned_by_the_visible_roo
         .processor
         .apply_compaction_settings(pioneer_compaction::CompactionSettings {
             selection: Some(pioneer_compaction::ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 transport: pioneer_compaction::Transport::Api,
                 instance: "summary-capture".into(),
                 model: "test-model".into(),

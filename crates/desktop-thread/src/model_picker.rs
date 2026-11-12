@@ -263,6 +263,20 @@ impl ComposerModelPickerView {
                             model_trigger_label,
                             model_trigger_loading,
                         ));
+                    let form = if let Some(service) =
+                        Self::render_service_selector_section(state.clone())
+                    {
+                        form.child(service)
+                    } else {
+                        form
+                    };
+                    let form = if let Some(context) =
+                        Self::render_context_selector_section(state.clone())
+                    {
+                        form.child(context)
+                    } else {
+                        form
+                    };
                     if let Some(reasoning) = Self::render_reasoning_effort_selector_section(state) {
                         form.child(reasoning)
                     } else {
@@ -312,27 +326,17 @@ impl ComposerModelPickerView {
         if matches!(state.mode, ProviderModelSelectorMode::Transcription) {
             return Vec::new();
         }
-        let selector = &state.input.selector;
-        let Some(selected_model) = selector.selected_model() else {
-            return Vec::new();
-        };
-        let Some(model) = selector
-            .models()
-            .iter()
-            .find(|model| model.id.as_str() == selected_model)
-        else {
-            return Vec::new();
-        };
-        let selected_effort = &state.input.selected_reasoning_effort;
-        provider_presentation::reasoning_effort_rows_for_model(model, selected_effort.as_deref())
+        state.input.reasoning_rows.clone()
     }
 
     fn reasoning_effort_trigger_label(
         rows: &[provider_presentation::ReasoningEffortRow],
+        configured: Option<&str>,
     ) -> String {
         rows.iter()
             .find(|row| row.selected)
             .map(|row| row.label.clone())
+            .or_else(|| configured.map(str::to_owned))
             .unwrap_or_else(|| t!("chat.composer.model.reasoning_default").to_string())
     }
 
@@ -581,7 +585,132 @@ impl ComposerModelPickerView {
             )
     }
 
+    fn render_service_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
+        let rows = state.input.service_rows.clone();
+        if rows.is_empty() {
+            return None;
+        }
+        let mut choices = v_flex().gap_1().w_full();
+        if (state.input.selected_service_mode.is_some() && !rows.iter().any(|row| row.selected))
+            || rows.iter().any(|row| row.selected && !row.available)
+        {
+            choices = choices.child(
+                div()
+                    .text_sm()
+                    .child(t!("chat.composer.model.service_invalid").to_string()),
+            );
+        }
+        for row in rows {
+            let next = state.clone();
+            let id = row.id.clone();
+            let label = if id == "standard" {
+                t!("chat.composer.model.service_standard").to_string()
+            } else {
+                row.label
+            };
+            choices = choices.child(
+                default_outline_button(SharedString::from(format!("service-mode-{}", id)))
+                    .w_full()
+                    .label(label)
+                    .selected(row.selected)
+                    .disabled(!row.available)
+                    .on_click(move |_, _, cx| {
+                        next.send(
+                            ComposerModelPickerIntent::SelectServiceMode {
+                                identity: next.input.identity.clone(),
+                                id: id.clone(),
+                            },
+                            cx,
+                        );
+                    }),
+            );
+        }
+        Some(
+            field()
+                .label(t!("chat.composer.model.service_label").to_string())
+                .child(choices),
+        )
+    }
+
+    fn render_context_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
+        let rows = state.input.context_rows.clone();
+        if rows.is_empty() {
+            return None;
+        }
+        let invalid =
+            state.input.selected_context_window.is_some() && !rows.iter().any(|row| row.selected);
+        let mut choices = v_flex().gap_1().w_full();
+        if invalid {
+            choices = choices.child(
+                div()
+                    .text_sm()
+                    .child(t!("chat.composer.model.context_invalid").to_string()),
+            );
+        }
+        for row in rows {
+            let next = state.clone();
+            let window = row.window;
+            let label = if window.is_none() {
+                t!(
+                    "chat.composer.model.context_auto",
+                    tokens = row.tokens.to_string()
+                )
+                .to_string()
+            } else {
+                t!(
+                    "chat.composer.model.context_up_to",
+                    tokens = row.tokens.to_string()
+                )
+                .to_string()
+            };
+            choices = choices.child(
+                default_outline_button(SharedString::from(format!(
+                    "context-window-{}",
+                    window.map_or_else(|| "auto".into(), |v| v.to_string())
+                )))
+                .w_full()
+                .label(label)
+                .selected(row.selected)
+                .on_click(move |_, _, cx| {
+                    next.send(
+                        ComposerModelPickerIntent::SelectContextWindow {
+                            identity: next.input.identity.clone(),
+                            window,
+                        },
+                        cx,
+                    );
+                }),
+            );
+        }
+        Some(
+            field()
+                .label(t!("chat.composer.model.context_label").to_string())
+                .child(choices),
+        )
+    }
+
     fn render_reasoning_effort_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
+        if state.input.default_reasoning_only {
+            let next = state.clone();
+            return Some(
+                field()
+                    .label(t!("chat.composer.model.reasoning_label").to_string())
+                    .child(
+                        default_outline_button("service-default-reasoning")
+                            .label(t!("chat.composer.model.reasoning_default").to_string())
+                            .selected(state.input.selected_reasoning_effort.is_none())
+                            .on_click(move |_, _, cx| {
+                                next.send(
+                                    ComposerModelPickerIntent::SelectReasoningEffort {
+                                        identity: next.input.identity.clone(),
+                                        effort: None,
+                                    },
+                                    cx,
+                                );
+                            }),
+                    ),
+            );
+        }
         let rows = Self::reasoning_effort_rows(&state);
         if rows.is_empty() {
             return None;
@@ -589,7 +718,10 @@ impl ComposerModelPickerView {
 
         let reasoning_trigger_width_px = state.reasoning_trigger_width_px.clone();
         let owner = state.owner.clone();
-        let trigger_label = Self::reasoning_effort_trigger_label(rows.as_slice());
+        let trigger_label = Self::reasoning_effort_trigger_label(
+            rows.as_slice(),
+            state.input.selected_reasoning_effort.as_deref(),
+        );
 
         Some(
             field()
@@ -1236,6 +1368,9 @@ mod lifecycle_tests {
                 .clone();
             trigger.focus(window, cx);
             let input = Arc::new(ComposerModelPickerPublication {
+                context_rows: vec![],
+                service_rows: vec![],
+                default_reasoning_only: false,
                 identity: ComposerOperationIdentity {
                     thread_id: "a".into(),
                     draft_id: draft.draft_id(),
@@ -1244,6 +1379,9 @@ mod lifecycle_tests {
                 revision: 1,
                 selector: ProviderModelSelectorState::new(None, None),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
                 deferred: true,
                 closed: false,
                 providers_request: Default::default(),

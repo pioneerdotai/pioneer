@@ -261,6 +261,9 @@ mod tests {
         let principal = crate::session::test_support::authenticated_test_superuser();
         let thread_id = "thread_authority_integrity";
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "workspace_authority_integrity".to_owned(),
             id: thread_id.to_owned(),
             name: None,

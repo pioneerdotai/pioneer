@@ -1225,6 +1225,9 @@ mod tests {
             [serde_json::to_string(&state).unwrap().into()],
         )).await.unwrap();
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "p".into(),
             model: "m".into(),
@@ -1431,6 +1434,8 @@ mod tests {
         }
         cancellation.cancel();
         worker.await;
+        // Pool acquisition uses real SQLite worker I/O after the virtual-time proof.
+        tokio::time::resume();
         let pending = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
             "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id LIKE 'protected-%' AND pending=1 AND retry_at=0")).await.unwrap().unwrap();
         assert_eq!(pending.try_get::<i64>("", "n").unwrap(), 7);

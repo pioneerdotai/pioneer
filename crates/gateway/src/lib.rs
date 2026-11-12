@@ -467,13 +467,15 @@ async fn run_gateway_until_shutdown_inner(
         crud_store.clone(),
     )));
 
-    let provider_timeout_policy = ProviderTimeoutPolicy::from_secs(
+    let mut provider_timeout_policy = ProviderTimeoutPolicy::from_secs(
         config.gateway.provider.connect_timeout_secs,
         config.gateway.provider.first_chunk_timeout_secs,
         config.gateway.provider.inter_chunk_idle_timeout_secs,
         config.gateway.provider.non_stream_request_timeout_secs,
         config.gateway.provider.max_stream_duration_secs,
     );
+    provider_timeout_policy.use_default_flex_timeouts =
+        config.gateway.provider.use_default_flex_timeouts;
 
     let provider_registry = Arc::new(
         ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
@@ -1334,9 +1336,6 @@ fn task_runtime_config_from_gateway_tasks_config(config: &GatewayTasksConfig) ->
         review: TaskReviewRuntimeConfig {
             enabled: config.review.enabled,
             allow_task_create_review_policy: config.review.allow_task_create_review_policy,
-            default_parent_review_for_immediate_attached_agent_tasks: config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks,
             default_max_revision_rounds: config.review.default_max_revision_rounds,
             auto_accept_after_seconds: config.review.auto_accept_after_seconds,
         },
@@ -1830,11 +1829,6 @@ mod runtime_tests {
 
         assert!(runtime_config.review.enabled);
         assert!(!runtime_config.review.allow_task_create_review_policy);
-        assert!(
-            runtime_config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(runtime_config.review.default_max_revision_rounds, 5);
         assert_eq!(runtime_config.review.auto_accept_after_seconds, 300);
     }

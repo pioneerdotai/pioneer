@@ -17,16 +17,55 @@ pub(super) struct ApiEmbeddingUsage(crate::usage::ChatUsage);
 /// Actual indexed float response schema shared by both implemented endpoints.
 #[derive(Debug, Deserialize)]
 pub struct IndexedEmbeddingResponse {
+    #[serde(default)]
+    pub(super) model: Option<String>,
     pub(super) data: Vec<ApiEmbeddingData>,
     #[serde(default)]
     pub(super) usage: Option<ApiEmbeddingUsage>,
 }
 impl IndexedEmbeddingResponse {
     pub fn into_response(self, expected_count: usize) -> Result<crate::types::EmbeddingResponse> {
-        Ok(crate::types::EmbeddingResponse {
-            embeddings: ordered_vectors(self.data, expected_count)?,
-            usage: self.usage.map(Into::into),
-        })
+        let mut usage = self.usage.map(TokenUsage::from);
+        if self.model.is_some() {
+            let observed = usage.get_or_insert_with(Default::default);
+            *observed = observed.clone().with_reported_model(self.model.as_deref());
+        }
+        let embeddings = ordered_vectors(self.data, expected_count).map_err(|error| {
+            if let Some(usage) = &usage {
+                crate::usage::with_error_usage(error, usage)
+            } else {
+                error
+            }
+        })?;
+        Ok(crate::types::EmbeddingResponse { embeddings, usage })
+    }
+}
+
+pub(super) fn with_request_id(
+    result: Result<crate::types::EmbeddingResponse>,
+    request_id: Option<String>,
+) -> Result<crate::types::EmbeddingResponse> {
+    match result {
+        Ok(mut response) => {
+            if request_id.is_some() {
+                response
+                    .usage
+                    .get_or_insert_with(Default::default)
+                    .request_id = request_id;
+            }
+            Ok(response)
+        }
+        Err(error) => {
+            if request_id.is_some() {
+                let mut usage = crate::usage::error_usage(&error)
+                    .cloned()
+                    .unwrap_or_default();
+                usage.request_id = request_id;
+                Err(crate::usage::with_error_usage(error, &usage))
+            } else {
+                Err(error)
+            }
+        }
     }
 }
 
@@ -302,6 +341,19 @@ mod tests {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(ordered_vectors(vec![item(0, vec![bad])], 1).is_err());
         }
+    }
+
+    #[test]
+    fn vector_validation_failure_retains_received_numeric_usage() {
+        let response: IndexedEmbeddingResponse = serde_json::from_value(serde_json::json!({
+            "data":[{"index":1,"embedding":[0.5]}],"usage":{"prompt_tokens":7,"total_tokens":7}
+        }))
+        .unwrap();
+        let error = response.into_response(1).unwrap_err();
+        let usage = crate::usage::error_usage(&error)
+            .expect("paid input was received before vector validation");
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(0));
     }
 
     #[test]

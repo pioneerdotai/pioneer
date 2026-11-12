@@ -1173,6 +1173,7 @@ async fn restore_task_agent_action_binding(
                 allowed_actions: allowed_action_names,
                 agent_authorization_fingerprint: authorization_fingerprint,
                 child_launch_grant: _,
+                ..
             } = serde_json::from_str(grant_json).context("Task resolved launch grant is invalid")?;
             let identity = super::agent_action_tools::current_saved_launch_identity(
                 processor,
@@ -2145,6 +2146,9 @@ impl TaskAgentExecutor {
             .unwrap_or_default();
         let is_composer_service_turn = composer_launch.is_some();
         let turn_params = composer_launch.unwrap_or_else(|| TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: child_thread_id.clone(),
             turn_id: child_turn_id.clone(),
@@ -2186,8 +2190,12 @@ impl TaskAgentExecutor {
                 agent_spec,
                 child_permission_profile.clone(),
                 effective_model_provider.as_str(),
+                effective_model.model.as_str(),
+                turn_params.context_window,
+                turn_params.context_authority.as_deref(),
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
+                true,
             )
             .await
             .context("failed to resolve hidden task execution security")?,
@@ -2249,6 +2257,7 @@ impl TaskAgentExecutor {
             parent.clone(),
             &occurrence_permission_profile,
             &occurrence_authorization,
+            cli_runtime_backend.is_none(),
         )
         .await?;
         let parent = &resolved_parent;
@@ -2285,8 +2294,12 @@ impl TaskAgentExecutor {
                         agent_spec,
                         child_permission_profile.clone(),
                         effective_model_provider.as_str(),
+                        effective_model.model.as_str(),
+                        turn_params.context_window,
+                        turn_params.context_authority.as_deref(),
                         child_thread_id.as_str(),
                         child_turn_id.as_str(),
+                        true,
                     )
                     .await?
                 }
@@ -3473,6 +3486,9 @@ impl TaskAgentExecutor {
             let task_run_id = run.id.clone();
             let execution_id = execution.id.clone();
             let prepare_params = TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: child_thread_id.clone(),
                 turn_id: child_turn_id.clone(),
@@ -3562,6 +3578,9 @@ impl TaskAgentExecutor {
             .thread_manager
             .agent_turn_start_with_permission_profile(
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: child_runtime.task_run_turn.thread_id.clone(),
                     turn_id: child_runtime.task_run_turn.turn_id.clone(),
@@ -3686,8 +3705,12 @@ impl TaskAgentExecutor {
                 .thread
                 .model_provider
                 .as_str(),
+            &thread_outcome.started_notification.thread.model,
+            None,
+            None,
             child_thread_id.as_str(),
             child_turn_id.as_str(),
+            true,
         )
         .await
         {
@@ -4557,6 +4580,9 @@ impl TaskAgentExecutor {
             .await
             .context("failed to load restored task turn input")?;
         let turn_start_params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: child_runtime.task_run_turn.thread_id.clone(),
             turn_id: child_runtime.task_run_turn.turn_id.clone(),
@@ -5995,8 +6021,12 @@ impl TaskAgentExecutor {
                     &reviewer_agent_spec,
                     reviewer_permission_profile.clone(),
                     effective_model.model_provider.as_str(),
+                    effective_model.model.as_str(),
+                    None,
+                    None,
                     task_run_turn.thread_id.as_str(),
                     task_run_turn.turn_id.as_str(),
+                    true,
                 )
                 .await
                 .context("failed to resolve reviewer execution security")?
@@ -6123,6 +6153,9 @@ impl TaskAgentExecutor {
             let prepared = processor
                 .prepare_task_cli_runtime_turn(
                     TurnStartParams {
+                        service_mode: None,
+                        context_authority: None,
+                        context_window: None,
                         agent_delegation_routes: Vec::new(),
                         thread_id: task_run_turn.thread_id.clone(),
                         turn_id: task_run_turn.turn_id.clone(),
@@ -6182,6 +6215,9 @@ impl TaskAgentExecutor {
             .thread_manager
             .agent_turn_start_with_permission_profile(
                 TurnStartParams {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     agent_delegation_routes: Vec::new(),
                     thread_id: task_run_turn.thread_id.clone(),
                     turn_id: task_run_turn.turn_id.clone(),
@@ -8904,6 +8940,8 @@ mod prepared_snapshot_tests {
         let request = |messages| {
             pioneer_agent::compaction::request::NativeRequestProjection::full(
                 pioneer_provider::ChatRequest {
+                    tool_declarations: None,
+                    service_mode: None,
                     model: "gpt-4".into(),
                     messages,
                     temperature: None,
@@ -9112,6 +9150,7 @@ async fn ensure_task_run_occurrence_context(
     mut parent: TaskParentRuntimeContext,
     permission_profile: &TurnPermissionProfileSnapshot,
     occurrence_authorization: &crate::authorization::ExecutionAuthorizationContext,
+    capture_native_context: bool,
 ) -> Result<TaskParentRuntimeContext> {
     scope_current_stage(Stage::ChildOccurrence, async {
         let Some(origin) = task_run_occurrence_origin(task_response, run) else {
@@ -9143,8 +9182,12 @@ async fn ensure_task_run_occurrence_context(
             agent_spec,
             permission_profile.clone(),
             effective_model.model_provider.as_str(),
+            effective_model.model.as_str(),
+            None,
+            None,
             parent.parent_thread_id.as_str(),
             run.id.as_str(),
+            capture_native_context,
         )
         .await
         .with_context(|| {
@@ -10433,8 +10476,12 @@ async fn resolve_task_child_execution_security_snapshot(
     agent_spec: &TaskAgentSpec,
     child_permission_profile: TurnPermissionProfileSnapshot,
     effective_model_provider: &str,
+    effective_model: &str,
+    manual_window: Option<u64>,
+    manual_authority: Option<&str>,
     child_thread_id: &str,
     child_turn_id: &str,
+    capture_native_context: bool,
 ) -> Result<TurnExecutionSecuritySnapshot> {
     scope_current_stage(Stage::ChildSecurity, async {
         let security_cap = agent_spec.security_cap.as_ref().ok_or_else(|| {
@@ -10473,6 +10520,85 @@ async fn resolve_task_child_execution_security_snapshot(
             child_turn_id.to_owned(),
             now_timestamp_secs().saturating_mul(1000),
         )?;
+        if capture_native_context {
+            let provider = processor
+                .provider_registry
+                .get_or_create_for_workspace(workspace_id, effective_model_provider)?;
+            crate::compaction::native_budget::validate_manual_authority(
+                provider.as_ref(),
+                effective_model,
+                manual_window,
+                manual_authority,
+            )?;
+            let frozen = processor
+                .crud_store
+                .get_task_actor_contract(&agent_spec.task_id)
+                .await?
+                .and_then(|contract| contract.derived_child_launch_grant_json)
+                .map(|json| {
+                    serde_json::from_str::<pioneer_protocol::TaskDerivedChildLaunchGrant>(&json)
+                })
+                .transpose()?;
+            let (working, summary) = match frozen {
+                Some(pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+                    native_context,
+                    native_summary,
+                    ..
+                }) => (native_context, native_summary),
+                None => (None, None),
+            };
+            let working = working
+                .filter(|budget| {
+                    budget.instance == effective_model_provider && budget.model == effective_model
+                })
+                .or_else(|| {
+                    parent_snapshot.native_context.clone().filter(|budget| {
+                        budget.instance == effective_model_provider
+                            && budget.model == effective_model
+                    })
+                });
+            let summary = summary.or_else(|| parent_snapshot.native_summary.clone());
+            snapshot.native_context = Some(match working {
+                Some(budget) => {
+                    anyhow::ensure!(
+                        budget.authority.as_deref() == provider.authority_fingerprint(),
+                        "Task context authority changed; create a new user-authorized launch"
+                    );
+                    budget
+                }
+                None => {
+                    crate::compaction::native_budget::capture(
+                        provider.as_ref(),
+                        effective_model_provider,
+                        effective_model,
+                        manual_window,
+                    )
+                    .await?
+                }
+            });
+            snapshot.native_summary = match summary {
+                Some(summary) if !summary.inherits_working => Some(summary),
+                Some(mut summary) => {
+                    summary.budget = snapshot
+                        .native_context
+                        .as_ref()
+                        .expect("captured task budget")
+                        .clone();
+                    Some(summary)
+                }
+                _ => {
+                    crate::compaction::native_budget::capture_summary(
+                        processor,
+                        workspace_id,
+                        snapshot
+                            .native_context
+                            .as_ref()
+                            .expect("captured task budget"),
+                    )
+                    .await?
+                }
+            };
+        }
         processor.add_native_turn_runtime_sandbox_roots(
             &mut snapshot,
             workspace_id,
@@ -14041,7 +14167,7 @@ mod tests {
         };
         let policy = TaskAgentReviewPolicy {
             mode: pioneer_protocol::TaskAgentReviewMode::ParentAgentWithReviewers, max_revision_rounds: 1,
-            require_explicit_acceptance: true, reviewers: vec![reviewer.clone()],
+            require_explicit_acceptance: true, disable_timeout_acceptance: false, reviewers: vec![reviewer.clone()],
             resolution_strategy: pioneer_protocol::TaskResultReviewResolutionStrategy::RequireAllRequiredReviewersThenParent,
         };
         response.agent_specs[0].review_policy = Some(policy.clone());

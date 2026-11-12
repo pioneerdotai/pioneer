@@ -1065,6 +1065,30 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             "thread_history_event_payload.json",
             ThreadHistoryEventPayload
         ),
+        schema_doc!(
+            "execution_reconcile_params.json",
+            crate::ExecutionReconcileParams
+        ),
+        schema_doc!(
+            "workspace_execution_reconcile_params.json",
+            crate::WorkspaceExecutionReconcileParams
+        ),
+        schema_doc!(
+            "workspace_execution_observability_response.json",
+            crate::WorkspaceExecutionObservabilityResponse
+        ),
+        schema_doc!(
+            "workspace_execution_observability_params.json",
+            crate::WorkspaceExecutionObservabilityParams
+        ),
+        schema_doc!(
+            "execution_observability_params.json",
+            crate::ExecutionObservabilityParams
+        ),
+        schema_doc!(
+            "execution_observability_response.json",
+            crate::ExecutionObservabilityResponse
+        ),
         schema_doc!("thread_timeline_page_params.json", ThreadTimelinePageParams),
         schema_doc!(
             "thread_timeline_page_response.json",

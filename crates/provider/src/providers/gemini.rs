@@ -1218,6 +1218,9 @@ fn provider_model_from_gemini_model_entry(m: GeminiModelEntry) -> ProviderModelI
     let reasoning = gemini_reasoning_capabilities_for_model_entry(&m);
 
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: id.clone(),
         name: m.display_name,
         description: m.description,
@@ -1327,6 +1330,29 @@ fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disclosed_tools_keep_prefix_in_serialized_payload() {
+        let render = |request: ChatRequest| {
+            serde_json::to_value(GeminiProvider::build_request_result(&request).unwrap()).unwrap()
+        };
+        let mut request = crate::tools::policy::test_request();
+        let before = render(request.clone());
+        let mut added = request.tools.as_ref().unwrap()[0].clone();
+        added.name = "alpha".into();
+        request.tools.as_mut().unwrap().push(added);
+        let body = render(request);
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0],
+            before["tools"][0]["functionDeclarations"][0],
+            "entire previously serialized definition must survive expansion"
+        );
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["name"],
+            "lookup"
+        );
+        assert_eq!(body["tools"][0]["functionDeclarations"][1]["name"], "alpha");
+    }
+
     #[tokio::test]
     async fn native_closed_levels_and_boolean_control_arbitrary_generate_content_model() {
         let id = "quartz-custom-787";
@@ -1610,7 +1636,7 @@ mod tests {
     fn usage_prompt_includes_cached_content_once() {
         let response: super::ApiGenerateResponse = serde_json::from_value(serde_json::json!({
             "candidates":[], "usageMetadata": {"promptTokenCount":140,
-                "cachedContentTokenCount":100,"candidatesTokenCount":9}
+                "cachedContentTokenCount":100,"candidatesTokenCount":9,"thoughtsTokenCount":0}
         }))
         .unwrap();
         let usage = super::GeminiProvider::extract_usage(&response).unwrap();
@@ -1654,6 +1680,8 @@ mod tests {
             ambiguous_input_aliases: vec![],
         });
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gemini-target".into(),
             messages: vec![message],
             temperature: None,
@@ -1724,6 +1752,8 @@ mod tests {
             )),
         );
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gemini-3-flash-preview".to_owned(),
             messages: vec![
                 message,
@@ -1850,6 +1880,8 @@ mod tests {
     #[test]
     fn build_request_separates_system_messages() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
                 ChatMessage::system("Be helpful"),
@@ -1889,6 +1921,8 @@ mod tests {
     #[test]
     fn build_request_no_system_message() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,
@@ -1911,6 +1945,8 @@ mod tests {
     #[test]
     fn build_request_multiple_system_messages() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
                 ChatMessage::system("Rule 1"),
@@ -1937,6 +1973,8 @@ mod tests {
     #[test]
     fn build_request_uses_compiled_prompt_sections_in_order() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
                 ChatMessage::system("legacy prompt should be ignored"),
@@ -1949,6 +1987,7 @@ mod tests {
             parallel_tool_calls: None,
             reasoning: None,
             compiled_prompt: Some(CompiledPromptPayload {
+                observation_manifest: None,
                 stable_system_text: "Stable rules".to_owned(),
                 dynamic_system_text: "Dynamic runtime".to_owned(),
                 boundary_marker: "<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->".to_owned(),
@@ -1972,6 +2011,8 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gemini-2.0-flash".into(),
             messages: vec![
                 ChatMessage::system("You are helpful"),
@@ -2009,6 +2050,8 @@ mod tests {
                 "thinkingLevelMap":{"high":"HIGH","xhigh":"XHIGH"}}),
         );
         let mut request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: id.into(),
             messages: vec![ChatMessage::user("Hello")],
             temperature: None,

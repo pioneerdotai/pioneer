@@ -1250,16 +1250,32 @@ pub(crate) async fn compress_history_payloads_for_test(store: &CrudStore) -> Res
         if !compression_is_enabled(&db, config, None).await? {
             enable_transparent_compression(&db, config).await?;
         }
+        // Concurrent task completion can append history during this fixture.
+        // Compress the finite prefix present now, rather than require a live
+        // table to stay empty between the final batch and the drain assertion.
+        let high_water = query_i64(
+            &db,
+            &format!(
+                "SELECT COALESCE(MAX(rowid), 0) AS value FROM {}",
+                config.backing_table
+            ),
+            "failed to capture physical fixture compression boundary",
+        )
+        .await?;
+        let mut drained = false;
         for _ in 0..32 {
             // Pre-policy physical-format fixture, including active history.
             // Production admission is exercised by the actual worker tests.
-            let rows = db.query_all_raw(Statement::from_string(DbBackend::Sqlite, format!(
-                "SELECT rowid AS zstd_rowid,id,payload FROM {} WHERE {} IS NULL ORDER BY rowid LIMIT 32",
+            let rows = db.query_all_raw(Statement::from_sql_and_values(DbBackend::Sqlite, format!(
+                "SELECT rowid AS zstd_rowid,id,payload FROM {} WHERE {} IS NULL AND rowid <= ? ORDER BY rowid LIMIT 32",
                 config.backing_table, config.dict_column,
-            ))).await?.into_iter().map(|row| Ok(PendingPayloadRow {
+            ), [high_water.into()])).await?.into_iter().map(|row| Ok(PendingPayloadRow {
                 rowid: row.try_get("", "zstd_rowid")?, id: row.try_get("", "id")?, payload: row.try_get("", "payload")?,
             })).collect::<Result<Vec<_>>>()?;
             if rows.is_empty() {
+                // This read proves the prefix was drained. A later write can
+                // legitimately make an existing row uncompressed again.
+                drained = true;
                 break;
             }
             let prepared = prepare_payload_rows(rows, 3, None)?;
@@ -1273,17 +1289,18 @@ pub(crate) async fn compress_history_payloads_for_test(store: &CrudStore) -> Res
             tx.commit().await?;
         }
         anyhow::ensure!(
-            query_i64(
+            drained || query_i64(
                 &db,
                 &format!(
-                    "SELECT COUNT(*) AS value FROM {} WHERE {} IS NULL",
+                    "SELECT COUNT(*) AS value FROM {} WHERE {} IS NULL AND rowid <= {high_water}",
                     config.backing_table, config.dict_column
                 ),
                 "legacy physical fixture must drain"
             )
             .await?
                 == 0,
-            "test compression exceeded its bounded fixture size"
+            "test compression did not drain {} through rowid {high_water}",
+            config.label()
         );
     }
     Ok(total)

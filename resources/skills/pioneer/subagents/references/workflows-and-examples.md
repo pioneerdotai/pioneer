@@ -29,6 +29,7 @@ Create all three first, then wait for the next actionable result:
 ```json
 {
   "title": "Memory extraction investigation",
+  "requireReview": false,
   "goal": "Find how post-turn extraction turns completed turns into durable memory write candidates.",
   "agentRole": "researcher",
   "instructions": [
@@ -52,7 +53,7 @@ Then:
 }
 ```
 
-Review every returned candidate immediately. Accept evidence-backed results, revise incomplete results, or cancel unusable work. Then call `task_wait` again with the remaining active `runIds`. Repeat until all three runs are resolved, then synthesize one parent answer.
+Inspect each completed result and call task_wait again for remaining active runs. These examples use requireReview:false, so no task_accept is needed. To require formal acceptance and same-worker corrections, select requireReview:true at creation and then handle each review-required candidate with accept/revise. Synthesize the inspected results into one parent answer.
 
 ## Independent Review Subagent
 
@@ -63,6 +64,7 @@ Child task:
 ```json
 {
   "title": "Review memory prompt rewrite",
+  "requireReview": false,
   "goal": "Review the edited memory prompt for incorrect semantics or missing safety constraints.",
   "agentRole": "reviewer",
   "instructions": [
@@ -79,7 +81,7 @@ Do not pass your intended conclusion. The point is independent validation.
 
 ## Parent Synthesis After Subagents
 
-When all attached child work is accepted, do not paste raw child outputs blindly. Integrate them.
+When all attached child work is complete and its results have been inspected, do not paste raw child outputs blindly. Integrate them.
 
 Good synthesis:
 
@@ -101,7 +103,7 @@ unless the user asked for an audit trail.
 
 ## Revision Workflow
 
-When a candidate is close but incomplete:
+Select requireReview:true when creating work that needs this lifecycle. With false, completed work cannot be reopened through task_revise. When a pending candidate is close but incomplete:
 
 1. Identify the missing requirement.
 2. Request revision with precise feedback.

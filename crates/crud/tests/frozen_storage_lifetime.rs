@@ -1917,8 +1917,9 @@ async fn task_event_pending_index_fresh_upgrade_down_reapply() {
         } else {
             (store, connection)
         };
-        // Later registered migrations can install their own triggers. The
-        // isolated target rollback/reapply must preserve this complete set.
+        // Snapshot the installed schema after the registered upgrade suffix.
+        // Later migrations may add their own triggers; down/reapply of this
+        // index migration must preserve all of them exactly.
         let triggers = connection
             .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,

@@ -226,3 +226,5 @@ pub mod task_child_reconcile_pending;
 pub mod task_child_reconcile_scope;
 
 pub mod agent_memory_payloads;
+pub mod execution_observation;
+pub mod execution_tariff;

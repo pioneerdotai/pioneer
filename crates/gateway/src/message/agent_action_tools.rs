@@ -5287,6 +5287,9 @@ impl AgentActionToolHandler {
             ToolError::internal(format!("failed to encode child authority: {error:#}"))
         })?;
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
@@ -6052,6 +6055,9 @@ impl AgentActionToolHandler {
             return Err(ToolError::execution_failed("agent_runtime_integrity_lost"));
         }
         let thread = pioneer_protocol::Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: self.context.workspace_id.clone(),
             id: thread_id.clone(),
             name: None,
@@ -6294,6 +6300,9 @@ impl AgentActionToolHandler {
             &format!("agent-message-turn\0{}", plan.projection.action_id),
         );
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: thread_id.clone(),
             turn_id,
@@ -6440,64 +6449,6 @@ impl AgentActionToolHandler {
             ),
         }
     }
-}
-
-pub(crate) async fn authorize_task_observations(
-    processor: &MessageProcessor,
-    execution_id: &AgentExecutionId,
-    root_execution_id: &AgentExecutionId,
-    task_ids: &[String],
-) -> Result<(), ToolError> {
-    if task_ids.is_empty()
-        || task_ids.len() > 64
-        || task_ids
-            .iter()
-            .any(|task_id| task_id.len() != 21 || task_id.trim() != task_id)
-        || task_ids.iter().collect::<BTreeSet<_>>().len() != task_ids.len()
-    {
-        return Err(ToolError::invalid_arguments(
-            AgentPublicOutcome::AgentActionNotAllowed.as_str(),
-        ));
-    }
-    for task_id in task_ids {
-        let contract = processor
-            .crud_store
-            .get_task_actor_contract(task_id.as_str())
-            .await
-            .map_err(|_| {
-                ToolError::execution_failed("task is unavailable for the current execution")
-            })?
-            .ok_or_else(|| {
-                ToolError::execution_failed("task is unavailable for the current execution")
-            })?;
-        let exact_creator = matches!(
-            &contract.creator,
-            PersistedActorRef::AgentExecution(creator) if creator == execution_id
-        );
-        let same_graph =
-            contract.work_graph_root_execution_id.as_deref() == Some(root_execution_id.as_str());
-        let owns_occurrence = if exact_creator || same_graph {
-            false
-        } else {
-            processor
-                .crud_store
-                .task_occurrence_matches_execution_or_graph(
-                    task_id.as_str(),
-                    execution_id.as_str(),
-                    root_execution_id.as_str(),
-                )
-                .await
-                .map_err(|_| {
-                    ToolError::execution_failed("task is unavailable for the current execution")
-                })?
-        };
-        if !exact_creator && !same_graph && !owns_occurrence {
-            return Err(ToolError::execution_failed(
-                "task is unavailable for the current execution",
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn adapter_tool_error(error: AgentToolAdapterError) -> ToolError {

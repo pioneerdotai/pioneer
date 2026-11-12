@@ -124,6 +124,10 @@ jobs:
           set -euo pipefail
           # Keep the runner's official Ubuntu fallbacks; its Azure mirror stalled CI.
           sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          # Prefer the official archive: the kernel mirror stalled index downloads.
+          # Keep an independent DNS fallback and the runner's remaining signed mirrors.
+          printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://mirrors.edge.kernel.org/ubuntu/\tpriority:2\n' | \
+            sudo tee -a /etc/apt/apt-mirrors.txt > /dev/null
           apt_options=(
             -o Acquire::Retries=3
             -o Acquire::http::Timeout=30
@@ -183,7 +187,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo nextest archive --locked --workspace --features pioneer-cli/computer-use \
+          # Archive compilation has exited with SIGTERM without a Cargo error.
+          # Record runner capacity and preserve the original command's exit status.
+          archive_resources() {
+            df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+            free -m
+            if [[ -r /sys/fs/cgroup/memory.events ]]; then
+              cat /sys/fs/cgroup/memory.events
+            fi
+          }
+          archive_exit() {
+            archive_status=$?
+            trap - EXIT
+            set +e
+            echo "Archive exit status: $archive_status"
+            archive_resources
+            exit "$archive_status"
+          }
+          trap archive_exit EXIT
+          archive_resources
+          /usr/bin/time -v cargo nextest archive --locked --workspace --features pioneer-cli/computer-use \
             --archive-file "$RUNNER_TEMP/nextest-tests.tar.zst"
 
       - name: upload-workspace-tests
