@@ -564,28 +564,37 @@ async fn startup_success_owns_one_process_and_prompt_failure_does_not_respawn() 
 }
 
 #[tokio::test]
-async fn startup_cleanup_failure_stops_sqlite_retries_when_descendant_holds_stderr() {
-    let mut fixture = StartupFixture::new(
-        "(exec 1>&-; sleep 30) &\necho $! > descendant\necho 'SQLiteError: database is locked' >&2\nexit 7",
-        "ready",
-    )
-    .await;
-    fixture.instance.startup_probe_timeout_ms = 400;
-    let error = fixture.start().await.err().unwrap();
+async fn startup_cleanup_deadline_stops_sqlite_retries_after_busy_exit() {
+    let fixture = StartupFixture::new(BUSY, "ready").await;
+    let gate = PhaseGate::new(StartupPhase::GroupCleanupConfirmed, 1);
+    let budget = Duration::from_millis(fixture.instance.startup_probe_timeout_ms);
+    let future = PHASE_GATE.scope(gate.clone(), fixture.start());
+    tokio::pin!(future);
+    tokio::select! {
+        result = &mut future => panic!("startup finished before the cleanup checkpoint: {}", result.is_ok()),
+        entered = tokio_timeout(Duration::from_secs(3), gate.entered.notified()) => entered.unwrap()
+    }
+    assert_eq!(fixture.starts().len(), 1);
+    fixture.assert_stopped();
+    // Holding stderr open does not guarantee a cleanup failure: termination
+    // signals descendants before joining the reader. Instead, hold the existing
+    // cleanup checkpoint until its deadline expires, after the real child exits.
+    tokio::time::pause();
+    tokio::time::advance(budget).await;
+    tokio::time::resume();
+    let error = future.await.err().unwrap();
     let failure = error.downcast_ref::<OpenCodeStartupFailure>().unwrap();
+    assert_eq!(failure.stage, OpenCodeStartupStage::AddressEof);
+    assert_eq!(failure.status.unwrap().code(), Some(7));
+    assert!(failure.sqlite_busy);
     assert!(failure.cleanup_error.is_some());
     assert_eq!(fixture.starts().len(), 1);
-    fixture.wait_stopped().await;
-    let descendant: i32 = std::fs::read_to_string(fixture.root.path().join("descendant"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let owner = fixture.startup.session().expect("retained startup owner");
     assert_eq!(
-        unsafe { libc::kill(descendant, 0) },
-        -1,
-        "descendant survived cleanup"
+        owner.close().await.unwrap_err().to_string(),
+        failure.cleanup_error.as_deref().unwrap()
     );
+    fixture.wait_stopped().await;
 }
 
 #[tokio::test]
