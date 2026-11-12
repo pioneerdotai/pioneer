@@ -908,6 +908,7 @@ async fn compiled_prompt_tool_controls_and_responses_generation_policy() {
                     req.tool_choice = Some(choice.clone());
                     req.messages[0] = ChatMessage::user("turn-facts-2026-11-02\ntest");
                     req.compiled_prompt = Some(crate::CompiledPromptPayload {
+                        observation_manifest: None,
                         stable_system_text: "compiled".into(),
                         dynamic_system_text: String::new(),
                         boundary_marker: String::new(),

@@ -6765,6 +6765,7 @@ async fn native_target_rechecks_complete_request_before_checkpoint_publication()
         parallel_tool_calls: None,
         reasoning: None,
         compiled_prompt: Some(CompiledPromptPayload {
+            observation_manifest: None,
             stable_system_text: "fixed instruction ".repeat(4000),
             dynamic_system_text: String::new(),
             boundary_marker: String::new(),

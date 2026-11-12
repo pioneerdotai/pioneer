@@ -74,6 +74,15 @@ pub trait Provider: Send + Sync {
         Ok(crate::catalog::model_catalog()?.limits(self.name(), model))
     }
 
+    /// Exact embeddings adapter route; absence never inherits a chat endpoint.
+    fn embedding_usage_profile(&self) -> crate::ProviderUsageProfile {
+        crate::ProviderUsageProfile {
+            api: "embeddings".into(),
+            api_version: None,
+            route: None,
+        }
+    }
+
     /// Context pricing metadata for the selected authority; never technical limits.
     async fn model_context_tiers(
         &self,

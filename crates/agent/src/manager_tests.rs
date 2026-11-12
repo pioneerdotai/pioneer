@@ -389,7 +389,9 @@ impl AgentManager {
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
         let runtime_snapshot = self.runtime_dependencies.snapshot().await;
-        self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
+        // Box at the fixture boundary so outer async helpers do not embed the
+        // composed production startup future and copy it through their frames.
+        Box::pin(self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
             mode,
@@ -405,7 +407,7 @@ impl AgentManager {
             None,
             pioneer_protocol::default_turn_permission_profile_snapshot(),
             test_full_access_security_snapshot(),
-        )
+        ))
         .await
     }
 
@@ -3470,6 +3472,7 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 
 fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent> {
     match event {
+        AgentDurableEvent::ProviderUsageSnapshot { .. } => None,
         AgentDurableEvent::ToolOutputRecorded { notification, .. } => {
             Some(AgentEvent::ItemDelta(notification))
         }
@@ -3878,8 +3881,9 @@ async fn start_simple_turn(
         .await
         .expect("thread should be created");
     let mut events = subscribe_agent_events(manager, thread_id).await;
-    manager
-        .start_test_turn_with_default_profile_and_capabilities(
+    // Keep the composed turn-start future out of the test harness stack.
+    Box::pin(
+        manager.start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             mode,
@@ -3892,9 +3896,10 @@ async fn start_simple_turn(
             }],
             Vec::new(),
             Vec::new(),
-        )
-        .await
-        .expect("turn should start");
+        ),
+    )
+    .await
+    .expect("turn should start");
 
     recv_events_until_terminal(&mut events).await
 }
@@ -4139,59 +4144,83 @@ async fn connection_owned_model_preparation_precedes_agent_tool_inventory() {
     assert!(tools.iter().any(|tool| tool.name == "read_file"));
 }
 
-#[tokio::test]
-async fn agent_dispatch_starts_with_main_prompt() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+fn run_composed_agent_startup_test<F, Fut>(name: &'static str, body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    // Exercise composed startup on the original Gateway-sized stack. Construct
+    // the fixture inside the thread so construction obeys the same bound.
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("agent fixture runtime should build")
+                .block_on(Box::pin(body()));
+        })
+        .expect("agent fixture thread should start")
+        .join()
+        .unwrap_or_else(|error| std::panic::resume_unwind(error));
+}
 
-    let memory = Arc::new(RecordingMemoryProvider::new(Ok(
-        MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        },
-    )));
-    manager.set_memory_provider(Some(memory.clone())).await;
-    install_configured_memory_hooks_for_test(&manager).await;
+#[test]
+fn agent_dispatch_starts_with_main_prompt() {
+    run_composed_agent_startup_test("agent_dispatch_starts_with_main_prompt", || async {
+        let provider = Arc::new(CaptureAgentProvider::default());
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+        let manager = AgentManager::new(registry, test_tool_loop_config());
 
-    let observed = start_simple_turn(
-        &manager,
-        "main_agent_loop_thread",
-        "workspace",
-        "main_agent_loop_turn",
-        ThreadMode::Agent,
-        "capture",
-        "hello",
-    )
-    .await;
-    assert_turn_completed(&observed);
+        let memory = Arc::new(RecordingMemoryProvider::new(Ok(
+            MemoryToolMaterialization {
+                bundles: vec![fake_standard_memory_tool_bundle()],
+                diagnostics: Vec::new(),
+            },
+        )));
+        manager.set_memory_provider(Some(memory.clone())).await;
+        install_configured_memory_hooks_for_test(&manager).await;
 
-    let requests = provider.snapshot_all_requests();
-    assert_eq!(
-        requests.len(),
-        1,
-        "one main dispatch without a preliminary request"
-    );
-    let main_request = &requests[0];
-    assert!(main_request.compiled_prompt.is_some());
-    assert!(main_request.tools.is_some());
-    assert_eq!(memory.tool_contexts().len(), 1);
-    assert!(
-        main_request
-            .tools
-            .as_ref()
-            .unwrap()
-            .iter()
-            .all(|tool| !tool.name.starts_with("memory_"))
-    );
-    assert!(
-        !main_request
-            .compiled_prompt
-            .as_ref()
-            .unwrap()
-            .full_system_text
-            .contains("### Memory Recall")
-    );
+        let observed = start_simple_turn(
+            &manager,
+            "main_agent_loop_thread",
+            "workspace",
+            "main_agent_loop_turn",
+            ThreadMode::Agent,
+            "capture",
+            "hello",
+        )
+        .await;
+        assert_turn_completed(&observed);
+
+        let requests = provider.snapshot_all_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one main dispatch without a preliminary request"
+        );
+        let main_request = &requests[0];
+        assert!(main_request.compiled_prompt.is_some());
+        assert!(main_request.tools.is_some());
+        assert_eq!(memory.tool_contexts().len(), 1);
+        assert!(
+            main_request
+                .tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|tool| !tool.name.starts_with("memory_"))
+        );
+        assert!(
+            !main_request
+                .compiled_prompt
+                .as_ref()
+                .unwrap()
+                .full_system_text
+                .contains("### Memory Recall")
+        );
+    });
 }
 
 fn agent_skill_delivery_fixture() -> AgentSkillRuntimeEntry {
@@ -9062,78 +9091,88 @@ async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
     assert!(completed_agent_message_text(&observed).is_none());
 }
 
-#[tokio::test]
-async fn computer_use_text_only_model_does_not_gate_computer_use() {
-    let provider = Arc::new(TextOnlyAgentProvider::with_requested_tools(
-        requested_tool_names(&["cua_get_window_state"]),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "text-only",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
+#[test]
+fn computer_use_text_only_model_does_not_gate_computer_use() {
+    run_composed_agent_startup_test(
+        "computer_use_text_only_model_does_not_gate_computer_use",
+        || async {
+            let provider = Arc::new(TextOnlyAgentProvider::with_requested_tools(
+                requested_tool_names(&["cua_get_window_state"]),
+            ));
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "text-only",
+                provider.clone(),
+            ));
+            let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
-    let observed = start_simple_turn(
-        &manager,
-        "thr_computer_use_text_only_no_gate",
-        "ws_computer_use_text_only_no_gate",
-        "turn_computer_use_text_only_no_gate",
-        ThreadMode::Agent,
-        "text-only",
-        "Open the requested desktop location.",
-    )
-    .await;
-    assert_turn_completed(&observed);
+            let observed = start_simple_turn(
+                &manager,
+                "thr_computer_use_text_only_no_gate",
+                "ws_computer_use_text_only_no_gate",
+                "turn_computer_use_text_only_no_gate",
+                ThreadMode::Agent,
+                "text-only",
+                "Open the requested desktop location.",
+            )
+            .await;
+            assert_turn_completed(&observed);
 
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 2);
-    let request_tool_names = requests[1]
-        .tools
-        .as_ref()
-        .expect("main request should still include available provider tools")
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        request_tool_names.contains(&"cua_get_window_state"),
-        !pioneer_tools::computer_use_tool_specs().is_empty(),
-        "computer_use must not be provider-gated by image capability"
+            let requests = provider.snapshot_requests();
+            assert_eq!(requests.len(), 2);
+            let request_tool_names = requests[1]
+                .tools
+                .as_ref()
+                .expect("main request should still include available provider tools")
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                request_tool_names.contains(&"cua_get_window_state"),
+                !pioneer_tools::computer_use_tool_specs().is_empty(),
+                "computer_use must not be provider-gated by image capability"
+            );
+        },
     );
 }
 
-#[tokio::test]
-async fn computer_use_registered_tool_exposes_after_request_tools() {
-    let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
-        requested_tool_names(&["cua_get_window_state"]),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
+#[test]
+fn computer_use_registered_tool_exposes_after_request_tools() {
+    run_composed_agent_startup_test(
+        "computer_use_registered_tool_exposes_after_request_tools",
+        || async {
+            let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
+                requested_tool_names(&["cua_get_window_state"]),
+            ));
+            let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+            let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
-    let observed = start_simple_turn(
-        &manager,
-        "thr_computer_use_registered_tool",
-        "ws_computer_use_registered_tool",
-        "turn_computer_use_registered_tool",
-        ThreadMode::Agent,
-        "capture",
-        "Open the requested desktop location.",
-    )
-    .await;
-    assert_turn_completed(&observed);
+            let observed = start_simple_turn(
+                &manager,
+                "thr_computer_use_registered_tool",
+                "ws_computer_use_registered_tool",
+                "turn_computer_use_registered_tool",
+                ThreadMode::Agent,
+                "capture",
+                "Open the requested desktop location.",
+            )
+            .await;
+            assert_turn_completed(&observed);
 
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 2);
-    let request_tool_names = requests[1]
-        .tools
-        .as_ref()
-        .expect("main request should include provider tools")
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        request_tool_names.contains(&"cua_get_window_state"),
-        !pioneer_tools::computer_use_tool_specs().is_empty(),
-        "image-capable providers may expose computer_use after request_tools"
+            let requests = provider.snapshot_requests();
+            assert_eq!(requests.len(), 2);
+            let request_tool_names = requests[1]
+                .tools
+                .as_ref()
+                .expect("main request should include provider tools")
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                request_tool_names.contains(&"cua_get_window_state"),
+                !pioneer_tools::computer_use_tool_specs().is_empty(),
+                "image-capable providers may expose computer_use after request_tools"
+            );
+        },
     );
 }
 
@@ -13260,8 +13299,8 @@ async fn continue_generation_recovery_reuses_saved_system_and_adds_context_at_ta
         .as_ref()
         .expect("recovery request should include compiled prompt payload");
     assert_eq!(
-        requests[0].compiled_prompt.as_ref().unwrap(),
-        continuation_prompt
+        serde_json::to_value(requests[0].compiled_prompt.as_ref().unwrap()).unwrap(),
+        serde_json::to_value(continuation_prompt).unwrap()
     );
     let initial_user = requests[0]
         .messages
@@ -15562,6 +15601,13 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         reasoning: None,
         compiled_prompt: None,
     };
+    let events = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
+    let mut receiver = events.take_durable_receiver().await.unwrap();
+    let acknowledgements = tokio::spawn(async move {
+        while receiver.recv().await.is_some() {
+            receiver.acknowledge_last(Ok(()));
+        }
+    });
     let context = || NativeContext {
         context_budget: None,
         summary_context: None,
@@ -15579,7 +15625,7 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         conversation_thread_id: None,
         provider_instance: "fixture".into(),
         provider: Arc::new(CaptureStandardProvider::default()),
-        events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
+        events: events.clone(),
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
     let live = Arc::new(AtomicUsize::new(0));
@@ -15601,10 +15647,16 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         NativeContextSession::new(context(), Arc::new(PendingContextBoundary(live.clone())));
     let preparing = session.prepare(request(), false);
     tokio::pin!(preparing);
-    tokio::select! { biased;
-        _ = &mut preparing => panic!("fixture preparation must wait"),
-        _ = tokio::task::yield_now() => {}
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while live.load(Ordering::SeqCst) == 0 {
+            tokio::select! { biased;
+                _ = &mut preparing => panic!("fixture preparation must wait"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("preparation must enter the context boundary");
     assert_eq!(live.load(Ordering::SeqCst), 1);
     session.context.cancellation.cancel();
     assert!(
@@ -15616,6 +15668,7 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
             .contains("cancelled")
     );
     assert_eq!(live.load(Ordering::SeqCst), 0);
+    acknowledgements.abort();
 }
 
 #[tokio::test]

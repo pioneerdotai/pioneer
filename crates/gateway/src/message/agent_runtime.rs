@@ -410,6 +410,7 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnCapabilitiesResolved { thread_id, .. }
         | AgentDurableEvent::SkillAuditEvents { thread_id, .. }
         | AgentDurableEvent::TurnLlmContextAppended { thread_id, .. }
+        | AgentDurableEvent::ProviderUsageSnapshot { thread_id, .. }
         | AgentDurableEvent::TurnProviderHistoryAppended { thread_id, .. }
         | AgentDurableEvent::ProviderFailureDetected { thread_id, .. }
         | AgentDurableEvent::RecoveryAttemptSucceeded { thread_id, .. }
@@ -470,6 +471,7 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnCapabilitiesResolved { turn_id, .. }
         | AgentDurableEvent::SkillAuditEvents { turn_id, .. }
         | AgentDurableEvent::TurnLlmContextAppended { turn_id, .. }
+        | AgentDurableEvent::ProviderUsageSnapshot { turn_id, .. }
         | AgentDurableEvent::TurnProviderHistoryAppended { turn_id, .. }
         | AgentDurableEvent::ProviderFailureDetected { turn_id, .. }
         | AgentDurableEvent::RecoveryAttemptSucceeded { turn_id, .. }
@@ -2180,7 +2182,12 @@ impl MessageProcessor {
                 );
                 // A captured control cancellation proves authority at its
                 // generation-bound writer, even after the work graph is fenced.
-                let already_committed = if initial_stop {
+                // Numeric late evidence refines an already prepared attempt;
+                // its source/physical identity is revalidated in the writer.
+                // It neither activates nor mutates execution lifecycle state.
+                let financial_refinement =
+                    matches!(&event, AgentDurableEvent::ProviderUsageSnapshot { .. });
+                let already_committed = if initial_stop || financial_refinement {
                     false
                 } else if let Some(turn_id) = durable_event_turn_id(&event) {
                     match self.guard_execution_commit(turn_id).await {
@@ -5657,6 +5664,26 @@ impl MessageProcessor {
                     return false;
                 }
                 true
+            }),
+            AgentDurableEvent::ProviderUsageSnapshot {
+                workspace_id,
+                thread_id,
+                turn_id,
+                item_id,
+                revision,
+                usage,
+            } => message_future(async move {
+                self.crud_store
+                    .record_native_provider_usage(
+                        &workspace_id,
+                        &thread_id,
+                        &turn_id,
+                        &item_id,
+                        revision,
+                        usage,
+                    )
+                    .await
+                    .is_ok()
             }),
             AgentDurableEvent::ToolOutputRecorded { id, notification } => {
                 message_future(async move {

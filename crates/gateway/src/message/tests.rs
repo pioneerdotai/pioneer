@@ -13,6 +13,9 @@ impl super::MessageProcessor {
     }
 }
 
+#[path = "tests/execution_observability.rs"]
+mod execution_observability;
+
 #[path = "tests/control_rpc.rs"]
 mod control_rpc;
 
@@ -2436,7 +2439,7 @@ where
 {
     let runtime = crate::build_gateway_runtime()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
-    let result = runtime.block_on(async move { tokio::spawn(future).await });
+    let result = runtime.block_on(async move { tokio::spawn(Box::pin(future)).await });
     // Test futures may leave best-effort blocking index work behind. Give it
     // a bounded grace period instead of waiting indefinitely during shutdown.
     runtime.shutdown_timeout(Duration::from_secs(5));
@@ -25238,7 +25241,7 @@ where
 {
     let runtime = crate::build_gateway_runtime()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
-    let result = runtime.block_on(async move { tokio::spawn(future).await });
+    let result = runtime.block_on(async move { tokio::spawn(Box::pin(future)).await });
     runtime.shutdown_timeout(Duration::from_secs(5));
     result.unwrap_or_else(|error| panic!("{name} task should finish: {error}"));
 }
@@ -89765,7 +89768,18 @@ async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, "completed");
     let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
-    assert_eq!(Some(retained), response.usage);
+    let mut returned = response.usage.unwrap();
+    // Retention omits an absent tariff rather than retaining its null placeholder.
+    if let Some(accounting) = returned
+        .accounting
+        .as_mut()
+        .and_then(JsonValue::as_object_mut)
+    {
+        if accounting.get("pricing").is_some_and(JsonValue::is_null) {
+            accounting.remove("pricing");
+        }
+    }
+    assert_eq!(retained, returned);
     assert!(!rows[0].usage_json.contains("fixture prompt"));
 }
 
@@ -89845,6 +89859,15 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert_eq!(started[0].status, "started");
     let metadata: serde_json::Value = serde_json::from_str(&started[0].usage_json).unwrap();
     assert_eq!(metadata["_pioneer_journal"]["connection_id"], "authority-a");
+    let prepared_attempt = metadata["physical_attempt_id"].as_str().unwrap().to_owned();
+    assert!(metadata["accounting"].is_object());
+    assert_eq!(
+        metadata["_pioneer_observation"]["context_manifest"]["layer"],
+        "application_canonical"
+    );
+    assert!(serde_json::Value::is_null(
+        &metadata["_pioneer_observation"]["timing"]["dispatch_at"]
+    ));
     assert!(stream.next().await.unwrap().unwrap().is_final);
     assert_eq!(
         stream
@@ -89865,6 +89888,10 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, "completed");
     let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(
+        retained.physical_attempt_id.as_deref(),
+        Some(prepared_attempt.as_str())
+    );
     assert_eq!(retained.input_tokens, Some(10));
     assert_eq!(retained.output_tokens, Some(2));
     assert_eq!(

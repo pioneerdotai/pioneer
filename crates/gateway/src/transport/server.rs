@@ -61,6 +61,8 @@ fn independent_read_request(request: &pioneer_protocol::JsonRpcRequest) -> bool 
         request.method.as_str(),
         methods::THREAD_GET
             | methods::THREAD_TREE
+            | methods::THREAD_EXECUTION_OBSERVABILITY
+            | methods::WORKSPACE_EXECUTION_OBSERVABILITY
             | methods::THREAD_TIMELINE_PAGE
             | methods::TURN_WORK_PAGE
             | methods::TURN_WORK_ITEMS_GET

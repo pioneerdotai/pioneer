@@ -71,7 +71,8 @@ impl SavedCatalog {
             &serde_json::to_string(&self.catalog.models)?,
             &serde_json::to_string(&self.catalog.provenance)?,
             self.catalog.tool_capabilities.clone(),
-        )
+        )?
+        .with_billing_models(self.catalog.billing_models.clone())
     }
 }
 
@@ -249,6 +250,19 @@ fn retain_unavailable_sources(
                 .entry(provider.clone())
                 .or_default()
                 .insert(id, origins.clone());
+        }
+    }
+    for (provider, entries) in previous.billing_models {
+        for (id, model) in entries {
+            let source = model["pricingSource"]["url"].as_str();
+            if source.is_some_and(|url| snapshot.source_body(url).is_none()) {
+                current
+                    .billing_models
+                    .entry(provider.clone())
+                    .or_default()
+                    .entry(id)
+                    .or_insert(model);
+            }
         }
     }
     let capabilities = current

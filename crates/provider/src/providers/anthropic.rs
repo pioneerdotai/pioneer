@@ -2021,6 +2021,7 @@ mod tests {
         let mut req = request(vec![ChatMessage::user("first")]);
         req.model = "claude-sonnet-5-5".into();
         req.compiled_prompt = Some(CompiledPromptPayload {
+            observation_manifest: None,
             stable_system_text: "rules".into(),
             dynamic_system_text: "time=one".into(),
             boundary_marker: "boundary".into(),
@@ -2720,6 +2721,7 @@ mod tests {
             parallel_tool_calls: None,
             reasoning: None,
             compiled_prompt: Some(CompiledPromptPayload {
+                observation_manifest: None,
                 stable_system_text: "Stable rules".to_owned(),
                 dynamic_system_text: "Dynamic runtime".to_owned(),
                 boundary_marker: "<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->".to_owned(),

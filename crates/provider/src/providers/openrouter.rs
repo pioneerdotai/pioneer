@@ -42,6 +42,8 @@ pub struct OpenRouterProvider {
     base_url: String,
     timeout_policy: ProviderTimeoutPolicy,
     client: Client,
+    embedding_tariffs:
+        std::sync::RwLock<std::collections::BTreeMap<String, crate::catalog::CatalogModel>>,
 }
 
 // ── OpenRouter API request types ────────────────────────────────────────────
@@ -644,8 +646,10 @@ impl OpenRouterArchitecture {
 #[serde(transparent)]
 struct OpenRouterReasoningMetadata(serde_json::Map<String, serde_json::Value>);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OpenRouterPricing {
+    #[serde(flatten)]
+    additional: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
@@ -720,6 +724,7 @@ impl OpenRouterProvider {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
+            embedding_tariffs: std::sync::RwLock::new(Default::default()),
         }
     }
 
@@ -1118,12 +1123,26 @@ impl OpenRouterProvider {
             Err(error) => return facts.failure(error, ProviderFailureStage::Connect),
         };
         let status = facts.http_status.expect("non-success response");
+        let usage = crate::usage::http_error_usage(
+            &body,
+            if embedding {
+                "embeddings"
+            } else {
+                "chat_completions"
+            },
+            facts.request_id.as_deref(),
+        );
         let mut failure =
             OpenRouterFailure::http(&body, status, facts.retry_after_ms, facts.request_id);
         if embedding {
             failure.classification.class = super::embedding::classify_input_failure(status, &body);
         }
-        failure.into()
+        let error = failure.into();
+        if let Some(usage) = usage {
+            crate::usage::with_error_usage(error, &usage)
+        } else {
+            error
+        }
     }
 
     async fn list_model_entries(
@@ -1445,6 +1464,14 @@ impl OpenRouterProvider {
 
 #[async_trait]
 impl crate::traits::Provider for OpenRouterProvider {
+    fn embedding_usage_profile(&self) -> crate::ProviderUsageProfile {
+        crate::ProviderUsageProfile {
+            api: "embeddings".into(),
+            api_version: None,
+            route: crate::usage::route(&self.base_url, "/embeddings"),
+        }
+    }
+
     fn usage_api(&self) -> &'static str {
         "chat_completions"
     }
@@ -1757,15 +1784,85 @@ impl crate::traits::Provider for OpenRouterProvider {
     }
 
     async fn list_embedding_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        Ok(self
+        let entries = self
             .list_model_entries(
                 self.models_request()
                     .query(&[("output_modalities", "embeddings")]),
             )
-            .await?
+            .await?;
+        let captured = chrono::Utc::now().to_rfc3339();
+        let mut tariffs = std::collections::BTreeMap::new();
+        for entry in &entries {
+            if let Some(pricing) = &entry.pricing {
+                let mut raw = serde_json::to_value(pricing)?;
+                let mut unknown = false;
+                if let Some(fields) = raw.as_object_mut() {
+                    fields.retain(|key, _| {
+                        let allowed = matches!(
+                            key.as_str(),
+                            "prompt"
+                                | "completion"
+                                | "image"
+                                | "request"
+                                | "input_cache_read"
+                                | "input_cache_write"
+                                | "overrides"
+                                | "web_search"
+                                | "audio"
+                                | "internal_reasoning"
+                        );
+                        unknown |= !allowed;
+                        // Public pricing evidence is lossless even for unknown
+                        // conditions. Private responses retain only the allowlist.
+                        allowed || self.base_url == BASE_URL
+                    });
+                }
+                let metadata = std::collections::BTreeMap::from([
+                    ("pricingEvidenceVersion".into(), serde_json::json!(1)),
+                    (
+                        "pricingUnits".into(),
+                        serde_json::json!("USD_per_million_tokens"),
+                    ),
+                    ("pricingCapturedAt".into(), serde_json::json!(captured)),
+                    (
+                        "pricingSource".into(),
+                        serde_json::json!({"url":"https://openrouter.ai/api/v1/models","units":"USD_per_token","raw":raw,
+                        "unknownRateContract":(unknown || self.base_url!=BASE_URL).then_some("unsupported_or_nonpublic_source_contract")}),
+                    ),
+                ]);
+                tariffs.insert(
+                    entry.id.clone(),
+                    crate::catalog::CatalogModel {
+                        id: entry.id.clone(),
+                        name: entry.id.clone(),
+                        provider: "openrouter".into(),
+                        api: "openai-embeddings".into(),
+                        base_url: self.base_url.clone(),
+                        context_window: entry.context_length.unwrap_or(0),
+                        max_tokens: 0,
+                        reasoning: false,
+                        input: vec!["text".into()],
+                        cost: serde_json::json!({}),
+                        metadata,
+                    },
+                );
+            }
+        }
+        self.embedding_tariffs
+            .write()
+            .expect("embedding tariff snapshot")
+            .extend(tariffs);
+        Ok(entries
             .into_iter()
             .map(openrouter_embedding_model_from_openrouter_model_entry)
             .collect())
+    }
+    fn model_catalog_entry(&self, model: &str) -> Option<crate::catalog::CatalogModel> {
+        self.embedding_tariffs
+            .read()
+            .expect("embedding tariff snapshot")
+            .get(model)
+            .cloned()
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
@@ -1799,13 +1896,19 @@ impl crate::traits::Provider for OpenRouterProvider {
             return Err(Self::api_error_for_operation(response, true).await);
         }
 
+        let request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
         let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
             response,
             Default::default(),
             "provider_response",
         )
         .await?;
-        response.into_response(expected_count)
+        super::embedding::with_request_id(response.into_response(expected_count), request_id)
     }
 }
 

@@ -873,7 +873,10 @@ pub(crate) async fn prepare_completed_history_owned(
     }
     let exit = tokio::select! { biased;
         _ = clock.sleep_until(operation_deadline) => CompactionExit::Reconcile(FailureKind::Deadline),
-        result = runner.run(cancellation) => result?,
+        result = pioneer_provider::usage::scope_causal_parent(
+            pioneer_provider::usage::current_causal_parent().unwrap_or_else(||format!("turn:{turn}")),
+            runner.run(cancellation),
+        ) => result?,
     };
     if suspending.load(std::sync::atomic::Ordering::Acquire)
         && matches!(exit, CompactionExit::Reconcile(FailureKind::Cancelled))

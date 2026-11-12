@@ -4830,9 +4830,40 @@ pub enum SystemEventLevel {
     Error,
 }
 
+/// Content-free source boundaries, bounded per invocation. All mono_ns values
+/// belong to the enclosing observation's process_run_id.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolPhaseBoundary {
+    pub phase: String,
+    pub attempt_id: u32,
+    pub ts_unix_ms: i64,
+    pub mono_ns: u64,
+    pub local_sequence: u64,
+}
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolOutputMeasurements {
+    pub captured_text_bytes: u64,
+    /// Prepared handler representation; persistence is a separate acknowledged fact.
+    pub prepared_source_bytes: u64,
+    pub model_projection_text_bytes: u64,
+    pub basis: String,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolObservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_boundaries: Vec<ToolPhaseBoundary>,
+    #[serde(default, skip_serializing_if = "no_omitted_tool_phases")]
+    pub omitted_phase_boundaries: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_sizes: Option<ToolOutputMeasurements>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_run_id: Option<String>,
     pub trace_id: String,
     pub turn_id: String,
     pub tool_call_id: String,
@@ -4841,6 +4872,10 @@ pub struct ToolObservation {
     pub ts_unix_ms: i64,
     pub mono_ns: u64,
     pub event_seq: u64,
+}
+
+fn no_omitted_tool_phases(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]

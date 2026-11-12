@@ -72,6 +72,7 @@ pub(crate) async fn measure<T>(
     phase: Phase,
     future: impl Future<Output = Result<T, ToolError>>,
 ) -> Result<T, ToolError> {
+    boundary(phase, "started");
     let mut measurement = Measurement::start(phase, &Correlation::capture());
     let correlation = measurement.correlation();
     let carrier = if correlation.is_current() {
@@ -100,6 +101,14 @@ pub(crate) async fn measure<T>(
             future.await
         }))
         .await;
+    boundary(
+        phase,
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
     measurement.finish(match &result {
         Ok(_) => Fact::Returned,
         Err(error) => error_fact(error),
@@ -111,8 +120,17 @@ pub(crate) fn measure_sync<T>(
     phase: Phase,
     work: impl FnOnce() -> Result<T, ToolError>,
 ) -> Result<T, ToolError> {
+    boundary(phase, "started");
     let mut observation = Measurement::start(phase, &Correlation::capture());
     let result = observation.correlation().run(work);
+    boundary(
+        phase,
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
     observation.finish(match &result {
         Ok(_) => Fact::Returned,
         Err(error) => error_fact(error),
@@ -142,4 +160,16 @@ pub(crate) fn output_completeness(
         ToolStoragePayload::Metadata { .. } | ToolStoragePayload::None => None,
     };
     observation.output_completeness(llm, display, storage);
+}
+
+tokio::task_local! { static DURABLE_TOOL_TRACE:crate::events::ToolEventTrace; }
+pub(crate) async fn scope_trace<F: Future>(
+    trace: crate::events::ToolEventTrace,
+    future: F,
+) -> F::Output {
+    DURABLE_TOOL_TRACE.scope(trace, future).await
+}
+fn boundary(phase: Phase, state: &str) {
+    let _ = DURABLE_TOOL_TRACE
+        .try_with(|trace| trace.emit_stage(1, &format!("typed.{phase:?}.{state}"), None, None));
 }

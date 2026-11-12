@@ -551,6 +551,10 @@ impl AuthorityBoundProvider {
 
 #[async_trait]
 impl Provider for AuthorityBoundProvider {
+    fn embedding_usage_profile(&self) -> crate::ProviderUsageProfile {
+        self.inner.embedding_usage_profile()
+    }
+
     fn request_usage_profile(&self, request: &ChatRequest) -> Result<crate::ProviderUsageProfile> {
         self.inner.request_usage_profile(request)
     }
@@ -626,7 +630,7 @@ impl Provider for AuthorityBoundProvider {
             self.public_result(self.inner.model_limits(&request.model).await)?;
             self.ensure_not_revoked()?;
         }
-        let context = crate::usage::UsageContext::capture_request(self.inner.as_ref(), &request)?;
+        let context = crate::usage::UsageContext::capture_request(self, &request)?;
         let mut response = self
             .public_result(
                 crate::attachments::admission::scope(
@@ -676,7 +680,7 @@ impl Provider for AuthorityBoundProvider {
             self.public_result(self.inner.model_limits(&request.model).await)?;
             self.ensure_not_revoked()?;
         }
-        let context = crate::usage::UsageContext::capture_request(self.inner.as_ref(), &request)?;
+        let context = crate::usage::UsageContext::capture_request(self, &request)?;
         let request_has_service_mode = request.service_mode.is_some();
         let mut response = self
             .public_result(

@@ -1074,3 +1074,53 @@ pub(super) fn tool_capabilities(snapshot: &SourceSnapshot) -> super::super::Tool
     }
     result
 }
+
+/// Keep operation tariffs from the same captured sources, separate from chat
+/// eligibility. Known adapter identities, never an embedding-looking name alone.
+pub(super) fn billing_models(
+    snapshot: &SourceSnapshot,
+) -> BTreeMap<String, BTreeMap<String, Value>> {
+    let mut result = BTreeMap::<String, BTreeMap<String, Value>>::new();
+    if let Some(source) = snapshot.source_body(SOURCE_URLS[0]) {
+        for (id, raw) in entries(source, "openai") {
+            if crate::providers::openai::embedding_model_definition(id).is_none() {
+                continue;
+            }
+            let mut candidate = base(
+                "openai",
+                id,
+                "openai-embeddings",
+                "https://api.openai.com/v1",
+                raw,
+                (0, 0),
+            );
+            candidate.model["pricingEvidenceVersion"] = json!(1);
+            candidate.model["pricingCapturedAt"] = json!(snapshot.captured_at);
+            candidate.model["pricingUnits"] = json!("USD_per_million_tokens");
+            result
+                .entry("openai".into())
+                .or_default()
+                .insert(id.clone(), candidate.model);
+        }
+    }
+    if let Some(source) = snapshot.source_body(SOURCE_URLS[2]) {
+        for raw in source["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|raw| vercel_embedding_eligible(raw))
+        {
+            if let Some(mut candidate) = vercel_model(raw) {
+                candidate.model["api"] = json!("openai-embeddings");
+                candidate.model["pricingEvidenceVersion"] = json!(1);
+                candidate.model["pricingCapturedAt"] = json!(snapshot.captured_at);
+                candidate.model["pricingUnits"] = json!("USD_per_million_tokens");
+                result
+                    .entry("vercel-ai-gateway".into())
+                    .or_default()
+                    .insert(candidate.id().into(), candidate.model);
+            }
+        }
+    }
+    result
+}

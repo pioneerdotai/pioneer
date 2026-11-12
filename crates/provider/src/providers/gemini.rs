@@ -1636,7 +1636,7 @@ mod tests {
     fn usage_prompt_includes_cached_content_once() {
         let response: super::ApiGenerateResponse = serde_json::from_value(serde_json::json!({
             "candidates":[], "usageMetadata": {"promptTokenCount":140,
-                "cachedContentTokenCount":100,"candidatesTokenCount":9}
+                "cachedContentTokenCount":100,"candidatesTokenCount":9,"thoughtsTokenCount":0}
         }))
         .unwrap();
         let usage = super::GeminiProvider::extract_usage(&response).unwrap();
@@ -1987,6 +1987,7 @@ mod tests {
             parallel_tool_calls: None,
             reasoning: None,
             compiled_prompt: Some(CompiledPromptPayload {
+                observation_manifest: None,
                 stable_system_text: "Stable rules".to_owned(),
                 dynamic_system_text: "Dynamic runtime".to_owned(),
                 boundary_marker: "<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->".to_owned(),

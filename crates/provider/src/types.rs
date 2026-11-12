@@ -878,6 +878,8 @@ impl From<ModelInputItem> for ChatMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledPromptPayload {
+    #[serde(skip)]
+    pub observation_manifest: Option<serde_json::Value>,
     pub stable_system_text: String,
     pub dynamic_system_text: String,
     pub boundary_marker: String,
@@ -1249,8 +1251,7 @@ impl TokenUsage {
                     .get("thoughtsTokenCount")
                     .and_then(serde_json::Value::as_u64);
                 self.output_tokens = match (candidates, thoughts) {
-                    (Some(c), t) => c.checked_add(t.unwrap_or(0)),
-                    (None, Some(t)) => Some(t),
+                    (Some(c), Some(t)) => c.checked_add(t),
                     _ => None,
                 };
             }
@@ -1909,6 +1910,7 @@ mod tests {
     #[test]
     fn compiled_prompt_sections_preserve_stable_then_dynamic_order() {
         let compiled = CompiledPromptPayload {
+            observation_manifest: None,
             stable_system_text: "Stable".to_owned(),
             dynamic_system_text: "Dynamic".to_owned(),
             boundary_marker: "<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->".to_owned(),
@@ -1937,6 +1939,7 @@ mod tests {
             parallel_tool_calls: None,
             reasoning: None,
             compiled_prompt: Some(CompiledPromptPayload {
+                observation_manifest: None,
                 stable_system_text: "Stable".to_owned(),
                 dynamic_system_text: "Dynamic".to_owned(),
                 boundary_marker: "<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->".to_owned(),

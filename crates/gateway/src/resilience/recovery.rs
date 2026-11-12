@@ -11281,6 +11281,19 @@ mod tests {
         let stale_item_id = "reasoning_stale_frontier";
         let later_item_id = "agent_message_after_stale_reasoning";
 
+        {
+            use sea_orm::EntityTrait;
+            pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+                id: sea_orm::Set(thread.workspace_id.clone()),
+                name: sea_orm::Set("Observation fixture".to_owned()),
+                is_active: sea_orm::Set(true),
+                is_current: sea_orm::Set(true),
+                ..Default::default()
+            })
+            .exec(&crud_store.database_connection())
+            .await
+            .expect("observation workspace should exist");
+        }
         crud_store
             .materialize_turn_start(
                 &thread,

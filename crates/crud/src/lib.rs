@@ -5273,10 +5273,23 @@ impl CrudStore {
         // Prepare outside writer admission. An invalid/unknown preview remains
         // unchanged unless the commit finds an authoritative release marker.
         let delivery_key = delivery_key.to_owned();
+        let source_observation = self
+            .prepare_retained_tool_source(&entry, &delivery_key)
+            .await?;
+        let archived_observation = if let Some(Some(payload)) = &preview_archive {
+            let mut archived = entry.clone();
+            archived.payload = payload.clone();
+            self.prepare_retained_tool_source(&archived, &delivery_key)
+                .await?
+        } else {
+            None
+        };
         let result = self
             .run_serialized_write(|| {
                 let mut entry = entry.clone();
                 let preview_archive = preview_archive.clone();
+                let mut source_observation = source_observation.clone();
+                let archived_observation = archived_observation.clone();
                 let delivery_key = delivery_key.clone();
                 async move {
                     let transaction = self
@@ -5292,6 +5305,7 @@ impl CrudStore {
                         )
                         .await?
                         {
+                            source_observation = archived_observation;
                             entry.payload = prepared.ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "released HTML preview result cannot be reintroduced"
@@ -5307,6 +5321,15 @@ impl CrudStore {
                     .await;
                     match outcome {
                         Ok(outcome) => {
+                            if !outcome.already_committed {
+                                if let Some(prepared) = &source_observation {
+                                    repositories::execution_observability::commit(
+                                        &transaction,
+                                        prepared,
+                                    )
+                                    .await?;
+                                }
+                            }
                             transaction
                                 .commit()
                                 .await
@@ -40489,6 +40512,7 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    mod execution_observability;
     use crate::{TurnEventDeliveryOutcome, TurnEventDeliverySettlement};
     mod authorization_reads;
     mod saved_history_read;
@@ -41039,6 +41063,19 @@ mod tests {
         .expect("pure maintenance read must succeed");
 
         transaction.rollback().await.expect("release writer");
+    }
+
+    async fn seed_observation_workspace(store: &CrudStore, workspace_id: &str) {
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(workspace_id.to_owned()),
+            name: Set("Observation fixture".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            ..Default::default()
+        })
+        .exec(&store.connection)
+        .await
+        .expect("observation workspace should exist");
     }
 
     async fn ensure_test_agent_identity(store: &CrudStore, workspace_id: &str, timestamp: i64) {
@@ -56466,6 +56503,7 @@ mod tests {
         let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_tool_policy";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_tool_policy";
         let turn_id = "turn_tool_policy";
         let item_id = "item_tool_policy";
@@ -58039,6 +58077,7 @@ mod tests {
         let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_raw_payload";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_raw_payload";
         let turn_id = "turn_raw_payload";
         let thread = sample_thread(workspace_id, thread_id, timestamp);
@@ -58291,6 +58330,7 @@ mod tests {
         let turn_id = "turn_running_pages";
         let thread = sample_thread(workspace_id, thread_id, timestamp);
         let turn = sample_turn(turn_id);
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -58366,6 +58406,7 @@ mod tests {
         let at = 1_700_000_000;
         let thread = sample_thread("ws_timeout_pages", "thr_timeout_pages", at);
         let turn = sample_turn("turn_timeout_pages");
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -58465,6 +58506,7 @@ mod tests {
         let store = test_store_with_zstd_turn_items().await;
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_timeout_terminalize";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_timeout_terminalize";
         let turn_id = "turn_timeout_terminalize";
         let item_id = "item_timeout_terminalize";
@@ -58575,6 +58617,7 @@ mod tests {
         let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_timeout_stale_candidate";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_timeout_stale_candidate";
         let turn_id = "turn_timeout_stale_candidate";
         let item_id = "item_timeout_stale_candidate";
@@ -58672,6 +58715,7 @@ mod tests {
         let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_turn_liveness";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_turn_liveness";
         let turn_id = "turn_turn_liveness";
         let stale_item_id = "reasoning_stale_liveness";
@@ -58796,6 +58840,7 @@ mod tests {
         let thread = sample_thread(workspace_id, thread_id, timestamp);
         let turn = sample_turn(turn_id);
 
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -59261,6 +59306,7 @@ mod tests {
         let thread = sample_thread(workspace_id, thread_id, timestamp);
         let turn = sample_turn(turn_id);
 
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -59718,6 +59764,17 @@ mod tests {
         let store = CrudStore::new(connection);
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_history_llm_context";
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(workspace_id.to_owned()),
+            name: Set("History test".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(unix_to_datetime(timestamp)),
+            updated_at: Set(unix_to_datetime(timestamp)),
+        })
+        .exec(&store.connection)
+        .await
+        .expect("workspace required by item projections should exist");
         let thread_id = "thr_history_llm_context";
         let turn_id = "turn_history_llm_context";
         let item_id = "item_history_llm_context";
@@ -61297,6 +61354,7 @@ mod tests {
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
 
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -61517,6 +61575,7 @@ mod tests {
         let store = CrudStore::new(connection.clone());
         let timestamp = 1_700_100_000;
         let workspace_id = "ws_000000000000000199";
+        seed_observation_workspace(&store, workspace_id).await;
         let thread_id = "thr_000000000000000199";
         let turn_id = "turn_000000000000000199";
         let item_id = "item_tool_retry";
@@ -64325,6 +64384,7 @@ mod tests {
             permission_profile: permission_profile.clone(),
         };
 
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -64546,6 +64606,7 @@ mod tests {
         executable_turn.mode = ThreadMode::Agent;
         let mut executable_audit = audit.clone();
         executable_audit.turn_id = executable_turn.id.clone();
+        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_non_executable_system_turn_start_with_permission_audit(
                 &thread,
@@ -69539,4 +69600,8 @@ impl CrudStore {
 pub use repositories::html_preview_io_work::{
     HtmlPreviewIoClaim, HtmlPreviewIoErrorClass, HtmlPreviewIoFamily, HtmlPreviewIoLocator,
     HtmlPreviewIoOutcome, HtmlPreviewIoSource, HtmlPreviewIoState,
+};
+
+pub use repositories::execution_observability::{
+    ExecutionObservationInput, PreparedExecutionObservation,
 };

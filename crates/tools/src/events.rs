@@ -234,6 +234,16 @@ pub struct ToolCallFailedEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_operation_id: Option<String>,
+    #[serde(default)]
+    pub phase_boundaries: Vec<pioneer_protocol::ToolPhaseBoundary>,
+    #[serde(default)]
+    pub omitted_phase_boundaries: u64,
+    #[serde(default)]
+    pub output_sizes: Option<pioneer_protocol::ToolOutputMeasurements>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_run_id: Option<String>,
     pub trace_id: String,
     pub turn_id: String,
     pub tool_call_id: String,
@@ -275,20 +285,28 @@ impl DurableToolEventEnvelope {
     }
 }
 
-#[derive(Default)]
-struct TraceState {
-    sequence: AtomicU64,
-    output_saved: AtomicBool,
-}
-
 #[derive(Clone)]
 pub struct ToolEventBus {
     tx: broadcast::Sender<ToolEvent>,
     durable_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<DurableToolEventEnvelope>>>>,
     durable_installed: Arc<AtomicBool>,
     durable_capacity: usize,
-    trace_sequences: Arc<Mutex<HashMap<String, Arc<TraceState>>>>,
+    trace_sequences: Arc<Mutex<HashMap<String, Arc<TraceMeasurements>>>>,
     thread_id: Arc<String>,
+}
+
+#[derive(Default)]
+struct TraceMeasurements {
+    output_saved: AtomicBool,
+    parent_operation_id: Option<String>,
+    sequence: AtomicU64,
+    detail: Mutex<TraceDetail>,
+}
+#[derive(Default, Clone)]
+struct TraceDetail {
+    boundaries: Vec<pioneer_protocol::ToolPhaseBoundary>,
+    omitted: u64,
+    output_sizes: Option<pioneer_protocol::ToolOutputMeasurements>,
 }
 
 #[derive(Clone)]
@@ -298,14 +316,14 @@ pub struct ToolEventTrace {
     turn_id: String,
     tool_call_id: String,
     tool_name: String,
-    state: Arc<TraceState>,
+    measurements: Arc<TraceMeasurements>,
     thread_id: Arc<String>,
 }
 
 impl ToolEventTrace {
     /// A positive durable ACK for this exact trace, including partial/error logs.
     pub fn has_saved_output_log(&self) -> bool {
-        self.state.output_saved.load(Ordering::Acquire)
+        self.measurements.output_saved.load(Ordering::Acquire)
     }
 
     pub(crate) fn has_durable_consumer(&self) -> bool {
@@ -361,11 +379,26 @@ impl ToolEventTrace {
     fn next_context(&self, pipeline_stage: &str, attempt_id: u32) -> ObservationContext {
         let ts_unix_ms = now_unix_ms();
         let event_seq = self
-            .state
+            .measurements
             .sequence
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
+        let detail = self
+            .measurements
+            .detail
+            .lock()
+            .expect("tool detail lock")
+            .clone();
         ObservationContext {
+            parent_operation_id: self.measurements.parent_operation_id.clone(),
+            phase_boundaries: detail.boundaries,
+            omitted_phase_boundaries: detail.omitted,
+            output_sizes: detail.output_sizes,
+            process_run_id: Some(
+                pioneer_observability::identity::run_identity()
+                    .run_id
+                    .clone(),
+            ),
             trace_id: self.trace_id.clone(),
             turn_id: self.turn_id.clone(),
             tool_call_id: self.tool_call_id.clone(),
@@ -384,6 +417,31 @@ impl ToolEventTrace {
         message: Option<String>,
         metadata: Option<JsonValue>,
     ) {
+        // Keep runtime-owned stage identity/timing only. Debug messages and
+        // metadata can contain paths, tool arguments or raw errors.
+        if pipeline_stage.len() <= 96
+            && pipeline_stage
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._".contains(&b))
+        {
+            let local_sequence = self
+                .measurements
+                .sequence
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            let mut detail = self.measurements.detail.lock().expect("tool detail lock");
+            if detail.boundaries.len() < 48 {
+                detail.boundaries.push(pioneer_protocol::ToolPhaseBoundary {
+                    phase: pipeline_stage.into(),
+                    attempt_id,
+                    ts_unix_ms: now_unix_ms(),
+                    mono_ns: monotonic_now_ns(),
+                    local_sequence,
+                });
+            } else {
+                detail.omitted = detail.omitted.saturating_add(1);
+            }
+        }
         debug!(
             target: "pioneer.tools.pipeline",
             trace_id = %self.trace_id,
@@ -495,6 +553,19 @@ impl ToolEventTrace {
                 }),
             )
             .await
+    }
+
+    pub(crate) fn record_output_sizes(
+        &self,
+        captured_text_bytes: usize,
+        prepared_source_bytes: usize,
+        model_projection_text_bytes: usize,
+    ) {
+        self.measurements.detail.lock().expect("tool detail lock").output_sizes=Some(pioneer_protocol::ToolOutputMeasurements {
+            captured_text_bytes:captured_text_bytes as u64,prepared_source_bytes:prepared_source_bytes as u64,
+            model_projection_text_bytes:model_projection_text_bytes as u64,
+            basis:"captured_handler_representation_and_actual_published_projection_not_uncaptured_process_output".into(),
+        });
     }
 
     pub async fn emit_completed(
@@ -681,11 +752,16 @@ impl ToolEventBus {
     ) -> ToolEventTrace {
         let trace_id = trace_id.into();
         let turn_id = turn_id.into();
-        let state = {
+        let measurements = {
             let mut guard = self.trace_sequences.lock().expect("trace sequences lock");
             guard
                 .entry(trace_id.clone())
-                .or_insert_with(|| Arc::new(TraceState::default()))
+                .or_insert_with(|| {
+                    Arc::new(TraceMeasurements {
+                        parent_operation_id: pioneer_provider::usage::current_causal_parent(),
+                        ..Default::default()
+                    })
+                })
                 .clone()
         };
         ToolEventTrace {
@@ -694,7 +770,7 @@ impl ToolEventBus {
             turn_id,
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
-            state,
+            measurements,
             thread_id: self.thread_id.clone(),
         }
     }
@@ -818,7 +894,10 @@ impl ToolEventBus {
                                 ))
                             })?;
                         if matches!(event.payload, ToolEventPayload::OutputDelta(_)) {
-                            trace.state.output_saved.store(true, Ordering::Release);
+                            trace
+                                .measurements
+                                .output_saved
+                                .store(true, Ordering::Release);
                         }
                     }
                     (true, None) => {

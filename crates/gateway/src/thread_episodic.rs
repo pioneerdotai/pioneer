@@ -301,6 +301,17 @@ pub(crate) trait ThreadEpisodicIndexEmbeddingProviderResolver: Send + Sync {
         ThreadEpisodicIndexResolutionError,
     >;
 
+    async fn resolve_active_embedding_provider_with_usage(
+        &self,
+        workspace_id: &str,
+        _store: &CrudStore,
+    ) -> std::result::Result<
+        Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+        ThreadEpisodicIndexResolutionError,
+    > {
+        self.resolve_active_embedding_provider(workspace_id).await
+    }
+
     fn active_embedding_provider_unavailable_reason(&self) -> Option<String> {
         None
     }
@@ -528,6 +539,7 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
         &self,
         workspace_id: &str,
         config: &GatewayThreadEpisodicVectorSearchConfig,
+        usage_store: Option<&CrudStore>,
     ) -> std::result::Result<
         Arc<dyn ThreadEpisodicEmbeddingProvider>,
         ThreadEpisodicIndexResolutionError,
@@ -552,6 +564,17 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                             ),
                         )
                     })?;
+                let api_provider = if let Some(store) = usage_store {
+                    crate::usage_journal::observe(
+                        api_provider,
+                        store,
+                        workspace_id,
+                        "embedding",
+                        workspace_id,
+                    )
+                } else {
+                    api_provider
+                };
                 let provider = RemoteEmbeddingProvider::openai(
                     model,
                     config.embedding_normalized,
@@ -611,6 +634,17 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                     }
                 } else {
                     None
+                };
+                let api_provider = if let Some(store) = usage_store {
+                    crate::usage_journal::observe(
+                        api_provider,
+                        store,
+                        workspace_id,
+                        "embedding",
+                        workspace_id,
+                    )
+                } else {
+                    api_provider
                 };
                 let provider = RemoteEmbeddingProvider::aggregator_with_max_input_tokens(
                     provider_id,
@@ -688,7 +722,24 @@ impl ThreadEpisodicIndexEmbeddingProviderResolver
         if !config.enabled {
             return Ok(None);
         }
-        self.resolve_configured_provider(workspace_id, &config)
+        self.resolve_configured_provider(workspace_id, &config, None)
+            .await
+            .map(Some)
+    }
+
+    async fn resolve_active_embedding_provider_with_usage(
+        &self,
+        workspace_id: &str,
+        store: &CrudStore,
+    ) -> std::result::Result<
+        Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+        ThreadEpisodicIndexResolutionError,
+    > {
+        let config = self.config_snapshot_for_workspace(workspace_id);
+        if !config.enabled {
+            return Ok(None);
+        }
+        self.resolve_configured_provider(workspace_id, &config, Some(store))
             .await
             .map(Some)
     }
@@ -736,7 +787,10 @@ impl ThreadEpisodicIndexPayloadProvider for RuntimeVectorThreadEpisodicIndexPayl
         let source_payload = resolved.source_payload.clone();
         let Some(embedding_provider) = self
             .embedding_provider_resolver
-            .resolve_active_embedding_provider(job.workspace_id.as_str())
+            .resolve_active_embedding_provider_with_usage(
+                job.workspace_id.as_str(),
+                self.crud_store.as_ref(),
+            )
             .await
             .map_err(|error| error.with_source_payload(source_payload.as_str()))?
         else {
@@ -1211,7 +1265,7 @@ impl ThreadEpisodicRecallService {
             return Err("active embedding provider resolver is not configured".to_owned());
         };
         let provider = resolver
-            .resolve_active_embedding_provider(workspace_id)
+            .resolve_active_embedding_provider_with_usage(workspace_id, self.crud_store.as_ref())
             .await
             .map_err(|error| format!("failed to resolve active embedding provider: {error:?}"))?;
         let Some(provider) = provider else {
@@ -2526,7 +2580,10 @@ impl ThreadEpisodicIndexExecutor {
         {
             // Resolve readiness before claim: waiting for a provider or
             // replacement never spends a job's execution budget.
-            let provider = match resolver.resolve_active_embedding_provider(workspace).await {
+            let provider = match resolver
+                .resolve_active_embedding_provider_with_usage(workspace, self.crud_store.as_ref())
+                .await
+            {
                 Ok(provider) => provider,
                 Err(error) => {
                     tracing::warn!(error = %error.message, "episodic projection provider unavailable before claim");
@@ -2567,7 +2624,7 @@ impl ThreadEpisodicIndexExecutor {
                         use futures_util::FutureExt;
                         let ownership_acquired = std::sync::atomic::AtomicBool::new(false);
                         let transition = async {
-                            let provider = resolver.resolve_active_embedding_provider(&workspace).await
+                            let provider = resolver.resolve_active_embedding_provider_with_usage(&workspace,store.as_ref()).await
                                 .map_err(|error| anyhow::anyhow!(error.message))?;
                             let target = if let Some(provider) = &provider {
                                 refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(provider.as_ref())?
