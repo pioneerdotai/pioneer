@@ -2054,7 +2054,7 @@ mod tests {
         let catalog = Arc::new(crate::generation::test_catalog_model(
             "openrouter",
             "fixture/other",
-            "Other",
+            "openai/gpt-5.4",
             serde_json::json!({"contextWindow":32000}),
         ));
         let wrapper = AuthorityBoundProvider {
