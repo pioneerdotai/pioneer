@@ -230,7 +230,8 @@ impl MessageProcessor {
         let scope = json!([
             authority.scope("search", &query_hash, false, params.limit),
             context.thread_id,
-            context.turn_id
+            context.turn_id,
+            pioneer_crud::THREAD_SEARCH_RANKING_VERSION
         ])
         .to_string();
         let state = params

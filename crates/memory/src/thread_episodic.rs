@@ -1120,6 +1120,44 @@ mod tests {
     }
 
     #[test]
+    fn rank_fusion_keeps_strong_single_branch_matches_ahead_of_two_moderate_matches() {
+        let mut strong = test_hit("workspace", "thread", "strong");
+        strong.semantic_rank = Some(1);
+        strong.lexical_rank = Some(52_612);
+        let mut moderate = test_hit("workspace", "thread", "moderate");
+        moderate.lexical_rank = Some(6);
+        moderate.semantic_rank = Some(28);
+        let ranked = rank_thread_episodic_search_hits(vec![moderate, strong]);
+        assert_eq!(ranked[0].hit.index_item_id, "strong");
+        assert!(ranked[0].score_breakdown.final_score > ranked[1].score_breakdown.final_score);
+    }
+
+    #[test]
+    fn single_branch_recall_preserves_absolute_cutoff_and_monotonic_scores() {
+        for semantic in [false, true] {
+            let scores = (1..=80)
+                .map(|rank| {
+                    let mut hit = test_hit("workspace", "thread", "source");
+                    hit.lexical_rank = (!semantic).then_some(rank);
+                    hit.semantic_rank = semantic.then_some(rank);
+                    Some(hit.rank_score())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(scores[0], Some(0.5));
+            assert_eq!(scores[61], Some(0.25));
+            assert!(scores.windows(2).all(|pair| pair[0] > pair[1]));
+            let mut profile = ThreadEpisodicSearchProfile::for_kind(
+                ThreadEpisodicSearchProfileKind::DefaultContext,
+            );
+            profile.adaptive_strategy = ThreadEpisodicAdaptiveStrategy::Absolute;
+            profile.max_candidates = 80;
+            let (count, _) =
+                PioneerAdaptiveCutoff::cutoff_len(&scores, profile.adaptive_cutoff_config());
+            assert_eq!(count, 62);
+        }
+    }
+
+    #[test]
     fn index_document_rejects_invalid_vectors_before_publication() {
         let identity =
             ThreadEpisodicEmbeddingIdentity::new("openai", "text-embedding-3-small", 3, true);
