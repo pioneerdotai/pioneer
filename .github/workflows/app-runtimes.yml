@@ -1,0 +1,151 @@
+name: App runtime images
+run-name: Publish App runtime images
+
+# Intentionally manual. Adding these files must not start a build or publish.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-runtimes-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [node, python, native, wasm]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Select image name
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          RUNTIME: ${{ matrix.runtime }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="ghcr.io/${OWNER,,}/runtime-${RUNTIME}"
+          tag="sha-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "tag=${repository}:${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # All RUN instructions use BUILDPLATFORM. The target images only receive
+      # metadata/files, so neither QEMU nor privileged VM access is necessary.
+      - name: Build and publish runtime image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: packaging/app-runtimes
+          file: packaging/app-runtimes/Dockerfile
+          target: ${{ matrix.runtime }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.image.outputs.tag }}
+          push: true
+          provenance: mode=min
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=Pioneer App runtime (${{ matrix.runtime }})
+
+      - name: Record candidate image identity
+        env:
+          RUNTIME: ${{ matrix.runtime }}
+          REPOSITORY: ${{ steps.image.outputs.repository }}
+          TAG: ${{ steps.image.outputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          digest = os.environ["DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("Build did not produce an image index digest")
+          runtime = os.environ["RUNTIME"]
+          data = {
+              "runtime": runtime,
+              "platforms": ["linux/amd64", "linux/arm64"],
+              "digest": digest,
+              "tag": os.environ["TAG"],
+              "image": f'{os.environ["REPOSITORY"]}@{digest}',
+          }
+          Path("runtime-results").mkdir()
+          Path(f"runtime-results/{runtime}.json").write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: runtime-identity-${{ matrix.runtime }}
+          path: runtime-results/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  catalog:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: runtime-identity-*
+          path: runtime-results
+          merge-multiple: true
+
+      - name: Assemble candidate catalog
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          runtimes = {}
+          for runtime in ("node", "python", "native", "wasm"):
+              entry = json.loads(Path(f"runtime-results/{runtime}.json").read_text())
+              if entry["runtime"] != runtime:
+                  raise SystemExit("Runtime identity mismatch")
+              runtimes[runtime] = entry
+          catalog = {
+              "sourceRevision": os.environ["GITHUB_SHA"],
+              "status": "candidate-not-qualified-in-microsandbox",
+              "runtimes": runtimes,
+          }
+          Path("runtime-catalog.candidate.json").write_text(json.dumps(catalog, indent=2) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("## App runtime candidates\n\n")
+              for runtime, entry in runtimes.items():
+                  identity = entry["image"]
+                  summary.write(f"- `{runtime}`: `{identity}`\n")
+              summary.write("\nThese images have not been qualified in Microsandbox or activated in Gateway.\n")
+          PY
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: runtime-catalog-candidate
+          path: runtime-catalog.candidate.json
+          if-no-files-found: error
+          retention-days: 7
