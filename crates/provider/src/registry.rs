@@ -774,7 +774,10 @@ impl Provider for AuthorityBoundProvider {
         }
         let metadata = self.public_result(self.inner.model_context_tiers(model).await)?;
         anyhow::ensure!(
-            metadata.is_some(),
+            metadata.is_some()
+                || self.input_admission.model(model).is_some_and(|model| {
+                    model.limits.context_window.is_some_and(|window| window > 0)
+                }),
             "Context pricing metadata is unavailable for this public provider/model"
         );
         Ok(metadata)
@@ -2043,6 +2046,53 @@ mod tests {
             self.bodies.lock().unwrap().push(body);
             Ok(Box::pin(stream::empty()))
         }
+    }
+
+    #[tokio::test]
+    async fn public_discovered_model_without_pricing_retains_auto_context_budget() {
+        let id = "fixture/new-model-before-price-catalog";
+        let catalog = Arc::new(crate::generation::test_catalog_model(
+            "openrouter",
+            "fixture/other",
+            "Other",
+            serde_json::json!({"contextWindow":32000}),
+        ));
+        let wrapper = AuthorityBoundProvider {
+            inner: Arc::new(RouterReasoningFixture {
+                discovery: serde_json::json!({"data":[{"id":id,"context_length":64000}]})
+                    .to_string(),
+                catalog,
+                bodies: Arc::new(Default::default()),
+                limits_error: None,
+            }),
+            authority_fingerprint: ProviderAuthorityFingerprint("new-model-account".into()),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog: true,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
+        };
+        let models = wrapper.inner.list_models().await.unwrap();
+        wrapper.remember_discovery(&models);
+        assert_eq!(
+            wrapper.model_limits(id).await.unwrap().context_window,
+            64000
+        );
+        assert!(wrapper.model_context_tiers(id).await.unwrap().is_none());
+        let mut raw = models[0].clone();
+        for window in [None, Some(0)] {
+            raw.limits.context_window = window;
+            wrapper.input_admission.replace_discovery(vec![raw.clone()]);
+            assert!(wrapper.model_context_tiers(id).await.is_err());
+        }
+        raw.limits.context_window = Some(64000);
+        raw.context_tiers = Some(pioneer_protocol::ProviderContextTiers::Invalid);
+        wrapper.input_admission.replace_discovery(vec![raw]);
+        assert_eq!(
+            wrapper.model_context_tiers(id).await.unwrap(),
+            Some(pioneer_protocol::ProviderContextTiers::Invalid)
+        );
     }
 
     #[tokio::test]
