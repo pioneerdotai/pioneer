@@ -352,71 +352,138 @@ async fn overlapping_work_preserves_union_exclusive_time_and_period_unknowns() {
 
 #[tokio::test]
 async fn nested_workspace_journal_usage_remains_visible_in_its_verified_thread_scope() {
-    let mut h = setup_semantic_timeline_query_harness().await;
-    let store = h.processor.crud_store.clone();
-    let workspace = store
-        .get_thread_by_id(&h.sandbox_thread_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .workspace_id;
-    let parent = "tool_parent";
-    store
-        .record_execution_observation(
-            pioneer_crud::ExecutionObservationInput {
-                workspace_id: workspace.clone(),
-                operation_id: parent.into(),
-                revision: 0,
-                thread_id: Some(h.sandbox_thread_id.clone()),
-                turn_id: Some(h.sandbox_turn_id.clone()),
-                owner_kind: "turn".into(),
-                owner_id: h.sandbox_turn_id.clone(),
-                parent_operation_id: None,
-                kind: "tool_invocation".into(),
-                purpose: "tool".into(),
-                provider: None,
-                model: None,
-                status: "running".into(),
-                recorded_at_ms: 1,
-                facts: json!({}),
-                tariff_evidence: None,
+    for cli_item in [false, true] {
+        let mut h = setup_semantic_timeline_query_harness().await;
+        let store = h.processor.crud_store.clone();
+        let workspace = store
+            .get_thread_by_id(&h.sandbox_thread_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace_id;
+        let requested_parent = format!("tool:{}:search_call:1", h.sandbox_turn_id);
+        let parent = if cli_item {
+            format!("item:{}:search_call", h.sandbox_turn_id)
+        } else {
+            requested_parent.clone()
+        };
+        store
+            .record_execution_observation(
+                pioneer_crud::ExecutionObservationInput {
+                    workspace_id: workspace.clone(),
+                    operation_id: parent.clone(),
+                    revision: 0,
+                    thread_id: Some(h.sandbox_thread_id.clone()),
+                    turn_id: Some(h.sandbox_turn_id.clone()),
+                    owner_kind: "turn".into(),
+                    owner_id: h.sandbox_turn_id.clone(),
+                    parent_operation_id: None,
+                    kind: "tool_invocation".into(),
+                    purpose: "tool".into(),
+                    provider: None,
+                    model: None,
+                    status: "running".into(),
+                    recorded_at_ms: 1,
+                    facts: if cli_item {
+                        json!({"tool_name":"threads_search","observation":null})
+                    } else {
+                        json!({})
+                    },
+                    tariff_evidence: None,
+                }
+                .prepare()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Missing sources and a different attempt must not inherit this CLI item.
+        if cli_item {
+            for rejected in [
+                format!("tool:{}:missing_call:1", h.sandbox_turn_id),
+                format!("tool:{}:search_call:2", h.sandbox_turn_id),
+                "tool:another_turn:search_call:1".to_owned(),
+            ] {
+                assert!(
+                    pioneer_provider::usage::scope_causal_parent(
+                        rejected,
+                        crate::usage_journal::Call::start(
+                            &store,
+                            &workspace,
+                            "embedding",
+                            &workspace,
+                            &pioneer_provider::TokenUsage::default(),
+                        ),
+                    )
+                    .await
+                    .is_err()
+                );
             }
-            .prepare()
-            .unwrap(),
+            assert!(
+                store
+                    .provider_usage_page(&workspace, &workspace, "", 100)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let mut usage = pioneer_provider::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(0),
+            ..Default::default()
+        };
+        let call = pioneer_provider::usage::scope_causal_parent(
+            requested_parent,
+            crate::usage_journal::Call::start(&store, &workspace, "embedding", &workspace, &usage),
         )
         .await
         .unwrap();
-    let mut usage = pioneer_provider::TokenUsage {
-        input_tokens: Some(10),
-        output_tokens: Some(0),
-        ..Default::default()
-    };
-    let call = pioneer_provider::usage::scope_causal_parent(
-        parent.into(),
-        crate::usage_journal::Call::start(&store, &workspace, "embedding", &workspace, &usage),
-    )
-    .await
-    .unwrap();
-    usage.input_tokens = Some(20);
-    // A partial cumulative update changes the live journal, not immutable page position.
-    call.record("started", &usage).await.unwrap();
-    let response = rpc(&mut h, "summary", json!({"purpose":"embedding"}), "nested").await;
-    let quantities = response.summary.unwrap()["token_quantities"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert_eq!(
-        quantities
-            .iter()
-            .find(|v| v["meter"] == "input_tokens")
-            .unwrap()["known_sum"],
-        "20"
-    );
-    let id = generate_test_request_id("observation", "workspace_isolation");
-    h.processor.process_request_for_connection(h.connection_id,&json!({"jsonrpc":"2.0","id":id,"method":"workspace/execution/observability","params":{"workspaceId":workspace,"view":"summary"}}).to_string()).await;
-    let response: pioneer_protocol::WorkspaceExecutionObservabilityResponse =
-        serde_json::from_value(recv_response_by_id(&mut h.rx, &id).await.result).unwrap();
-    assert_eq!(response.summary.unwrap()["attempts"], 0);
+        usage.input_tokens = Some(20);
+        // A partial cumulative update changes the live journal, not immutable page position.
+        call.record("started", &usage).await.unwrap();
+        let response = rpc(&mut h, "summary", json!({"purpose":"embedding"}), "nested").await;
+        let quantities = response.summary.unwrap()["token_quantities"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            quantities
+                .iter()
+                .find(|v| v["meter"] == "input_tokens")
+                .unwrap()["known_sum"],
+            "20"
+        );
+        let id = generate_test_request_id("observation", "workspace_isolation");
+        h.processor.process_request_for_connection(h.connection_id,&json!({"jsonrpc":"2.0","id":id,"method":"workspace/execution/observability","params":{"workspaceId":workspace,"view":"summary"}}).to_string()).await;
+        let response: pioneer_protocol::WorkspaceExecutionObservabilityResponse =
+            serde_json::from_value(recv_response_by_id(&mut h.rx, &id).await.result).unwrap();
+        assert_eq!(response.summary.unwrap()["attempts"], 0);
+        call.record("completed", &usage).await.unwrap();
+        let journal = store
+            .provider_usage_page(&workspace, &workspace, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].status, "completed");
+        let metadata: JsonValue = serde_json::from_str(&journal[0].usage_json).unwrap();
+        assert_eq!(metadata["_pioneer_observation"]["causal_parent"], parent);
+        let observation = store
+            .execution_observation_latest(
+                &workspace,
+                &h.sandbox_thread_id,
+                &format!("provider:journal:{}", journal[0].id),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observation.parent_operation_id.as_deref(),
+            Some(parent.as_str())
+        );
+        assert_eq!(
+            observation.turn_id.as_deref(),
+            Some(h.sandbox_turn_id.as_str())
+        );
+    }
 }
 
 #[tokio::test]

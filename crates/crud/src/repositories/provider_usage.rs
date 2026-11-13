@@ -108,16 +108,15 @@ impl CrudStore {
                 None
             };
             let parent = if let Some(parent) = causal_parent.filter(|_| causal_turn.is_none()) {
-                use pioneer_entity::execution_observation as fact;
-                Some(
-                    fact::Entity::find()
-                        .filter(fact::Column::WorkspaceId.eq(&record.workspace_id))
-                        .filter(fact::Column::OperationId.eq(parent))
-                        .order_by_desc(fact::Column::Revision)
-                        .one(&self.connection)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("usage causal parent unavailable"))?,
-                )
+                let parent =
+                    find_usage_causal_parent(&self.connection, &record.workspace_id, parent)
+                        .await?;
+                // Keep the durable parent identity in both the journal and its
+                // projection. Preparation reads only scoped observation metadata;
+                // commit_revision rechecks parent existence, ownership and scope
+                // inside the same transaction as the journal publication.
+                value["_pioneer_observation"]["causal_parent"] = parent.operation_id.clone().into();
+                Some(parent)
             } else {
                 None
             };
@@ -482,4 +481,50 @@ fn fit_journal_diagnostics(value: &mut serde_json::Value) -> Result<()> {
         value["_pioneer_observation"]["diagnostic_loss"] = serde_json::json!({"context_entries_dropped_for_numeric_capacity":dropped,"financial_facts_dropped":false});
     }
     Ok(())
+}
+
+/// Native CLI tools publish a canonical item without ToolObservation, whereas
+/// the shared orchestrator scopes nested provider work to its first attempt.
+/// Resolve that one known identity difference against persisted evidence, never
+/// by dropping a missing parent or guessing a turn/workspace owner.
+async fn find_usage_causal_parent<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    requested: &str,
+) -> Result<pioneer_entity::execution_observation::Model> {
+    use pioneer_entity::execution_observation as fact;
+    let exact = fact::Entity::find()
+        .filter(fact::Column::WorkspaceId.eq(workspace_id))
+        .filter(fact::Column::OperationId.eq(requested))
+        .order_by_desc(fact::Column::Revision)
+        .one(db)
+        .await?;
+    if let Some(parent) = exact {
+        return Ok(parent);
+    }
+    let logical = requested
+        .strip_prefix("tool:")
+        .and_then(|identity| identity.strip_suffix(":1"))
+        .and_then(|identity| identity.split_once(':'));
+    if let Some((turn_id, item_id)) = logical {
+        let item = fact::Entity::find()
+            .filter(fact::Column::WorkspaceId.eq(workspace_id))
+            .filter(fact::Column::OperationId.eq(format!("item:{turn_id}:{item_id}")))
+            .order_by_desc(fact::Column::Revision)
+            .one(db)
+            .await?;
+        if let Some(item) = item {
+            let facts: serde_json::Value = serde_json::from_str(&item.facts_json)?;
+            ensure!(
+                item.kind == "tool_invocation"
+                    && item.turn_id.as_deref() == Some(turn_id)
+                    && facts
+                        .get("observation")
+                        .is_some_and(serde_json::Value::is_null),
+                "usage causal parent is not an unobserved CLI tool"
+            );
+            return Ok(item);
+        }
+    }
+    anyhow::bail!("usage causal parent unavailable")
 }
