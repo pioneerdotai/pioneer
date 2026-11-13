@@ -59,8 +59,30 @@ the free Container registry policy will be announced at least one month ahead.
 These images are candidates. The workflow does not add them to Gateway's catalog,
 change installed Apps, or establish production readiness. Before integration,
 separately verify Microsandbox startup on both architectures, networking and
-ports, writable data, and application compatibility. Do not run this workflow
-while the current restriction on builds and tests remains in effect.
+ports, writable data, and application compatibility. This workflow only builds
+and publishes runtime images; it does not run application or Gateway tests.
+
+## Published checkpoint
+
+The [first publication run](https://github.com/pioneerdotai/pioneer/actions/runs/43411306752)
+completed successfully on November 13, 2026, from source revision
+`b739d6720a0714cf9fd7b0fa5cfbefb169ea234b`. All four packages are public.
+Public package creation was enabled in the organization; private and internal
+package settings were left unchanged.
+
+The exact [candidate catalog](runtime-catalog.candidate.json) is retained in Git
+independently of the seven-day Actions artifact retention. It records published
+image index digests and both supported platforms for future Gateway integration.
+Anonymous registry access was verified for all four indexes, both architecture
+manifests and configurations, and every referenced layer endpoint. Layer checks
+verified registry authorization and HTTPS download redirects without downloading
+the complete layers. Manifest/configuration contents were checked against their
+SHA-256 digests. All final configurations
+use UID/GID `65532:65532` and have no default Entrypoint or CMD.
+
+These checks establish publication and download availability. They do not
+establish execution compatibility with Microsandbox; the catalog remains marked
+`candidate-not-qualified-in-microsandbox` until that separate qualification.
 
 ## Launch contract
 
