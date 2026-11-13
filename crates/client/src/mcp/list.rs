@@ -3,6 +3,11 @@
 use pioneer_protocol::{McpListItem, McpListParams, McpServerDetailsResponse};
 use std::collections::HashSet;
 
+/// Standalone screens and pickers hide owned records; common catalogs retain them.
+pub fn mcp_is_standalone(server: &McpListItem) -> bool {
+    server.plugin_owner.is_none()
+}
+
 pub const MCP_INSTALL_PENDING_KEY: &str = "__install__";
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -182,6 +187,7 @@ mod tests {
 
     pub(crate) fn server(id: &str, name: &str) -> McpListItem {
         McpListItem {
+            plugin_owner: None,
             id: id.to_owned(),
             name: name.to_owned(),
             display_name: None,

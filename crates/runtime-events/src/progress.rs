@@ -12,6 +12,19 @@ use serde_json::Value as JsonValue;
 use tokio::sync::broadcast;
 use tracing::debug;
 
+#[derive(Debug, Default)]
+struct ProgressFlushWorker {
+    task: Option<Arc<tokio::sync::Mutex<ProgressFlushCompletion>>>,
+    wake: Arc<tokio::sync::Notify>,
+    failure: Option<String>,
+    closed: bool,
+}
+#[derive(Debug)]
+struct ProgressFlushCompletion {
+    task: Option<tokio::task::JoinHandle<()>>,
+    failure: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProgressCoalescerConfig {
     pub flush_interval: Duration,
@@ -169,6 +182,7 @@ struct ProgressCoalescerState {
     pending_delta_bytes: u64,
     heartbeats: HashMap<HeartbeatKey, PendingHeartbeat>,
     flush_scheduled: bool,
+    closed: bool,
 }
 
 #[derive(Debug)]
@@ -179,6 +193,17 @@ struct ProgressCoalescerInner {
     state: StdMutex<ProgressCoalescerState>,
     live_tx: broadcast::Sender<WorkItem<AgentProgressEvent>>,
     config: ProgressCoalescerConfig,
+    flush_worker: StdMutex<ProgressFlushWorker>,
+}
+
+impl Drop for ProgressCoalescerInner {
+    fn drop(&mut self) {
+        self.flush_worker
+            .get_mut()
+            .expect("progress worker ownership poisoned")
+            .wake
+            .notify_one();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +230,48 @@ impl ProgressCoalescer {
                     "estimate: pending delta UTF-8 bytes only; payload/markdown/envelope excluded",
                 ),
                 config,
+                flush_worker: StdMutex::new(ProgressFlushWorker::default()),
             }),
+        }
+    }
+
+    pub async fn shutdown_and_wait(&self) -> Result<(), String> {
+        let workers = &self.inner.flush_worker;
+        let tasks = {
+            let mut workers = workers.lock().expect("progress worker ownership poisoned");
+            workers.closed = true;
+            self.inner
+                .state
+                .lock()
+                .expect("progress coalescer poisoned")
+                .closed = true;
+            workers.wake.notify_one();
+            workers.task.clone()
+        };
+        for completion in tasks.into_iter() {
+            let mut completion = completion.lock().await;
+            if let Some(task) = completion.task.as_mut() {
+                let result = task.await;
+                completion.task.take();
+                if result.is_err() {
+                    completion.failure = Some("progress flush worker failed".into());
+                }
+            }
+            if let Some(error) = &completion.failure {
+                workers
+                    .lock()
+                    .expect("progress ownership poisoned")
+                    .failure
+                    .get_or_insert(error.clone());
+            }
+        }
+        // No recursive worker or offer can register after the closed gate.
+        self.flush_all().await;
+        let mut workers = workers.lock().expect("progress ownership poisoned");
+        workers.task.take();
+        match &workers.failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
         }
     }
 
@@ -276,6 +342,9 @@ impl ProgressCoalescer {
                 .state
                 .lock()
                 .expect("progress coalescer poisoned");
+            if state.closed {
+                return;
+            }
             let key = HeartbeatKey {
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
@@ -574,6 +643,9 @@ impl ProgressCoalescer {
                 .state
                 .lock()
                 .expect("progress coalescer poisoned");
+            if state.closed {
+                return;
+            }
             let is_new = !state.pending.contains_key(&key);
             if is_new && self.total_pending_keys(&state) >= self.inner.config.max_pending_keys {
                 self.inner.observer.outcome(QueueOutcome::Rejected, 1);
@@ -644,7 +716,7 @@ impl ProgressCoalescer {
     }
 
     fn schedule_flush(&self) {
-        let coalescer = self.clone();
+        let owner = Arc::downgrade(&self.inner);
         if tokio::runtime::Handle::try_current().is_err() {
             if let Ok(mut state) = self.inner.state.lock() {
                 state.flush_scheduled = false;
@@ -658,19 +730,63 @@ impl ProgressCoalescer {
             pioneer_observability::work::Trigger::Timer,
             ExecutorRole::Event,
         );
-        tokio::spawn(timer.scope(async move {
-            pioneer_observability::live::sleeping(
-                coalescer.inner.config.flush_interval,
-                tokio::time::sleep(coalescer.inner.config.flush_interval),
-            )
-            .await;
-            let (events, has_more) =
-                coalescer.drain_batch(pioneer_observability::updates::FlushReason::Timer);
-            coalescer.send_live_events(events);
-            if has_more {
-                coalescer.schedule_flush();
+        {
+            let workers = &self.inner.flush_worker;
+            let mut workers = workers.lock().expect("progress ownership poisoned");
+            if workers.closed {
+                return;
             }
-        }));
+            if workers.task.is_none() {
+                // One actual flush worker for this coalescer. Manual
+                // flushes and new offers only wake it; no recursive task queue.
+                let wake = workers.wake.clone();
+                workers.task = Some(Arc::new(tokio::sync::Mutex::new(ProgressFlushCompletion {
+                    task: Some(tokio::spawn(timer.scope(async move {
+                        loop {
+                            wake.notified().await;
+                            let Some(inner) = owner.upgrade() else {
+                                break;
+                            };
+                            let coalescer = ProgressCoalescer { inner };
+                            if coalescer
+                                .inner
+                                .state
+                                .lock()
+                                .expect("progress coalescer poisoned")
+                                .closed
+                            {
+                                break;
+                            }
+                            loop {
+                                pioneer_observability::live::sleeping(
+                                    coalescer.inner.config.flush_interval,
+                                    tokio::time::sleep(coalescer.inner.config.flush_interval),
+                                )
+                                .await;
+                                let (events, has_more) = coalescer.drain_batch(
+                                    pioneer_observability::updates::FlushReason::Timer,
+                                );
+                                coalescer.send_live_events(events);
+                                if coalescer
+                                    .inner
+                                    .state
+                                    .lock()
+                                    .expect("progress coalescer poisoned")
+                                    .closed
+                                {
+                                    return;
+                                }
+                                if !has_more {
+                                    break;
+                                }
+                            }
+                        }
+                    }))),
+                    failure: None,
+                })));
+            }
+            workers.wake.notify_one();
+        }
     }
 
     fn drain_batch(

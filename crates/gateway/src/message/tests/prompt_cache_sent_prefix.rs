@@ -347,7 +347,16 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
         let mut bounded_item_id = None;
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                match committed.recv().await.unwrap() {
+                let event = match committed.recv().await {
+                    Ok(event) => event,
+                    // Terminal persistence may retire this unsubscribed actor
+                    // before the terminal event reaches its in-memory hub.
+                    // Confirm the durable outcome below, rather than requiring
+                    // the actor to outlive its completed Turn.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(error) => panic!("committed event stream lost prefix evidence: {error}"),
+                };
+                match event {
                     AgentDurableEvent::ItemCompleted { notification }
                         if matches!(&notification.item, TurnItem::DynamicToolCall {
                             tool_name, success: Some(false), ..
@@ -391,6 +400,12 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
         })
         .await
         .unwrap();
+        let (_, completed) = store
+            .get_turn(&thread.id, &turn.id)
+            .await
+            .unwrap()
+            .expect("the loop must retain its durable Turn");
+        assert_eq!(completed.status, TurnStatus::Completed, "{completed:?}");
         assert_eq!(acked_tools, ["cache_error", "cache_slow"]);
         assert!(
             failed_tool_recorded,

@@ -1,0 +1,1843 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PluginShellResponse",
+  "type": "object",
+  "properties": {
+    "accepted": {
+      "type": "boolean"
+    },
+    "active_flows": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "command_receipt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PluginCommandReceipt"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "launches": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NativeOAuthLaunch"
+      }
+    },
+    "operation_id": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "origin": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PluginCommandOrigin"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "parent": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PluginPublication"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "picker": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PluginPickerRow"
+      }
+    }
+  },
+  "required": [
+    "accepted",
+    "launches",
+    "picker",
+    "active_flows"
+  ],
+  "$defs": {
+    "McpAuditEventSummary": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "callable_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "catalog_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "details": {
+          "default": null
+        },
+        "raw_tool_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_installation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_name": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "server_name",
+        "action",
+        "decision",
+        "created_at"
+      ]
+    },
+    "McpListItem": {
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "plugin_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy": {
+          "$ref": "#/$defs/McpPolicyState"
+        },
+        "prompts_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "required": [
+          "type"
+        ],
+        "resource_templates_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "resources_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "runtime": {
+          "$ref": "#/$defs/McpRuntimeStatus"
+        },
+        "scope": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "status": {
+          "$ref": "#/$defs/McpServerStatus"
+        },
+        "tools_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "scope",
+        "policy",
+        "required",
+        "runtime",
+        "tools_count",
+        "resources_count",
+        "resource_templates_count",
+        "prompts_count",
+        "status"
+      ]
+    },
+    "McpManagementDetails": {
+      "description": "Configuration and diagnostics intentionally excluded from the operational\nMCP capability returned by discovery endpoints.",
+      "type": "object",
+      "properties": {
+        "audit": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpAuditEventSummary"
+          }
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "health": {
+          "$ref": "#/$defs/McpServerHealthDetails"
+        },
+        "oauth_cleanup_available": {
+          "description": "Device-neutral cleanup availability, including uncertain persistence.\nFalse after confirmed Clear; omitted by older Gateways.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "oauth_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpOAuthState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "recent_bindings": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpTurnBindingSummary"
+          }
+        },
+        "scope": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "source_kind": {
+          "$ref": "#/$defs/McpSourceKind"
+        },
+        "transport": {
+          "$ref": "#/$defs/McpTransportSummary"
+        }
+      },
+      "required": [
+        "scope",
+        "source_kind",
+        "transport",
+        "fingerprint",
+        "health"
+      ]
+    },
+    "McpOAuthState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "preparing",
+        "awaiting_callback",
+        "exchanging",
+        "resolving",
+        "retired",
+        "cleanup_required",
+        "authorized",
+        "auth_required",
+        "insufficient_scope",
+        "denied",
+        "cancelled",
+        "timed_out",
+        "failed"
+      ]
+    },
+    "McpPolicyState": {
+      "type": "object",
+      "properties": {
+        "allow_implicit_invocation": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "allow_implicit_invocation"
+      ]
+    },
+    "McpPromptCatalogItem": {
+      "type": "object",
+      "properties": {
+        "arguments_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "arguments_count"
+      ]
+    },
+    "McpResourceCatalogItem": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "McpResourceTemplateCatalogItem": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri_template": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "McpRuntimeState": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpRuntimeStatus": {
+      "type": "object",
+      "properties": {
+        "last_seen_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "live": {
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/McpRuntimeState"
+        }
+      },
+      "required": [
+        "state",
+        "live"
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "McpServerCatalogDetails": {
+      "type": "object",
+      "properties": {
+        "catalog_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generated_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "prompts": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpPromptCatalogItem"
+          }
+        },
+        "resource_templates": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpResourceTemplateCatalogItem"
+          }
+        },
+        "resources": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpResourceCatalogItem"
+          }
+        },
+        "server_info": {
+          "default": null
+        },
+        "server_instructions_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tools": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpToolCatalogItem"
+          }
+        }
+      }
+    },
+    "McpServerDetailsResponse": {
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "$ref": "#/$defs/McpServerCatalogDetails"
+        },
+        "generated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "management": {
+          "description": "Management-only configuration and diagnostics. Omitted unless the\ncaller may manage the selected MCP installation.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpManagementDetails"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "server": {
+          "$ref": "#/$defs/McpListItem"
+        },
+        "snapshot_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "snapshot_version",
+        "generated_at",
+        "server",
+        "catalog"
+      ]
+    },
+    "McpServerHealthDetails": {
+      "type": "object",
+      "properties": {
+        "catalog_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next_retry_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "retry_attempt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runtime": {
+          "$ref": "#/$defs/McpRuntimeStatus"
+        },
+        "status": {
+          "$ref": "#/$defs/McpServerStatus"
+        },
+        "status_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stderr_tail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "runtime",
+        "status"
+      ]
+    },
+    "McpServerStatus": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpSourceKind": {
+      "type": "string",
+      "enum": [
+        "config"
+      ]
+    },
+    "McpToolAnnotationSummary": {
+      "type": "object",
+      "properties": {
+        "destructive_hint": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "idempotent_hint": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "open_world_hint": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "read_only_hint": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "McpToolCatalogItem": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpToolAnnotationSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_schema_summary": true,
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "McpTransportSummary": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "stdio"
+            }
+          },
+          "required": [
+            "kind",
+            "command"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "streamable_http"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "url"
+          ]
+        }
+      ]
+    },
+    "McpTurnBindingSummary": {
+      "type": "object",
+      "properties": {
+        "callable_name": {
+          "type": "string"
+        },
+        "capability_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "catalog_version": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "raw_tool_name": {
+          "type": "string"
+        },
+        "selection_reason": {
+          "type": "string"
+        },
+        "server_installation_id": {
+          "type": "string"
+        },
+        "server_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server_installation_id",
+        "server_name",
+        "raw_tool_name",
+        "callable_name",
+        "catalog_version",
+        "fingerprint",
+        "selection_reason"
+      ]
+    },
+    "NativeOAuthLaunch": {
+      "type": "object",
+      "properties": {
+        "authorization_url": {
+          "type": "string"
+        },
+        "flow_id": {
+          "type": "string"
+        },
+        "redirect_uri": {
+          "type": "string"
+        },
+        "server_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "flow_id",
+        "workspace_id",
+        "server_id",
+        "authorization_url",
+        "redirect_uri"
+      ]
+    },
+    "PluginCommandOrigin": {
+      "type": "object",
+      "properties": {
+        "authorization_sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "connection_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "connection_id": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "connection_generation",
+        "authorization_sequence"
+      ]
+    },
+    "PluginCommandReceipt": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "origin": {
+          "$ref": "#/$defs/PluginCommandOrigin"
+        },
+        "parent_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_id",
+        "generation",
+        "origin"
+      ]
+    },
+    "PluginComponentItem": {
+      "type": "object",
+      "properties": {
+        "diagnostic": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "mcp_installation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "member_key": {
+          "type": "string"
+        },
+        "runtime_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skill_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "member_key",
+        "status"
+      ]
+    },
+    "PluginDiagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "path",
+        "message"
+      ]
+    },
+    "PluginItem": {
+      "type": "object",
+      "properties": {
+        "components": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginComponentItem"
+          }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2048,
+          "default": null
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginDiagnostic"
+          }
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "state": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "$ref": "#/$defs/PluginMetadata",
+          "default": {
+            "display_name": null,
+            "short_description": null,
+            "description": null,
+            "long_description": null,
+            "developer_name": null,
+            "homepage": null,
+            "repository": null,
+            "documentation_url": null,
+            "support_url": null,
+            "privacy_policy_url": null,
+            "terms_of_service_url": null,
+            "license": null,
+            "category": null,
+            "brand_color": null,
+            "author": {
+              "name": null,
+              "email": null,
+              "url": null
+            },
+            "keywords": [],
+            "default_prompts": [],
+            "logo": null,
+            "composer_icon": null
+          }
+        },
+        "allow_implicit_invocation": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "enabled",
+        "state",
+        "revision",
+        "status",
+        "components",
+        "diagnostics"
+      ]
+    },
+    "PluginOAuthPresentation": {
+      "type": "object",
+      "properties": {
+        "browser_failed": {
+          "type": "boolean"
+        },
+        "flow_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_id": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/McpOAuthState"
+        }
+      },
+      "required": [
+        "server_id",
+        "state",
+        "browser_failed"
+      ]
+    },
+    "PluginOperationPublication": {
+      "type": "object",
+      "properties": {
+        "busy": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "native_operation_id": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin": {
+          "$ref": "#/$defs/PluginCommandOrigin"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginsMutationResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uncertain": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "generation",
+        "origin",
+        "busy",
+        "uncertain"
+      ]
+    },
+    "PluginOwner": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "plugin_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "member_key"
+      ]
+    },
+    "PluginPickerRow": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "plugin_id": {
+          "type": "string"
+        },
+        "selectable": {
+          "type": "boolean"
+        },
+        "selected": {
+          "type": "boolean"
+        },
+        "stale": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "key",
+        "label",
+        "selected",
+        "selectable",
+        "stale"
+      ]
+    },
+    "PluginPublication": {
+      "type": "object",
+      "properties": {
+        "busy": {
+          "type": "boolean"
+        },
+        "connection_id": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "details": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginItem"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "loaded": {
+          "type": "boolean"
+        },
+        "managing": {
+          "type": "boolean"
+        },
+        "mcp": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/McpListItem"
+          }
+        },
+        "mcp_details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/McpServerDetailsResponse"
+          }
+        },
+        "mutation_uncertain": {
+          "type": "boolean"
+        },
+        "oauth": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginOAuthPresentation"
+          }
+        },
+        "operations": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/PluginOperationPublication"
+          }
+        },
+        "plugin_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plugins": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginItem"
+          }
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "skill_health": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillHealthItem"
+          }
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillListItem"
+          }
+        }
+      },
+      "required": [
+        "operations",
+        "loaded",
+        "revision",
+        "generation",
+        "plugins",
+        "skills",
+        "skill_health",
+        "mcp",
+        "mcp_details",
+        "oauth",
+        "busy",
+        "managing",
+        "mutation_uncertain"
+      ]
+    },
+    "PluginsMutationResponse": {
+      "type": "object",
+      "properties": {
+        "plugin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginItem"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "removed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "removed"
+      ]
+    },
+    "SkillAuditTimelineItem": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "details_json": {
+          "type": "string"
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action",
+        "decision",
+        "created_at",
+        "details_json"
+      ]
+    },
+    "SkillDependencyDiagnostic": {
+      "type": "object",
+      "properties": {
+        "hint": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name",
+        "status",
+        "hint"
+      ]
+    },
+    "SkillHealthItem": {
+      "type": "object",
+      "properties": {
+        "dependency_diagnostics": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillDependencyDiagnostic"
+          }
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recent_audit": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillAuditTimelineItem"
+          }
+        },
+        "security_findings": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillSecurityFinding"
+          }
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "trust_gate": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillTrustGateStatus"
+          }
+        },
+        "trust_level": {
+          "type": "string"
+        },
+        "validation_issues": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillValidationDiagnostic"
+          }
+        }
+      },
+      "required": [
+        "skill_id",
+        "slug",
+        "source_kind",
+        "trust_level"
+      ]
+    },
+    "SkillHealthSummary": {
+      "type": "object",
+      "properties": {
+        "dependency_failures": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillDependencyDiagnostic"
+          }
+        },
+        "security_blocks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillSecurityFinding"
+          }
+        },
+        "status": {
+          "type": "string"
+        },
+        "validation_issues": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillValidationDiagnostic"
+          }
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillInstallState": {
+      "type": "object",
+      "properties": {
+        "install_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "lifecycle_editable": {
+          "type": "boolean",
+          "default": true
+        },
+        "managed": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "managed",
+        "installed"
+      ]
+    },
+    "SkillListItem": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "health": {
+          "$ref": "#/$defs/SkillHealthSummary"
+        },
+        "install": {
+          "$ref": "#/$defs/SkillInstallState"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillPackMembership"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plugin_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy": {
+          "$ref": "#/$defs/SkillPolicyState"
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trust_level": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "skill_id",
+        "slug",
+        "source_kind",
+        "display_name",
+        "description",
+        "fingerprint",
+        "trust_level",
+        "install",
+        "policy",
+        "health",
+        "status"
+      ]
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackMembership": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "pack_id": {
+          "$ref": "#/$defs/SkillPackId"
+        }
+      },
+      "required": [
+        "pack_id",
+        "member_key"
+      ]
+    },
+    "SkillPolicyState": {
+      "type": "object",
+      "properties": {
+        "allow_implicit_invocation": {
+          "type": "boolean"
+        },
+        "allow_implicit_invocation_editable": {
+          "type": "boolean",
+          "default": true
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "allow_implicit_invocation"
+      ]
+    },
+    "SkillSecurityFinding": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule_id",
+        "severity",
+        "message"
+      ]
+    },
+    "SkillTrustGateStatus": {
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": "boolean"
+        },
+        "minimum_trust": {
+          "type": "string"
+        },
+        "tool_kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_kind",
+        "minimum_trust",
+        "allowed"
+      ]
+    },
+    "SkillValidationDiagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "field_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "level",
+        "message"
+      ]
+    },
+    "PluginMetadata": {
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "short_description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "long_description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "developer_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "homepage": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "repository": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "documentation_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "support_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "privacy_policy_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "terms_of_service_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "license": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "category": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "brand_color": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "author": {
+          "$ref": "#/$defs/PluginAuthor",
+          "default": {
+            "name": null,
+            "email": null,
+            "url": null
+          }
+        },
+        "keywords": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "default_prompts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "logo": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "composer_icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      }
+    },
+    "PluginAuthor": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "description": "Authored presentation only. None of these fields grant execution authority."
+    },
+    "ImageReference": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision"
+      ],
+      "description": "Immutable image reference. Gateway inventory exposes a native storage link, never image bytes."
+    }
+  }
+}

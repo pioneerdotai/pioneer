@@ -1,0 +1,16 @@
+[package]
+name = "pioneer-desktop-plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true, features = ["component", "assets"] }
+pioneer-client.workspace = true
+rust-i18n.workspace = true
+pioneer-desktop-foundation.workspace = true
+
+[dev-dependencies]
+pioneer-protocol.workspace = true
+gpui-kit = { workspace = true, features = ["test-support"] }
+pioneer-client = { workspace = true, features = ["test-support"] }

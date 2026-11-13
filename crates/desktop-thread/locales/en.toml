@@ -333,9 +333,20 @@
 "timeline.web_search.running" = "Searching the web"
 "timeline.work_group.completed" = "Worked"
 
+"chat.composer.add_menu.plugins" = "Add plugins"
+
+"plugins.empty" = "No plugins installed"
+"plugins.error" = "Could not load plugins. Try again."
+"plugins.loading" = "Loading plugins…"
+"plugins.search" = "Search plugins"
+"plugins.select" = "Select plugins"
+"plugins.unavailable" = "Unavailable"
+
 "timeline.html.loading" = "Loading page…"
 "timeline.html.failed" = "Couldn’t display this page"
 "chat.composer.preparing_send" = "Preparing message"
+"plugins.retry" = "Try again"
+"plugins.stale" = "Selected revision is no longer current"
 
 "chat.composer.model.context_label" = "Context window"
 "chat.composer.model.context_auto" = "Auto — up to %{tokens} tokens"

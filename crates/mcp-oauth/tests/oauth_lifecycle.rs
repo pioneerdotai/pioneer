@@ -106,6 +106,7 @@ struct Fake {
     discovery_mode: AtomicUsize,
     authorization_server: Mutex<Option<String>>,
     discovery_headers: Mutex<Vec<HeaderMap>>,
+    mcp_headers: Mutex<Vec<HeaderMap>>,
     deny_mcp: AtomicUsize,
     resources: AtomicBool,
     stateful: AtomicBool,
@@ -142,6 +143,7 @@ impl Server {
             discovery_mode: AtomicUsize::new(0),
             authorization_server: Mutex::new(None),
             discovery_headers: Mutex::new(vec![]),
+            mcp_headers: Mutex::new(vec![]),
             deny_mcp: AtomicUsize::new(0),
             resources: AtomicBool::new(false),
             stateful: AtomicBool::new(false),
@@ -203,12 +205,24 @@ async fn resource_metadata(State(s): State<Arc<Fake>>) -> Json<Value> {
 }
 async fn as_metadata(State(s): State<Arc<Fake>>, headers: HeaderMap) -> Response {
     s.discovery_headers.lock().unwrap().push(headers);
-    match s.discovery_mode.load(Ordering::SeqCst) {
+    let mode = s.discovery_mode.load(Ordering::SeqCst);
+    match mode {
         1 => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         2 => return StatusCode::NOT_FOUND.into_response(),
         _ => {}
     }
-    Json(json!({"issuer":s.base,"authorization_endpoint":format!("{}/authorize",s.base),"token_endpoint":format!("{}/token",s.base),"registration_endpoint":format!("{}/register",s.base),"token_endpoint_auth_methods_supported":["client_secret_basic","client_secret_post","none"],"response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true,"scopes_supported":["read","write","offline_access"]})).into_response()
+    let mut metadata = json!({"issuer":s.base,"authorization_endpoint":format!("{}/authorize",s.base),"token_endpoint":format!("{}/token",s.base),"registration_endpoint":format!("{}/register",s.base),"token_endpoint_auth_methods_supported":["client_secret_basic","client_secret_post","none"],"response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true,"scopes_supported":["read","write","offline_access"]});
+    // CIMD-only provider, or a provider supporting both CIMD and DCR.
+    if matches!(mode, 3 | 4) {
+        metadata["client_id_metadata_document_supported"] = json!(true);
+        if mode == 3 {
+            metadata
+                .as_object_mut()
+                .unwrap()
+                .remove("registration_endpoint");
+        }
+    }
+    Json(metadata).into_response()
 }
 async fn register(State(s): State<Arc<Fake>>, Json(body): Json<Value>) -> Response {
     s.registrations.fetch_add(1, Ordering::SeqCst);
@@ -238,6 +252,12 @@ async fn token(
             fields.get("client_secret").map(String::as_str),
             Some("client-secret-canary")
         );
+    } else if fields.get("client_id").map(String::as_str)
+        == Some("https://getpioneer.dev/oauth/client-metadata.json")
+    {
+        assert!(matches!(s.discovery_mode.load(Ordering::SeqCst), 3 | 4));
+        assert!(headers.get("authorization").is_none());
+        assert!(!fields.contains_key("client_secret"));
     } else if s.preregistered_post.load(Ordering::SeqCst) {
         assert!(headers.get("authorization").is_none());
         assert_eq!(
@@ -318,6 +338,7 @@ async fn delete_mcp_session(State(s): State<Arc<Fake>>, headers: HeaderMap) -> S
 }
 
 async fn mcp(State(s): State<Arc<Fake>>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    s.mcp_headers.lock().unwrap().push(headers.clone());
     let deny = s.deny_mcp.load(Ordering::SeqCst);
     if deny == 6 && body["method"] == "resources/list" {
         return (
@@ -661,6 +682,55 @@ async fn protected_install_starts_one_browser_flow_and_callback_connects() {
     session.shutdown().await;
     h.service.shutdown().await;
 }
+#[tokio::test]
+async fn cimd_login_restores_and_refreshes_without_dynamic_registration() {
+    for discovery_mode in [3, 4] {
+        let h = Harness::new(true).await;
+        h.server
+            .data
+            .discovery_mode
+            .store(discovery_mode, Ordering::SeqCst);
+        let event = h.login().await;
+        let url = url::Url::parse(event.authorization_url.as_ref().unwrap()).unwrap();
+        let query = url.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            query["client_id"],
+            "https://getpioneer.dev/oauth/client-metadata.json"
+        );
+        assert_eq!(query["code_challenge_method"], "S256");
+        let record = h.persistence.read("installation").await.unwrap().unwrap();
+        assert_eq!(
+            record.registration.client_id.as_str(),
+            query["client_id"].as_ref()
+        );
+        assert!(record.registration.client_secret.is_none());
+        assert!(record.registration.registration_response.is_none());
+        let mut session = h.connect().await.unwrap();
+        assert_eq!(session.initial_catalog().tools_count(), 1);
+        session.shutdown().await;
+        h.service.shutdown().await;
+
+        let restored = McpOAuthService::new(h.persistence.clone(), h.sink.clone()).unwrap();
+        let client = restored
+            .client("installation", &h.server.installation())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.get_access_token().await.unwrap(), "access-0");
+        client
+            .auth_manager
+            .lock()
+            .await
+            .refresh_token()
+            .await
+            .unwrap();
+        assert_eq!(h.server.data.exchanges.load(Ordering::SeqCst), 1);
+        assert_eq!(h.server.data.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(h.server.data.registrations.load(Ordering::SeqCst), 0);
+        restored.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn wrong_state_or_issuer_does_not_consume_valid_callback() {
     let h = Harness::new(true).await;
@@ -1359,6 +1429,7 @@ async fn expired_credentials_survive_resave_and_refresh_before_first_connection(
 #[tokio::test]
 async fn pre_registered_secret_scopes_and_s256_are_used_without_dcr() {
     let h = Harness::new(true).await;
+    h.server.data.discovery_mode.store(3, Ordering::SeqCst);
     let mut installation = h.server.installation();
     h.store
         .put_string(
@@ -1737,11 +1808,32 @@ async fn explicit_authorization_header_never_starts_native_oauth() {
         .unwrap();
     let connector = RmcpRuntimeConnector::with_oauth(Arc::new(h.service.clone()));
     let mut session = connector
-        .connect(installation, "installation".into(), Arc::new(Empty), 0)
+        .connect(
+            installation.clone(),
+            "installation".into(),
+            Arc::new(Empty),
+            0,
+        )
         .await
         .unwrap();
     assert_eq!(h.sink.browsers(), 0);
     assert_eq!(h.server.data.registrations.load(Ordering::SeqCst), 0);
+    assert!(
+        h.service
+            .client("installation", &installation)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        h.service
+            .sign_in("installation", &installation, 10, REDIRECT)
+            .await
+            .is_err()
+    );
+    for headers in h.server.data.mcp_headers.lock().unwrap().iter() {
+        assert_eq!(headers["authorization"], "Bearer explicit");
+    }
     session.shutdown().await;
     h.service.shutdown().await;
 }
@@ -1785,31 +1877,68 @@ async fn repeated_token_exchanges_are_rate_limited_without_erasing_credentials()
 
 #[tokio::test]
 async fn replacing_native_oauth_with_explicit_header_clears_old_credentials() {
-    let h = Harness::new(true).await;
-    h.login().await;
-    let mut installation = h.server.installation();
-    if let McpTransportConfig::StreamableHttp { headers, .. } = &mut installation.transport {
-        headers.insert(
-            "Authorization".into(),
-            pioneer_mcp::McpConfigValue::Literal {
-                value: "Bearer explicit".into(),
-            },
-        );
-    }
-    h.service
-        .synchronize("installation", &installation)
-        .await
-        .unwrap();
-    assert!(h.persistence.read("installation").await.unwrap().is_none());
-    assert!(
+    // Package provenance never changes the header policy. Exercise the real
+    // credential transition and wire request so stale OAuth cannot take over.
+    for source_ref in [
+        json!({}),
+        json!({"plugin_id":"parent", "member_key":"http"}),
+    ] {
+        let h = Harness::new(true).await;
+        h.login().await;
+        let mut installation = h.server.installation();
+        installation.source_ref = source_ref;
+        if let McpTransportConfig::StreamableHttp { headers, .. } = &mut installation.transport {
+            headers.insert(
+                "aUtHoRiZaTiOn".into(),
+                pioneer_mcp::McpConfigValue::Literal {
+                    value: "Bearer explicit".into(),
+                },
+            );
+            headers.insert(
+                "X-Context".into(),
+                pioneer_mcp::McpConfigValue::Literal {
+                    value: "keep".into(),
+                },
+            );
+        }
         h.service
-            .client("installation", &installation)
+            .synchronize("installation", &installation)
             .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(h.sink.browsers(), 1);
-    h.service.shutdown().await;
+            .unwrap();
+        assert!(h.persistence.read("installation").await.unwrap().is_none());
+        assert!(
+            h.service
+                .client("installation", &installation)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            h.service
+                .sign_in("installation", &installation, 10, REDIRECT)
+                .await
+                .is_err()
+        );
+        // Observe only the new explicit-header connection.
+        h.server.data.mcp_headers.lock().unwrap().clear();
+        let mut session = RmcpRuntimeConnector::with_oauth(Arc::new(h.service.clone()))
+            .connect(installation, "installation".into(), Arc::new(Empty), 0)
+            .await
+            .unwrap();
+        {
+            let requests = h.server.data.mcp_headers.lock().unwrap();
+            assert!(!requests.is_empty());
+            for headers in requests.iter() {
+                assert_eq!(headers["authorization"], "Bearer explicit");
+                assert_eq!(headers.get_all("authorization").iter().count(), 1);
+                assert_eq!(headers["x-context"], "keep");
+            }
+        }
+        assert_eq!(h.sink.browsers(), 1);
+        assert_eq!(h.server.data.registrations.load(Ordering::SeqCst), 1);
+        session.shutdown().await;
+        h.service.shutdown().await;
+    }
 }
 
 #[tokio::test]

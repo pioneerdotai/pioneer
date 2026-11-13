@@ -611,6 +611,23 @@ impl ComposerView {
                     menu
                 };
 
+                let menu = if can_use_skills && can_use_mcp {
+                    menu.item(Self::composer_add_menu_item(
+                        t!("chat.composer.add_menu.plugins").to_string().into(),
+                        PioneerIconName::Plugin,
+                        {
+                            let entity = desktop_entity.clone();
+                            move |window, cx| {
+                                let _ = entity.update(cx, |view, cx| {
+                                    view.open_composer_plugins_picker(window, cx)
+                                });
+                            }
+                        },
+                    ))
+                } else {
+                    menu
+                };
+
                 if can_use_mcp {
                     menu.item(Self::composer_add_menu_item(
                         t!("chat.composer.add_menu.mcp").to_string().into(),
@@ -790,7 +807,12 @@ impl ComposerView {
     ) -> AnyElement {
         let identity = capability.id.clone();
         let group_id = format!("composer-capability-chip-{identity}");
+        let plugin_icon = match &capability.kind {
+            ComposerCapabilityKind::Plugin { icon, .. } => Some(icon.clone()),
+            _ => None,
+        };
         let icon = match capability.kind {
+            ComposerCapabilityKind::Plugin { .. } => PioneerIconName::Plugin,
             ComposerCapabilityKind::Skill { .. } => PioneerIconName::Zap,
             ComposerCapabilityKind::McpServer { .. } | ComposerCapabilityKind::McpTool { .. } => {
                 PioneerIconName::Mcp
@@ -820,12 +842,18 @@ impl ComposerView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
-                        Icon::new(icon)
+                    .child(match plugin_icon {
+                        Some(icon) => self
+                            .plugin_images
+                            .element(icon.as_ref())
+                            .size_3()
+                            .into_any_element(),
+                        None => Icon::new(icon)
                             .size_3()
                             .opacity(0.8)
-                            .text_color(cx.theme().foreground),
-                    ),
+                            .text_color(cx.theme().foreground)
+                            .into_any_element(),
+                    }),
             )
             .child(
                 div()

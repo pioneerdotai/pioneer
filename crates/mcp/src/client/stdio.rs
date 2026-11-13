@@ -1,5 +1,8 @@
 use crate::runtime::{MaterializedStdioTransport, StderrTail};
-use anyhow::Result;
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
@@ -9,10 +12,12 @@ use rmcp::RoleClient;
 use rmcp::transport::async_rw::AsyncRwTransport;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::process::Command;
 use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::Mutex;
 
 pub(crate) const MCP_MAX_STDIO_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
@@ -75,9 +80,8 @@ pub(crate) type BoundedStdioTransport =
     AsyncRwTransport<RoleClient, BoundedLineReader<ManagedChildStdout>, ChildStdin>;
 
 pub(crate) struct ManagedChildStdout {
-    child: Option<Box<dyn ChildWrapper>>,
+    child: Arc<StdioChildOwner>,
     stdout: ChildStdout,
-    observation: Option<pioneer_observability::resources::ChildRegistration>,
 }
 
 impl AsyncRead for ManagedChildStdout {
@@ -90,29 +94,150 @@ impl AsyncRead for ManagedChildStdout {
     }
 }
 
+// The session retains the real process-group wrapper after transport close.
+// Drop can signal termination, but only this native helper acknowledges wait.
+pub(crate) struct StdioChildOwner {
+    state: Arc<Mutex<StdioChildState>>,
+    // Keep the public kill/wait future across cancelled observers.
+    stop: Mutex<Option<Shared<BoxFuture<'static, std::result::Result<(), Arc<std::io::Error>>>>>>,
+}
+struct StdioChildState {
+    child: Box<dyn ChildWrapper>,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
+    process_stopped: bool,
+    process_error: Option<String>,
+    observation: pioneer_observability::resources::ChildRegistration,
+    reader_error: Option<String>,
+}
+impl StdioChildOwner {
+    fn new(mut child: Box<dyn ChildWrapper>, tail: &StderrTail) -> Arc<Self> {
+        let observation = pioneer_observability::resources::ChildRegistration::register(
+            child.id(),
+            pioneer_observability::resources::ChildRole::Mcp,
+            None,
+        );
+        let stderr_reader = child
+            .inner_mut()
+            .stderr()
+            .take()
+            .map(|stderr| tail.spawn_reader(stderr));
+        Arc::new(Self {
+            state: Arc::new(Mutex::new(StdioChildState {
+                child,
+                stderr_reader,
+                process_stopped: false,
+                process_error: None,
+                observation,
+                reader_error: None,
+            })),
+            stop: Mutex::new(None),
+        })
+    }
+
+    pub(crate) async fn stop_and_wait(&self) -> std::io::Result<()> {
+        let completion = {
+            let mut slot = self.stop.lock().await;
+            slot.get_or_insert_with(|| {
+                let state = self.state.clone();
+                async move { Self::drain(state).await.map_err(Arc::new) }
+                    .boxed()
+                    .shared()
+            })
+            .clone()
+        };
+        let result = completion.clone().await;
+        if result.is_err() {
+            // Retry a failed public stop call while retaining reader errors.
+            // Cancellation never reaches this branch.
+            let mut slot = self.stop.lock().await;
+            if slot
+                .as_ref()
+                .is_some_and(|current| current.ptr_eq(&completion))
+            {
+                *slot = None;
+            }
+        }
+        result.map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
+    }
+
+    async fn drain(state: Arc<Mutex<StdioChildState>>) -> std::io::Result<()> {
+        let mut state = state.lock().await;
+        if !state.process_stopped {
+            let signal = state.child.start_kill();
+            #[cfg(unix)]
+            let signal = match signal {
+                Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                    // macOS rejects signals to a group containing only zombies.
+                    // Reap our retained leader, then signal the same group again:
+                    // a finished parent must not spare any remaining descendants.
+                    let parent = state.child.inner_mut();
+                    parent.start_kill()?;
+                    parent.wait().await?;
+                    state.child.start_kill()
+                }
+                result => result,
+            };
+            if let Err(error) = signal {
+                #[cfg(unix)]
+                let already_gone = error.raw_os_error() == Some(libc::ESRCH);
+                #[cfg(not(unix))]
+                let already_gone = false;
+                if !already_gone {
+                    tracing::warn!(
+                        operation = "signal",
+                        error_kind = ?error.kind(),
+                        os_error = error.raw_os_error(),
+                        "MCP stdio cleanup failed"
+                    );
+                    return Err(error);
+                }
+            }
+            let status = match state.child.wait().await {
+                Ok(status) => status,
+                Err(error) => {
+                    tracing::warn!(
+                        operation = "wait",
+                        error_kind = ?error.kind(),
+                        os_error = error.raw_os_error(),
+                        "MCP stdio cleanup failed"
+                    );
+                    state.process_error = Some("MCP process wait failed".into());
+                    return Err(error);
+                }
+            };
+            state.observation.exited(status.success());
+            state.process_stopped = true;
+        }
+        if let Some(reader) = state.stderr_reader.as_mut() {
+            reader.abort();
+            let result = (&mut *reader).await;
+            state.stderr_reader = None;
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                tracing::warn!(operation = "stderr_join", "MCP stdio cleanup failed");
+                state.reader_error = Some("MCP stderr reader join failed".into());
+            }
+        }
+        if let Some(error) = state.process_error.as_ref().or(state.reader_error.as_ref()) {
+            return Err(std::io::Error::other(error.clone()));
+        }
+        Ok(())
+    }
+}
 impl Drop for ManagedChildStdout {
     fn drop(&mut self) {
-        if let Some(child) = self.child.take() {
-            let observation = self.observation.take();
-            tokio::spawn(pioneer_observability::work::inherit(
-                pioneer_observability::work::Boundary::Child,
-                pioneer_observability::work::WorkKind::Child,
-                pioneer_observability::work::ExecutorRole::Child,
-                async move {
-                    let _observation = observation;
-                    let mut child = child;
-                    if let Err(error) = Box::into_pin(child.kill()).await {
-                        tracing::warn!(%error, "failed to terminate MCP stdio child process");
-                    }
-                },
-            ));
+        if let Ok(mut state) = self.child.state.try_lock()
+            && !state.process_stopped
+        {
+            let _ = state.child.start_kill();
         }
     }
 }
 
 pub(crate) fn build_stdio_transport(
     transport: &MaterializedStdioTransport,
-) -> Result<(BoundedStdioTransport, StderrTail)> {
+) -> std::io::Result<(BoundedStdioTransport, StderrTail, Arc<StdioChildOwner>)> {
     let stderr_tail = StderrTail::new(16 * 1024, transport.secrets.clone());
     let mut command = Command::new(transport.command.as_str());
     command.args(transport.args.iter().map(String::as_str));
@@ -136,34 +261,33 @@ pub(crate) fn build_stdio_transport(
     #[cfg(windows)]
     command.wrap(JobObject);
 
-    let mut child = command.spawn()?;
-    let observation = pioneer_observability::resources::ChildRegistration::register(
-        child.id(),
-        pioneer_observability::resources::ChildRole::Mcp,
-        None,
-    );
-    let stdin = child
-        .inner_mut()
-        .stdin()
-        .take()
-        .ok_or_else(|| std::io::Error::other("MCP stdio child stdin was not piped"))?;
-    let stdout = child
-        .inner_mut()
-        .stdout()
-        .take()
-        .ok_or_else(|| std::io::Error::other("MCP stdio child stdout was not piped"))?;
-    let stderr = child.inner_mut().stderr().take();
-    if let Some(stderr) = stderr {
-        stderr_tail.spawn_reader(stderr);
-    }
-
+    let child = command.spawn()?;
+    // Keep the wrapper and stderr reader together while taking the configured pipes.
+    let owner = StdioChildOwner::new(child, &stderr_tail);
+    let pipes = {
+        let mut state = owner
+            .state
+            .try_lock()
+            .expect("new stdio owner is unobserved");
+        let stdin = state.child.inner_mut().stdin().take();
+        let stdout = state.child.inner_mut().stdout().take();
+        (stdin, stdout)
+    };
+    let (Some(stdin), Some(stdout)) = pipes else {
+        return Err(std::io::Error::other(
+            "MCP stdio child stdin/stdout was not piped",
+        ));
+    };
     let reader = BoundedLineReader::new(
         ManagedChildStdout {
-            child: Some(child),
+            child: owner.clone(),
             stdout,
-            observation: Some(observation),
         },
         MCP_MAX_STDIO_FRAME_BYTES,
     );
-    Ok((AsyncRwTransport::new_client(reader, stdin), stderr_tail))
+    Ok((
+        AsyncRwTransport::new_client(reader, stdin),
+        stderr_tail,
+        owner,
+    ))
 }

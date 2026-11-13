@@ -12,6 +12,7 @@ pub struct Model {
     pub workspace_id: String,
     pub connection_id: i64,
     pub status: String,
+    pub purpose: String,
     pub file_name: String,
     pub archive_format: String,
     pub compressed_size_bytes: i64,

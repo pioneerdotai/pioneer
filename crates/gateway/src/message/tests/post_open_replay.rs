@@ -656,104 +656,121 @@ pub(super) fn pause_auth_unavailable(
     (waiting, release)
 }
 
-#[tokio::test]
-async fn native_authorization_unavailable_cannot_complete_a_live_lost_replay() {
+// Each case creates its own real database. Keep a watchdog per scenario so
+// setup for the other resource passes cannot consume its recovery budget.
+async fn assert_native_authorization_unavailable_requires_recovery(orphan: bool, pass: usize) {
     tokio::time::timeout(Duration::from_secs(20), async {
-        // All three resource passes; restart orphan shares the real durable path.
-        for (orphan, pass) in [(false, 0), (false, 1), (false, 2), (true, 2)] {
-            let mut f = Fixture::new(orphan).await;
-            f.use_member_observer().await;
-            let (entered, release) = pause_auth_unavailable(
-                &f.processor,
-                f.connection,
-                events::TURN_PERMISSION_REQUEST_OPENED,
-                THREAD,
-                pass,
-            );
-            let (id, mut opening) = f.open("authunavailable").await;
-            entered.await.unwrap();
-            opening.join().await.unwrap();
-            recv_response_by_id(&mut f.rx, &id).await;
-            recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
-            release.send(()).unwrap();
-            f.processor
-                .session_manager
-                .drain_thread_replays(f.connection)
-                .await;
-            f.outbound.writer_stopped().await;
-            assert!(
-                f.outbound
-                    .try_send_data(Message::Text("lost replay cannot stay live".into()))
-                    .is_err()
-            );
-            while let Ok(Message::Text(text)) = f.rx.try_recv() {
-                let frame: JsonValue = serde_json::from_str(&text).unwrap();
-                assert_ne!(frame["method"], events::TURN_PERMISSION_REQUEST_OPENED);
-            }
-            let stored = f
-                .processor
-                .crud_store
-                .get_cli_runtime_pending_request(REQUEST)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                stored.status,
-                pioneer_crud::CliRuntimePendingRequestStatus::Pending
-            );
-            if !orphan {
-                assert!(matches!(
-                    f.responder.try_recv(),
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-                ));
-            }
-            // A completed replay flag cannot justify another successful reply
-            // on the sealed socket. Recovery must establish a new incarnation.
-            let (repeat, mut repeated) = f.open("authlostdedup").await;
-            repeated.join().await.unwrap();
-            while let Ok(Message::Text(text)) = f.rx.try_recv() {
-                let frame: JsonValue = serde_json::from_str(&text).unwrap();
-                assert!(!(frame["id"] == repeat && frame.get("result").is_some()));
-            }
-            let old = f
-                .processor
+        let mut f = Fixture::new(orphan).await;
+        f.use_member_observer().await;
+        let (entered, release) = pause_auth_unavailable(
+            &f.processor,
+            f.connection,
+            events::TURN_PERMISSION_REQUEST_OPENED,
+            THREAD,
+            pass,
+        );
+        let (id, mut opening) = f.open("authunavailable").await;
+        entered.await.unwrap();
+        opening.join().await.unwrap();
+        recv_response_by_id(&mut f.rx, &id).await;
+        recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+        release.send(()).unwrap();
+        f.processor
+            .session_manager
+            .drain_thread_replays(f.connection)
+            .await;
+        f.outbound.writer_stopped().await;
+        assert!(
+            f.outbound
+                .try_send_data(Message::Text("lost replay cannot stay live".into()))
+                .is_err()
+        );
+        while let Ok(Message::Text(text)) = f.rx.try_recv() {
+            let frame: JsonValue = serde_json::from_str(&text).unwrap();
+            assert_ne!(frame["method"], events::TURN_PERMISSION_REQUEST_OPENED);
+        }
+        let stored = f
+            .processor
+            .crud_store
+            .get_cli_runtime_pending_request(REQUEST)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.status,
+            pioneer_crud::CliRuntimePendingRequestStatus::Pending
+        );
+        if !orphan {
+            assert!(matches!(
+                f.responder.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        // A completed replay flag cannot justify another successful reply
+        // on the sealed socket. Recovery must establish a new incarnation.
+        let (repeat, mut repeated) = f.open("authlostdedup").await;
+        repeated.join().await.unwrap();
+        while let Ok(Message::Text(text)) = f.rx.try_recv() {
+            let frame: JsonValue = serde_json::from_str(&text).unwrap();
+            assert!(!(frame["id"] == repeat && frame.get("result").is_some()));
+        }
+        let old = f
+            .processor
+            .thread_manager
+            .subscription_incarnation(f.connection, THREAD)
+            .await
+            .unwrap();
+        f.processor
+            .session_manager
+            .unregister_connection(f.connection)
+            .await;
+        f.processor
+            .thread_manager
+            .connection_closed(f.connection)
+            .await;
+        f.use_member_observer().await;
+        let (id, mut reopening) = f.open("authrecovered").await;
+        reopening.join().await.unwrap();
+        recv_response_by_id(&mut f.rx, &id).await;
+        recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
+        let opened =
+            recv_notification_by_method(&mut f.rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+        assert_eq!(opened.params.unwrap()["request"]["request_id"], REQUEST);
+        f.processor
+            .session_manager
+            .drain_thread_replays(f.connection)
+            .await;
+        assert!(!Arc::ptr_eq(
+            &old,
+            &f.processor
                 .thread_manager
                 .subscription_incarnation(f.connection, THREAD)
                 .await
-                .unwrap();
-            f.processor
-                .session_manager
-                .unregister_connection(f.connection)
-                .await;
-            f.processor
-                .thread_manager
-                .connection_closed(f.connection)
-                .await;
-            f.use_member_observer().await;
-            let (id, mut reopening) = f.open("authrecovered").await;
-            reopening.join().await.unwrap();
-            recv_response_by_id(&mut f.rx, &id).await;
-            recv_notification_by_method(&mut f.rx, events::THREAD_STARTED).await;
-            let opened =
-                recv_notification_by_method(&mut f.rx, events::TURN_PERMISSION_REQUEST_OPENED)
-                    .await;
-            assert_eq!(opened.params.unwrap()["request"]["request_id"], REQUEST);
-            f.processor
-                .session_manager
-                .drain_thread_replays(f.connection)
-                .await;
-            assert!(!Arc::ptr_eq(
-                &old,
-                &f.processor
-                    .thread_manager
-                    .subscription_incarnation(f.connection, THREAD)
-                    .await
-                    .unwrap()
-            ));
-        }
+                .unwrap()
+        ));
     })
     .await
     .expect("resource authorization replay watchdog");
+}
+
+#[tokio::test]
+async fn native_authorization_unavailable_at_first_resource_pass_requires_recovery() {
+    assert_native_authorization_unavailable_requires_recovery(false, 0).await;
+}
+
+#[tokio::test]
+async fn native_authorization_unavailable_at_second_resource_pass_requires_recovery() {
+    assert_native_authorization_unavailable_requires_recovery(false, 1).await;
+}
+
+#[tokio::test]
+async fn native_authorization_unavailable_at_third_resource_pass_requires_recovery() {
+    assert_native_authorization_unavailable_requires_recovery(false, 2).await;
+}
+
+#[tokio::test]
+async fn orphan_native_authorization_unavailable_requires_recovery() {
+    assert_native_authorization_unavailable_requires_recovery(true, 2).await;
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use crate::{binding::CatalogBinding, sidebar::CatalogSidebar, table::*};
+use crate::{sidebar::CatalogSidebar, table::*};
 use gpui_kit::component::VirtualListScrollHandle;
 use gpui_kit::component::table::TableState;
 use gpui_kit::{prelude::*, *};
@@ -9,6 +9,7 @@ use pioneer_client::{
     navigation::{ClientNavigationState, SemanticDestination},
     skills::{operations::*, store::*, types::*},
 };
+use pioneer_desktop_foundation::CatalogBinding;
 use pioneer_desktop_foundation::ClientBindingRegistrar;
 use std::sync::{
     Arc,
@@ -118,11 +119,13 @@ pub struct SkillsCatalogView {
     pub(crate) input: Arc<CatalogInput>,
     pub(crate) binding: Arc<CatalogBinding>,
     sidebar: Entity<CatalogSidebar>,
+    plugin_component: Option<(String, String, SkillId)>,
     demand: Option<SkillsDemand>,
     demand_key: Option<(String, Option<SkillId>)>,
     pub(crate) sidebar_width: Pixels,
     pub(crate) mount: u64,
     pub(crate) window_active: bool,
+    embedded_active: bool,
     pub(crate) presentation_error: Option<String>,
     pub(crate) native_task: Option<Task<()>>,
     pub(crate) parent_generation: u64,
@@ -144,11 +147,28 @@ impl SkillsCatalogView {
         self.input.is_skill_pending(id)
     }
 
+    /// Embed the genuine native details/controller under one plugin parent.
+    /// The native catalog's authoritative owner is rechecked on every publication.
+    pub fn new_plugin_details(
+        config: SkillsCatalogConfig,
+        workspace: String,
+        parent: String,
+        child: SkillId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let view = Self::new(config, window, cx);
+        view.update(cx, |view, cx| {
+            view.plugin_component = Some((workspace, parent, child));
+            view.sync_publications(window, cx);
+        });
+        view
+    }
     pub fn new(config: SkillsCatalogConfig, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let mount = NEXT_MOUNT.fetch_add(1, Ordering::Relaxed);
         cx.new(|cx| {
             let binding = CatalogBinding::new(config.registrar.clone());
-            let mut changed = binding.changed.subscribe();
+            let mut changed = binding.watch();
             let handle = window.window_handle();
             let task = cx.spawn(async move |view: WeakEntity<Self>, cx| {
                 while changed.changed().await.is_ok() {
@@ -209,10 +229,12 @@ impl SkillsCatalogView {
                 binding,
                 sidebar,
                 demand: None,
+                plugin_component: None,
                 demand_key: None,
                 sidebar_width: px(320.),
                 mount,
                 window_active: window.is_window_active(),
+                embedded_active: false,
                 presentation_error: None,
                 native_task: None,
                 parent_generation: 0,
@@ -222,8 +244,24 @@ impl SkillsCatalogView {
             view
         })
     }
+    pub(crate) fn is_plugin_component(&self) -> bool {
+        self.plugin_component.is_some()
+    }
+    pub(crate) fn plugin_parent(&self) -> Option<(&str, &str)> {
+        self.plugin_component
+            .as_ref()
+            .map(|(workspace, parent, _)| (workspace.as_str(), parent.as_str()))
+    }
     pub fn sidebar(&self) -> AnyView {
         self.sidebar.clone().into()
+    }
+    pub fn set_embedded_context(&mut self, width: Pixels, active: bool, cx: &mut Context<Self>) {
+        self.set_sidebar_width(width, cx);
+        if self.embedded_active != active {
+            self.embedded_active = active;
+            self.sync_demand();
+            cx.notify();
+        }
     }
     pub fn set_sidebar_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
         if self.sidebar_width != width {
@@ -250,6 +288,16 @@ impl SkillsCatalogView {
         .into()
     }
     fn visible(&self) -> bool {
+        if let Some((workspace, parent, child)) = &self.plugin_component {
+            let navigation = self.client.navigation_snapshot();
+            return self.embedded_active
+                && navigation.workspace_id() == Some(workspace.as_str())
+                && matches!(navigation.destination(), SemanticDestination::Plugin { plugin_id, component: Some(key) }
+                    if plugin_id == parent && self.client.plugin_details_publication(workspace, parent)
+                        .and_then(|p| p.details).is_some_and(|p| p.components.iter().any(|c|
+                            c.kind == key.kind && c.member_key == key.member_key && c.skill_id.as_ref() == Some(child))));
+        }
+
         matches!(
             self.input.navigation_input.destination(),
             SemanticDestination::Skills { .. }
@@ -278,6 +326,15 @@ impl SkillsCatalogView {
     }
     fn sync_publications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut next = CatalogInput::empty(&self.client);
+        if let Some((workspace, _, child)) = &self.plugin_component {
+            if next.navigation_input.workspace_id() == Some(workspace.as_str()) {
+                next.navigation_input = Arc::new(next.navigation_input.with_details_destination(
+                    SemanticDestination::Skills {
+                        skill_id: Some(child.clone()),
+                    },
+                ));
+            }
+        }
         let session = self.client.gateway_session();
         next.gateway.connection_state = session
             .status
@@ -305,8 +362,38 @@ impl SkillsCatalogView {
                 workspace_id: Some(workspace.clone()),
             });
             if let Some(catalog) = self.client.skills_catalog_snapshot(&workspace) {
-                next.skills_catalog = catalog.catalog.iter().map(|s| (**s).clone()).collect();
-                next.installed_skills = catalog.installed.iter().map(|s| (**s).clone()).collect();
+                next.skills_catalog = catalog
+                    .catalog
+                    .iter()
+                    .filter(|skill| match &self.plugin_component {
+                        Some((expected_workspace, parent, child)) => {
+                            expected_workspace == &workspace
+                                && &skill.skill_id == child
+                                && skill
+                                    .plugin_owner
+                                    .as_ref()
+                                    .is_some_and(|owner| &owner.plugin_id == parent)
+                        }
+                        None => pioneer_client::skills::catalog::skill_is_user_selectable(skill),
+                    })
+                    .map(|s| (**s).clone())
+                    .collect();
+                next.installed_skills = catalog
+                    .installed
+                    .iter()
+                    .filter(|skill| match &self.plugin_component {
+                        Some((expected_workspace, parent, child)) => {
+                            expected_workspace == &workspace
+                                && &skill.skill_id == child
+                                && skill
+                                    .plugin_owner
+                                    .as_ref()
+                                    .is_some_and(|owner| &owner.plugin_id == parent)
+                        }
+                        None => true,
+                    })
+                    .map(|s| (**s).clone())
+                    .collect();
                 next.skills_management = (*catalog.management).clone();
                 next.skills_loading = catalog.request == SkillsLoadState::Loading;
                 next.skills_error = (catalog.request == SkillsLoadState::Failed)
@@ -391,6 +478,35 @@ impl SkillsCatalogView {
             self.native_task = None;
             self.presentation_error = None;
             self.upload.update(cx, |upload, cx| upload.cancel(cx));
+        }
+        if let Some((workspace, parent, child)) = &self.plugin_component {
+            scopes.push(ClientScope::Plugins {
+                workspace_id: workspace.clone(),
+            });
+            if let Some(publication) = self.client.plugin_details_publication(workspace, parent) {
+                if let Some(operation) = publication.operations.get(parent) {
+                    if operation.busy
+                        || (operation.uncertain
+                            && !self
+                                .client
+                                .plugin_parent_recovery_available(workspace, parent))
+                    {
+                        next.pending.insert(child.clone());
+                    }
+                    let error = if operation.uncertain {
+                        Some(t!("skills.error.plugin_uncertain").to_string())
+                    } else {
+                        operation
+                            .error
+                            .as_ref()
+                            .map(|_| t!("skills.error.plugin_change_failed").to_string())
+                    };
+                    if self.presentation_error != error {
+                        self.presentation_error = error;
+                        cx.notify();
+                    }
+                }
+            }
         }
         let changed = *self.input != next;
         let screen_changed = !self.input.same_screen(&next);
@@ -595,104 +711,6 @@ mod tests {
         assert!(first.read_with(cx, |view, _| view.parent_generation) > generation);
     }
 
-    #[gpui_kit::test]
-    fn upload_progress_notifies_only_operation_child_and_terminal_visibility_once(
-        cx: &mut TestAppContext,
-    ) {
-        use pioneer_client::skills::{
-            operations::SkillUploadTarget,
-            upload_flow::{SkillUploadPublication, SkillUploadState},
-        };
-        cx.update(gpui_kit::init);
-        let client = pioneer_client::catalog_test_support::client();
-        client.navigate(
-            NavigationIntent::SelectWorkspace {
-                workspace_id: Some("workspace".into()),
-            },
-            None,
-        );
-        client.navigate_skills(pioneer_client::skills::route::SkillsRoute::List);
-        client.accept_skills_catalog_for_test(
-            "workspace",
-            pioneer_client::skills::catalog::project_skills_snapshot(
-                vec![pioneer_client::catalog_test_support::skill('A')],
-                vec![],
-            ),
-        );
-        let (root, cx) = cx.add_window_view(|window, cx| {
-            let view = SkillsCatalogView::new(
-                SkillsCatalogConfig::new(client.clone(), Arc::new(Registrar)),
-                window,
-                cx,
-            );
-            gpui_kit::component::Root::new(view, window, cx)
-        });
-        let view = root.read_with(cx, |root, _| {
-            root.view().clone().downcast::<SkillsCatalogView>().unwrap()
-        });
-        let upload = view.read_with(cx, |view, _| view.upload.clone());
-        let publication = |revision, sent_bytes, state| {
-            Some(Arc::new(SkillUploadPublication {
-                operation_id: 7,
-                generation: 7,
-                revision,
-                state,
-                sent_bytes,
-                total_bytes: 8,
-                target: SkillUploadTarget::Install,
-                pack: false,
-            }))
-        };
-        cx.update(|_, cx| {
-            upload.update(cx, |upload, cx| {
-                upload.apply_publication(publication(1, 0, SkillUploadState::Uploading), cx)
-            })
-        });
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| view.set_window_active(false, cx));
-        });
-        assert!(upload.read_with(cx, |upload, _| upload.active()));
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| view.set_window_active(true, cx));
-        });
-        cx.run_until_parked();
-        let counts = Rc::new([Cell::new(0), Cell::new(0)]);
-        let subs = cx.update(|_, cx| {
-            let child = counts.clone();
-            let parent = counts.clone();
-            (
-                cx.observe(&upload, move |_, _| child[0].set(child[0].get() + 1)),
-                cx.observe(&view, move |_, _| parent[1].set(parent[1].get() + 1)),
-            )
-        });
-        let catalog = client.skills_catalog_snapshot("workspace").unwrap();
-        cx.update(|_, cx| {
-            upload.update(cx, |upload, cx| {
-                upload.apply_publication(publication(2, 2, SkillUploadState::Uploading), cx)
-            })
-        });
-        cx.run_until_parked();
-        assert_eq!([counts[0].get(), counts[1].get()], [1, 0]);
-        assert!(Arc::ptr_eq(
-            &catalog,
-            &client.skills_catalog_snapshot("workspace").unwrap()
-        ));
-        cx.update(|_, cx| {
-            upload.update(cx, |upload, cx| {
-                upload.apply_publication(publication(2, 2, SkillUploadState::Uploading), cx)
-            })
-        });
-        cx.run_until_parked();
-        assert_eq!([counts[0].get(), counts[1].get()], [1, 0]);
-        cx.update(|_, cx| {
-            upload.update(cx, |upload, cx| {
-                upload.apply_publication(publication(3, 2, SkillUploadState::Cancelled), cx)
-            })
-        });
-        cx.run_until_parked();
-        assert_eq!([counts[0].get(), counts[1].get()], [2, 1]);
-        drop(subs);
-    }
     #[gpui_kit::test]
     fn audit_table_refresh_preserves_entity_and_emits_no_user_selection(cx: &mut TestAppContext) {
         use pioneer_client::skills::types::SkillAuditTimelineItem;

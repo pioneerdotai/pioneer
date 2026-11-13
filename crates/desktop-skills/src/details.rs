@@ -86,93 +86,12 @@ impl SkillsCatalogView {
             .size_full()
             .bg(cx.theme().background)
             .child(
-                v_flex()
-                    .pt_3()
-                    .px_6()
-                    .pb_5()
-                    .gap_4()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .justify_between()
-                            .items_start()
-                            .gap_10()
-                            .child(
-                                v_flex().flex_1().min_w_0().gap_3().child(
-                                    v_flex()
-                                        .w_full()
-                                        .min_w_0()
-                                        .child(
-                                            h_flex()
-                                                .w_full()
-                                                .min_w_0()
-                                                .items_baseline()
-                                                .gap_1()
-                                                .when_some(owner, |this, owner| {
-                                                    this.child(
-                                                        div()
-                                                            .flex_none()
-                                                            .text_base()
-                                                            .font_medium()
-                                                            .opacity(0.6)
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
-                                                            .text_ellipsis()
-                                                            .child(owner.to_owned()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .flex_none()
-                                                            .text_base()
-                                                            .opacity(0.6)
-                                                            .child("/"),
-                                                    )
-                                                })
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .text_base()
-                                                        .font_semibold()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .child(skill.slug.clone()),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .min_w_0()
-                                                .text_sm()
-                                                .line_height(relative(1.35))
-                                                .opacity(0.6)
-                                                .overflow_hidden()
-                                                .whitespace_normal()
-                                                .line_clamp(3)
-                                                .child(skill.description.clone()),
-                                        ),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .mt_1p5()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(status_color)
-                                    .text_xs()
-                                    .text_color(status_color)
-                                    .font_medium()
-                                    .child(status_label),
-                            ),
-                    )
+                pioneer_desktop_foundation::CatalogDetailsHeader::new(skill.slug.clone())
+                    .status(status_label, status_color)
+                    .when_some(owner, |header, owner| header.owner(owner.to_owned()))
+                    .description(skill.description.clone())
                     .when(can_manage, |this| {
-                        this.child(
+                        this.actions(
                             h_flex()
                                 .items_center()
                                 .gap_2()

@@ -214,6 +214,8 @@ pub mod workspace_membership;
 pub mod compaction_checkpoint_event_input;
 pub mod compaction_checkpoint_import;
 pub mod compaction_checkpoint_replay_alias;
+pub mod plugin_component;
+pub mod plugin_installation;
 
 pub mod portable_payload_dictionary;
 
@@ -222,6 +224,8 @@ pub mod portable_payload;
 pub mod html_preview_io_work;
 pub mod portable_payload_block;
 
+pub mod plugin_default_prompt;
+pub mod plugin_keyword;
 pub mod task_child_reconcile_pending;
 pub mod task_child_reconcile_scope;
 

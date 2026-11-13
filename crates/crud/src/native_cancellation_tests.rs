@@ -1236,69 +1236,28 @@ impl MigratorTrait for CancellationSchemaFixtureMigrator {
     }
 }
 
-async fn cancellation_schema_store(workspace_id: &str) -> CrudStore {
-    use migration::{ColumnDef, SchemaManager, Table};
-    use sea_orm::sea_query::Alias;
-
-    let store =
-        test_store_with_workspace_migrator::<CancellationSchemaFixtureMigrator>(workspace_id).await;
-    add_thread_unread_column_to_legacy_fixture(&store).await;
-    // Keep down(1) aimed at cancellation, without registering later migrations.
-    // These tests still use today's terminal projector: its CLI binding Entity
-    // selects storage metadata even though these fixtures have no CLI/frozen
-    // roots. Pure upgrade proofs above/below never use this compatibility setup.
-    let transaction = store.connection.begin().await.unwrap();
-    let schema = SchemaManager::new(&*transaction);
-    assert!(
-        !schema
-            .has_column("turn_cli_runtime_binding", "frozen_manifest_id")
-            .await
-            .unwrap(),
-        "the fixture must stop before frozen lifetime migration"
-    );
-    schema
-        .alter_table(
-            Table::alter()
-                .table(Alias::new("turn_cli_runtime_binding"))
-                .add_column(
-                    ColumnDef::new(Alias::new("frozen_manifest_id"))
-                        .text()
-                        .null(),
-                )
-                .to_owned(),
-        )
-        .await
-        .unwrap();
-    // Use the real physical projection after adding its locator prerequisite;
-    // leave migration receipts untouched so cancellation remains the last step.
-    for migration in Migrator::migrations().into_iter().filter(|migration| {
-        matches!(
-            migration.name(),
-            "m20261027_000001_portable_payload" | "m20261027_000003_portable_cli_mapping"
-        )
-    }) {
-        migration.up(&schema).await.unwrap();
+// Runtime projection fixtures need the current schema. Exercise the exact
+// cancellation migration's rollback guard without rolling back later migrations
+// or teaching current repositories to read a historical schema.
+async fn rollback_cancellation_migration(
+    db: &pioneer_sqlite::SqliteDatabase,
+) -> std::result::Result<(), sea_orm::DbErr> {
+    let name = cancellation_migration_name();
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == name)
+        .expect("cancellation migration must be registered");
+    let transaction = db.begin().await?;
+    let result = migration
+        .down(&migration::SchemaManager::new(&*transaction))
+        .await;
+    match result {
+        Ok(()) => transaction.commit().await,
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
     }
-    assert!(
-        pioneer_entity::turn_cli_runtime_binding::Entity::find()
-            .one(&transaction)
-            .await
-            .unwrap()
-            .is_none(),
-        "the compatibility projection must not reclassify existing CLI roots"
-    );
-    transaction.commit().await.unwrap();
-    add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
-    store
-}
-
-async fn cancellation_schema_started_turn(
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-) -> (CrudStore, Thread, Turn) {
-    let store = cancellation_schema_store(workspace_id).await;
-    start_test_turn(store, workspace_id, thread_id, turn_id).await
 }
 
 // Use the scoped writer transaction's SeaORM executor without exposing a pool.
@@ -1610,6 +1569,7 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
 
 impl HistoricalMigrationRows {
     async fn assert_preserved(&self, db: &pioneer_sqlite::SqliteDatabase) {
+        use sea_orm::Iterable;
         use sea_orm::sea_query::{Alias, Query};
         assert_eq!(
             pioneer_entity::workspace::Entity::find_by_id(self.workspace.id.clone())
@@ -1627,6 +1587,16 @@ impl HistoricalMigrationRows {
         );
         assert_eq!(
             pioneer_entity::turn::Entity::find_by_id(self.turn.id.clone())
+                .select_only()
+                .columns(pioneer_entity::turn::Column::iter().filter(|column| {
+                    !matches!(column, pioneer_entity::turn::Column::PluginSelectionJson)
+                }))
+                // This historical schema predates plugin selections. Compare
+                // every stored column and supply its absent nullable field.
+                .expr_as(
+                    Expr::val(None::<String>),
+                    pioneer_entity::turn::Column::PluginSelectionJson,
+                )
                 .one(db)
                 .await
                 .unwrap(),
@@ -2246,17 +2216,20 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
 
 #[tokio::test]
 async fn native_cancellation_migration_down_preserves_context_and_terminal_markers() {
-    let store = cancellation_schema_store("ws_cancel_down_guard").await;
-    let (store, turn, plan) = fixture_with_store(store, "down_guard").await;
+    let (store, turn, plan) = fixture("down_guard").await;
     let original = pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
         .one(&store.connection)
         .await
         .unwrap()
         .unwrap();
+    let error = rollback_cancellation_migration(&store.connection)
+        .await
+        .expect_err("durable cancellation context must prevent rollback");
     assert!(
-        migrate_fixture(&store.connection, Some(1), true)
-            .await
-            .is_err()
+        error
+            .to_string()
+            .contains("native cancellation context contains durable data"),
+        "{error}"
     );
     assert_eq!(
         pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
@@ -2276,10 +2249,14 @@ async fn native_cancellation_migration_down_preserves_context_and_terminal_marke
         repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
             .await
             .unwrap();
+    let error = rollback_cancellation_migration(&store.connection)
+        .await
+        .expect_err("accepted cancellation context must prevent rollback");
     assert!(
-        migrate_fixture(&store.connection, Some(1), true)
-            .await
-            .is_err()
+        error
+            .to_string()
+            .contains("native cancellation context contains durable data"),
+        "{error}"
     );
     assert!(
         store
@@ -2421,12 +2398,9 @@ async fn native_cancellation_task_resume_clears_only_confirmed_blocked_and_rolls
 
 #[tokio::test]
 async fn native_cancellation_migration_down_rejects_marker_without_context() {
-    let (store, thread, mut turn) = cancellation_schema_started_turn(
-        "ws_marker_down",
-        "thread_marker_down",
-        "turn_marker_down",
-    )
-    .await;
+    let (store, thread, mut turn) =
+        test_store_with_started_turn("ws_marker_down", "thread_marker_down", "turn_marker_down")
+            .await;
     turn.status = TurnStatus::Completed;
     store
         .materialize_turn_events_atomically(
@@ -2452,10 +2426,14 @@ async fn native_cancellation_migration_down_rejects_marker_without_context() {
         repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
             .await
             .unwrap();
+    let error = rollback_cancellation_migration(&store.connection)
+        .await
+        .expect_err("accepted terminal marker must prevent rollback");
     assert!(
-        migrate_fixture(&store.connection, Some(1), true)
-            .await
-            .is_err()
+        error
+            .to_string()
+            .contains("projection stream contains accepted terminal markers"),
+        "{error}"
     );
     assert!(
         repositories::turn_event_projection_stream_state::has_accepted_terminal(
@@ -2476,7 +2454,7 @@ async fn native_cancellation_migration_down_rejects_marker_without_context() {
 #[tokio::test]
 async fn native_cancellation_migration_down_rejects_duplicate_effect_kinds_atomically() {
     use migration::SchemaManager;
-    let (store, thread, turn) = cancellation_schema_started_turn(
+    let (store, thread, turn) = test_store_with_started_turn(
         "ws_duplicate_down",
         "thread_duplicate_down",
         "turn_duplicate_down",
@@ -2517,18 +2495,19 @@ async fn native_cancellation_migration_down_rejects_duplicate_effect_kinds_atomi
         .await
         .unwrap()
     );
-    let applied_before =
-        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&store.connection)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|migration| migration.name().to_owned())
-            .collect::<Vec<_>>();
+    let applied_before = Migrator::get_applied_migrations_read_only(&store.connection)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|migration| migration.name().to_owned())
+        .collect::<Vec<_>>();
 
+    let error = rollback_cancellation_migration(&store.connection)
+        .await
+        .expect_err("duplicate effect kinds must prevent restoring the old unique index");
     assert!(
-        migrate_fixture(&store.connection, Some(1), true)
-            .await
-            .is_err()
+        error.to_string().contains("UNIQUE constraint failed"),
+        "{error}"
     );
 
     assert_eq!(
@@ -2540,7 +2519,7 @@ async fn native_cancellation_migration_down_rejects_duplicate_effect_kinds_atomi
         second_before
     );
     assert_eq!(
-        CancellationSchemaFixtureMigrator::get_applied_migrations_read_only(&store.connection)
+        Migrator::get_applied_migrations_read_only(&store.connection)
             .await
             .unwrap()
             .into_iter()

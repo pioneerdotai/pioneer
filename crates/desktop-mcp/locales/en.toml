@@ -15,6 +15,7 @@ title = "No installed MCP servers"
 description = "Install new MCP servers and expand your agents' capabilities."
 
 [mcp.dialog]
+replace_owned = "Replace this server’s configuration"
 install_title = "Install MCP server"
 install = "Install"
 uninstall_title = "Uninstall %{name}?"
@@ -24,6 +25,7 @@ config_json = "Config JSON"
 secret_store_hint = "Secret values from env, headers, tokens and authorization fields are stored through the gateway secret store."
 
 [mcp.dialog.error]
+owned_server_body = "Enter one server configuration object with command or URL."
 config_required = "MCP config JSON is required"
 config_invalid = "MCP config JSON is invalid: %{error}"
 servers_required = "MCP config JSON must contain an mcpServers object"
@@ -68,6 +70,7 @@ restart = "Restart"
 uninstall = "Uninstall"
 
 [mcp.details]
+configure = "Configure"
 not_selected = "MCP server is not selected"
 enabled = "Enabled"
 implicit = "Implicit"
@@ -134,6 +137,9 @@ items_count = "Items: %{count}"
 keys_count = "Keys: %{count}"
 
 [mcp.error]
+plugin_submitted = "The change was submitted. Check the server status before retrying."
+plugin_uncertain = "The outcome is unknown. Refresh before taking another action."
+plugin_change_failed = "The change could not be confirmed. Refresh this card before trying again."
 server_name_required = "MCP server name is required"
 gateway_not_connected = "Gateway is not connected"
 workspace_not_selected = "Workspace is not selected"

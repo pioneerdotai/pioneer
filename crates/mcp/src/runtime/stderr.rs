@@ -19,7 +19,7 @@ impl StderrTail {
         }
     }
 
-    pub fn spawn_reader<R>(&self, mut reader: R)
+    pub fn spawn_reader<R>(&self, mut reader: R) -> tokio::task::JoinHandle<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
@@ -40,7 +40,7 @@ impl StderrTail {
                 guard.push_str(chunk.as_str());
                 *guard = bounded_text(guard.as_str(), max_chars);
             }
-        });
+        })
     }
 
     pub async fn snapshot(&self) -> String {

@@ -26,6 +26,10 @@ impl McpCatalogView {
         }
     }
     pub(crate) fn close_mcp_details_screen(&mut self, _: &mut Context<Self>) {
+        if self.plugin_component.is_some() {
+            self.client.navigate(NavigationIntent::BackFromPlugin, None);
+            return;
+        }
         self.client.navigate(
             NavigationIntent::Navigate {
                 destination: if self
@@ -64,7 +68,19 @@ impl McpCatalogView {
     }
     pub(crate) fn send(&mut self, intent: McpIntent, cx: &mut Context<Self>) {
         if let Some(w) = self.input.navigation_input.workspace_id() {
-            if self.client.mcp_intent(w, intent).is_err() {
+            let failed = if let Some((workspace, parent, _)) = &self.plugin_component {
+                self.client
+                    .plugin_intent_for(
+                        workspace,
+                        parent,
+                        pioneer_client::plugins::runtime::PluginIntent::Mcp { intent },
+                    )
+                    .outcome()
+                    != pioneer_client::core::ClientTransitionOutcome::Changed
+            } else {
+                self.client.mcp_intent(w, intent).is_err()
+            };
+            if failed {
                 self.presentation_error = Some(t!("mcp.error.gateway_not_connected").to_string());
                 cx.notify();
             }

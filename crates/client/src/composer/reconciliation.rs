@@ -69,6 +69,7 @@ pub(crate) fn reconcile_composer_policy(
     let mut mcp_server_ids = Vec::new();
     for capability in &domain.capabilities {
         match &capability.kind {
+            ComposerCapabilityKind::Plugin { .. } => {}
             ComposerCapabilityKind::Skill { skill_id, .. } => {
                 skill_ids.push(skill_id.as_str().to_owned());
             }
@@ -122,6 +123,7 @@ pub(crate) fn reconcile_composer_policy(
     domain
         .capabilities
         .retain(|capability| match &capability.kind {
+            ComposerCapabilityKind::Plugin { .. } => true,
             ComposerCapabilityKind::Skill { skill_id, .. } => {
                 allowed_skills.contains(skill_id.as_str())
             }

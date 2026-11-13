@@ -689,16 +689,21 @@ impl CliMcpToolFacade {
         (encoded.len() <= self.limits.max_frame_bytes).then_some(encoded)
     }
 
-    pub(crate) async fn shutdown(&self) -> CliMcpFacadeShutdownOutcome {
+    pub(crate) fn request_shutdown(&self) {
         if !self.shutting_down.swap(true, Ordering::AcqRel) {
             self.admission.close();
             self.ledger.cancel_all();
         }
+    }
+    pub(crate) async fn shutdown(&self) -> CliMcpFacadeShutdownOutcome {
+        self.request_shutdown();
         let drained = self
             .ledger
             .wait_drained(self.limits.shutdown_drain_duration)
             .await;
-        self.ledger.clear();
+        if drained {
+            self.ledger.clear();
+        }
         CliMcpFacadeShutdownOutcome { drained }
     }
 

@@ -334,7 +334,17 @@
 "timeline.web_search.results_count" = "%{count} परिणाम"
 "timeline.web_search.running" = "वेब पर खोज रहा है"
 "timeline.work_group.completed" = "काम किया"
+
+"chat.composer.add_menu.plugins" = "प्लगइन जोड़ें"
+"plugins.empty" = "कोई प्लगइन इंस्टॉल नहीं है"
+"plugins.error" = "प्लगइन लोड नहीं हो सके। फिर से कोशिश करें।"
+"plugins.loading" = "प्लगइन लोड हो रहे हैं…"
+"plugins.search" = "प्लगइन खोजें"
+"plugins.select" = "प्लगइन चुनें"
+"plugins.unavailable" = "अनुपलब्ध"
 "chat.composer.preparing_send" = "संदेश तैयार हो रहा है"
+"plugins.retry" = "फिर कोशिश करें"
+"plugins.stale" = "चुना गया संस्करण अब नवीनतम नहीं है"
 
 "chat.composer.model.context_label" = "संदर्भ विंडो"
 "chat.composer.model.context_auto" = "ऑटो — %{tokens} टोकन तक"

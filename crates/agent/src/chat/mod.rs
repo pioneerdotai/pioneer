@@ -286,36 +286,41 @@ fn unknown_tool_task_result(
 }
 
 struct AbortOnDropJoinHandle<T> {
-    handle: Option<tokio::task::JoinHandle<T>>,
+    owner: Arc<crate::NativeTask>,
+    result: Option<tokio::sync::oneshot::Receiver<T>>,
 }
-
-impl<T> AbortOnDropJoinHandle<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+impl<T: Send + 'static> AbortOnDropJoinHandle<T> {
+    fn spawn(
+        future: impl std::future::Future<Output = T> + Send + 'static,
+        control: &TurnExecutionControl,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = crate::NativeTask::new(tokio::spawn(async move {
+            let _ = tx.send(future.await);
+        }));
+        // Synchronous publication before the root reaches its next await.
+        control.completion.retain_tool(task.clone());
         Self {
-            handle: Some(handle),
+            owner: task,
+            result: Some(rx),
         }
     }
-
-    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
-        // Keep ownership of the JoinHandle while awaiting it.  Taking it out
-        // before the await makes Drop unable to abort a task when the join
-        // future is cancelled (for example when the parent Turn is fenced).
-        // Tokio then detaches the child and any external side effect can outlive
-        // the Turn owner.
+    async fn join(mut self) -> Result<T, String> {
         let result = self
-            .handle
+            .result
             .as_mut()
-            .expect("join handle should be present")
-            .await;
-        self.handle.take();
-        result
+            .expect("tool result receiver")
+            .await
+            .map_err(|_| "native tool task ended without its result".to_owned())?;
+        self.owner.join().await.map_err(|error| error.to_string())?;
+        self.result.take();
+        Ok(result)
     }
 }
-
 impl<T> Drop for AbortOnDropJoinHandle<T> {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
+        if self.result.is_some() {
+            self.owner.abort();
         }
     }
 }
@@ -1535,7 +1540,8 @@ fn resolve_turn_capability_input(
             TurnCapabilityKind::Skill {
                 pack_id: Some(_), ..
             }
-            | TurnCapabilityKind::SkillPack { .. } => {
+            | TurnCapabilityKind::SkillPack { .. }
+            | TurnCapabilityKind::Plugin { .. } => {
                 normalized.rejected.push(rejected_capability(
                     capability,
                     TurnCapabilityRejectedReason::InvalidInput,
@@ -1605,7 +1611,8 @@ fn resolve_turn_capability_input(
             TurnCapabilityKind::Skill {
                 pack_id: Some(_), ..
             }
-            | TurnCapabilityKind::SkillPack { .. } => {
+            | TurnCapabilityKind::SkillPack { .. }
+            | TurnCapabilityKind::Plugin { .. } => {
                 unreachable!("pack metadata was rejected before runtime normalization")
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
@@ -1844,6 +1851,7 @@ fn capability_display_label(rejected: &TurnRejectedCapability) -> String {
     match &rejected.kind {
         TurnCapabilityKind::Skill { skill_id, .. } => skill_id.to_string(),
         TurnCapabilityKind::SkillPack { pack_id } => pack_id.to_string(),
+        TurnCapabilityKind::Plugin { plugin_id, .. } => plugin_id.clone(),
         TurnCapabilityKind::McpServer { name, .. } => name.clone(),
         TurnCapabilityKind::McpTool {
             server_name,
@@ -4987,22 +4995,22 @@ fn execute_agent_provider_response<'a>(
         }
 
         if !provider_tool_calling {
-            if !agent_skill_overlay.is_empty() {
-                if recovery.is_some() {
-                    return Err(ChatTurnError::Terminal(
-                        "pinned Agent skills cannot be recovered without native tool calling"
-                            .to_owned(),
-                    ));
-                }
-                emit_turn_skills_resolved_event(
-                    event_tx.as_ref(),
-                    thread_id,
-                    turn_id,
-                    skills::to_turn_skill_bindings(skills_resolution.result.active.as_slice(), &[]),
-                    true,
-                )
-                .await?;
+            if !agent_skill_overlay.is_empty() && recovery.is_some() {
+                return Err(ChatTurnError::Terminal(
+                    "pinned Agent skills cannot be recovered without native tool calling"
+                        .to_owned(),
+                ));
             }
+            // An empty native skill resolution also completes a selected plugin's
+            // preparation. Confirm it before provider execution, as in the tool path.
+            emit_turn_skills_resolved_event(
+                event_tx.as_ref(),
+                thread_id,
+                turn_id,
+                skills::to_turn_skill_bindings(skills_resolution.result.active.as_slice(), &[]),
+                !agent_skill_overlay.is_empty() || turn_tool_provider.is_some(),
+            )
+            .await?;
 
             let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
                 hook_runtime.as_ref(),
@@ -5226,10 +5234,23 @@ fn execute_agent_provider_response<'a>(
             }
         }
 
-        let skill_tool_materialization = skill_tools::materialize_skill_tooling(
+        let mut skill_tool_materialization = skill_tools::materialize_skill_tooling(
             &skills_resolution.runtime_plan,
             &tool_loop_config.skills,
         );
+
+        if let Some(provider) = &turn_tool_provider {
+            skill_tools::guard_skill_tooling(
+                &mut skill_tool_materialization,
+                &skills_resolution.runtime_plan,
+                provider.clone(),
+                TurnToolContext {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: turn_id.into(),
+                },
+            );
+        }
 
         for excluded in &skill_tool_materialization.excluded_tools {
             warn!(
@@ -5345,6 +5366,8 @@ fn execute_agent_provider_response<'a>(
             }
         }
         .with_permission_approval_broker(permission_approval_broker);
+
+        turn_control.completion.retain_shell(tools.shell.clone());
 
         // One trusted provider capability decision owns native filesystem-tool
         // visibility for this turn.  Apply it before tool visibility so the core tools,
@@ -5520,7 +5543,7 @@ fn execute_agent_provider_response<'a>(
                 skills_resolution.result.active.as_slice(),
                 exposed_agent_overlay,
             ),
-            !agent_skill_overlay.is_empty(),
+            !agent_skill_overlay.is_empty() || turn_tool_provider.is_some(),
         )
         .await?;
 
@@ -7120,7 +7143,8 @@ fn execute_agent_provider_response<'a>(
                     // own task keeps nested dispatch from being polled under the full chat-loop
                     // future, whose execution-window state is intentionally large.
                     let tool_parent = tool_batch_parent.clone();
-                    let handle = tokio::spawn(async move {
+                    let completion_control = turn_control.clone();
+                    let handle = AbortOnDropJoinHandle::spawn(async move {
                         let provider_call_id = model_tool_call.id.clone();
                         let arguments = model_tool_call.arguments.clone();
                         let tool_name = model_tool_call.name.clone();
@@ -7682,7 +7706,7 @@ fn execute_agent_provider_response<'a>(
                             delivery,
                             message,
                         })
-                    });
+                    }, &completion_control);
 
                     SpawnedToolTask {
                         item_id: task_item_id,
@@ -7690,7 +7714,7 @@ fn execute_agent_provider_response<'a>(
                         ordinal,
                         tool_name: task_tool_name,
                         arguments: task_arguments,
-                        handle: AbortOnDropJoinHandle::new(handle),
+                        handle,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -8397,6 +8421,33 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn retained_tool_tasks_keep_existing_parallel_dispatch() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let control = crate::TurnExecutionControl::new(tx, 1);
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let a = barrier.clone();
+        let first = super::AbortOnDropJoinHandle::spawn(
+            async move {
+                a.wait().await;
+                1
+            },
+            &control,
+        );
+        let b = barrier.clone();
+        let second = super::AbortOnDropJoinHandle::spawn(
+            async move {
+                b.wait().await;
+                2
+            },
+            &control,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait())
+            .await
+            .unwrap();
+        assert_eq!(first.join().await.unwrap(), 1);
+        assert_eq!(second.join().await.unwrap(), 2);
+    }
     use super::{
         ChatExecutionWindowStats, ExecutedToolResult, TURN_ITEM_ID_LEN,
         TaskMutationFinalizationGuard, agent_skill_cards_have_read_path,

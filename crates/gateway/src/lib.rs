@@ -29,6 +29,7 @@ mod hook_run_store;
 mod hook_runtime;
 mod human_interaction;
 mod identity;
+mod images;
 mod invitation;
 mod keep_awake;
 mod mcp_oauth;

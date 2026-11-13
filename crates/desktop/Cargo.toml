@@ -32,6 +32,7 @@ base64.workspace = true
 tracing.workspace = true
 pioneer-config.workspace = true
 pioneer-client.workspace = true
+pioneer-desktop-plugins.workspace = true
 pioneer-desktop-foundation.workspace = true
 pioneer-keystore.workspace = true
 pioneer-observability.workspace = true

@@ -1758,3 +1758,6 @@ reason_unknown = "処理が正常に完了しませんでした。Gateway のロ
 [mcp.oauth]
 callback_received = "応答を受け付けました。Pioneerでログイン結果を確認してください。"
 callback_rejected = "ログインを受け付けられませんでした。Pioneerに戻って再試行してください。"
+
+[plugins]
+title = "プラグイン"

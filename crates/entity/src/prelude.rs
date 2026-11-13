@@ -209,6 +209,8 @@ pub use super::user_notification_outbox::Entity as UserNotificationOutbox;
 pub use super::workspace::Entity as Workspace;
 pub use super::workspace_membership::Entity as WorkspaceMembership;
 
+pub use super::plugin_component::Entity as PluginComponent;
+pub use super::plugin_installation::Entity as PluginInstallation;
 pub use super::portable_payload_dictionary::Entity as PortablePayloadDictionary;
 
 pub use super::portable_payload::Entity as PortablePayload;
@@ -216,6 +218,8 @@ pub use super::portable_payload::Entity as PortablePayload;
 pub use super::html_preview_io_work::Entity as HtmlPreviewIoWork;
 pub use super::portable_payload_block::Entity as PortablePayloadBlock;
 
+pub use super::plugin_default_prompt::Entity as PluginDefaultPrompt;
+pub use super::plugin_keyword::Entity as PluginKeyword;
 pub use super::task_child_reconcile_pending::Entity as TaskChildReconcilePending;
 pub use super::task_child_reconcile_scope::Entity as TaskChildReconcileScope;
 

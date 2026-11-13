@@ -155,6 +155,9 @@ fn hash_secret_field(hasher: &mut Sha256, value: &[u8]) {
 #[async_trait]
 pub trait McpRuntimeSession: Send {
     fn initial_catalog(&self) -> &McpCatalogSnapshot;
+    fn startup_failure(&self) -> Option<&McpRuntimeError> {
+        None
+    }
     fn degraded_reason(&self) -> Option<&str> {
         None
     }
@@ -169,6 +172,14 @@ pub trait McpRuntimeSession: Send {
         cancellation: CancellationToken,
     ) -> Result<McpToolCallResult, McpRuntimeError>;
     async fn shutdown(&mut self);
+    /// Native completion path. Legacy implementations cannot silently claim an
+    /// acknowledgement they have never provided.
+    async fn shutdown_result(&mut self) -> Result<(), McpRuntimeError> {
+        self.shutdown().await;
+        Err(McpRuntimeError::failed(
+            "MCP session cleanup acknowledgement is unavailable",
+        ))
+    }
 }
 
 #[async_trait]

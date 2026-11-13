@@ -183,5 +183,17 @@ pub(crate) async fn shutdown_async<S>(stream: &mut S) -> Result<(), PrivateIpcEr
 where
     S: AsyncWrite + Unpin,
 {
-    stream.shutdown().await.map_err(Into::into)
+    match stream.shutdown().await {
+        Ok(()) => Ok(()),
+        // A peer that already closed the socket needs no further write shutdown.
+        Err(error) if peer_closed(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn peer_closed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
+    )
 }

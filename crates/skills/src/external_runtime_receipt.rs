@@ -29,6 +29,8 @@ pub struct ExternalRuntimeSkillReceiptEntry {
     pub source_kind: String,
     pub source_folder_hash: String,
     pub install_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
     pub installed_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
 }
@@ -273,6 +275,7 @@ pub fn prepare_external_runtime_receipt_v2(
         upsert_external_runtime_receipt_entry(
             &mut converted,
             ExternalRuntimeSkillReceiptEntry {
+                plugin_id: None,
                 skill_id: candidate.skill_id.clone(),
                 owner: candidate.owner.clone(),
                 slug: candidate.slug.clone(),
@@ -422,6 +425,7 @@ pub fn external_runtime_skill_is_current(
         && actual.source_kind == expected.source_kind
         && actual.source_folder_hash == expected.source_folder_hash
         && actual.install_path == expected_install_path
+        && actual.plugin_id == expected.plugin_id
         && actual.install_path == destination)
 }
 
@@ -536,6 +540,7 @@ mod tests {
     ) -> ExternalRuntimeSkillReceiptEntry {
         let leaf_slug = slug.rsplit('/').next().unwrap_or(slug);
         ExternalRuntimeSkillReceiptEntry {
+            plugin_id: None,
             skill_id: test_skill_id(slug),
             owner: Some("workspace".to_owned()),
             slug: leaf_slug.to_owned(),

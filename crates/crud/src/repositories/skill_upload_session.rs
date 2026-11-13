@@ -18,6 +18,7 @@ pub async fn insert_skill_upload_session<C: ConnectionTrait>(
         workspace_id: Set(record.workspace_id.clone()),
         connection_id: Set(i64::try_from(record.connection_id).unwrap_or(i64::MAX)),
         status: Set(record.status.clone()),
+        purpose: Set(record.purpose.clone()),
         file_name: Set(record.file_name.clone()),
         archive_format: Set(record.archive_format.clone()),
         compressed_size_bytes: Set(i64::try_from(record.compressed_size_bytes).unwrap_or(i64::MAX)),

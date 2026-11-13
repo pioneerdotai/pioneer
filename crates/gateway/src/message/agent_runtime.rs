@@ -2573,6 +2573,19 @@ impl MessageProcessor {
                     "gateway could not persist the turn skill projection",
                 ));
             }
+            let resolved_skills = bindings
+                .iter()
+                .map(|b| b.skill_id.clone())
+                .collect::<Vec<_>>();
+            self.crud_store
+                .ready_plugin_selection(&turn_id, &resolved_skills)
+                .await
+                .map_err(|_| {
+                    DurableCommitRejection::retryable(
+                        "plugin_selection_unavailable",
+                        "plugin selection could not become ready",
+                    )
+                })?;
             pioneer_observability::record_native_lifecycle_event(
                 pioneer_observability::NativeLifecycleEventMetric {
                     stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
@@ -9930,6 +9943,25 @@ impl MessageProcessor {
         self.thread_manager
             .rollback_turn_finish(rollback_context)
             .await;
+        // A competing cancellation or terminal write can commit while this
+        // candidate is being rejected. Reuse the committed Turn so rolling
+        // back the candidate cannot revive foreground ownership in memory.
+        match self.crud_store.get_turn(thread_id, turn_id).await {
+            Ok(Some((_, terminal))) if terminal.status != TurnStatus::InProgress => {
+                match self
+                    .thread_manager
+                    .commit_terminal_turn(thread_id, &terminal)
+                    .await
+                {
+                    Ok(_) => return false,
+                    Err(error) => warn!(thread_id, turn_id, error = %error,
+                        "failed to synchronize competing terminal Turn after rollback"),
+                }
+            }
+            Err(error) => warn!(thread_id, turn_id, error = %error,
+                "failed to read competing terminal Turn after rollback"),
+            _ => {}
+        }
         true
     }
 
@@ -10357,6 +10389,34 @@ impl MessageProcessor {
         turn: &pioneer_protocol::Turn,
         reason: &str,
     ) -> anyhow::Result<bool> {
+        self.cancel_root_agent_work_graph(thread_id, turn, reason, None)
+            .await
+    }
+
+    /// Internal lifecycle prerequisite, with one deadline for graph fencing,
+    /// admission and every native root/descendant cleanup. No public RPC.
+    pub(super) async fn cancel_root_agent_work_graph_for_turn_and_wait(
+        &self,
+        thread_id: &str,
+        turn: &pioneer_protocol::Turn,
+        reason: &str,
+        request_deadline: tokio::time::Instant,
+    ) -> anyhow::Result<bool> {
+        tokio::time::timeout_at(
+            request_deadline,
+            self.cancel_root_agent_work_graph(thread_id, turn, reason, Some(request_deadline)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("native graph stop deadline expired; cleanup unconfirmed"))?
+    }
+
+    async fn cancel_root_agent_work_graph(
+        &self,
+        thread_id: &str,
+        turn: &pioneer_protocol::Turn,
+        reason: &str,
+        completion_deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<bool> {
         // A detached admission records provenance, not a responding execution.
         // Its Task owns cancellation through the ordinary Task lifecycle.
         if turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask {
@@ -10382,11 +10442,19 @@ impl MessageProcessor {
         let Some(execution) =
             pioneer_crud::load_agent_execution(&database, execution_id.as_str()).await?
         else {
+            if let Some(deadline) = completion_deadline {
+                self.stop_graph_turn_without_root(thread_id, turn, reason, deadline)
+                    .await?;
+            }
             return Ok(false);
         };
         if execution.id != execution.work_graph_root_execution_id
             || execution.parent_execution_id.is_some()
         {
+            if let Some(deadline) = completion_deadline {
+                self.stop_graph_turn_without_root(thread_id, turn, reason, deadline)
+                    .await?;
+            }
             return Ok(false);
         }
 
@@ -10399,17 +10467,125 @@ impl MessageProcessor {
             .await
             .get(&(thread_id.to_owned(), turn.id.clone()))
             .and_then(|intent| intent.actor_id.clone());
-        let targets = self
-            .crud_store
-            .cancel_agent_work_graph_as(
-                execution.id.as_str(),
-                reason,
-                pioneer_crud::utc_now(),
-                actor_id
-                    .as_deref()
-                    .map(|actor| (actor, thread_id, turn.id.as_str())),
-            )
-            .await?;
+        let targets = if completion_deadline.is_some() {
+            self.crud_store
+                .cancel_agent_work_graph_and_collect_owners(
+                    execution.id.as_str(),
+                    reason,
+                    pioneer_crud::utc_now(),
+                )
+                .await?
+        } else {
+            self.crud_store
+                .cancel_agent_work_graph_as(
+                    execution.id.as_str(),
+                    reason,
+                    pioneer_crud::utc_now(),
+                    actor_id
+                        .as_deref()
+                        .map(|actor| (actor, thread_id, turn.id.as_str())),
+                )
+                .await?
+        };
+
+        let mut cli_turns = std::collections::BTreeSet::new();
+        let mut cli_owners = Vec::new();
+        let mut cli_keys = std::collections::HashSet::new();
+        if completion_deadline.is_some() {
+            let mut turns = targets
+                .iter()
+                .filter_map(|target| {
+                    Some((
+                        target.thread_id.clone()?,
+                        target.turn_id.clone()?,
+                        target.turn_pending,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            turns.push((
+                thread_id.to_owned(),
+                turn.id.clone(),
+                turn.status == pioneer_protocol::TurnStatus::InProgress,
+            ));
+            for (thread, turn_id, pending) in turns {
+                if let Some(binding) = self
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await?
+                {
+                    anyhow::ensure!(
+                        binding.thread_id == thread
+                            && binding.workspace_id == execution.workspace_id,
+                        "CLI graph binding scope changed"
+                    );
+                    cli_turns.insert((thread, turn_id.clone()));
+                    let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                        binding.workspace_id,
+                        binding.runtime_id,
+                        binding.continuation_thread_id,
+                    )?;
+                    cli_keys.insert(key.clone());
+                    let manager = self
+                        .cli_runtime_manager
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("CLI graph owner inventory unavailable"))?;
+                    let owners = manager
+                        .stop_inventory(&execution.workspace_id)
+                        .into_iter()
+                        .filter(|owner| owner.instance().key() == &key && owner.owns_turn(&turn_id))
+                        .collect::<Vec<_>>();
+                    anyhow::ensure!(
+                        !pending || !owners.is_empty(),
+                        "pending CLI graph owner is unknown"
+                    );
+                    for owner in owners {
+                        if !cli_owners.iter().any(
+                            |known: &crate::cli_runtime::manager::CliSessionStopOwner| {
+                                known.instance() == owner.instance()
+                            },
+                        ) {
+                            cli_owners.push(owner);
+                        }
+                    }
+                }
+            }
+        }
+        let api_targets = targets
+            .iter()
+            .filter(|target| !target.has_cli_binding)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (native_owners, native_threads, captured_runs) = if completion_deadline.is_some() {
+            let mut threads = targets
+                .iter()
+                .filter_map(|target| target.turn_id.as_ref().and(target.thread_id.clone()))
+                .collect::<std::collections::BTreeSet<_>>();
+            threads.insert(thread_id.to_owned());
+            // Capture before Task/native cancellation, after the durable admission
+            // fence. Snapshot also covers predecessor and retirement ownership;
+            // historical terminal rows alone are never cleanup proof.
+            let threads = threads.into_iter().collect::<Vec<_>>();
+            let owners = self
+                .agent_manager
+                .capture_native_stop_owners(&threads)
+                .await?;
+            // Include proven historical runs omitted from cancellation selection.
+            let captured_runs = owners
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            let owners = select_native_graph_owners(
+                &api_targets,
+                owners,
+                thread_id,
+                turn.id.as_str(),
+                matches!(turn.status, pioneer_protocol::TurnStatus::InProgress)
+                    && !cli_turns.contains(&(thread_id.to_owned(), turn.id.clone())),
+            )?;
+            (owners, threads, captured_runs)
+        } else {
+            (Vec::new(), Vec::new(), std::collections::HashSet::new())
+        };
 
         let mut task_ids = targets
             .iter()
@@ -10452,6 +10628,9 @@ impl MessageProcessor {
                 )
                 .await
             {
+                if completion_deadline.is_some() {
+                    return Err(error.context("descendant Task cleanup failed"));
+                }
                 warn!(
                     root_execution_id = execution.id,
                     task_id,
@@ -10462,6 +10641,31 @@ impl MessageProcessor {
             }
         }
 
+        if let Some(deadline) = completion_deadline {
+            if let Some(manager) = &self.cli_runtime_manager {
+                for owner in &cli_owners {
+                    manager.stop_and_wait(owner, deadline).await?;
+                }
+            }
+            // Every captured run is awaited; execution IDs cannot overwrite
+            // multiple revisions, recovery runs or outstanding predecessors.
+            for owner in &native_owners {
+                self.mcp_service
+                    .cancel_turn_mcp_invocations(owner.turn_id());
+                self.await_native_graph_owner(owner, reason, deadline)
+                    .await?;
+            }
+        }
+
+        let mut selected_turns = native_owners
+            .iter()
+            .map(|owner| (owner.thread_id(), owner.turn_id()))
+            .collect::<std::collections::BTreeSet<_>>();
+        selected_turns.extend(
+            cli_turns
+                .iter()
+                .map(|(thread, turn)| (thread.as_str(), turn.as_str())),
+        );
         let mut direct_failure = None;
         for target in targets {
             if target.execution_id == execution.id {
@@ -10470,53 +10674,197 @@ impl MessageProcessor {
             let (Some(thread_id), Some(turn_id)) =
                 (target.thread_id.as_deref(), target.turn_id.as_deref())
             else {
+                if completion_deadline.is_some() && target.turn_id.is_some() {
+                    anyhow::bail!("descendant native runtime owner is unknown");
+                }
                 continue;
             };
             self.mcp_service.cancel_turn_mcp_invocations(turn_id);
-            let stopped_cli = match self
-                .cancel_task_cli_runtime_turn(thread_id, turn_id, reason)
-                .await
-            {
-                Ok(stopped) => stopped,
-                Err(error) if target.parent_task_id.is_none() => {
-                    direct_failure.get_or_insert(error);
+            if completion_deadline.is_some() {
+                if !selected_turns.contains(&(thread_id, turn_id)) {
+                    // The snapshot's full native lifetime invariant proves no
+                    // outstanding owner; do not mutate historical completed Turns.
                     continue;
                 }
-                Err(_) => false, // genuine Tasks retain their own cleanup owner
-            };
-            if !stopped_cli {
-                if target.parent_task_id.is_none() {
-                    if let Err(error) = self
-                        .commit_turn_interrupted_with_recovery_disposition(
-                            thread_id.to_owned(),
-                            turn_id.to_owned(),
-                            reason.to_owned(),
-                            None,
-                            true,
-                        )
-                        .await
-                    {
-                        // Preserve completion failure, but keep process control
-                        // and siblings downstream of the committed graph fence.
-                        direct_failure.get_or_insert_with(|| anyhow::Error::msg(error.clone()));
-                        if !error.is_retryable() {
-                            // A semantic refusal grants no control over a
-                            // replacement owner/generation or conflicting result.
-                            continue;
+            } else {
+                let stopped_cli = match self
+                    .cancel_task_cli_runtime_turn(thread_id, turn_id, reason)
+                    .await
+                {
+                    Ok(stopped) => stopped,
+                    Err(error) if target.parent_task_id.is_none() => {
+                        direct_failure.get_or_insert(error);
+                        continue;
+                    }
+                    Err(_) => false, // genuine Tasks retain their own cleanup owner
+                };
+                if !stopped_cli {
+                    if target.parent_task_id.is_none() {
+                        if let Err(error) = self
+                            .commit_turn_interrupted_with_recovery_disposition(
+                                thread_id.to_owned(),
+                                turn_id.to_owned(),
+                                reason.to_owned(),
+                                None,
+                                true,
+                            )
+                            .await
+                        {
+                            // Preserve completion failure, but keep process control
+                            // and siblings downstream of the committed graph fence.
+                            direct_failure.get_or_insert_with(|| anyhow::Error::msg(error.clone()));
+                            if !error.is_retryable() {
+                                // A semantic refusal grants no control over a
+                                // replacement owner/generation or conflicting result.
+                                continue;
+                            }
                         }
                     }
+                    let _ = self
+                        .agent_manager
+                        .cancel_turn(thread_id, turn_id, reason)
+                        .await;
                 }
-                let _ = self
-                    .agent_manager
-                    .cancel_turn(thread_id, turn_id, reason)
-                    .await;
             }
             self.unregister_agent_action_binding(turn_id).await;
         }
         if let Some(error) = direct_failure {
             return Err(error);
         }
+
+        if completion_deadline.is_some() {
+            // Completion of captured tasks can unblock a previously accepted
+            // recovery/continuation. Revalidate actor admission/publication at
+            // the success boundary; do not cancel a replacement by old run ID.
+            let remaining = self
+                .agent_manager
+                .capture_native_stop_owners(&native_threads)
+                .await?;
+            validate_native_graph_stop_snapshot(&captured_runs, &remaining)?;
+            if let Some(manager) = &self.cli_runtime_manager {
+                anyhow::ensure!(
+                    !manager
+                        .stop_inventory(&execution.workspace_id)
+                        .iter()
+                        .any(|owner| cli_keys.contains(owner.instance().key())),
+                    "CLI graph publication changed during stop; retry required"
+                );
+            }
+        }
         Ok(true)
+    }
+
+    async fn stop_graph_turn_without_root(
+        &self,
+        thread: &str,
+        turn: &pioneer_protocol::Turn,
+        reason: &str,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        if let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding(&turn.id)
+            .await?
+        {
+            anyhow::ensure!(
+                binding.thread_id == thread,
+                "CLI fallback binding scope changed"
+            );
+            let manager = self
+                .cli_runtime_manager
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("CLI stop inventory unavailable"))?;
+            let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                binding.workspace_id.clone(),
+                binding.runtime_id,
+                binding.continuation_thread_id,
+            )?;
+            let owners = manager
+                .stop_inventory(&binding.workspace_id)
+                .into_iter()
+                .filter(|owner| owner.instance().key() == &key && owner.owns_turn(&turn.id))
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                turn.status != pioneer_protocol::TurnStatus::InProgress || !owners.is_empty(),
+                "pending CLI fallback owner unknown"
+            );
+            for owner in &owners {
+                manager.stop_and_wait(owner, deadline).await?;
+            }
+            anyhow::ensure!(
+                !manager
+                    .stop_inventory(&binding.workspace_id)
+                    .iter()
+                    .any(|owner| owner.instance().key() == &key),
+                "CLI fallback publication changed during stop"
+            );
+            return Ok(());
+        }
+        tokio::time::timeout_at(deadline, async {
+            let threads = [thread.to_owned()];
+            // Inventory rejects accepted/unpublished starts and unresolved
+            // recovery. Terminal DB state or a missing owner is never proof.
+            let captured = self
+                .agent_manager
+                .capture_native_stop_owners(&threads)
+                .await?
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            let exact = self
+                .agent_manager
+                .capture_turn_stop_owner(thread, &turn.id)
+                .await?;
+            anyhow::ensure!(
+                captured.contains(&exact),
+                "native fallback owner changed before stop"
+            );
+            // Its normal completion path drains its captured predecessors;
+            // do that before examining the rest of the unordered inventory.
+            if !exact.is_quiescent() {
+                self.await_native_graph_owner(&exact, reason, deadline)
+                    .await?;
+            }
+            for owner in &captured {
+                if owner == &exact {
+                    continue;
+                }
+                if owner.turn_id() != turn.id {
+                    anyhow::ensure!(
+                        owner.is_quiescent(),
+                        "outstanding native fallback predecessor or replacement"
+                    );
+                    continue;
+                }
+                // A logical Turn can stay pending after its native run drained.
+                // This new stop needs actual quiescence, not that run's failure.
+                if !owner.is_quiescent() {
+                    self.await_native_graph_owner(owner, reason, deadline)
+                        .await?;
+                }
+            }
+            let remaining = self
+                .agent_manager
+                .capture_native_stop_owners(&threads)
+                .await?;
+            validate_native_graph_stop_snapshot(&captured, &remaining)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("native fallback stop deadline expired; cleanup unconfirmed")
+        })?
+    }
+
+    pub(super) async fn await_native_graph_owner(
+        &self,
+        owner: &pioneer_agent::NativeTurnStopOwner,
+        reason: &str,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        self.agent_manager
+            .cancel_captured_turn_and_wait(owner, reason, deadline)
+            .await
+            .map_err(|error| anyhow::anyhow!("descendant native cleanup failed: {error}"))
     }
 
     /// Native provider success with a final response is acknowledged only after
@@ -12412,6 +12760,39 @@ impl MessageProcessor {
             .context("failed to materialize artifact-aware user message payload")?;
         let (text, mut attachments) = payload.unwrap_or_default();
         attachments.extend_from_slice(capability_attachments);
+        // Freeze the authored image reference with the user message. Only the Gateway's
+        // matching installed revision may supply it; client image references are ignored.
+        for attachment in &mut attachments {
+            if let pioneer_protocol::UserMessageAttachment::Plugin { capability } = attachment {
+                capability.icon = None;
+                if let Ok(Some(parent)) = self
+                    .crud_store
+                    .find_plugin_installation(&capability.plugin_id)
+                    .await
+                {
+                    if parent.workspace_id == workspace_id
+                        && parent.revision == capability.expected_revision
+                        && parent.state == "installed"
+                        && parent.pending_json.is_none()
+                    {
+                        capability.icon = parent
+                            .composer_icon_path
+                            .as_ref()
+                            .zip(parent.composer_icon_revision.as_ref())
+                            .or_else(|| {
+                                parent.logo_path.as_ref().zip(parent.logo_revision.as_ref())
+                            })
+                            .map(|(_, revision)| {
+                                pioneer_protocol::ImageReference::plugin_icon(
+                                    &parent.workspace_id,
+                                    &parent.id,
+                                    revision.clone(),
+                                )
+                            });
+                    }
+                }
+            }
+        }
 
         if text.is_empty() && attachments.is_empty() {
             return Ok(());
@@ -12933,6 +13314,7 @@ fn user_message_attachments_from_capabilities_with_lookup<'a>(
                         },
                     }
                 }
+                pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id, expected_revision } => pioneer_protocol::UserMessageAttachment::Plugin { capability: pioneer_protocol::TurnPluginCapabilitySummary { plugin_id: plugin_id.clone(), expected_revision: *expected_revision, label: capability.label.clone().ok_or_else(|| anyhow::anyhow!("plugin presentation missing"))?, icon: None } },
                 pioneer_protocol::TurnCapabilityKind::SkillPack { pack_id } => {
                     let name = pack_names.get(pack_id).ok_or_else(|| {
                         anyhow::anyhow!(
@@ -13263,6 +13645,76 @@ mod user_message_attachment_tests {
                 if capability.pack_id == pack_id && capability.label == "Authoritative Pack"
         ));
     }
+}
+
+/// Match bounded durable one-to-many bindings to captured actual native runs.
+/// A missing pending binding is an admission/ownership gap, not a terminal-state
+/// cleanup claim. Historical bindings can disappear only through the manager's
+/// proven-quiescent release/actor-join invariant used by its snapshot.
+pub(super) fn select_native_graph_owners(
+    targets: &[pioneer_crud::AgentWorkGraphCancellationTarget],
+    owners: Vec<pioneer_agent::NativeTurnStopOwner>,
+    root_thread: &str,
+    root_turn: &str,
+    root_pending: bool,
+) -> anyhow::Result<Vec<pioneer_agent::NativeTurnStopOwner>> {
+    if targets.iter().any(|target| target.has_cli_binding) {
+        anyhow::bail!("graph stop contains an unsupported CLI runtime binding");
+    }
+    let mut bindings = std::collections::BTreeSet::new();
+    for target in targets {
+        match (&target.thread_id, &target.turn_id) {
+            (Some(thread), Some(turn)) => {
+                bindings.insert((thread.as_str(), turn.as_str()));
+            }
+            (None, Some(_)) => anyhow::bail!("graph response thread owner is unknown"),
+            (_, None) => {} // Serialized fence closes queued/unadmitted work.
+        }
+    }
+    let known_turns = owners
+        .iter()
+        .map(|owner| (owner.thread_id(), owner.turn_id()))
+        .collect::<std::collections::BTreeSet<_>>();
+    for owner in &owners {
+        if !owner.is_quiescent()
+            && !bindings.contains(&(owner.thread_id(), owner.turn_id()))
+            && (owner.thread_id(), owner.turn_id()) != (root_thread, root_turn)
+        {
+            anyhow::bail!("outstanding native run has no exact graph response binding");
+        }
+    }
+    for target in targets.iter().filter(|target| target.turn_pending) {
+        if let (Some(thread), Some(turn)) = (&target.thread_id, &target.turn_id) {
+            if !known_turns.contains(&(thread.as_str(), turn.as_str())) {
+                anyhow::bail!("pending graph response native owner is unknown");
+            }
+        }
+    }
+    if root_pending && !known_turns.contains(&(root_thread, root_turn)) {
+        anyhow::bail!("pending root native owner is unknown");
+    }
+    // Pending rows require a known native owner above, but may lag its completed
+    // cleanup. A new stop awaits outstanding runs; the complete initial snapshot
+    // still owns final identity validation, including already quiescent runs.
+    Ok(owners
+        .into_iter()
+        .filter(|owner| !owner.is_quiescent())
+        .collect())
+}
+
+/// The success boundary permits only proven-quiescent identities already in
+/// the initial snapshot, including history omitted from cancellation selection.
+pub(super) fn validate_native_graph_stop_snapshot(
+    captured: &std::collections::HashSet<pioneer_agent::NativeTurnStopOwner>,
+    remaining: &[pioneer_agent::NativeTurnStopOwner],
+) -> anyhow::Result<()> {
+    if remaining
+        .iter()
+        .any(|owner| !owner.is_quiescent() || !captured.contains(owner))
+    {
+        anyhow::bail!("native graph publication changed during stop; retry required");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

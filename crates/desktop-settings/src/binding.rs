@@ -69,11 +69,8 @@ impl SettingsBinding {
                     avatar_revision: auth.principal.avatar_revision?,
                 })
             });
-        let scope = request.as_ref().map(|request| ClientScope::Avatar {
-            principal_id: avatar_identity_key(
-                request.principal_id.as_str(),
-                &request.avatar_revision,
-            ),
+        let scope = request.as_ref().map(|request| ClientScope::Image {
+            key: avatar_identity_key(request.principal_id.as_str(), &request.avatar_revision),
         });
         let authority = config
             .client

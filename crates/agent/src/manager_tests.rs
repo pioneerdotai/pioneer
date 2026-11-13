@@ -174,7 +174,7 @@ fn load_test_catalog() {
     });
 }
 
-pub(super) fn test_tool_loop_config() -> ToolLoopConfig {
+pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
     load_test_catalog();
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
@@ -6764,7 +6764,7 @@ async fn thread_removal_fences_a_full_mailbox_without_unbounded_wait() {
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6801,7 +6801,7 @@ async fn thread_removal_does_not_expose_replacement_until_old_actor_has_stopped(
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6872,7 +6872,7 @@ async fn control_timeout_fences_only_the_unresponsive_actor_generation() {
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6958,7 +6958,7 @@ async fn abandoned_enqueued_control_is_generation_fenced_on_reconciliation() {
             control_outcomes: outcomes,
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -7019,7 +7019,7 @@ async fn terminal_retirement_fences_generation_before_registry_release() {
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -7076,7 +7076,7 @@ async fn terminal_retirement_does_not_publish_replacement_before_old_actor_stops
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -13061,6 +13061,18 @@ async fn cancel_turn_returns_without_waiting_for_actor_terminal_event() {
         .await
         .expect("turn should start");
 
+    let owner = manager
+        .capture_turn_stop_owner(thread_id, turn_id)
+        .await
+        .unwrap();
+    let (release, released) = tokio::sync::oneshot::channel();
+    owner
+        .control
+        .completion
+        .retain_tool(super::NativeTask::new(tokio::spawn(async move {
+            let _ = released.await;
+        })));
+
     // Gateway commits the durable Interrupted lifecycle before invoking this
     // process control. The runtime must therefore stop independently without
     // waiting for the actor to publish a second terminal event.
@@ -13071,6 +13083,29 @@ async fn cancel_turn_returns_without_waiting_for_actor_terminal_event() {
     .await
     .expect("turn cancellation must not wait for the actor mailbox")
     .expect("turn cancellation should succeed");
+    assert!(
+        timeout(
+            Duration::from_millis(10),
+            manager.cancel_captured_turn_and_wait(
+                &owner,
+                "wait",
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+        )
+        .await
+        .is_err()
+    );
+    assert!(owner.control.completion.outcome().is_none());
+    release.send(()).unwrap();
+    manager
+        .cancel_captured_turn_and_wait(
+            &owner,
+            "retry",
+            tokio::time::Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    manager.remove_thread(thread_id).await;
 }
 
 #[tokio::test]
@@ -15727,6 +15762,9 @@ async fn compaction_boundary_prepares_each_follow_up_before_provider() {
         "new input reached the provider once"
     );
 }
+
+#[path = "manager_tests_stop_admission.rs"]
+mod stop_admission;
 
 #[tokio::test(start_paused = true)]
 async fn durable_gateway_cancellation_cleans_actor_and_allows_next_turn_without_preparation() {

@@ -38,6 +38,21 @@
     "health_details"
   ],
   "$defs": {
+    "PluginOwner": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "plugin_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "member_key"
+      ]
+    },
     "SkillAuditTimelineItem": {
       "type": "object",
       "properties": {
@@ -253,6 +268,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/SkillPackMembership"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plugin_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginOwner"
             },
             {
               "type": "null"

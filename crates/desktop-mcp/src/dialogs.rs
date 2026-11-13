@@ -15,6 +15,11 @@ use std::sync::Arc;
 pub(crate) struct McpConfigForm {
     input: Entity<TextareaState>,
     workspace: String,
+    plugin_target: Option<(String, String)>,
+    plugin_receipt: Option<pioneer_client::plugins::runtime::PluginCommandReceipt>,
+    origin: pioneer_client::plugins::runtime::PluginCommandOrigin,
+    plugin_unknown: bool,
+    authorization: Option<(u64, u64)>,
     operation: Option<u64>,
     publication: Option<Arc<McpActionPublication>>,
     error: Option<String>,
@@ -24,9 +29,11 @@ pub(crate) struct McpConfigForm {
 }
 impl McpConfigForm {
     fn pending(&self) -> bool {
-        self.publication
-            .as_ref()
-            .is_some_and(|p| p.state == McpActionState::Pending)
+        (self.plugin_receipt.is_some() && !self.plugin_unknown)
+            || self
+                .publication
+                .as_ref()
+                .is_some_and(|p| p.state == McpActionState::Pending)
     }
 }
 impl McpCatalogView {
@@ -92,10 +99,29 @@ impl McpCatalogView {
         else {
             return;
         };
+        let owned_name = if let Some((expected_workspace, parent, child)) = &self.plugin_component {
+            let Some(server) = self.input.mcp_servers.iter().find(|server| {
+                expected_workspace == &workspace
+                    && &server.id == child
+                    && server
+                        .plugin_owner
+                        .as_ref()
+                        .is_some_and(|owner| &owner.plugin_id == parent)
+            }) else {
+                return;
+            };
+            Some(server.name.clone())
+        } else {
+            None
+        };
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(5, 14)
-                .placeholder(r#"{ "mcpServers": { ... } }"#)
+                .placeholder(if owned_name.is_some() {
+                    r#"{ "url": "https://…", "headers": {} }"#
+                } else {
+                    r#"{ "mcpServers": { ... } }"#
+                })
         });
         if let Some(value) = initial_config {
             input.update(cx, |input, cx| input.set_value(value, window, cx));
@@ -113,6 +139,14 @@ impl McpCatalogView {
         let form = cx.new(|_| McpConfigForm {
             input,
             workspace,
+            plugin_target: self
+                .plugin_component
+                .as_ref()
+                .map(|(_, parent, child)| (parent.clone(), child.clone())),
+            plugin_receipt: None,
+            origin: self.client.plugin_command_origin(),
+            plugin_unknown: false,
+            authorization: self.client.authorization_permissions_epoch(),
             operation: None,
             publication: None,
             error: None,
@@ -143,10 +177,14 @@ impl McpCatalogView {
                 .overlay_closable(!pending)
                 .keyboard(!pending)
                 .title(
-                    div()
-                        .text_base()
-                        .font_semibold()
-                        .child(t!("mcp.dialog.install_title").to_string()),
+                    div().text_base().font_semibold().child(
+                        t!(if state.plugin_target.is_some() {
+                            "mcp.dialog.replace_owned"
+                        } else {
+                            "mcp.dialog.install_title"
+                        })
+                        .to_string(),
+                    ),
                 )
                 .on_close({
                     let form = form.clone();
@@ -167,8 +205,15 @@ impl McpCatalogView {
                             .on_click(|_, window, cx| window.close_dialog(cx))
                             .into_any_element(),
                         default_primary_button("mcp-config-dialog-save")
-                            .label(t!("mcp.dialog.install").to_string())
-                            .disabled(pending)
+                            .label(
+                                t!(if state.plugin_target.is_some() {
+                                    "mcp.dialog.replace_owned"
+                                } else {
+                                    "mcp.dialog.install"
+                                })
+                                .to_string(),
+                            )
+                            .disabled(pending || state.plugin_unknown)
                             .loading(pending)
                             .on_click({
                                 let owner = owner.clone();
@@ -192,7 +237,7 @@ impl McpCatalogView {
                                 .child(
                                     field()
                                         .label(t!("mcp.dialog.config_json").to_string())
-                                        .child(Textarea::new(&input).min_w_0()),
+                                        .child(Textarea::new(&input).min_w_0().disabled(pending)),
                                 )
                                 .when_some(error, |form, error| {
                                     form.child(
@@ -223,9 +268,30 @@ impl McpCatalogView {
         form.update(cx, |form, cx| {
             if !form.open
                 || !form.lifetime.read(cx).valid()
+                || form.authorization != self.client.authorization_permissions_epoch()
+                || form.plugin_unknown
                 || form.pending()
                 || form.parent_generation != self.parent_generation
             {
+                return;
+            }
+            if let Some((parent, child)) = &form.plugin_target {
+                match self.client.submit_plugin_command(
+                    &form.workspace,
+                    parent,
+                    pioneer_client::plugins::runtime::PluginIntent::ConfigureMcp {
+                        server_id: child.clone(),
+                        body: form.input.read(cx).value().to_string(),
+                    },
+                    &form.origin,
+                ) {
+                    Ok(receipt) => {
+                        form.plugin_receipt = Some(receipt);
+                        form.error = None;
+                    }
+                    Err(_) => form.error = Some(t!("mcp.error.plugin_change_failed").to_string()),
+                }
+                cx.notify();
                 return;
             }
             let config = form.input.read(cx).value().to_string();
@@ -261,11 +327,71 @@ impl McpCatalogView {
             if !form.open {
                 return false;
             }
-            if form.parent_generation != self.parent_generation {
+            if form.parent_generation != self.parent_generation
+                || form.authorization != self.client.authorization_permissions_epoch()
+            {
                 form.open = false;
                 form.input
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 return true;
+            }
+            if form.plugin_target.is_some() {
+                let Some(receipt) = &form.plugin_receipt else {
+                    return false;
+                };
+                let operation = self
+                    .client
+                    .plugin_command_operation(&form.workspace, receipt);
+                let Some(operation) = operation else {
+                    form.plugin_unknown = true;
+                    form.error = Some(t!("mcp.error.plugin_uncertain").to_string());
+                    cx.notify();
+                    return false;
+                };
+                if let Some(native_id) = operation.native_operation_id {
+                    let publication = self
+                        .client
+                        .mcp_action_snapshot(&form.workspace, "configuration")
+                        .filter(|p| {
+                            p.operation_id == native_id && p.kind == McpActionKind::Configure
+                        });
+                    match publication.as_ref() {
+                        Some(p) if p.state == McpActionState::Succeeded && !p.uncertain => {
+                            form.open = false;
+                            form.input
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            return true;
+                        }
+                        Some(p) if p.state == McpActionState::Pending => return false,
+                        Some(p) if !p.uncertain && p.state == McpActionState::Failed => {
+                            form.error = Some(
+                                p.field_error
+                                    .as_ref()
+                                    .map(mcp_install_field_error)
+                                    .unwrap_or_else(|| {
+                                        t!("mcp.error.plugin_change_failed").to_string()
+                                    }),
+                            );
+                            form.plugin_receipt = None;
+                            cx.notify();
+                            return false;
+                        }
+                        _ => form.plugin_unknown = true,
+                    }
+                } else if operation.busy {
+                    return false;
+                } else if operation.error.is_some() && !operation.uncertain {
+                    // Parent validation rejected before native admission. Input survives.
+                    form.plugin_receipt = None;
+                    form.error = Some(t!("mcp.error.plugin_change_failed").to_string());
+                    cx.notify();
+                    return false;
+                } else {
+                    form.plugin_unknown = true;
+                }
+                form.error = Some(t!("mcp.error.plugin_uncertain").to_string());
+                cx.notify();
+                return false;
             }
             let publication = self
                 .client

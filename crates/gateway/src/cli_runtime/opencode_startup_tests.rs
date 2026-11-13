@@ -82,6 +82,7 @@ pub(crate) struct StartupFixture {
     pub(crate) root: tempfile::TempDir,
     pub(crate) instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
     http: JoinHandle<()>,
+    startup: crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
 }
 
 impl Drop for StartupFixture {
@@ -175,6 +176,7 @@ while read line; do :; done
             root,
             instance,
             http,
+            startup: Default::default(),
         }
     }
 
@@ -189,6 +191,7 @@ while read line; do :; done
             env,
             None,
             &self.root.path().join("data"),
+            &self.startup,
         )
         .await
     }
@@ -346,6 +349,13 @@ async fn sqlite_startup_conflict_uses_one_deadline_including_backoff() {
     assert_eq!(fixture.starts().len(), 2);
     // A fresh 1s timeout on the second attempt would exceed 1.4s.
     assert!(started.elapsed() < Duration::from_millis(1250));
+    let failure = error.downcast_ref::<OpenCodeStartupFailure>().unwrap();
+    let owner = fixture.startup.session().expect("retained startup owner");
+    let cleanup = owner.close().await;
+    match failure.cleanup_error.as_deref() {
+        Some(expected) => assert_eq!(cleanup.unwrap_err().to_string(), expected),
+        None => cleanup.unwrap(),
+    }
     fixture.wait_stopped().await;
 }
 
@@ -403,6 +413,12 @@ async fn startup_timeout_never_retries_even_with_sqlite_stderr() {
             .any(|line| line.contains("SQLiteError: database is locked"))
     );
     assert_eq!(fixture.starts().len(), 1);
+    let owner = fixture.startup.session().expect("retained startup owner");
+    let cleanup = owner.close().await;
+    match failure.cleanup_error.as_deref() {
+        Some(expected) => assert_eq!(cleanup.unwrap_err().to_string(), expected),
+        None => cleanup.unwrap(),
+    }
     fixture.wait_stopped().await;
 }
 
@@ -467,6 +483,7 @@ async fn startup_cancellation_during_address_wait_cleans_owned_children() {
         fixture.wait_for_starts(1).await;
         assert!(process_present(fixture.starts()[0]));
     }
+    fixture.startup.session().unwrap().close().await.unwrap();
     fixture.wait_stopped().await;
     assert_eq!(fixture.starts().len(), 1);
 }
@@ -507,6 +524,12 @@ async fn startup_pid_health_failures_never_retry_and_health_shares_address_deadl
             assert_eq!(failure.stage, OpenCodeStartupStage::Health);
         }
         assert_eq!(fixture.starts().len(), 1);
+        let owner = fixture.startup.session().expect("retained startup owner");
+        let cleanup = owner.close().await;
+        match failure.cleanup_error.as_deref() {
+            Some(expected) => assert_eq!(cleanup.unwrap_err().to_string(), expected),
+            None => cleanup.unwrap(),
+        }
         fixture.wait_stopped().await;
     }
 }
@@ -541,28 +564,37 @@ async fn startup_success_owns_one_process_and_prompt_failure_does_not_respawn() 
 }
 
 #[tokio::test]
-async fn startup_cleanup_failure_stops_sqlite_retries_when_descendant_holds_stderr() {
-    let mut fixture = StartupFixture::new(
-        "(exec 1>&-; sleep 30) &\necho $! > descendant\necho 'SQLiteError: database is locked' >&2\nexit 7",
-        "ready",
-    )
-    .await;
-    fixture.instance.startup_probe_timeout_ms = 400;
-    let error = fixture.start().await.err().unwrap();
+async fn startup_cleanup_deadline_stops_sqlite_retries_after_busy_exit() {
+    let fixture = StartupFixture::new(BUSY, "ready").await;
+    let gate = PhaseGate::new(StartupPhase::GroupCleanupConfirmed, 1);
+    let budget = Duration::from_millis(fixture.instance.startup_probe_timeout_ms);
+    let future = PHASE_GATE.scope(gate.clone(), fixture.start());
+    tokio::pin!(future);
+    tokio::select! {
+        result = &mut future => panic!("startup finished before the cleanup checkpoint: {}", result.is_ok()),
+        entered = tokio_timeout(Duration::from_secs(3), gate.entered.notified()) => entered.unwrap()
+    }
+    assert_eq!(fixture.starts().len(), 1);
+    fixture.assert_stopped();
+    // Holding stderr open does not guarantee a cleanup failure: termination
+    // signals descendants before joining the reader. Instead, hold the existing
+    // cleanup checkpoint until its deadline expires, after the real child exits.
+    tokio::time::pause();
+    tokio::time::advance(budget).await;
+    tokio::time::resume();
+    let error = future.await.err().unwrap();
     let failure = error.downcast_ref::<OpenCodeStartupFailure>().unwrap();
+    assert_eq!(failure.stage, OpenCodeStartupStage::AddressEof);
+    assert_eq!(failure.status.unwrap().code(), Some(7));
+    assert!(failure.sqlite_busy);
     assert!(failure.cleanup_error.is_some());
     assert_eq!(fixture.starts().len(), 1);
-    fixture.wait_stopped().await;
-    let descendant: i32 = std::fs::read_to_string(fixture.root.path().join("descendant"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let owner = fixture.startup.session().expect("retained startup owner");
     assert_eq!(
-        unsafe { libc::kill(descendant, 0) },
-        -1,
-        "descendant survived cleanup"
+        owner.close().await.unwrap_err().to_string(),
+        failure.cleanup_error.as_deref().unwrap()
     );
+    fixture.wait_stopped().await;
 }
 
 #[tokio::test]
@@ -729,4 +761,267 @@ async fn startup_public_diagnostics_bound_lines_and_strip_controls() {
     assert!(failure.stderr[0].contains("[truncated"));
     assert!(format!("{error:#}").len() < 2300);
     fixture.assert_stopped();
+}
+
+// The factory only creates real resources and returns an ordinary startup Err.
+// Completion is supplied by the production retained owner and manager drain,
+// never by a fake stop/closed predicate on the factory.
+struct FailedRetainedStartupFactory {
+    config: CLIAgentProcessSpawnConfig,
+    expired_cleanup: bool,
+    reader_release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    failed: Notify,
+    resources: std::sync::Mutex<Option<Arc<OpenCodeStartupOwner>>>,
+}
+
+#[async_trait::async_trait]
+impl CLIAgentRuntimeSessionFactory for FailedRetainedStartupFactory {
+    async fn start_session_with_launch_spec(
+        &self,
+        instance: &CliSessionInstanceId,
+        _launch: &CliSessionLaunchSpec,
+        startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
+    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+        let mut config = self.config.clone();
+        config.process_generation = Some(instance.generation());
+        let catalog = tempfile::tempdir()?;
+        let process = spawn_cli_agent_process(&config)?;
+        let owner = OpenCodeStartupOwner::new(process, catalog, startup);
+        *self.resources.lock().unwrap() = Some(owner.clone());
+        let (mut stdout, stdin) = owner.process.lock().await.take_stdio()?;
+        *owner.stdin.lock().await = Some(stdin);
+        let release = self.reader_release.lock().unwrap().take().unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let mut slot = owner.stdout_reader.lock().await;
+        *slot = Some(tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            // A real pipe reader whose actual join is deliberately delayed.
+            // Its handle is registered in the production owner, not lost on Err.
+            release.recv().unwrap();
+            tokio::runtime::Handle::current().block_on(async move {
+                use tokio::io::AsyncReadExt;
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).await.unwrap();
+            });
+        }));
+        drop(slot);
+        ready.await.unwrap();
+        let error = if self.expired_cleanup {
+            let deadline = Instant::now() - Duration::from_millis(1);
+            let mut process = owner.process.lock().await;
+            let failure = opencode_startup_failure(
+                &mut process,
+                OpenCodeStartupStage::Timeout,
+                anyhow!("startup address deadline"),
+                &config.env,
+                deadline,
+            )
+            .await;
+            drop(process);
+            let failure = owner.failed_attempt(failure, deadline).await;
+            assert!(failure.cleanup_error.is_some());
+            anyhow::Error::new(failure)
+        } else {
+            anyhow!("ordinary startup failure after actual spawn")
+        };
+        self.failed.notify_one();
+        Err(error)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_startup_retains_actual_process_and_reader_through_cancelled_stop_and_retry() {
+    use crate::cli_runtime::manager::{
+        CLIAgentRuntimeManager, CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionStartOptions,
+    };
+    for expired_cleanup in [false, true] {
+        let fixture = StartupFixture::new("", "ready").await;
+        let (release, reader_release) = std::sync::mpsc::channel();
+        let factory = Arc::new(FailedRetainedStartupFactory {
+            config: CLIAgentProcessSpawnConfig {
+                executable: fixture.instance.binary_path.clone(),
+                args: Vec::new(),
+                cwd: Some(fixture.root.path().to_path_buf()),
+                home_path: None,
+                home_dir: None,
+                env: SensitiveEnvironment::new(),
+                env_remove: Vec::new(),
+                stderr_ring_lines: 16,
+                process_group: true,
+                process_generation: None,
+            },
+            expired_cleanup,
+            reader_release: std::sync::Mutex::new(Some(reader_release)),
+            failed: Notify::new(),
+            resources: std::sync::Mutex::new(None),
+        });
+        let manager = Arc::new(
+            CLIAgentRuntimeManager::new(factory.clone(), Duration::from_secs(60)).unwrap(),
+        );
+        let key = CLIAgentRuntimeSessionKey::new("ws", "opencode", "startup-error").unwrap();
+        let starter = {
+            let manager = manager.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                manager
+                    .get_or_start_with_launch_spec(
+                        key,
+                        CliSessionLaunchSpec::opencode(
+                            CLIAgentRuntimeSessionStartOptions::default(),
+                            CliMcpSessionLaunch::Disabled,
+                            None,
+                        ),
+                    )
+                    .await
+            })
+        };
+        factory.failed.notified().await;
+        assert!(
+            !starter.is_finished(),
+            "startup observer must wait for real cleanup"
+        );
+        let captured = manager
+            .stop_inventory("ws")
+            .pop()
+            .expect("failed process owner remains retained");
+        assert!(manager.existing_session(&key).await.is_none());
+        // The factory failed; cancelling its observer cannot drop actual cleanup.
+        starter.abort();
+        assert!(matches!(starter.await, Err(error) if error.is_cancelled()));
+        {
+            let mut stop =
+                Box::pin(manager.stop_and_wait(&captured, Instant::now() + Duration::from_secs(5)));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(stop.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(manager.stop_inventory("ws").len(), 1);
+        release.send(()).unwrap();
+        let result = manager
+            .stop_and_wait(&captured, Instant::now() + Duration::from_secs(5))
+            .await;
+        assert_eq!(result.is_err(), expired_cleanup);
+        let resources = factory.resources.lock().unwrap().as_ref().unwrap().clone();
+        assert!(
+            resources.stdout_reader.lock().await.is_none(),
+            "actual reader join was consumed"
+        );
+        assert!(
+            resources.process.lock().await.try_wait().unwrap().is_some(),
+            "actual child was reaped"
+        );
+        // Ordinary factory Err is not permanent failure once actual cleanup is
+        // confirmed. A consumed cleanup failure, however, remains sticky.
+        assert_eq!(
+            manager.stop_inventory("ws").len(),
+            usize::from(expired_cleanup)
+        );
+        assert_eq!(
+            manager
+                .stop_and_wait(&captured, Instant::now() + Duration::from_secs(5))
+                .await
+                .is_err(),
+            expired_cleanup
+        );
+        fixture.assert_stopped();
+    }
+}
+
+// Exercise publication at the real spawn/address/deadline seam as well as
+// the delayed actual-join contract above. No test supplies its stop outcome.
+struct DeadlineStartupFactory {
+    instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    root: PathBuf,
+    gate: Arc<PhaseGate>,
+}
+
+#[async_trait::async_trait]
+impl CLIAgentRuntimeSessionFactory for DeadlineStartupFactory {
+    async fn start_session_with_launch_spec(
+        &self,
+        instance: &CliSessionInstanceId,
+        _launch: &CliSessionLaunchSpec,
+        startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
+    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+        let result = PHASE_GATE
+            .scope(
+                self.gate.clone(),
+                spawn_opencode_server(
+                    &self.instance,
+                    &self.root,
+                    &SensitiveEnvironment::new(),
+                    Some(instance.generation()),
+                    &self.root.join("data"),
+                    startup,
+                ),
+            )
+            .await;
+        let error = result
+            .err()
+            .expect("actual startup must exhaust its deadline");
+        let failure = error.downcast_ref::<OpenCodeStartupFailure>().unwrap();
+        assert_eq!(failure.stage, OpenCodeStartupStage::Timeout);
+        assert!(failure.cleanup_error.is_some());
+        Err(error)
+    }
+}
+
+#[tokio::test]
+async fn actual_startup_deadline_cannot_release_generation_after_unconfirmed_cleanup() {
+    use crate::cli_runtime::manager::{
+        CLIAgentRuntimeManager, CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionStartOptions,
+    };
+    let fixture = StartupFixture::new("", "ready").await;
+    let gate = PhaseGate::new(StartupPhase::AddressLineRead, 1);
+    let manager = Arc::new(
+        CLIAgentRuntimeManager::new(
+            Arc::new(DeadlineStartupFactory {
+                instance: fixture.instance.clone(),
+                root: fixture.root.path().to_path_buf(),
+                gate: gate.clone(),
+            }),
+            Duration::from_secs(60),
+        )
+        .unwrap(),
+    );
+    let starter = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .get_or_start_with_launch_spec(
+                    CLIAgentRuntimeSessionKey::new("ws", "opencode", "deadline").unwrap(),
+                    CliSessionLaunchSpec::opencode(
+                        CLIAgentRuntimeSessionStartOptions::default(),
+                        CliMcpSessionLaunch::Disabled,
+                        None,
+                    ),
+                )
+                .await
+        })
+    };
+    tokio_timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(fixture.starts().len(), 1);
+    let captured = manager.stop_inventory("ws").pop().unwrap();
+    // The deadline is spent only after the actual child published stdout.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(
+        fixture.instance.startup_probe_timeout_ms,
+    ))
+    .await;
+    tokio::time::resume();
+    assert!(starter.await.unwrap().is_err());
+    for _ in 0..2 {
+        assert!(
+            manager
+                .stop_and_wait(&captured, Instant::now() + Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        assert_eq!(manager.stop_inventory("ws").len(), 1);
+    }
+    fixture.wait_stopped().await;
 }

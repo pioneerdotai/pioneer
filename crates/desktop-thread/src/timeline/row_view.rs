@@ -31,6 +31,7 @@ pub(crate) struct RowPresentation {
     pub(super) reasoning_has_body: bool,
     workspace_id: Option<String>,
     author: TimelineAuthorPresentation,
+    pub(super) plugin_images: pioneer_desktop_foundation::ImageViews,
     pub(super) catalog_input:
         Option<Arc<pioneer_client::composer::catalog::ComposerCatalogPublication>>,
     principal_capabilities: pioneer_client::authorization::PrincipalPresentationCapabilities,
@@ -139,6 +140,27 @@ impl RowPresentation {
                 _ => String::new(),
             })
             .unwrap_or_default();
+        let mut plugin_images = slot
+            .view
+            .as_ref()
+            .map(|row| row.read(cx).presentation.plugin_images.clone())
+            .unwrap_or_else(|| {
+                pioneer_desktop_foundation::ImageViews::new().placeholder("icons/box.svg")
+            });
+        let icons = slot
+            .snapshot()
+            .item()
+            .map(|item| match &item.item {
+                pioneer_client::timeline::types::TurnItem::UserMessage { attachments, .. } => {
+                    pioneer_client::timeline::labels::parse_user_attachments(attachments)
+                        .into_iter()
+                        .filter_map(|attachment| attachment.plugin_icon)
+                        .collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        plugin_images.reconcile(icons, cx);
         let (dino, elapsed) = (None, None);
         let presentation = Self {
             actions: RowActions {
@@ -164,6 +186,7 @@ impl RowPresentation {
             workspace_id: screen.thread_workspace_id(&screen.thread_id),
             author: screen.current_timeline_author_presentation(exact_author),
             catalog_input: screen.catalog_input.clone(),
+            plugin_images,
             principal_capabilities: screen.principal_presentation_capabilities(),
             thread_capabilities: screen.thread_presentation_capabilities(&screen.thread_id),
             artifact_policy,

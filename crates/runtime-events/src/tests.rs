@@ -452,6 +452,30 @@ async fn snapshot_lane_keeps_latest_value_for_each_item() {
 }
 
 #[tokio::test]
+async fn owned_cli_hub_shutdown_rejects_queued_publication_and_late_progress() {
+    let hub = Arc::new(ExecutionEventHub::new());
+    let publisher = {
+        let hub = hub.clone();
+        tokio::spawn(async move { hub.publish_durable_and_wait(completed("turn_1")).await })
+    };
+    tokio::task::yield_now().await;
+    let mut live = hub.subscribe_live();
+    hub.publish_progress(delta("buffered"));
+    hub.shutdown_and_wait().await.unwrap();
+    assert!(publisher.await.unwrap().is_err());
+    assert!(
+        hub.publish_durable_and_wait(completed("turn_2"))
+            .await
+            .is_err()
+    );
+    while live.try_recv().is_ok() {}
+    hub.publish_progress(delta("late"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(live.try_recv().is_err());
+    hub.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn terminal_flush_precedes_capacity_and_envelope_keeps_origin_until_ack_or_loss() {
     use pioneer_observability::scenario::{accept_params, inject_params};
     use std::future::{Future, poll_fn};

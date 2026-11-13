@@ -10472,6 +10472,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "pioneer-observability",
+ "pioneer-plugins",
  "pioneer-protocol",
  "pioneer-skills",
  "qrcode",
@@ -10580,6 +10581,7 @@ dependencies = [
  "pioneer-desktop-foundation",
  "pioneer-desktop-mcp",
  "pioneer-desktop-onboarding",
+ "pioneer-desktop-plugins",
  "pioneer-desktop-providers",
  "pioneer-desktop-settings",
  "pioneer-desktop-skills",
@@ -10644,6 +10646,8 @@ version = "0.72.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -10669,6 +10673,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "pioneer-desktop-plugins"
+version = "0.72.0"
+dependencies = [
+ "gpui-kit",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "pioneer-protocol",
+ "rust-i18n",
 ]
 
 [[package]]
@@ -10831,6 +10846,7 @@ dependencies = [
  "pioneer-memory",
  "pioneer-migration",
  "pioneer-observability",
+ "pioneer-plugins",
  "pioneer-promt",
  "pioneer-protocol",
  "pioneer-provider",
@@ -10910,6 +10926,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "libc",
  "pioneer-observability",
  "process-wrap",
  "reqwest",
@@ -11016,6 +11033,22 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "pioneer-plugins"
+version = "0.72.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "http",
+ "pioneer-protocol",
+ "pioneer-skills",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "url",
 ]
 
 [[package]]
@@ -11195,6 +11228,7 @@ dependencies = [
  "pioneer-provider",
  "pioneer-skills",
  "pioneer-sqlite",
+ "process-wrap",
  "regex",
  "regex-syntax",
  "reqwest",

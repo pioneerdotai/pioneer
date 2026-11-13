@@ -1758,3 +1758,6 @@ reason_unknown = "操作未按预期完成。请检查 Gateway 日志。"
 [mcp.oauth]
 callback_received = "已接受回调。请返回 Pioneer 查看登录结果。"
 callback_rejected = "登录被拒绝。请返回 Pioneer 重新登录。"
+
+[plugins]
+title = "插件"

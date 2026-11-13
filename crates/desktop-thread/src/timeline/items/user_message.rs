@@ -411,6 +411,7 @@ impl RowPresentation {
                     .child(self.render_user_message_attachment_preview(
                         preview_image_path,
                         attachment.kind,
+                        attachment.plugin_icon.as_ref(),
                         cx,
                     ))
                     .child(
@@ -437,11 +438,24 @@ impl RowPresentation {
         &self,
         preview_image_path: Option<PathBuf>,
         kind: ParsedUserAttachmentKind,
+        plugin_icon: Option<&pioneer_client::plugins::PluginIcon>,
         cx: &mut App,
     ) -> AnyElement {
+        if kind == ParsedUserAttachmentKind::Plugin {
+            return div()
+                .flex_none()
+                .size(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(self.plugin_images.element(plugin_icon).size_3())
+                .into_any_element();
+        }
         if matches!(
             kind,
-            ParsedUserAttachmentKind::Skill | ParsedUserAttachmentKind::Mcp
+            ParsedUserAttachmentKind::Plugin
+                | ParsedUserAttachmentKind::Skill
+                | ParsedUserAttachmentKind::Mcp
         ) {
             return attachment_capability_icon(kind, cx).into_any_element();
         }
@@ -489,6 +503,7 @@ fn attachment_file_icon(flex_none: bool) -> gpui_kit::Div {
 
 fn attachment_capability_icon(kind: ParsedUserAttachmentKind, cx: &mut App) -> gpui_kit::Div {
     let icon = match kind {
+        ParsedUserAttachmentKind::Plugin => PioneerIconName::Plugin,
         ParsedUserAttachmentKind::Skill => PioneerIconName::Zap,
         ParsedUserAttachmentKind::Mcp => PioneerIconName::Mcp,
         ParsedUserAttachmentKind::File => PioneerIconName::Paperclip,

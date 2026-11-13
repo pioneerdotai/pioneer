@@ -61,6 +61,37 @@ impl MessageProcessor {
             McpScopeKind::User => "default".to_owned(),
         };
 
+        let initial = self
+            .crud_store
+            .find_mcp_server_installation(scope_kind.as_str(), &scope_key, params.name.trim())
+            .await;
+        let _plugin = match initial {
+            Ok(Some(ref row)) => match self
+                .acquire_plugin_child_admission(
+                    &workspace_id,
+                    "mcp",
+                    row.id.as_deref().unwrap_or(""),
+                )
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        mcp_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            MCP_ERROR_INVALID_REQUEST,
+                            super::super::plugins::native_plugin_error_code(&error),
+                            json!({}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            _ => None,
+        };
         let row = match self
             .mcp_service
             .restart_server(scope_kind.as_str(), scope_key.as_str(), params.name.trim())
@@ -130,7 +161,7 @@ impl MessageProcessor {
             .runtime_snapshot(scope_kind.as_str(), scope_key.as_str())
             .await;
         let runtime = row.id.as_deref().and_then(|id| runtime_snapshots.get(id));
-        let server =
+        let mut server =
             match list_item_from_record_with_catalog_and_runtime(&row, catalog.as_ref(), runtime) {
                 Ok(server) => server,
                 Err(error) => {
@@ -148,6 +179,26 @@ impl MessageProcessor {
                     return;
                 }
             };
+        server.plugin_owner = match self.crud_store.find_mcp_plugin_owner(&server.id).await {
+            Ok(owner) => owner.map(|owner| pioneer_protocol::PluginOwner {
+                plugin_id: owner.plugin_id,
+                member_key: owner.member_key,
+            }),
+            Err(_) => {
+                self.send_error(
+                    connection_id,
+                    mcp_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        MCP_ERROR_INTERNAL,
+                        "MCP ownership unavailable",
+                        json!({}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let payload = McpServerRestartResponse {
             accepted: true,
             server,

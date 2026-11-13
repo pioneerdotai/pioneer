@@ -1,0 +1,786 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PluginShellRequest",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "parent_snapshot"
+        },
+        "plugin_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "workspace_id",
+        "plugin_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "intent": {
+          "$ref": "#/$defs/PluginIntent"
+        },
+        "kind": {
+          "type": "string",
+          "const": "parent_command"
+        },
+        "origin": {
+          "$ref": "#/$defs/PluginCommandOrigin"
+        },
+        "plugin_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "workspace_id",
+        "plugin_id",
+        "origin",
+        "intent"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "configure_oauth"
+        },
+        "redirect_uri": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "redirect_uri"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "poll_oauth"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "draft_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "const": "composer_picker"
+        },
+        "query": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "thread_id",
+        "draft_id",
+        "query"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "oauth_callback"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "url"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        },
+        "flow_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "browser_result"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "flow_id",
+        "cancelled"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "expected_connection": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "file_uri": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "start_archive"
+        },
+        "target": {
+          "$ref": "#/$defs/SkillUploadTarget"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "workspace_id",
+        "expected_connection",
+        "target",
+        "file_uri"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "cancel_upload"
+        },
+        "operation_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "workspace_id",
+        "operation_id"
+      ]
+    }
+  ],
+  "$defs": {
+    "McpIntent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "retry_authorization_browser"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "sign_in"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "disconnect"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "flow_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "cancel_authorization"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id",
+            "flow_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allow_implicit_invocation": {
+              "type": "boolean"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "policy"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id",
+            "enabled",
+            "allow_implicit_invocation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "restart"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "remove"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "config_json": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "configure"
+            }
+          },
+          "required": [
+            "kind",
+            "config_json"
+          ]
+        }
+      ]
+    },
+    "PluginCommandOrigin": {
+      "type": "object",
+      "properties": {
+        "authorization_sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "connection_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "connection_id": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "connection_generation",
+        "authorization_sequence"
+      ]
+    },
+    "PluginComponentKey": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "member_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "member_key"
+      ]
+    },
+    "PluginIntent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "observe"
+            },
+            "plugin_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "close"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "expected_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "set_enabled"
+            },
+            "plugin_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "plugin_id",
+            "expected_revision",
+            "enabled"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expected_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "intent": {
+              "$ref": "#/$defs/PluginManagementIntent"
+            },
+            "kind": {
+              "type": "string",
+              "const": "mutate"
+            },
+            "plugin_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "plugin_id",
+            "expected_revision",
+            "intent"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "install"
+            },
+            "upload_operation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "upload_operation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "confirm_changes": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "apply_update"
+            },
+            "upload_operation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "upload_operation",
+            "confirm_changes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allow_implicit_invocation": {
+              "type": "boolean"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "skill"
+            },
+            "skill_id": {
+              "$ref": "#/$defs/SkillId"
+            }
+          },
+          "required": [
+            "kind",
+            "skill_id",
+            "enabled",
+            "allow_implicit_invocation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "remove_skill"
+            },
+            "skill_id": {
+              "$ref": "#/$defs/SkillId"
+            }
+          },
+          "required": [
+            "kind",
+            "skill_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "body": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "configure_mcp"
+            },
+            "server_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "server_id",
+            "body"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "intent": {
+              "$ref": "#/$defs/McpIntent"
+            },
+            "kind": {
+              "type": "string",
+              "const": "mcp"
+            }
+          },
+          "required": [
+            "kind",
+            "intent"
+          ]
+        }
+      ]
+    },
+    "PluginManagementIntent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "update"
+            },
+            "confirm_changes": {
+              "type": "boolean"
+            },
+            "expected_fingerprint": {
+              "type": "string"
+            },
+            "upload_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "upload_id",
+            "expected_fingerprint",
+            "confirm_changes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "retry"
+            },
+            "components": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/PluginComponentKey"
+              }
+            },
+            "restore_removed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "components",
+            "restore_removed"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "continue"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "remove"
+            },
+            "purge_data": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "purge_data"
+          ]
+        }
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillUploadTarget": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "plugin_install"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "install"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "update"
+            },
+            "skill_id": {
+              "$ref": "#/$defs/SkillId"
+            }
+          },
+          "required": [
+            "kind",
+            "skill_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "update_pack"
+            },
+            "pack_id": {
+              "$ref": "#/$defs/SkillPackId"
+            }
+          },
+          "required": [
+            "kind",
+            "pack_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "plugin_preview"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expected_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "plugin_update_preview"
+            },
+            "plugin_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "plugin_id",
+            "expected_revision"
+          ]
+        }
+      ]
+    }
+  }
+}

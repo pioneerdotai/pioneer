@@ -5,6 +5,9 @@ use std::{
     sync::{Arc, mpsc},
 };
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpIntent {
     RetryAuthorizationBrowser {
         server_id: String,
@@ -73,6 +76,8 @@ pub enum McpActionState {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct McpActionPublication {
+    /// Configure was dispatched without an authoritative response.
+    pub uncertain: bool,
     pub operation_id: u64,
     pub revision: u64,
     pub state: McpActionState,
@@ -128,11 +133,33 @@ impl ClientCore {
         .and_then(|p| p.snapshot().payload())
     }
     pub fn mcp_intent(&self, workspace: &str, intent: McpIntent) -> anyhow::Result<u64> {
+        self.mcp_intent_admit(workspace, intent, None)
+    }
+    /// Plugin delegation shares native validation, queueing and completion. It
+    /// must never recapture a Gateway selected after the originating read.
+    pub(crate) fn mcp_intent_bound(
+        &self,
+        workspace: &str,
+        intent: McpIntent,
+        epoch: (u64, u64, Option<u64>),
+    ) -> anyhow::Result<u64> {
+        self.mcp_intent_admit(workspace, intent, Some(epoch))
+    }
+    fn mcp_intent_admit(
+        &self,
+        workspace: &str,
+        intent: McpIntent,
+        expected_epoch: Option<(u64, u64, Option<u64>)>,
+    ) -> anyhow::Result<u64> {
         anyhow::ensure!(
             self.capability_management_allowed(workspace),
             "capability_access_denied"
         );
-        let epoch = self.provider_runtime_epoch();
+        let epoch = expected_epoch.unwrap_or_else(|| self.provider_runtime_epoch());
+        anyhow::ensure!(
+            expected_epoch.is_none() || self.provider_runtime_epoch() == epoch,
+            "connection_changed"
+        );
         anyhow::ensure!(epoch.2.is_some(), "gateway_not_connected");
         let (target, name, scope_kind) = match &intent {
             McpIntent::RetryAuthorizationBrowser { server_id }
@@ -186,6 +213,10 @@ impl ClientCore {
                 .is_some_and(|p| p.state == McpActionState::Pending),
             "mcp_action_pending"
         );
+        anyhow::ensure!(
+            expected_epoch.is_none() || self.provider_runtime_epoch() == epoch,
+            "connection_changed"
+        );
         owner.next = owner
             .next
             .checked_add(1)
@@ -233,14 +264,28 @@ impl ClientCore {
         Ok(operation)
     }
     pub(crate) fn capability_management_allowed(&self, workspace: &str) -> bool {
+        // Admission may hold a native/Plugin owner. Identity publication fences
+        // those owners while holding identity_authorization, then commits this
+        // projection. Never acquire the identity mutex in the reverse order.
         !self.is_stopped()
             && self
-                .authorization_snapshot(Some(workspace), None)
-                .or_else(|| self.authorization_snapshot(None, None))
+                .committed_capability_snapshot(workspace)
                 .is_some_and(|p| {
                     crate::authorization::principal_presentation_capabilities(&p)
                         .can_manage_capabilities
                 })
+    }
+    // Shared read/management policy must use the same committed identity as
+    // provider_runtime_epoch. Publication fences domain owners before commit;
+    // reading this projection never takes identity_authorization under them.
+    pub(crate) fn committed_capability_snapshot(
+        &self,
+        workspace: &str,
+    ) -> Option<pioneer_protocol::AuthorizationCapabilitySnapshot> {
+        self.snapshot(&ClientScope::Administration { workspace_id: None })
+            .and_then(|p| p.snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>())
+            .and_then(|p| p.capabilities.snapshot(Some(workspace), None)
+                .or_else(|| p.capabilities.snapshot(None, None)))
     }
     fn publish_mcp_action(
         &self,
@@ -269,6 +314,7 @@ impl ClientCore {
             .checked_add(1)
             .expect("MCP action revision exhausted");
         let p = Arc::new(McpActionPublication {
+            uncertain: kind == McpActionKind::Configure && state == McpActionState::Cancelled,
             operation_id: operation,
             revision,
             state,
@@ -342,6 +388,8 @@ impl ClientCore {
             ) {
                 self.forget_mcp_oauth(&work.workspace, &work.target);
             }
+            // Keep read generation fencing atomic with Pending settlement.
+            // The read policy uses committed projection, never identity mutex.
             self.fence_mcp_reads_after_action(&work.workspace, &work.target);
         } else if matches!(work.intent, McpIntent::Policy { .. })
             && let Some((enabled, implicit)) = work.previous_policy
@@ -416,6 +464,7 @@ impl ClientCore {
         {
             return;
         }
+        let uncertain = result.is_err();
         let (state, field_error, refresh) = match result {
             Ok(response) => {
                 let reduction = super::actions::reduce_mcp_install_finish(
@@ -475,6 +524,7 @@ impl ClientCore {
             }
         }
         let p = Arc::new(McpActionPublication {
+            uncertain,
             operation_id: work.operation,
             revision,
             state,
@@ -510,10 +560,11 @@ impl ClientCore {
         }
     }
     pub(crate) fn start_mcp_operation_controller(self: &Arc<Self>) {
-        let (sender, receiver) = mpsc::sync_channel::<Work>(32);
+        let (sender, receiver) =
+            mpsc::sync_channel::<Work>(crate::request_state::CONTROLLER_QUEUE_CAPACITY);
         let queue_observer = pioneer_observability::queues::QueueObserver::new(
             pioneer_observability::queues::QueueKind::ClientController,
-            Some(32),
+            Some(crate::request_state::CONTROLLER_QUEUE_CAPACITY),
             "unsupported: controller request payload/shared references are not serialized",
         );
         let worker_queue = queue_observer.clone();
@@ -551,10 +602,14 @@ impl ClientCore {
                         Ok(None)
                     };
                     drop(core);
+                    let bound = sender.requests_for_connection(
+                        work.epoch.2.expect("admitted MCP action has a connection"),
+                    );
                     if let McpIntent::Configure { config_json } = &work.intent {
                         let params =
                             configuration_params(&work.workspace, config_json, oauth_redirect);
-                        let result = sender.mcp_install(params);
+                        let result =
+                            crate::transport::ws::command_sender::mcp_install(&bound, params);
                         let outcome = if result.is_ok() {
                             pioneer_observability::work::Outcome::Completed
                         } else {
@@ -576,7 +631,11 @@ impl ClientCore {
                                     core.mcp_action_current(&work),
                                     "connection_changed"
                                 );
-                                core.retry_mcp_oauth_browser(&work.workspace, &work.target)
+                                core.retry_mcp_oauth_browser_bound(
+                                    &work.workspace,
+                                    &work.target,
+                                    work.epoch,
+                                )
                             }),
                         McpIntent::SignIn { .. }
                         | McpIntent::Disconnect { .. }
@@ -623,26 +682,33 @@ impl ClientCore {
                             enabled,
                             allow_implicit_invocation,
                             ..
-                        } => sender
-                            .mcp_policy_set(super::actions::mcp_policy_set_params(
+                        } => crate::transport::ws::command_sender::mcp_policy_set(
+                            &bound,
+                            super::actions::mcp_policy_set_params(
                                 &work.workspace,
                                 &work.name,
                                 *enabled,
                                 *allow_implicit_invocation,
-                            ))
-                            .map(|_| ()),
-                        McpIntent::Restart { .. } => sender
-                            .mcp_server_restart(super::actions::mcp_server_restart_params(
-                                &work.workspace,
-                                &work.name,
-                            ))
-                            .map(|_| ()),
-                        McpIntent::Remove { .. } => sender
-                            .mcp_uninstall(super::actions::mcp_uninstall_params(
-                                &work.workspace,
-                                &work.name,
-                            ))
-                            .map(|_| ()),
+                            ),
+                        )
+                        .map(|_| ()),
+                        McpIntent::Restart { .. } => {
+                            crate::transport::ws::command_sender::mcp_server_restart(
+                                &bound,
+                                super::actions::mcp_server_restart_params(
+                                    &work.workspace,
+                                    &work.name,
+                                ),
+                            )
+                            .map(|_| ())
+                        }
+                        McpIntent::Remove { .. } => {
+                            crate::transport::ws::command_sender::mcp_uninstall(
+                                &bound,
+                                super::actions::mcp_uninstall_params(&work.workspace, &work.name),
+                            )
+                            .map(|_| ())
+                        }
                         McpIntent::Configure { .. } => {
                             unreachable!("configuration uses typed validation completion")
                         }
@@ -693,6 +759,136 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(2);
         core.mcp_controller.lock().unwrap().sender = Some(sender);
         (core, receiver)
+    }
+    #[test]
+    fn authorization_publication_and_native_settlement_both_make_progress() {
+        for _ in 0..32 {
+            let (core, receiver) = fixture();
+            core.mcp_intent(
+                "workspace",
+                McpIntent::Policy {
+                    server_id: "a".into(),
+                    enabled: false,
+                    allow_implicit_invocation: false,
+                },
+            )
+            .unwrap();
+            let work = receiver.try_recv().unwrap();
+            assert!(core.mcp_action_current(&work));
+            let target = work.target.clone();
+            assert_eq!(
+                core.mcp_action_snapshot("workspace", &target)
+                    .unwrap()
+                    .state,
+                McpActionState::Pending
+            );
+            let publication = core
+                .snapshot(&ClientScope::Administration { workspace_id: None })
+                .unwrap();
+            let mut revoked = (*publication.snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
+            revoked.authorization_change_sequence += 1;
+            revoked.capabilities.clear_epoch();
+            let start = Arc::new(std::sync::Barrier::new(3));
+            let (finished, observed) = mpsc::channel();
+            let worker_core = core.clone();
+            let worker_start = start.clone();
+            let worker_finished = finished.clone();
+            let worker = std::thread::spawn(move || {
+                worker_start.wait();
+                worker_core.complete_mcp_action(work, Ok(()));
+                worker_finished.send(()).unwrap();
+            });
+            let publisher_core = core.clone();
+            let publisher_start = start.clone();
+            let publisher = std::thread::spawn(move || {
+                let _identity = publisher_core.identity_authorization.lock().unwrap();
+                publisher_start.wait();
+                publisher_core.publish_identity_authorization(
+                    &revoked,
+                    crate::gateway::identity_authorization::IdentityPublicationChange::Revalidate,
+                );
+                finished.send(()).unwrap();
+            });
+            start.wait();
+            // Bound a deadlock failure, but require actual publication AND
+            // settlement acknowledgements plus joins, not a timeout as success.
+            for _ in 0..2 {
+                observed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("publisher/settlement cycle");
+            }
+            publisher.join().unwrap();
+            worker.join().unwrap();
+            assert!(!core.capability_management_allowed("workspace"));
+            assert!(core.mcp_action_snapshot("workspace", &target).is_none());
+        }
+    }
+    // NOT_RUN / NOT_COMPILED. No provider, browser or MCP fixture is launched.
+    #[test]
+    fn plugin_native_admission_never_recaptures_replacement_with_copied_ids() {
+        for intent in [
+            McpIntent::Configure {
+                config_json: r#"{"mcpServers":{"a":{"command":"fake"}}}"#.into(),
+            },
+            McpIntent::Policy {
+                server_id: "a".into(),
+                enabled: false,
+                allow_implicit_invocation: false,
+            },
+            McpIntent::Restart {
+                server_id: "a".into(),
+            },
+            McpIntent::Remove {
+                server_id: "a".into(),
+            },
+            McpIntent::SignIn {
+                server_id: "a".into(),
+            },
+            McpIntent::Disconnect {
+                server_id: "a".into(),
+            },
+            McpIntent::CancelAuthorization {
+                server_id: "a".into(),
+                flow_id: "copied-flow".into(),
+            },
+            McpIntent::RetryAuthorizationBrowser {
+                server_id: "a".into(),
+            },
+        ] {
+            let (core, receiver) = fixture();
+            let origin = core.provider_runtime_epoch();
+            let pause = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let worker_core = core.clone();
+            let worker_pause = pause.clone();
+            let worker_resume = resume.clone();
+            let worker_intent = intent.clone();
+            let worker = std::thread::spawn(move || {
+                worker_pause.wait();
+                worker_resume.wait();
+                worker_core.mcp_intent_bound("workspace", worker_intent, origin)
+            });
+            pause.wait();
+            crate::catalog_test_support::switch_connection(&core, 8);
+            resume.wait();
+            assert_eq!(
+                worker.join().unwrap().unwrap_err().to_string(),
+                "connection_changed"
+            );
+            assert!(receiver.try_recv().is_err());
+            assert!(
+                core.mcp_catalog_snapshot("workspace").unwrap().servers()[0]
+                    .policy
+                    .enabled
+            );
+            let admitted = core.provider_runtime_epoch();
+            core.mcp_intent_bound("workspace", intent, admitted)
+                .unwrap();
+            let work = receiver.try_recv().unwrap();
+            crate::catalog_test_support::switch_connection(&core, 9);
+            assert_eq!(work.epoch, admitted);
+            assert!(!core.mcp_action_current(&work));
+        }
     }
     #[test]
     fn retired_ticket_releases_its_action_and_cannot_finish_the_replacement() {
@@ -875,6 +1071,8 @@ mod tests {
     #[test]
     fn actions_have_one_generation_and_optimistic_policy_rolls_back_only_matching_server() {
         let (core, receiver) = fixture();
+        let (_plugins, assert_plugins_quiet) =
+            crate::plugins::runtime::tests::watch_plugin_reads(&core);
         let b = core.mcp_catalog_snapshot("workspace").unwrap().servers()[1].clone();
         let intent = || McpIntent::Policy {
             server_id: "a".into(),
@@ -912,6 +1110,7 @@ mod tests {
             core.mcp_action_snapshot("workspace", "a").unwrap().state,
             McpActionState::Succeeded
         );
+        assert_plugins_quiet();
     }
     #[test]
     fn restart_remove_configuration_and_revoke_use_typed_queue_without_echoing_secrets() {
@@ -948,6 +1147,8 @@ mod tests {
     fn configuration_partial_result_keeps_validation_open_and_redacts_input_values() {
         use pioneer_protocol::*;
         let (core, receiver) = fixture();
+        let (_plugins, assert_plugins_quiet) =
+            crate::plugins::runtime::tests::watch_plugin_reads(&core);
         core.mcp_intent("workspace",McpIntent::Configure{config_json:r#"{"mcpServers":{"synthetic":{"command":"fake","env":{"TOKEN":"private-value"}}}}"#.into()}).unwrap();
         let work = receiver.try_recv().unwrap();
         core.complete_mcp_configuration(
@@ -976,5 +1177,25 @@ mod tests {
         let serialized = serde_json::to_string(&*result).unwrap();
         assert!(!serialized.contains("private-value"));
         assert!(serialized.contains("[redacted]"));
+        assert!(!result.uncertain);
+        let id = core
+            .mcp_intent(
+                "workspace",
+                McpIntent::Configure {
+                    config_json: r#"{"mcpServers":{"synthetic":{"command":"fake"}}}"#.into(),
+                },
+            )
+            .unwrap();
+        core.complete_mcp_configuration(
+            receiver.try_recv().unwrap(),
+            Err(anyhow::anyhow!("response lost")),
+        );
+        let lost = core
+            .mcp_action_snapshot("workspace", "configuration")
+            .unwrap();
+        assert_eq!(lost.operation_id, id);
+        assert!(lost.uncertain);
+        assert_eq!(lost.state, McpActionState::Failed);
+        assert_plugins_quiet();
     }
 }

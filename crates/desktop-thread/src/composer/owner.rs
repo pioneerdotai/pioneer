@@ -65,6 +65,8 @@ pub(crate) struct ComposerView {
     pub(super) file_task: Option<Task<()>>,
     pub(super) send_task: Option<Task<()>>,
     synchronized_thread_inputs: Option<ComposerThreadInputs>,
+    pub(super) plugin_images: pioneer_desktop_foundation::ImageViews,
+    images_visible: bool,
     _release: Subscription,
     _subscriptions: Vec<Subscription>,
     _binding_task: Task<()>,
@@ -256,6 +258,9 @@ impl ComposerView {
                 file_task: None,
                 send_task: None,
                 synchronized_thread_inputs: None,
+                plugin_images: pioneer_desktop_foundation::ImageViews::new()
+                    .placeholder("icons/box.svg"),
+                images_visible: false,
                 _release: release,
                 _subscriptions: vec![input_subscription, mention_subscription, voice_events],
                 _binding_task: binding_task,
@@ -407,6 +412,16 @@ impl ComposerView {
             || local_changed
             || next.is_none()
             || next != self.synchronized_thread_inputs;
+        let icons = self
+            .effective_composer_capabilities()
+            .into_iter()
+            .filter(|_| self.images_visible)
+            .filter_map(|capability| match capability.kind {
+                ComposerCapabilityKind::Plugin { icon, .. } => icon,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.plugin_images.reconcile(icons, cx);
         self.synchronized_thread_inputs = next;
         self.observe_opening_inputs();
         if notify {
@@ -449,7 +464,19 @@ impl ComposerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.images_visible = visible;
         self.thread_bindings.set_active(visible);
+        if visible {
+            let icons = self
+                .effective_composer_capabilities()
+                .into_iter()
+                .filter_map(|capability| match capability.kind {
+                    ComposerCapabilityKind::Plugin { icon, .. } => icon,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            self.plugin_images.reconcile(icons, cx);
+        }
         self.voice.update(cx, |voice, cx| {
             voice.set_visible(visible, window.is_window_active(), cx)
         });
@@ -461,6 +488,7 @@ impl ComposerView {
                 self.client
                     .complete_composer_operation(identity, ComposerOperationCompletion::Cancelled);
             }
+            self.plugin_images.reconcile(Vec::new(), cx);
             self.file_task.take();
             self.send_task.take();
             self.files.retire_mount(&self.thread_id, self.mount);

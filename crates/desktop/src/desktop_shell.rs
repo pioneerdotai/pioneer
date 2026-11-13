@@ -60,6 +60,7 @@ pub(crate) struct DesktopShellView {
     providers: Option<Entity<pioneer_desktop_providers::ProviderCatalogView>>,
     mcp: Option<Entity<pioneer_desktop_mcp::McpCatalogView>>,
     skills: Option<Entity<pioneer_desktop_skills::SkillsCatalogView>>,
+    plugins: Option<Entity<pioneer_desktop_plugins::PluginsView>>,
     agents_document: Option<Entity<pioneer_desktop_agents_doc::AgentsDocumentEditor>>,
     desktop_update: Option<Entity<pioneer_desktop_update::DesktopUpdateView>>,
     task_notifications: Option<Entity<pioneer_desktop_task_notifications::TaskNotificationView>>,
@@ -87,6 +88,7 @@ impl DesktopShellView {
             self.onboarding.as_ref().map(|root| root.clone().into())
         } else {
             match route.route() {
+                MainRoute::Plugins => self.plugins.as_ref().map(|root| root.clone().into()),
                 MainRoute::Threads => self.thread.as_ref().map(|(_, root)| root.clone().into()),
                 MainRoute::AgentsDoc => self
                     .agents_document
@@ -113,6 +115,9 @@ impl DesktopShellView {
         } else {
             px(0.)
         };
+        if let Some(view) = &self.plugins {
+            view.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+        }
         if let Some(view) = &self.providers {
             view.update(cx, |view, cx| view.set_sidebar_width(width, cx));
         }
@@ -135,6 +140,9 @@ impl DesktopShellView {
             view.update(cx, |view, cx| view.set_window_active(active, cx));
         }
         if let Some(view) = &self.skills {
+            view.update(cx, |view, cx| view.set_window_active(active, cx));
+        }
+        if let Some(view) = &self.plugins {
             view.update(cx, |view, cx| view.set_window_active(active, cx));
         }
         if let Some(view) = &self.settings {
@@ -323,6 +331,13 @@ impl DesktopShellView {
             let runtime = cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>();
             (runtime.core(), runtime.registrar())
         };
+        if !cx.has_global::<pioneer_desktop_foundation::ImageViewConfig>() {
+            cx.set_global(pioneer_desktop_foundation::ImageViewConfig::new(
+                client.clone(),
+                registrar.clone(),
+                Arc::new(crate::platform::images::DesktopImageViews(client.clone())),
+            ));
+        }
         let onboarding = pioneer_desktop_onboarding::OnboardingView::new(
             pioneer_desktop_onboarding::OnboardingConfig {
                 client: client.clone(),
@@ -374,6 +389,65 @@ impl DesktopShellView {
         );
         let skills = pioneer_desktop_skills::SkillsCatalogView::new(
             pioneer_desktop_skills::SkillsCatalogConfig::new(client.clone(), registrar.clone()),
+            window,
+            cx,
+        );
+        let details_client = client.clone();
+        let details_registrar = registrar.clone();
+        let plugins = pioneer_desktop_plugins::PluginsView::new(
+            client.clone(),
+            registrar.clone(),
+            Box::new(move |workspace, plugin, component, window, cx| {
+                if let Some(id) = component.mcp_installation_id.clone() {
+                    let view = pioneer_desktop_mcp::McpCatalogView::new_plugin_details(
+                        pioneer_desktop_mcp::McpCatalogConfig::new(
+                            details_client.clone(),
+                            details_registrar.clone(),
+                        ),
+                        workspace.to_owned(),
+                        plugin.to_owned(),
+                        id,
+                        window,
+                        cx,
+                    );
+                    let sidebar = view.read(cx).sidebar();
+                    let bounds_owner = view.downgrade();
+                    Some(pioneer_desktop_plugins::PluginComponentDetails::new(
+                        view.into(),
+                        sidebar,
+                        move |width, active, cx| {
+                            let _ = bounds_owner.update(cx, |view, cx| {
+                                view.set_embedded_context(width, active, cx)
+                            });
+                        },
+                    ))
+                } else {
+                    component.skill_id.clone().map(|id| {
+                        let view = pioneer_desktop_skills::SkillsCatalogView::new_plugin_details(
+                            pioneer_desktop_skills::SkillsCatalogConfig::new(
+                                details_client.clone(),
+                                details_registrar.clone(),
+                            ),
+                            workspace.to_owned(),
+                            plugin.to_owned(),
+                            id,
+                            window,
+                            cx,
+                        );
+                        let sidebar = view.read(cx).sidebar();
+                        let bounds_owner = view.downgrade();
+                        pioneer_desktop_plugins::PluginComponentDetails::new(
+                            view.into(),
+                            sidebar,
+                            move |width, active, cx| {
+                                let _ = bounds_owner.update(cx, |view, cx| {
+                                    view.set_embedded_context(width, active, cx)
+                                });
+                            },
+                        )
+                    })
+                }
+            }),
             window,
             cx,
         );
@@ -506,6 +580,7 @@ impl DesktopShellView {
         } else {
             WindowRoute::Main
         });
+        let plugins_sidebar = pioneer_desktop_plugins::PluginsView::sidebar_surface(&plugins, cx);
         let sidebar = cx.new(|cx| SidebarHostView {
             workspaces: workspaces.clone(),
             desktop_update: desktop_update.clone(),
@@ -514,6 +589,7 @@ impl DesktopShellView {
             providers: providers.read(cx).sidebar(),
             administration: administration.read(cx).sidebar(),
             mcp: mcp.read(cx).sidebar(),
+            plugins_sidebar,
             skills: skills.read(cx).sidebar(),
         });
         let layout_subscription = cx.observe(&layout, |view, _, cx| {
@@ -590,6 +666,7 @@ impl DesktopShellView {
             administration: Some(administration),
             mcp: Some(mcp),
             skills: Some(skills),
+            plugins: Some(plugins),
             agents_document: None,
             desktop_update,
             task_notifications: Some(task_notifications),
@@ -693,9 +770,12 @@ impl DesktopShellView {
                     pioneer_desktop_thread::ThreadNavigationEvent::OpenMcpServer { server_id } => {
                         core.navigate(
                             NavigationIntent::Navigate {
-                                destination: SemanticDestination::Mcp {
-                                    server_id: Some(server_id.clone()),
-                                },
+                                destination: core.navigation_snapshot().workspace_id().map_or(
+                                    SemanticDestination::Mcp {
+                                        server_id: Some(server_id.clone()),
+                                    },
+                                    |workspace| core.mcp_destination(workspace, server_id),
+                                ),
                             },
                             None,
                         );
@@ -734,6 +814,7 @@ impl DesktopShellView {
                 route: SettingsRoute::Account,
             },
             MainRoute::Mcp if self.can_manage => SemanticDestination::Mcp { server_id: None },
+            MainRoute::Plugins if self.can_manage => SemanticDestination::Plugins,
             MainRoute::Skills if self.can_manage => SemanticDestination::Skills { skill_id: None },
             _ => return,
         };
@@ -884,6 +965,9 @@ impl Render for DesktopShellView {
                     view.activate_navigation(MainRoute::Mcp, cx)
                 }),
             )
+            .on_action(cx.listener(|view, _: &OpenPlugins, _, cx| {
+                view.activate_navigation(MainRoute::Plugins, cx)
+            }))
             .on_action(cx.listener(|view, _: &OpenSkills, _, cx| {
                 view.activate_navigation(MainRoute::Skills, cx)
             }))
@@ -941,6 +1025,7 @@ struct SidebarHostView {
     providers: AnyView,
     administration: AnyView,
     mcp: AnyView,
+    plugins_sidebar: AnyView,
     skills: AnyView,
 }
 impl Render for SidebarHostView {
@@ -967,6 +1052,7 @@ impl Render for SidebarHostView {
             MainRoute::Providers => &self.providers,
             MainRoute::Administration => &self.administration,
             MainRoute::Mcp | MainRoute::McpDetails => &self.mcp,
+            MainRoute::Plugins => &self.plugins_sidebar,
             MainRoute::Skills | MainRoute::SkillDetails => &self.skills,
             MainRoute::Threads | MainRoute::AgentsDoc => unreachable!(),
         }

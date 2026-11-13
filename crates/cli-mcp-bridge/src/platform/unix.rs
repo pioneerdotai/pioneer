@@ -399,6 +399,8 @@ mod tests {
         let mut accepted = accepted.expect("accept");
         drop(connected.expect("connect"));
         assert!(accepted.receive_frame().await.expect("read").is_none());
+        accepted.shutdown().await.expect("shutdown after peer EOF");
+        accepted.shutdown().await.expect("shutdown is idempotent");
     }
 
     #[test]

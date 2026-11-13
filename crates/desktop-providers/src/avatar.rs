@@ -43,8 +43,8 @@ pub(crate) struct CliAvatars {
     publication_sequences: Vec<(String, Option<u64>)>,
 }
 fn avatar_scope(revision: &str) -> ClientScope {
-    ClientScope::Avatar {
-        principal_id: avatar_identity_key(&format!("agent:{revision}"), revision),
+    ClientScope::Image {
+        key: avatar_identity_key(&format!("agent:{revision}"), revision),
     }
 }
 impl CliAvatars {
@@ -126,8 +126,8 @@ impl CliAvatars {
             .snapshot(&avatar_scope(revision))?
             .snapshot()
             .payload::<AvatarPublication>()?;
-        if publication.avatar_revision() != revision
-            || publication.principal_id() != format!("agent:{revision}")
+        if publication.revision() != revision
+            || publication.resource_id() != format!("agent:{revision}")
         {
             return None;
         }

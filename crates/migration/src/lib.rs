@@ -28,6 +28,8 @@ mod m20261029_000001_thread_read_creation_order;
 mod m20261106_000001_agent_ledger_deadline_index;
 mod portable_payload_target;
 
+mod m20261111_000001_plugin_ownership;
+
 pub struct Migrator;
 
 pub mod stable_skill_id;
@@ -247,6 +249,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261106_000001_agent_ledger_deadline_index::Migration),
             Box::new(m20261109_000001_execution_observability::Migration),
             Box::new(m20261108_000001_sqlite_memory_search::Migration),
+            Box::new(m20261111_000001_plugin_ownership::Migration),
         ]
     }
 }

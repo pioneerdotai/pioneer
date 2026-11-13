@@ -353,6 +353,7 @@ async fn run_single_bridge_conformance(
     provider.writer.shutdown().await?;
     helper.await.context("helper join")??;
     server.await.context("facade join")??;
+    supervisor.revoke_session_result(&process_instance).await?;
     let grant_revoked_on_eof = supervisor
         .coordinator()
         .authorize_list(&attachment.bound_grant, reservation.generation)

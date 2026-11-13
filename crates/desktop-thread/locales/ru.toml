@@ -333,9 +333,20 @@
 "timeline.web_search.running" = "Ищу в интернете"
 "timeline.work_group.completed" = "Работал"
 
+"chat.composer.add_menu.plugins" = "Добавить плагины"
+
+"plugins.empty" = "Плагины ещё не установлены"
+"plugins.error" = "Не удалось загрузить плагины. Попробуйте снова."
+"plugins.loading" = "Загрузка плагинов…"
+"plugins.search" = "Поиск плагинов"
+"plugins.select" = "Выбор плагинов"
+"plugins.unavailable" = "Недоступен"
+
 "timeline.html.loading" = "Загрузка страницы…"
 "timeline.html.failed" = "Не удалось показать страницу"
 "chat.composer.preparing_send" = "Подготовка сообщения"
+"plugins.retry" = "Повторить"
+"plugins.stale" = "Выбранная версия больше не актуальна"
 
 "chat.composer.model.context_label" = "Контекстное окно"
 "chat.composer.model.context_auto" = "Авто — до %{tokens} токенов"

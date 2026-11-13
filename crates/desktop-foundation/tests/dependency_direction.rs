@@ -55,45 +55,9 @@ fn desktop_depends_on_client_directly_and_not_on_mobile_boundary() {
     }
 }
 
-#[test]
-fn foundation_has_no_router_store_cache_or_custom_element_implementation() {
-    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut source_names = rust_sources(&source_root)
-        .iter()
-        .map(|path| {
-            path.file_name()
-                .and_then(|value| value.to_str())
-                .expect("UTF-8 Foundation source name")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    source_names.sort();
-    assert_eq!(
-        source_names,
-        ["avatar.rs", "binding.rs", "identity.rs", "lib.rs"]
-    );
-
-    for entry in fs::read_dir(source_root).expect("Foundation source directory") {
-        let path = entry.expect("Foundation source entry").path();
-        if path.extension().and_then(|value| value.to_str()) != Some("rs") {
-            continue;
-        }
-        let source = fs::read_to_string(&path).expect("Foundation source file");
-        for forbidden in [
-            "struct DesktopClientBindingRouter",
-            "impl Element for",
-            "Entity<",
-            "ClientEffectPlan",
-            "ClientIntent",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "{} contains forbidden Foundation responsibility: {forbidden}",
-                path.display()
-            );
-        }
-    }
-}
+// Foundation module inventory, closed retained-owner exceptions and Render
+// purity have one primary owner: desktop/tests/desktop_architecture.rs and its
+// handwritten contract. Keep cross-shell boundary checks here.
 
 #[test]
 fn client_contract_remains_shell_neutral() {

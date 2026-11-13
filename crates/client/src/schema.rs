@@ -42,6 +42,14 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "plugin_operation_publication.json",
+            crate::plugins::runtime::PluginOperationPublication
+        ),
+        schema_doc!(
+            "plugin_publication.json",
+            crate::plugins::runtime::PluginPublication
+        ),
+        schema_doc!(
             "workspace_push_params.json",
             pioneer_protocol::WorkspacePushParams
         ),
@@ -169,7 +177,7 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             "gateway_session_publication.json",
             crate::gateway::session_controller::GatewaySessionPublication
         ),
-        schema_doc!("avatar_publication.json", crate::avatars::AvatarPublication),
+        schema_doc!("image_publication.json", crate::images::ImagePublication),
         schema_doc!(
             "turn_cancellation_publication.json",
             crate::turns::cancellation::TurnCancellationPublication

@@ -15,6 +15,7 @@ title = "インストール済み MCP サーバーはありません"
 description = "新しい MCP サーバーをインストールして、エージェントの機能を拡張します。"
 
 [mcp.dialog]
+replace_owned = "このサーバーの設定を置き換える"
 install_title = "MCP サーバーをインストール"
 install = "インストール"
 uninstall_title = "%{name} をアンインストールしますか？"
@@ -134,6 +135,9 @@ items_count = "項目: %{count}"
 keys_count = "キー: %{count}"
 
 [mcp.error]
+plugin_submitted = "変更を送信しました。再試行前にサーバーの状態を確認してください。"
+plugin_uncertain = "結果が不明です。次の操作の前に更新してください。"
+plugin_change_failed = "変更を確認できません。再試行の前に更新してください。"
 server_name_required = "MCP サーバー名が必要です"
 gateway_not_connected = "ゲートウェイに接続されていません"
 workspace_not_selected = "ワークスペースが選択されていません"

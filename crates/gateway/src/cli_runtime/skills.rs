@@ -30,6 +30,7 @@ pub(crate) struct CliRuntimeSelectedSkill {
     pub install_name: String,
     pub installed_path: PathBuf,
     pub source_folder_hash: String,
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,6 +212,7 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
             );
         }
         plans.push(CliRuntimeSkillInstallPlan {
+            plugin_id: None,
             skill_id: skill.skill_id.clone(),
             owner: skill.definition.identity.owner.clone(),
             slug: skill.definition.identity.slug.clone(),
@@ -238,6 +240,37 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
     Ok(plans)
 }
 
+/// Plugin ownership is receipt metadata; installation uses the same planner,
+/// source directory and native destination as an ordinary skill.
+pub(crate) async fn build_cli_runtime_owned_skill_install_plans(
+    store: &pioneer_crud::CrudStore,
+    workspace: &str,
+    runtime: &pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
+    resolved: &[pioneer_skills::ResolvedSkill],
+    receipt_path: &Path,
+) -> Result<Vec<CliRuntimeSkillInstallPlan>> {
+    let mut plans =
+        build_cli_runtime_skill_install_plans(runtime, runtime_kind, resolved, receipt_path)?;
+    for plan in &mut plans {
+        let Some(owner) = store.find_skill_plugin_owner(&plan.skill_id).await? else {
+            continue;
+        };
+        let parent = store
+            .find_plugin_installation(&owner.plugin_id)
+            .await?
+            .filter(|p| {
+                p.workspace_id == workspace
+                    && p.enabled
+                    && p.state == "installed"
+                    && p.pending_json.is_none()
+            })
+            .context("plugin skill source unavailable")?;
+        plan.plugin_id = Some(parent.id);
+    }
+    Ok(plans)
+}
+
 /// Process identity and indexed Claude plugin bindings use this canonical order.
 /// Keep attachment/application order separately in turn instructions and inputs.
 pub(crate) fn normalize_cli_runtime_selected_skills(
@@ -259,6 +292,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
     runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
     bindings: &[TurnSkillBinding],
     receipt_path: &Path,
+    plugin_selection: Option<&pioneer_protocol::PluginSelectionSnapshot>,
 ) -> Result<Vec<CliRuntimeSelectedSkill>> {
     if bindings.is_empty() {
         return Ok(Vec::new());
@@ -279,6 +313,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
                 entry.runtime_id == runtime.id
                     && entry.runtime_kind == runtime_kind_name
                     && entry.skill_id == binding.skill_id
+                    && Path::new(&entry.native_skills_root) == native_skills_root
                     && cli_system_skill_export_name(
                         &binding.source_kind,
                         binding.skill_owner.as_deref(),
@@ -293,6 +328,18 @@ pub(crate) fn restore_cli_runtime_selected_skills(
                 binding.skill_id
             );
         };
+        let expected_parent = plugin_selection
+            .and_then(|snapshot| {
+                snapshot
+                    .children
+                    .iter()
+                    .find(|child| child.kind == "skill" && child.id == binding.skill_id.as_str())
+            })
+            .map(|child| child.parent_id.as_str());
+        anyhow::ensure!(
+            entry.plugin_id.as_deref() == expected_parent,
+            "CLI skill receipt ownership differs from the ready selection"
+        );
         verify_system_skill_export_alias(
             &binding.source_kind,
             binding.skill_owner.as_deref(),
@@ -357,6 +404,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
             );
         }
         selected.push(CliRuntimeSelectedSkill {
+            plugin_id: entry.plugin_id.clone(),
             install_name: entry.install_name.clone(),
             installed_path,
             source_folder_hash: entry.source_folder_hash.clone(),
@@ -444,6 +492,9 @@ pub(crate) fn partition_cli_runtime_capabilities(
     let mut partition = CliRuntimeCapabilityPartition::default();
     for capability in capabilities {
         match &capability.kind {
+            pioneer_protocol::TurnCapabilityKind::Plugin { .. } => {
+                return Err("plugin parent must be expanded before CLI projection".into());
+            }
             TurnCapabilityKind::Skill {
                 skill_id,
                 pack_id: None,
@@ -532,6 +583,7 @@ pub(crate) async fn acquire_cli_runtime_skill_destination_lock(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CliRuntimeSkillInstallPlan {
+    pub plugin_id: Option<String>,
     pub skill_id: SkillId,
     pub owner: Option<String>,
     pub slug: String,
@@ -555,6 +607,7 @@ pub(crate) enum CliRuntimeSkillInstallStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CliRuntimeSkillInstallResult {
+    pub plugin_id: Option<String>,
     pub status: CliRuntimeSkillInstallStatus,
     pub install_name: String,
     pub source_folder_hash: String,
@@ -565,6 +618,7 @@ pub(crate) struct CliRuntimeSkillInstallResult {
 impl From<&CliRuntimeSkillInstallResult> for CliRuntimeSelectedSkill {
     fn from(value: &CliRuntimeSkillInstallResult) -> Self {
         Self {
+            plugin_id: value.plugin_id.clone(),
             install_name: value.install_name.clone(),
             installed_path: value.installed_path.clone(),
             source_folder_hash: value.source_folder_hash.clone(),
@@ -586,6 +640,7 @@ fn planned_receipt_entry(
     updated_at_unix_ms: u64,
 ) -> ExternalRuntimeSkillReceiptEntry {
     ExternalRuntimeSkillReceiptEntry {
+        plugin_id: plan.plugin_id.clone(),
         skill_id: plan.skill_id.clone(),
         owner: plan.owner.clone(),
         slug: plan.slug.clone(),
@@ -706,11 +761,12 @@ fn prepare_orchestration_export(plan: &CliRuntimeSkillInstallPlan) -> Result<tem
     Ok(export)
 }
 
-pub(crate) async fn install_one_cli_runtime_skill(
+pub(crate) async fn install_one_cli_runtime_skill<F: std::future::Future<Output = Result<()>>>(
     destination_locks: &CliRuntimeSkillDestinationLocks,
     skills_write_lock: &Arc<Mutex<()>>,
     receipt_conversion_candidates: &[ExternalRuntimeReceiptConversionCandidate],
     plan: &CliRuntimeSkillInstallPlan,
+    before_replace: F,
 ) -> Result<CliRuntimeSkillInstallResult> {
     verify_system_skill_export_alias(
         &plan.source_kind,
@@ -754,11 +810,12 @@ pub(crate) async fn install_one_cli_runtime_skill(
     };
     if let Some(entry) = previous.as_ref()
         && external_runtime_skill_is_current(&receipt, &expected, &plan.destination)?
-        // Another Pioneer environment may have updated the shared export while
-        // this environment's receipt still describes its previous contents.
-        && (managed.is_none() || compute_skill_folder_hash(&plan.destination)? == source_folder_hash)
+        // A receipt is metadata, not proof of the current exported bytes.
+        // Use the same destination check for every CLI skill export.
+        && compute_skill_folder_hash(&plan.destination)? == source_folder_hash
     {
         return Ok(CliRuntimeSkillInstallResult {
+            plugin_id: plan.plugin_id.clone(),
             status: CliRuntimeSkillInstallStatus::Current,
             install_name: plan.install_name.clone(),
             source_folder_hash,
@@ -766,6 +823,8 @@ pub(crate) async fn install_one_cli_runtime_skill(
             receipt_updated_at_unix_ms: entry.updated_at_unix_ms,
         });
     }
+
+    before_replace.await?;
 
     if managed.is_none() {
         let _receipt_guard = skills_write_lock.clone().lock_owned().await;
@@ -811,6 +870,7 @@ pub(crate) async fn install_one_cli_runtime_skill(
     }
 
     Ok(CliRuntimeSkillInstallResult {
+        plugin_id: plan.plugin_id.clone(),
         status: if previous.is_some() {
             CliRuntimeSkillInstallStatus::Updated
         } else {
@@ -926,6 +986,7 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("SKILL.md"), format!("# {name}\n")).unwrap();
         CliRuntimeSkillInstallPlan {
+            plugin_id: None,
             skill_id: test_skill_id(name, SkillSourceKind::Registry),
             owner: Some("registry".to_owned()),
             slug: name.to_owned(),
@@ -1026,6 +1087,7 @@ mod tests {
 
     fn installed_skill(name: &str, path: &str) -> CliRuntimeSkillInstallResult {
         CliRuntimeSkillInstallResult {
+            plugin_id: None,
             status: CliRuntimeSkillInstallStatus::Current,
             install_name: name.to_owned(),
             source_folder_hash: "source-hash-not-prompt-content".to_owned(),
@@ -1237,10 +1299,15 @@ mod tests {
             let mut installed = Vec::new();
             for plan in &plans {
                 assert_eq!(plan.install_name, format!("pioneer-system-{}", plan.slug));
-                let result =
-                    install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, plan)
-                        .await
-                        .unwrap();
+                let result = install_one_cli_runtime_skill(
+                    &locks,
+                    &receipt_lock,
+                    &candidates,
+                    plan,
+                    async { Ok(()) },
+                )
+                .await
+                .unwrap();
                 assert_eq!(result.status, CliRuntimeSkillInstallStatus::Installed);
                 let exported = fs::read_to_string(result.installed_path.join("SKILL.md")).unwrap();
                 assert!(exported.starts_with(&format!("---\nname: {}\n", plan.install_name)));
@@ -1261,9 +1328,15 @@ mod tests {
             }
             let before = fs::read(&receipt_path).unwrap();
             for (plan, first) in plans.iter().zip(&installed) {
-                let again = install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, plan)
-                    .await
-                    .unwrap();
+                let again = install_one_cli_runtime_skill(
+                    &locks,
+                    &receipt_lock,
+                    &candidates,
+                    plan,
+                    async { anyhow::bail!("current exports must not stop native owners") },
+                )
+                .await
+                .unwrap();
                 assert_eq!(again.status, CliRuntimeSkillInstallStatus::Current);
                 assert_eq!(
                     again.receipt_updated_at_unix_ms,
@@ -1271,6 +1344,23 @@ mod tests {
                 );
             }
             assert_eq!(fs::read(&receipt_path).unwrap(), before);
+            let damaged = &plans[0];
+            fs::write(damaged.destination.join("SKILL.md"), "damaged export").unwrap();
+            let mut stopped = false;
+            let repaired =
+                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, damaged, async {
+                    stopped = true;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert!(stopped);
+            assert_eq!(repaired.status, CliRuntimeSkillInstallStatus::Updated);
+            assert!(
+                fs::read_to_string(damaged.destination.join("SKILL.md"))
+                    .unwrap()
+                    .starts_with(&format!("---\nname: {}\n", damaged.install_name))
+            );
             // A stale ordinary-name receipt can coexist with the new export.
             // It cannot authorize cleanup or adoption of that directory.
             let mut receipt = read_external_runtime_receipt(&receipt_path).unwrap();
@@ -1284,6 +1374,7 @@ mod tests {
                 kind,
                 &cli_runtime_turn_skill_bindings(&resolved),
                 &receipt_path,
+                None,
             )
             .unwrap();
             assert_eq!(restored.len(), 4);
@@ -1331,7 +1422,8 @@ mod tests {
                     &runtime,
                     kind,
                     &cli_runtime_turn_skill_bindings(&resolved),
-                    &receipt_path
+                    &receipt_path,
+                    None,
                 )
                 .unwrap(),
                 restored
@@ -1404,9 +1496,11 @@ mod tests {
         let mut installed = Vec::new();
         for plan in &plans {
             installed.push(
-                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, plan)
-                    .await
-                    .unwrap(),
+                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, plan, async {
+                    Ok(())
+                })
+                .await
+                .unwrap(),
             );
         }
         let initial = normalize_cli_runtime_selected_skills(
@@ -1418,6 +1512,7 @@ mod tests {
             pioneer_protocol::CLIAgentRuntimeKind::Claude,
             &cli_runtime_turn_skill_bindings(&resolved),
             &receipt_path,
+            None,
         )
         .unwrap();
         assert_eq!(initial, restored);
@@ -1466,6 +1561,7 @@ mod tests {
                 &Arc::new(Mutex::new(())),
                 &[receipt_candidate(&plan)],
                 &plan,
+                async { Ok(()) },
             )
             .await
             .unwrap_err();
@@ -1518,6 +1614,7 @@ mod tests {
                 pioneer_protocol::CLIAgentRuntimeKind::Codex,
                 &cli_runtime_turn_skill_bindings(&[selected]),
                 &plan.receipt_path,
+                None,
             )
             .unwrap_err();
             assert!(
@@ -1641,6 +1738,7 @@ mod tests {
                 &Arc::new(Mutex::new(())),
                 &candidates,
                 &plan,
+                async { Ok(()) },
             )
             .await
             .unwrap();
@@ -1665,6 +1763,7 @@ mod tests {
                     &Arc::new(Mutex::new(())),
                     &candidates,
                     &plan,
+                    async { Ok(()) },
                 )
                 .await
                 .unwrap();
@@ -1679,6 +1778,7 @@ mod tests {
                     pioneer_protocol::CLIAgentRuntimeKind::Claude,
                     &cli_runtime_turn_skill_bindings(&resolved[skill_index..skill_index + 1]),
                     &plan.receipt_path,
+                    None,
                 )
                 .unwrap();
                 assert_eq!(restored, vec![CliRuntimeSelectedSkill::from(&updated)]);
@@ -1753,6 +1853,7 @@ mod tests {
                 &prod_receipt_lock,
                 &candidates,
                 &prod_plan,
+                async { Ok(()) },
             )
             .await
             .unwrap();
@@ -1763,6 +1864,7 @@ mod tests {
                 &Arc::new(Mutex::new(())),
                 &candidates,
                 &dev_plan,
+                async { Ok(()) },
             )
             .await
             .unwrap();
@@ -1782,6 +1884,7 @@ mod tests {
                 &prod_receipt_lock,
                 &candidates,
                 &prod_plan,
+                async { Ok(()) },
             )
             .await
             .unwrap();
@@ -1801,6 +1904,7 @@ mod tests {
                     pioneer_protocol::CLIAgentRuntimeKind::Codex,
                     &cli_runtime_turn_skill_bindings(&[prod_skill]),
                     &prod_plan.receipt_path,
+                    None,
                 )
                 .unwrap(),
                 vec![CliRuntimeSelectedSkill::from(&refreshed)]
@@ -1828,14 +1932,17 @@ mod tests {
         let locks = new_cli_runtime_skill_destination_locks();
         let receipt_lock = Arc::new(Mutex::new(()));
         let candidates = [receipt_candidate(&plan)];
-        install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
+        install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan, async { Ok(()) })
             .await
             .unwrap();
         fs::create_dir_all(plan.destination.join("node_modules")).unwrap();
         let sentinel = plan.destination.join("node_modules/sentinel");
         fs::write(&sentinel, b"preserve user files").unwrap();
         let before = fs::read(&plan.receipt_path).unwrap();
-        let error = install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
+        let error =
+            install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan, async {
+                Ok(())
+            })
             .await
             .unwrap_err();
         assert!(error.to_string().contains("unhashed directory"));
@@ -1882,9 +1989,15 @@ mod tests {
                         plan.native_skills_root.clone()
                     }
                     "nested" => {
-                        install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
-                            .await
-                            .unwrap();
+                        install_one_cli_runtime_skill(
+                            &locks,
+                            &receipt_lock,
+                            &candidates,
+                            &plan,
+                            async { Ok(()) },
+                        )
+                        .await
+                        .unwrap();
                         let link = plan.destination.join("references/foreign");
                         symlink(&foreign, &link).unwrap();
                         link
@@ -1897,9 +2010,15 @@ mod tests {
                 };
                 let receipt_before = fs::read(&plan.receipt_path).ok();
                 assert!(
-                    install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
-                        .await
-                        .is_err()
+                    install_one_cli_runtime_skill(
+                        &locks,
+                        &receipt_lock,
+                        &candidates,
+                        &plan,
+                        async { Ok(()) }
+                    )
+                    .await
+                    .is_err()
                 );
                 assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
                 assert_eq!(fs::read(foreign.join("sentinel")).unwrap(), b"foreign");
@@ -2304,6 +2423,61 @@ mod tests {
     }
 
     #[test]
+    fn codex_skill_builder_emits_persistent_tree_path_with_readable_supporting_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let installed_path = temp.path().join("skills/proposal-51-sentinel");
+        std::fs::create_dir_all(installed_path.join("references")).unwrap();
+        std::fs::write(installed_path.join("SKILL.md"), b"# sentinel\n").unwrap();
+        std::fs::write(
+            installed_path.join("references/guide.txt"),
+            b"CODEX SUPPORTING FILE SENTINEL\n",
+        )
+        .unwrap();
+        let installed = CliRuntimeSkillInstallResult {
+            plugin_id: None,
+            status: CliRuntimeSkillInstallStatus::Installed,
+            install_name: "proposal-51-sentinel".to_owned(),
+            source_folder_hash: "fixture-hash".to_owned(),
+            installed_path: installed_path.clone(),
+            receipt_updated_at_unix_ms: 1,
+        };
+        let mut mapping = pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping {
+            input: vec![
+                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
+                    text: "original user request".to_owned(),
+                },
+            ],
+            diagnostics: Vec::new(),
+        };
+
+        prepend_cli_skill_delivery(
+            &[installed],
+            &["proposal-51-sentinel".to_owned()],
+            &mut mapping,
+        );
+
+        assert_eq!(
+            mapping.input[1..],
+            vec![
+                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill {
+                    name: "proposal-51-sentinel".to_owned(),
+                    path: installed_path
+                        .join("SKILL.md")
+                        .to_string_lossy()
+                        .into_owned(),
+                },
+                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
+                    text: "original user request".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            std::fs::read(installed_path.join("references/guide.txt")).unwrap(),
+            b"CODEX SUPPORTING FILE SENTINEL\n"
+        );
+    }
+
+    #[test]
     fn required_exports_remain_readable_without_automatic_body_invocation() {
         use pioneer_cli_agent_runtime::input::{
             CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping,
@@ -2467,9 +2641,15 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 let candidates = [receipt_candidate(&plan)];
-                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
-                    .await
-                    .unwrap()
+                install_one_cli_runtime_skill(
+                    &destination_locks,
+                    &receipt_lock,
+                    &candidates,
+                    &plan,
+                    async { Ok(()) },
+                )
+                .await
+                .unwrap()
             }));
         }
         barrier.wait().await;
@@ -2521,9 +2701,15 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 let candidates = [receipt_candidate(&plan)];
                 barrier.wait().await;
-                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
-                    .await
-                    .unwrap()
+                install_one_cli_runtime_skill(
+                    &destination_locks,
+                    &receipt_lock,
+                    &candidates,
+                    &plan,
+                    async { Ok(()) },
+                )
+                .await
+                .unwrap()
             }));
         }
         barrier.wait().await;
@@ -2559,9 +2745,15 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 let candidates = [receipt_candidate(&plan)];
-                install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
-                    .await
-                    .unwrap()
+                install_one_cli_runtime_skill(
+                    &destination_locks,
+                    &receipt_lock,
+                    &candidates,
+                    &plan,
+                    async { Ok(()) },
+                )
+                .await
+                .unwrap()
             }));
         }
         barrier.wait().await;
@@ -2588,10 +2780,15 @@ mod tests {
         let destination_locks = new_cli_runtime_skill_destination_locks();
         let receipt_lock = Arc::new(Mutex::new(()));
         let candidates = [receipt_candidate(&plan)];
-        let installed =
-            install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
-                .await
-                .unwrap();
+        let installed = install_one_cli_runtime_skill(
+            &destination_locks,
+            &receipt_lock,
+            &candidates,
+            &plan,
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
         let runtime = runtime_instance(
             GatewayCliAgentRuntimeKindConfig::Claude,
             temp.path()
@@ -2615,11 +2812,13 @@ mod tests {
             CLIAgentRuntimeKind::Claude,
             std::slice::from_ref(&binding),
             plan.receipt_path.as_path(),
+            None,
         )
         .unwrap();
         assert_eq!(
             selected,
             vec![CliRuntimeSelectedSkill {
+                plugin_id: None,
                 install_name: installed.install_name,
                 installed_path: installed.installed_path.clone(),
                 source_folder_hash: installed.source_folder_hash,
@@ -2632,6 +2831,7 @@ mod tests {
             CLIAgentRuntimeKind::Claude,
             std::slice::from_ref(&binding),
             plan.receipt_path.as_path(),
+            None,
         )
         .unwrap_err();
         assert!(format!("{drift:#}").contains("installed content differs"));
@@ -2644,6 +2844,7 @@ mod tests {
             CLIAgentRuntimeKind::Claude,
             std::slice::from_ref(&binding),
             plan.receipt_path.as_path(),
+            None,
         )
         .unwrap_err();
         assert!(format!("{escaped:#}").contains("non-canonical install name"));
@@ -2660,14 +2861,25 @@ mod tests {
         let receipt_lock = Arc::new(Mutex::new(()));
 
         let candidates = [receipt_candidate(&plan)];
-        install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
-            .await
-            .unwrap();
+        install_one_cli_runtime_skill(
+            &destination_locks,
+            &receipt_lock,
+            &candidates,
+            &plan,
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
         fs::write(plan.source.join("changed"), b"changed").unwrap();
         symlink("loop", plan.source.join("loop")).unwrap();
-        let failed =
-            install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
-                .await;
+        let failed = install_one_cli_runtime_skill(
+            &destination_locks,
+            &receipt_lock,
+            &candidates,
+            &plan,
+            async { Ok(()) },
+        )
+        .await;
         assert!(failed.is_err());
         assert!(
             read_external_runtime_receipt(&plan.receipt_path)
@@ -2677,10 +2889,15 @@ mod tests {
         );
 
         fs::remove_file(plan.source.join("loop")).unwrap();
-        let retried =
-            install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
-                .await
-                .unwrap();
+        let retried = install_one_cli_runtime_skill(
+            &destination_locks,
+            &receipt_lock,
+            &candidates,
+            &plan,
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
         assert_eq!(retried.status, CliRuntimeSkillInstallStatus::Installed);
     }
 }

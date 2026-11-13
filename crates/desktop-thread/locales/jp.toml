@@ -334,7 +334,17 @@
 "timeline.web_search.results_count" = "%{count} 件の結果"
 "timeline.web_search.running" = "Web を検索中"
 "timeline.work_group.completed" = "作業済み"
+
+"chat.composer.add_menu.plugins" = "プラグインを追加"
+"plugins.empty" = "プラグインがインストールされていません"
+"plugins.error" = "プラグインを読み込めませんでした。もう一度お試しください。"
+"plugins.loading" = "プラグインを読み込み中…"
+"plugins.search" = "プラグインを検索"
+"plugins.select" = "プラグインを選択"
+"plugins.unavailable" = "利用不可"
 "chat.composer.preparing_send" = "メッセージを準備中"
+"plugins.retry" = "再試行"
+"plugins.stale" = "選択したバージョンは最新ではありません"
 
 "chat.composer.model.context_label" = "コンテキストウィンドウ"
 "chat.composer.model.context_auto" = "自動 — 最大 %{tokens} トークン"

@@ -20,7 +20,7 @@ use crate::{notifications::effects::ClientEffect, runtime::ClientRuntime};
 // changing production ownership or notification behavior.
 #[cfg(test)]
 std::thread_local! {
-    static IDENTITY_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static IDENTITY_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static SEND_READINESS_BEFORE_WAIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -188,8 +188,11 @@ pub enum ClientScope {
     Artifact {
         thread_id: String,
     },
-    Avatar {
-        principal_id: String,
+    // Keep the established wire shape; this scope now carries any native image.
+    #[serde(rename = "avatar")]
+    Image {
+        #[serde(rename = "principal_id")]
+        key: String,
     },
     AdministrationOperation,
     AdministrationPage {
@@ -222,6 +225,9 @@ pub enum ClientScope {
     SkillsAction {
         workspace_id: String,
         target: String,
+    },
+    Plugins {
+        workspace_id: String,
     },
     SkillsUpload {
         workspace_id: String,
@@ -269,6 +275,11 @@ pub enum ClientDemand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
+    Plugins {
+        workspace_id: String,
+        connection_id: Option<u64>,
+        intent: crate::plugins::runtime::PluginIntent,
+    },
     SessionDemand {
         demand: crate::gateway::session_driver::SessionDemand,
     },
@@ -958,7 +969,7 @@ impl Drop for ClientSubscription {
                 .remove(&self.id);
             core.thread_subscription_changed(&self.queue.scope, false);
             core.composer_subscription_changed(&self.queue.scope, false);
-            core.avatar_subscription_changed(&self.queue.scope, false);
+            core.image_subscription_changed(&self.queue.scope, false);
             core.task_inbox_subscription_changed(&self.queue.scope, false);
             core.task_review_subscription_changed(&self.queue.scope, false);
             core.approval_action_subscription_changed(&self.queue.scope, false);
@@ -1071,7 +1082,9 @@ pub struct ClientCore {
         Mutex<crate::settings::model_picker::SettingsModelPickerController>,
     pub(crate) settings_runtime: Mutex<crate::settings::runtime::SettingsRuntime>,
     pub(crate) agents_documents: Mutex<crate::agents_doc::runtime::DocumentRuntime>,
-    pub(crate) skills_controller: Mutex<crate::skills::operations::SkillsController>,
+    pub(crate) plugins_controller: Mutex<crate::plugins::runtime::PluginController>,
+    pub(crate) capability_operations:
+        Mutex<crate::package_delivery::operations::CapabilityOperations>,
     pub(crate) skills_store: Mutex<crate::skills::store::SkillsStore>,
     pub(crate) mcp_controller: Mutex<crate::mcp::operations::McpController>,
     pub(crate) mcp_oauth: Mutex<crate::mcp::oauth::OAuthController>,
@@ -1108,7 +1121,7 @@ pub struct ClientCore {
     pub(crate) approval_actions:
         Mutex<crate::cli_runtime::approval_actions::ApprovalActionController>,
     pub(crate) task_reviews: Mutex<crate::tasks::review_controller::TaskReviewActionController>,
-    pub(crate) avatar_store: Mutex<crate::avatars::AvatarStore>,
+    pub(crate) image_store: Mutex<crate::images::ImageStore>,
     pub(crate) workspace_catalog: Mutex<crate::workspaces::catalog::WorkspaceCatalogStore>,
     pub(crate) workspace_controller: Mutex<crate::workspaces::controller::WorkspaceController>,
     pub(crate) task_notifications: Mutex<crate::tasks::notifications::TaskNotificationController>,
@@ -1369,7 +1382,10 @@ impl Default for ClientCore {
 impl ClientCore {
     pub fn new() -> Self {
         Self {
-            skills_controller: Mutex::new(crate::skills::operations::SkillsController::default()),
+            plugins_controller: Mutex::default(),
+            capability_operations: Mutex::new(
+                crate::package_delivery::operations::CapabilityOperations::default(),
+            ),
             agents_documents: Mutex::new(Default::default()),
             onboarding: Mutex::new(Default::default()),
             settings_runtime: Mutex::new(Default::default()),
@@ -1403,7 +1419,7 @@ impl ClientCore {
             composer_catalog_requests: Mutex::default(),
             approval_actions: Mutex::default(),
             task_reviews: Mutex::default(),
-            avatar_store: Mutex::default(),
+            image_store: Mutex::default(),
             workspace_catalog: Mutex::default(),
             workspace_controller: Mutex::default(),
             task_notifications: Mutex::default(),
@@ -1848,7 +1864,11 @@ impl ClientCore {
             .lock()
             .expect("settings owner poisoned")
             .stop();
-        self.skills_controller
+        self.plugins_controller
+            .lock()
+            .expect("plugins poisoned")
+            .stop();
+        self.capability_operations
             .lock()
             .expect("Skills controller poisoned")
             .stop();
@@ -1905,7 +1925,7 @@ impl ClientCore {
             .lock()
             .expect("composer store poisoned")
             .clear();
-        self.avatar_store
+        self.image_store
             .lock()
             .expect("avatar store poisoned")
             .invalidate();
@@ -2066,17 +2086,25 @@ impl ClientCore {
             _ => {}
         }
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
+            if let pioneer_protocol::GatewayNotification::PluginsChanged(event) = notification {
+                self.refresh_skills(&event.workspace_id);
+                self.refresh_mcp(&event.workspace_id);
+                self.refresh_plugin_publication(&event.workspace_id);
+                return None;
+            }
             self.observe_administration_notification(notification);
             self.observe_provider_runtime_notification(notification);
             if self.observe_mcp_oauth_notification(notification) {
+                self.refresh_plugins_for_native_notification(notification);
                 return None;
             }
             if self.observe_mcp_notification(notification) {
+                self.refresh_plugins_for_native_notification(notification);
                 return None;
             }
-            if let pioneer_protocol::GatewayNotification::SkillsChanged(notification) = notification
-            {
-                self.refresh_skills(&notification.workspace_id);
+            if let pioneer_protocol::GatewayNotification::SkillsChanged(event) = notification {
+                self.refresh_skills(&event.workspace_id);
+                self.refresh_plugins_for_native_notification(notification);
                 return None;
             }
             self.observe_composer_voice_notification(notification);
@@ -2145,6 +2173,7 @@ impl ClientCore {
         core.start_settings_controller();
         core.start_settings_model_picker_controller();
         core.start_onboarding_controller();
+        core.start_plugins_controller();
         core.start_skills_controller();
         core.start_skills_operation_controller();
         core.start_provider_operation_controller();
@@ -2770,7 +2799,7 @@ impl ClientCore {
     ) -> ClientSubscription {
         self.thread_subscription_changed(&scope, true);
         self.composer_subscription_changed(&scope, true);
-        self.avatar_subscription_changed(&scope, true);
+        self.image_subscription_changed(&scope, true);
         self.task_inbox_subscription_changed(&scope, true);
         self.task_review_subscription_changed(&scope, true);
         self.approval_action_subscription_changed(&scope, true);
@@ -2931,6 +2960,17 @@ impl ClientCore {
             ClientIntent::ComposerModelPicker { intent } => {
                 return self.composer_model_picker_intent(intent.clone());
             }
+            ClientIntent::Plugins {
+                workspace_id,
+                connection_id,
+                intent,
+            } => {
+                return if self.current_auth_ticket().1 == *connection_id {
+                    self.plugin_intent(workspace_id, intent.clone())
+                } else {
+                    self.reject_intent()
+                };
+            }
             ClientIntent::ComposerCatalog { intent } => {
                 return self.composer_catalog_intent(intent.clone());
             }
@@ -3040,13 +3080,14 @@ impl ClientCore {
         if outcome == ClientTransitionOutcome::Changed {
             self.thread_demand_changed(&thread_scope, thread_demand);
             self.composer_demand_changed(&thread_scope, thread_demand);
-            self.avatar_demand_changed(&thread_scope, thread_demand);
+            self.image_demand_changed(&thread_scope, thread_demand);
             self.task_inbox_demand_changed(&thread_scope, thread_demand);
             self.task_review_demand_changed(&thread_scope, thread_demand);
             self.approval_action_demand_changed(&thread_scope, thread_demand);
             self.message_revision_demand_changed(&thread_scope, thread_demand);
             self.message_deletion_demand_changed(&thread_scope, thread_demand);
             self.composer_catalog_demand_changed(&thread_scope, thread_demand);
+            self.plugin_demand_changed(&thread_scope, thread_demand);
             self.mcp_binding_demand_changed(&thread_scope, thread_demand);
             self.skills_binding_demand_changed(&thread_scope, thread_demand);
             self.document_demand_changed(&thread_scope, thread_demand);
@@ -3546,7 +3587,7 @@ impl ClientCore {
                 .lock()
                 .expect("activation owner poisoned")
                 .invalidate();
-            self.avatar_store
+            self.image_store
                 .lock()
                 .expect("avatar store poisoned")
                 .invalidate_access();
@@ -3576,6 +3617,7 @@ impl ClientCore {
             self.fence_mcp_oauth();
             self.invalidate_skills();
             self.invalidate_skills_operations();
+            self.invalidate_plugin_publications();
             self.invalidate_provider_operations();
             self.cancel_artifact_downloads(None);
             self.cancel_composer_requests();
@@ -3785,6 +3827,9 @@ impl ClientCore {
         drop(document_fence);
         if evict_protected {
             self.retire_thread_controller_jobs();
+            // Identity callers still own I here. Retain the invalidation's
+            // read obligations; admission resumes with other feature demands
+            // after the caller releases I, never recursively inside commit.
         }
         self.wake_thread_timeline_requests();
         self.update_thread_presentation_identity(principal);
@@ -4927,8 +4972,8 @@ mod tests {
         let operation = ClientOperationId::new("avatar-read").unwrap();
         core.publish(
             &authority(),
-            ClientScope::Avatar {
-                principal_id: "principal-a".to_owned(),
+            ClientScope::Image {
+                key: "principal-a".to_owned(),
             },
             revisions(1),
             Arc::new("ready"),

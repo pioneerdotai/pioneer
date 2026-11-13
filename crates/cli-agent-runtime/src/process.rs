@@ -12,12 +12,16 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// Standard grace used by the existing CLI process lifecycle.
+pub const DEFAULT_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 const DEFAULT_STDERR_RING_LINES: usize = 200;
 const REDACTED_SECRET: &str = "[REDACTED]";
@@ -271,10 +275,12 @@ pub struct CLIAgentProcess {
     child: Box<dyn ChildWrapper>,
     #[cfg(unix)]
     owned_process_group: Option<u32>,
+    process_group_requested: bool,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     stderr: StderrRing,
     stderr_reader: Option<JoinHandle<()>>,
+    stderr_failure: Option<String>,
 }
 
 impl CLIAgentProcess {
@@ -322,8 +328,31 @@ impl CLIAgentProcess {
     }
 
     pub async fn terminate_with_grace(&mut self, grace: Duration) -> Result<ExitStatus> {
+        let status = self.terminate_parent_with_grace(grace).await?;
+        if self.process_group_requested {
+            // Signal remaining descendants even when the parent already exited.
+            // Ordinary stop does not wait for external reaping of the group.
+            if let Err(error) = self.child.start_kill() {
+                #[cfg(unix)]
+                let already_gone = error.raw_os_error() == Some(libc::ESRCH);
+                #[cfg(not(unix))]
+                let already_gone = false;
+                if !already_gone {
+                    return Err(error).context("failed to stop CLI descendants");
+                }
+            }
+            self.child
+                .wait()
+                .await
+                .context("failed to wait for stopped CLI process")?;
+        }
+        // Descendant signals release inherited pipes before joining our reader.
+        self.wait_for_stderr().await?;
+        Ok(status)
+    }
+
+    async fn terminate_parent_with_grace(&mut self, grace: Duration) -> Result<ExitStatus> {
         if let Some(status) = self.try_wait()? {
-            self.wait_for_stderr().await?;
             return Ok(status);
         }
 
@@ -349,16 +378,11 @@ impl CLIAgentProcess {
             }
         }?;
         self.observation.exited(status.success());
-        self.wait_for_stderr().await?;
         Ok(status)
     }
 
-    /// Kill remaining members and confirm removal of an owned service group
-    /// after its parent was reaped.
-    /// Unlike `terminate_with_grace`, this also covers descendants which closed
-    /// their pipes before the parent exited. Only callers requiring this stronger
-    /// barrier opt in; the supplied deadline is never extended here. Platforms
-    /// without group observation fail closed instead of claiming completion.
+    /// Explicit startup cleanup barrier. Ordinary termination uses the public
+    /// process wait and reader join without requiring the PGID to disappear.
     pub async fn terminate_service_group(&mut self, deadline: tokio::time::Instant) -> Result<()> {
         #[cfg(unix)]
         {
@@ -391,10 +415,13 @@ impl CLIAgentProcess {
             if group_gone()? {
                 return Ok(());
             }
-            if let Err(error) = self.child.start_kill()
-                && error.raw_os_error() != Some(libc::ESRCH)
-            {
-                return Err(error).context("failed to kill owned service process group");
+            // The direct child may already be reaped. Signal the captured
+            // group, never a new child lookup or a cached wrapper status.
+            if unsafe { libc::kill(-pgid, libc::SIGKILL) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error).context("failed to kill owned service process group");
+                }
             }
             tokio::time::timeout_at(deadline, async {
                 loop {
@@ -409,9 +436,25 @@ impl CLIAgentProcess {
                 }
             })
             .await
-            .context("owned service process group cleanup was not confirmed before deadline")?
+            .context("owned service process group cleanup was not confirmed before deadline")??;
+            Ok(())
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            anyhow::ensure!(
+                self.process_group_requested,
+                "owned Windows job is unavailable"
+            );
+            self.child
+                .start_kill()
+                .context("failed to terminate owned Windows job")?;
+            tokio::time::timeout_at(deadline, self.child.wait())
+                .await
+                .context("Windows job cleanup deadline exhausted")??;
+            self.wait_for_stderr().await?;
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = deadline;
             bail!("service process group cleanup confirmation is unavailable on this platform")
@@ -419,9 +462,18 @@ impl CLIAgentProcess {
     }
 
     async fn wait_for_stderr(&mut self) -> Result<()> {
+        if let Some(error) = &self.stderr_failure {
+            bail!("{error}");
+        }
         if let Some(reader) = self.stderr_reader.as_mut() {
-            reader.await.context("failed to drain CLI process stderr")?;
+            let result = reader.await;
             self.stderr_reader.take();
+            if result.is_err() {
+                self.stderr_failure = Some("failed to drain CLI process stderr".to_owned());
+            }
+        }
+        if let Some(error) = &self.stderr_failure {
+            bail!("{error}");
         }
         Ok(())
     }
@@ -596,16 +648,19 @@ pub fn spawn_prepared_cli_agent_process(
         }
     });
 
-    Ok(CLIAgentProcess {
+    let process = CLIAgentProcess {
         observation,
         #[cfg(unix)]
         owned_process_group: prepared.process_group.then(|| child.id()).flatten(),
+        process_group_requested: prepared.process_group,
         child,
         stdin,
         stdout,
         stderr,
         stderr_reader,
-    })
+        stderr_failure: None,
+    };
+    Ok(process)
 }
 
 pub fn scrub_inherited_cli_environment(command: &mut Command) {
@@ -889,6 +944,82 @@ sleep 30
             .expect("process should terminate");
         assert!(!status.success());
         assert!(process.try_wait().expect("poll after terminate").is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_termination_stops_descendants_before_joining_stderr() {
+        let root = unique_temp_dir("open-stderr-descendant");
+        let script = root.join("parent");
+        write_unix_script(
+            &script,
+            "#!/bin/sh\n(exec </dev/null >/dev/null; echo inherited-stderr >&2; exec sleep 60) &\necho $! > descendant\nexit 0\n",
+        );
+        let mut process = spawn_cli_agent_process(
+            &CLIAgentProcessSpawnConfig::codex_app_server(
+                script.to_string_lossy(),
+                root.join("home").to_string_lossy(),
+            )
+            .with_cwd(root.clone())
+            .with_process_generation(43)
+            .unwrap(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while process.try_wait().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Natural wait preserves the inherited pipe; stop signals descendants
+        // before joining the real stderr reader, without waiting for external reap.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), process.wait())
+                .await
+                .is_err()
+        );
+        assert!(process.stderr_reader.is_some());
+        let status = tokio::time::timeout(
+            Duration::from_secs(5),
+            process.terminate_with_grace(Duration::from_secs(2)),
+        )
+        .await
+        .expect("descendant signals must precede inherited pipe join")
+        .unwrap();
+        assert!(status.success());
+        assert!(process.try_wait().unwrap().is_some());
+        assert!(
+            process.stderr_reader.is_none(),
+            "actual reader join consumed"
+        );
+        assert_eq!(process.stderr().process_generation(), Some(43));
+        assert!(
+            process
+                .terminate_with_grace(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn normal_windows_cli_stop_uses_public_wrapper() {
+        let root = unique_temp_dir("windows-job-completion");
+        let mut config =
+            CLIAgentProcessSpawnConfig::codex_app_server("cmd.exe", root.to_string_lossy());
+        config.args = vec!["/D".into(), "/C".into(), "exit 0".into()];
+        let mut process = spawn_cli_agent_process(&config).unwrap();
+        process
+            .terminate_with_grace(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(process.try_wait().unwrap().is_some());
+        process
+            .terminate_with_grace(Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 
     #[cfg(unix)]

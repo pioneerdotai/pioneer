@@ -78,6 +78,7 @@ pub struct SkillCatalogSnapshot {
 #[derive(Debug, Default)]
 struct ParsedFrontmatter {
     name: Option<String>,
+    authored_name: Option<String>,
     owner: Option<String>,
     description: Option<String>,
     slug: Option<String>,
@@ -122,6 +123,15 @@ pub struct SkillMarkdownParseContext {
     pub identity_slug_override: Option<String>,
     pub version_hint_override: Option<String>,
     pub display_name_override: Option<String>,
+}
+
+/// Authored required fields, before display fallbacks or identity overrides.
+/// The name retains whitespace so package callers can require an exact match
+/// with their member directory. Description is trimmed like native metadata.
+#[derive(Debug, Clone)]
+pub struct SkillMarkdownAuthoredFields {
+    pub name: Option<String>,
+    pub description: Option<String>,
 }
 
 fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
@@ -644,6 +654,9 @@ fn parse_frontmatter(frontmatter: Option<&str>) -> Result<ParsedFrontmatter> {
         .context("YAML frontmatter root must be a mapping")?;
 
     parsed.name = parse_string_field(map, "name", &mut parsed.issues);
+    parsed.authored_name = yaml_lookup(map, "name")
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::to_owned);
     parsed.owner = parse_string_field(map, "owner", &mut parsed.issues);
     parsed.description = parse_string_field(map, "description", &mut parsed.issues);
     parsed.slug = parse_string_field(map, "slug", &mut parsed.issues);
@@ -830,9 +843,22 @@ pub fn parse_skill_markdown(
     content: &str,
     context: SkillMarkdownParseContext,
 ) -> Result<SkillDefinition> {
+    parse_skill_markdown_with_authored_fields(content, context).map(|(definition, _)| definition)
+}
+
+/// Parse once for native conformance and authored-field validation. Existing
+/// native callers retain display fallbacks through `parse_skill_markdown`.
+pub fn parse_skill_markdown_with_authored_fields(
+    content: &str,
+    context: SkillMarkdownParseContext,
+) -> Result<(SkillDefinition, SkillMarkdownAuthoredFields)> {
     let normalized = content.replace("\r\n", "\n");
     let (frontmatter_block, body_block) = split_frontmatter(normalized.as_str());
     let mut frontmatter = parse_frontmatter(frontmatter_block)?;
+    let authored = SkillMarkdownAuthoredFields {
+        name: frontmatter.authored_name.take(),
+        description: frontmatter.description.clone(),
+    };
     normalize_implicit_invocation_policy_for_source(&context.source_kind, &mut frontmatter);
     let body = body_block.trim().to_owned();
 
@@ -922,7 +948,7 @@ pub fn parse_skill_markdown(
     }
     definition.policy_hints.catalog_hidden = frontmatter.catalog_hidden;
 
-    Ok(definition)
+    Ok((definition, authored))
 }
 
 /// The bytes and sidecar facts of one physical file. IDs, source semantics and

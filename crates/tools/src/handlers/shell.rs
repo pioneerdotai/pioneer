@@ -14,15 +14,20 @@ use crate::{
 };
 use async_trait::async_trait;
 use pioneer_protocol::{SandboxBackendKind, TurnExecutionSecuritySnapshot};
+use process_wrap::tokio::ChildWrapper;
 use std::collections::{BTreeMap, HashMap};
 use std::future::pending;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, Command};
+#[cfg(not(windows))]
+use tokio::process::Child;
+use tokio::process::{ChildStdin, Command};
+#[cfg(windows)]
+type Child = Box<dyn ChildWrapper>;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, Instant as TokioInstant, sleep, sleep_until};
 
@@ -70,15 +75,56 @@ impl Default for OneShotOutputLimits {
 }
 
 pub struct UnifiedExecHandler {
-    sessions: Arc<Mutex<HashMap<u64, Arc<Mutex<ExecSession>>>>>,
+    sessions: Arc<StdMutex<HashMap<u64, Arc<Mutex<ExecSession>>>>>,
+    one_shots: StdMutex<HashMap<u64, Arc<Mutex<RetainedOneShot>>>>,
     next_session_id: AtomicU64,
     one_shot_limits: OneShotOutputLimits,
+    cleanup_error: StdMutex<Option<String>>,
+}
+
+struct RetainedOneShot {
+    observation: pioneer_observability::resources::ChildRegistration,
+    child: Child,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    reader_error: Option<String>,
+    process_id: Option<u32>,
+    _runtime_temp_dir: Option<Arc<crate::process_policy::ProcessRuntimeTempDir>>,
+}
+
+impl RetainedOneShot {
+    async fn confirm_group(&mut self) -> Result<(), ToolError> {
+        confirm_shell_group(&mut self.child, &mut self.process_id).await
+    }
+}
+
+async fn drain_shell_readers(
+    readers: &mut Vec<tokio::task::JoinHandle<()>>,
+    reader_error: &mut Option<String>,
+) -> Result<(), ToolError> {
+    while let Some(reader) = readers.last_mut() {
+        reader.abort();
+        let result = (&mut *reader).await;
+        readers.pop();
+        if let Err(error) = result {
+            if !error.is_cancelled() {
+                let message = format!("shell reader join failed: {error}");
+                *reader_error = Some(message.clone());
+            }
+        }
+    }
+    match reader_error {
+        Some(error) => Err(ToolError::internal(error.clone())),
+        None => Ok(()),
+    }
 }
 
 struct ExecSession {
     process_correlation: pioneer_observability::scenario::Correlation,
     observation: pioneer_observability::resources::ChildRegistration,
     child: Child,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    reader_error: Option<String>,
+    process_id: Option<u32>,
     stdin: Option<ChildStdin>,
     stdout: Arc<Mutex<SessionBuffer>>,
     stderr: Arc<Mutex<SessionBuffer>>,
@@ -93,6 +139,62 @@ struct ExecSession {
     _runtime_temp_dir: Option<Arc<crate::process_policy::ProcessRuntimeTempDir>>,
 }
 
+impl ExecSession {
+    async fn confirm_group(&mut self) -> Result<(), ToolError> {
+        confirm_shell_group(&mut self.child, &mut self.process_id).await
+    }
+}
+
+fn spawn_shell_command(command: Command) -> std::io::Result<Child> {
+    #[cfg(windows)]
+    {
+        use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
+        let mut wrapped = CommandWrap::from(command);
+        let mut flags = CreationFlags(Default::default());
+        flags.0.0 = 0x0000_0200; // existing CREATE_NEW_PROCESS_GROUP policy
+        wrapped.wrap(KillOnDrop).wrap(flags).wrap(JobObject);
+        // JobObject spawns suspended, assigns to the captured job, then resumes.
+        wrapped.spawn()
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = command;
+        command.spawn()
+    }
+}
+
+fn shell_parent_try_wait(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+    #[cfg(windows)]
+    {
+        // SAFETY: borrow only the native parent temporarily; never extract or
+        // drop its wrapper. The owner still uses the public wrapper wait
+        // when stopping the Windows job.
+        unsafe { child.try_inner_child_mut() }
+            .ok_or_else(|| std::io::Error::other("shell parent unavailable"))?
+            .try_wait()
+    }
+    #[cfg(not(windows))]
+    {
+        child.try_wait()
+    }
+}
+
+async fn shell_parent_wait(child: &mut Child) -> std::io::Result<ExitStatus> {
+    #[cfg(windows)]
+    {
+        // SAFETY: the borrow ends with parent wait; the captured job wrapper
+        // remains in the owner for the public wrapper stop/wait.
+        unsafe { child.try_inner_child_mut() }
+            .ok_or_else(|| std::io::Error::other("shell parent unavailable"))?
+            .wait()
+            .await
+    }
+    #[cfg(not(windows))]
+    {
+        child.wait().await
+    }
+}
+
 impl Drop for ExecSession {
     fn drop(&mut self) {
         self.reader_shutdown.cancel();
@@ -102,15 +204,24 @@ impl Drop for ExecSession {
 impl Default for UnifiedExecHandler {
     fn default() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(StdMutex::new(HashMap::new())),
+            one_shots: StdMutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(0),
             one_shot_limits: OneShotOutputLimits::default(),
+            cleanup_error: StdMutex::new(None),
         }
     }
 }
 
 impl Drop for UnifiedExecHandler {
     fn drop(&mut self) {
+        if let Ok(children) = self.one_shots.try_lock() {
+            for child in children.values() {
+                if let Ok(mut child) = child.try_lock() {
+                    terminate_child_process_now(&mut child.child);
+                }
+            }
+        }
         if let Ok(sessions) = self.sessions.try_lock() {
             for session in sessions.values() {
                 if let Ok(mut guard) = session.try_lock() {
@@ -396,6 +507,155 @@ impl ToolHandler for UnifiedExecHandler {
 }
 
 impl UnifiedExecHandler {
+    /// Called after native dispatch tasks have ended. No registry lock spans a
+    /// process wait. A cancelled waiter leaves each Child and JoinHandle here.
+    pub async fn stop_and_wait(&self) -> Result<(), ToolError> {
+        let children = self
+            .one_shots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(id, child)| (*id, child.clone()))
+            .collect::<Vec<_>>();
+        for (id, child) in children {
+            let mut retained = child.lock().await;
+            let process_result = async {
+                let status = terminate_child_process(&mut retained.child).await?;
+                retained.confirm_group().await?;
+                Ok(status)
+            }
+            .await;
+            observe_shell_status(
+                &mut retained.observation,
+                process_result.as_ref().ok().copied(),
+            );
+            if let Err(error) = &process_result {
+                self.remember_cleanup_error(error);
+            }
+            let RetainedOneShot {
+                readers,
+                reader_error,
+                ..
+            } = &mut *retained;
+            if let Err(error) = drain_shell_readers(readers, reader_error).await {
+                self.remember_cleanup_error(&error);
+            }
+            if process_result.is_ok() {
+                self.one_shots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+            }
+        }
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for id in sessions {
+            if let Err(error) = self.close_session(id).await {
+                self.remember_cleanup_error(&error);
+            }
+        }
+        match self
+            .cleanup_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(error) => Err(ToolError::internal(error)),
+            None => Ok(()),
+        }
+    }
+
+    fn remember_cleanup_error(&self, error: &ToolError) {
+        let mut failure = self
+            .cleanup_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failure.is_none() {
+            *failure = Some(error.to_string());
+        }
+    }
+
+    /// Used only after native dispatch tasks joined, so no new child can appear.
+    /// An error outcome and ownership of an unconfirmed process are distinct.
+    pub fn cleanup_is_quiescent(&self) -> bool {
+        self.one_shots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+            && self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+    }
+
+    async fn close_session(&self, id: u64) -> Result<(), ToolError> {
+        self.close_session_inner(id, true).await
+    }
+
+    // A terminal command result and strict group cleanup are separate outcomes.
+    // Normal completion may report its result on platforms without group
+    // observation, while retaining the same owner and failed cleanup obligation.
+    async fn close_session_inner(
+        &self,
+        id: u64,
+        require_group_completion: bool,
+    ) -> Result<(), ToolError> {
+        let session = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .cloned();
+        if let Some(session) = session {
+            let mut session = session.lock().await;
+            let process_result = terminate_child_process(&mut session.child).await;
+            let group_result = if process_result.is_ok() {
+                session.confirm_group().await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = &group_result {
+                self.remember_cleanup_error(error);
+            }
+            observe_shell_status(
+                &mut session.observation,
+                process_result.as_ref().ok().copied(),
+            );
+            if let Err(error) = &process_result {
+                self.remember_cleanup_error(error);
+            }
+            let ExecSession {
+                readers,
+                reader_error,
+                ..
+            } = &mut *session;
+            let result = drain_shell_readers(readers, reader_error).await;
+            if let Err(error) = &result {
+                self.remember_cleanup_error(error);
+            }
+            // Release only after child wait and all reader joins, even on reader panic.
+            if process_result.is_ok() && group_result.is_ok() {
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+            }
+            if require_group_completion || cfg!(unix) {
+                return process_result.and(group_result).and(result);
+            }
+            // Unsupported observation is not a failed command or a successful
+            // drain. The map entry, captured identity and cleanup error remain.
+            return process_result.and(result);
+        }
+        Ok(())
+    }
+
     async fn handle_exec_command(
         &self,
         args: ExecCommandArgs,
@@ -416,13 +676,20 @@ impl UnifiedExecHandler {
                     &trace,
                     cancellation,
                     self.one_shot_limits,
+                    self,
                 ),
             )
             .await?;
             return Ok(Box::new(result.into_tool_output()));
         }
 
-        if self.sessions.lock().await.len() >= MAX_ACTIVE_SESSIONS {
+        if self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+            >= MAX_ACTIVE_SESSIONS
+        {
             return Err(ToolError::execution_failed(format!(
                 "too many active exec sessions (limit={MAX_ACTIVE_SESSIONS}); close existing sessions or wait for cleanup"
             )));
@@ -448,7 +715,7 @@ impl UnifiedExecHandler {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = spawn_shell_command(command).map_err(|error| {
             ToolError::execution_failed(format!("failed to spawn command: {error}"))
         })?;
 
@@ -457,42 +724,46 @@ impl UnifiedExecHandler {
             pioneer_observability::resources::ChildRole::Shell,
             None,
         );
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdin = child.stdin.take();
+        let stdout = child.stdout().take();
+        let stderr = child.stderr().take();
+        let stdin = child.stdin().take();
         let session_id = self
             .next_session_id
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         let stdout_buffer = Arc::new(Mutex::new(SessionBuffer::default()));
         let stderr_buffer = Arc::new(Mutex::new(SessionBuffer::default()));
+        let mut readers = Vec::new();
         let reader_shutdown = tokio_util::sync::CancellationToken::new();
         let spool = Arc::new(Mutex::new(SessionSpool::new(self.one_shot_limits)));
         if let Some(stdout) = stdout {
-            spawn_retained_reader(
+            readers.push(spawn_retained_reader(
                 stdout,
                 stdout_buffer.clone(),
                 spool.clone(),
                 0,
                 reader_shutdown.child_token(),
-            );
+            ));
         }
         if let Some(stderr) = stderr {
-            spawn_retained_reader(
+            readers.push(spawn_retained_reader(
                 stderr,
                 stderr_buffer.clone(),
                 spool.clone(),
                 1,
                 reader_shutdown.child_token(),
-            );
+            ));
         }
 
         let poll = Arc::new(Mutex::new(()));
         let _poll = poll.lock().await;
         let session = Arc::new(Mutex::new(ExecSession {
+            process_id: child.id(),
             process_correlation: pioneer_observability::scenario::Correlation::capture(),
             observation,
             child,
+            readers,
+            reader_error: None,
             stdin,
             stdout: stdout_buffer,
             stderr: stderr_buffer,
@@ -509,7 +780,7 @@ impl UnifiedExecHandler {
 
         self.sessions
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session_id, session.clone());
 
         let session_cancelled = tokio::select! {
@@ -530,9 +801,9 @@ impl UnifiedExecHandler {
                     );
                 }
             }
-            self.sessions.lock().await.remove(&session_id);
             drain_session_pipes(&session).await;
             let _ = save_session_output(&session, &trace).await;
+            self.close_session(session_id).await?;
             return Err(ToolError::cancelled(
                 "command cancelled; only acknowledged output can be recovered",
             ));
@@ -540,7 +811,7 @@ impl UnifiedExecHandler {
 
         let state = {
             let mut guard = session.lock().await;
-            let status = guard.child.try_wait().map_err(|error| {
+            let status = shell_parent_try_wait(&mut guard.child).map_err(|error| {
                 ToolError::execution_failed(format!("failed to poll process state: {error}"))
             })?;
             if let Some(status) = status {
@@ -569,13 +840,13 @@ impl UnifiedExecHandler {
                 let terminated = terminate_child_process(&mut guard.child).await;
                 observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
                 drop(guard);
-                self.sessions.lock().await.remove(&session_id);
+                self.close_session(session_id).await?;
                 return Err(error);
             }
         };
 
         if state.finished {
-            self.sessions.lock().await.remove(&session_id);
+            self.close_session_inner(session_id, false).await?;
         }
 
         let payload = retained_exec_payload(
@@ -611,7 +882,7 @@ impl UnifiedExecHandler {
         let session = self
             .sessions
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&args.session_id)
             .cloned()
             .ok_or_else(|| {
@@ -654,7 +925,7 @@ impl UnifiedExecHandler {
         let (state, command_preview, started_at, process_correlation) = {
             let mut guard = session.lock().await;
             guard.last_touched = Instant::now();
-            let status = guard.child.try_wait().map_err(|error| {
+            let status = shell_parent_try_wait(&mut guard.child).map_err(|error| {
                 ToolError::execution_failed(format!("failed to poll process state: {error}"))
             })?;
             if let Some(status) = status {
@@ -688,7 +959,7 @@ impl UnifiedExecHandler {
                 let terminated = terminate_child_process(&mut guard.child).await;
                 observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
                 drop(guard);
-                self.sessions.lock().await.remove(&args.session_id);
+                self.close_session(args.session_id).await?;
                 return Err(error);
             }
         };
@@ -706,7 +977,7 @@ impl UnifiedExecHandler {
             pioneer_observability::tool_call::Fact::ProcessExitedFailure
         });
         if state.finished {
-            self.sessions.lock().await.remove(&args.session_id);
+            self.close_session_inner(args.session_id, false).await?;
         }
 
         let payload = retained_exec_payload(
@@ -733,8 +1004,49 @@ impl UnifiedExecHandler {
     }
 
     async fn cleanup_stale_sessions(&self) {
+        let children = self
+            .one_shots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(id, child)| (*id, child.clone()))
+            .collect::<Vec<_>>();
+        for (id, child) in children {
+            if let Ok(mut retained) = child.try_lock() {
+                let status = shell_parent_try_wait(&mut retained.child).ok().flatten();
+                observe_shell_status(&mut retained.observation, status);
+                if status.is_some() {
+                    let cleanup = async {
+                        terminate_child_process(&mut retained.child).await?;
+                        retained.confirm_group().await
+                    }
+                    .await;
+                    if let Err(error) = cleanup {
+                        self.remember_cleanup_error(&error);
+                        continue;
+                    }
+                    let RetainedOneShot {
+                        readers,
+                        reader_error,
+                        ..
+                    } = &mut *retained;
+                    if let Err(error) = drain_shell_readers(readers, reader_error).await {
+                        self.remember_cleanup_error(&error);
+                    }
+                    if readers.is_empty() {
+                        self.one_shots
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&id);
+                    }
+                }
+            }
+        }
         let snapshot = {
-            let sessions = self.sessions.lock().await;
+            let sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             sessions
                 .iter()
                 .map(|(id, session)| (*id, session.clone()))
@@ -745,7 +1057,7 @@ impl UnifiedExecHandler {
         for (session_id, session) in snapshot {
             let mut guard = session.lock().await;
             let expired = guard.last_touched.elapsed() >= Duration::from_millis(SESSION_TTL_MS);
-            let status = guard.child.try_wait().ok().flatten();
+            let status = shell_parent_try_wait(&mut guard.child).ok().flatten();
             let finished = status.is_some();
             observe_shell_status(&mut guard.observation, status);
 
@@ -763,12 +1075,18 @@ impl UnifiedExecHandler {
                         );
                     }
                 }
-                to_remove.push(session_id);
+                drop(guard);
+                if self.close_session(session_id).await.is_ok() {
+                    to_remove.push(session_id);
+                }
             }
         }
 
         if !to_remove.is_empty() {
-            let mut sessions = self.sessions.lock().await;
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for session_id in to_remove {
                 sessions.remove(&session_id);
             }
@@ -881,6 +1199,7 @@ async fn run_one_shot(
     trace: &crate::events::ToolEventTrace,
     cancellation: tokio_util::sync::CancellationToken,
     configured_limits: OneShotOutputLimits,
+    owner: &UnifiedExecHandler,
 ) -> Result<OneShotCommandResult, ToolError> {
     let started_at = Instant::now();
     let process_plan = build_process_spawn_plan(
@@ -897,20 +1216,44 @@ async fn run_one_shot(
     let timeout_ms = process_plan.timeout_ms;
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
+    let child = spawn_shell_command(command).map_err(|error| {
         ToolError::execution_failed(format!("failed to spawn command: {error}"))
     })?;
-    let mut observation = pioneer_observability::resources::ChildRegistration::register(
+    let observation = pioneer_observability::resources::ChildRegistration::register(
         child.id(),
         pioneer_observability::resources::ChildRole::Shell,
         None,
     );
     let process_id = child.id();
+    let child_id = owner.next_session_id.fetch_add(1, Ordering::Relaxed);
+    let retained = Arc::new(Mutex::new(RetainedOneShot {
+        observation,
+        child,
+        readers: Vec::new(),
+        reader_error: None,
+        process_id,
+        _runtime_temp_dir: process_plan.runtime_temp_dir.clone(),
+    }));
+    owner
+        .one_shots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(child_id, retained.clone());
 
-    let stdout_reader = child.stdout.take().ok_or_else(|| {
+    let mut retained = retained.lock().await;
+    let RetainedOneShot {
+        observation,
+        child,
+        readers,
+        reader_error,
+        process_id: group_id,
+        ..
+    } = &mut *retained;
+
+    let stdout_reader = child.stdout().take().ok_or_else(|| {
         ToolError::internal("stdout pipe was unexpectedly unavailable".to_owned())
     })?;
-    let stderr_reader = child.stderr.take().ok_or_else(|| {
+    let stderr_reader = child.stderr().take().ok_or_else(|| {
         ToolError::internal("stderr pipe was unexpectedly unavailable".to_owned())
     })?;
 
@@ -922,20 +1265,40 @@ async fn run_one_shot(
     let reader_shutdown = tokio_util::sync::CancellationToken::new();
     let (chunk_tx, mut chunk_rx) =
         mpsc::channel::<ShellChunkEvent>(ONE_SHOT_CHUNK_CHANNEL_CAPACITY);
-    let stdout_task = tokio::spawn(read_stream_with_chunks(
-        stdout_reader,
-        "stdout",
-        chunk_tx.clone(),
-        output_budget.clone(),
-        reader_shutdown.child_token(),
-    ));
-    let stderr_task = tokio::spawn(read_stream_with_chunks(
-        stderr_reader,
-        "stderr",
-        chunk_tx,
-        output_budget,
-        reader_shutdown.child_token(),
-    ));
+    let stdout_shutdown = reader_shutdown.child_token();
+    let stderr_shutdown = reader_shutdown.child_token();
+    let stdout_budget = output_budget.clone();
+    let stdout_chunk_tx = chunk_tx.clone();
+    let (stdout_tx, stdout_result) = tokio::sync::oneshot::channel();
+    let stdout_task = tokio::spawn(async move {
+        let result = read_stream_with_chunks(
+            stdout_reader,
+            "stdout",
+            stdout_chunk_tx,
+            stdout_budget,
+            stdout_shutdown,
+        )
+        .await;
+        let _ = stdout_tx.send(result);
+    });
+    let (stderr_tx, stderr_result) = tokio::sync::oneshot::channel();
+    let stderr_task = tokio::spawn(async move {
+        let result = read_stream_with_chunks(
+            stderr_reader,
+            "stderr",
+            chunk_tx,
+            output_budget,
+            stderr_shutdown,
+        )
+        .await;
+        let _ = stderr_tx.send(result);
+    });
+    let stdout_abort = stdout_task.abort_handle();
+    let stderr_abort = stderr_task.abort_handle();
+    readers.push(stdout_task);
+    readers.push(stderr_task);
+    let stdout_task = stdout_abort;
+    let stderr_task = stderr_abort;
 
     let mut stdout_buf = String::new();
     let mut stderr_buf = String::new();
@@ -973,8 +1336,8 @@ async fn run_one_shot(
             _ = cancellation.cancelled() => {
                 cancelled = true;
                 if status_opt.is_none() {
-                    status_opt = Some(terminate_child_process(&mut child).await?);
-                    observe_shell_status(&mut observation, status_opt);
+                    status_opt = Some(terminate_child_process(child).await?);
+                    observe_shell_status(observation, status_opt);
                 } else {
                     kill_process_tree(process_id, true);
                 }
@@ -985,18 +1348,18 @@ async fn run_one_shot(
             }
             _ = &mut wait_deadline, if status_opt.is_none() => {
                 timed_out = true;
-                status_opt = Some(terminate_child_process(&mut child).await?);
-                observe_shell_status(&mut observation, status_opt);
+                status_opt = Some(terminate_child_process(child).await?);
+                    observe_shell_status(observation, status_opt);
                 pipe_drain_deadline.get_or_insert_with(|| {
                     TokioInstant::now() + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
                 });
             }
-            wait_result = child.wait(), if status_opt.is_none() => {
+            wait_result = shell_parent_wait(child), if status_opt.is_none() => {
                 let status = wait_result.map_err(|error| {
                     ToolError::execution_failed(format!("failed to wait for command: {error}"))
                 })?;
                 status_opt = Some(status);
-                observe_shell_status(&mut observation, status_opt);
+                observe_shell_status(observation, status_opt);
                 // A one-shot invocation owns its whole process group. Do not
                 // let a detached descendant retain stdout/stderr indefinitely
                 // after the direct child exits.
@@ -1099,11 +1462,11 @@ async fn run_one_shot(
         ));
     }
 
-    let stdout_summary = stdout_task
+    let stdout_summary = stdout_result
         .await
         .map_err(|error| ToolError::internal(format!("stdout task failed: {error}")))?
         .map_err(|error| ToolError::execution_failed(format!("failed to read stdout: {error}")))?;
-    let stderr_summary = stderr_task
+    let stderr_summary = stderr_result
         .await
         .map_err(|error| ToolError::internal(format!("stderr task failed: {error}")))?
         .map_err(|error| ToolError::execution_failed(format!("failed to read stderr: {error}")))?;
@@ -1113,6 +1476,24 @@ async fn run_one_shot(
     let status = status_opt.ok_or_else(|| {
         ToolError::execution_failed("command finished without exit status".to_owned())
     })?;
+
+    let group_result = confirm_shell_group(child, group_id).await;
+    let group_confirmed = group_result.is_ok();
+    if let Err(error) = group_result {
+        owner.remember_cleanup_error(&error);
+        #[cfg(unix)]
+        return Err(error);
+    }
+    drain_shell_readers(readers, reader_error).await?;
+    if group_confirmed {
+        owner
+            .one_shots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&child_id);
+    }
+    // On unsupported platforms return the actual command outcome below while
+    // keeping this unconfirmed group in the existing owner for strict stop.
 
     let output_stats = ExecOutputStats {
         stdout: ExecStreamOutputStats {
@@ -1487,8 +1868,11 @@ async fn terminate_child_process(child: &mut Child) -> Result<ExitStatus, ToolEr
         let _ = terminate_windows_process_tree(pid, false);
     }
 
-    let waited =
-        tokio::time::timeout(Duration::from_millis(PROCESS_KILL_GRACE_MS), child.wait()).await;
+    let waited = tokio::time::timeout(
+        Duration::from_millis(PROCESS_KILL_GRACE_MS),
+        shell_parent_wait(child),
+    )
+    .await;
     match waited {
         Ok(Ok(status)) => {
             // The parent can exit on SIGTERM while a descendant ignores it.
@@ -1502,12 +1886,86 @@ async fn terminate_child_process(child: &mut Child) -> Result<ExitStatus, ToolEr
         Err(_) => {
             kill_process_tree(process_id, true);
             let _ = child.start_kill();
-            child.wait().await.map_err(|error| {
+            shell_parent_wait(child).await.map_err(|error| {
                 ToolError::execution_failed(format!(
                     "failed to wait after SIGKILL termination: {error}"
                 ))
             })
         }
+    }
+}
+
+// None is published only after confirmed disappearance. Every spawned shell
+// captures its group leader before the first await and retains it across waits.
+async fn confirm_shell_group(child: &mut Child, group: &mut Option<u32>) -> Result<(), ToolError> {
+    let Some(pid) = *group else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    let _ = &child;
+    #[cfg(unix)]
+    {
+        let pgid = i32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| ToolError::internal("shell process group identity unavailable"))?;
+        let gone = || -> Result<bool, ToolError> {
+            if unsafe { libc::kill(-pgid, 0) } == 0 {
+                return Ok(false);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(true)
+            } else {
+                Err(ToolError::execution_failed(format!(
+                    "failed to observe shell group: {error}"
+                )))
+            }
+        };
+        if !gone()? {
+            if unsafe { libc::kill(-pgid, libc::SIGKILL) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(ToolError::execution_failed(format!(
+                        "failed to kill shell group: {error}"
+                    )));
+                }
+            }
+            let deadline = TokioInstant::now() + Duration::from_millis(PROCESS_KILL_GRACE_MS);
+            loop {
+                if gone()? {
+                    break;
+                }
+                if TokioInstant::now() >= deadline {
+                    return Err(ToolError::execution_failed(
+                        "shell group cleanup deadline exhausted",
+                    ));
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        }
+        *group = None;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        child.start_kill().map_err(|e| {
+            ToolError::execution_failed(format!("failed to terminate shell job: {e}"))
+        })?;
+        tokio::time::timeout(Duration::from_millis(PROCESS_KILL_GRACE_MS), child.wait())
+            .await
+            .map_err(|_| ToolError::execution_failed("shell job cleanup deadline exhausted"))?
+            .map_err(|e| ToolError::execution_failed(format!("failed to drain shell job: {e}")))?;
+        *group = None;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (child, pid);
+        Err(ToolError::execution_failed(
+            "shell group completion observation unavailable",
+        ))
     }
 }
 
@@ -1607,7 +2065,8 @@ fn spawn_retained_reader<R>(
     spool: Arc<Mutex<SessionSpool>>,
     stream: usize,
     shutdown: tokio_util::sync::CancellationToken,
-) where
+) -> tokio::task::JoinHandle<()>
+where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -1654,7 +2113,7 @@ fn spawn_retained_reader<R>(
             }
             buffer.append(&chunk[..read]);
         }
-    });
+    })
 }
 
 async fn drain_session_pipes(session: &Arc<Mutex<ExecSession>>) {
@@ -1855,6 +2314,315 @@ mod tests {
         TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
     };
 
+    // Real same-group descendant closes every inherited pipe. SIGSTOP keeps
+    // the parent wait pending long enough to cancel the first observer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_shell_stop_retains_closed_pipe_descendant_group() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "(exec </dev/null >/dev/null 2>/dev/null; exec sleep 60) & echo $! > descendant; kill -STOP $$; wait"])
+            .current_dir(root.path()).process_group(0).kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let pgid = child.id().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !root.path().join("descendant").exists() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut status = 0;
+                let observed = unsafe {
+                    libc::waitpid(pgid as i32, &mut status, libc::WNOHANG | libc::WUNTRACED)
+                };
+                if observed == pgid as i32 && libc::WIFSTOPPED(status) {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let descendant: i32 = std::fs::read_to_string(root.path().join("descendant"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::getpgid(descendant) }, pgid as i32);
+        let handler = UnifiedExecHandler::default();
+        let retained = Arc::new(Mutex::new(RetainedOneShot {
+            observation: pioneer_observability::resources::ChildRegistration::register(
+                Some(pgid),
+                pioneer_observability::resources::ChildRole::Shell,
+                None,
+            ),
+            child,
+            readers: Vec::new(),
+            reader_error: None,
+            process_id: Some(pgid),
+            _runtime_temp_dir: None,
+        }));
+        handler
+            .one_shots
+            .lock()
+            .unwrap()
+            .insert(1, retained.clone());
+        {
+            let mut observer = Box::pin(handler.stop_and_wait());
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(observer.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(!handler.cleanup_is_quiescent());
+        assert_eq!(retained.lock().await.process_id, Some(pgid));
+        // Resuming allows the pending TERM to reap the parent. Actual group
+        // disappearance, including orphan reaping by the OS, is independent.
+        unsafe {
+            libc::kill(pgid as i32, libc::SIGCONT);
+        }
+        let result = handler.stop_and_wait().await;
+        let gone = unsafe { libc::kill(-(pgid as i32), 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if result.is_ok() {
+            assert!(gone, "parent/empty readers cannot acknowledge a live group");
+            assert!(handler.cleanup_is_quiescent());
+            handler.stop_and_wait().await.unwrap();
+        } else {
+            assert!(!handler.cleanup_is_quiescent());
+            // A zombie can keep the group observable until the OS reaps it.
+            // A retry may drain it, but must preserve the consumed failure.
+            assert!(handler.stop_and_wait().await.is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_one_shot_dispatch_retains_child_and_async_cleanup_reaps_it() {
+        let handler = Arc::new(UnifiedExecHandler::default());
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let bus = ToolEventBus::new(8);
+        let mut durable = bus.take_durable_receiver().unwrap();
+        let trace = bus.start_trace("turn", "call", "exec_command");
+        let native = handler.clone();
+        let task = tokio::spawn(async move {
+            started.send(()).unwrap();
+            native
+                .handle(
+                    invocation(
+                        "exec_command",
+                        ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                            command: Some(vec![
+                                "sh".into(),
+                                "-c".into(),
+                                "printf ready; sleep 60".into(),
+                            ]),
+                            workdir: None,
+                            timeout_ms: Some(60_000),
+                            max_output_tokens: None,
+                            yield_time_ms: None,
+                            tty: Some(false),
+                        })),
+                    ),
+                    trace,
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        let _unacknowledged_output = tokio::time::timeout(Duration::from_secs(5), durable.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let child = handler
+            .one_shots
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        task.abort();
+        let cancellation = match task.await {
+            Err(error) => error,
+            Ok(_) => panic!("tool dispatch should be aborted"),
+        };
+        assert!(cancellation.is_cancelled());
+        assert_eq!(handler.one_shots.lock().unwrap().len(), 1);
+        handler.stop_and_wait().await.unwrap();
+        assert!(child.lock().await.child.try_wait().unwrap().is_some());
+        assert!(handler.one_shots.lock().unwrap().is_empty());
+        handler.stop_and_wait().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_completion_reaps_yielded_persistent_sessions() {
+        let handler = UnifiedExecHandler::default();
+        handler
+            .handle(
+                invocation(
+                    "exec_command",
+                    ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                        command: Some(vec!["sh".into(), "-c".into(), "sleep 60".into()]),
+                        workdir: None,
+                        timeout_ms: None,
+                        max_output_tokens: None,
+                        yield_time_ms: Some(1),
+                        tty: Some(true),
+                    })),
+                ),
+                trace("exec_command"),
+            )
+            .await
+            .unwrap();
+        let session = handler
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(session.lock().await.child.try_wait().unwrap().is_none());
+        handler.stop_and_wait().await.unwrap();
+        assert!(session.lock().await.child.try_wait().unwrap().is_some());
+        assert!(handler.sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_shell_reader_wait_preserves_handle_and_cached_panic_is_sticky() {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        // Cleanup aborts reader tasks; even a task not yet polled remains owned.
+        let mut readers = vec![tokio::spawn(async move {
+            let _ = released.await;
+        })];
+        let mut failure = None;
+        drain_shell_readers(&mut readers, &mut failure)
+            .await
+            .unwrap();
+        assert!(readers.is_empty());
+        let _ = release.send(());
+        let reader = tokio::spawn(async {
+            panic!("reader failure");
+        });
+        while !reader.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let other = tokio::spawn(std::future::pending::<()>());
+        let other_handle = other.abort_handle();
+        readers.push(other);
+        readers.push(reader);
+        assert!(
+            drain_shell_readers(&mut readers, &mut failure)
+                .await
+                .is_err()
+        );
+        assert!(readers.is_empty());
+        assert!(other_handle.is_finished());
+        // Even a previously cached error must not abandon newly retained readers.
+        let another = tokio::spawn(std::future::pending::<()>());
+        let another_handle = another.abort_handle();
+        readers.push(another);
+        assert!(
+            drain_shell_readers(&mut readers, &mut failure)
+                .await
+                .is_err()
+        );
+        assert!(readers.is_empty());
+        assert!(another_handle.is_finished());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_reader_drain_keeps_unconfirmed_join_for_retry() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (started, start) = tokio::sync::oneshot::channel();
+        // Abort cannot stop a running blocking reader; only its real join can
+        // acknowledge the ownership. No process is needed for this regression.
+        let reader = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = released.recv();
+        });
+        start.await.unwrap();
+        let mut readers = vec![reader];
+        let mut failure = None;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                drain_shell_readers(&mut readers, &mut failure)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(readers.len(), 1);
+        release.send(()).unwrap();
+        drain_shell_readers(&mut readers, &mut failure)
+            .await
+            .unwrap();
+        assert!(readers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reader_panic_does_not_abandon_other_readers_or_other_owned_processes() {
+        let handler = UnifiedExecHandler::default();
+        let mut children = Vec::new();
+        let mut reader_controls = Vec::new();
+        for id in 0..2 {
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args(["-c", "sleep 60"])
+                .process_group(0)
+                .kill_on_drop(true);
+            let child = command.spawn().unwrap();
+            let process_id = child.id();
+            let pending = tokio::spawn(std::future::pending::<()>());
+            reader_controls.push(pending.abort_handle());
+            let panicked = tokio::spawn(async {
+                panic!("retained reader failure");
+            });
+            while !panicked.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let retained = Arc::new(Mutex::new(RetainedOneShot {
+                observation: pioneer_observability::resources::ChildRegistration::register(
+                    process_id,
+                    pioneer_observability::resources::ChildRole::Shell,
+                    None,
+                ),
+                child,
+                readers: vec![pending, panicked],
+                reader_error: None,
+                process_id,
+                _runtime_temp_dir: None,
+            }));
+            handler
+                .one_shots
+                .lock()
+                .unwrap()
+                .insert(id, retained.clone());
+            children.push(retained);
+        }
+        assert!(handler.stop_and_wait().await.is_err());
+        assert!(handler.cleanup_is_quiescent());
+        for child in children {
+            let mut child = child.lock().await;
+            assert!(child.child.try_wait().unwrap().is_some());
+            assert!(child.readers.is_empty());
+        }
+        assert!(
+            reader_controls
+                .iter()
+                .all(tokio::task::AbortHandle::is_finished)
+        );
+        // Resolved ownership is released; the handler's failure outcome remains sticky.
+        assert!(handler.stop_and_wait().await.is_err());
+        assert!(handler.cleanup_is_quiescent());
+    }
+
     fn invocation(tool_name: &str, payload: ToolPayload) -> ToolInvocation {
         let workdir = std::env::current_dir().expect("cwd must be available");
         ToolInvocation {
@@ -2047,7 +2815,11 @@ mod tests {
                 "no positive storage ACK was received"
             );
             assert!(
-                handler.sessions.lock().await.is_empty(),
+                handler
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
                 "cancelled initial delivery must release its session owner"
             );
         }
@@ -2055,38 +2827,92 @@ mod tests {
 
     #[tokio::test]
     async fn exec_command_receives_invocation_environment() {
-        let handler = UnifiedExecHandler::default();
-        let mut tool_invocation = invocation(
-            "exec_command",
-            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
-                command: Some(vec![
-                    "sh".to_owned(),
-                    "-c".to_owned(),
-                    "printf %s \"$PIONEER_TEST_OUTPUT_DIR\"".to_owned(),
-                ]),
-                workdir: None,
-                timeout_ms: None,
-                max_output_tokens: None,
-                yield_time_ms: None,
-                tty: Some(false),
-            })),
-        );
-        tool_invocation.environment.insert(
-            "PIONEER_TEST_OUTPUT_DIR".to_owned(),
-            "/tmp/pioneer-output-test".to_owned(),
-        );
-
-        let output = handler
-            .handle(tool_invocation, trace("exec_command"))
-            .await
-            .expect("exec command should execute");
-
-        assert!(output.success(), "full access output should succeed");
-        assert!(
-            output.raw_text().contains("/tmp/pioneer-output-test"),
-            "expected invocation env in command output: {}",
-            output.raw_text()
-        );
+        // Exercise ordinary command completion for both supported Windows modes.
+        let modes: &[bool] = if cfg!(windows) {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        for &tty in modes {
+            let handler = UnifiedExecHandler::default();
+            #[cfg(windows)]
+            let command = vec![
+                "cmd.exe".into(),
+                "/D".into(),
+                "/C".into(),
+                "echo %PIONEER_TEST_OUTPUT_DIR%".into(),
+            ];
+            #[cfg(not(windows))]
+            let command = vec![
+                "sh".into(),
+                "-c".into(),
+                "printf %s \"$PIONEER_TEST_OUTPUT_DIR\"".into(),
+            ];
+            let mut tool_invocation = invocation(
+                "exec_command",
+                ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                    command: Some(command),
+                    workdir: None,
+                    timeout_ms: None,
+                    max_output_tokens: None,
+                    yield_time_ms: Some(1000),
+                    tty: Some(tty),
+                })),
+            );
+            tool_invocation.environment.insert(
+                "PIONEER_TEST_OUTPUT_DIR".to_owned(),
+                "/tmp/pioneer-output-test".to_owned(),
+            );
+            let mut output = handler
+                .handle(tool_invocation, trace("exec_command"))
+                .await
+                .expect("exec command should execute");
+            let mut text = output.raw_text();
+            if cfg!(windows) && tty {
+                let session_id = parse_session_id(&text);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while output.raw_json()["exit_code"].is_null() {
+                        output = handler
+                            .handle(
+                                invocation(
+                                    "write_stdin",
+                                    ToolPayload::LocalShell(LocalShellPayload::WriteStdin(
+                                        WriteStdinArgs {
+                                            session_id,
+                                            chars: None,
+                                            yield_time_ms: Some(10),
+                                            max_output_tokens: None,
+                                        },
+                                    )),
+                                ),
+                                trace("write_stdin"),
+                            )
+                            .await
+                            .unwrap();
+                        text.push_str(&output.raw_text());
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            assert!(output.success(), "full access output should succeed");
+            assert_eq!(output.raw_json()["exit_code"], 0);
+            assert!(
+                text.contains("/tmp/pioneer-output-test"),
+                "expected invocation env in command output: {text}"
+            );
+            #[cfg(windows)]
+            {
+                assert!(
+                    handler.cleanup_is_quiescent(),
+                    "normal stop releases the shell owner"
+                );
+                for _ in 0..2 {
+                    handler.stop_and_wait().await.unwrap();
+                    assert!(handler.cleanup_is_quiescent());
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2675,7 +3501,13 @@ mod tests {
             assert!(last["stdout"].as_str().unwrap().len() <= 200);
         }
         assert_eq!(last["exit_code"], 9);
-        assert!(handler.sessions.lock().await.is_empty());
+        assert!(
+            handler
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
         bus.close_durable_lane();
         let (stdout, stderr) = reader.await.unwrap();
         assert_eq!(stdout, "\0".repeat(700000));
@@ -2906,7 +3738,7 @@ mod tests {
             Err(error) => assert!(matches!(error, ToolError::Cancelled(_))),
         }
         assert!(
-            handler.sessions.lock().await.is_empty(),
+            handler.sessions.lock().unwrap().is_empty(),
             "cancelled tty command should not leave a live session"
         );
     }

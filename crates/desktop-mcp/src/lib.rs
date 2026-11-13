@@ -4,7 +4,6 @@ extern crate rust_i18n;
 rust_i18n::i18n!("locales", fallback = "en");
 mod actions;
 mod assets;
-mod binding;
 mod buttons;
 mod catalog;
 mod details;
@@ -76,3 +75,6 @@ mod boundary_tests {
         }
     }
 }
+
+mod card;
+pub(crate) use card::McpServerCard;

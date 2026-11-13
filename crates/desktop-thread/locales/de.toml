@@ -334,7 +334,17 @@
 "timeline.web_search.results_count" = "%{count} Ergebnisse"
 "timeline.web_search.running" = "Suche im Web"
 "timeline.work_group.completed" = "Gearbeitet"
+
+"chat.composer.add_menu.plugins" = "Plugins hinzufügen"
+"plugins.empty" = "Keine Plugins installiert"
+"plugins.error" = "Plugins konnten nicht geladen werden. Erneut versuchen."
+"plugins.loading" = "Plugins werden geladen…"
+"plugins.search" = "Plugins suchen"
+"plugins.select" = "Plugins auswählen"
+"plugins.unavailable" = "Nicht verfügbar"
 "chat.composer.preparing_send" = "Nachricht wird vorbereitet"
+"plugins.retry" = "Erneut versuchen"
+"plugins.stale" = "Die ausgewählte Version ist nicht mehr aktuell"
 
 "chat.composer.model.context_label" = "Kontextfenster"
 "chat.composer.model.context_auto" = "Automatisch — bis %{tokens} Token"

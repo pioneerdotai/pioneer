@@ -241,6 +241,7 @@ pub(super) async fn exercise(
         };
         let installed =
             ["pioneer-system-tasks", "selected"].map(|name| CliRuntimeSkillInstallResult {
+                plugin_id: None,
                 status: CliRuntimeSkillInstallStatus::Current,
                 install_name: name.into(),
                 source_folder_hash: format!("hash-{name}"),

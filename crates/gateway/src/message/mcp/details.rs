@@ -150,7 +150,7 @@ impl MessageProcessor {
                 server_id.as_str(),
             )
             .await;
-        let server =
+        let mut server =
             match list_item_from_record_with_catalog_and_runtime(&row, catalog.as_ref(), runtime) {
                 Ok(server) => server,
                 Err(error) => {
@@ -168,6 +168,25 @@ impl MessageProcessor {
                     return;
                 }
             };
+
+        server.plugin_owner = match self.crud_store.find_mcp_plugin_owner(&server_id).await {
+            Ok(owner) => owner.map(|owner| pioneer_protocol::PluginOwner {
+                plugin_id: owner.plugin_id,
+                member_key: owner.member_key,
+            }),
+            Err(_) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        "MCP ownership unavailable",
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
 
         // Members need the catalog to select and understand an MCP server.
         // Management audit and cross-turn binding history are not part of

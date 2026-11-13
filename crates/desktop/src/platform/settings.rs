@@ -100,7 +100,7 @@ impl pioneer_desktop_settings::SettingsAvatarPort for DesktopSettingsPlatform {
         let client = self.client.clone();
         cx.background_spawn(async move {
             let home = crate::state::runtime_home_dir().map_err(|_| AvatarCacheError::Offline)?;
-            let service = client.avatar_cache_service(home)?;
+            let service = client.image_cache_service(home)?;
             let runtime = tokio::runtime::Runtime::new().map_err(|_| AvatarCacheError::Offline)?;
             let _runtime_observer = pioneer_observability::runtime::register(
                 runtime.handle(),

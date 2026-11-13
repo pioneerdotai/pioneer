@@ -80,11 +80,13 @@ pub mod core;
 mod error;
 pub mod gateway;
 pub mod ids;
+pub mod images;
 mod local_file;
 pub mod mcp;
 pub mod navigation;
 pub mod notifications;
 pub mod platform;
+pub mod plugins;
 pub mod providers;
 pub mod request_state;
 pub mod rpc;
@@ -110,5 +112,7 @@ pub mod catalog_test_support;
 #[cfg(test)]
 pub(crate) static OBSERVABILITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Shared package delivery for Skills and Plugins.
+pub mod package_delivery;
 #[cfg(test)]
 mod scenario_test_support;
