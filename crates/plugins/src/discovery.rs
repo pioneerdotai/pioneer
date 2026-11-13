@@ -1,5 +1,5 @@
-use crate::{Boundary, Diagnostic, Entry, Manifest, PortableServer, Snapshot, parse_mcp};
-use pioneer_skills::contract::parse_skill_markdown_with_authored_fields;
+use crate::{Boundary, Diagnostic, Entry, Manifest, PackageMcpServer, Snapshot, load_mcp};
+use pioneer_skills::contract::parse_skill_markdown;
 use pioneer_skills::{SkillId, SkillMarkdownParseContext, SkillSourceKind};
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +13,7 @@ pub enum ComponentPlan {
     },
     Mcp {
         member_key: String,
-        server: PortableServer,
+        server: PackageMcpServer,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +70,7 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
                         "invalid_skill",
                         Boundary::Skill,
                         &file,
-                        "Skill must conform to Agent Skills and resolve within the package",
+                        "Skill could not be read through the native parser",
                     )),
                 }
             }
@@ -85,7 +85,7 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
     match crate::source::mcp(snapshot, &manifest, imported) {
         Ok(None) => {}
         Ok(Some(bytes)) => {
-            match parse_mcp(
+            match load_mcp(
                 &bytes,
                 snapshot.limits().components.saturating_sub(examined),
             ) {
@@ -93,7 +93,7 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedPluginPlan, Diagnostic> {
                     for (member_key, server) in servers {
                         match server {
                             Ok(server)
-                                if crate::portable_mcp::validate_snapshot_paths(
+                                if crate::package_mcp::validate_snapshot_paths(
                                     &server, snapshot,
                                 ) =>
                             {
@@ -153,7 +153,7 @@ pub(crate) fn valid_skill_at(text: &str, name: &str, member_path: &str) -> bool 
     let Ok(skill_id) = SkillId::new("000000000000000000000") else {
         return false;
     };
-    parse_skill_markdown_with_authored_fields(
+    parse_skill_markdown(
         text,
         SkillMarkdownParseContext {
             skill_id,
@@ -168,9 +168,5 @@ pub(crate) fn valid_skill_at(text: &str, name: &str, member_path: &str) -> bool 
             display_name_override: None,
         },
     )
-    .is_ok_and(|(skill, authored)| {
-        authored.name.as_deref() == Some(name)
-            && authored.description.is_some()
-            && skill.conformance.agentskills_strict.compliant
-    })
+    .is_ok()
 }

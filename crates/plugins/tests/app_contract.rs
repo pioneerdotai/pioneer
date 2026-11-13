@@ -218,12 +218,15 @@ fn selected_symlink_is_rejected_even_when_target_is_contained() {
 #[test]
 fn app_loader_supports_declared_component_combinations_and_rejects_invalid_artwork() {
     use pioneer_plugins::{ComponentPlan, app};
-    for (skills, mcp, local, count) in [
-        (false, false, false, 0),
-        (true, false, false, 1),
-        (false, true, false, 1),
-        (false, true, true, 1),
-        (true, true, true, 2),
+    for (skills, mcp, local, http_type, count) in [
+        (false, false, false, "", 0),
+        (true, false, false, "", 1),
+        (false, true, false, "", 1),
+        (false, true, false, "streamable-http", 1),
+        (false, true, false, "http", 1),
+        (true, true, false, "http", 2),
+        (false, true, true, "", 1),
+        (true, true, true, "", 2),
     ] {
         let root = tempfile::tempdir().unwrap();
         let mut value = manifest();
@@ -237,7 +240,7 @@ fn app_loader_supports_declared_component_combinations_and_rejects_invalid_artwo
             fs::create_dir_all(root.path().join("capabilities/one")).unwrap();
             fs::write(
                 root.path().join("capabilities/one/SKILL.md"),
-                "---\nname: one\ndescription: Inspect bundled data.\n---\nRead bundled data.\n",
+                "---\nname: Display title\nallowed-tools: [Read]\n---\nRead bundled data.\n",
             )
             .unwrap();
         }
@@ -253,12 +256,18 @@ fn app_loader_supports_declared_component_combinations_and_rejects_invalid_artwo
                 json!({"type":"stdio", "command":"./dist/mcp/server", "args":["${APP_ROOT}/dist/mcp/server"], "cwd":"${APP_ROOT}"})
             } else {
                 value["mcp"] = json!({"config": "./config/mcp.json"});
-                json!({"type":"streamable-http", "url":"https://example.test/mcp"})
+                let mut server = json!({"url":"https://example.test/mcp",
+                    "oauth":{"client_id":"registered"},"startup_timeout_sec":7});
+                if !http_type.is_empty() {
+                    server["type"] = http_type.into();
+                }
+                server
             };
             fs::create_dir(root.path().join("config")).unwrap();
             fs::write(
                 root.path().join("config/mcp.json"),
-                json!({"mcpServers":{"example":server}}).to_string(),
+                json!({"$schema":"native-schema-reference","mcpServers":{"example":server}})
+                    .to_string(),
             )
             .unwrap();
         }
@@ -267,6 +276,19 @@ fn app_loader_supports_declared_component_combinations_and_rejects_invalid_artwo
         let package = app::load(&snapshot).unwrap();
         assert!(package.diagnostics.is_empty(), "{:?}", package.diagnostics);
         assert_eq!(package.components.len(), count);
+        if mcp && !local {
+            assert!(
+                package
+                    .components
+                    .iter()
+                    .any(|component| matches!(component,
+                        ComponentPlan::Mcp { server, .. }
+                            if server.config()["url"] == "https://example.test/mcp"
+                                && server.config()["oauth"]["client_id"] == "registered"
+                                && server.config()["startup_timeout_sec"] == 7
+                    ))
+            );
+        }
         if skills {
             assert!(
                 package

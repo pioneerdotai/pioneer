@@ -1142,7 +1142,7 @@ impl MessageProcessor {
                     }
                 }
                 ComponentPlan::Mcp { server, .. } => {
-                    let plan = mcp::portable::portable_install_plan(
+                    let plan = mcp::package::package_install_plan(
                         server,
                         Path::new(&guard.parent.package_path),
                         Path::new(&guard.parent.data_path),

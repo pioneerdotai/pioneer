@@ -979,7 +979,9 @@ impl PackageClient<'_> {
                 PluginIntent::SetEnabled { expected_revision, .. }
                 | PluginIntent::Mutate { expected_revision, .. } => Some(*expected_revision),
                 PluginIntent::ApplyUpdate { upload_operation, .. } => self.skill_upload_snapshot(workspace, *upload_operation).and_then(|upload| match &upload.target {
-                    crate::package_delivery::operations::SkillUploadTarget::PluginUpdatePreview { plugin_id, expected_revision } if plugin_id == &key => Some(*expected_revision),
+                    crate::package_delivery::operations::SkillUploadTarget::PluginUpdatePreview { plugin_id, expected_revision }
+                    | crate::package_delivery::operations::SkillUploadTarget::AppUpdatePreview { app_id: plugin_id, expected_revision }
+                        if plugin_id == &key && upload.target.package_kind() == Some(self.kind) => Some(*expected_revision),
                     _ => None,
                 }),
                 _ => None,
@@ -994,11 +996,13 @@ impl PackageClient<'_> {
                 && match &intent {
                     PluginIntent::Install { upload_operation } => self.skill_upload_snapshot(workspace, *upload_operation).is_some_and(|upload| {
                         upload.mutation_uncertain && upload.plugin_preview.is_some()
-                            && matches!(&upload.target, crate::package_delivery::operations::SkillUploadTarget::PluginInstall | crate::package_delivery::operations::SkillUploadTarget::PluginPreview)
+                            && upload.target.package_kind() == Some(self.kind)
+                            && matches!(&upload.target, crate::package_delivery::operations::SkillUploadTarget::PluginInstall | crate::package_delivery::operations::SkillUploadTarget::PluginPreview | crate::package_delivery::operations::SkillUploadTarget::AppPreview)
                     }),
                     PluginIntent::ApplyUpdate { upload_operation, .. } => self.skill_upload_snapshot(workspace, *upload_operation).is_some_and(|upload| {
                         upload.mutation_uncertain && upload.plugin_update_preview.is_some()
-                            && matches!(&upload.target, crate::package_delivery::operations::SkillUploadTarget::PluginUpdatePreview { plugin_id, .. } if plugin_id == &key)
+                            && upload.target.package_kind() == Some(self.kind)
+                            && matches!(&upload.target, crate::package_delivery::operations::SkillUploadTarget::PluginUpdatePreview { plugin_id, .. } | crate::package_delivery::operations::SkillUploadTarget::AppUpdatePreview { app_id: plugin_id, .. } if plugin_id == &key)
                     }),
                     _ => false,
                 };
@@ -2350,7 +2354,14 @@ pub(crate) mod tests {
     }
     #[test]
     fn two_parent_surfaces_keep_their_details_and_outcomes_through_queued_settlement() {
-        let core = crate::catalog_test_support::client();
+        for kind in [PackageKind::Plugin, PackageKind::App] {
+            assert_two_parent_settlement_and_recovery(kind);
+        }
+    }
+
+    fn assert_two_parent_settlement_and_recovery(kind: PackageKind) {
+        let owner_core = crate::catalog_test_support::client();
+        let core = owner_core.packages(kind);
         let parent = |letter: char| PluginItem {
             id: letter.to_string().repeat(21),
             name: letter.to_string(),
@@ -2378,7 +2389,7 @@ pub(crate) mod tests {
         core.publish_plugins("workspace", &mut ready);
         let (sender, receiver) = mpsc::sync_channel(4);
         {
-            let mut owner = core.plugins_controller.lock().unwrap();
+            let mut owner = core.controller().lock().unwrap();
             owner.sender = Some(sender);
             owner.publications.insert("workspace".into(), ready);
         }
@@ -2407,7 +2418,7 @@ pub(crate) mod tests {
         // read locators, and leaves the queue empty. Shared/FFI uses this entry.
         let rejected_without_replacement = |intent| {
             let (before, reads, requests) = {
-                let owner = core.plugins_controller.lock().unwrap();
+                let owner = core.controller().lock().unwrap();
                 (
                     owner.publications["workspace"].clone(),
                     owner.recovery_reads.clone(),
@@ -2427,7 +2438,7 @@ pub(crate) mod tests {
                 receiver.try_recv(),
                 Err(mpsc::TryRecvError::Empty)
             ));
-            let owner = core.plugins_controller.lock().unwrap();
+            let owner = core.controller().lock().unwrap();
             assert_eq!(owner.publications["workspace"], before);
             assert_eq!(owner.recovery_reads, reads);
             assert_eq!(owner.requests, requests);
@@ -2485,7 +2496,7 @@ pub(crate) mod tests {
         // response has already been recorded before its follow-up list read.
         // Exercise that production reducer and the real scoped surface getters;
         // no transport/persistence outcome is claimed by this fixture.
-        let pending = core.plugins_controller.lock().unwrap().publications["workspace"].clone();
+        let pending = core.controller().lock().unwrap().publications["workspace"].clone();
         let retained = [a.id.clone(), b.id.clone()].into_iter().collect();
         let a_result = PluginsMutationResponse {
             plugin: Some(a.clone()),
@@ -2628,7 +2639,7 @@ pub(crate) mod tests {
         // Ordinary lost response: use the actual admitted operation, parent,
         // authority and available sender, then the worker's settlement reducer.
         {
-            let mut owner = core.plugins_controller.lock().unwrap();
+            let mut owner = core.controller().lock().unwrap();
             let publication = owner.publications.get_mut("workspace").unwrap();
             publication.settle_operation(
                 &first_work.key,
@@ -2699,14 +2710,14 @@ pub(crate) mod tests {
             );
             let work = receiver.try_recv().unwrap();
             assert!(matches!(work.intent, PluginIntent::Observe { .. }));
-            let cached_revision = core.plugins_controller.lock().unwrap().publications["workspace"]
+            let cached_revision = core.controller().lock().unwrap().publications["workspace"]
                 .plugins
                 .iter()
                 .find(|item| item.id == a.id)
                 .unwrap()
                 .revision;
             rejected_without_replacement(set_enabled(cached_revision));
-            let mut owner = core.plugins_controller.lock().unwrap();
+            let mut owner = core.controller().lock().unwrap();
             let publication = owner.publications.get_mut("workspace").unwrap();
             let result = match revision {
                 Some(revision) => {
@@ -2754,7 +2765,7 @@ pub(crate) mod tests {
         assert!(!core.plugin_parent_recovery_available("workspace", &b.id));
         rejected_without_replacement(set_enabled(7)); // Stale CAS.
         let read_identity = {
-            let mut owner = core.plugins_controller.lock().unwrap();
+            let mut owner = core.controller().lock().unwrap();
             let evidence = owner
                 .recovery_reads
                 .get_mut(&("workspace".into(), a.id.clone()))
@@ -2764,14 +2775,14 @@ pub(crate) mod tests {
             saved
         };
         rejected_without_replacement(set_enabled(8)); // Evidence for another operation generation.
-        core.plugins_controller
+        core.controller()
             .lock()
             .unwrap()
             .recovery_reads
             .insert(("workspace".into(), a.id.clone()), read_identity);
         // A later inventory revision cannot reuse an older recovery read.
         {
-            let mut owner = core.plugins_controller.lock().unwrap();
+            let mut owner = core.controller().lock().unwrap();
             owner
                 .publications
                 .get_mut("workspace")
@@ -2793,7 +2804,7 @@ pub(crate) mod tests {
         // otherwise eligible A recovery. No worker/transport timing is needed.
         let (bounded_sender, bounded_receiver) = mpsc::sync_channel(1);
         let previous_sender = core
-            .plugins_controller
+            .controller()
             .lock()
             .unwrap()
             .sender
@@ -2813,7 +2824,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(core.plugin_parent_recovery_available("workspace", &a.id));
-        let prior_generation = core.plugins_controller.lock().unwrap().requests
+        let prior_generation = core.controller().lock().unwrap().requests
             [&("workspace".into(), a.id.clone())]
             .latest_generation()
             .get();
@@ -2837,7 +2848,7 @@ pub(crate) mod tests {
             Err(mpsc::TryRecvError::Empty)
         ));
         {
-            let mut owner = core.plugins_controller.lock().unwrap();
+            let mut owner = core.controller().lock().unwrap();
             owner.sender = Some(previous_sender);
             let publication = owner.publications.get_mut("workspace").unwrap();
             publication.operations.get_mut(&b.id).unwrap().result = Some(PluginsMutationResponse {
@@ -2866,7 +2877,7 @@ pub(crate) mod tests {
         assert_eq!(recovery.generation, recovery_work.generation);
         assert!(!core.plugin_parent_recovery_available("workspace", &a.id));
         {
-            let mut owner = core.plugins_controller.lock().unwrap();
+            let mut owner = core.controller().lock().unwrap();
             let publication = owner.publications.get_mut("workspace").unwrap();
             publication.operations.get_mut(&a.id).unwrap().result = Some(PluginsMutationResponse {
                 plugin: Some(PluginItem {
@@ -2917,9 +2928,15 @@ pub(crate) mod tests {
             state: SkillUploadState::Succeeded,
             sent_bytes: 1,
             total_bytes: 1,
-            target: SkillUploadTarget::PluginUpdatePreview {
-                plugin_id: a.id.clone(),
-                expected_revision: 8,
+            target: match kind {
+                PackageKind::Plugin => SkillUploadTarget::PluginUpdatePreview {
+                    plugin_id: a.id.clone(),
+                    expected_revision: 8,
+                },
+                PackageKind::App => SkillUploadTarget::AppUpdatePreview {
+                    app_id: a.id.clone(),
+                    expected_revision: 8,
+                },
             },
             pack: false,
         };
@@ -2952,7 +2969,7 @@ pub(crate) mod tests {
         .unwrap();
         let update_work = receiver.try_recv().unwrap();
         {
-            let mut owner = core.plugins_controller.lock().unwrap();
+            let mut owner = core.controller().lock().unwrap();
             owner
                 .publications
                 .get_mut("workspace")

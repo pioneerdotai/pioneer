@@ -23,8 +23,8 @@ mod install;
 mod list;
 pub(in crate::message) use list::mcp_installation_is_disclosed;
 mod oauth;
+pub(crate) mod package;
 mod policy;
-pub(crate) mod portable;
 mod restart;
 mod uninstall;
 

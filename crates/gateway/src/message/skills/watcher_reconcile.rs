@@ -243,7 +243,8 @@ impl Discovery {
             };
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(_) => {
+                Err(error) => {
+                    super::report_reconciliation_error("discovery_read", &error.into());
                     self.failed = true;
                     continue;
                 }
@@ -293,7 +294,8 @@ impl Discovery {
                 }
                 Ok(())
             })();
-            if result.is_err() {
+            if let Err(error) = result {
+                super::report_reconciliation_error("discovery_entry", &error);
                 self.failed = true;
             }
         }
@@ -633,7 +635,7 @@ fn cleanup(attempts: Attempts, fence: JobFence) -> Work {
                     Ok(!check.try_exists()? || attempt_marker(&check)?.is_some_and(|marker| !marker.publishing || committed))
                 }).await;
                 yield Progress::Quantum;
-                let removable = match removable { Ok(removable) => removable, Err(_) => { yield Progress::Failed; continue; } };
+                let removable = match removable { Ok(removable) => removable, Err(error) => { super::report_reconciliation_error("cleanup_check", &error); yield Progress::Failed; continue; } };
                 if !removable { continue; }
                 fence.claim_path(&path, true);
                 #[cfg(test)] {
@@ -644,9 +646,13 @@ fn cleanup(attempts: Attempts, fence: JobFence) -> Work {
                 yield Progress::Quantum;
                 let garbage = path.clone();
                 let start = owned_fs(&fence.stop, move || Removal::new(garbage)).await;
-                let Ok(mut removal) = start else {
-                    yield Progress::Failed;
-                    continue;
+                let mut removal = match start {
+                    Ok(removal) => removal,
+                    Err(error) => {
+                        super::report_reconciliation_error("cleanup_start", &error);
+                        yield Progress::Failed;
+                        continue;
+                    }
                 };
                 loop {
                     fence.check()?;
@@ -664,7 +670,8 @@ fn cleanup(attempts: Attempts, fence: JobFence) -> Work {
                                 break;
                             }
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            super::report_reconciliation_error("cleanup_remove", &error);
                             yield Progress::Failed;
                             break;
                         }
@@ -693,10 +700,10 @@ fn resolved_attempts(attempts: Attempts, fence: JobFence, skill_id: SkillId) -> 
             let failed = owned_fs(&fence.stop, move || {
                 let mut failed = false;
                 for (path, artifact_owner) in paths {
-                    let marker = match attempt_marker(&path) { Ok(marker) => marker, Err(_) => { failed |= artifact_owner == owner; continue; } };
+                    let marker = match attempt_marker(&path) { Ok(marker) => marker, Err(error) => { if artifact_owner == owner { super::report_reconciliation_error("resolved_marker", &error); failed = true; } continue; } };
                     if marker.is_some_and(|marker| marker.skill_id.as_ref() == Some(&id) && marker.publishing) {
                         if let Some(attempt) = tracked.lock().expect("skills attempts lock").get_mut(&path) { attempt.committed = true; }
-                        if set_attempt_publishing(&path, false).is_err() { warn!("committed skill artifact outcome persistence deferred; cleanup uses acknowledged in-memory proof"); }
+                        if let Err(error) = set_attempt_publishing(&path, false) { super::report_reconciliation_error("resolved_marker_write", &error); }
                     }
                 }
                 Ok(failed)
@@ -727,7 +734,7 @@ fn has_pending_attempt(
                 let mut failed = false;
                 let mut found = None;
                 for (path, committed, artifact_owner) in paths {
-                    let marker = match attempt_marker(&path) { Ok(marker) => marker, Err(_) => { failed |= artifact_owner == owner; continue; } };
+                    let marker = match attempt_marker(&path) { Ok(marker) => marker, Err(error) => { if artifact_owner == owner { super::report_reconciliation_error("pending_marker", &error); failed = true; } continue; } };
                     if !committed && marker.is_some_and(|marker| marker.skill_id.as_ref() == Some(&id) && marker.publishing) { found = found.or(Some(path)); }
                 }
                 Ok((found, failed))
@@ -954,7 +961,14 @@ pub(super) fn root_job(
                                     yield progress;
                                 },
                                 Ok(None) => break,
-                                _ => {
+                                Ok(Some(Err(error))) => {
+                                    super::report_reconciliation_error("import", &error);
+                                    round_complete = false;
+                                    yield Progress::Failed;
+                                    break;
+                                }
+                                Err(_) => {
+                                    warn!(phase = "import", cause = "panic", "skills reconciliation step failed; retry retained");
                                     round_complete = false;
                                     yield Progress::Failed;
                                     break;
@@ -1009,7 +1023,15 @@ pub(super) fn root_job(
                                         yield progress;
                                     },
                                     Ok(None) => break,
-                                    _ => {
+                                    Ok(Some(Err(error))) => {
+                                        super::report_reconciliation_error("managed", &error);
+                                        complete = false;
+                                        round_complete = false;
+                                        yield Progress::Failed;
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        warn!(phase = "managed", cause = "panic", "skills reconciliation step failed; retry retained");
                                         complete = false;
                                         yield Progress::Failed;
                                         break;
@@ -1351,9 +1373,9 @@ fn import_job(
                 let mut failed = false;
                 for (path, committed) in page {
                     if path.parent() != Some(expected_parent.as_path()) { continue; }
-                    let exists = match path.try_exists() { Ok(exists) => exists, Err(_) => { failed = true; continue; } };
+                    let exists = match path.try_exists() { Ok(exists) => exists, Err(error) => { super::report_reconciliation_error("staging_exists", &error.into()); failed = true; continue; } };
                     if !exists { continue; }
-                    let marker = match attempt_marker(&path) { Ok(marker) => marker, Err(_) => { failed = true; continue; } };
+                    let marker = match attempt_marker(&path) { Ok(marker) => marker, Err(error) => { super::report_reconciliation_error("staging_marker", &error); failed = true; continue; } };
                     blocked |= committed || marker.is_none_or(|marker| !marker.publishing);
                 }
                 Ok((blocked, failed))
@@ -1567,11 +1589,11 @@ fn managed_job(
             match result {
                 Ok(Some(prepared)) => break prepared,
                 Ok(None) => {}
-                Err(_) => {
+                Err(error) => {
                     if changed_availability(&baseline, &row, None) {
                         yield Progress::Changed(root.scope_key.clone());
                     }
-                    Err::<(), anyhow::Error>(anyhow::anyhow!(
+                    Err::<(), anyhow::Error>(error.context(
                         "managed skill validation failed; retry retained"
                     ))?;
                 }

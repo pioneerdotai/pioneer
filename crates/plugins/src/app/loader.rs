@@ -1,9 +1,9 @@
 //! App-only preparation over shared component primitives. No vendor discovery.
-use super::{AppManifest, ManifestError, SelectionPlan, json, manifest::path};
-use crate::portable_mcp::{PackageRootKind, parse_server_for, validate_snapshot_paths_for};
+use super::{AppManifest, ManifestError, SelectionPlan, manifest::path};
+use crate::package_mcp::{PackageRootKind, load_mcp, validate_snapshot_paths_for};
 use crate::{Boundary, ComponentPlan, Diagnostic, Entry, Snapshot};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct LoadedAppPackage {
@@ -83,7 +83,7 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedAppPackage, ManifestError> {
                     "invalid_skill",
                     Boundary::Skill,
                     &skill_file,
-                    "Declared Skill does not conform to Agent Skills",
+                    "Declared Skill could not be read through the native parser",
                 ));
             }
         }
@@ -97,40 +97,20 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedAppPackage, ManifestError> {
         let bytes = snapshot
             .file(&config)
             .ok_or_else(|| ManifestError::new("missing_mcp_config", "app.json/mcp/config"))?;
-        let value = json::parse(bytes, &config)?;
-        let map = value
-            .as_object()
-            .ok_or_else(|| ManifestError::new("invalid_type", &config))?;
-        for key in map.keys() {
-            if key != "mcpServers" {
-                return Err(ManifestError::new(
-                    "unknown_field",
-                    &format!("{config}/{key}"),
-                ));
-            }
-        }
-        let servers = map
-            .get("mcpServers")
-            .and_then(Value::as_object)
-            .ok_or_else(|| ManifestError::new("invalid_mcp_config", &config))?;
-        if servers.len() > limit.saturating_sub(examined) {
-            return Err(ManifestError::new("component_limit", &config));
-        }
-        let mut names = BTreeSet::new();
+        let servers = load_mcp(bytes, limit.saturating_sub(examined)).map_err(|d| {
+            let code = if d.code == "component_limit" {
+                "component_limit"
+            } else {
+                "invalid_mcp_document"
+            };
+            ManifestError::new(code, &config)
+        })?;
         for (name, server) in servers {
             let field = format!(
                 "{config}/mcpServers/{}",
                 name.replace('~', "~0").replace('/', "~1")
             );
-            // Native MCP's current workspace name conflict remains explicit at install.
-            let valid_name = (1..=64).contains(&name.len())
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
-            if !valid_name || !names.insert(name) {
-                return Err(ManifestError::new("invalid_mcp_name", &field));
-            }
-            match parse_server_for(name, server, PackageRootKind::App) {
+            match server {
                 Ok(server)
                     if validate_snapshot_paths_for(&server, snapshot, PackageRootKind::App) =>
                 {

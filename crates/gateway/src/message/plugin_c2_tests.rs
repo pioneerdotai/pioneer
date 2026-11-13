@@ -1001,6 +1001,7 @@ async fn install_rpc_app(
     root: &std::path::Path,
     slug: &str,
     decorated_paths: bool,
+    strict_skill: bool,
 ) -> pioneer_protocol::AppItem {
     let package = root.join(slug);
     std::fs::create_dir_all(package.join("assets")).unwrap();
@@ -1028,7 +1029,8 @@ async fn install_rpc_app(
         json!({
             "slug":slug,"name":format!("App {slug}"),"version":"1.2.3",
             "shortDescription":"Saved description","developer":{"name":"Author","logo":icons},
-            "icon":icons,"skills":"./skills/","locales":{"en":"en.json"},"defaultLocale":"en"
+            "icon":icons,"skills":"./skills/","mcp":{"config":"./mcp.json"},
+            "locales":{"en":"en.json"},"defaultLocale":"en"
         })
         .to_string(),
     )
@@ -1040,9 +1042,23 @@ async fn install_rpc_app(
     .unwrap();
     std::fs::write(
         package.join("skills").join(slug).join("SKILL.md"),
-        format!(
-            "---\nname: {slug}\ndescription: App regression skill\n---\nUse this installed skill.\n"
-        ),
+        if strict_skill {
+            format!("---\nname: {slug}\ndescription: App regression skill\n---\nUse this installed skill.\n")
+        } else {
+            // Native installation accepts this OpenClaw-compatible definition;
+            // the unchanged default strict execution policy keeps it hidden.
+            "---\nname: Display title\nallowed-tools: [Read]\n---\nUse this installed skill.\n".to_owned()
+        },
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("mcp.json"),
+        json!({"$schema":"native-config-reference","mcpServers":{
+            format!("mcp-{slug}"):{"command":"must-not-start-disabled-fixture",
+                "env":{"TOKEN":"bundled-canary"},"disabled":true,
+                "startup_timeout_sec":5,"tool_timeout_sec":9}
+        }})
+        .to_string(),
     )
     .unwrap();
     let upload = create_finalized_archive_upload_with_purpose(
@@ -1076,7 +1092,7 @@ async fn install_rpc_app(
         .await,
     )
     .unwrap();
-    assert_eq!(preview.components.len(), 1);
+    assert_eq!(preview.components.len(), 2);
     assert!(preview.diagnostics.is_empty());
     let installed_wire = app_rpc(
         harness,
@@ -1130,7 +1146,56 @@ async fn install_rpc_app(
         serde_json::from_str(stored.app_manifest_json.as_deref().unwrap()).unwrap();
     assert_eq!(manifest["name"], format!("App {slug}"));
     assert_eq!(stored.package_fingerprint, preview.fingerprint);
-    let skill = installed.components[0].skill_id.as_ref().unwrap();
+    let skill = installed
+        .components
+        .iter()
+        .find_map(|c| c.skill_id.as_ref())
+        .unwrap();
+    let mcp = installed
+        .components
+        .iter()
+        .find(|c| c.kind == "mcp")
+        .unwrap();
+    let row = harness
+        .crud_store
+        .find_mcp_server_installation("workspace", &workspace, &mcp.member_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.id.as_ref(), mcp.mcp_installation_id.as_ref());
+    assert!(!row.enabled);
+    let native = crate::mcp_service::installation_from_record(&row).unwrap();
+    assert!(!native.required);
+    let pioneer_mcp::McpTransportConfig::Stdio {
+        env,
+        startup_timeout_ms,
+        tool_timeout_ms,
+        ..
+    } = &native.transport
+    else {
+        panic!("expected native stdio");
+    };
+    assert_eq!((*startup_timeout_ms, *tool_timeout_ms), (5000, 9000));
+    let pioneer_mcp::McpConfigValue::SecretRef { ref_id } = &env["TOKEN"] else {
+        panic!("expected native secret ref");
+    };
+    assert_eq!(
+        harness
+            .processor
+            .gateway_secrets
+            .get_mcp_secret(ref_id)
+            .unwrap()
+            .as_deref(),
+        Some("bundled-canary")
+    );
+    let mcp_owner = harness
+        .crud_store
+        .native_package_owner("mcp", row.id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(mcp_owner.kind, pioneer_protocol::PackageKind::App);
+    assert_eq!(mcp_owner.package_id, installed.id);
     let owner = harness
         .crud_store
         .native_package_owner("skill", skill.as_str())
@@ -1153,11 +1218,14 @@ async fn install_rpc_app(
     assert!(
         matches!(&normalized.presentation[0].kind, TurnCapabilityKind::App {app_id,expected_revision:1} if app_id==&installed.id)
     );
-    assert!(
+    assert_eq!(
         normalized.execution.iter().any(
             |cap| matches!(&cap.kind,TurnCapabilityKind::Skill{skill_id,..} if skill_id==skill)
-        )
+        ),
+        strict_skill
     );
+    assert!(!normalized.execution.iter().any(|cap| matches!(&cap.kind,
+        TurnCapabilityKind::McpServer { name, .. } if name == &mcp.member_key)));
     let frozen = normalized.plugin_selection.unwrap();
     assert_eq!(frozen.parents[0].kind, pioneer_protocol::PackageKind::App);
     assert_eq!(frozen.parents[0].revision, 1);
@@ -1176,8 +1244,8 @@ async fn app_rpc_install_read_selection_and_damaged_inventory_removal() {
     let root = unique_temp_dir("app-rpc-correction");
     // One scenario owns the real install contract and path→themed presentation
     // regression. No direct insertion of parent rows or fabricated fingerprints.
-    let a = install_rpc_app(&mut harness, &root, "rpc-app-a", false).await;
-    let b = install_rpc_app(&mut harness, &root, "rpc-app-b", true).await;
+    let a = install_rpc_app(&mut harness, &root, "rpc-app-a", false, true).await;
+    let b = install_rpc_app(&mut harness, &root, "rpc-app-b", true, false).await;
     let workspace = harness.workspace_id.clone();
     let list: pioneer_protocol::AppsListResponse = serde_json::from_value(
         app_rpc(
@@ -1294,5 +1362,175 @@ async fn app_rpc_install_read_selection_and_damaged_inventory_removal() {
     )
     .unwrap();
     assert_eq!(list.apps, vec![b]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// NOT_RUN / NOT_COMPILED. Native edits and package updates share real secret storage.
+#[tokio::test]
+async fn app_update_preserves_native_mcp_secret_override() {
+    let mut harness = setup_cli_runtime_security_harness(None).await;
+    let root = unique_temp_dir("app-native-mcp-override");
+    let slug = "native-mcp-override";
+    let app = install_rpc_app(&mut harness, &root, slug, false, true).await;
+    let workspace = harness.workspace_id.clone();
+    let member = app.components.iter().find(|c| c.kind == "mcp").unwrap();
+    let row = harness
+        .crud_store
+        .find_mcp_server_installation("workspace", &workspace, &member.member_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let installed = crate::mcp_service::installation_from_record(&row).unwrap();
+    let pioneer_mcp::McpTransportConfig::Stdio { env, .. } = &installed.transport else {
+        panic!("expected stdio");
+    };
+    let pioneer_mcp::McpConfigValue::SecretRef {
+        ref_id: bundled_ref,
+    } = &env["TOKEN"]
+    else {
+        panic!("expected secret ref");
+    };
+    let edited: pioneer_protocol::McpInstallResponse = serde_json::from_value(app_rpc(
+        &mut harness,methods::MCP_INSTALL,json!({"workspace_id":workspace,
+            "config_json":json!({"mcpServers":{(member.member_key.clone()):{
+                "command":"must-not-start-disabled-fixture","disabled":true,"env":{"TOKEN":"native-user-canary"}
+            }}}).to_string()})).await).unwrap();
+    assert_eq!(edited.servers.len(), 1);
+    assert!(matches!(
+        edited.servers[0].status,
+        pioneer_protocol::McpInstallResultStatus::Updated
+    ));
+    let overridden = harness
+        .crud_store
+        .find_mcp_server_installation("workspace", &workspace, &member.member_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let native = crate::mcp_service::installation_from_record(&overridden).unwrap();
+    let pioneer_mcp::McpTransportConfig::Stdio { env, .. } = &native.transport else {
+        panic!("expected stdio");
+    };
+    let pioneer_mcp::McpConfigValue::SecretRef { ref_id: user_ref } = &env["TOKEN"] else {
+        panic!("expected secret ref");
+    };
+    assert_ne!(user_ref, bundled_ref);
+    assert_eq!(
+        harness
+            .processor
+            .gateway_secrets
+            .get_mcp_secret(user_ref)
+            .unwrap()
+            .as_deref(),
+        Some("native-user-canary")
+    );
+    assert!(
+        harness
+            .processor
+            .gateway_secrets
+            .get_mcp_secret(bundled_ref)
+            .unwrap()
+            .is_none()
+    );
+    let current: pioneer_protocol::AppItem = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_DETAILS,
+            json!({"workspace_id":workspace,"app_id":app.id}),
+        )
+        .await,
+    )
+    .unwrap();
+    let config_path = root.join(slug).join("mcp.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["mcpServers"][&member.member_key]["env"]["TOKEN"] = json!("new-package-canary");
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    // Updating an owned Skill uses native admission too, without the former
+    // package-only strict conformance gate. Runtime policy is unchanged.
+    std::fs::write(
+        root.join(slug).join("skills").join(slug).join("SKILL.md"),
+        "---\nname: Updated title\nallowed-tools: [Read]\n---\nUse updated native skill.\n",
+    )
+    .unwrap();
+    let upload = create_finalized_archive_upload_with_purpose(
+        &harness.processor,
+        &mut harness.rx,
+        harness.connection_id,
+        &workspace,
+        build_test_directory_archive(&root.join(slug)),
+        "update.tar.gz".into(),
+        "native-mcp-update",
+        pioneer_protocol::SkillUploadPurpose::App,
+    )
+    .await;
+    let preview: pioneer_protocol::AppsUpdatePreviewResponse = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_PREVIEW,
+            json!({"workspace_id":workspace,"upload_id":upload,
+            "target":{"app_id":app.id,"expected_revision":current.revision}}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert!(
+        preview
+            .authorization_changes
+            .iter()
+            .any(|c| c.kind == "mcp" && c.member_key == member.member_key)
+    );
+    let updated: pioneer_protocol::AppsMutationResponse = serde_json::from_value(app_rpc(&mut harness,
+        methods::APPS_UPDATE,json!({"workspace_id":workspace,"app_id":app.id,"expected_revision":current.revision,
+            "upload_id":upload,"expected_fingerprint":preview.package.fingerprint,"confirm_changes":true})).await).unwrap();
+    let updated = updated.app.unwrap();
+    assert_eq!(updated.state, "installed");
+    assert_eq!(updated.status, "installed");
+    let updated_skill_id = updated
+        .components
+        .iter()
+        .find_map(|component| component.skill_id.as_ref())
+        .unwrap();
+    let updated_skill = harness
+        .crud_store
+        .find_skill_installation(updated_skill_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&updated_skill.install_path).join("SKILL.md"))
+            .unwrap(),
+        "---\nname: Updated title\nallowed-tools: [Read]\n---\nUse updated native skill.\n"
+    );
+    let final_row = harness
+        .crud_store
+        .find_mcp_server_installation("workspace", &workspace, &member.member_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_row.id, overridden.id);
+    assert_eq!(final_row.transport_json, overridden.transport_json);
+    assert_eq!(final_row.auth_json, overridden.auth_json);
+    assert_eq!(final_row.secret_refs_json, overridden.secret_refs_json);
+    assert_eq!(
+        harness
+            .processor
+            .gateway_secrets
+            .get_mcp_secret(user_ref)
+            .unwrap()
+            .as_deref(),
+        Some("native-user-canary")
+    );
+    assert!(
+        harness
+            .processor
+            .gateway_secrets
+            .get_mcp_secret(bundled_ref)
+            .unwrap()
+            .is_none(),
+        "unused package credentials must not be materialized after native override"
+    );
+    let removed:pioneer_protocol::AppsMutationResponse=serde_json::from_value(app_rpc(&mut harness,methods::APPS_REMOVE,
+        json!({"workspace_id":workspace,"app_id":updated.id,"expected_revision":updated.revision,"purge_data":true})).await).unwrap();
+    assert!(removed.removed);
     std::fs::remove_dir_all(root).unwrap();
 }

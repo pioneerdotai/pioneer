@@ -11042,9 +11042,9 @@ version = "0.72.0"
 dependencies = [
  "anyhow",
  "hex",
- "http",
  "image",
  "libc",
+ "pioneer-mcp",
  "pioneer-protocol",
  "pioneer-skills",
  "semver",

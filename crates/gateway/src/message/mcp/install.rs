@@ -137,8 +137,8 @@ impl MessageProcessor {
         Ok(response)
     }
 
-    /// The genuine native installer, shared by the legacy parser and portable
-    /// package adapter. Ownership is committed with the native row and audit.
+    /// The native installer, shared by standalone and packaged MCP configs.
+    /// Ownership is committed with the native row and audit.
     async fn install_mcp_plan_deferred(
         &self,
         request_context: &RequestContext,
@@ -490,6 +490,13 @@ impl MessageProcessor {
                         }
                     }
                 }
+            }
+            if ownership.is_some() {
+                // A package update can retain native auth/transport overrides.
+                // Materialize only refs still used after applying those masks.
+                let retained_refs = mcp_secret_ref_ids(&installation.secret_refs);
+                item.secrets
+                    .retain(|secret| retained_refs.contains(&secret.ref_id));
             }
             if let Some(change) = native.as_deref_mut() {
                 // Legacy parsing is unchanged. Only an owned edit allocates fresh

@@ -12,6 +12,18 @@ use pioneer_plugins::*;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs};
 
+fn server(config: Value) -> PackageMcpServer {
+    load_mcp(
+        &serde_json::to_vec(&json!({"mcpServers":{"server":config}})).unwrap(),
+        1,
+    )
+    .unwrap()
+    .pop()
+    .unwrap()
+    .1
+    .unwrap()
+}
+
 const SKILL: &str =
     "---\nname: good\ndescription: Inspect bundled data.\n---\nRead assets/data.json.\n";
 
@@ -65,8 +77,9 @@ fn zenmoney_host_manifests_import_both_skill_and_http_connector() {
         if member_key == "financial-brief" && member_path == "skills/financial-brief"
     )));
     assert!(plan.components.iter().any(|component| matches!(component,
-        ComponentPlan::Mcp { member_key, server: PortableServer::StreamableHttp { url, headers } }
-        if member_key == "zenmoney" && url == "https://api.zenmoney.app/mcp" && headers.is_empty()
+        ComponentPlan::Mcp { member_key, server }
+        if member_key == "zenmoney" && server.config()["url"] == "https://api.zenmoney.app/mcp"
+            && server.config().get("headers").is_none()
     )));
 }
 
@@ -164,39 +177,23 @@ fn manifest_priority_is_deterministic_and_selected_errors_do_not_fall_back() {
 }
 
 #[test]
-fn bundled_skills_require_authored_fields_with_native_frontmatter_parsing() {
-    for fields in [
-        "description: Inspect data.",
-        "name: good",
-        "name: ''\ndescription: Inspect data.",
-        "name: good\ndescription: ' '",
-        "name: 123\ndescription: Inspect data.",
-        "name: good\ndescription: 123",
-        "name: ' good '\ndescription: Inspect data.",
-        "name: other\ndescription: Inspect data.",
-        "name: good\ndescription: Inspect data.\nallowed-tools: [Read]",
-    ] {
-        let markdown = format!("---\n{fields}\n---\nRead bundled data.");
-        let plan = load(&package(manifest(), &[("skills/good/SKILL.md", &markdown)])).unwrap();
-        assert!(plan.components.is_empty(), "{fields}");
-        assert!(
-            plan.diagnostics
-                .iter()
-                .any(|d| { d.code == "invalid_skill" && d.pointer == "skills/good/SKILL.md" })
-        );
-    }
+fn bundled_skills_use_native_fallbacks_and_accept_non_strict_metadata() {
     for markdown in [
+        "Read bundled data.".to_owned(),
+        "---\nname: good\n---\nRead bundled data.".to_owned(),
+        "---\ndescription: Inspect data.\n---\nRead bundled data.".to_owned(),
+        "---\nname: Display title\ndescription: Inspect data.\nallowed-tools: [Read]\n---\nRead bundled data.".to_owned(),
         SKILL.to_owned(),
         SKILL.replace('\n', "\r\n"),
         format!("\u{feff}{SKILL}"),
-        "---\nname: good\ndescription: |\n  Inspect data.\n  Keep context.\n---\nRead assets.\n"
-            .into(),
+        "---\nname: good\ndescription: |\n  Inspect data.\n  Keep context.\n---\nRead assets.".to_owned(),
     ] {
         let plan = load(&package(manifest(), &[("skills/good/SKILL.md", &markdown)])).unwrap();
         assert_eq!(plan.components.len(), 1, "{markdown}");
         assert!(plan.diagnostics.is_empty(), "{:?}", plan.diagnostics);
     }
 }
+
 fn manifest() -> Value {
     json!({"$schema":PLUGIN_SCHEMA,"name":"fixture.tools"})
 }
@@ -273,7 +270,7 @@ fn unknown_manifest_fields_and_foreign_extension_values_are_ignored() {
 #[test]
 fn empty_skills_only_mcp_only_mixed_and_partial_packages_are_valid() {
     let mcp = serde_json::to_string(&json!({"$schema":MCP_SCHEMA,"mcpServers":{
-        "good":{"type":"stdio","command":"node"}, "bad":{"type":"stdio","url":"https://example.org"}}})).unwrap();
+        "good":{"type":"stdio","command":"node"}, "bad":{"command":"node","url":"https://example.org"}}})).unwrap();
     for (files, count) in [
         (vec![], 0),
         (vec![("skills/good/SKILL.md", SKILL)], 1),
@@ -305,7 +302,7 @@ fn discovery_is_fixed_nonrecursive_and_invalid_skill_does_not_disable_siblings()
         manifest(),
         &[
             ("skills/good/SKILL.md", SKILL),
-            ("skills/bad/SKILL.md", SKILL),
+            ("skills/bad/SKILL.md", "---\nname: bad\n---\n"),
             ("skills/nested/deep/SKILL.md", SKILL),
             ("skills/lower/skill.md", SKILL),
             ("elsewhere/SKILL.md", SKILL),
@@ -316,61 +313,64 @@ fn discovery_is_fixed_nonrecursive_and_invalid_skill_does_not_disable_siblings()
     assert_eq!(plan.diagnostics.len(), 1);
 }
 #[test]
-fn mcp_versions_envelope_closed_variants_and_sse_have_narrow_failures() {
-    for document in [
-        json!({"$schema":"wrong","mcpServers":{}}),
-        json!({"$schema":MCP_SCHEMA,"mcpServers":{},"extra":true}),
-    ] {
-        assert_eq!(
-            parse_mcp(&serde_json::to_vec(&document).unwrap(), 256)
-                .unwrap_err()
-                .boundary,
-            Boundary::Mcp
-        );
-    }
+fn package_mcp_keeps_the_native_config_contract() {
+    let context = || pioneer_mcp::InstallParseContext {
+        scope_kind: pioneer_mcp::McpScopeKind::Workspace,
+        scope_key: "package-preview".into(),
+        default_enabled: true,
+        default_allow_implicit_invocation: false,
+    };
+    // The native installer is the independent compatibility reference, including
+    // its existing treatment of transport tags and additional configuration fields.
     for config in [
-        json!({"type":"stdio","command":"/absolute"}),
-        json!({"type":"stdio","command":"bash -c"}),
-        json!({"type":"stdio","command":"${PLUGIN_ROOT}/bin"}),
-        json!({"type":"stdio","command":"node","cwd":"unrooted"}),
-        json!({"type":"stdio","command":"node","cwd":null}),
-        json!({"type":"stdio","command":"node","env":{"PLUGIN_DATA":"override"}}),
-        json!({"type":"streamable-http","url":"http://example.org"}),
-        json!({"type":"streamable-http","url":"https://@example.org"}),
-        json!({"type":"streamable-http","url":"https://example.org/#fragment"}),
-        json!({"type":"streamable-http","url":"https://example.org","headers":{"X-Name":"a","x-name":"b"}}),
-        json!({"type":"stdio","command":"node","url":"https://example.org"}),
-        json!({"type":"sse","url":"https://example.org"}),
+        json!({"command":"node","args":["server.js"]}),
+        json!({"command":"/usr/bin/python3","cwd":"/tmp","env":{"TOKEN":"canary"}}),
+        json!({"url":"http://example.org/mcp"}),
+        json!({"type":"http","url":"https://example.org/mcp"}),
+        json!({"type":"streamable-http","url":"https://example.org/mcp"}),
+        json!({"url":"https://example.org/mcp","oauth":{"client_id":"client","client_secret":"oauth-canary","scopes":["read"]},"headers":{"X-Key":"header-canary"},"enabled":false,"allow_implicit_invocation":true,"required":true,"startup_timeout_sec":7,"tool_timeout_sec":19}),
+        json!({"command":"node","disabled":true,"timeout":3}),
+        json!({"command":"node","cwd":null}),
+        json!({"command":"node","url":"https://example.org"}),
+        json!({"url":"https://user:password@example.org/mcp"}),
+        json!({"url":"https://example.org/mcp?token=canary"}),
+        json!({"url":"https://example.org/mcp#fragment"}),
+        json!({"url":"https://example.org/mcp","headers":{"X-Key":false}}),
+        json!({"command":"node","args":[false]}),
     ] {
-        let entries = parse_mcp(
-            &serde_json::to_vec(&json!({"$schema":MCP_SCHEMA,"mcpServers":{"invalid":config,
-            "valid":{"type":"streamable-http","url":"https://example.org/mcp?query=allowed"}}}))
-            .unwrap(),
-            256,
-        )
-        .unwrap();
+        let document = json!({"mcpServers":{"example":config}}).to_string();
+        let reference = pioneer_mcp::parse_install_config(&document, context()).unwrap();
+        let loaded = load_mcp(document.as_bytes(), 1).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1.is_ok(), reference.items[0].is_valid());
+        if let Ok(server) = &loaded[0].1 {
+            assert_eq!(server.config(), &config);
+            assert!(!format!("{server:?}").contains("canary"));
+        }
+    }
+    // Native envelope metadata does not select an alternative package parser.
+    for document in [
+        json!({"mcpServers":{}}),
+        json!({"$schema":"native-schema-reference","mcpServers":{},"extra":true}),
+    ] {
         assert!(
-            entries
-                .iter()
-                .find(|(name, _)| name == "invalid")
+            load_mcp(document.to_string().as_bytes(), 1)
                 .unwrap()
-                .1
-                .is_err()
-        );
-        assert!(
-            entries
-                .iter()
-                .find(|(name, _)| name == "valid")
-                .unwrap()
-                .1
-                .is_ok()
+                .is_empty()
         );
     }
+    assert_eq!(
+        load_mcp(br#"{"mcpServers":{"one":{"command":"node"}}}"#, 0)
+            .unwrap_err()
+            .code,
+        "component_limit"
+    );
 }
+
 #[test]
 fn expansion_is_single_pass_and_http_configuration_is_opaque() {
     assert_eq!(
-        portable_mcp::expand(
+        package_mcp::expand(
             "${PLUGIN_ROOT}/${PLUGIN_DATA}/${HOME}/${PLUGIN_OTHER}",
             "${PLUGIN_DATA}",
             "data"
@@ -379,31 +379,25 @@ fn expansion_is_single_pass_and_http_configuration_is_opaque() {
     );
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    let server = PortableServer::Stdio {
-        command: "node".into(),
-        args: vec!["${HOME}".into(), "${PLUGIN_ROOT}/file".into()],
-        env: BTreeMap::from([("CONFIG".into(), "${PLUGIN_DATA}".into())]),
-        cwd: None,
-    };
-    let ResolvedServer::Stdio { args, env, cwd, .. } =
-        portable_mcp::resolve(&server, root.path(), data.path()).unwrap()
-    else {
-        panic!()
-    };
-    assert_eq!(args[0], "${HOME}");
-    assert_eq!(cwd, root.path().canonicalize().unwrap().to_str().unwrap());
-    assert_eq!(env["CONFIG"], env["PLUGIN_DATA"]);
-    let server = PortableServer::StreamableHttp {
-        url: "https://example.org/mcp?q=${PLUGIN_ROOT}".into(),
-        headers: BTreeMap::from([("X-Value".into(), "${PLUGIN_DATA}".into())]),
-    };
-    let ResolvedServer::StreamableHttp { url, headers } =
-        portable_mcp::resolve(&server, root.path(), data.path()).unwrap()
-    else {
-        panic!()
-    };
-    assert!(url.contains("${PLUGIN_ROOT}"));
-    assert_eq!(headers["X-Value"], "${PLUGIN_DATA}");
+    let config = server(
+        json!({"command":"node","args":["${HOME}","${PLUGIN_ROOT}/file"],"env":{"CONFIG":"${PLUGIN_DATA}"}}),
+    );
+    let resolved = package_mcp::resolve(&config, root.path(), data.path()).unwrap();
+    assert_eq!(resolved["args"][0], "${HOME}");
+    assert_eq!(
+        resolved["cwd"],
+        root.path().canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        resolved["env"]["CONFIG"],
+        data.path().canonicalize().unwrap().to_str().unwrap()
+    );
+    let config = server(
+        json!({"url":"https://example.org/mcp/${PLUGIN_ROOT}","headers":{"X-Value":"${PLUGIN_DATA}"},"required":true}),
+    );
+    let resolved = package_mcp::resolve(&config, root.path(), data.path()).unwrap();
+    assert_eq!(&resolved, config.config());
+    assert_eq!(resolved["headers"]["X-Value"], "${PLUGIN_DATA}");
 }
 #[test]
 fn command_placeholder_text_is_literal_when_it_is_an_executable_token() {
@@ -411,17 +405,9 @@ fn command_placeholder_text_is_literal_when_it_is_an_executable_token() {
     let data = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("bin")).unwrap();
     fs::write(root.path().join("bin/${PLUGIN_ROOT}"), "bundled").unwrap();
-    let server = PortableServer::Stdio {
-        command: "./bin/${PLUGIN_ROOT}".into(),
-        args: vec![],
-        env: BTreeMap::new(),
-        cwd: None,
-    };
-    let ResolvedServer::Stdio { command, .. } =
-        portable_mcp::resolve(&server, root.path(), data.path()).unwrap()
-    else {
-        panic!()
-    };
+    let config = server(json!({"command":"./bin/${PLUGIN_ROOT}"}));
+    let resolved = package_mcp::resolve(&config, root.path(), data.path()).unwrap();
+    let command = resolved["command"].as_str().unwrap();
     assert!(command.ends_with("bin/${PLUGIN_ROOT}"));
 }
 
@@ -548,8 +534,8 @@ fn spaced_executable_is_one_literal_path_and_args_remain_separate() {
         "shell": {"type":"stdio", "command":"node --eval anything"},
         "nul": {"type":"stdio", "command":"./bin/my\u{0} server"}
     }});
-    let parsed = parse_mcp(&serde_json::to_vec(&config).unwrap(), 256).unwrap();
-    let server = parsed
+    let parsed = load_mcp(&serde_json::to_vec(&config).unwrap(), 256).unwrap();
+    let selected_server = parsed
         .iter()
         .find(|(key, _)| key == "spaced")
         .unwrap()
@@ -567,12 +553,10 @@ fn spaced_executable_is_one_literal_path_and_args_remain_separate() {
     )
     .unwrap();
     let snapshot = Snapshot::capture(root.path(), snapshot_limits(), || false).unwrap();
-    assert_eq!(load(&snapshot).unwrap().components.len(), 1);
-    let ResolvedServer::Stdio { command, args, .. } =
-        portable_mcp::resolve(server, root.path(), data.path()).unwrap()
-    else {
-        panic!()
-    };
+    assert_eq!(load(&snapshot).unwrap().components.len(), 2);
+    let resolved = package_mcp::resolve(selected_server, root.path(), data.path()).unwrap();
+    let command = resolved["command"].as_str().unwrap();
+    let args = &resolved["args"];
     assert_eq!(
         command,
         root.path()
@@ -582,12 +566,17 @@ fn spaced_executable_is_one_literal_path_and_args_remain_separate() {
             .to_str()
             .unwrap()
     );
-    assert_eq!(args, ["--title", "two words"]);
-    assert!(
-        parsed
-            .iter()
-            .filter(|(key, _)| key != "spaced")
-            .all(|(_, server)| server.is_err())
+    assert_eq!(args, &json!(["--title", "two words"]));
+    let shell = parsed
+        .iter()
+        .find(|(key, _)| key == "shell")
+        .unwrap()
+        .1
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        package_mcp::resolve(shell, root.path(), data.path()).unwrap()["command"],
+        "node --eval anything"
     );
     #[cfg(unix)]
     {
@@ -598,12 +587,7 @@ fn spaced_executable_is_one_literal_path_and_args_remain_separate() {
             root.path().join("bin/escape server"),
         )
         .unwrap();
-        let escaped = PortableServer::Stdio {
-            command: "./bin/escape server".into(),
-            args: vec![],
-            env: BTreeMap::new(),
-            cwd: None,
-        };
+        let escaped = server(json!({"command":"./bin/escape server"}));
         let captured = Snapshot::capture(root.path(), snapshot_limits(), || false).unwrap();
         assert!(captured.file("bin/escape server").is_none());
         fs::write(
@@ -620,21 +604,32 @@ fn spaced_executable_is_one_literal_path_and_args_remain_separate() {
                 .iter()
                 .any(|d| d.code == "invalid_mcp_path")
         );
-        assert!(portable_mcp::resolve(&escaped, root.path(), data.path()).is_err());
+        assert!(package_mcp::resolve(&escaped, root.path(), data.path()).is_err());
     }
-    for command in [
-        "./../outside server",
-        "./bin/my server --flag",
-        "sh -c anything",
-    ] {
-        let server = PortableServer::Stdio {
-            command: command.into(),
-            args: vec![],
-            env: BTreeMap::new(),
-            cwd: None,
-        };
-        assert!(portable_mcp::resolve(&server, root.path(), data.path()).is_err());
+    for command in ["./../outside server", "./bin/my server --flag"] {
+        let config = server(json!({"command":command}));
+        assert!(package_mcp::resolve(&config, root.path(), data.path()).is_err());
     }
+}
+
+#[test]
+fn native_host_paths_remain_valid_without_becoming_package_members() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let host_cwd = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().unwrap();
+    let config = json!({"command":executable,"cwd":host_cwd.path()});
+    let document = json!({"mcpServers":{"server":config}}).to_string();
+    let snapshot = package(manifest(), &[("mcp.json", &document)]);
+    let plan = load(&snapshot).unwrap();
+    assert!(plan.diagnostics.is_empty());
+    assert_eq!(plan.components.len(), 1);
+    let ComponentPlan::Mcp { server, .. } = &plan.components[0] else {
+        panic!("expected native MCP config");
+    };
+    let resolved = package_mcp::resolve(server, root.path(), data.path()).unwrap();
+    assert_eq!(resolved["command"], config["command"]);
+    assert_eq!(resolved["cwd"], config["cwd"]);
 }
 
 #[test]
@@ -643,7 +638,7 @@ fn invalid_or_denied_skill_markdown_still_skips_only_that_skill() {
         manifest(),
         &[
             ("skills/good/SKILL.md", SKILL),
-            ("skills/invalid/SKILL.md", "missing frontmatter"),
+            ("skills/invalid/SKILL.md", "---\nname: invalid\n---\n"),
             ("skills/escaped/SKILL.md", SKILL),
         ],
     );

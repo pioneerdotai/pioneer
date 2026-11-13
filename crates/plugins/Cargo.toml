@@ -11,11 +11,11 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
-http.workspace = true
 url.workspace = true
 semver.workspace = true
 libc.workspace = true
 image.workspace = true
+pioneer-mcp.workspace = true
 pioneer-skills.workspace = true
 pioneer-protocol.workspace = true
 

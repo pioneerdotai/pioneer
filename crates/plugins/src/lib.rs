@@ -7,7 +7,7 @@ mod discovery;
 pub mod images;
 mod manifest;
 mod metadata;
-pub mod portable_mcp;
+pub mod package_mcp;
 mod snapshot;
 mod source;
 pub use diagnostic::{Boundary, Diagnostic};
@@ -16,5 +16,5 @@ pub use manifest::{
     MCP_SCHEMA, MCP_SCHEMA_BYTES, Manifest, PLUGIN_SCHEMA, PLUGIN_SCHEMA_BYTES, SPEC_VERSION,
     parse_manifest,
 };
-pub use portable_mcp::{PortableServer, ResolvedServer, parse_mcp};
+pub use package_mcp::{PackageMcpServer, load_mcp};
 pub use snapshot::{Entry, Limits, Snapshot};

@@ -2,7 +2,11 @@
 use super::*;
 
 impl MessageProcessor {
-    pub(super) async fn apps_request(&self, context: &RequestContext, request: JsonRpcRequest) {
+    pub(in crate::message) async fn apps_request(
+        &self,
+        context: &RequestContext,
+        request: JsonRpcRequest,
+    ) {
         let id = request.id.clone();
         let params = request.params.unwrap_or_else(|| json!({}));
         let decode = || -> anyhow::Result<(&'static str, serde_json::Value)> {

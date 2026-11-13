@@ -976,7 +976,7 @@ impl MessageProcessor {
                     .map(|_| ())
                 }
                 ComponentPlan::Mcp { server, .. } => {
-                    match mcp::portable::portable_install_plan(
+                    match mcp::package::package_install_plan(
                         server, &package, &data, workspace, &ownership,
                     ) {
                         Ok(native) => self

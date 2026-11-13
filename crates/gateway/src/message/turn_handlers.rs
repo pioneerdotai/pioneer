@@ -1705,7 +1705,7 @@ impl MessageProcessor {
                     }
                     let mut leaves = Vec::new();
                     for component in components.iter().filter(|c| c.status == "installed") {
-                        let (id, leaf) = match component.kind.as_str() {
+                        let (id, leaf, mcp_enabled) = match component.kind.as_str() {
                             "skill" => {
                                 let skill_id = pioneer_protocol::SkillId::new(
                                     component.skill_id.clone().ok_or_else(|| {
@@ -1738,6 +1738,7 @@ impl MessageProcessor {
                                             pack_id: None,
                                         },
                                     },
+                                    true,
                                 )
                             }
                             "mcp" => {
@@ -1767,6 +1768,7 @@ impl MessageProcessor {
                                             scope_kind: pioneer_protocol::McpScopeKind::Workspace,
                                         },
                                     },
+                                    row.enabled,
                                 )
                             }
                             _ => {
@@ -1791,7 +1793,7 @@ impl MessageProcessor {
                             TurnCapabilityKind::Skill { skill_id, .. } => plugin_skill_projection.as_ref().and_then(|projection|projection.get(skill_id))
                                 .copied()
                                 .unwrap_or(false),
-                            _ => true,
+                            _ => mcp_enabled,
                         };
                         if eligible {
                             plugin_capability_ids.insert(leaf.id.clone());
