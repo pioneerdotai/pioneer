@@ -69391,8 +69391,8 @@ pub use repositories::html_preview_io_work::{
 };
 
 pub use crate::thread_episodic::{
-    ThreadEpisodicSearchAccess, ThreadEpisodicSearchEmbedding, ThreadEpisodicSearchQuery,
-    ThreadEpisodicSearchRow, thread_search_rank_score,
+    THREAD_SEARCH_RANKING_VERSION, ThreadEpisodicSearchAccess, ThreadEpisodicSearchEmbedding,
+    ThreadEpisodicSearchQuery, ThreadEpisodicSearchRow, thread_search_rank_score,
 };
 impl CrudStore {
     pub async fn search_thread_episodic_projection(

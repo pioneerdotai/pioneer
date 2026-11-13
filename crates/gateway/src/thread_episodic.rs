@@ -14662,9 +14662,15 @@ mod tests {
             .await
             .unwrap();
         // Insert in the opposite order to the stable IDs used for rank ties.
-        for (index, id) in ["z_shared_source", "m_shared_source", "a_shared_source"]
-            .into_iter()
-            .enumerate()
+        for (index, id) in [
+            "z_shared_source",
+            "m_shared_source",
+            "a_shared_source",
+            "d_confirmed_copy",
+            "0_hidden_copy",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let item_id = format!("shared_{index}");
             let turn_id = format!("turn_shared_{index}");
@@ -14700,11 +14706,24 @@ mod tests {
                         source_actor_role: StoreThreadEpisodicSourceActorRole::User,
                         source_runtime_kind: ThreadEpisodicSourceRuntimeKind::UserTurn,
                         source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
-                        visibility: ThreadEpisodicItemVisibility::UserVisible,
+                        visibility: if id == "0_hidden_copy" {
+                            ThreadEpisodicItemVisibility::InternalHidden
+                        } else {
+                            ThreadEpisodicItemVisibility::UserVisible
+                        },
                         status: ThreadEpisodicItemStatus::PendingIndex,
                         text_hash: item_text_hash(&committed, text),
                         source_text_hash: source_text_hash(text),
-                        projection_group_id: format!("projection_{id}"),
+                        // Only confirmed copies share a logical source. The other
+                        // occurrences deliberately share text and vector, but not identity.
+                        projection_group_id: format!(
+                            "projection_{}",
+                            if matches!(id, "d_confirmed_copy" | "0_hidden_copy") {
+                                "a_shared_source"
+                            } else {
+                                id
+                            }
+                        ),
                         language_hint: None,
                         token_estimate: 8,
                         indexed_at: None,
@@ -14754,21 +14773,16 @@ mod tests {
             assert_eq!(second.hits.len(), 1);
             assert!(second.next_cursor.is_none());
             let expected = [
-                ("a_shared_source", "shared_2", "turn_shared_2"),
-                ("m_shared_source", "shared_1", "turn_shared_1"),
-                ("z_shared_source", "shared_0", "turn_shared_0"),
+                ("a_shared_source", "shared_2", "turn_shared_2", 1),
+                ("m_shared_source", "shared_1", "turn_shared_1", 3),
+                ("z_shared_source", "shared_0", "turn_shared_0", 4),
             ];
-            for (position, (hit, (id, item_id, turn_id))) in first
-                .hits
-                .into_iter()
-                .chain(second.hits)
-                .zip(expected)
-                .enumerate()
+            for (hit, (id, item_id, turn_id, rank)) in
+                first.hits.into_iter().chain(second.hits).zip(expected)
             {
                 assert_eq!(hit.index_item_id, id, "{mode:?}");
                 assert_eq!(hit.item_id, item_id);
                 assert_eq!(hit.turn_id, turn_id);
-                let rank = (position + 1) as i64;
                 assert_eq!(
                     hit.lexical_rank,
                     (mode != ThreadEpisodicSearchMode::Semantic).then_some(rank)
@@ -14963,36 +14977,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_lexical_snippet_shows_late_unicode_match_within_character_budget() {
+    async fn sqlite_lexical_snippets_keep_short_text_and_late_unicode_context() {
         let (store, workspace) = setup_thread_episodic_store().await;
-        let text = format!(
+        let long_text = format!(
             "{} левый контекст latecontextneedle правый контекст",
             "далеко начало ".repeat(2000)
         );
-        let (item, job, resolved) =
-            sql_search_pending(&store, &workspace, "late_snippet", &text).await;
-        assert_eq!(
-            sql_search_publish(&store, &item, &job, &resolved, None)
+        let short_text = "shortcontextneedle я просил писать миграции через SeaORM и оставлять raw SQL только для неподдерживаемых операций";
+        for (id, text, query) in [
+            ("late_snippet", long_text.as_str(), "latecontextneedle"),
+            ("short_snippet", short_text, "shortcontextneedle"),
+        ] {
+            let (item, job, resolved) = sql_search_pending(&store, &workspace, id, text).await;
+            assert_eq!(
+                sql_search_publish(&store, &item, &job, &resolved, None)
+                    .await
+                    .unwrap(),
+                ThreadEpisodicIndexAttemptOutcome::Applied
+            );
+            let mut request = sql_search_request(&workspace, query);
+            request.profile.snippet_chars = 120;
+            let page = SqliteThreadEpisodicBackend::new(store.clone())
+                .search_page(request, 10, None, None)
                 .await
-                .unwrap(),
-            ThreadEpisodicIndexAttemptOutcome::Applied
-        );
-        let mut request = sql_search_request(&workspace, "latecontextneedle");
-        request.profile.snippet_chars = 120;
-        let page = SqliteThreadEpisodicBackend::new(store)
-            .search_page(request, 10, None, None)
-            .await
-            .unwrap();
-        assert_eq!(page.hits.len(), 1);
-        let hit = &page.hits[0];
-        assert_eq!(hit.index_item_id, item.id);
-        assert!(hit.text.contains("latecontextneedle"));
-        assert!(hit.text.contains("контекст"));
-        assert!(hit.text.chars().count() <= 120);
-        assert_eq!(
-            hit.metadata.get("pioneer.thread_episodic.source_text_hash"),
-            Some(&item.source_text_hash)
-        );
+                .unwrap();
+            assert_eq!(page.hits.len(), 1);
+            let hit = &page.hits[0];
+            assert_eq!(hit.index_item_id, item.id);
+            assert!(hit.text.contains(query));
+            assert!(hit.text.chars().count() <= 120);
+            if id == "short_snippet" {
+                assert_eq!(hit.text, text);
+            } else {
+                assert!(hit.text.contains("контекст"));
+            }
+            assert_eq!(
+                hit.metadata.get("pioneer.thread_episodic.source_text_hash"),
+                Some(&item.source_text_hash)
+            );
+        }
     }
 
     #[tokio::test]
