@@ -130,11 +130,12 @@ fn make_cli_summarizer(
         kind == selection.transport,
         "selected CLI service instance changed kind"
     );
+    let home = crate::cli_runtime::config::service_home(&instance)?;
     let (service, catalog) = match kind {
         Transport::Codex => (
             CliService::Codex(CodexService::new(CodexServiceConfig {
                 executable: instance.binary_path,
-                home_path: instance.home_path,
+                home_path: home,
                 environment,
             })),
             "openai-codex",
@@ -142,7 +143,7 @@ fn make_cli_summarizer(
         Transport::Claude => (
             CliService::Claude(ClaudeService::new(ClaudeServiceConfig {
                 executable: instance.binary_path,
-                config_dir: instance.home_path,
+                config_dir: home,
                 environment,
             })),
             "anthropic",
@@ -290,13 +291,20 @@ fn service_diagnostic(error: &anyhow::Error) -> pioneer_compaction::runner::Fail
                 "cli_working_action_rejected",
                 "Codex exec attempted an action outside the summary service",
             )),
-            "unsupported Claude service capability version" => Some((
-                "cli_version_unsupported",
-                "Installed Claude version does not match the supported service protocol",
-            )),
             _ => None,
         });
-    let mut diagnostic = if let Some((code, explanation)) = known {
+    let mut diagnostic = if let Some(process) =
+        error.downcast_ref::<pioneer_cli_agent_runtime::service::ServiceProcessFailure>()
+    {
+        FailureDiagnostic::new(
+            stage,
+            "cli_process_failed",
+            &format!(
+                "CLI process class={}, exit={:?}, signal={:?}",
+                process.class, process.exit_code, process.signal,
+            ),
+        )
+    } else if let Some((code, explanation)) = known {
         FailureDiagnostic::new(stage, code, explanation)
     } else if let Some(failure) = error.downcast_ref::<ServiceFailure>() {
         FailureDiagnostic::new(
@@ -623,6 +631,22 @@ pub(crate) fn apply_cli_usage(
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn process_status_survives_missing_completion_in_stored_diagnostic() {
+        let error = anyhow::anyhow!("Codex service ended without completion").context(
+            pioneer_cli_agent_runtime::service::ServiceProcessFailure {
+                exit_code: Some(23),
+                signal: None,
+                class: "authentication",
+            },
+        );
+        let diagnostic = super::service_diagnostic(&error);
+        assert_eq!(diagnostic.code, "cli_process_failed");
+        let stored = serde_json::to_string(&diagnostic).unwrap();
+        assert!(stored.contains("authentication"));
+        assert!(stored.contains("23"));
+    }
+
     #[test]
     fn cli_service_usage_preserves_partial_counters_and_cost_provenance() {
         let mut codex = pioneer_provider::TokenUsage {

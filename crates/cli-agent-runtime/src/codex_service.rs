@@ -6,7 +6,7 @@ use crate::event::{
     RuntimeEventMappingOptions, classify_runtime_provider_failure, map_codex_notification_event,
 };
 use crate::process::{CLIAgentProcess, SensitiveEnvironment};
-use crate::service::{CodexServiceDeadline, ServiceFailure, ServiceStage};
+use crate::service::{CodexServiceDeadline, ServiceFailure, ServiceProcessFailure, ServiceStage};
 use anyhow::{Context, Result, bail, ensure};
 use pioneer_protocol::ProviderFailureClass;
 use tokio::{
@@ -106,10 +106,7 @@ impl CodexService {
                 retry_after_ms: None,
             }
         );
-        let run = async {
-            let (output, success) = self.invoke(&request, deadline, MAX_SERVICE_BYTES).await?;
-            decode_exec_outcome(&output, success)
-        };
+        let run = self.invoke(&request, deadline, MAX_SERVICE_BYTES);
         let result = match tokio::time::timeout_at(deadline, run).await {
             Ok(result) => result,
             Err(_) => Err(CodexServiceDeadline.into()),
@@ -131,7 +128,7 @@ impl CodexService {
         request: &CodexServiceRequest,
         deadline: Instant,
         cap: usize,
-    ) -> Result<(Vec<u8>, bool)> {
+    ) -> Result<CodexServiceCompletion> {
         let result = {
             let mut owner = self.attempt.lock().await;
             ensure!(owner.is_none(), "previous service attempt needs cleanup");
@@ -166,10 +163,45 @@ impl CodexService {
                 Ok::<_, anyhow::Error>(output)
             };
             let exchange = async {
-                let (_, output) =
-                    tokio::try_join!(async { write.await.map_err(anyhow::Error::from) }, read)?;
-                let status = owner.as_mut().unwrap().process.wait().await?;
-                Ok((output, status.success()))
+                // Drain stdout even when stdin closes early, so process status
+                // and terminal usage survive a BrokenPipe from a failed launch.
+                let (written, output) = tokio::join!(write, read);
+                let output = output?;
+                let process = &mut owner.as_mut().unwrap().process;
+                let status = process.wait().await.context(ServiceStage("cli_wait"))?;
+                let decoded =
+                    decode_exec_completion(&output).context(ServiceStage("cli_exec_decode"));
+                if !status.success() || written.is_err() {
+                    let stderr = process.stderr().lines().await;
+                    let error = match decoded {
+                        Ok(completion) => crate::service::with_observed_usage(
+                            anyhow::anyhow!("Codex service process failed"),
+                            completion.observed_usage,
+                        ),
+                        // Keep typed provider rejections as well as usage. The
+                        // process status must not erase context/rate-limit policy.
+                        Err(error) => error,
+                    };
+                    let mut error =
+                        error.context(ServiceProcessFailure::from_status(status, &stderr));
+                    if let Err(write_error) = written {
+                        error = error
+                            .context(format!("CLI service stdin: {:?}", write_error.kind()))
+                            .context(ServiceStage("cli_stdin"));
+                    }
+                    return Err(error);
+                }
+                decoded.map_err(|error| {
+                    if error.is::<ServiceFailure>() {
+                        error
+                    } else {
+                        error.context(ServiceProcessFailure {
+                            exit_code: status.code(),
+                            signal: None,
+                            class: "invalid_completion",
+                        })
+                    }
+                })
             };
             exchange.await
         };
@@ -211,7 +243,7 @@ fn process_config(
         CLIAgentProcessSpawnConfig::codex_app_server(&config.executable, &config.home_path)
             .with_cwd(cwd)
             .with_environment(&config.environment)
-            .with_stderr_ring_lines(0);
+            .with_stderr_ring_lines(8);
     process.args = [
         "exec",
         "--ephemeral",
@@ -231,6 +263,15 @@ fn process_config(
         process.args.extend([
             "--config".into(),
             format!("{key}={}", toml::Value::try_from(value)?),
+        ]);
+    }
+    // --ignore-user-config also resets credential storage to "file". Keep
+    // only the account's storage selector, without loading user behavior,
+    // provider overrides, MCP, hooks, instructions or conversation state.
+    if let Some(store) = credential_store(&config.home_path)? {
+        process.args.extend([
+            "--config".into(),
+            format!("cli_auth_credentials_store={}", toml::Value::String(store)),
         ]);
     }
     process.args.extend([
@@ -253,18 +294,51 @@ fn process_config(
     Ok(process)
 }
 
+/// Read only the authentication backend selector from the selected home.
+/// Bound the input and never propagate source config text through an error.
+fn credential_store(home: &str) -> Result<Option<String>> {
+    use std::io::Read;
+    let home = crate::process::expand_home_path(home, None)?;
+    let file = match std::fs::File::open(home.join("config.toml")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => bail!("CLI service credential configuration is unreadable"),
+    };
+    let mut text = String::new();
+    file.take(256 * 1024 + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| anyhow::anyhow!("CLI service credential configuration is unreadable"))?;
+    ensure!(
+        text.len() <= 256 * 1024,
+        "CLI service credential configuration exceeds capacity"
+    );
+    let value: toml::Value = toml::from_str(&text)
+        .map_err(|_| anyhow::anyhow!("CLI service credential configuration is invalid"))?;
+    let Some(store) = value.get("cli_auth_credentials_store") else {
+        return Ok(None);
+    };
+    let store = store
+        .as_str()
+        .filter(|store| matches!(*store, "file" | "keyring" | "auto" | "ephemeral"))
+        .ok_or_else(|| anyhow::anyhow!("CLI service credential storage selector is invalid"))?;
+    Ok(Some(store.into()))
+}
+
 /// Production process-exit boundary, shared by summarize and pure regressions.
 /// Decode first so a valid terminal's numeric evidence survives nonzero exit;
 /// neither a bad transcript nor a failed process becomes a successful summary.
 pub fn decode_exec_outcome(output: &[u8], success: bool) -> Result<CodexServiceCompletion> {
-    let completion = decode_exec_completion(output).context(ServiceStage("cli_exec_decode"))?;
+    let decoded = decode_exec_completion(output).context(ServiceStage("cli_exec_decode"));
     if !success {
-        return Err(crate::service::with_observed_usage(
-            anyhow::anyhow!("Codex service process failed"),
-            completion.observed_usage,
-        ));
+        return Err(match decoded {
+            Ok(completion) => crate::service::with_observed_usage(
+                anyhow::anyhow!("Codex service process failed"),
+                completion.observed_usage,
+            ),
+            Err(error) => error.context("Codex service process failed"),
+        });
     }
-    Ok(completion)
+    decoded
 }
 
 /// Decode the pinned exec JSONL contract without invoking an external process.
@@ -639,6 +713,12 @@ mod exec_tests {
             ProviderFailureClass::ContextTooLarge
         );
         assert!(!format!("{error:?}").contains("private source"));
+        let nonzero = decode_exec_outcome(&encode(&failed), false).err().unwrap();
+        assert_eq!(
+            nonzero.downcast_ref::<ServiceFailure>().unwrap().class,
+            ProviderFailureClass::ContextTooLarge
+        );
+
         for kind in [
             "command_execution",
             "file_change",
@@ -662,7 +742,7 @@ mod exec_tests {
         let fixture = tempfile::tempdir().unwrap();
         let home = fixture.path().join("auth");
         std::fs::create_dir(&home).unwrap();
-        let user_config = "[mcp_servers.unexpected]\ncommand='never-run'\n[plugins.unexpected]\nenabled=true\n[projects.fixture]\ntrust_level='trusted'\n";
+        let user_config = "cli_auth_credentials_store=\"keyring\"\n[mcp_servers.unexpected]\ncommand='never-run'\n[plugins.unexpected]\nenabled=true\n[projects.fixture]\ntrust_level='trusted'\n";
         std::fs::write(home.join("config.toml"), user_config).unwrap();
         let executable = fixture.path().join("mock-codex");
         let script=r#"#!/usr/bin/env python3
@@ -675,11 +755,17 @@ assert a[0]=='exec' and a[-1]=='-'
 assert all(flag in a for flag in ['--ephemeral','--ignore-user-config','--ignore-rules','--skip-git-repo-check','--json'])
 assert a[a.index('--model')+1]=='gpt-5.6-luna'
 assert a[a.index('--sandbox')+1]=='read-only'
+assert 'cli_auth_credentials_store="keyring"' in a
 assert 'model_reasoning_effort="low"' in a
 assert 'private fixture portion' not in str(a)
 assert 'service instructions' not in str(a)
 assert pathlib.Path('instructions.txt').read_text()=='service instructions'
 assert '[mcp_servers.unexpected]' in (home/'config.toml').read_text()
+if (home/'early-exit').exists():
+    print('authentication failed: PRIVATE-STDERR-CANARY', file=sys.stderr)
+    code = int((home/'early-exit').read_text())
+    if code == 0: sys.stdin.read()
+    sys.exit(code)
 assert sys.stdin.read()=='private fixture portion'
 with (home/'trace').open('a') as f: f.write(json.dumps({'pid':os.getpid(),'cwd':os.getcwd()})+'\n')
 (home/'started').touch()
@@ -751,6 +837,21 @@ if (home/'bad-exit').exists(): sys.exit(1)
                 -1,
                 "owned process still alive"
             );
+        }
+        for (code, class) in [(23, "authentication"), (0, "invalid_completion")] {
+            std::fs::write(home.join("early-exit"), code.to_string()).unwrap();
+            let mut input = request();
+            input.input = "x".repeat(128 * 1024);
+            let error = service
+                .summarize(input, Duration::from_secs(5))
+                .await
+                .err()
+                .unwrap();
+            let process = error.downcast_ref::<ServiceProcessFailure>().unwrap();
+            assert_eq!(process.exit_code, Some(code));
+            assert_eq!(process.class, class);
+            assert!(!format!("{error:#}").contains("PRIVATE-STDERR-CANARY"));
+            assert!(service.attempt.lock().await.is_none());
         }
         assert!(!home.join("sessions").exists());
         assert_eq!(

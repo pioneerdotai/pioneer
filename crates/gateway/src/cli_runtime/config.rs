@@ -14,6 +14,24 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Service calls use the same account home as the selected working runtime,
+/// while keeping their own process, instructions and conversation state.
+pub(crate) fn service_home(
+    instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+) -> Result<String> {
+    let home = instance
+        .shadow_home_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|home| !home.is_empty())
+        .unwrap_or(&instance.home_path);
+    Ok(
+        pioneer_cli_agent_runtime::process::expand_home_path(home, None)?
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 pub(crate) fn load_effective_cli_runtime_instances(
     runtime_home: &Path,
 ) -> Result<Vec<EffectiveGatewayCliAgentRuntimeInstanceConfig>> {
@@ -193,6 +211,30 @@ mod tests {
             event_channel_capacity: 16,
             stderr_ring_lines: 16,
             debug_native_events: false,
+        }
+    }
+
+    #[test]
+    fn service_home_expands_defaults_and_follows_selected_account() {
+        for kind in [
+            GatewayCliAgentRuntimeKindConfig::Codex,
+            GatewayCliAgentRuntimeKindConfig::Claude,
+        ] {
+            let mut selected = instance(kind, vec![]);
+            selected.home_path = "~/.provider".into();
+            let expected =
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".provider");
+            assert_eq!(
+                super::service_home(&selected).unwrap(),
+                expected.to_string_lossy()
+            );
+            selected.shadow_home_path = Some("~/account-work".into());
+            let expected =
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("account-work");
+            assert_eq!(
+                super::service_home(&selected).unwrap(),
+                expected.to_string_lossy()
+            );
         }
     }
 

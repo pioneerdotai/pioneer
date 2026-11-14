@@ -557,6 +557,28 @@ async fn sleep_after_transient_storage_poll_failure(transient_storage_poll_faile
     true
 }
 
+const TITLE_JOB_MAX_RECOVERIES: u8 = 2;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThreadTitleRecovery {
+    text: Arc<str>,
+    remaining: u8,
+}
+impl From<&str> for ThreadTitleRecovery {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.into(),
+            remaining: TITLE_JOB_MAX_RECOVERIES,
+        }
+    }
+}
+impl std::ops::Deref for ThreadTitleRecovery {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ThreadTitleJobState {
     Pending,
@@ -566,8 +588,8 @@ enum ThreadTitleJobState {
     FailedNonRetriable,
     // Retain the original user text only while waiting for recovery. This is
     // not name provenance or a queue of completion triggers.
-    DeferredUntilSuccessfulTurn(Arc<str>),
-    AwaitingSuccessfulTurn(Arc<str>),
+    DeferredUntilSuccessfulTurn(ThreadTitleRecovery),
+    AwaitingSuccessfulTurn(ThreadTitleRecovery),
 }
 
 #[derive(Clone)]
