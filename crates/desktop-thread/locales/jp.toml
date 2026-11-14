@@ -366,3 +366,5 @@
 "apps.unavailable" = "利用不可"
 "apps.retry" = "再試行"
 "apps.stale" = "選択したバージョンは最新ではありません"
+
+"apps.view" = "App view"

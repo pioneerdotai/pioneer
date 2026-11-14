@@ -366,3 +366,5 @@
 "apps.unavailable" = "不可用"
 "apps.retry" = "重试"
 "apps.stale" = "所选版本已不是当前版本"
+
+"apps.view" = "App view"

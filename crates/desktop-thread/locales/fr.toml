@@ -366,3 +366,5 @@
 "apps.unavailable" = "Indisponible"
 "apps.retry" = "Réessayer"
 "apps.stale" = "La version sélectionnée n’est plus à jour"
+
+"apps.view" = "App view"

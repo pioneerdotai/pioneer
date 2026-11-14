@@ -43,13 +43,13 @@
   "additionalProperties": false,
   "required": [
     "collection",
-    "encoding",
-    "eof",
     "index",
     "modelIndex",
-    "nextOffset",
+    "encoding",
+    "version",
     "offset",
-    "text",
-    "version"
+    "nextOffset",
+    "eof",
+    "text"
   ]
 }

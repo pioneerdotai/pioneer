@@ -160,7 +160,7 @@ impl MessageProcessor {
                 let skills_root = match parent.kind {
                     pioneer_protocol::PackageKind::Plugin => "skills".to_owned(),
                     pioneer_protocol::PackageKind::App => {
-                        let manifest = pioneer_plugins::app::AppManifest::parse(
+                        let manifest = pioneer_apps::AppManifest::parse(
                             parent
                                 .app_manifest_json
                                 .as_deref()
@@ -191,13 +191,15 @@ impl MessageProcessor {
                 let location =
                     install_location_for_source_kind(context, &source_kind).ok_or_else(invalid)?;
                 let policy = installer_policy(context);
-                let package_limits = self.package_delivery_context().plugin_limits();
+                let package_limits = self
+                    .package_delivery_context()
+                    .limits_for_package(parent.kind);
                 crate::message::package_delivery::prepare_cancellable(
                     move |cancellation| -> Result<PreparedInstallSource> {
                         let mut cleanup =
                             crate::message::package_delivery::TemporaryDirectory::new()?;
                         let package = Path::new(&parent.package_path);
-                        let source_dir = pioneer_plugins::containment::resolve_contained(
+                        let source_dir = pioneer_packages::containment::resolve_contained(
                             package,
                             &package.join(path),
                         )?;
@@ -220,7 +222,7 @@ impl MessageProcessor {
                             .expect("package source")
                             .package_fingerprint
                             .as_str();
-                        let copy = pioneer_plugins::Snapshot::capture(
+                        let copy = pioneer_packages::Snapshot::capture(
                             prepared.source_dir(),
                             package_limits,
                             || cancellation.is_cancelled(),

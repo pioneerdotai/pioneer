@@ -29,7 +29,7 @@ impl MessageProcessor {
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         SKILLS_ERROR_INVALID_REQUEST,
-                        super::super::super::plugins::native_plugin_error_code(&error),
+                        super::super::super::packages::native_plugin_error_code(&error),
                         json!({}),
                     ),
                 )
@@ -64,7 +64,7 @@ impl MessageProcessor {
                         Some(request_id.clone()),
                         INVALID_REQUEST_CODE,
                         SKILLS_ERROR_INTERNAL,
-                        super::super::super::plugins::native_plugin_error_code(&error),
+                        super::super::super::packages::native_plugin_error_code(&error),
                         json!({}),
                     )
                 }),

@@ -1524,7 +1524,7 @@ impl MessageProcessor {
         source_turn: &str,
         execution: &[pioneer_protocol::TurnCapability],
     ) -> anyhow::Result<Vec<pioneer_protocol::TurnCapability>> {
-        let Some(snapshot) = super::plugins::validate_cli_plugin_selection(
+        let Some(snapshot) = super::packages::validate_cli_plugin_selection(
             self.crud_store.as_ref(),
             workspace,
             source_turn,
@@ -1811,7 +1811,7 @@ impl MessageProcessor {
                     presentation.push(TurnCapability {
                         label: Some(if parent.kind==pioneer_protocol::PackageKind::App {
                             (||->anyhow::Result<String>{
-                                let manifest=pioneer_plugins::app::AppManifest::parse(parent.app_manifest_json.as_deref().context("App manifest missing")?.as_bytes())?;
+                                let manifest=pioneer_apps::AppManifest::parse(parent.app_manifest_json.as_deref().context("App manifest missing")?.as_bytes())?;
                                 let locales=manifest.validate_localizations_json(parent.app_localizations_json.as_deref().context("App localizations missing")?.as_bytes())?;
                                 Ok(manifest.presentation("",&locales).name)
                             })().map_err(|_|TurnStartFailure::unavailable("App presentation unavailable"))?
@@ -5639,7 +5639,7 @@ impl MessageProcessor {
             }
             let plugin_selection = normalized_capabilities.plugin_selection;
             let plugin_launch_guards = if let Some(snapshot) = &plugin_selection {
-                match super::plugins::acquire_plugin_selection_admission(
+                match super::packages::acquire_plugin_selection_admission(
                     self.crud_store.as_ref(), &self.plugin_mutation_locks, &thread.workspace_id, snapshot,
                 ).await {
                     Ok(guards) => guards,
@@ -7874,7 +7874,7 @@ impl MessageProcessor {
                 };
             let native_cwd = security_snapshot.sandbox.cwd.clone();
             let proxy_env = crate::cli_runtime::config::proxy_env(proxy_url.as_deref());
-            let committed_plugin_selection = match super::plugins::validate_cli_plugin_selection(
+            let committed_plugin_selection = match super::packages::validate_cli_plugin_selection(
                 self.crud_store.as_ref(),
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
@@ -9391,7 +9391,7 @@ impl MessageProcessor {
                     };
                 }
             };
-        let plugin_selection = match super::plugins::validate_cli_plugin_selection(
+        let plugin_selection = match super::packages::validate_cli_plugin_selection(
             self.crud_store.as_ref(),
             binding.workspace_id.as_str(),
             binding.turn_id.as_str(),

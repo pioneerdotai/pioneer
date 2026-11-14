@@ -339,7 +339,9 @@ pub async fn insert_parent(
     if row.kind == crate::PackageKind::App {
         anyhow::ensure!(
             app_installation::Entity::find()
+                .inner_join(package_installation::Entity)
                 .filter(app_installation::Column::Slug.eq(&row.name))
+                .filter(package_installation::Column::WorkspaceId.eq(&row.workspace_id))
                 .one(db)
                 .await?
                 .is_none(),
@@ -979,4 +981,27 @@ pub async fn mark_package_removed(
     row.diagnostic = Set(Some("component_removed_for_update".into()));
     row.update(db).await?;
     Ok(())
+}
+
+/// A finite startup frontier for the App runtime owner, including disabled parents
+/// so interrupted executions can be fenced before a new execution is admitted.
+pub async fn app_runtime_page<C: ConnectionTrait>(db: &C, after: &str, through: &str, limit: u64) -> Result<Vec<(package_installation::Model, Option<app_installation::Model>)>> {
+    let rows = package_installation::Entity::find()
+        .filter(package_installation::Column::Kind.eq("app"))
+        .filter(package_installation::Column::Id.gt(after))
+        .filter(package_installation::Column::Id.lte(through))
+        .order_by_asc(package_installation::Column::Id)
+        .limit(limit.min(64)).all(db).await?;
+    let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
+    let apps = app_installation::Entity::find().filter(app_installation::Column::Id.is_in(ids)).all(db).await?;
+    Ok(rows.into_iter().map(|parent| { let app = apps.iter().find(|a| a.id == parent.id).cloned(); (parent,app) }).collect())
+}
+
+/// Capture the finite App discovery frontier before paging a maintenance pass.
+pub async fn app_runtime_frontier<C: ConnectionTrait>(db: &C) -> Result<Option<String>> {
+    Ok(package_installation::Entity::find().select_only()
+        .column(package_installation::Column::Id)
+        .filter(package_installation::Column::Kind.eq("app"))
+        .order_by_desc(package_installation::Column::Id)
+        .into_tuple::<String>().one(db).await?)
 }

@@ -649,7 +649,7 @@ mod tests {
         use pioneer_client::{
             core::*,
             navigation::{SemanticDestination, SettingsRoute},
-            plugins::runtime::PluginPublication,
+            packages::runtime::PluginPublication,
             plugins::{PluginComponentItem, PluginItem},
         };
         cx.update(gpui_kit::init);

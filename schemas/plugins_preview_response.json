@@ -10,12 +10,12 @@
       }
     },
     "description": {
+      "description": "Authored package description, bounded by the Gateway; absent for old peers.",
       "type": [
         "string",
         "null"
       ],
-      "maxLength": 2048,
-      "default": null
+      "maxLength": 2048
     },
     "diagnostics": {
       "type": "array",

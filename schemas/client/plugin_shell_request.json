@@ -7,6 +7,142 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "app_view_close"
+        },
+        "ticket": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "kind",
+        "ticket"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "app_view_poll"
+        },
+        "ticket": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "kind",
+        "ticket"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "app_view_open"
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "app_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id",
+        "app_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "draft_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "const": "app_composer_picker"
+        },
+        "query": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "thread_id",
+        "draft_id",
+        "query"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "intent": {
+          "$ref": "#/$defs/PluginIntent"
+        },
+        "kind": {
+          "type": "string",
+          "const": "app_parent_command"
+        },
+        "origin": {
+          "$ref": "#/$defs/PluginCommandOrigin"
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "app_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "workspace_id",
+        "app_id",
+        "origin",
+        "intent"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "app_parent_snapshot"
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "app_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "workspace_id",
+        "app_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "parent_snapshot"
         },
         "plugin_id": {
@@ -691,6 +827,39 @@
     },
     "SkillUploadTarget": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "expected_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "app_update_preview"
+            },
+            "app_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "app_id",
+            "expected_revision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "app_preview"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
         {
           "type": "object",
           "properties": {

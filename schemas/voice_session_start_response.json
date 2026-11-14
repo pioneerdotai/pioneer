@@ -5,7 +5,10 @@
   "properties": {
     "audio_integrity_version": {
       "description": "Version 1 verifies the ordered PCM ingress at finalize, before publication.",
-      "type": ["integer", "null"],
+      "type": [
+        "integer",
+        "null"
+      ],
       "format": "uint32",
       "minimum": 0
     },

@@ -64,7 +64,7 @@ impl PackageRecord {
                     .app_manifest_json
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("App manifest missing"))?;
-                let manifest = pioneer_plugins::app::AppManifest::parse(bytes.as_bytes())?;
+                let manifest = pioneer_apps::AppManifest::parse(bytes.as_bytes())?;
                 anyhow::ensure!(
                     manifest.slug() == self.name,
                     "App slug does not match manifest"
@@ -233,7 +233,7 @@ pub struct PreparedAppMetadata {
     pub(crate) fingerprint: String,
 }
 impl PreparedAppMetadata {
-    pub fn from_package(package: &pioneer_plugins::app::LoadedAppPackage) -> anyhow::Result<Self> {
+    pub fn from_package(package: &pioneer_apps::LoadedAppPackage) -> anyhow::Result<Self> {
         let manifest_json = serde_json::to_string(package.manifest.document())?;
         let localizations_json = serde_json::to_string(&package.localizations)?;
         package

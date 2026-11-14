@@ -368,3 +368,5 @@
 "apps.unavailable" = "Недоступен"
 "apps.retry" = "Повторить"
 "apps.stale" = "Выбранная версия больше не актуальна"
+
+"apps.view" = "App view"

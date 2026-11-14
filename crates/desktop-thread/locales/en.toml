@@ -368,3 +368,5 @@
 "apps.unavailable" = "Unavailable"
 "apps.retry" = "Try again"
 "apps.stale" = "Selected revision is no longer current"
+
+"apps.view" = "App view"

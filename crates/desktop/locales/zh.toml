@@ -448,6 +448,13 @@ hide_others = "隐藏其他"
 show_all = "显示全部"
 quit = "退出 Pioneer"
 
+[menu.edit]
+name = "编辑"
+cut = "剪切"
+copy = "复制"
+paste = "粘贴"
+select_all = "全选"
+
 [menu.about]
 version = "版本 %{version}"
 copyright = "© Pioneer Contributors"

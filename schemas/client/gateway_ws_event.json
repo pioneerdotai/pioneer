@@ -2057,6 +2057,22 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "apps_changed"
+            },
+            "params": {
+              "$ref": "#/$defs/AppsChangedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "access_changed"
             },
             "params": {
@@ -11733,6 +11749,27 @@
               "type": "integer",
               "format": "int64"
             },
+            "type": {
+              "type": "string",
+              "const": "app"
+            },
+            "appId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
             "pluginId": {
               "type": "string"
             },
@@ -15123,6 +15160,41 @@
         "revision"
       ],
       "description": "Immutable image reference. Gateway inventory exposes a native storage link, never image bytes."
+    },
+    "AppsChangedNotification": {
+      "type": "object",
+      "properties": {
+        "runtime_only": {
+          "type": "boolean",
+          "default": false
+        },
+        "execution_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "app_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "app_id",
+        "revision"
+      ]
     }
   }
 }

@@ -2,6 +2,7 @@ mod access_invalidation;
 pub(crate) mod agent_action_tools;
 mod agent_route_handlers;
 mod agent_runtime;
+mod apps;
 mod artifact_finalization_diagnostics;
 mod artifact_registration;
 mod artifact_tools;
@@ -27,9 +28,9 @@ mod message_turn;
 mod native_health;
 mod notifications;
 mod package_delivery;
+pub(crate) mod packages;
 mod patch_history_handlers;
 mod permission_handlers;
-pub(crate) mod plugins;
 mod projection_work;
 mod provider_handlers;
 mod provider_readiness;
@@ -747,6 +748,8 @@ pub struct MessageProcessor {
     mcp_service: Arc<McpService>,
     skills_write_lock: Arc<tokio::sync::Mutex<()>>,
     plugin_mutation_locks: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    app_runtime: Arc<apps::runtime::AppRuntime>,
+    host_api: Arc<crate::host_api::HostApi>,
     cli_runtime_skill_destination_locks: CliRuntimeSkillDestinationLocks,
     #[cfg(test)]
     cli_runtime_skill_preflight_test_events: Arc<Mutex<Vec<String>>>,
@@ -1428,6 +1431,8 @@ impl MessageProcessor {
             mcp_service,
             skills_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             plugin_mutation_locks,
+            app_runtime: Arc::new(apps::runtime::AppRuntime::default()),
+            host_api: Arc::new(crate::host_api::HostApi::default()),
             cli_runtime_skill_destination_locks: new_cli_runtime_skill_destination_locks(),
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
@@ -3057,6 +3062,7 @@ impl MessageProcessor {
         // Startup reconciliation is a bounded Maintenance DB action, not
         // an automatic installer replay. Unfinished parents remain closed.
         background.crud_store.interrupt_unfinished_plugins().await?;
+        self.start_app_runtimes().await;
 
         let task_runtime_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceTaskRuntimeStart);
@@ -5987,6 +5993,8 @@ impl MessageProcessor {
             mcp_service,
             skills_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             plugin_mutation_locks,
+            app_runtime: Arc::new(apps::runtime::AppRuntime::default()),
+            host_api: Arc::new(crate::host_api::HostApi::default()),
             cli_runtime_skill_destination_locks: new_cli_runtime_skill_destination_locks(),
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),

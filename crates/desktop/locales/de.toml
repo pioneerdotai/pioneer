@@ -448,6 +448,13 @@ hide_others = "Andere ausblenden"
 show_all = "Alle einblenden"
 quit = "Pioneer beenden"
 
+[menu.edit]
+name = "Bearbeiten"
+cut = "Ausschneiden"
+copy = "Kopieren"
+paste = "Einfügen"
+select_all = "Alles auswählen"
+
 [menu.about]
 version = "Version %{version}"
 copyright = "© Pioneer Contributors"

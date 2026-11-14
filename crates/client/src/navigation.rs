@@ -521,7 +521,7 @@ impl ClientCore {
                 .snapshot(&self.packages(kind).scope(workspace.into()))
                 .and_then(|p| {
                     p.snapshot()
-                        .payload::<crate::plugins::runtime::PluginPublication>()
+                        .payload::<crate::packages::runtime::PluginPublication>()
                 })
             {
                 if let Some((parent, child)) = p.plugins.iter().find_map(|p| {

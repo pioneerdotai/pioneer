@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionObservabilityParams",
+  "type": "object",
+  "properties": {
+    "after": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "beforeWallMs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "executionId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fromWallMs": {
+      "description": "Half-open source start wall-time range; untimed facts are excluded and counted separately.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "includeDescendants": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "includeRevisions": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "operationId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parentOperationId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "purpose": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "taskId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "through": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "turnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "view": {
+      "$ref": "#/$defs/ExecutionObservationView"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "threadId",
+    "view"
+  ],
+  "$defs": {
+    "ExecutionObservationView": {
+      "type": "string",
+      "enum": [
+        "summary",
+        "timeline",
+        "contexts",
+        "attempt",
+        "export"
+      ]
+    }
+  }
+}

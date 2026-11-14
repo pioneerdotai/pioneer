@@ -61,6 +61,15 @@
       "additionalProperties": {
         "$ref": "#/$defs/ComposerCatalogRequest"
       }
+    },
+    "apps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PluginItem"
+      }
+    },
+    "app_request": {
+      "$ref": "#/$defs/ComposerCatalogRequest"
     }
   },
   "required": [
@@ -74,7 +83,9 @@
     "mcp_request",
     "tool_requests",
     "plugins",
-    "plugin_request"
+    "plugin_request",
+    "apps",
+    "app_request"
   ],
   "$defs": {
     "ComposerCapability": {
@@ -98,6 +109,53 @@
     },
     "ComposerCapabilityKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "App": {
+              "type": "object",
+              "properties": {
+                "expected_revision": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "icon": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/ImageReference"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "app_id": {
+                  "type": "string"
+                },
+                "dark_icon": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/ImageReference"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                }
+              },
+              "required": [
+                "app_id",
+                "expected_revision"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "App"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -333,6 +391,7 @@
     "ComposerPickerKind": {
       "type": "string",
       "enum": [
+        "apps",
         "skills",
         "mcp",
         "plugins"
@@ -340,6 +399,25 @@
     },
     "ComposerPickerSelection": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ComposerCapability"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "apps"
+            }
+          },
+          "required": [
+            "kind",
+            "capabilities"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -1213,6 +1291,16 @@
             }
           ],
           "default": null
+        },
+        "app": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -1255,6 +1343,132 @@
         "revision"
       ],
       "description": "Immutable image reference. Gateway inventory exposes a native storage link, never image bytes."
+    },
+    "AppMetadata": {
+      "type": "object",
+      "properties": {
+        "has_ui": {
+          "type": "boolean",
+          "default": false
+        },
+        "icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppThemedIcon"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "composer_icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppThemedIcon"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "developer_logo": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppThemedIcon"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "developer_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "default_locale": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "localizations": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/AppLocalization"
+          }
+        }
+      },
+      "required": [
+        "categories",
+        "localizations"
+      ]
+    },
+    "AppThemedIcon": {
+      "type": "object",
+      "properties": {
+        "light": {
+          "$ref": "#/$defs/ImageReference"
+        },
+        "dark": {
+          "$ref": "#/$defs/ImageReference"
+        }
+      },
+      "required": [
+        "light",
+        "dark"
+      ]
+    },
+    "AppLocalization": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shortDescription": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "longDescription": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": []
     }
   }
 }

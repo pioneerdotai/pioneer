@@ -323,6 +323,11 @@ macro_rules! schema_doc {
 
 pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
     vec![
+        schema_doc!("app_view_params.json", crate::AppViewParams),
+        schema_doc!("app_view_bootstrap.json", crate::AppViewBootstrap),
+        schema_doc!("app_view_lease_params.json", crate::AppViewLeaseParams),
+        schema_doc!("app_view_lease_response.json", crate::AppViewLeaseResponse),
+        schema_doc!("app_runtime_info.json", crate::AppRuntimeInfo),
         schema_doc!("apps_source_params.json", crate::AppsSourceParams),
         schema_doc!("apps_install_params.json", crate::AppsInstallParams),
         schema_doc!("apps_set_enabled_params.json", crate::AppsSetEnabledParams),

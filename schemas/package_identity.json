@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PackageIdentity",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/PackageKind"
+    }
+  },
+  "required": [
+    "kind",
+    "id"
+  ],
+  "$defs": {
+    "PackageKind": {
+      "description": "Product identity is distinct even when installation mechanics are shared.",
+      "type": "string",
+      "enum": [
+        "plugin",
+        "app"
+      ]
+    }
+  }
+}

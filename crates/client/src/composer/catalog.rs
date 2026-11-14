@@ -294,7 +294,7 @@ impl ClientCore {
                     .description_for_locale(parent.description.as_deref(), locale);
             }
         }
-        let mut rows = crate::plugins::package_picker_rows(kind, selected, &parents, query);
+        let mut rows = crate::packages::package_picker_rows(kind, selected, &parents, query);
         for row in &mut rows {
             let parent = catalog.as_ref().and_then(|p| {
                 if kind == pioneer_protocol::PackageKind::App {
@@ -304,7 +304,7 @@ impl ClientCore {
                 }
             });
             row.selectable &= parent.is_some_and(|parent| {
-                crate::plugins::package_target_supported(
+                crate::packages::package_target_supported(
                     kind,
                     parent,
                     input.domain().capability_target,
@@ -801,7 +801,7 @@ impl ClientCore {
                     .iter()
                     .find(|p| p.id == plugin_id);
                     let Some(parent) = parent.filter(|p| {
-                        crate::plugins::package_target_supported(
+                        crate::packages::package_target_supported(
                             kind,
                             p,
                             draft.domain().capability_target,
@@ -809,7 +809,7 @@ impl ClientCore {
                     }) else {
                         return self.reject_intent();
                     };
-                    let Some(capability) = crate::plugins::package_capability(kind, parent) else {
+                    let Some(capability) = crate::packages::package_capability(kind, parent) else {
                         return self.reject_intent();
                     };
                     Some(capability)
@@ -912,7 +912,7 @@ impl ClientCore {
                                         .id == c.id
                                     })
                                     .is_none_or(|p| {
-                                        !crate::plugins::package_target_supported(
+                                        !crate::packages::package_target_supported(
                                             kind,
                                             p,
                                             draft.domain().capability_target,

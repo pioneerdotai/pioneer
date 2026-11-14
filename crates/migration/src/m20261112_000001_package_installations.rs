@@ -198,10 +198,21 @@ impl MigrationTrait for Migration {
         )
         .await?;
         m.create_table(Table::create().table("app_installation")
-            .col(text("id").primary_key()).col(text("slug").unique_key())
+            .col(text("id").primary_key()).col(text("slug"))
             .col(text("manifest_json").check(Expr::cust("json_valid(manifest_json) AND json_type(manifest_json)='object' AND json_type(manifest_json,'$.slug')='text' AND json_extract(manifest_json,'$.slug')=slug")))
             .col(text("localizations_json").default("{}").check(Expr::cust("json_valid(localizations_json) AND json_type(localizations_json)='object'")))
             .foreign_key(ForeignKey::create().from("app_installation", "id").to("package_installation", "id").on_delete(ForeignKeyAction::Restrict)).to_owned()).await?;
+        // Apps reserve a slug within the parent's workspace. The index serves
+        // that lookup; the joined uniqueness guard is installed below. This
+        // table starts empty, so no existing App rows are scanned or rebuilt.
+        m.create_index(
+            Index::create()
+                .name("ix_app_slug")
+                .table("app_installation")
+                .col("slug")
+                .to_owned(),
+        )
+        .await?;
         rename(m, "plugin_component", "package_component").await?;
         rename_column(m, "package_component", "plugin_id", "package_id").await?;
         // A single persisted selection. Old snapshots decode kind=plugin by default;
@@ -389,6 +400,7 @@ const PACKAGE_TRIGGERS: &[&str] = &[
     "package_component_identity",
     "plugin_extension_insert",
     "app_extension_insert",
+    "app_workspace_slug_insert",
     "plugin_extension_identity",
     "app_extension_identity",
     "plugin_extension_delete",
@@ -449,6 +461,16 @@ CREATE TRIGGER app_extension_insert BEFORE INSERT ON app_installation
 WHEN NOT EXISTS (SELECT 1 FROM package_installation WHERE id=NEW.id AND kind='app')
  OR EXISTS (SELECT 1 FROM plugin_installation WHERE id=NEW.id)
 BEGIN SELECT RAISE(ABORT,'app extension parent mismatch'); END;
+-- A UNIQUE index cannot span metadata and the operational parent table.
+-- Workspace, App id and slug are immutable under the identity guards.
+CREATE TRIGGER app_workspace_slug_insert BEFORE INSERT ON app_installation
+WHEN EXISTS (
+ SELECT 1 FROM app_installation a
+ JOIN package_installation existing ON existing.id=a.id
+ JOIN package_installation incoming ON incoming.id=NEW.id
+ WHERE a.slug=NEW.slug AND existing.workspace_id=incoming.workspace_id
+)
+BEGIN SELECT RAISE(ABORT,'app slug already installed in workspace'); END;
 CREATE TRIGGER plugin_extension_identity BEFORE UPDATE OF id ON plugin_installation
 WHEN NEW.id!=OLD.id
 BEGIN SELECT RAISE(ABORT,'plugin extension identity immutable'); END;

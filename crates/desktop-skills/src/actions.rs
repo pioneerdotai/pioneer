@@ -71,7 +71,7 @@ impl SkillsCatalogView {
     fn send(&mut self, intent: SkillsIntent, cx: &mut Context<Self>) {
         if let Some(w) = self.input.navigation_input.workspace_id() {
             let failed = if let Some((workspace, parent)) = self.plugin_parent() {
-                use pioneer_client::plugins::runtime::PluginIntent;
+                use pioneer_client::packages::runtime::PluginIntent;
                 let intent = match intent {
                     SkillsIntent::Policy {
                         skill_id,

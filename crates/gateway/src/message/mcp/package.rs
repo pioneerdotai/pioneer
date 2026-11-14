@@ -2,7 +2,7 @@
 use anyhow::Result;
 use pioneer_crud::PluginOwnershipWrite;
 use pioneer_mcp::{InstallParseContext, McpInstallPlan, McpScopeKind, parse_install_config};
-use pioneer_plugins::PackageMcpServer;
+use pioneer_packages::PackageMcpServer;
 use std::path::Path;
 
 pub(crate) fn package_install_plan(
@@ -12,16 +12,16 @@ pub(crate) fn package_install_plan(
     workspace: &str,
     owner: &PluginOwnershipWrite,
 ) -> Result<McpInstallPlan> {
-    let config = pioneer_plugins::package_mcp::resolve_for(
+    let config = pioneer_packages::package_mcp::resolve_for(
         server,
         root,
         data,
         match owner.kind {
             pioneer_protocol::PackageKind::Plugin => {
-                pioneer_plugins::package_mcp::PackageRootKind::Plugin
+                pioneer_packages::package_mcp::PackageRootKind::Plugin
             }
             pioneer_protocol::PackageKind::App => {
-                pioneer_plugins::package_mcp::PackageRootKind::App
+                pioneer_packages::package_mcp::PackageRootKind::App
             }
         },
     )?;
@@ -70,7 +70,7 @@ mod tests {
         }
     }
     fn server(config: &Value) -> PackageMcpServer {
-        pioneer_plugins::load_mcp(
+        pioneer_packages::load_mcp(
             json!({"mcpServers":{"zenmoney":config}})
                 .to_string()
                 .as_bytes(),

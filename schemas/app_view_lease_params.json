@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppViewLeaseParams",
+  "type": "object",
+  "properties": {
+    "relative_url": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "relative_url"
+  ]
+}

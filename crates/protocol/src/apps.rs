@@ -178,6 +178,10 @@ pub struct AppsMutationResponse {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AppsChangedNotification {
+    #[serde(default)]
+    pub runtime_only: bool,
+    #[serde(default)]
+    pub execution_id: Option<String>,
     pub workspace_id: String,
     pub app_id: String,
     pub revision: i64,
@@ -211,6 +215,9 @@ pub struct AppLocalization {
 /// Verified presentation snapshot only; native authority remains in components.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AppMetadata {
+    #[serde(default)]
+    pub has_ui: bool,
+    #[serde(default)]
     pub icon: Option<AppThemedIcon>,
     pub composer_icon: Option<AppThemedIcon>,
     pub developer_logo: Option<AppThemedIcon>,
@@ -289,3 +296,31 @@ pub fn canonical_app_locale(value: &str) -> Result<String, &'static str> {
         .map(|locale| locale.to_string())
         .map_err(|_| "invalid_locale")
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AppViewParams { pub workspace_id: String, pub app_id: String }
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AppViewBootstrap {
+    pub package_revision: i64,
+    pub relative_url: crate::AuthSecretString,
+    pub expires_at: u64,
+    pub execution_id: String,
+    pub title: String,
+}
+
+
+/// Installation/component state remains on AppItem. This is live execution state.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AppRuntimeInfo {
+    pub state: String,
+    pub execution_id: Option<String>,
+    pub diagnostic: Option<String>,
+    pub logs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AppViewLeaseParams { pub relative_url: crate::AuthSecretString }
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AppViewLeaseResponse { pub expires_at: u64 }

@@ -1,5 +1,5 @@
-fn snapshot_limits() -> pioneer_plugins::Limits {
-    pioneer_plugins::Limits {
+fn snapshot_limits() -> pioneer_packages::Limits {
+    pioneer_packages::Limits {
         expanded_bytes: 50 * 1024 * 1024,
         entry_bytes: 1024 * 1024,
         entries: 2048,
@@ -8,6 +8,7 @@ fn snapshot_limits() -> pioneer_plugins::Limits {
     }
 }
 
+use pioneer_packages::*;
 use pioneer_plugins::*;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs};

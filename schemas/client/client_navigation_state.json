@@ -176,6 +176,44 @@
         {
           "type": "object",
           "properties": {
+            "component": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PluginComponentKey"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "app"
+            },
+            "app_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "app_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "apps"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "kind": {
               "type": "string",
               "const": "plugins"

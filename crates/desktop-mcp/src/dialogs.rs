@@ -16,8 +16,8 @@ pub(crate) struct McpConfigForm {
     input: Entity<TextareaState>,
     workspace: String,
     plugin_target: Option<(String, String)>,
-    plugin_receipt: Option<pioneer_client::plugins::runtime::PluginCommandReceipt>,
-    origin: pioneer_client::plugins::runtime::PluginCommandOrigin,
+    plugin_receipt: Option<pioneer_client::packages::runtime::PluginCommandReceipt>,
+    origin: pioneer_client::packages::runtime::PluginCommandOrigin,
     plugin_unknown: bool,
     authorization: Option<(u64, u64)>,
     operation: Option<u64>,
@@ -281,7 +281,7 @@ impl McpCatalogView {
                     .submit_plugin_command(
                         &form.workspace,
                         parent,
-                        pioneer_client::plugins::runtime::PluginIntent::ConfigureMcp {
+                        pioneer_client::packages::runtime::PluginIntent::ConfigureMcp {
                             server_id: child.clone(),
                             body: form.input.read(cx).value().to_string(),
                         },

@@ -35,7 +35,7 @@ pub fn build_app_upload_archive(
     );
     if metadata.is_file() {
         use std::io::Read;
-        const MAX_BYTES: usize = 64 * 1024 * 1024;
+        const MAX_BYTES: usize = pioneer_apps::MAX_UPLOAD_ARCHIVE_BYTES;
         anyhow::ensure!(metadata.len() <= MAX_BYTES as u64, "archive_input_limit");
         let mut options = fs::OpenOptions::new();
         options.read(true);
@@ -99,17 +99,8 @@ pub fn build_app_upload_archive(
         });
     }
     anyhow::ensure!(metadata.is_dir(), "source_kind");
-    let (_, snapshot) = pioneer_plugins::app::SelectionPlan::capture(
-        source,
-        pioneer_plugins::Limits {
-            expanded_bytes: 50 * 1024 * 1024,
-            entry_bytes: 10 * 1024 * 1024,
-            entries: 4096,
-            depth: 64,
-            components: 256,
-        },
-        &cancelled,
-    )?;
+    let (_, snapshot) =
+        pioneer_apps::SelectionPlan::capture(source, pioneer_apps::PACKAGE_LIMITS, &cancelled)?;
     build_app_snapshot_archive(&snapshot, cancelled)
 }
 
@@ -285,10 +276,11 @@ fn build_upload_archive(source_root: &Path, root_name: String) -> Result<SkillUp
 /// The delivery controller retains these bytes through preview/install using an
 /// App-purpose upload; Gateway independently validates the extracted selection.
 pub fn build_app_snapshot_archive(
-    snapshot: &pioneer_plugins::Snapshot,
+    snapshot: &pioneer_packages::Snapshot,
     cancelled: impl Fn() -> bool,
 ) -> Result<SkillUploadArchive> {
-    use pioneer_plugins::{Entry, app::SelectionPlan};
+    use pioneer_apps::SelectionPlan;
+    use pioneer_packages::Entry;
     let manifest = SelectionPlan::validate_package(snapshot)?;
     let encoder = GzBuilder::new()
         .mtime(0)
@@ -355,6 +347,10 @@ pub fn build_app_snapshot_archive(
         bail!("cancelled");
     }
     let bytes = builder.into_inner()?.finish()?;
+    anyhow::ensure!(
+        bytes.len() <= pioneer_apps::MAX_UPLOAD_ARCHIVE_BYTES,
+        "archive_input_limit"
+    );
     Ok(SkillUploadArchive {
         file_name: format!("{root}.tar.gz"),
         sha256: hex::encode(Sha256::digest(&bytes)),
@@ -548,6 +544,50 @@ mod tests {
     use flate2::read::GzDecoder;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tar::Archive;
+
+    #[test]
+    fn app_folder_upload_accepts_a_prebuilt_library_larger_than_ten_mib() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("runtime")).unwrap();
+        let document = serde_json::json!({
+            "slug": "backend-app", "name": "Backend", "version": "1.0.0",
+            "shortDescription": "Prebuilt backend", "developer": {"name": "Author"},
+            "icon": {"light": "icon.png", "dark": "icon.png"},
+            "runtime": {
+                "environment": "node", "cwd": "runtime", "command": ["node", "start.js"],
+                "port": 3000, "readiness": {"path": "/healthz"}
+            }
+        });
+        fs::write(root.path().join("app.json"), document.to_string()).unwrap();
+        fs::write(root.path().join("icon.png"), hex::decode(
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082"
+        ).unwrap()).unwrap();
+        fs::write(
+            root.path().join("runtime/start.js"),
+            b"// Prebuilt entry point\n",
+        )
+        .unwrap();
+        let library_bytes = 18 * 1024 * 1024;
+        fs::File::create(root.path().join("runtime/library.so"))
+            .unwrap()
+            .set_len(library_bytes)
+            .unwrap();
+
+        let upload = build_app_upload_archive(root.path(), || false).unwrap();
+        let mut archive = Archive::new(GzDecoder::new(upload.bytes.as_slice()));
+        let mut library_found = false;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().as_ref() == Path::new("backend-app/runtime/library.so") {
+                assert_eq!(
+                    io::copy(&mut entry, &mut io::sink()).unwrap(),
+                    library_bytes
+                );
+                library_found = true;
+            }
+        }
+        assert!(library_found);
+    }
 
     #[test]
     fn build_skill_upload_archive_is_stable_for_unchanged_input() {

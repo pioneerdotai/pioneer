@@ -74,7 +74,7 @@ impl McpCatalogView {
                     .plugin_intent_for(
                         workspace,
                         parent,
-                        pioneer_client::plugins::runtime::PluginIntent::Mcp { intent },
+                        pioneer_client::packages::runtime::PluginIntent::Mcp { intent },
                     )
                     .outcome()
                     != pioneer_client::core::ClientTransitionOutcome::Changed

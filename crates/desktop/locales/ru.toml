@@ -448,6 +448,13 @@ hide_others = "Скрыть остальные"
 show_all = "Показать все"
 quit = "Выйти из Pioneer"
 
+[menu.edit]
+name = "Правка"
+cut = "Вырезать"
+copy = "Копировать"
+paste = "Вставить"
+select_all = "Выделить всё"
+
 [menu.about]
 version = "Версия %{version}"
 copyright = "© Pioneer Contributors"

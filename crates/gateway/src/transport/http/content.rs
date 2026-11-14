@@ -614,7 +614,10 @@ impl Drop for StreamBodyState {
     }
 }
 
-fn map_stream_admission(error: StreamAdmissionError, request_id: RequestId) -> HttpError {
+pub(super) fn map_stream_admission(
+    error: StreamAdmissionError,
+    request_id: RequestId,
+) -> HttpError {
     let reason_code = match error {
         StreamAdmissionError::GlobalCapacity => "global_capacity",
         StreamAdmissionError::PrincipalCapacity => "principal_capacity",

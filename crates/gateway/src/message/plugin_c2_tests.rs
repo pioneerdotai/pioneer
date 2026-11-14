@@ -271,7 +271,7 @@ async fn cli_restore_requires_committed_ready_bindings_and_current_parent_author
         .await
         .unwrap();
     assert!(
-        super::super::plugins::validate_cli_plugin_selection(
+        super::super::packages::validate_cli_plugin_selection(
             &harness.crud_store,
             &harness.workspace_id,
             "c2-ready-turn"
@@ -346,7 +346,7 @@ async fn cli_restore_requires_committed_ready_bindings_and_current_parent_author
         .await
         .unwrap();
     assert!(
-        super::super::plugins::validate_cli_plugin_selection(
+        super::super::packages::validate_cli_plugin_selection(
             &harness.crud_store,
             &harness.workspace_id,
             "c2-ready-turn"
@@ -391,7 +391,7 @@ async fn cli_restore_requires_committed_ready_bindings_and_current_parent_author
         .await
         .unwrap();
     assert!(
-        super::super::plugins::validate_cli_plugin_selection(
+        super::super::packages::validate_cli_plugin_selection(
             &harness.crud_store,
             &harness.workspace_id,
             "c2-ready-turn"
@@ -554,7 +554,7 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
     }))
     .unwrap();
     std::fs::write(package.join("plugin.json"), &manifest).unwrap();
-    let snapshot = pioneer_plugins::Snapshot::capture(
+    let snapshot = pioneer_packages::Snapshot::capture(
         &package,
         harness.processor.package_delivery_context().plugin_limits(),
         || false,
@@ -970,7 +970,7 @@ fn app_selection_preserves_both_parent_domains_and_blocks_owned_leaf_bypass() {
         assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[raw]).await.is_err());
         assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[pioneer_protocol::package_capability(pioneer_protocol::PackageKind::Plugin,&app,1)]).await.is_err());
         assert!(harness.processor.normalize_turn_skill_capabilities("foreign-workspace",&[selected.clone()]).await.is_err());
-        let guards=super::super::plugins::acquire_plugin_selection_admission(&harness.crud_store,&harness.processor.plugin_mutation_locks,&harness.workspace_id,&snapshot).await.unwrap();drop(guards);
+        let guards=super::super::packages::acquire_plugin_selection_admission(&harness.crud_store,&harness.processor.plugin_mutation_locks,&harness.workspace_id,&snapshot).await.unwrap();drop(guards);
         harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&app,1,"updating",false,"{\"kind\":\"enable\"}").await.unwrap();
         assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[selected]).await.is_err());
         assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[plugin_selected]).await.is_ok());

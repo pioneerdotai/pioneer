@@ -119,6 +119,10 @@ pub mod methods {
     pub const APPS_RETRY: &str = "apps/retry";
     pub const APPS_CONTINUE: &str = "apps/continue";
     pub const APPS_SET_ENABLED: &str = "apps/set_enabled";
+    pub const APPS_RUNTIME_INFO: &str = "apps/runtime_info";
+    pub const APPS_RENEW_VIEW: &str = "apps/renew_view";
+    pub const APPS_CLOSE_VIEW: &str = "apps/close_view";
+    pub const APPS_OPEN_VIEW: &str = "apps/open_view";
     pub const APPS_LIST: &str = "apps/list";
     pub const APPS_DETAILS: &str = "apps/details";
     pub const APPS_CHANGED: &str = "apps/changed";

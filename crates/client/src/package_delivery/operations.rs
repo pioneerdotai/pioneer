@@ -1347,7 +1347,7 @@ mod tests {
     fn skill_policy_remove_failure_retry_and_access_fence_share_one_controller() {
         let (core, receiver) = fixture();
         let (_plugins, assert_plugins_quiet) =
-            crate::plugins::runtime::tests::watch_plugin_reads(&core);
+            crate::packages::runtime::tests::watch_plugin_reads(&core);
         let id = skill('A').skill_id;
         let intent = || SkillsIntent::Policy {
             skill_id: id.clone(),
@@ -1547,7 +1547,7 @@ mod tests {
     fn upload_update_completes_once_and_stale_effect_errors_do_not_cancel_next_chunk() {
         let (core, receiver) = fixture();
         let (_plugins, assert_plugins_quiet) =
-            crate::plugins::runtime::tests::watch_plugin_reads(&core);
+            crate::packages::runtime::tests::watch_plugin_reads(&core);
         let before = core.skills_catalog_snapshot("workspace").unwrap();
         let id = skill('A').skill_id;
         let operation = core

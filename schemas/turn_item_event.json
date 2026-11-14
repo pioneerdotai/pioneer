@@ -312,6 +312,22 @@
         "failed"
       ]
     },
+    "ImageReference": {
+      "description": "Immutable image reference. Published paths are authenticated Gateway storage links.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision"
+      ]
+    },
     "ItemDeltaStream": {
       "type": "string",
       "enum": [
@@ -1391,8 +1407,41 @@
           "format": "uint64",
           "minimum": 0
         },
+        "omittedPhaseBoundaries": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "outputSizes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolOutputMeasurements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parentOperationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phaseBoundaries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolPhaseBoundary"
+          }
+        },
         "pipelineStage": {
           "type": "string"
+        },
+        "processRunId": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "toolCallId": {
           "type": "string"
@@ -1469,6 +1518,36 @@
         "partial_success"
       ]
     },
+    "ToolOutputMeasurements": {
+      "type": "object",
+      "properties": {
+        "basis": {
+          "type": "string"
+        },
+        "capturedTextBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "modelProjectionTextBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "preparedSourceBytes": {
+          "description": "Prepared handler representation; persistence is a separate acknowledged fact.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "capturedTextBytes",
+        "preparedSourceBytes",
+        "modelProjectionTextBytes",
+        "basis"
+      ]
+    },
     "ToolOutputPolicySnapshot": {
       "type": "object",
       "properties": {
@@ -1526,6 +1605,41 @@
         "title",
         "metadata",
         "truncated"
+      ]
+    },
+    "ToolPhaseBoundary": {
+      "description": "Content-free source boundaries, bounded per invocation. All mono_ns values\nbelong to the enclosing observation's process_run_id.",
+      "type": "object",
+      "properties": {
+        "attemptId": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "localSequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "monoNs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "phase": {
+          "type": "string"
+        },
+        "tsUnixMs": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "phase",
+        "attemptId",
+        "tsUnixMs",
+        "monoNs",
+        "localSequence"
       ]
     },
     "ToolRecoveryIdempotencyMode": {
@@ -1814,6 +1928,46 @@
             "kind"
           ]
         }
+      ]
+    },
+    "TurnAppCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "appId": {
+          "type": "string"
+        },
+        "darkIcon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "appId",
+        "expectedRevision",
+        "label"
       ]
     },
     "TurnExecutionWindowBlockedNotification": {
@@ -4233,12 +4387,6 @@
           "type": "integer",
           "format": "int64"
         },
-        "label": {
-          "type": "string"
-        },
-        "pluginId": {
-          "type": "string"
-        },
         "icon": {
           "anyOf": [
             {
@@ -4247,8 +4395,13 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "pluginId": {
+          "type": "string"
         }
       },
       "required": [
@@ -4518,6 +4671,22 @@
           "type": "object",
           "properties": {
             "capability": {
+              "$ref": "#/$defs/TurnAppCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
               "$ref": "#/$defs/TurnSkillPackCapabilitySummary"
             },
             "type": {
@@ -4613,22 +4782,6 @@
         "snippet",
         "source"
       ]
-    },
-    "ImageReference": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        },
-        "revision": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "path",
-        "revision"
-      ],
-      "description": "Immutable image reference. Gateway inventory exposes a native storage link, never image bytes."
     }
   }
 }

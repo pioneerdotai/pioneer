@@ -41,13 +41,14 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 #[cfg(any(feature = "schema", test))]
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
+        schema_doc!("app_view_publication.json", crate::apps::AppViewPublication),
         schema_doc!(
             "plugin_operation_publication.json",
-            crate::plugins::runtime::PluginOperationPublication
+            crate::packages::runtime::PluginOperationPublication
         ),
         schema_doc!(
             "plugin_publication.json",
-            crate::plugins::runtime::PluginPublication
+            crate::packages::runtime::PluginPublication
         ),
         schema_doc!(
             "workspace_push_params.json",

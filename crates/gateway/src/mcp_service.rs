@@ -803,7 +803,7 @@ impl McpService {
     /// pending plan still fences execution. Startup and OAuth launch cannot.
     pub(crate) async fn reload_after_plugin_change(
         &self,
-        guard: &crate::message::plugins::PluginMutationGuard,
+        guard: &crate::message::packages::PluginMutationGuard,
     ) -> Result<()> {
         self.reload_workspace_with_store(
             self.runtime_store(),
@@ -816,7 +816,7 @@ impl McpService {
         &self,
         store: &CrudStore,
         row: &McpServerInstallationRecord,
-        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
+        admitted: Option<&crate::message::packages::PluginMutationGuard>,
     ) -> Result<bool> {
         if row.scope_kind != "workspace" {
             return Ok(true);
@@ -850,7 +850,7 @@ impl McpService {
         &self,
         store: &CrudStore,
         workspace_id: &str,
-        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
+        admitted: Option<&crate::message::packages::PluginMutationGuard>,
     ) -> Result<()> {
         let rows = store
             .list_mcp_server_installations("workspace", workspace_id)
@@ -2125,7 +2125,7 @@ impl McpService {
         row: McpServerInstallationRecord,
         effective_secret_fingerprint: String,
         store: &CrudStore,
-        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
+        admitted: Option<&crate::message::packages::PluginMutationGuard>,
     ) -> Result<()> {
         let installation = installation_from_record(&row)?;
         let installation_id = row

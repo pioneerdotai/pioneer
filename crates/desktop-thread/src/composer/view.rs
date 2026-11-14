@@ -611,7 +611,7 @@ impl ComposerView {
                     menu
                 };
 
-                let menu = if can_use_skills && can_use_mcp {
+                let menu = if can_use_skills {
                     menu.item(Self::composer_add_menu_item(
                         t!("chat.composer.add_menu.apps").to_string().into(),
                         PioneerIconName::Plugin,

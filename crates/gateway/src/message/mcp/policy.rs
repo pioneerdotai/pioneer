@@ -4,7 +4,7 @@ struct McpPolicyChange {
     payload: McpPolicySetResponse,
     now: i64,
     lifecycle: tokio::sync::OwnedMutexGuard<()>,
-    plugin: Option<super::super::plugins::NativePluginMutation>,
+    plugin: Option<super::super::packages::NativePluginMutation>,
     request_id: RequestId,
 }
 
@@ -198,7 +198,7 @@ impl MessageProcessor {
                         Some(request_id.clone()),
                         INVALID_REQUEST_CODE,
                         MCP_ERROR_INVALID_REQUEST,
-                        super::super::plugins::native_plugin_error_code(&error),
+                        super::super::packages::native_plugin_error_code(&error),
                         json!({}),
                     )
                 })?,

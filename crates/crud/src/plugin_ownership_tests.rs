@@ -2138,38 +2138,46 @@ fn app_parent(id: &str, workspace: &str) -> crate::PackageRecord {
 }
 
 #[tokio::test]
-async fn app_slug_is_global_and_failed_reservation_leaves_no_orphan_parent() {
+async fn app_slug_is_workspace_scoped_and_failed_reservation_leaves_no_orphan_parent() {
     use sea_orm::{EntityTrait, Set};
     let store = test_store_with_workspace("ws-app-one").await;
     store
         .run_serialized_write(|| async {
-            pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
-                id: Set("ws-app-two".into()),
-                name: Set("Other workspace".into()),
-                is_active: Set(true),
-                is_current: Set(false),
-                created_at: Set(util::unix_to_datetime(1)),
-                updated_at: Set(util::unix_to_datetime(1)),
-            })
-            .exec(&store.connection)
-            .await?;
+            for workspace in ["ws-app-two", "ws-app-three"] {
+                pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+                    id: Set(workspace.into()),
+                    name: Set(workspace.into()),
+                    is_active: Set(true),
+                    is_current: Set(false),
+                    created_at: Set(util::unix_to_datetime(1)),
+                    updated_at: Set(util::unix_to_datetime(1)),
+                })
+                .exec(&store.connection)
+                .await?;
+            }
             Ok(())
         })
         .await
         .unwrap();
-    store
-        .insert_package_installation(&app_parent("app-one", "ws-app-one"))
+    let first = app_parent("app-one", "ws-app-one");
+    let second = app_parent("app-two", "ws-app-two");
+    let (one, two) = tokio::join!(
+        store.insert_package_installation(&first),
+        store.insert_package_installation(&second)
+    );
+    one.unwrap();
+    two.unwrap();
+    let error = store
+        .insert_package_installation(&app_parent("duplicate", "ws-app-one"))
         .await
-        .unwrap();
+        .unwrap_err();
     assert!(
-        store
-            .insert_package_installation(&app_parent("app-two", "ws-app-two"))
-            .await
-            .is_err()
+        error.to_string().contains("apps.slug_conflict"),
+        "wrong rejection: {error}"
     );
     assert!(
         store
-            .find_package_installation("app-two")
+            .find_package_installation("duplicate")
             .await
             .unwrap()
             .is_none()
@@ -2181,14 +2189,20 @@ async fn app_slug_is_global_and_failed_reservation_leaves_no_orphan_parent() {
             .unwrap()
             .is_none()
     );
-    let apps = store
-        .list_package_installations("ws-app-one", pioneer_protocol::PackageKind::App)
-        .await
-        .unwrap();
-    assert_eq!(
-        apps.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-        ["app-one"]
-    );
+    for (workspace, expected) in [
+        ("ws-app-one", vec!["app-one"]),
+        ("ws-app-two", vec!["app-two"]),
+        ("ws-app-three", vec![]),
+    ] {
+        let apps = store
+            .list_package_installations(workspace, pioneer_protocol::PackageKind::App)
+            .await
+            .unwrap();
+        assert_eq!(
+            apps.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            expected
+        );
+    }
     assert!(
         store
             .list_plugin_installations("ws-app-one")
@@ -2196,6 +2210,33 @@ async fn app_slug_is_global_and_failed_reservation_leaves_no_orphan_parent() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn concurrent_same_workspace_app_reservations_publish_one_installation() {
+    let store = test_store_with_workspace("ws-app-race").await;
+    let first = app_parent("candidate-one", "ws-app-race");
+    let second = app_parent("candidate-two", "ws-app-race");
+    let (one, two) = tokio::join!(
+        store.insert_package_installation(&first),
+        store.insert_package_installation(&second)
+    );
+    assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+    let installed = store
+        .list_package_installations("ws-app-race", pioneer_protocol::PackageKind::App)
+        .await
+        .unwrap();
+    assert_eq!(installed.len(), 1);
+    for (id, result) in [("candidate-one", one), ("candidate-two", two)] {
+        let row = store.find_package_installation(id).await.unwrap();
+        if let Err(error) = result {
+            assert!(error.to_string().contains("apps.slug_conflict"));
+            assert!(row.is_none(), "rejected reservation leaked its parent");
+        } else {
+            assert_eq!(installed[0].id, id);
+            assert_eq!(row.unwrap().workspace_id, "ws-app-race");
+        }
+    }
 }
 
 #[tokio::test]
@@ -2308,4 +2349,70 @@ async fn package_reload_preserves_structured_legacy_operation_diagnostic() {
     assert_eq!(reloaded.operation_error_json.as_deref(), Some(diagnostic));
     assert_eq!(reloaded.state, "installed");
     assert_eq!(reloaded.pending_json.as_deref(), Some("{}"));
+}
+
+#[tokio::test]
+async fn app_runtime_discovery_has_a_finite_frontier_and_advances_past_a_poison_row() {
+    let store = test_store_with_workspace("ws-runtime").await;
+    for index in 0..66 {
+        let id = format!("app-{index:03}");
+        let mut row = app_parent(&id, "ws-runtime");
+        row.name = id.clone();
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(row.app_manifest_json.as_deref().unwrap()).unwrap();
+        manifest["slug"] = id.into();
+        row.app_manifest_json = Some(manifest.to_string());
+        store.insert_package_installation(&row).await.unwrap();
+    }
+    store
+        .insert_plugin_installation(&parent("zzz-plugin", "ws-runtime"))
+        .await
+        .unwrap();
+    // Simulate an interrupted/corrupt domain extension through the project's
+    // writer-backed handle; valid CRUD publishes both rows atomically.
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM app_installation WHERE id='app-032'")
+        .await
+        .unwrap();
+    let maintenance = store.with_maintenance_access();
+    let frontier = maintenance.app_runtime_frontier().await.unwrap().unwrap();
+    assert_eq!(frontier, "app-065");
+    let mut later = app_parent("zzz-app", "ws-runtime");
+    later.name = "later-app".into();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(later.app_manifest_json.as_deref().unwrap()).unwrap();
+    manifest["slug"] = "later-app".into();
+    later.app_manifest_json = Some(manifest.to_string());
+    store.insert_package_installation(&later).await.unwrap();
+    let first = maintenance.app_runtime_page("", &frontier).await.unwrap();
+    assert_eq!(first.len(), 64);
+    assert!(
+        first
+            .iter()
+            .any(|(id, row)| id == "app-032" && row.is_none())
+    );
+    let second = maintenance
+        .app_runtime_page(&first.last().unwrap().0, &frontier)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        vec!["app-064", "app-065"]
+    );
+    assert!(
+        maintenance
+            .app_runtime_page("app-065", &frontier)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        maintenance.app_runtime_frontier().await.unwrap().as_deref(),
+        Some("zzz-app")
+    );
+    assert_eq!(
+        maintenance.database_connection().read_class(),
+        pioneer_sqlite::SqliteReadClass::Maintenance
+    );
 }

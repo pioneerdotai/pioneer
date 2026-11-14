@@ -1602,6 +1602,8 @@ impl MessageProcessor {
                         | methods::PLUGINS_DETAILS
                         | methods::APPS_LIST
                         | methods::APPS_DETAILS
+                        | methods::APPS_RUNTIME_INFO
+                        | methods::APPS_OPEN_VIEW
                         | methods::CLI_RUNTIME_LIST
                         | methods::CLI_RUNTIME_GET
                         | methods::CLI_RUNTIME_STATUS
@@ -1657,7 +1659,9 @@ impl MessageProcessor {
                     methods::PLUGINS_LIST
                     | methods::PLUGINS_DETAILS
                     | methods::APPS_LIST
-                    | methods::APPS_DETAILS => params
+                    | methods::APPS_DETAILS
+                    | methods::APPS_RUNTIME_INFO
+                    | methods::APPS_OPEN_VIEW => params
                         .get("workspace_id")
                         .and_then(JsonValue::as_str)
                         .ok_or_else(invalid_params)?
@@ -6236,7 +6240,7 @@ impl MessageProcessor {
                     }
                 }
                 methods::PLUGINS_LIST | methods::PLUGINS_DETAILS | methods::PLUGINS_PREVIEW | methods::PLUGINS_INSTALL | methods::PLUGINS_SET_ENABLED | methods::PLUGINS_UPDATE | methods::PLUGINS_REMOVE | methods::PLUGINS_RETRY | methods::PLUGINS_CONTINUE => { self.plugins_request(&context, request).await; }
-                methods::APPS_LIST | methods::APPS_DETAILS | methods::APPS_PREVIEW | methods::APPS_INSTALL | methods::APPS_SET_ENABLED | methods::APPS_UPDATE | methods::APPS_REMOVE | methods::APPS_RETRY | methods::APPS_CONTINUE => { self.apps_request(&context, request).await; }
+                methods::APPS_RENEW_VIEW | methods::APPS_CLOSE_VIEW | methods::APPS_RUNTIME_INFO | methods::APPS_OPEN_VIEW | methods::APPS_LIST | methods::APPS_DETAILS | methods::APPS_PREVIEW | methods::APPS_INSTALL | methods::APPS_SET_ENABLED | methods::APPS_UPDATE | methods::APPS_REMOVE | methods::APPS_RETRY | methods::APPS_CONTINUE => { self.apps_request(&context, request).await; }
                 methods::SKILLS_INSTALL => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsInstallParams>(params_value) {

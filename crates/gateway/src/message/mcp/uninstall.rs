@@ -90,7 +90,7 @@ impl MessageProcessor {
                         Some(request_id.clone()),
                         INVALID_REQUEST_CODE,
                         MCP_ERROR_INVALID_REQUEST,
-                        super::super::plugins::native_plugin_error_code(&error),
+                        super::super::packages::native_plugin_error_code(&error),
                         json!({}),
                     )
                 })?,
@@ -112,7 +112,7 @@ impl MessageProcessor {
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             MCP_ERROR_INTERNAL,
-                            super::super::plugins::native_plugin_error_code(&error),
+                            super::super::packages::native_plugin_error_code(&error),
                             json!({}),
                         )
                     })?;

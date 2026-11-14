@@ -27,6 +27,7 @@ mod epic5_observability;
 mod helpers;
 mod hook_run_store;
 mod hook_runtime;
+mod host_api;
 mod human_interaction;
 mod identity;
 mod images;
@@ -1112,6 +1113,7 @@ async fn run_gateway_until_shutdown_inner(
     message_processor
         .shutdown_provider_readiness_supervisor()
         .await;
+    message_processor.shutdown_app_runtimes().await;
     message_processor.shutdown_skills_watcher().await;
     message_processor.shutdown_resilience_workers().await;
     let patch_telemetry = pioneer_tools::apply_patch::patch_telemetry().snapshot();

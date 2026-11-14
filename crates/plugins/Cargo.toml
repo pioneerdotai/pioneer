@@ -7,17 +7,15 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 url.workspace = true
-semver.workspace = true
-libc.workspace = true
-image.workspace = true
-pioneer-mcp.workspace = true
-pioneer-skills.workspace = true
+pioneer-packages.workspace = true
 pioneer-protocol.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+pioneer-mcp.workspace = true
+pioneer-skills.workspace = true

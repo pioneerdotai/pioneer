@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppViewBootstrap",
+  "type": "object",
+  "properties": {
+    "execution_id": {
+      "type": "string"
+    },
+    "expires_at": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "package_revision": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "relative_url": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "package_revision",
+    "relative_url",
+    "expires_at",
+    "execution_id",
+    "title"
+  ]
+}

@@ -366,3 +366,5 @@
 "apps.unavailable" = "अनुपलब्ध"
 "apps.retry" = "फिर कोशिश करें"
 "apps.stale" = "चुना गया संस्करण अब नवीनतम नहीं है"
+
+"apps.view" = "App view"

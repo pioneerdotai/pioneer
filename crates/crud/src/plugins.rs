@@ -219,6 +219,7 @@ impl CrudStore {
             .map(|metadata| crate::repositories::plugin_metadata::prepare(&parent.id, metadata))
             .transpose()?;
         let row = parent.clone();
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| {
             let row = row.clone();
             let prepared = prepared.clone();
@@ -285,6 +286,7 @@ impl CrudStore {
         if !matches!(state, "installed" | "interrupted") {
             bail!("invalid plugin install outcome");
         }
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| {
             let error = error.clone();
             async move {
@@ -377,6 +379,7 @@ impl CrudStore {
             let _: serde_json::Value = serde_json::from_str(pending)?;
         }
         let row = parent.clone();
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| {
             let row = row.clone();
             async move {
@@ -576,6 +579,7 @@ impl CrudStore {
             bail!("invalid plugin mutation");
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| async move {
             let db = self.connection.begin().await?;
             let row = plugins::begin_mutation(
@@ -604,6 +608,7 @@ impl CrudStore {
         if !matches!(state, "installed" | "interrupted") {
             bail!("invalid plugin outcome");
         }
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| {
             let error = error.clone();
             async move {
@@ -634,6 +639,7 @@ impl CrudStore {
         .await
     }
     pub async fn delete_plugin_parent(&self, id: &str, revision: i64) -> Result<()> {
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| async move {
             let db = self.connection.begin().await?;
             plugins::delete_parent(&db, id, revision).await?;
@@ -688,6 +694,7 @@ impl CrudStore {
             bail!("plugin pending too large");
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| async move {
             let db = self.connection.begin().await?;
             plugins::interrupt_mutation(&db, id, revision, pending.into(), error.into()).await?;
@@ -778,6 +785,7 @@ impl CrudStore {
             bail!("invalid plugin repair");
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| async move {
             let db = self.connection.begin().await?;
             let row = plugins::resume_mutation(
@@ -810,6 +818,7 @@ impl CrudStore {
             bail!("plugin plan exceeds bound");
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| async move {
             let db = self.connection.begin().await?;
             let upload = crate::repositories::skill_upload_session::find_skill_upload_session(
@@ -901,6 +910,7 @@ impl CrudStore {
         let prepared = metadata
             .map(|metadata| crate::repositories::plugin_metadata::prepare(id, metadata))
             .transpose()?;
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| {
             let prepared = prepared.clone();
             async move {
@@ -959,6 +969,7 @@ impl CrudStore {
         upload_id: Option<&str>,
         metadata: &crate::PreparedAppMetadata,
     ) -> Result<()> {
+        let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
         self.run_serialized_write(|| async {
             let db = self.connection.begin().await?;
             plugins::publish_package(
@@ -1002,5 +1013,26 @@ impl CrudStore {
         };
         db.commit().await?;
         Ok(owner)
+    }
+}
+
+impl CrudStore {
+    pub async fn app_runtime_page(&self, after: &str, through: &str) -> Result<Vec<(String, Option<PackageRecord>)>> {
+        let db = self.connection.begin_read().await?;
+        let rows = plugins::app_runtime_page(&db, after, through, 64).await?;
+        db.commit().await?;
+        // Authored JSON parsing happens after releasing reader capacity. A
+        // rejected row advances the raw frontier without blocking later Apps.
+        Ok(rows.into_iter().map(|(parent,app)| { let id=parent.id.clone(); (id, PackageRecord::project(parent,None,app).ok()) }).collect())
+    }
+}
+
+
+impl CrudStore {
+    pub async fn app_runtime_frontier(&self) -> Result<Option<String>> {
+        let db = self.connection.begin_read().await?;
+        let frontier = plugins::app_runtime_frontier(&db).await?;
+        db.commit().await?;
+        Ok(frontier)
     }
 }

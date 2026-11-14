@@ -900,7 +900,7 @@ async fn count_turn_execution_window_terminal_items_query<C: ConnectionTrait>(
         .select_only()
         .column(turn_item::Column::ItemType)
         .column_as(
-            sea_orm::sea_query::Expr::col(turn_item::Column::Id).count(),
+            sea_orm::ExprTrait::count(sea_orm::sea_query::Expr::col(turn_item::Column::Id)),
             "item_count",
         )
         .group_by(turn_item::Column::ItemType)

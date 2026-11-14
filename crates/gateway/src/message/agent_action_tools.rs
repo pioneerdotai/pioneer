@@ -4257,7 +4257,7 @@ async fn dispatch_agent_action_outbox_row_inner(
         return Err(Failure::InvalidStart.into());
     }
     if let Some(snapshot) = &dispatch.plugin_selection {
-        let _admission = super::plugins::acquire_plugin_selection_admission(
+        let _admission = super::packages::acquire_plugin_selection_admission(
             processor.crud_store.as_ref(),
             &processor.plugin_mutation_locks,
             &execution.workspace_id,
@@ -5839,7 +5839,7 @@ impl AgentActionToolHandler {
         // graph and outbox preparation step above therefore leaves no phantom
         // child Turn behind when it fails.
         let plugin_guards = if let Some(snapshot) = &normalized_capabilities.plugin_selection {
-            let guards = super::plugins::acquire_plugin_selection_admission(
+            let guards = super::packages::acquire_plugin_selection_admission(
                 processor.crud_store.as_ref(),
                 &processor.plugin_mutation_locks,
                 &self.context.workspace_id,
