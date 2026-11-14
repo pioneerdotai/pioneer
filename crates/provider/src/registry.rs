@@ -2015,6 +2015,14 @@ mod tests {
             }
             Ok(self.catalog.limits(self.name(), model))
         }
+        async fn model_context_tiers(
+            &self,
+            model: &str,
+        ) -> Result<Option<pioneer_protocol::ProviderContextTiers>> {
+            // Use the same isolated snapshot as model_limits; the process-wide
+            // catalog is deliberately not bootstrapped by this fixture.
+            Ok(self.catalog.context_tiers(self.name(), model).cloned())
+        }
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
             let body = crate::providers::openrouter::render_chat_request_mode_for_test(
                 &self.catalog,
