@@ -2420,3 +2420,75 @@ async fn app_runtime_discovery_has_a_finite_frontier_and_advances_past_a_poison_
         pioneer_sqlite::SqliteReadClass::Maintenance
     );
 }
+
+#[tokio::test]
+async fn dev_app_identity_schema_restores_release_guard_and_refuses_unsafe_downgrade() {
+    use migration::{Migrator, MigratorTrait, SchemaManager};
+    use sea_orm::TransactionTrait;
+
+    let store = test_store_with_workspace("ws-dev-schema").await;
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == "m20261115_000001_dev_app_identity")
+        .expect("dev App identity migration");
+    // Exercise the migration on the project's serialized writer, with normal
+    // FK-off runtime settings. Table shape remains compatible across this DDL.
+    store
+        .run_serialized_write(|| async {
+            let db = store.connection.begin().await?;
+            migration.down(&SchemaManager::new(&*db)).await?;
+            db.commit().await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let release = app_parent("release", "ws-dev-schema");
+    store.insert_package_installation(&release).await.unwrap();
+    let mut dev = app_parent("dev-one", "ws-dev-schema");
+    dev.source_upload_id = "dev:source-one".into();
+    assert!(store.insert_package_installation(&dev).await.is_err());
+    assert!(
+        store
+            .find_package_installation("dev-one")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    store
+        .run_serialized_write(|| async {
+            let db = store.connection.begin().await?;
+            migration.up(&SchemaManager::new(&*db)).await?;
+            db.commit().await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store.insert_package_installation(&dev).await.unwrap();
+    let rejected = store
+        .run_serialized_write(|| async {
+            let db = store.connection.begin().await?;
+            migration.down(&SchemaManager::new(&*db)).await?;
+            db.commit().await?;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        rejected
+            .to_string()
+            .contains("Remove dev App connections before downgrading")
+    );
+    let mut other = app_parent("dev-two", "ws-dev-schema");
+    other.source_upload_id = "dev:source-two".into();
+    store.insert_package_installation(&other).await.unwrap();
+    let duplicate = app_parent("release-duplicate", "ws-dev-schema");
+    assert!(store.insert_package_installation(&duplicate).await.is_err());
+    assert!(
+        store
+            .find_package_installation("release-duplicate")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

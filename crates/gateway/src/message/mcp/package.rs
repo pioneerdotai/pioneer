@@ -5,13 +5,38 @@ use pioneer_mcp::{InstallParseContext, McpInstallPlan, McpScopeKind, parse_insta
 use pioneer_packages::PackageMcpServer;
 use std::path::Path;
 
-pub(crate) fn package_install_plan(
+#[cfg(test)]
+fn package_install_plan(
     server: &PackageMcpServer,
     root: &Path,
     data: &Path,
     workspace: &str,
     owner: &PluginOwnershipWrite,
 ) -> Result<McpInstallPlan> {
+    package_install_plan_mode(server, root, data, workspace, owner, false)
+}
+
+pub(crate) fn package_server_name(parent: &pioneer_crud::PackageRecord, member: &str) -> String {
+    if super::super::apps::dev::is_dev(parent) {
+        format!("dev_{}_{}", parent.id, member)
+    } else {
+        member.into()
+    }
+}
+
+pub(crate) fn package_install_plan_mode(
+    server: &PackageMcpServer,
+    root: &Path,
+    data: &Path,
+    workspace: &str,
+    owner: &PluginOwnershipWrite,
+    development: bool,
+) -> Result<McpInstallPlan> {
+    let name = if development {
+        format!("dev_{}_{}", owner.plugin_id, owner.member_key)
+    } else {
+        owner.member_key.clone()
+    };
     let config = pioneer_packages::package_mcp::resolve_for(
         server,
         root,
@@ -26,7 +51,7 @@ pub(crate) fn package_install_plan(
         },
     )?;
     let mut plan = parse_install_config(
-        &serde_json::json!({"mcpServers":{owner.member_key.clone():config}}).to_string(),
+        &serde_json::json!({"mcpServers":{(name):config}}).to_string(),
         InstallParseContext {
             scope_kind: McpScopeKind::Workspace,
             scope_key: workspace.to_owned(),

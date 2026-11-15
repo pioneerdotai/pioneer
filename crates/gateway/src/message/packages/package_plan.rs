@@ -2,14 +2,14 @@
 use super::*;
 
 #[derive(Clone)]
-pub(super) struct PackagePresentation {
+pub(in crate::message) struct PackagePresentation {
     pub name: String,
     pub version: Option<String>,
     pub description: Option<String>,
     pub metadata: PluginMetadata,
 }
 #[derive(Clone)]
-pub(super) struct PackagePlan {
+pub(in crate::message) struct PackagePlan {
     pub kind: PackageKind,
     pub presentation: PackagePresentation,
     pub tree_digest: String,
@@ -121,21 +121,7 @@ pub(super) fn load_package(snapshot: &Snapshot, kind: PackageKind) -> anyhow::Re
                 snapshot,
                 super::super::apps::architecture().unwrap_or("unsupported"),
             )?;
-            let doc = app.manifest.document();
-            let presentation = PackagePresentation {
-                name: app.manifest.slug().into(),
-                version: doc["version"].as_str().map(str::to_owned),
-                description: doc["shortDescription"].as_str().map(str::to_owned),
-                metadata: app_metadata(&app.manifest, &app.images, &app.localizations),
-            };
-            Ok(PackagePlan {
-                kind,
-                presentation,
-                tree_digest: app.tree_digest.clone(),
-                components: app.components.clone(),
-                diagnostics: app.diagnostics.clone(),
-                app: Some(app),
-            })
+            source_app_plan(app)
         }
     }
 }
@@ -151,4 +137,24 @@ pub(super) fn select_package_snapshot(
         &snapshot,
         super::super::apps::architecture().unwrap_or("unsupported"),
     )
+}
+
+pub(in crate::message) fn source_app_plan(
+    app: pioneer_apps::LoadedAppPackage,
+) -> anyhow::Result<PackagePlan> {
+    let doc = app.manifest.document();
+    let presentation = PackagePresentation {
+        name: app.manifest.slug().into(),
+        version: doc["version"].as_str().map(str::to_owned),
+        description: doc["shortDescription"].as_str().map(str::to_owned),
+        metadata: app_metadata(&app.manifest, &app.images, &app.localizations),
+    };
+    Ok(PackagePlan {
+        kind: PackageKind::App,
+        presentation,
+        tree_digest: app.tree_digest.clone(),
+        components: app.components.clone(),
+        diagnostics: app.diagnostics.clone(),
+        app: Some(app),
+    })
 }

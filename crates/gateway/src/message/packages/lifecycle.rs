@@ -78,8 +78,13 @@ pub(super) fn verified_package(
     limits: pioneer_packages::Limits,
 ) -> anyhow::Result<(Snapshot, PackagePlan)> {
     let package = Path::new(&parent.package_path);
-    let (snapshot, plan) =
-        package_snapshot_cancellable(package, cancellation, limits, parent.kind)?;
+    let (snapshot, plan) = if super::super::apps::dev::is_dev(parent) {
+        let snapshot = Snapshot::capture(package, limits, || cancellation.is_cancelled())?;
+        let plan = super::package_plan::source_app_plan(pioneer_apps::load_source(&snapshot)?)?;
+        (snapshot, plan)
+    } else {
+        package_snapshot_cancellable(package, cancellation, limits, parent.kind)?
+    };
     anyhow::ensure!(
         snapshot.tree_digest() == parent.package_fingerprint,
         "plugins.package_changed"
@@ -88,6 +93,87 @@ pub(super) fn verified_package(
 }
 
 impl MessageProcessor {
+    pub(in crate::message) async fn refresh_dev_app(
+        &self,
+        context: &RequestContext,
+        parent: &pioneer_crud::PackageRecord,
+        source: pioneer_apps::PreparedAppSource,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(super::super::apps::dev::is_dev(parent), "apps.not_dev");
+        let guard = self
+            .acquire_plugin_mutation(&parent.workspace_id, &parent.id, parent.revision)
+            .await?;
+        anyhow::ensure!(
+            guard.parent.pending_json.is_none(),
+            "apps.dev_mutation_pending"
+        );
+        anyhow::ensure!(
+            source.package.manifest.slug() == parent.name,
+            "apps.dev_slug_changed_remove_and_add"
+        );
+        let links = self.crud_store.list_plugin_components(&parent.id).await?;
+        let children = source
+            .package
+            .components
+            .iter()
+            .map(|component| {
+                let component = key(component);
+                let id = links
+                    .iter()
+                    .find(|l| l.kind == component.kind && l.member_key == component.member_key)
+                    .and_then(|l| l.skill_id.clone().or(l.mcp_installation_id.clone()))
+                    .unwrap_or_else(|| pioneer_protocol::generate_id(21));
+                ReservedChild {
+                    kind: component.kind,
+                    key: component.member_key,
+                    id,
+                }
+            })
+            .collect();
+        let action = PackageAction {
+            kind: "update".into(),
+            children,
+            target_fingerprint: source.package.tree_digest.clone(),
+            ..Default::default()
+        };
+        let next = Path::new(&parent.package_path).with_file_name("package-next");
+        guard
+            .fs(move |_| {
+                if next.exists() {
+                    std::fs::remove_dir_all(&next)?;
+                }
+                publish_package(&source.snapshot, &next)?;
+                Ok(())
+            })
+            .await?;
+        let updated = self
+            .crud_store
+            .begin_plugin_mutation(
+                &parent.workspace_id,
+                &parent.id,
+                parent.revision,
+                "updating",
+                parent.enabled,
+                &serde_json::to_string(&action)?,
+            )
+            .await?;
+        drop(guard);
+        let request = RequestId::new(pioneer_protocol::generate_id(21))?;
+        self.mutate_plugin(
+            context,
+            &request,
+            PluginsMutateParams {
+                workspace_id: parent.workspace_id.clone(),
+                plugin_id: parent.id.clone(),
+                expected_revision: updated.revision,
+                intent: PluginManagementIntent::Continue,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.error.message))?;
+        Ok(())
+    }
+
     pub(super) async fn preview_plugin_update(
         &self,
         context: &RequestContext,
@@ -299,7 +385,7 @@ impl MessageProcessor {
         }
         Ok((removed, authorization_changes, (snapshot, previous)))
     }
-    pub(super) async fn mutate_plugin(
+    pub(in crate::message) async fn mutate_plugin(
         &self,
         context: &RequestContext,
         request: &RequestId,
@@ -383,6 +469,9 @@ impl MessageProcessor {
             } => {
                 if before.is_some() || guard.parent.state == "removing" {
                     return Err(plugin_error(request, "plugins.use_continue_or_remove"));
+                }
+                if super::super::apps::dev::is_dev(&guard.parent) {
+                    return Err(plugin_error(request, "apps.dev_use_source"));
                 }
                 let owner = AuthenticatedTransferOwner::from_request_context(context);
                 {
@@ -671,6 +760,7 @@ impl MessageProcessor {
                 action
             }
             PluginManagementIntent::Remove { purge_data } => {
+                let purge_data = purge_data || super::super::apps::dev::is_dev(&guard.parent);
                 let links = self
                     .crud_store
                     .list_plugin_components(&guard.parent.id)
@@ -768,6 +858,20 @@ impl MessageProcessor {
                         if purge_data && Path::new(&parent.data_path).exists() {
                             std::fs::remove_dir_all(&parent.data_path)?;
                         }
+                        if purge_data && super::super::apps::dev::is_dev(parent) {
+                            let root = package.parent().context("apps.dev_invalid_storage")?;
+                            match std::fs::remove_file(root.join("dev.json")) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                            // Known resources only; never follow the source project.
+                            match std::fs::remove_dir(root) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                        }
                         Ok(())
                     })
                     .await?;
@@ -812,7 +916,15 @@ impl MessageProcessor {
                     if fs_action.kind == "update" {
                         swap_package_after_stop(package, &fs_action.target_fingerprint, limits)?;
                     }
-                    let (snapshot, plan) = package_snapshot(package, limits, parent.kind)?;
+                    let (snapshot, plan) = if super::super::apps::dev::is_dev(parent) {
+                        let snapshot = Snapshot::capture(package, limits, || false)?;
+                        let plan = super::package_plan::source_app_plan(
+                            pioneer_apps::load_source(&snapshot)?,
+                        )?;
+                        (snapshot, plan)
+                    } else {
+                        package_snapshot(package, limits, parent.kind)?
+                    };
                     let digest = snapshot.tree_digest();
                     let expected = &fs_action.target_fingerprint;
                     anyhow::ensure!(&digest == expected, "plugins.package_changed");
@@ -1013,7 +1125,7 @@ impl MessageProcessor {
                 request.clone(),
                 McpUninstallParams {
                     workspace_id: guard.parent.workspace_id.clone(),
-                    name: link.member_key.clone(),
+                    name: mcp::package::package_server_name(&guard.parent, &link.member_key),
                     scope_kind: pioneer_protocol::McpScopeKind::Workspace,
                 },
                 Some(&write),
@@ -1143,12 +1255,13 @@ impl MessageProcessor {
                     }
                 }
                 ComponentPlan::Mcp { server, .. } => {
-                    let plan = mcp::package::package_install_plan(
+                    let plan = mcp::package::package_install_plan_mode(
                         server,
                         Path::new(&guard.parent.package_path),
                         Path::new(&guard.parent.data_path),
                         &guard.parent.workspace_id,
                         &ownership,
+                        super::super::apps::dev::is_dev(&guard.parent),
                     )?;
                     self.install_mcp_plan(
                         context,
@@ -1312,7 +1425,7 @@ impl MessageProcessor {
                         .installation_lifecycle_guard(
                             "workspace",
                             &guard.parent.workspace_id,
-                            &link.member_key,
+                            &mcp::package::package_server_name(&guard.parent, &link.member_key),
                         )
                         .await;
                     self.mcp_service

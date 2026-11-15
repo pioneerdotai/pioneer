@@ -4,7 +4,7 @@ use anyhow::Context;
 mod lifecycle;
 use pioneer_crud::PluginOwnershipWrite;
 use pioneer_packages::{ComponentPlan, Entry, Snapshot};
-mod package_plan;
+pub(super) mod package_plan;
 use package_plan::{PackagePlan, load_package, select_package_snapshot};
 use pioneer_protocol::constants::methods;
 use pioneer_protocol::*;
@@ -720,7 +720,8 @@ impl MessageProcessor {
                             context,
                             id,
                             &workspace,
-                            &source.upload,
+                            Some(&source.upload),
+                            None,
                             &self.package_storage_root(&workspace, kind),
                             snapshot,
                             plan,
@@ -768,12 +769,13 @@ impl MessageProcessor {
         }
     }
 
-    async fn install_plugin(
+    pub(in crate::message) async fn install_plugin(
         &self,
         context: &RequestContext,
         request_id: &RequestId,
         workspace: &str,
-        upload: &pioneer_crud::SkillUploadSessionRecord,
+        upload: Option<&pioneer_crud::SkillUploadSessionRecord>,
+        dev: Option<super::apps::dev::DevSource>,
         runtime_root: &Path,
         snapshot: Snapshot,
         plan: PackagePlan,
@@ -784,12 +786,20 @@ impl MessageProcessor {
         let package = root.join("package");
         let data = root.join("data");
         let new_root = root.clone();
+        let source_id = match (upload, dev.as_ref()) {
+            (Some(upload), None) => upload.upload_id.clone(),
+            (None, Some(source)) if plan.kind == PackageKind::App => source.identity(workspace),
+            _ => return Err(plugin_error(request_id, "plugins.invalid_prepared_source")),
+        };
         let (mut staging, plan, pending) = super::package_delivery::prepare_cancellable(
             move |cancellation| -> anyhow::Result<_> {
                 let mut staging = super::package_delivery::TemporaryDirectory::new()?;
                 std::fs::create_dir_all(new_root.parent().context("plugins.root_invalid")?)?;
                 std::fs::create_dir(&new_root)?;
                 staging.remove_on_drop(new_root.clone());
+                if let Some(dev) = &dev {
+                    std::fs::write(new_root.join("dev.json"), serde_json::to_vec(dev)?)?;
+                }
                 let package = new_root.join("package");
                 publish_package_cancellable(&snapshot, &package, cancellation)?;
                 std::fs::create_dir(new_root.join("data"))?;
@@ -840,7 +850,7 @@ impl MessageProcessor {
             workspace_id: workspace.into(),
             name: plan.presentation.name.clone(),
             version: plan.presentation.version.clone(),
-            source_upload_id: upload.upload_id.clone(),
+            source_upload_id: source_id.clone(),
             package_path: package.to_string_lossy().into(),
             data_path: data.to_string_lossy().into(),
             package_fingerprint: plan.tree_digest.clone(),
@@ -896,33 +906,32 @@ impl MessageProcessor {
         };
         // Authentication ownership (not just connection ID) is rechecked through
         // the existing upload contract immediately before the atomic DB reserve.
-        let owner = AuthenticatedTransferOwner::from_request_context(context);
-        if let Err(error) = self
-            .revalidate_package_upload(&owner, workspace, &upload.upload_id, request_id, plan.kind)
-            .await
-        {
-            return Err(error);
+        if upload.is_some() {
+            let owner = AuthenticatedTransferOwner::from_request_context(context);
+            self.revalidate_package_upload(&owner, workspace, &source_id, request_id, plan.kind)
+                .await?;
         }
         // From dispatch onward cancellation/returned Err cannot establish rollback.
         staging.preserve();
-        if let Err(reserve_error) = self
-            .crud_store
-            .reserve_package_installation_with_metadata(
-                &parent,
-                context.connection_id(),
-                now.timestamp(),
-                (plan.kind == PackageKind::Plugin).then_some(&plan.presentation.metadata),
-            )
-            .await
-        {
+        let reserve = if upload.is_some() {
+            self.crud_store
+                .reserve_package_installation_with_metadata(
+                    &parent,
+                    context.connection_id(),
+                    now.timestamp(),
+                    (plan.kind == PackageKind::Plugin).then_some(&plan.presentation.metadata),
+                )
+                .await
+        } else {
+            self.crud_store.insert_package_installation(&parent).await
+        };
+        if let Err(reserve_error) = reserve {
             // A failed reserve response does not prove rollback. Match update's
             // conservative reconciliation: delete only after a successful read
             // proves that this upload has no durable parent. Read failure keeps
             // staging for recovery instead of deleting possibly committed bytes.
             if matches!(
-                self.crud_store
-                    .find_plugin_by_upload(&upload.upload_id)
-                    .await,
+                self.crud_store.find_plugin_by_upload(&source_id).await,
                 Ok(None)
             ) {
                 staging.remove_on_drop(root.clone());
@@ -943,10 +952,7 @@ impl MessageProcessor {
                 .limits_for_package(parent.kind),
             _lock: Arc::new(_parent_guard),
         };
-        self.skill_upload_owners
-            .lock()
-            .await
-            .remove(&upload.upload_id);
+        self.skill_upload_owners.lock().await.remove(&source_id);
 
         for (component, reserved) in plan.components.iter().zip(&pending.children) {
             let mut ownership = PluginOwnershipWrite {
@@ -980,8 +986,13 @@ impl MessageProcessor {
                     .map(|_| ())
                 }
                 ComponentPlan::Mcp { server, .. } => {
-                    match mcp::package::package_install_plan(
-                        server, &package, &data, workspace, &ownership,
+                    match mcp::package::package_install_plan_mode(
+                        server,
+                        &package,
+                        &data,
+                        workspace,
+                        &ownership,
+                        super::apps::dev::is_dev(&parent),
                     ) {
                         Ok(native) => self
                             .install_mcp_plan(
@@ -1358,6 +1369,18 @@ impl MessageProcessor {
         };
         let partial = diagnostics.iter().any(diagnostic_affects_status)
             || components.iter().any(|c| c.status != "installed");
+        if super::apps::dev::is_dev(parent) {
+            if let Some(name) = &mut metadata.display_name {
+                name.push_str(" (dev)");
+            }
+            if let Some(app) = &mut metadata.app {
+                for locale in app.localizations.values_mut() {
+                    if let Some(name) = &mut locale.name {
+                        name.push_str(" (dev)");
+                    }
+                }
+            }
+        }
         plugin_icon_links(&mut metadata, parent);
         Ok(PluginItem {
             id: parent.id.clone(),
@@ -1643,14 +1666,14 @@ impl MessageProcessor {
             let Some(id) = child.mcp_installation_id else {
                 continue;
             };
-            let name = &child.member_key;
+            let name = mcp::package::package_server_name(parent, &child.member_key);
             let _native = self
                 .mcp_service
-                .installation_lifecycle_guard("workspace", &parent.workspace_id, name)
+                .installation_lifecycle_guard("workspace", &parent.workspace_id, &name)
                 .await;
             let row = self
                 .crud_store
-                .find_mcp_server_installation("workspace", &parent.workspace_id, name)
+                .find_mcp_server_installation("workspace", &parent.workspace_id, &name)
                 .await?
                 .filter(|row| row.id.as_deref() == Some(id.as_str()))
                 .ok_or_else(|| anyhow::anyhow!("plugins.component_owner_changed"))?;

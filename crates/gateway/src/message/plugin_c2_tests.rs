@@ -1534,3 +1534,625 @@ async fn app_update_preserves_native_mcp_secret_override() {
     assert!(removed.removed, "App removal must finish: {removed:?}");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+// Source-only regression: NOT_RUN / NOT_COMPILED. Native MCP fixture is disabled;
+// no developer server, provider, process or VM is needed by this scenario.
+#[tokio::test]
+async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
+    let mut harness = setup_cli_runtime_security_harness(None).await;
+    let grants = crate::view_grants::ViewGrantService::new(&Default::default()).unwrap();
+    harness.processor.set_view_grant_service(grants.clone());
+    let root = tempfile::tempdir().unwrap();
+    let slug = "dev-app-fixture";
+    let release = install_rpc_app(&mut harness, root.path(), slug, false, true).await;
+    let workspace = harness.workspace_id.clone();
+    let project = root.path().join(slug);
+    let release_parent = harness
+        .crud_store
+        .find_package_installation(&release.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.join("app.json")).unwrap()).unwrap();
+    manifest["runtime"] = json!({"environment":"node","cwd":"not-built","command":["node","main.js"],"port":3000,"readiness":{"path":"/"}});
+    manifest["ui"] = json!({"path":"/"});
+    std::fs::write(project.join("app.json"), manifest.to_string()).unwrap();
+    let add = json!({"workspace_id":workspace,"project":project,"url":"http://127.0.0.1:9"});
+    let added = app_rpc(&mut harness, methods::APPS_DEV_ADD, add.clone()).await;
+    let id = added["id"].as_str().unwrap().to_owned();
+    assert_ne!(id, release.id);
+    assert_eq!(
+        app_rpc(&mut harness, methods::APPS_DEV_ADD, add).await["id"],
+        id
+    );
+    // Both transitions go through the same real MCP stop barrier as updates,
+    // removal and continuation. The release server has the same member key.
+    for enabled in [false, true] {
+        let parent = harness
+            .crud_store
+            .find_package_installation(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        let changed: pioneer_protocol::AppItem = serde_json::from_value(app_rpc(
+            &mut harness, methods::APPS_SET_ENABLED,
+            json!({"workspace_id":workspace,"app_id":id,"expected_revision":parent.revision,"enabled":enabled}),
+        ).await).unwrap();
+        assert_eq!(changed.enabled, enabled);
+        assert!(
+            harness
+                .crud_store
+                .find_package_installation(&release.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+    }
+    // Crash fixture: a real installed member's retry was reserved durably,
+    // then Gateway interrupted it before the common stop barrier ran.
+    let current = harness
+        .crud_store
+        .find_package_installation(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mcp_child = harness
+        .crud_store
+        .list_plugin_components(&id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|child| child.kind == "mcp")
+        .unwrap();
+    let pending = json!({"kind":"retry","target_fingerprint":current.package_fingerprint,
+        "children":[{"kind":"mcp","key":mcp_child.member_key,"id":mcp_child.mcp_installation_id}]})
+    .to_string();
+    let reserved = harness
+        .crud_store
+        .begin_plugin_mutation(
+            &workspace,
+            &id,
+            current.revision,
+            "updating",
+            true,
+            &pending,
+        )
+        .await
+        .unwrap();
+    harness
+        .crud_store
+        .interrupt_unfinished_plugins()
+        .await
+        .unwrap();
+    let resumed: pioneer_protocol::AppsMutationResponse = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_CONTINUE,
+            json!({"workspace_id":workspace,"app_id":id,"expected_revision":reserved.revision}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(resumed.app.unwrap().state, "installed");
+    let retained = harness
+        .crud_store
+        .list_plugin_components(&id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|child| child.kind == "mcp")
+        .unwrap();
+    assert_eq!(retained.member_key, mcp_child.member_key);
+    assert_eq!(retained.mcp_installation_id, mcp_child.mcp_installation_id);
+    let initial = harness
+        .crud_store
+        .find_package_installation(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    let storage = std::path::Path::new(&initial.package_path)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert_eq!(
+        harness
+            .crud_store
+            .list_plugin_components(&id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let mcp = harness
+        .crud_store
+        .list_mcp_server_installations("workspace", &workspace)
+        .await
+        .unwrap();
+    assert!(
+        mcp.iter()
+            .any(|server| server.name == format!("dev_{id}_mcp-{slug}"))
+    );
+    assert!(
+        mcp.iter()
+            .any(|server| server.name == format!("mcp-{slug}"))
+    );
+
+    harness.processor.start_dev_apps().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness.processor.app_view_status(&id).await.state != "ready" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The same authenticated Apps RPC used by Desktop returns the registered
+    // URL even with no listening dev server. Its grant is native lease control,
+    // never a browser resource URL for this App.
+    let first: pioneer_protocol::AppViewBootstrap = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_OPEN_VIEW,
+            json!({"workspace_id":workspace,"app_id":id}),
+        )
+        .await,
+    )
+    .unwrap();
+    let second: pioneer_protocol::AppViewBootstrap = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_OPEN_VIEW,
+            json!({"workspace_id":workspace,"app_id":id}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert!(first.development);
+    assert_eq!(first.dev_url.as_deref(), Some("http://127.0.0.1:9"));
+    assert_eq!(first.dev_url, second.dev_url);
+    assert_ne!(first.relative_url, second.relative_url);
+    for params in [
+        json!({"workspace_id":"foreign-workspace","app_id":id}),
+        json!({"workspace_id":workspace,"app_id":id,"dev_url":"http://localhost:4000"}),
+    ] {
+        let request = pioneer_protocol::generate_id(21);
+        harness.processor.process_request_for_connection(
+            harness.connection_id,
+            &json!({"jsonrpc":"2.0","id":request,"method":methods::APPS_OPEN_VIEW,"params":params}).to_string(),
+        ).await;
+        let response: serde_json::Value =
+            serde_json::from_str(&recv_jsonrpc_payload_by_id(&mut harness.rx, &request).await)
+                .unwrap();
+        assert!(response.get("error").is_some());
+        assert!(response.get("result").is_none());
+    }
+    let second_secret = second
+        .relative_url
+        .expose_secret()
+        .strip_prefix("/storage/app-views/")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    let scope = grants.app_scope(second_secret).unwrap();
+    let crate::view_grants::ViewGrantSubject::App(app_scope) = &scope.subject else {
+        panic!("expected App lease");
+    };
+    let connection = harness
+        .processor
+        .session_manager
+        .connection_context(harness.connection_id)
+        .await
+        .unwrap();
+    let authenticated = crate::request_context::AuthenticatedRequestContext::new(
+        connection.principal_arc().clone(),
+        None,
+        crate::request_context::SourceTransport::HttpStorage,
+        crate::request_context::RequestNetworkContext::Unavailable,
+        crate::request_context::CanonicalMethod::rpc(methods::APPS_OPEN_VIEW),
+    );
+    assert_eq!(
+        harness
+            .processor
+            .app_ui_endpoint(&authenticated, app_scope)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "apps.dev_direct_view_only"
+    );
+    app_rpc(
+        &mut harness,
+        methods::APPS_CLOSE_VIEW,
+        json!({"relative_url":first.relative_url}),
+    )
+    .await;
+    let renewed = app_rpc(
+        &mut harness,
+        methods::APPS_RENEW_VIEW,
+        json!({"relative_url":second.relative_url}),
+    )
+    .await;
+    assert!(renewed["expires_at"].as_u64().unwrap() > 0);
+    std::fs::write(project.join("app.json"), "{invalid").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness
+            .processor
+            .app_view_status(&id)
+            .await
+            .failure
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let rejected = harness
+        .crud_store
+        .find_package_installation(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected.package_fingerprint, initial.package_fingerprint);
+    assert_eq!(rejected.revision, initial.revision);
+    assert!(grants.app_scope(second_secret).is_ok());
+
+    // Manifest and locale events must publish metadata and remove native members.
+    manifest.as_object_mut().unwrap().remove("skills");
+    manifest.as_object_mut().unwrap().remove("mcp");
+    std::fs::write(project.join("en.json"), r#"{"name":"Dev changed"}"#).unwrap();
+    std::fs::write(project.join("app.json"), manifest.to_string()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let current = harness
+                .crud_store
+                .find_package_installation(&id)
+                .await
+                .unwrap()
+                .unwrap();
+            if current.revision > initial.revision
+                && current.state == "installed"
+                && current.pending_json.is_none()
+                && harness
+                    .processor
+                    .app_view_status(&id)
+                    .await
+                    .failure
+                    .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let details: pioneer_protocol::AppItem = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_DETAILS,
+            json!({"workspace_id":workspace,"app_id":id}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(details.name, "Dev changed (dev)");
+    assert!(grants.app_scope(second_secret).is_err());
+    assert!(details.components.is_empty());
+    assert_eq!(
+        harness
+            .crud_store
+            .list_plugin_components(&release.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let mcp = harness
+        .crud_store
+        .list_mcp_server_installations("workspace", &workspace)
+        .await
+        .unwrap();
+    assert_eq!(mcp.len(), 1);
+    assert_eq!(mcp[0].name, format!("mcp-{slug}"));
+
+    // Drop/recreate the observer owner against the same durable registration.
+    harness.processor.shutdown_dev_apps().await;
+    harness.processor.start_dev_apps().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness.processor.app_view_status(&id).await.state != "ready" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let offline = root.path().join("offline-project");
+    std::fs::rename(&project, &offline).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness
+            .processor
+            .app_view_status(&id)
+            .await
+            .failure
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        harness
+            .crud_store
+            .find_package_installation(&id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    std::fs::rename(&offline, &project).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness
+            .processor
+            .app_view_status(&id)
+            .await
+            .failure
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let disabled_view: pioneer_protocol::AppViewBootstrap = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_OPEN_VIEW,
+            json!({"workspace_id":workspace,"app_id":id}),
+        )
+        .await,
+    )
+    .unwrap();
+    let disabled_secret = disabled_view
+        .relative_url
+        .expose_secret()
+        .strip_prefix("/storage/app-views/")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    for enabled in [false, true] {
+        let current = harness
+            .crud_store
+            .find_package_installation(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        let changed: pioneer_protocol::AppItem = serde_json::from_value(app_rpc(
+            &mut harness, methods::APPS_SET_ENABLED,
+            json!({"workspace_id":workspace,"app_id":id,"expected_revision":current.revision,"enabled":enabled}),
+        ).await).unwrap();
+        assert_eq!(changed.enabled, enabled);
+        assert!(grants.app_scope(disabled_secret).is_err());
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness.processor.app_view_status(&id).await.state != "ready" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let final_view: pioneer_protocol::AppViewBootstrap = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_OPEN_VIEW,
+            json!({"workspace_id":workspace,"app_id":id}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(final_view.dev_url.as_deref(), Some("http://127.0.0.1:9"));
+    let final_secret = final_view
+        .relative_url
+        .expose_secret()
+        .strip_prefix("/storage/app-views/")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    let removed = app_rpc(
+        &mut harness,
+        methods::APPS_DEV_REMOVE,
+        json!({"workspace_id":workspace,"app_id":id}),
+    )
+    .await;
+    assert_eq!(removed["removed"], true);
+    assert!(grants.app_scope(final_secret).is_err());
+    harness.processor.shutdown_dev_apps().await;
+    assert!(!storage.exists());
+    assert!(project.join("app.json").exists());
+    assert!(
+        harness
+            .crud_store
+            .find_package_installation(&id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let untouched = harness
+        .crud_store
+        .find_package_installation(&release.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        untouched.package_fingerprint,
+        release_parent.package_fingerprint
+    );
+    assert_eq!(untouched.revision, release_parent.revision);
+    assert!(untouched.enabled);
+}
+
+// File-event regression sources only: NOT_RUN / NOT_COMPILED.
+#[tokio::test]
+async fn dev_app_observes_repairs_of_invalid_nested_skills_after_restart_and_creation() {
+    let mut harness = setup_cli_runtime_security_harness(None).await;
+    let root = tempfile::tempdir().unwrap();
+    let slug = "dev-watch-repair";
+    let _release = install_rpc_app(&mut harness, root.path(), slug, false, true).await;
+    let project = root.path().join(slug);
+    let workspace = harness.workspace_id.clone();
+    let added = app_rpc(
+        &mut harness,
+        methods::APPS_DEV_ADD,
+        json!({"workspace_id":workspace,"project":project,"url":"http://127.0.0.1:9"}),
+    )
+    .await;
+    let id = added["id"].as_str().unwrap().to_owned();
+    let original = harness
+        .crud_store
+        .find_package_installation(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    let existing_skill = project.join("skills").join(slug).join("SKILL.md");
+    let valid = std::fs::read(&existing_skill).unwrap();
+    // There is no observer while this accepted Skill becomes invalid.
+    std::fs::write(&existing_skill, "").unwrap();
+    harness.processor.start_dev_apps().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness
+            .processor
+            .app_view_status(&id)
+            .await
+            .failure
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        harness
+            .crud_store
+            .find_package_installation(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .package_fingerprint,
+        original.package_fingerprint
+    );
+    // Only file content changes: no parent directory or manifest event repairs it.
+    let repaired = String::from_utf8(valid).unwrap() + "\nRepaired instruction.\n";
+    std::fs::write(&existing_skill, repaired).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let current = harness
+                .crud_store
+                .find_package_installation(&id)
+                .await
+                .unwrap()
+                .unwrap();
+            if current.package_fingerprint != original.package_fingerprint
+                && current.state == "installed"
+                && harness
+                    .processor
+                    .app_view_status(&id)
+                    .await
+                    .failure
+                    .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let accepted = harness
+        .crud_store
+        .find_package_installation(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    let added_skill = project.join("skills/added/SKILL.md");
+    std::fs::create_dir_all(added_skill.parent().unwrap()).unwrap();
+    std::fs::write(&added_skill, "").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness
+            .processor
+            .app_view_status(&id)
+            .await
+            .failure
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        harness
+            .crud_store
+            .find_package_installation(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .package_fingerprint,
+        accepted.package_fingerprint
+    );
+    assert!(
+        !harness
+            .crud_store
+            .list_plugin_components(&id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.member_key == "added")
+    );
+    std::fs::write(
+        &added_skill,
+        "---\nname: added\ndescription: Added skill\n---\nNew instructions.\n",
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let components = harness
+                .crud_store
+                .list_plugin_components(&id)
+                .await
+                .unwrap();
+            if components
+                .iter()
+                .any(|c| c.member_key == "added" && c.status == "installed")
+                && harness
+                    .processor
+                    .app_view_status(&id)
+                    .await
+                    .failure
+                    .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = harness
+        .crud_store
+        .find_package_installation(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(
+            std::path::Path::new(&snapshot.package_path).join("skills/added/SKILL.md")
+        )
+        .unwrap(),
+        "---\nname: added\ndescription: Added skill\n---\nNew instructions.\n"
+    );
+    harness.processor.shutdown_dev_apps().await;
+}

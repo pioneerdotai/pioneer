@@ -145,40 +145,27 @@ impl AppView {
                 .and_then(|p| p.url.as_ref())
                 .map(|u| u.expose_secret().to_owned());
             if let Some(url) = url {
-                let prefix = self
-                    .publication
-                    .as_ref()
-                    .and_then(|p| p.base_url.as_ref())
-                    .map(|u| u.expose_secret().to_owned());
-                if let Some(prefix) = prefix {
-                    self.palette = palette(cx);
+                self.palette = palette(cx);
+                let publication = self.publication.as_ref().expect("ready publication");
+                let attributes = view_attributes(
+                    &url,
+                    publication.base_url.as_ref().map(|u| u.expose_secret()),
+                    publication.development,
+                    &t!("apps.view_title").to_string(),
+                    &self.palette,
+                );
+                if let Ok(mut attributes) = attributes {
                     self.context =
                         Some(wry::WebContext::new(Some(self._storage.path().to_owned())));
                     let document_loaded = self.document_loaded.clone();
-                    let builder = wry::WebViewBuilder::new_with_web_context(
-                        self.context.as_mut().expect("owned context"),
-                    )
-                    .with_background_color(native_background(cx))
-                    .with_html(isolated_document(
-                        &url,
-                        &t!("apps.view_title").to_string(),
-                        &self.palette,
-                    ))
-                    .with_initialization_script(theme_script(&self.palette))
-                    .with_on_page_load_handler(move |event, _| {
-                        if matches!(event, wry::PageLoadEvent::Finished) {
-                            document_loaded.store(true, std::sync::atomic::Ordering::Release);
-                        }
-                    })
-                    .with_incognito(true)
-                    .with_devtools(false)
-                    .with_clipboard(false)
-                    .with_download_started_handler(|_, _| false)
-                    .with_visible(false)
-                    .with_navigation_handler(move |url| {
-                        url == "about:blank" || url.starts_with(&prefix)
-                    })
-                    .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny);
+                    attributes.context = self.context.as_mut();
+                    let builder = wry::WebViewBuilder::new_with_attributes(attributes)
+                        .with_background_color(native_background(cx))
+                        .with_on_page_load_handler(move |event, _| {
+                            if matches!(event, wry::PageLoadEvent::Finished) {
+                                document_loaded.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        });
                     match WebView::build(builder, window, cx) {
                         Ok(view) => {
                             apply_native_theme(&view, cx);
@@ -201,7 +188,16 @@ impl AppView {
             if let Some(view) = &self.webview {
                 let view = view.read(cx);
                 apply_native_theme(view, cx);
-                let _ = view.evaluate_script(&theme_script(&self.palette));
+                let publication = self.publication.as_ref().expect("ready publication");
+                let script = if publication.development {
+                    dev_theme_script(
+                        &self.palette,
+                        publication.url.as_ref().expect("ready URL").expose_secret(),
+                    )
+                } else {
+                    theme_script(&self.palette)
+                };
+                let _ = view.evaluate_script(&script);
             }
         }
         self.sync_webview_visibility(cx);
@@ -357,6 +353,75 @@ fn palette(cx: &App) -> serde_json::Value {
     };
     serde_json::json!({"appearance":if theme.mode.is_dark(){"dark"}else{"light"},"background":css(theme.background),"foreground":css(theme.foreground),"muted":css(theme.muted_foreground),"border":css(theme.border),"accent":css(theme.primary),"accent-foreground":css(theme.primary_foreground)})
 }
+
+/// These are the actual Wry loader attributes, consumed by the existing panel.
+/// No custom protocol or IPC handler is installed for either App presentation.
+fn view_attributes<'a>(
+    url: &str,
+    prefix: Option<&str>,
+    development: bool,
+    title: &str,
+    palette: &serde_json::Value,
+) -> anyhow::Result<wry::WebViewAttributes<'a>> {
+    let mut attributes = wry::WebViewAttributes {
+        incognito: true,
+        devtools: development,
+        clipboard: false,
+        visible: false,
+        download_started_handler: Some(Box::new(|_, _| false)),
+        new_window_req_handler: Some(Box::new(|_, _| wry::NewWindowResponse::Deny)),
+        ..Default::default()
+    };
+    let script = if development {
+        let parsed = url::Url::parse(url)?;
+        anyhow::ensure!(
+            parsed.scheme() == "http" && parsed.host().is_some(),
+            "invalid dev URL"
+        );
+        let origin = parsed.origin();
+        // Top-level navigation stays on this origin. Subresources, fetch and
+        // WebSockets use the browser's ordinary policies, without interception.
+        attributes.navigation_handler = Some(Box::new(move |candidate| {
+            url::Url::parse(&candidate).is_ok_and(|next| {
+                next.origin() == origin && next.username().is_empty() && next.password().is_none()
+            })
+        }));
+        attributes.url = Some(url.to_owned());
+        dev_theme_script(palette, url)
+    } else {
+        let prefix = prefix
+            .ok_or_else(|| anyhow::anyhow!("missing App view prefix"))?
+            .to_owned();
+        attributes.navigation_handler = Some(Box::new(move |url| {
+            url == "about:blank" || url.starts_with(&prefix)
+        }));
+        attributes.html = Some(isolated_document(url, title, palette));
+        theme_script(palette)
+    };
+    attributes
+        .initialization_scripts
+        .push(wry::InitializationScript {
+            script,
+            for_main_frame_only: true,
+        });
+    Ok(attributes)
+}
+
+fn dev_theme_script(palette: &serde_json::Value, url: &str) -> String {
+    let origin = serde_json::to_string(
+        &url::Url::parse(url)
+            .expect("validated dev URL")
+            .origin()
+            .ascii_serialization(),
+    )
+    .expect("origin JSON");
+    // Wry on Windows injects initialization scripts into subframes too. Guard
+    // both origin and top frame. This carries theme data only, no RPC bridge.
+    // Leave the application's DOM intact so SSR hydration sees its own markup.
+    format!(
+        r#"(()=>{{if(window.top!==window||location.origin!=={origin})return;const p={palette};const send=()=>window.postMessage({{type:'pioneer.theme',palette:p}},location.origin);send();document.addEventListener('DOMContentLoaded',send,{{once:true}})}})();"#
+    )
+}
 fn isolated_document(url: &str, title: &str, palette: &serde_json::Value) -> String {
     let escape = |v: &str| {
         v.replace('&', "&amp;")
@@ -382,7 +447,79 @@ fn isolated_document(url: &str, title: &str, palette: &serde_json::Value) -> Str
     )
 }
 fn theme_script(palette: &serde_json::Value) -> String {
+    // Only the Pioneer wrapper owns these styles. Wry on Windows can also run
+    // initialization scripts inside the application's iframe.
     format!(
-        r#"(()=>{{const p={palette};const apply=()=>{{const r=document.documentElement;if(!r)return;r.style.colorScheme=p.appearance;for(const k of ['background','foreground','muted','border','accent','accent-foreground'])r.style.setProperty('--pioneer-'+k,p[k]);const f=document.querySelector('iframe');if(f){{const send=()=>f.contentWindow.postMessage({{type:'pioneer.theme',palette:p}},'*');f.onload=()=>{{send();f.style.visibility='visible'}};send()}}}};apply();document.addEventListener('DOMContentLoaded',apply,{{once:true}})}})();"#
+        r#"(()=>{{if(window.top!==window)return;const p={palette};const apply=()=>{{const r=document.documentElement;if(!r)return;r.style.colorScheme=p.appearance;for(const k of ['background','foreground','muted','border','accent','accent-foreground'])r.style.setProperty('--pioneer-'+k,p[k]);const f=document.querySelector('iframe');if(f){{const send=()=>f.contentWindow.postMessage({{type:'pioneer.theme',palette:p}},'*');f.onload=()=>{{send();f.style.visibility='visible'}};send()}}}};apply();document.addEventListener('DOMContentLoaded',apply,{{once:true}})}})();"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn palette() -> serde_json::Value {
+        serde_json::json!({"appearance":"dark", "background":"Canvas", "foreground":"CanvasText",
+            "muted":"GrayText", "border":"ButtonBorder", "accent":"Highlight", "accent-foreground":"HighlightText"})
+    }
+
+    #[test]
+    fn dev_panel_passes_the_url_to_wry_without_a_document_proxy_or_native_bridge() {
+        // Inspect the actual loader attributes passed to WebView::build. A
+        // registration-only or location-planner test cannot cover this boundary.
+        let attributes =
+            view_attributes("http://localhost:3000", None, true, "App", &palette()).unwrap();
+        assert_eq!(attributes.url.as_deref(), Some("http://localhost:3000"));
+        assert!(attributes.html.is_none());
+        assert!(attributes.headers.is_none());
+        assert!(attributes.ipc_handler.is_none());
+        assert!(attributes.custom_protocols.is_empty());
+        assert!(attributes.proxy_config.is_none());
+        assert!(attributes.incognito);
+        assert!(attributes.devtools);
+        let navigate = attributes.navigation_handler.unwrap();
+        for url in [
+            "http://localhost:3000/",
+            "http://localhost:3000/home?tab=1#details",
+            "http://localhost:3000/deep/path",
+        ] {
+            assert!(navigate(url.into()), "{url}");
+        }
+        for url in [
+            "http://localhost:30001/",
+            "http://localhost:3000.evil.test/",
+            "http://localhost:17878/storage/app-views/x/",
+            "http://127.0.0.1:3000/",
+            "http://localhost:3000@evil.test/",
+            "https://localhost:3000/",
+            "file:///tmp/index.html",
+            "pioneer://internal",
+            "about:blank",
+        ] {
+            assert!(!navigate(url.into()), "{url}");
+        }
+        assert!(attributes.new_window_req_handler.is_some());
+    }
+
+    #[test]
+    fn installed_panel_keeps_its_sandboxed_document_and_devtools_disabled() {
+        let prefix = "http://localhost:17878/storage/app-views/release-grant/";
+        let attributes = view_attributes(
+            &format!("{prefix}index.html"),
+            Some(prefix),
+            false,
+            "App",
+            &palette(),
+        )
+        .unwrap();
+        assert!(attributes.url.is_none());
+        let html = attributes.html.as_ref().unwrap();
+        assert!(html.contains("sandbox=\"allow-scripts allow-forms\""));
+        assert!(html.contains(&format!("src=\"{prefix}index.html\"")));
+        assert!(!attributes.devtools);
+        let navigate = attributes.navigation_handler.unwrap();
+        assert!(navigate("about:blank".into()));
+        assert!(navigate(format!("{prefix}next")));
+        assert!(!navigate("http://localhost:3000/".into()));
+    }
 }

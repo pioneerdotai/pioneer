@@ -1,5 +1,6 @@
 //! App lifecycle, execution authority and UI admission over the neutral package coordinator.
 mod authority;
+pub(super) mod dev;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 pub(super) mod provision;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
@@ -28,7 +29,25 @@ impl MessageProcessor {
         context: &RequestContext,
         request: JsonRpcRequest,
     ) {
-        if architecture().is_err() {
+        if matches!(
+            request.method.as_str(),
+            methods::APPS_DEV_ADD | methods::APPS_DEV_LIST | methods::APPS_DEV_REMOVE
+        ) {
+            self.dev_apps_request(context, request).await;
+            return;
+        }
+        if architecture().is_err()
+            && !matches!(
+                request.method.as_str(),
+                methods::APPS_LIST
+                    | methods::APPS_DETAILS
+                    | methods::APPS_OPEN_VIEW
+                    | methods::APPS_RUNTIME_INFO
+                    | methods::APPS_RENEW_VIEW
+                    | methods::APPS_CLOSE_VIEW
+                    | methods::APPS_REMOVE
+            )
+        {
             let mut error = plugin_error(&request.id, APPS_UNSUPPORTED_HOST_PLATFORM);
             error.error.data = Some(json!({"code": APPS_UNSUPPORTED_HOST_PLATFORM}));
             self.send_error(context.connection_id(), error).await;

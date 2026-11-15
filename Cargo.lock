@@ -11286,6 +11286,7 @@ dependencies = [
  "flate2",
  "hex",
  "pioneer-cli-mcp-bridge",
+ "pioneer-client",
  "pioneer-config",
  "pioneer-gateway",
  "pioneer-observability",
@@ -11536,6 +11537,7 @@ dependencies = [
  "rust-i18n",
  "serde_json",
  "tempfile",
+ "url",
 ]
 
 [[package]]

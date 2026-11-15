@@ -128,6 +128,8 @@ mod m20261015_000001_compaction_invalid_completion_resume;
 mod m20261015_000002_terminal_task_input_roots;
 mod m20261018_000001_thread_unread_start;
 
+mod m20261115_000001_dev_app_identity;
+
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
@@ -252,6 +254,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261108_000001_sqlite_memory_search::Migration),
             Box::new(m20261111_000001_plugin_ownership::Migration),
             Box::new(m20261112_000001_package_installations::Migration),
+            Box::new(m20261115_000001_dev_app_identity::Migration),
         ]
     }
 }

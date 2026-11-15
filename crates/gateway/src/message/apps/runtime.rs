@@ -102,6 +102,7 @@ impl AppRuntime {
 }
 impl MessageProcessor {
     pub(in crate::message) async fn stop_app_runtime(&self, app: &str) -> Result<()> {
+        self.stop_dev_view(app).await;
         self.host_api.fence_app(app);
         let execution = self.app_runtime.executions.lock().await.get(app).map(|e| {
             (
@@ -307,6 +308,9 @@ impl MessageProcessor {
         parent: pioneer_crud::PackageRecord,
         shutdown: &CancellationToken,
     ) -> Result<()> {
+        if super::dev::is_dev(&parent) {
+            return Ok(());
+        }
         let mutation = self.plugin_mutation_lock(&parent.id).await;
         let _guard = tokio::select! { _ = shutdown.cancelled() => return Ok(()), guard = mutation.lock_owned() => guard };
         let parent = match self

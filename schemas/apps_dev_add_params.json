@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppsDevAddParams",
+  "type": "object",
+  "properties": {
+    "project": {
+      "type": "string"
+    },
+    "url": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id",
+    "project",
+    "url"
+  ],
+  "description": "Local authoring connection. The Gateway reads project files on its host."
+}
