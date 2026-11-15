@@ -73,7 +73,12 @@ impl PreparedInstallSource {
                 format!("upload:{}", upload.upload.upload_id)
             }
             Self::Package { ownership, .. } => {
-                format!("plugin:{}:{}", ownership.plugin_id, ownership.member_key)
+                format!(
+                    "{}:{}:{}",
+                    ownership.kind.as_str(),
+                    ownership.plugin_id,
+                    ownership.member_key
+                )
             }
         }
     }
@@ -134,11 +139,12 @@ impl MessageProcessor {
             SkillInstallSource::PackageMember(ownership, admission) => {
                 let parent = self
                     .crud_store
-                    .find_plugin_installation(&ownership.plugin_id)
+                    .find_package_installation(&ownership.plugin_id)
                     .await
                     .map_err(|_| invalid())?
                     .ok_or_else(invalid)?;
-                if parent.workspace_id != workspace
+                if parent.kind != ownership.kind
+                    || parent.workspace_id != workspace
                     || parent.revision != ownership.expected_revision
                     || !matches!(
                         parent.state.as_str(),
@@ -151,7 +157,30 @@ impl MessageProcessor {
                 // before reserving it. Check the fixed member path and verify
                 // this copied member below; do not rehash every sibling for
                 // every child in the sequential install loop.
-                let path = format!("skills/{}", ownership.member_key);
+                let skills_root = match parent.kind {
+                    pioneer_protocol::PackageKind::Plugin => "skills".to_owned(),
+                    pioneer_protocol::PackageKind::App => {
+                        let manifest = pioneer_apps::AppManifest::parse(
+                            parent
+                                .app_manifest_json
+                                .as_deref()
+                                .ok_or_else(invalid)?
+                                .as_bytes(),
+                        )
+                        .map_err(|_| invalid())?;
+                        let declared = manifest
+                            .document()
+                            .get("skills")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(invalid)?;
+                        declared
+                            .strip_prefix("./")
+                            .unwrap_or(declared)
+                            .trim_end_matches('/')
+                            .to_owned()
+                    }
+                };
+                let path = format!("{skills_root}/{}", ownership.member_key);
                 if ownership.member_key.is_empty()
                     || ownership.member_key.contains(['/', '\\', ':'])
                     || matches!(ownership.member_key.as_str(), "." | "..")
@@ -162,13 +191,15 @@ impl MessageProcessor {
                 let location =
                     install_location_for_source_kind(context, &source_kind).ok_or_else(invalid)?;
                 let policy = installer_policy(context);
-                let package_limits = self.package_delivery_context().plugin_limits();
+                let package_limits = self
+                    .package_delivery_context()
+                    .limits_for_package(parent.kind);
                 crate::message::package_delivery::prepare_cancellable(
                     move |cancellation| -> Result<PreparedInstallSource> {
                         let mut cleanup =
                             crate::message::package_delivery::TemporaryDirectory::new()?;
                         let package = Path::new(&parent.package_path);
-                        let source_dir = pioneer_plugins::containment::resolve_contained(
+                        let source_dir = pioneer_packages::containment::resolve_contained(
                             package,
                             &package.join(path),
                         )?;
@@ -191,7 +222,7 @@ impl MessageProcessor {
                             .expect("package source")
                             .package_fingerprint
                             .as_str();
-                        let copy = pioneer_plugins::Snapshot::capture(
+                        let copy = pioneer_packages::Snapshot::capture(
                             prepared.source_dir(),
                             package_limits,
                             || cancellation.is_cancelled(),

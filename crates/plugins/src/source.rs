@@ -1,6 +1,4 @@
-use crate::{
-    Boundary, Diagnostic, Entry, MCP_SCHEMA, Manifest, PLUGIN_SCHEMA, Snapshot, parse_manifest,
-};
+use crate::{Boundary, Diagnostic, Entry, Manifest, PLUGIN_SCHEMA, Snapshot, parse_manifest};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
 
@@ -115,7 +113,7 @@ pub(crate) fn manifest(
         "vendor_subset_import",
         Boundary::Package,
         path,
-        "Vendor import supports only metadata, skills/ and portable MCP; hooks, commands, UI and other host features are not imported",
+        "Vendor import supports only metadata, skills/ and native MCP configuration; hooks, host commands, UI and other host features are not imported",
     ));
     for other in vendor_paths {
         if other != path && snapshot.entries().contains_key(other) {
@@ -212,35 +210,5 @@ pub(crate) fn mcp<'a>(
             ));
         }
     };
-    if !imported {
-        return Ok(Some(Cow::Borrowed(bytes)));
-    }
-    let mut document: Value =
-        serde_json::from_slice(bytes).map_err(|_| invalid("invalid_mcp_document", path))?;
-    let object = document
-        .as_object_mut()
-        .ok_or_else(|| invalid("invalid_mcp_document", path))?;
-    if object
-        .get("$schema")
-        .is_some_and(|schema| schema.as_str() != Some(MCP_SCHEMA))
-    {
-        return Err(invalid("invalid_mcp_document", path));
-    }
-    object.insert("$schema".into(), Value::String(MCP_SCHEMA.into()));
-    if let Some(servers) = object.get_mut("mcpServers").and_then(Value::as_object_mut) {
-        for server in servers.values_mut().filter_map(Value::as_object_mut) {
-            if server.get("type").and_then(Value::as_str) == Some("http") {
-                server.insert("type".into(), Value::String("streamable-http".into()));
-            } else if !server.contains_key("type") {
-                let kind = if server.contains_key("command") {
-                    "stdio"
-                } else {
-                    "streamable-http"
-                };
-                server.insert("type".into(), Value::String(kind.into()));
-            }
-        }
-    }
-    let bytes = serde_json::to_vec(&document).map_err(|_| invalid("invalid_mcp_document", path))?;
-    Ok(Some(Cow::Owned(bytes)))
+    Ok(Some(Cow::Borrowed(bytes)))
 }

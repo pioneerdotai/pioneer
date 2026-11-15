@@ -16,8 +16,8 @@ pub(crate) struct McpConfigForm {
     input: Entity<TextareaState>,
     workspace: String,
     plugin_target: Option<(String, String)>,
-    plugin_receipt: Option<pioneer_client::plugins::runtime::PluginCommandReceipt>,
-    origin: pioneer_client::plugins::runtime::PluginCommandOrigin,
+    plugin_receipt: Option<pioneer_client::packages::runtime::PluginCommandReceipt>,
+    origin: pioneer_client::packages::runtime::PluginCommandOrigin,
     plugin_unknown: bool,
     authorization: Option<(u64, u64)>,
     operation: Option<u64>,
@@ -103,10 +103,9 @@ impl McpCatalogView {
             let Some(server) = self.input.mcp_servers.iter().find(|server| {
                 expected_workspace == &workspace
                     && &server.id == child
-                    && server
-                        .plugin_owner
-                        .as_ref()
-                        .is_some_and(|owner| &owner.plugin_id == parent)
+                    && server.package_owner().as_ref().is_some_and(|owner| {
+                        owner.kind == self.package_kind && &owner.package_id == parent
+                    })
             }) else {
                 return;
             };
@@ -276,15 +275,18 @@ impl McpCatalogView {
                 return;
             }
             if let Some((parent, child)) = &form.plugin_target {
-                match self.client.submit_plugin_command(
-                    &form.workspace,
-                    parent,
-                    pioneer_client::plugins::runtime::PluginIntent::ConfigureMcp {
-                        server_id: child.clone(),
-                        body: form.input.read(cx).value().to_string(),
-                    },
-                    &form.origin,
-                ) {
+                match self
+                    .client
+                    .packages(self.package_kind)
+                    .submit_plugin_command(
+                        &form.workspace,
+                        parent,
+                        pioneer_client::packages::runtime::PluginIntent::ConfigureMcp {
+                            server_id: child.clone(),
+                            body: form.input.read(cx).value().to_string(),
+                        },
+                        &form.origin,
+                    ) {
                     Ok(receipt) => {
                         form.plugin_receipt = Some(receipt);
                         form.error = None;
@@ -341,6 +343,7 @@ impl McpCatalogView {
                 };
                 let operation = self
                     .client
+                    .packages(self.package_kind)
                     .plugin_command_operation(&form.workspace, receipt);
                 let Some(operation) = operation else {
                     form.plugin_unknown = true;

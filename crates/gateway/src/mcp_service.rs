@@ -803,7 +803,7 @@ impl McpService {
     /// pending plan still fences execution. Startup and OAuth launch cannot.
     pub(crate) async fn reload_after_plugin_change(
         &self,
-        guard: &crate::message::plugins::PluginMutationGuard,
+        guard: &crate::message::packages::PluginMutationGuard,
     ) -> Result<()> {
         self.reload_workspace_with_store(
             self.runtime_store(),
@@ -816,7 +816,7 @@ impl McpService {
         &self,
         store: &CrudStore,
         row: &McpServerInstallationRecord,
-        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
+        admitted: Option<&crate::message::packages::PluginMutationGuard>,
     ) -> Result<bool> {
         if row.scope_kind != "workspace" {
             return Ok(true);
@@ -826,10 +826,10 @@ impl McpService {
             if store
                 .find_mcp_plugin_owner(id)
                 .await?
-                .is_some_and(|owner| owner.plugin_id == guard.parent().id)
+                .is_some_and(|owner| owner.package_id == guard.parent().id)
             {
                 let current = store
-                    .find_plugin_installation(&guard.parent().id)
+                    .find_package_installation(&guard.parent().id)
                     .await?
                     .context("plugin owner missing")?;
                 anyhow::ensure!(
@@ -850,7 +850,7 @@ impl McpService {
         &self,
         store: &CrudStore,
         workspace_id: &str,
-        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
+        admitted: Option<&crate::message::packages::PluginMutationGuard>,
     ) -> Result<()> {
         let rows = store
             .list_mcp_server_installations("workspace", workspace_id)
@@ -2125,7 +2125,7 @@ impl McpService {
         row: McpServerInstallationRecord,
         effective_secret_fingerprint: String,
         store: &CrudStore,
-        admitted: Option<&crate::message::plugins::PluginMutationGuard>,
+        admitted: Option<&crate::message::packages::PluginMutationGuard>,
     ) -> Result<()> {
         let installation = installation_from_record(&row)?;
         let installation_id = row
@@ -8634,7 +8634,11 @@ mod tests {
                 let now = chrono::Utc::now().fixed_offset();
                 let parent = "P".repeat(21);
                 store
-                    .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+                    .insert_plugin_installation(&pioneer_crud::PackageRecord {
+                        kind: pioneer_crud::PackageKind::Plugin,
+                        app_manifest_json: None,
+                        app_localizations_json: None,
+                        operation_error_json: None,
                         id: parent.clone(),
                         workspace_id: workspace.clone(),
                         name: "oauth-parent".into(),
@@ -8676,6 +8680,7 @@ mod tests {
                     .await
                     .unwrap();
                 let write = pioneer_crud::PluginOwnershipWrite {
+                    kind: pioneer_protocol::PackageKind::Plugin,
                     plugin_id: parent.clone(),
                     expected_revision: 1,
                     member_key: "one".into(),
@@ -10185,7 +10190,11 @@ mod tests {
         let child_id = "S".repeat(21);
         let now = chrono::Utc::now().fixed_offset();
         store
-            .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+            .insert_plugin_installation(&pioneer_crud::PackageRecord {
+                kind: pioneer_crud::PackageKind::Plugin,
+                app_manifest_json: None,
+                app_localizations_json: None,
+                operation_error_json: None,
                 id: parent_id.clone(),
                 workspace_id: workspace.clone(),
                 name: "mixed".into(),
@@ -10230,6 +10239,7 @@ mod tests {
         row.name = "pplugin_closed_parent_fixture".into();
         row.enabled = true;
         let write = pioneer_crud::PluginOwnershipWrite {
+            kind: pioneer_protocol::PackageKind::Plugin,
             plugin_id: parent_id.clone(),
             expected_revision: 1,
             member_key: "one".into(),

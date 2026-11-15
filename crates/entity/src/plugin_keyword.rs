@@ -20,7 +20,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub plugin_installation: HasOne<super::plugin_installation::Entity>,
+    pub package_installation: HasOne<super::package_installation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

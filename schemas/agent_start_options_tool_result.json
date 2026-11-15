@@ -80,17 +80,70 @@
   },
   "additionalProperties": false,
   "required": [
+    "identities",
+    "profiles",
+    "inheritParentIdentityAvailable",
     "defaultPioneerIdentityAvailable",
     "derivedEphemeralIdentityAvailable",
-    "eof",
-    "generationFingerprint",
-    "identities",
-    "inheritParentIdentityAvailable",
     "inheritParentProfileAvailable",
     "maxPermissionProfile",
-    "profiles"
+    "generationFingerprint",
+    "eof"
   ],
   "$defs": {
+    "AgentCatalogFragment": {
+      "description": "Concatenate text in offset order and decode JSON to recover one catalog entry.",
+      "type": "object",
+      "properties": {
+        "collection": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string"
+        },
+        "eof": {
+          "type": "boolean"
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "modelIndex": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "nextOffset": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "offset": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "text": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "collection",
+        "index",
+        "modelIndex",
+        "encoding",
+        "version",
+        "offset",
+        "nextOffset",
+        "eof",
+        "text"
+      ]
+    },
     "AgentExecutionProfileId": {
       "type": "string",
       "maxLength": 21,
@@ -111,15 +164,6 @@
         "ephemeral"
       ]
     },
-    "AgentToolBackendKind": {
-      "description": "Deliberately contains only a backend class.  Runtime instance IDs and\nprovider/model configuration remain server-side implementation details.",
-      "type": "string",
-      "enum": [
-        "api",
-        "cli",
-        "acp"
-      ]
-    },
     "AgentRouteAction": {
       "type": "string",
       "enum": [
@@ -129,6 +173,15 @@
         "schedule_task",
         "review_task_result",
         "deliver_result"
+      ]
+    },
+    "AgentToolBackendKind": {
+      "description": "Deliberately contains only a backend class.  Runtime instance IDs and\nprovider/model configuration remain server-side implementation details.",
+      "type": "string",
+      "enum": [
+        "api",
+        "cli",
+        "acp"
       ]
     },
     "AgentToolIdentityOption": {
@@ -385,59 +438,6 @@
       },
       "required": [
         "effort"
-      ]
-    },
-    "AgentCatalogFragment": {
-      "description": "Concatenate text in offset order and decode JSON to recover one catalog entry.",
-      "type": "object",
-      "properties": {
-        "collection": {
-          "type": "string"
-        },
-        "encoding": {
-          "type": "string"
-        },
-        "eof": {
-          "type": "boolean"
-        },
-        "index": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        },
-        "modelIndex": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        },
-        "nextOffset": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        },
-        "offset": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        },
-        "text": {
-          "type": "string"
-        },
-        "version": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "collection",
-        "encoding",
-        "eof",
-        "index",
-        "modelIndex",
-        "nextOffset",
-        "offset",
-        "text",
-        "version"
       ]
     }
   }

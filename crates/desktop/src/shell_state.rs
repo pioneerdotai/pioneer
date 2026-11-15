@@ -3,6 +3,7 @@ use gpui_kit::{App, Context, Pixels, Subscription, Window, px};
 
 pub(crate) struct ShellStateStore {
     sidebar_visible: bool,
+    app_height: Pixels,
     sidebar_width: Pixels,
     _bounds: Subscription,
 }
@@ -13,9 +14,21 @@ impl ShellStateStore {
         });
         Self {
             sidebar_visible: true,
+            app_height: px(crate::state::app_panel_height(cx)),
             sidebar_width: px(320.),
             _bounds: bounds,
         }
+    }
+    pub(crate) fn app_height(&self) -> Pixels {
+        self.app_height
+    }
+    pub(crate) fn set_app_height(&mut self, height: Pixels, cx: &mut Context<Self>) {
+        if !f32::from(height).is_finite() {
+            return;
+        }
+        self.app_height = height.clamp(px(180.), px(1200.));
+        let _ = crate::state::set_app_panel_height(cx, f32::from(self.app_height));
+        cx.notify();
     }
     pub(crate) fn sidebar_visible(&self) -> bool {
         self.sidebar_visible

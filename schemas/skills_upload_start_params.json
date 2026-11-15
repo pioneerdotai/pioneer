@@ -51,7 +51,8 @@
       "type": "string",
       "enum": [
         "skill",
-        "plugin"
+        "plugin",
+        "app"
       ]
     }
   }

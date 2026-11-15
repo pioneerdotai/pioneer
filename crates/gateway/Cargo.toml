@@ -12,6 +12,7 @@ default = []
 computer-use = ["dep:cua-driver-sdk", "pioneer-tools/computer-use"]
 
 [dependencies]
+portable-pty = "0.9"
 cua-driver-sdk = { workspace = true, optional = true }
 pioneer-compaction.workspace = true
 anyhow.workspace = true
@@ -38,6 +39,8 @@ pioneer-promt.workspace = true
 pioneer-runtime-events.workspace = true
 pioneer-tunnel.workspace = true
 pioneer-skills.workspace = true
+pioneer-apps.workspace = true
+pioneer-packages.workspace = true
 pioneer-plugins.workspace = true
 pioneer-sqlite.workspace = true
 pioneer-tasks.workspace = true
@@ -86,8 +89,11 @@ zeroize.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+microsandbox.workspace = true
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_Security", "Win32_UI_Shell", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [build-dependencies]
 pioneer-protocol.workspace = true

@@ -549,6 +549,31 @@ enum Progress {
     Failed,
     Waiting(Instant),
 }
+
+// Do not log raw errors: validation and IO errors may contain Skill contents,
+// credentials or local paths. Keep the failing stage and a bounded cause.
+fn report_reconciliation_error(phase: &'static str, error: &anyhow::Error) {
+    let cause = if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => "io_not_found",
+            std::io::ErrorKind::PermissionDenied => "io_permission_denied",
+            std::io::ErrorKind::InvalidData => "io_invalid_data",
+            std::io::ErrorKind::AlreadyExists => "io_already_exists",
+            std::io::ErrorKind::Interrupted => "io_interrupted",
+            _ => "io_other",
+        }
+    } else if error.downcast_ref::<sea_orm::DbErr>().is_some() {
+        "database"
+    } else if error.downcast_ref::<serde_json::Error>().is_some() {
+        "invalid_json"
+    } else {
+        "validation_or_state"
+    };
+    warn!(
+        phase,
+        cause, "skills reconciliation step failed; retry retained"
+    );
+}
 struct Job {
     signals: Arc<Signals>,
     claims: Arc<ClaimLease>,
@@ -1249,7 +1274,7 @@ async fn run_with_signals(
     let mut snapshot_retry = Instant::now();
     let mut snapshot_attempts: u32 = 0;
 
-    warn!(
+    debug!(
         "skills native events may be unavailable on network filesystems; observation there is degraded to the bounded 30-minute safety reconciliation"
     );
     while !stop.is_cancelled() {
@@ -1598,6 +1623,15 @@ async fn run_with_signals(
                 }
                 result => {
                     let success = matches!(result, Ok(None)) && !job.failed;
+                    match &result {
+                        Ok(Some(Err(error))) => report_reconciliation_error("root", error),
+                        Err(_) => warn!(
+                            phase = "root",
+                            cause = "panic",
+                            "skills reconciliation step failed; retry retained"
+                        ),
+                        _ => {}
+                    }
                     if !success {
                         warn!(
                             "skills root reconciliation failed; successful packages coalesce and failed work retains backoff"

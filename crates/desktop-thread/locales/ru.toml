@@ -358,3 +358,15 @@
 "chat.composer.model.service_standard" = "Стандартный"
 
 "chat.composer.model.service_invalid" = "Сохранённый режим недоступен. Выберите стандартный или другой режим."
+
+"chat.composer.add_menu.apps" = "Добавить приложения"
+"apps.empty" = "Приложения ещё не установлены"
+"apps.error" = "Не удалось загрузить приложения. Попробуйте снова."
+"apps.loading" = "Загрузка приложений…"
+"apps.search" = "Поиск приложений"
+"apps.select" = "Выбор приложений"
+"apps.unavailable" = "Недоступен"
+"apps.retry" = "Повторить"
+"apps.stale" = "Выбранная версия больше не актуальна"
+
+"apps.view" = "App view"

@@ -250,7 +250,7 @@ impl CLIAgentProcessSpawnConfig {
             env,
             env_remove,
             stderr_redactions,
-            stderr_ring_lines: self.stderr_ring_lines.max(1),
+            stderr_ring_lines: self.stderr_ring_lines,
             process_group: self.process_group,
             process_generation: self.process_generation,
         })

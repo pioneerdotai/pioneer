@@ -137,8 +137,8 @@ impl MessageProcessor {
         Ok(response)
     }
 
-    /// The genuine native installer, shared by the legacy parser and portable
-    /// package adapter. Ownership is committed with the native row and audit.
+    /// The native installer, shared by standalone and packaged MCP configs.
+    /// Ownership is committed with the native row and audit.
     async fn install_mcp_plan_deferred(
         &self,
         request_context: &RequestContext,
@@ -228,7 +228,7 @@ impl MessageProcessor {
                         Some(request_id.clone()),
                         INVALID_REQUEST_CODE,
                         MCP_ERROR_INVALID_REQUEST,
-                        super::super::plugins::native_plugin_error_code(&error),
+                        super::super::packages::native_plugin_error_code(&error),
                         json!({}),
                     )
                 })?,
@@ -255,7 +255,7 @@ impl MessageProcessor {
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         MCP_ERROR_INTERNAL,
-                        super::super::plugins::native_plugin_error_code(&error),
+                        super::super::packages::native_plugin_error_code(&error),
                         json!({}),
                     )
                 }),
@@ -282,7 +282,7 @@ impl MessageProcessor {
         workspace_id: &str,
         plan: pioneer_mcp::McpInstallPlan,
         ownership: Option<&pioneer_crud::PluginOwnershipWrite>,
-        mut native: Option<&mut super::super::plugins::NativePluginMutation>,
+        mut native: Option<&mut super::super::packages::NativePluginMutation>,
         oauth_redirect_uri: Option<&str>,
         oauth_callback_unavailable: bool,
     ) -> std::result::Result<(McpInstallResponse, Vec<McpChangedItem>), JsonRpcErrorResponse> {
@@ -386,7 +386,7 @@ impl MessageProcessor {
                             )
                         })?;
                     if !linked.is_some_and(|link| {
-                        link.plugin_id == owner.plugin_id && link.member_key == owner.member_key
+                        link.package_id == owner.plugin_id && link.member_key == owner.member_key
                     }) {
                         return Err(mcp_error(
                             Some(request_id),
@@ -490,6 +490,13 @@ impl MessageProcessor {
                         }
                     }
                 }
+            }
+            if ownership.is_some() {
+                // A package update can retain native auth/transport overrides.
+                // Materialize only refs still used after applying those masks.
+                let retained_refs = mcp_secret_ref_ids(&installation.secret_refs);
+                item.secrets
+                    .retain(|secret| retained_refs.contains(&secret.ref_id));
             }
             if let Some(change) = native.as_deref_mut() {
                 // Legacy parsing is unchanged. Only an owned edit allocates fresh
@@ -770,18 +777,24 @@ impl MessageProcessor {
             });
 
             let mut published_server = list_item_from_record(&record);
-            published_server.plugin_owner = native
+            published_server.package_owner = native
                 .as_deref()
-                .map(|change| pioneer_protocol::PluginOwner {
-                    plugin_id: change.write.plugin_id.clone(),
+                .map(|change| pioneer_protocol::PackageOwner {
+                    kind: change.write.kind,
+                    package_id: change.write.plugin_id.clone(),
                     member_key: change.write.member_key.clone(),
                 })
                 .or_else(|| {
-                    ownership.map(|owner| pioneer_protocol::PluginOwner {
-                        plugin_id: owner.plugin_id.clone(),
+                    ownership.map(|owner| pioneer_protocol::PackageOwner {
+                        kind: owner.kind,
+                        package_id: owner.plugin_id.clone(),
                         member_key: owner.member_key.clone(),
                     })
                 });
+            published_server.plugin_owner = published_server
+                .package_owner
+                .as_ref()
+                .and_then(pioneer_protocol::PackageOwner::as_plugin);
             response_items.push(McpInstallResult {
                 name: record.name.clone(),
                 status: if changed_action == McpChangedAction::Update {

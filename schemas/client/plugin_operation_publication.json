@@ -413,6 +413,16 @@
             }
           ],
           "default": null
+        },
+        "app": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -455,6 +465,132 @@
         "revision"
       ],
       "description": "Immutable image reference. Gateway inventory exposes a native storage link, never image bytes."
+    },
+    "AppMetadata": {
+      "type": "object",
+      "properties": {
+        "has_ui": {
+          "type": "boolean",
+          "default": false
+        },
+        "icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppThemedIcon"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "composer_icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppThemedIcon"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "developer_logo": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppThemedIcon"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "developer_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "default_locale": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "localizations": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/AppLocalization"
+          }
+        }
+      },
+      "required": [
+        "categories",
+        "localizations"
+      ]
+    },
+    "AppThemedIcon": {
+      "type": "object",
+      "properties": {
+        "light": {
+          "$ref": "#/$defs/ImageReference"
+        },
+        "dark": {
+          "$ref": "#/$defs/ImageReference"
+        }
+      },
+      "required": [
+        "light",
+        "dark"
+      ]
+    },
+    "AppLocalization": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shortDescription": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "longDescription": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": []
     }
   }
 }

@@ -52,9 +52,11 @@ impl SkillUploadFailure {
                     machine_code,
                     ..
                 } => match machine_code.as_deref().unwrap_or(message) {
-                    "plugins.package_rejected"
+                    "apps.package_rejected"
+                    | "plugins.package_rejected"
                     | "plugins.upload_unavailable_or_invalid_archive" => Self::InvalidPackage,
                     "plugins.busy" | "package_delivery.busy" => Self::Busy,
+                    "skills.upload.size_limit" => Self::SourceTooLarge,
                     _ => Self::Unknown,
                 },
                 _ => Self::Unknown,
@@ -73,7 +75,7 @@ impl SkillUploadFailure {
                 "source_unavailable" | "source_kind" => return Self::SourceUnavailable,
                 "source_changed" => return Self::SourceChanged,
                 "invalid_upload_archive" => return Self::InvalidPackage,
-                "entry_limit" | "entry_size_limit" | "expanded_limit" => {
+                "entry_limit" | "entry_size_limit" | "expanded_limit" | "archive_input_limit" => {
                     return Self::SourceTooLarge;
                 }
                 "gateway_not_connected" | "client_stopped" => return Self::GatewayUnavailable,

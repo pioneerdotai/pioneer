@@ -169,11 +169,10 @@ mod tests {
 }
 
 pub use pioneer_protocol::{
-    PluginComponentItem, PluginComponentKey, PluginIcon, PluginItem, PluginManagementIntent,
-    PluginMetadata, PluginsMutateParams, PluginsSetEnabledParams, PluginsUpdatePreviewResponse,
+    PackageKind, PluginComponentItem, PluginComponentKey, PluginIcon, PluginItem,
+    PluginManagementIntent, PluginMetadata, PluginsMutateParams, PluginsSetEnabledParams,
+    PluginsUpdatePreviewResponse,
 };
-
-pub mod runtime;
 
 /// Parent-only presentation for immediate pickers. Selection retains its original
 /// revision even when catalog labels/revisions refresh. Desktop picker migration:
@@ -194,29 +193,7 @@ pub fn plugin_picker_rows(
     plugins: &[PluginItem],
     query: &str,
 ) -> Vec<PluginPickerRow> {
-    let query = query.trim().to_lowercase();
-    let mut rows:Vec<_>=plugins.iter().filter(|p|p.name.to_lowercase().contains(&query)).map(|p|{
-        let selected=current.iter().find(|c|matches!(&c.kind,ComposerCapabilityKind::Plugin{plugin_id,..} if plugin_id==&p.id));
-        PluginPickerRow{plugin_id:p.id.clone(),key:pioneer_protocol::plugin_capability_key(&p.id),label:p.name.clone(),description:p.description.clone(),selected:selected.is_some(),selectable:plugin_capability(p).is_some(),stale:selected.is_some_and(|c|matches!(c.kind,ComposerCapabilityKind::Plugin{expected_revision,..} if expected_revision!=p.revision))}
-    }).collect();
-    for c in current {
-        if let ComposerCapabilityKind::Plugin { plugin_id, .. } = &c.kind {
-            if !plugins.iter().any(|p| &p.id == plugin_id)
-                && c.label.to_lowercase().contains(&query)
-            {
-                rows.push(PluginPickerRow {
-                    plugin_id: plugin_id.clone(),
-                    key: c.id.clone(),
-                    label: c.label.clone(),
-                    description: None,
-                    selected: true,
-                    selectable: false,
-                    stale: true,
-                });
-            }
-        }
-    }
-    rows
+    crate::packages::package_picker_rows(PackageKind::Plugin, current, plugins, query)
 }
 // Parent selection has no client-provided expansion. Keep already selected
 // parents removable under unsupported providers; new selection uses the same

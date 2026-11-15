@@ -161,7 +161,14 @@ pub(crate) async fn effective(
     let limits = provider.model_limits(model).await?;
     let current_window = match provider.model_context_tiers(model).await? {
         Some(metadata) => metadata
-            .resolve(limits.context_window, saved.manual_window)
+            // A captured manual endpoint may exceed a newly narrowed technical
+            // cap. Clamp only that cap; changed tariff endpoints still validate.
+            .resolve(
+                limits.context_window,
+                saved
+                    .manual_window
+                    .map(|window| window.min(limits.context_window)),
+            )
             .map_err(anyhow::Error::msg)?,
         None => {
             ensure!(
@@ -361,6 +368,7 @@ mod tests {
         pro_available: bool,
         authority: &'static str,
         windows: Vec<u64>,
+        technical_window: u64,
     }
     #[async_trait]
     impl Provider for BudgetProvider {
@@ -372,7 +380,7 @@ mod tests {
         }
         async fn model_limits(&self, _: &str) -> Result<pioneer_provider::catalog::CatalogLimits> {
             Ok(pioneer_provider::catalog::CatalogLimits {
-                context_window: 10000,
+                context_window: self.technical_window,
                 context_origin: pioneer_provider::catalog::OriginKind::Source,
                 max_input: Some(9000),
                 max_output: Some(2048),
@@ -412,10 +420,11 @@ mod tests {
     }
     #[tokio::test]
     async fn durable_native_cap_never_widens_and_complete_request_uses_it() {
-        let provider = BudgetProvider {
+        let mut provider = BudgetProvider {
             pro_available: true,
             authority: "account-a",
             windows: vec![1000, 10000],
+            technical_window: 10000,
         };
         let proof = pioneer_provider::catalog::context_choice_authority("account-a", "model");
         assert!(validate_manual_authority(&provider, "model", Some(10000), Some(&proof)).is_ok());
@@ -452,6 +461,7 @@ mod tests {
             pro_available: false,
             authority: "account-a",
             windows: vec![1000, 10000],
+            technical_window: 10000,
         };
         assert!(
             effective(&unavailable, "instance", "model", Some(&restored), None)
@@ -507,10 +517,26 @@ mod tests {
             .unwrap()
             .fits
         );
+        provider.technical_window = 5000;
+        assert_eq!(
+            effective(&provider, "instance", "model", Some(&authorized), None)
+                .await
+                .unwrap()
+                .context,
+            5000,
+            "saved manual consent narrows to the new technical ceiling"
+        );
+        assert!(
+            capture(&provider, "instance", "model", Some(10000))
+                .await
+                .is_err()
+        );
+        provider.technical_window = 10000;
         let refreshed = BudgetProvider {
             pro_available: true,
             authority: "account-a",
             windows: vec![2000, 10000],
+            technical_window: 10000,
         };
         assert_eq!(
             effective(&refreshed, "instance", "model", Some(&saved), None)
@@ -523,6 +549,7 @@ mod tests {
             pro_available: true,
             authority: "account-b",
             windows: vec![1000, 10000],
+            technical_window: 10000,
         };
         assert!(
             effective(&other, "instance", "model", Some(&authorized), None)

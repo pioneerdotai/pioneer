@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionReconcileParams",
+  "type": "object",
+  "properties": {
+    "expectedSequence": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "operationId": {
+      "type": "string"
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "threadId",
+    "operationId",
+    "expectedSequence"
+  ]
+}

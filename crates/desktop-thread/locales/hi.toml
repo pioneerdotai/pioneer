@@ -356,3 +356,15 @@
 "chat.composer.model.service_standard" = "मानक"
 
 "chat.composer.model.service_invalid" = "सहेजा गया सेवा स्तर उपलब्ध नहीं है। मानक या दूसरा मोड चुनें।"
+
+"chat.composer.add_menu.apps" = "ऐप जोड़ें"
+"apps.empty" = "कोई ऐप इंस्टॉल नहीं है"
+"apps.error" = "ऐप लोड नहीं हो सके। फिर से कोशिश करें।"
+"apps.loading" = "ऐप लोड हो रहे हैं…"
+"apps.search" = "ऐप खोजें"
+"apps.select" = "ऐप चुनें"
+"apps.unavailable" = "अनुपलब्ध"
+"apps.retry" = "फिर कोशिश करें"
+"apps.stale" = "चुना गया संस्करण अब नवीनतम नहीं है"
+
+"apps.view" = "App view"

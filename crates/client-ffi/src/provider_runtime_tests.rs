@@ -48,7 +48,7 @@ fn provider_runtime_direct_and_versioned_dispatch_preserve_scope_and_cancellatio
 
 fn fixture(wire_core: Arc<ClientCore>) -> ClientFfiRuntime {
     ClientFfiRuntime {
-        native_oauth: Arc::new(plugin_shell::NativeOAuthShell::new(&wire_core)),
+        native_oauth: Arc::new(package_shell::NativeOAuthShell::new(&wire_core)),
         plugin_uploads: Default::default(),
         core: wire_core.clone(),
         config: Default::default(),

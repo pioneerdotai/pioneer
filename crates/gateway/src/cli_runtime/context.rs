@@ -2074,6 +2074,7 @@ mod tests {
     fn explicit_cli_selection_keeps_order_and_excludes_required_exports() {
         let plan = |id: &str, name: &str| crate::cli_runtime::skills::CliRuntimeSkillInstallPlan {
             plugin_id: None,
+            package_owner: None,
             skill_id: pioneer_protocol::SkillId::new(id).unwrap(),
             owner: None,
             slug: name.to_owned(),

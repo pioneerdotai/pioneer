@@ -1,0 +1,16 @@
+_version = 1
+
+[apps]
+title = "ऐप्स"
+
+view_title = "App"
+bottom = "Bottom panel"
+right = "Right sidebar"
+expand = "Expand"
+exit_expanded = "Exit expanded view"
+close_view = "Close App view"
+loading = "Opening App…"
+offline = "Reconnect to open this App."
+unavailable = "This App view is no longer available."
+failed = "The App could not be opened."
+denied = "You do not have access to this App."

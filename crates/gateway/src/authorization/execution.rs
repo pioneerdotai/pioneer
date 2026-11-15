@@ -842,7 +842,8 @@ impl ExecutionAdmissionService {
                     ));
                 }
                 pioneer_protocol::TurnCapabilityKind::SkillPack { .. }
-                | pioneer_protocol::TurnCapabilityKind::Plugin { .. } => {
+                | pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+                | pioneer_protocol::TurnCapabilityKind::App { .. } => {
                     bail!("unexpanded skill pack reached execution admission");
                 }
             }
@@ -3425,7 +3426,8 @@ impl ExecutionAuthorizationContext {
                     ));
                 }
                 pioneer_protocol::TurnCapabilityKind::SkillPack { .. }
-                | pioneer_protocol::TurnCapabilityKind::Plugin { .. } => {
+                | pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+                | pioneer_protocol::TurnCapabilityKind::App { .. } => {
                     bail!("unexpanded skill pack reached task continuation admission");
                 }
             }

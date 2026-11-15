@@ -84,6 +84,23 @@
         "opencode"
       ]
     },
+    "NativeServiceModeSelection": {
+      "description": "Explicit choice uses the existing endpoint/credential/model authority proof.\nAbsence means Standard; Inherit belongs to the enclosing model selection.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "authority"
+      ]
+    },
     "PermissionBehavior": {
       "type": "string",
       "enum": [
@@ -376,6 +393,7 @@
           ]
         },
         "context_window": {
+          "description": "Manual Native/API choice from this thread's latest admitted conversation.",
           "type": [
             "integer",
             "null"
@@ -429,6 +447,16 @@
             "null"
           ]
         },
+        "service_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeServiceModeSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "sidebar_visibility": {
           "$ref": "#/$defs/ThreadSidebarVisibility",
           "default": "visible"
@@ -458,29 +486,6 @@
         },
         "workspace_id": {
           "type": "string"
-        },
-        "service_mode": {
-          "anyOf": [
-            {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                },
-                "authority": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "id",
-                "authority"
-              ],
-              "additionalProperties": false
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "required": [
@@ -719,8 +724,7 @@
         },
         "work_owner": {
           "description": "Immutable owner of the admitted work; absent historical wire values own their turn.",
-          "$ref": "#/$defs/TurnWorkOwner",
-          "default": "turn"
+          "$ref": "#/$defs/TurnWorkOwner"
         }
       },
       "required": [

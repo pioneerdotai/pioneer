@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppThemedIcon",
+  "type": "object",
+  "properties": {
+    "dark": {
+      "$ref": "#/$defs/ImageReference"
+    },
+    "light": {
+      "$ref": "#/$defs/ImageReference"
+    }
+  },
+  "required": [
+    "light",
+    "dark"
+  ],
+  "$defs": {
+    "ImageReference": {
+      "description": "Immutable image reference. Published paths are authenticated Gateway storage links.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision"
+      ]
+    }
+  }
+}

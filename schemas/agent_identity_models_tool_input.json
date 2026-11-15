@@ -4,6 +4,13 @@
   "description": "Model discovery is scoped to an identity already admitted to this execution.",
   "type": "object",
   "properties": {
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
     "identityId": {
       "$ref": "#/$defs/AgentIdentityId"
     },
@@ -11,15 +18,8 @@
       "type": "integer",
       "format": "uint32",
       "default": 100,
-      "minimum": 1,
-      "maximum": 100
-    },
-    "cursor": {
-      "type": [
-        "string",
-        "null"
-      ],
-      "default": null
+      "maximum": 100,
+      "minimum": 1
     }
   },
   "additionalProperties": false,

@@ -229,6 +229,9 @@ pub enum ClientScope {
     Plugins {
         workspace_id: String,
     },
+    Apps {
+        workspace_id: String,
+    },
     SkillsUpload {
         workspace_id: String,
         operation_id: u64,
@@ -275,10 +278,15 @@ pub enum ClientDemand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
+    Apps {
+        workspace_id: String,
+        connection_id: Option<u64>,
+        intent: crate::packages::runtime::PluginIntent,
+    },
     Plugins {
         workspace_id: String,
         connection_id: Option<u64>,
-        intent: crate::plugins::runtime::PluginIntent,
+        intent: crate::packages::runtime::PluginIntent,
     },
     SessionDemand {
         demand: crate::gateway::session_driver::SessionDemand,
@@ -1082,7 +1090,9 @@ pub struct ClientCore {
         Mutex<crate::settings::model_picker::SettingsModelPickerController>,
     pub(crate) settings_runtime: Mutex<crate::settings::runtime::SettingsRuntime>,
     pub(crate) agents_documents: Mutex<crate::agents_doc::runtime::DocumentRuntime>,
-    pub(crate) plugins_controller: Mutex<crate::plugins::runtime::PluginController>,
+    pub(crate) plugins_controller: Mutex<crate::packages::runtime::PluginController>,
+    pub(crate) app_views: Mutex<crate::apps::AppViews>,
+    pub(crate) apps_controller: Mutex<crate::packages::runtime::PluginController>,
     pub(crate) capability_operations:
         Mutex<crate::package_delivery::operations::CapabilityOperations>,
     pub(crate) skills_store: Mutex<crate::skills::store::SkillsStore>,
@@ -1383,6 +1393,8 @@ impl ClientCore {
     pub fn new() -> Self {
         Self {
             plugins_controller: Mutex::default(),
+            apps_controller: Mutex::default(),
+            app_views: Mutex::default(),
             capability_operations: Mutex::new(
                 crate::package_delivery::operations::CapabilityOperations::default(),
             ),
@@ -1826,6 +1838,7 @@ impl ClientCore {
     }
 
     pub fn shutdown(&self) {
+        self.retire_app_views();
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
@@ -1868,6 +1881,7 @@ impl ClientCore {
             .lock()
             .expect("plugins poisoned")
             .stop();
+        self.apps_controller.lock().expect("apps poisoned").stop();
         self.capability_operations
             .lock()
             .expect("Skills controller poisoned")
@@ -2086,6 +2100,17 @@ impl ClientCore {
             _ => {}
         }
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
+            if let pioneer_protocol::GatewayNotification::AppsChanged(event) = notification {
+                self.invalidate_app_views(event);
+                if event.runtime_only {
+                    return None;
+                }
+                self.refresh_skills(&event.workspace_id);
+                self.refresh_mcp(&event.workspace_id);
+                self.packages(pioneer_protocol::PackageKind::App)
+                    .refresh_plugin_publication(&event.workspace_id);
+                return None;
+            }
             if let pioneer_protocol::GatewayNotification::PluginsChanged(event) = notification {
                 self.refresh_skills(&event.workspace_id);
                 self.refresh_mcp(&event.workspace_id);
@@ -2959,6 +2984,18 @@ impl ClientCore {
             }
             ClientIntent::ComposerModelPicker { intent } => {
                 return self.composer_model_picker_intent(intent.clone());
+            }
+            ClientIntent::Apps {
+                workspace_id,
+                connection_id,
+                intent,
+            } => {
+                return if self.current_auth_ticket().1 == *connection_id {
+                    self.packages(pioneer_protocol::PackageKind::App)
+                        .plugin_intent(workspace_id, intent.clone())
+                } else {
+                    self.reject_intent()
+                };
             }
             ClientIntent::Plugins {
                 workspace_id,

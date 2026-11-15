@@ -2112,6 +2112,7 @@ impl TaskToolHandler {
                 matches!(
                     cap.kind,
                     pioneer_protocol::TurnCapabilityKind::Plugin { .. }
+                        | pioneer_protocol::TurnCapabilityKind::App { .. }
                 )
             }) {
                 persisted_launch.execution.selected_capabilities = capabilities.1;

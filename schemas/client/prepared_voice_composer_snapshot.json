@@ -515,6 +515,27 @@
               "type": "integer",
               "format": "int64"
             },
+            "type": {
+              "type": "string",
+              "const": "app"
+            },
+            "appId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
             "pluginId": {
               "type": "string"
             },

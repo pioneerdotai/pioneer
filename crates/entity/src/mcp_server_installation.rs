@@ -32,6 +32,8 @@ pub struct Model {
     pub fingerprint: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(has_one)]
+    pub package_component: HasOne<super::package_component::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

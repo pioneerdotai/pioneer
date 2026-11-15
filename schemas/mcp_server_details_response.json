@@ -115,6 +115,16 @@
         "name": {
           "type": "string"
         },
+        "package_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PackageOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "plugin_owner": {
           "anyOf": [
             {
@@ -685,6 +695,33 @@
         "catalog_version",
         "fingerprint",
         "selection_reason"
+      ]
+    },
+    "PackageKind": {
+      "description": "Product identity is distinct even when installation mechanics are shared.",
+      "type": "string",
+      "enum": [
+        "plugin",
+        "app"
+      ]
+    },
+    "PackageOwner": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PackageKind"
+        },
+        "member_key": {
+          "type": "string"
+        },
+        "package_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "package_id",
+        "member_key"
       ]
     },
     "PluginOwner": {

@@ -324,6 +324,7 @@ fn connect_options(
     });
     options.map_sqlx_sqlite_opts(move |sqlite_options| {
         sqlite_options
+            .foreign_keys(false)
             .busy_timeout(Duration::from_millis(DEFAULT_SQLITE_BUSY_TIMEOUT_MS))
             .thread_name(move |id| format!("{worker_prefix}{id}"))
     });
@@ -425,6 +426,42 @@ mod tests {
     };
     use sea_orm::{ConnectionTrait, DbBackend, Statement, StreamTrait, TransactionTrait};
     use std::path::Path;
+
+    // NOT_RUN / NOT_COMPILED. Bootstrap PRAGMA must survive physical pool replacement.
+    #[tokio::test]
+    async fn replacement_writer_preserves_foreign_keys_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = pioneer_config::AppConfig::load().unwrap();
+        let runtime = super::GatewayDatabaseRuntimeConfig::from_app_config(&config).unwrap();
+        let options = super::connect_options(
+            sqlite_connection_url(&temp.path().join("replacement.db")),
+            1,
+            &runtime,
+            "pioneer-sqlite-writer-",
+        );
+        let writer = sea_orm::Database::connect(options).await.unwrap();
+        pioneer_sqlite::apply_sqlite_pragmas(&writer).await.unwrap();
+        // Closing the only physical connection forces SQLx to create a fresh one.
+        // Do not reapply bootstrap pragmas: this reproduces idle/lifetime replacement.
+        writer
+            .get_sqlite_connection_pool()
+            .acquire()
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        let pragma = writer
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_keys",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pragma.try_get::<i64>("", "foreign_keys").unwrap(), 0);
+        writer.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn installer_inspection_reads_history_without_migrations_or_creation() {

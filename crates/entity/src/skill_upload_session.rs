@@ -12,7 +12,6 @@ pub struct Model {
     pub workspace_id: String,
     pub connection_id: i64,
     pub status: String,
-    pub purpose: String,
     pub file_name: String,
     pub archive_format: String,
     pub compressed_size_bytes: i64,
@@ -27,6 +26,8 @@ pub struct Model {
     pub aborted_at_unix: Option<i64>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub purpose: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -24,6 +24,15 @@ impl std::fmt::Display for CodexServiceDeadline {
 }
 impl std::error::Error for CodexServiceDeadline {}
 
+#[derive(Debug)]
+pub struct ClaudeServiceDeadline;
+impl std::fmt::Display for ClaudeServiceDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Claude service deadline exceeded")
+    }
+}
+impl std::error::Error for ClaudeServiceDeadline {}
+
 /// Safe stage context survives anyhow propagation without persisting raw errors.
 #[derive(Debug)]
 pub struct ServiceStage(pub &'static str);
@@ -33,6 +42,56 @@ impl std::fmt::Display for ServiceStage {
     }
 }
 impl std::error::Error for ServiceStage {}
+
+/// Process-owned failure metadata. No stderr text, prompt or credentials escape
+/// the service boundary; classification is diagnostic, not a retry receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceProcessFailure {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub class: &'static str,
+}
+impl ServiceProcessFailure {
+    pub(crate) fn from_status(status: std::process::ExitStatus, stderr: &[String]) -> Self {
+        let text = stderr.join("\n").to_ascii_lowercase();
+        let class = if text.contains("unexpected argument") || text.contains("unrecognized option")
+        {
+            "unsupported_arguments"
+        } else if text.contains("error loading config") || text.contains("error parsing") {
+            "configuration"
+        } else if text.contains("not logged in")
+            || text.contains("authentication")
+            || text.contains("unauthorized")
+            || text.contains("login required")
+        {
+            "authentication"
+        } else {
+            "process_exit"
+        };
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
+        Self {
+            exit_code: status.code(),
+            signal,
+            class,
+        }
+    }
+}
+impl std::fmt::Display for ServiceProcessFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CLI service process failure: {} (exit={:?}, signal={:?})",
+            self.class, self.exit_code, self.signal
+        )
+    }
+}
+impl std::error::Error for ServiceProcessFailure {}
 
 /// CLI-owned counters only; exclude transcripts, errors, native session state
 /// and arbitrary identifiers from an otherwise much larger terminal result.

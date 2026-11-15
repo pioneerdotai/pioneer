@@ -3,6 +3,12 @@
   "title": "PluginsSetEnabledParams",
   "type": "object",
   "properties": {
+    "allow_implicit_invocation": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "enabled": {
       "type": "boolean"
     },
@@ -15,13 +21,6 @@
     },
     "workspace_id": {
       "type": "string"
-    },
-    "allow_implicit_invocation": {
-      "type": [
-        "boolean",
-        "null"
-      ],
-      "default": null
     }
   },
   "additionalProperties": false,

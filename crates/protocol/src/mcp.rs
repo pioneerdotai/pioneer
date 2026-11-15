@@ -65,6 +65,8 @@ pub struct McpInstallResult {
 pub struct McpListItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_owner: Option<crate::PluginOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_owner: Option<crate::PackageOwner>,
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -523,6 +525,7 @@ mod tests {
     fn operational_mcp_item_has_no_management_transport_or_diagnostics() {
         let item = McpListItem {
             plugin_owner: None,
+            package_owner: None,
             id: "mcp-1".to_owned(),
             name: "search".to_owned(),
             display_name: Some("Search".to_owned()),
@@ -689,4 +692,17 @@ pub struct McpOAuthNotification {
     /// Authorization URLs contain ephemeral state. Debug must redact them.
     pub authorization_url: Option<crate::AuthSecretString>,
     pub diagnostic: Option<String>,
+}
+
+impl McpListItem {
+    pub fn package_owner(&self) -> Option<crate::PackageOwner> {
+        self.package_owner.clone().or_else(|| {
+            self.plugin_owner
+                .as_ref()
+                .map(crate::PackageOwner::from_plugin)
+        })
+    }
+    pub fn is_package_component(&self) -> bool {
+        self.package_owner.is_some() || self.plugin_owner.is_some()
+    }
 }

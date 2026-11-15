@@ -108,6 +108,14 @@ function or general storage refactor was introduced.
     rejects events beyond the durable watermark (missing means -1), admitting
     a streamless owner only with no events. The real snapshot producer now
     precedes completion/replay in the primary new-path regression.
+13. Static test ownership review found an expected tiny item moved before its
+    later serialization; retain a clone in that assertion. No compiler/test
+    success is inferred from this source correction.
+14. Fresh main added package-installation migration at the same list tail.
+    Local integration retains it before the stage-one migration. Auto-merged
+    finalization/window-count changes remain metadata-only and preserve the
+    new hydration boundaries. Normal Migrator/codegen repeated on an isolated
+    database from the combined schema; no generated turn model diff remained.
 
 No application compilation or tests establish these conclusions. The final
 review must examine all source, generated fields and test fixtures together.

@@ -88,12 +88,19 @@ constructor = "SkillsCatalogView::new"
 public_modules = []
 edges = ["pioneer-client", "pioneer-desktop-foundation"]
 [[features]]
-package = "pioneer-desktop-plugins"
-path = "desktop-plugins"
-root = "PluginsView"
-constructor = "PluginsView::new"
+package = "pioneer-desktop-packages"
+path = "desktop-packages"
+root = "PackageCatalogView"
+constructor = "PackageCatalogView::new"
 public_modules = []
 edges = ["pioneer-client", "pioneer-desktop-foundation"]
+[[features]]
+package = "pioneer-desktop-apps"
+path = "desktop-apps"
+root = "AppView"
+constructor = "AppView::new"
+public_modules = []
+edges = ["pioneer-client"]
 [[features]]
 package = "pioneer-desktop-settings"
 path = "desktop-settings"
@@ -166,7 +173,9 @@ edges = ["pioneer-client", "pioneer-desktop-foundation"]
 "TUI-45" = { kind = "RenderOnce", owner = "OnboardingView", symbol = "OnboardingSurface", file = "desktop-onboarding/src/lib.rs" }
 "TUI-46" = { kind = "RenderOnce", owner = "owning feature", symbol = "AvatarSurface", file = "desktop-foundation/src/avatar.rs" }
 "TUI-47" = { kind = "Behavior", owner = "OnboardingView", symbol = "Popover", file = "desktop-onboarding/src/switcher.rs" }
-"TUI-48" = { kind = "Entity", owner = "PluginsView", symbol = "PluginsView", file = "desktop-plugins/src/lib.rs" }
+"TUI-48" = { kind = "Entity", owner = "PackageCatalogView", symbol = "PackageCatalogView", file = "desktop-packages/src/lib.rs" }
+
+"TUI-49" = { kind = "Entity", owner = "AppView", symbol = "AppView", file = "desktop-apps/src/lib.rs" }
 
 [caches]
 image_bytes = { owner = "Client ImageStore", source = "client/src/images/mod.rs", max_files = 2048, max_age_days = 30 }
@@ -212,8 +221,8 @@ artifact_preview = { owner = "Client ArtifactRegistry", source = "client/src/art
 "desktop-skills:CatalogSidebar" = ["Render", "SkillsCatalogView", "TUI-38"]
 "desktop-skills:SkillManagementRowView" = ["Render", "SkillsCatalogView", "TUI-38"]
 # One generic delivery view, mounted by both independent features.
-"desktop-foundation:UploadView" = ["Render", "SkillsCatalogView / PluginsView", "TUI-38"]
-"desktop-plugins:PluginsSidebar" = ["Render", "PluginsView", "TUI-48"]
+"desktop-foundation:UploadView" = ["Render", "SkillsCatalogView / PackageCatalogView", "TUI-38"]
+"desktop-packages:PluginsSidebar" = ["Render", "PackageCatalogView", "TUI-48"]
 "desktop-settings:ActivationView" = ["Render", "SettingsView", "TUI-40"]
 "desktop-settings:ProfileEditor" = ["Render", "SettingsView", "TUI-39"]
 "desktop-settings:SettingsScreenView" = ["Render", "SettingsView", "TUI-39"]
@@ -233,11 +242,11 @@ artifact_preview = { owner = "Client ArtifactRegistry", source = "client/src/art
 "desktop-thread:TaskReviewActionView" = ["Render", "ThreadView", "TUI-26"]
 
 # Value-only catalogue composition shared across independent features.
-"desktop-foundation:CatalogCard" = ["RenderOnce", "SkillsCatalogView / PluginsView", "TUI-38"]
-"desktop-foundation:CatalogSummaryCard" = ["RenderOnce", "McpCatalogView / PluginsView", "TUI-37"]
-"desktop-foundation:CatalogDetailsHeader" = ["RenderOnce", "McpCatalogView / SkillsCatalogView / PluginsView", "TUI-37"]
+"desktop-foundation:CatalogCard" = ["RenderOnce", "SkillsCatalogView / PackageCatalogView", "TUI-38"]
+"desktop-foundation:CatalogSummaryCard" = ["RenderOnce", "McpCatalogView / PackageCatalogView", "TUI-37"]
+"desktop-foundation:CatalogDetailsHeader" = ["RenderOnce", "McpCatalogView / SkillsCatalogView / PackageCatalogView", "TUI-37"]
 "desktop-foundation:ImageSurface" = ["RenderOnce", "owning image presentation", "TUI-46"]
 # Weak shared identities; each visible owner holds a lease, never image bytes.
-"desktop-foundation:ImageView" = ["Render", "PluginsView / ComposerView / TimelineRowView", "TUI-46"]
+"desktop-foundation:ImageView" = ["Render", "PackageCatalogView / ComposerView / TimelineRowView", "TUI-46"]
 "desktop-skills:SkillCard" = ["RenderOnce", "SkillsCatalogView", "TUI-38"]
 "desktop-mcp:McpServerCard" = ["RenderOnce", "McpCatalogView", "TUI-37"]

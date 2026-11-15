@@ -14,8 +14,27 @@ pub(crate) struct PackageDeliveryContext {
     pub max_file_bytes: usize,
 }
 impl PackageDeliveryContext {
-    pub(super) fn plugin_limits(&self) -> pioneer_plugins::Limits {
-        pioneer_plugins::Limits {
+    pub(super) fn limits_for_package(
+        &self,
+        kind: pioneer_protocol::PackageKind,
+    ) -> pioneer_packages::Limits {
+        match kind {
+            pioneer_protocol::PackageKind::App => pioneer_apps::PACKAGE_LIMITS,
+            pioneer_protocol::PackageKind::Plugin => self.plugin_limits(),
+        }
+    }
+    pub(super) fn for_package(mut self, kind: pioneer_protocol::PackageKind) -> Self {
+        if kind == pioneer_protocol::PackageKind::App {
+            let limits = pioneer_apps::PACKAGE_LIMITS;
+            self.max_upload_compressed_bytes = pioneer_apps::MAX_UPLOAD_ARCHIVE_BYTES;
+            self.max_upload_uncompressed_bytes = limits.expanded_bytes;
+            self.max_upload_archive_entries = limits.entries;
+            self.max_file_bytes = limits.entry_bytes;
+        }
+        self
+    }
+    pub(super) fn plugin_limits(&self) -> pioneer_packages::Limits {
+        pioneer_packages::Limits {
             expanded_bytes: self.max_upload_uncompressed_bytes,
             entry_bytes: self.max_file_bytes,
             entries: self.max_upload_archive_entries,
@@ -27,7 +46,8 @@ impl PackageDeliveryContext {
 }
 impl MessageProcessor {
     pub(crate) fn package_delivery_context(&self) -> PackageDeliveryContext {
-        // Retain existing transfer limits/wire contracts. Resolving delivery
+        // Base transfer policy for Skills/Plugins; Apps select their domain limits.
+        // Retain existing wire contracts. Resolving delivery
         // never loads a Skills catalog or requires configured Skills roots.
         let limits = &self.tool_loop_config.skills.security;
         PackageDeliveryContext {
@@ -42,6 +62,21 @@ impl MessageProcessor {
             max_upload_uncompressed_bytes: limits.max_install_archive_uncompressed_bytes.max(1),
             max_upload_archive_entries: limits.max_install_archive_entries.max(1),
             max_file_bytes: limits.max_install_file_bytes,
+        }
+    }
+    pub(crate) fn package_storage_root(
+        &self,
+        workspace: &str,
+        kind: pioneer_protocol::PackageKind,
+    ) -> PathBuf {
+        match kind {
+            pioneer_protocol::PackageKind::Plugin => self.plugin_storage_root(workspace),
+            pioneer_protocol::PackageKind::App => {
+                use sha2::{Digest, Sha256};
+                self.artifact_runtime_home
+                    .join("apps")
+                    .join(hex::encode(Sha256::digest(workspace.as_bytes())))
+            }
         }
     }
     pub(crate) fn plugin_storage_root(&self, workspace: &str) -> PathBuf {
@@ -154,6 +189,37 @@ pub(in crate::message) mod upload;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_delivery_admits_backend_libraries_without_changing_other_package_limits() {
+        let base = PackageDeliveryContext {
+            upload_root: PathBuf::new(),
+            materialized_root: PathBuf::new(),
+            upload_ttl_secs: 3600,
+            upload_recommended_chunk_size_bytes: 65536,
+            upload_max_chunk_size_bytes: 65536,
+            max_upload_compressed_bytes: 10 * 1024 * 1024,
+            max_upload_uncompressed_bytes: 50 * 1024 * 1024,
+            max_upload_archive_entries: 2048,
+            max_file_bytes: 1024 * 1024,
+        };
+        let app = base.clone().for_package(pioneer_protocol::PackageKind::App);
+        assert!(app.max_upload_compressed_bytes >= 14 * 1024 * 1024);
+        assert!(app.max_file_bytes >= 18 * 1024 * 1024);
+        assert!(
+            base.limits_for_package(pioneer_protocol::PackageKind::App)
+                .entry_bytes
+                >= 18 * 1024 * 1024
+        );
+        let plugin = base
+            .clone()
+            .for_package(pioneer_protocol::PackageKind::Plugin);
+        for context in [&base, &plugin] {
+            assert_eq!(context.max_upload_compressed_bytes, 10 * 1024 * 1024);
+            assert_eq!(context.max_file_bytes, 1024 * 1024);
+            assert_eq!(context.plugin_limits().entry_bytes, 1024 * 1024);
+        }
+    }
 
     // NOT_RUN / NOT_COMPILED. One cleanup-owner contract, no Gateway/DB/native
     // fixture. The blocking pool is gated so an executor-thread recursive Drop

@@ -29,6 +29,7 @@ mod m20261106_000001_agent_ledger_deadline_index;
 mod portable_payload_target;
 
 mod m20261111_000001_plugin_ownership;
+mod m20261112_000001_package_installations;
 
 mod m20261115_000001_portable_turn_payload;
 
@@ -252,6 +253,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261109_000001_execution_observability::Migration),
             Box::new(m20261108_000001_sqlite_memory_search::Migration),
             Box::new(m20261111_000001_plugin_ownership::Migration),
+            Box::new(m20261112_000001_package_installations::Migration),
             Box::new(m20261115_000001_portable_turn_payload::Migration),
         ]
     }

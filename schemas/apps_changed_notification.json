@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppsChangedNotification",
+  "type": "object",
+  "properties": {
+    "app_id": {
+      "type": "string"
+    },
+    "execution_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "revision": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "runtime_only": {
+      "type": "boolean",
+      "default": false
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "app_id",
+    "revision"
+  ]
+}

@@ -55,3 +55,46 @@ pub(super) async fn plugin_icon_route(
         &request_id,
     )
 }
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AppIconPath {
+    workspace_id: String,
+    app_id: String,
+    icon_revision: String,
+}
+pub(super) async fn app_icon_route(
+    State(state): State<GatewayHttpState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Path(path): Path<AppIconPath>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    let context =
+        authenticate_native_storage_request(&state, peer_addr, &headers, "storage/app/icon")
+            .await?;
+    let request_id = context
+        .request_id()
+        .cloned()
+        .expect("native HTTP authentication assigns a request ID");
+    if !valid_revision(&path.icon_revision) {
+        return Err(HttpError::not_found(request_id));
+    }
+    let image = state
+        .message_processor
+        .app_icon_snapshot(
+            &context,
+            &path.workspace_id,
+            &path.app_id,
+            &path.icon_revision,
+        )
+        .await
+        .map_err(|_| HttpError::not_found(request_id.clone()))?;
+    image_representation_response(
+        &image.content,
+        image.media_type,
+        &path.icon_revision,
+        method,
+        &headers,
+        &request_id,
+    )
+}

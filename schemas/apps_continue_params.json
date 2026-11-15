@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppsContinueParams",
+  "type": "object",
+  "properties": {
+    "app_id": {
+      "type": "string"
+    },
+    "expected_revision": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id",
+    "app_id",
+    "expected_revision"
+  ]
+}

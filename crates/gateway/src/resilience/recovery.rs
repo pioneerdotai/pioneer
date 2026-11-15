@@ -518,7 +518,7 @@ pub struct RecoveryCoordinator {
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     turn_execution_owner_id: Arc<str>,
     listener_starter: Arc<RwLock<Option<RecoveryListenerStarter>>>,
-    plugin_launch_locks: Option<crate::message::plugins::PluginMutationLocks>,
+    plugin_launch_locks: Option<crate::message::packages::PluginMutationLocks>,
     active_scan: Arc<tokio::sync::Mutex<(Option<String>, Option<String>)>>,
     orphan_scan: Arc<tokio::sync::Mutex<OrphanExecutionScan>>,
     terminal_scan: Arc<tokio::sync::Mutex<(Option<String>, Option<String>)>>,
@@ -788,7 +788,7 @@ impl RecoveryCoordinator {
 
     pub(crate) fn with_plugin_launch_locks(
         mut self,
-        locks: crate::message::plugins::PluginMutationLocks,
+        locks: crate::message::packages::PluginMutationLocks,
     ) -> Self {
         self.plugin_launch_locks = Some(locks);
         self
@@ -805,7 +805,7 @@ impl RecoveryCoordinator {
             );
             return Ok(Vec::new());
         };
-        crate::message::plugins::acquire_plugin_launch_admission(
+        crate::message::packages::acquire_plugin_launch_admission(
             &self.crud_store,
             locks,
             workspace,

@@ -41,12 +41,14 @@ pub enum SkillUploadPurpose {
     #[default]
     Skill,
     Plugin,
+    App,
 }
 impl SkillUploadPurpose {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Skill => "skill",
             Self::Plugin => "plugin",
+            Self::App => "app",
         }
     }
 }
@@ -157,6 +159,8 @@ pub struct SkillPackMembership {
 pub struct SkillListItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_owner: Option<crate::PluginOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_owner: Option<crate::PackageOwner>,
     pub skill_id: SkillId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack: Option<SkillPackMembership>,
@@ -518,6 +522,7 @@ mod tests {
     fn list_item(character: char, pack: Option<SkillPackMembership>) -> SkillListItem {
         SkillListItem {
             plugin_owner: None,
+            package_owner: None,
             skill_id: skill_id(character),
             pack,
             owner: None,
@@ -963,6 +968,7 @@ mod tests {
     fn management_results_and_notifications_carry_id_and_presentation() {
         let list_item = SkillListItem {
             plugin_owner: None,
+            package_owner: None,
             skill_id: skill_id('E'),
             pack: None,
             owner: Some("owner".to_owned()),
@@ -1208,5 +1214,18 @@ mod tests {
 
         assert!(schema_json.contains("uploaded_archive"));
         assert!(!schema_json.contains("\"path\""));
+    }
+}
+
+impl SkillListItem {
+    pub fn package_owner(&self) -> Option<crate::PackageOwner> {
+        self.package_owner.clone().or_else(|| {
+            self.plugin_owner
+                .as_ref()
+                .map(crate::PackageOwner::from_plugin)
+        })
+    }
+    pub fn is_package_component(&self) -> bool {
+        self.package_owner.is_some() || self.plugin_owner.is_some()
     }
 }

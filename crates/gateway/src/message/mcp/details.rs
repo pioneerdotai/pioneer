@@ -169,11 +169,12 @@ impl MessageProcessor {
                 }
             };
 
-        server.plugin_owner = match self.crud_store.find_mcp_plugin_owner(&server_id).await {
-            Ok(owner) => owner.map(|owner| pioneer_protocol::PluginOwner {
-                plugin_id: owner.plugin_id,
-                member_key: owner.member_key,
-            }),
+        server.package_owner = match self
+            .crud_store
+            .native_package_owner("mcp", &server_id)
+            .await
+        {
+            Ok(owner) => owner,
             Err(_) => {
                 self.send_error(
                     connection_id,
@@ -187,6 +188,10 @@ impl MessageProcessor {
                 return;
             }
         };
+        server.plugin_owner = server
+            .package_owner
+            .as_ref()
+            .and_then(pioneer_protocol::PackageOwner::as_plugin);
 
         // Members need the catalog to select and understand an MCP server.
         // Management audit and cross-turn binding history are not part of

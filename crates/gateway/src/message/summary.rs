@@ -41,6 +41,7 @@ pub async fn generate_thread_title(
             .prepare_cli_runtime_proxy_url(&thread.workspace_id, &instance.id)
             .await?;
         generate_cli_title(
+            processor,
             crud,
             &thread.workspace_id,
             thread_id,
@@ -99,17 +100,11 @@ fn title_cli_instance(
         .find(|instance| instance.id == id)
         .context("selected CLI title instance is unavailable")?;
     ensure!(instance.enabled, "selected CLI title instance is disabled");
-    ensure!(
-        matches!(
-            instance.kind,
-            GatewayCliAgentRuntimeKindConfig::Codex | GatewayCliAgentRuntimeKindConfig::Claude
-        ),
-        "selected CLI runtime does not support isolated title generation"
-    );
     Ok(Some(instance))
 }
 
 async fn generate_cli_title(
+    processor: &super::MessageProcessor,
     crud: &CrudStore,
     workspace: &str,
     thread_id: &str,
@@ -118,70 +113,106 @@ async fn generate_cli_title(
     prompt: String,
     environment: pioneer_cli_agent_runtime::process::SensitiveEnvironment,
 ) -> Result<String> {
-    let codex = instance.kind == GatewayCliAgentRuntimeKindConfig::Codex;
+    use GatewayCliAgentRuntimeKindConfig::{Claude, Codex, OpenCode};
+    let home = crate::cli_runtime::config::service_home(&instance)?;
+    let kind = instance.kind;
+    let (provider, api) = match kind {
+        Codex => ("codex-cli", "codex_exec_json"),
+        Claude => ("claude-cli", "claude_print_json"),
+        OpenCode => ("opencode-cli", "opencode_http"),
+    };
     let mut usage = pioneer_provider::TokenUsage {
-        provider: Some(if codex { "codex-cli" } else { "claude-cli" }.into()),
-        api: Some(
-            if codex {
-                "codex_exec_json"
-            } else {
-                "claude_print_json"
-            }
-            .into(),
-        ),
+        provider: Some(provider.into()),
+        api: Some(api.into()),
         model: Some(model.into()),
         ..Default::default()
     };
-    let claude_output_cap = if codex {
-        0
-    } else {
+    let claude_output_cap = if kind == Claude {
         pioneer_provider::catalog::model_catalog()?
             .limits("anthropic", model)
             .max_output
             .unwrap_or(1024)
+    } else {
+        0
     };
     let call =
         crate::usage_journal::Call::start(crud, workspace, "title", thread_id, &usage).await?;
     let timeout = std::time::Duration::from_millis(instance.request_timeout_ms);
     // These are fresh nonpersistent service contexts, never the user's session.
     // No compaction prompt, runner, lifecycle, or visible Pioneer turn is used.
-    let result = if codex {
-        let service = CodexService::new(CodexServiceConfig {
-            executable: instance.binary_path,
-            home_path: instance.home_path,
-            environment,
-        });
-        service
-            .summarize(
-                CodexServiceRequest {
-                    model: model.into(),
-                    effort: None,
-                    instructions: title_instructions().into(),
-                    input: prompt,
-                },
+    let result = match kind {
+        Codex => {
+            let service = CodexService::new(CodexServiceConfig {
+                executable: instance.binary_path,
+                home_path: home,
+                environment,
+            });
+            service
+                .summarize(
+                    CodexServiceRequest {
+                        model: model.into(),
+                        effort: None,
+                        instructions: title_instructions().into(),
+                        input: prompt,
+                    },
+                    timeout,
+                )
+                .await
+                .map(|result| (result.text, result.observed_usage))
+        }
+        Claude => {
+            let service = ClaudeService::new(ClaudeServiceConfig {
+                executable: instance.binary_path,
+                config_dir: home,
+                environment,
+            });
+            service
+                .summarize(
+                    ClaudeServiceRequest {
+                        model: model.into(),
+                        effort: None,
+                        instructions: title_instructions().into(),
+                        input: prompt,
+                        output_cap: claude_output_cap,
+                    },
+                    timeout,
+                )
+                .await
+                .map(|result| (result.text, result.observed_usage))
+        }
+        OpenCode => {
+            let data_home = processor.opencode_managed_data_home(&instance);
+            let service = crate::cli_runtime::opencode_session::OpenCodeSummaryService::new(
+                instance,
+                environment,
+                data_home,
+            );
+            let result = match tokio::time::timeout(
                 timeout,
+                service.summarize(model.into(), None, title_instructions(), prompt, timeout),
             )
             .await
-            .map(|result| (result.text, result.observed_usage))
-    } else {
-        let service = ClaudeService::new(ClaudeServiceConfig {
-            executable: instance.binary_path,
-            config_dir: instance.home_path,
-            environment,
-        });
-        service
-            .summarize(
-                ClaudeServiceRequest {
-                    model: model.into(),
-                    effort: None,
-                    instructions: title_instructions().into(),
-                    input: prompt,
-                    output_cap: claude_output_cap,
-                },
-                timeout,
-            )
-            .await
-            .map(|result| (result.text, result.observed_usage))
+            {
+                Ok(result) => result,
+                Err(_) => Err(pioneer_cli_agent_runtime::service::ServiceFailure {
+                    class: pioneer_protocol::ProviderFailureClass::NetworkTransient,
+                    retry_after_ms: None,
+                }
+                .into()),
+            };
+            let cleanup = service.cleanup().await;
+            match (result, cleanup) {
+                (Ok((text, _, _, raw)), Ok(())) => Ok((text, raw)),
+                (Err(error), _) => Err(error),
+                (Ok((_, _, _, raw)), Err(error)) => Err(error
+                    .context(pioneer_cli_agent_runtime::service::ObservedServiceUsage(
+                        raw,
+                    ))
+                    .context(pioneer_cli_agent_runtime::service::ServiceStage(
+                        "cli_cleanup",
+                    ))),
+            }
+        }
     };
     let raw = match &result {
         Ok((_, raw)) => Some(raw),
@@ -294,7 +325,7 @@ mod tests {
     };
 
     #[test]
-    fn title_selection_preserves_overrides_and_routes_api_codex_claude() {
+    fn title_selection_preserves_overrides_and_routes_all_cli_kinds() {
         use super::*;
         let mut config = SummaryConfig {
             summary_model: Some("unused".into()),
@@ -322,6 +353,7 @@ mod tests {
         for kind in [
             GatewayCliAgentRuntimeKindConfig::Codex,
             GatewayCliAgentRuntimeKindConfig::Claude,
+            GatewayCliAgentRuntimeKindConfig::OpenCode,
         ] {
             instance.kind = kind;
             let (provider, model) = title_selection(&config, "cli_runtime:work", "native-model");

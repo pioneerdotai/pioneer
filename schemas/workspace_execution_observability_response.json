@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspaceExecutionObservabilityResponse",
+  "type": "object",
+  "properties": {
+    "coverage": true,
+    "nextAfter": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "records": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExecutionObservationRecord"
+      }
+    },
+    "summary": true,
+    "through": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspaceId",
+    "through",
+    "records",
+    "coverage"
+  ],
+  "$defs": {
+    "ExecutionObservationRecord": {
+      "type": "object",
+      "properties": {
+        "causalLinks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "executionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "facts": true,
+        "kind": {
+          "type": "string"
+        },
+        "lane": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "ownerId": {
+          "type": "string"
+        },
+        "ownerKind": {
+          "type": "string"
+        },
+        "parentOperationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "recordedAtMs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "resolutionOrigin": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "rootThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "sourceRevision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tariffEvidence": true,
+        "tariffHash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskExecutionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskRunId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timing": true,
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "windowId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "lane",
+        "causalLinks",
+        "sequence",
+        "operationId",
+        "revision",
+        "sourceRevision",
+        "resolutionOrigin",
+        "ownerKind",
+        "ownerId",
+        "kind",
+        "purpose",
+        "status",
+        "recordedAtMs",
+        "facts",
+        "timing"
+      ]
+    }
+  }
+}

@@ -532,6 +532,7 @@ mod tests {
     fn server(id: &str) -> McpListItem {
         McpListItem {
             plugin_owner: None,
+            package_owner: None,
             id: id.to_owned(),
             name: id.to_owned(),
             display_name: None,

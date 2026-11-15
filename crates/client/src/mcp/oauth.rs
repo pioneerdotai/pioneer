@@ -1409,7 +1409,7 @@ mod tests {
     fn manual_browser_retry_requires_live_operation_and_updates_failure_projection() {
         let core = crate::catalog_test_support::client();
         let (_plugins, assert_plugins_quiet) =
-            crate::plugins::runtime::tests::watch_plugin_reads(&core);
+            crate::packages::runtime::tests::watch_plugin_reads(&core);
         let shell = Arc::new(Shell::default());
         core.set_mcp_oauth_shell(shell.clone());
         core.observe_mcp_oauth_notification(&GatewayNotification::McpOAuthChanged(event(

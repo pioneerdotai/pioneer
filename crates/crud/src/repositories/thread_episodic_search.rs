@@ -75,9 +75,12 @@ pub async fn search<C: ConnectionTrait>(
         AND (i.status IN ('pending_index','failed') OR (i.status = 'active' AND i.search_text IS NULL) {missing_embedding})) AS incomplete");
     let lexical = if request.lexical {
         values.push(request.query.clone().into());
-        "SELECT e.id, bm25(thread_episodic_fts) AS distance FROM thread_episodic_fts JOIN eligible e ON e.search_rowid = thread_episodic_fts.rowid WHERE thread_episodic_fts MATCH pioneer_fts_literal(?)".to_owned()
+        // Keep MATCH outside the occurrence loop, even without planner statistics.
+        "SELECT e.search_rowid AS id, e.id AS sort_id, bm25(thread_episodic_fts) AS distance
+         FROM thread_episodic_fts CROSS JOIN eligible e ON e.search_rowid = thread_episodic_fts.rowid
+         WHERE thread_episodic_fts MATCH pioneer_fts_literal(?)".to_owned()
     } else {
-        "SELECT id, 0.0 AS distance FROM eligible WHERE 0".to_owned()
+        "SELECT search_rowid AS id, id AS sort_id, 0.0 AS distance FROM eligible WHERE 0".to_owned()
     };
     let semantic = if let Some(embedding) = &request.embedding {
         ensure!(
@@ -92,71 +95,108 @@ pub async fn search<C: ConnectionTrait>(
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
+        let dimension = i64::try_from(embedding.dimension)?;
+        let byte_length = i64::try_from(
+            embedding
+                .dimension
+                .checked_mul(4)
+                .ok_or_else(|| anyhow::anyhow!("embedding size overflow"))?,
+        )?;
         values.extend([
             embedding.provider_id.clone().into(),
             embedding.model.clone().into(),
-            i64::try_from(embedding.dimension)?.into(),
+            dimension.into(),
             embedding.normalized.into(),
-            i64::try_from(
-                embedding
-                    .dimension
-                    .checked_mul(4)
-                    .ok_or_else(|| anyhow::anyhow!("embedding size overflow"))?,
-            )?
-            .into(),
+            byte_length.into(),
+            dimension.into(),
+            byte_length.into(),
             bytes.into(),
         ]);
         // CASE is lazy in SQLite: distance cannot execute for an artifact that
         // did not pass the materialized identity/dimension/length boundary.
         // Only IDs and scalar scores are materialized, never corpus BLOBs.
-        "SELECT a.id, CASE WHEN a.id IN (SELECT artifact_id FROM semantic_artifacts)
+        "SELECT a.id, CASE WHEN a.dimension = ? AND length(a.vector_bytes) = ?
             THEN vec_distance_cosine(a.vector_bytes, ?) END AS distance
-         FROM thread_episodic_embedding_artifacts a
-         WHERE a.id IN (SELECT artifact_id FROM semantic_artifacts)"
+         FROM semantic_artifacts ids CROSS JOIN thread_episodic_embedding_artifacts a
+           ON a.rowid = ids.artifact_rowid"
             .to_owned()
     } else {
         "SELECT id, 0.0 AS distance FROM eligible WHERE 0".to_owned()
     };
     let semantic_artifacts = if request.embedding.is_some() {
-        "SELECT DISTINCT a.id AS artifact_id FROM eligible e JOIN thread_episodic_embedding_artifacts a ON a.id = e.embedding_artifact_id AND a.workspace_id = e.workspace_id WHERE a.provider_id = ? AND a.model = ? AND a.dimension = ? AND a.normalized = ? AND length(a.vector_bytes) = ?"
+        "SELECT a.id AS artifact_id, a.rowid AS artifact_rowid
+         FROM eligible_artifact_ids e CROSS JOIN thread_episodic_embedding_artifacts a
+           ON a.id = e.embedding_artifact_id AND a.workspace_id = e.workspace_id
+         WHERE a.provider_id = ? AND a.model = ? AND a.dimension = ? AND a.normalized = ? AND length(a.vector_bytes) = ?
+         ORDER BY a.rowid"
     } else {
         "SELECT id AS artifact_id FROM eligible WHERE 0"
     };
-    // RRF is the common domain policy (equal branch weights, fixed k). Push its
-    // order into SQLite so a deep page transfers only its bounded rows. Return
-    // ranks, never BM25/distance; the common layer computes the public score.
+    // Rank policy belongs to the domain; SQLite only pushes down its order.
+    // The default lexical path avoids empty vector/fusion stages entirely.
+    let ranking = if request.embedding.is_none() {
+        values.push(THREAD_SEARCH_RRF_K.into());
+        "lexical_ranks AS (
+            SELECT id, row_number() OVER (ORDER BY distance,sort_id) AS lexical_rank,
+                NULL AS semantic_rank,
+                1.0 / (? + row_number() OVER (ORDER BY distance,sort_id)) AS score
+            FROM lexical_candidates
+        ), grouped_hits AS (
+            SELECT e.id, c.lexical_rank, c.semantic_rank, max(c.score) AS score,
+                e.thread_id, e.turn_id, e.item_id, 1 AS group_position
+            FROM lexical_ranks c JOIN eligible e ON e.search_rowid=c.id
+            GROUP BY e.group_id
+        )"
+        .to_owned()
+        // SQLite's single built-in max() selects all bare columns from its
+        // winning row. Unique one-based lexical ranks make that winner unique.
+        // Hybrid scores can tie, so that path uses explicit source tie breaks.
+    } else {
+        values.extend([THREAD_SEARCH_RRF_K.into(), THREAD_SEARCH_RRF_K.into()]);
+        format!("eligible_artifact_ids AS MATERIALIZED (SELECT DISTINCT workspace_id, embedding_artifact_id FROM eligible),
+        semantic_artifacts AS MATERIALIZED ({semantic_artifacts}),
+        semantic_scores AS MATERIALIZED ({semantic}),
+        semantic_candidates AS (SELECT e.search_rowid AS id, e.id AS sort_id, s.distance FROM eligible e JOIN semantic_scores s ON s.id = e.embedding_artifact_id),
+        lexical_ranks AS (SELECT id, row_number() OVER (ORDER BY distance,sort_id) AS lexical_rank FROM lexical_candidates),
+        semantic_ranks AS (SELECT id, row_number() OVER (ORDER BY distance,sort_id) AS semantic_rank FROM semantic_candidates WHERE distance IS NOT NULL),
+        contributions AS (
+            SELECT id, lexical_rank, NULL AS semantic_rank, 1.0 / (? + lexical_rank) AS contribution FROM lexical_ranks
+            UNION ALL SELECT id, NULL, semantic_rank, 1.0 / (? + semantic_rank) FROM semantic_ranks
+        ), fused AS (
+            SELECT id, max(lexical_rank) AS lexical_rank, max(semantic_rank) AS semantic_rank, sum(contribution) AS score
+            FROM contributions GROUP BY id
+        ), grouped_hits AS (
+            SELECT e.id, c.lexical_rank, c.semantic_rank, c.score, e.thread_id, e.turn_id, e.item_id,
+                row_number() OVER (PARTITION BY e.group_id ORDER BY c.score DESC, e.thread_id, e.turn_id, e.item_id, e.id) AS group_position
+            FROM fused c JOIN eligible e ON e.search_rowid=c.id
+        )")
+    };
     values.extend([
-        THREAD_SEARCH_RRF_K.into(),
-        THREAD_SEARCH_RRF_K.into(),
         i64::from(request.limit).into(),
         offset.into(),
+        i64::from(request.snippet_chars).into(),
         request.query.clone().into(),
         i64::from(request.snippet_chars).into(),
     ]);
     // MATCH, scalar extension calls, window ranks and CTE materialization are
     // missing from the installed Entity/SeaQuery search API. All data is bound.
+    // Integer occurrence keys keep intermediate grouping compact; rank ties
+    // still use the stable item ID, and pages return the public source IDs.
     let sql = format!("WITH eligible AS MATERIALIZED (
-        SELECT i.id, i.workspace_id, i.thread_id, i.turn_id, i.item_id, i.embedding_artifact_id, i.rowid AS search_rowid {source_scope} AND i.status = 'active' AND i.search_text IS NOT NULL
+        SELECT i.id, i.workspace_id, i.thread_id, i.turn_id, i.item_id, i.embedding_artifact_id, i.rowid AS search_rowid, COALESCE(i.projection_group_id,i.id) AS group_id {source_scope} AND i.status = 'active' AND i.search_text IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM thread_episodic_items newer WHERE newer.workspace_id = i.workspace_id
               AND newer.thread_id = i.thread_id AND newer.turn_id = i.turn_id AND newer.item_id = i.item_id
               AND newer.status = 'active' AND newer.deleted_at IS NULL AND newer.search_text IS NOT NULL
               AND (newer.updated_at > i.updated_at OR (newer.updated_at = i.updated_at AND newer.id > i.id)))
     ), lexical_candidates AS MATERIALIZED ({lexical}),
-    semantic_artifacts AS MATERIALIZED ({semantic_artifacts}),
-    semantic_scores AS MATERIALIZED ({semantic}),
-    semantic_candidates AS (SELECT e.id, s.distance FROM eligible e JOIN semantic_scores s ON s.id = e.embedding_artifact_id),
-    lexical_ranks AS (SELECT id, row_number() OVER (ORDER BY distance,id) AS lexical_rank FROM lexical_candidates),
-    semantic_ranks AS (SELECT id, row_number() OVER (ORDER BY distance,id) AS semantic_rank FROM semantic_candidates WHERE distance IS NOT NULL),
-    candidates AS (SELECT id FROM lexical_ranks UNION SELECT id FROM semantic_ranks),
-    ranked_page AS MATERIALIZED (
-        SELECT c.id, l.lexical_rank, s.semantic_rank,
-            (coalesce(1.0 / (? + l.lexical_rank),0) + coalesce(1.0 / (? + s.semantic_rank),0)) AS score
-        FROM candidates c JOIN eligible e ON e.id = c.id
-        LEFT JOIN lexical_ranks l ON l.id = c.id LEFT JOIN semantic_ranks s ON s.id = c.id
-        ORDER BY score DESC, e.thread_id, e.turn_id, e.item_id, e.id LIMIT ? OFFSET ?
+    {ranking}, ranked_page AS MATERIALIZED (
+        SELECT id, lexical_rank, semantic_rank, score, thread_id, turn_id, item_id
+        FROM grouped_hits WHERE group_position=1
+        ORDER BY score DESC, thread_id, turn_id, item_id, id LIMIT ? OFFSET ?
     )
     SELECT i.id, i.workspace_id, i.thread_id, i.turn_id, i.item_id, i.source_actor_role, i.source_runtime_kind, i.source_context_json, i.visibility, i.status, i.text_hash, i.source_text_hash, i.language_hint, i.token_estimate, i.indexed_at, i.created_at, i.updated_at, i.deleted_at, i.projection_group_id, i.embedding_artifact_id,
-        substr(CASE WHEN p.lexical_rank IS NOT NULL THEN
+        substr(CASE WHEN length(i.search_text) <= ? THEN i.search_text
+            WHEN p.lexical_rank IS NOT NULL THEN
             (SELECT snippet(thread_episodic_fts,0,'','','…',8) FROM thread_episodic_fts
              WHERE rowid=i.rowid AND thread_episodic_fts MATCH pioneer_fts_literal(?))
             ELSE i.search_text END,1,?) AS search_text,
@@ -203,8 +243,8 @@ pub async fn search<C: ConnectionTrait>(
     })
 }
 
-const SOURCE_FROM: &str = r#"FROM thread_episodic_items i
-    JOIN thread t ON t.id = i.thread_id AND t.workspace_id = i.workspace_id
+const SOURCE_FROM: &str = r#"FROM thread t
+    CROSS JOIN thread_episodic_items i ON t.id = i.thread_id AND t.workspace_id = i.workspace_id
     LEFT JOIN thread_lineage lineage ON lineage.child_thread_id = t.id
     JOIN thread r ON r.id = CASE WHEN t.access_class = 'internal' THEN lineage.root_thread_id ELSE t.id END AND r.workspace_id = i.workspace_id
     JOIN workspace w ON w.id = i.workspace_id AND w.is_active = 1"#;

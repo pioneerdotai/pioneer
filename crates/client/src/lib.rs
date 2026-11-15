@@ -68,6 +68,7 @@
 
 pub mod administration;
 pub mod agents_doc;
+pub mod apps;
 pub mod artifacts;
 pub mod authorization;
 pub mod avatars;
@@ -85,6 +86,7 @@ mod local_file;
 pub mod mcp;
 pub mod navigation;
 pub mod notifications;
+pub mod packages;
 pub mod platform;
 pub mod plugins;
 pub mod providers;

@@ -18,6 +18,8 @@ struct DesktopStateFile {
     window: Option<WindowState>,
     #[serde(default)]
     sidebar: SidebarState,
+    #[serde(default = "default_app_panel_height")]
+    app_panel_height: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -66,6 +68,32 @@ const fn default_state_version() -> u32 {
     DESKTOP_STATE_VERSION
 }
 
+fn default_app_panel_height() -> f32 {
+    320.
+}
+pub(crate) fn app_panel_height(cx: &mut App) -> f32 {
+    if ensure_loaded(cx).is_err() {
+        return default_app_panel_height();
+    }
+    let height = cx.global::<DesktopStateStore>().state.app_panel_height;
+    if height.is_finite() && height >= 180. {
+        height
+    } else {
+        default_app_panel_height()
+    }
+}
+pub(crate) fn set_app_panel_height(cx: &mut App, height: f32) -> Result<()> {
+    if !height.is_finite() {
+        return Ok(());
+    }
+    ensure_loaded(cx)?;
+    let (path, serialized) = {
+        let store = cx.global_mut::<DesktopStateStore>();
+        store.state.app_panel_height = height.clamp(180., 1200.);
+        (store.path.clone(), serialize_state(&store.state)?)
+    };
+    write_state_file(&path, serialized)
+}
 pub(crate) fn window(cx: &mut App) -> Result<Option<WindowState>> {
     ensure_loaded(cx)?;
     Ok(cx

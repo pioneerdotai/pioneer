@@ -1541,7 +1541,8 @@ fn resolve_turn_capability_input(
                 pack_id: Some(_), ..
             }
             | TurnCapabilityKind::SkillPack { .. }
-            | TurnCapabilityKind::Plugin { .. } => {
+            | TurnCapabilityKind::Plugin { .. }
+            | TurnCapabilityKind::App { .. } => {
                 normalized.rejected.push(rejected_capability(
                     capability,
                     TurnCapabilityRejectedReason::InvalidInput,
@@ -1612,7 +1613,8 @@ fn resolve_turn_capability_input(
                 pack_id: Some(_), ..
             }
             | TurnCapabilityKind::SkillPack { .. }
-            | TurnCapabilityKind::Plugin { .. } => {
+            | TurnCapabilityKind::Plugin { .. }
+            | TurnCapabilityKind::App { .. } => {
                 unreachable!("pack metadata was rejected before runtime normalization")
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
@@ -1851,7 +1853,10 @@ fn capability_display_label(rejected: &TurnRejectedCapability) -> String {
     match &rejected.kind {
         TurnCapabilityKind::Skill { skill_id, .. } => skill_id.to_string(),
         TurnCapabilityKind::SkillPack { pack_id } => pack_id.to_string(),
-        TurnCapabilityKind::Plugin { plugin_id, .. } => plugin_id.clone(),
+        TurnCapabilityKind::Plugin { plugin_id, .. }
+        | TurnCapabilityKind::App {
+            app_id: plugin_id, ..
+        } => plugin_id.clone(),
         TurnCapabilityKind::McpServer { name, .. } => name.clone(),
         TurnCapabilityKind::McpTool {
             server_name,

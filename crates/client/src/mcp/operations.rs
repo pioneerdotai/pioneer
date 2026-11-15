@@ -1072,7 +1072,7 @@ mod tests {
     fn actions_have_one_generation_and_optimistic_policy_rolls_back_only_matching_server() {
         let (core, receiver) = fixture();
         let (_plugins, assert_plugins_quiet) =
-            crate::plugins::runtime::tests::watch_plugin_reads(&core);
+            crate::packages::runtime::tests::watch_plugin_reads(&core);
         let b = core.mcp_catalog_snapshot("workspace").unwrap().servers()[1].clone();
         let intent = || McpIntent::Policy {
             server_id: "a".into(),
@@ -1148,7 +1148,7 @@ mod tests {
         use pioneer_protocol::*;
         let (core, receiver) = fixture();
         let (_plugins, assert_plugins_quiet) =
-            crate::plugins::runtime::tests::watch_plugin_reads(&core);
+            crate::packages::runtime::tests::watch_plugin_reads(&core);
         core.mcp_intent("workspace",McpIntent::Configure{config_json:r#"{"mcpServers":{"synthetic":{"command":"fake","env":{"TOKEN":"private-value"}}}}"#.into()}).unwrap();
         let work = receiver.try_recv().unwrap();
         core.complete_mcp_configuration(
