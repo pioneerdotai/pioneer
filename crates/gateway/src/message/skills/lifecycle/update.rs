@@ -29,7 +29,7 @@ impl MessageProcessor {
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         SKILLS_ERROR_INVALID_REQUEST,
-                        super::super::super::plugins::native_plugin_error_code(&error),
+                        super::super::super::packages::native_plugin_error_code(&error),
                         json!({}),
                     ),
                 )
@@ -64,7 +64,7 @@ impl MessageProcessor {
                         Some(request_id.clone()),
                         INVALID_REQUEST_CODE,
                         SKILLS_ERROR_INTERNAL,
-                        super::super::super::plugins::native_plugin_error_code(&error),
+                        super::super::super::packages::native_plugin_error_code(&error),
                         json!({}),
                     )
                 }),
@@ -252,7 +252,7 @@ impl MessageProcessor {
                     )
                 })?;
             let Some(link) = link.filter(|link| {
-                link.plugin_id == owner.plugin_id && link.member_key == owner.member_key
+                link.package_id == owner.plugin_id && link.member_key == owner.member_key
             }) else {
                 return Err(skills_error(
                     Some(request_id),
@@ -303,17 +303,6 @@ impl MessageProcessor {
                 ));
             }
         };
-        if materialized.ownership().is_some()
-            && !prepared.definition.conformance.agentskills_strict.compliant
-        {
-            return Err(skills_error(
-                Some(request_id),
-                INVALID_PARAMS_CODE,
-                SKILLS_ERROR_INVALID_REQUEST,
-                "package skill does not conform to Agent Skills",
-                json!({}),
-            ));
-        }
         let upload_guard = match materialized.upload_id() {
             Some(id) => Some(self.acquire_skill_upload_lock(id).await),
             None => None,

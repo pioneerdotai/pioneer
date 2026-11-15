@@ -241,6 +241,28 @@
         {
           "type": "object",
           "properties": {
+            "appId": {
+              "type": "string"
+            },
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "expectedRevision": {
               "type": "integer",
               "format": "int64"
@@ -253,6 +275,7 @@
               "const": "plugin"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "pluginId",
@@ -280,6 +303,7 @@
               "const": "skill"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "skillId"
@@ -296,6 +320,7 @@
               "const": "skillPack"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "packId"
@@ -315,6 +340,7 @@
               "const": "mcpServer"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "name",
@@ -338,6 +364,7 @@
               "const": "mcpTool"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "serverName",

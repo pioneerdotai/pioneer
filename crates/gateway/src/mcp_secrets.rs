@@ -154,7 +154,11 @@ mod tests {
             "children":[{"kind":"mcp","id":"reserved_native"}],"cleanup_refs":["uncertain"]})
         .to_string();
         store
-            .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+            .insert_plugin_installation(&pioneer_crud::PackageRecord {
+                kind: pioneer_crud::PackageKind::Plugin,
+                app_manifest_json: None,
+                app_localizations_json: None,
+                operation_error_json: None,
                 id: id.clone(),
                 workspace_id: "ws_gc".into(),
                 name: "fixture.tools".into(),
@@ -213,7 +217,7 @@ mod tests {
         assert!(secrets.get_mcp_secret("orphan").unwrap().is_none());
         assert_eq!(
             store
-                .find_plugin_installation(&id)
+                .find_package_installation(&id)
                 .await
                 .unwrap()
                 .unwrap()

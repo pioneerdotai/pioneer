@@ -2,6 +2,30 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Product identity is distinct even when installation mechanics are shared.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageKind {
+    #[default]
+    Plugin,
+    App,
+}
+impl PackageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plugin => "plugin",
+            Self::App => "app",
+        }
+    }
+    pub fn from_storage(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "plugin" => Ok(Self::Plugin),
+            "app" => Ok(Self::App),
+            _ => Err("invalid package kind"),
+        }
+    }
+}
+
 /// Authored presentation only. None of these fields grant execution authority.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct PluginAuthor {
@@ -15,6 +39,8 @@ pub use crate::images::ImageReference as PluginIcon;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(default)]
 pub struct PluginMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<crate::AppMetadata>,
     pub display_name: Option<String>,
     pub short_description: Option<String>,
     pub description: Option<String>,
@@ -36,6 +62,32 @@ pub struct PluginMetadata {
     pub composer_icon: Option<PluginIcon>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PackageIdentity {
+    pub kind: PackageKind,
+    pub id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PackageOwner {
+    pub kind: PackageKind,
+    pub package_id: String,
+    pub member_key: String,
+}
+impl PackageOwner {
+    pub fn as_plugin(&self) -> Option<PluginOwner> {
+        (self.kind == PackageKind::Plugin).then(|| PluginOwner {
+            plugin_id: self.package_id.clone(),
+            member_key: self.member_key.clone(),
+        })
+    }
+    pub fn from_plugin(owner: &PluginOwner) -> Self {
+        Self {
+            kind: PackageKind::Plugin,
+            package_id: owner.plugin_id.clone(),
+            member_key: owner.member_key.clone(),
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct PluginOwner {
     pub plugin_id: String,
@@ -141,6 +193,8 @@ pub struct PluginSelectionSnapshot {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginSelectedParent {
+    #[serde(default)]
+    pub kind: PackageKind,
     pub id: String,
     pub revision: i64,
 }
@@ -284,4 +338,55 @@ pub struct PluginsContinueParams {
     pub workspace_id: String,
     pub plugin_id: String,
     pub expected_revision: i64,
+}
+
+/// One persisted package selection; aliases retain existing Plugin source consumers.
+pub type PackageSelectionSnapshot = PluginSelectionSnapshot;
+pub type PackageSelectedParent = PluginSelectedParent;
+pub type PackageSelectedChild = PluginSelectedChild;
+
+impl PackageIdentity {
+    pub fn resolve(
+        owner: Option<&Self>,
+        legacy_plugin: Option<&str>,
+    ) -> Result<Option<Self>, &'static str> {
+        if let Some(owner) = owner {
+            if owner.id.is_empty()
+                || legacy_plugin
+                    .is_some_and(|id| owner.kind != PackageKind::Plugin || id != owner.id)
+            {
+                return Err("inconsistent package provenance");
+            }
+            Ok(Some(owner.clone()))
+        } else {
+            Ok(legacy_plugin.map(|id| Self {
+                kind: PackageKind::Plugin,
+                id: id.into(),
+            }))
+        }
+    }
+}
+
+impl PluginMetadata {
+    pub fn name_for_locale(&self, base: &str, locale: &str) -> String {
+        self.app
+            .as_ref()
+            .and_then(|a| a.localized(locale, |l| l.name.as_deref()))
+            .or_else(|| self.display_name.clone())
+            .unwrap_or_else(|| base.into())
+    }
+    pub fn description_for_locale(&self, base: Option<&str>, locale: &str) -> Option<String> {
+        self.app
+            .as_ref()
+            .and_then(|a| a.localized(locale, |l| l.short_description.as_deref()))
+            .or_else(|| self.description.clone())
+            .or_else(|| base.map(str::to_owned))
+    }
+    pub fn logo_for_theme(&self, dark: bool) -> Option<&crate::ImageReference> {
+        self.app
+            .as_ref()
+            .and_then(|a| a.icon.as_ref())
+            .map(|i| if dark { &i.dark } else { &i.light })
+            .or(self.logo.as_ref())
+    }
 }

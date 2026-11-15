@@ -112,6 +112,20 @@ pub mod methods {
     pub const PLUGINS_LIST: &str = "plugins/list";
     pub const PLUGINS_DETAILS: &str = "plugins/details";
     pub const PLUGINS_CHANGED: &str = "plugins/changed";
+    pub const APPS_PREVIEW: &str = "apps/preview";
+    pub const APPS_INSTALL: &str = "apps/install";
+    pub const APPS_UPDATE: &str = "apps/update";
+    pub const APPS_REMOVE: &str = "apps/remove";
+    pub const APPS_RETRY: &str = "apps/retry";
+    pub const APPS_CONTINUE: &str = "apps/continue";
+    pub const APPS_SET_ENABLED: &str = "apps/set_enabled";
+    pub const APPS_RUNTIME_INFO: &str = "apps/runtime_info";
+    pub const APPS_RENEW_VIEW: &str = "apps/renew_view";
+    pub const APPS_CLOSE_VIEW: &str = "apps/close_view";
+    pub const APPS_OPEN_VIEW: &str = "apps/open_view";
+    pub const APPS_LIST: &str = "apps/list";
+    pub const APPS_DETAILS: &str = "apps/details";
+    pub const APPS_CHANGED: &str = "apps/changed";
     pub const SKILLS_LIST: &str = "skills/list";
     pub const SKILLS_INSTALL: &str = "skills/install";
     pub const SKILLS_UPDATE: &str = "skills/update";
@@ -296,6 +310,19 @@ pub mod methods {
         PLUGINS_SET_ENABLED,
         PLUGINS_LIST,
         PLUGINS_DETAILS,
+        APPS_PREVIEW,
+        APPS_INSTALL,
+        APPS_UPDATE,
+        APPS_REMOVE,
+        APPS_RETRY,
+        APPS_CONTINUE,
+        APPS_SET_ENABLED,
+        APPS_RUNTIME_INFO,
+        APPS_RENEW_VIEW,
+        APPS_CLOSE_VIEW,
+        APPS_OPEN_VIEW,
+        APPS_LIST,
+        APPS_DETAILS,
         SKILLS_LIST,
         SKILLS_INSTALL,
         SKILLS_UPDATE,

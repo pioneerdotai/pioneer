@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use axum::serve::ListenerExt as _;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use pioneer_config::AppConfig;
 use pioneer_protocol::{
@@ -301,6 +302,13 @@ pub async fn spawn_server(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let readiness = state.readiness();
     let join_handle = tokio::spawn(async move {
+        // Small interactive WS frames must not wait for TCP coalescing, on
+        // either the App proxy connection or the backend Host API connection.
+        let listener = listener.tap_io(|socket| {
+            if let Err(error) = socket.set_nodelay(true) {
+                tracing::warn!(%error, "failed to enable Gateway TCP_NODELAY");
+            }
+        });
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),

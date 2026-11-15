@@ -39,7 +39,11 @@ async fn owned_skill_keeps_native_installation_and_native_source_override() {
     let id = "P".repeat(21);
     let now = chrono::Utc::now().fixed_offset();
     store
-        .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        .insert_plugin_installation(&pioneer_crud::PackageRecord {
+            kind: pioneer_crud::PackageKind::Plugin,
+            app_manifest_json: None,
+            app_localizations_json: None,
+            operation_error_json: None,
             id: id.clone(),
             workspace_id: workspace.clone(),
             name: "fixture.tools".into(),
@@ -114,6 +118,7 @@ async fn owned_skill_keeps_native_installation_and_native_source_override() {
             )],
             None,
             Some(&PluginOwnershipWrite {
+                kind: pioneer_protocol::PackageKind::Plugin,
                 plugin_id: id.clone(),
                 expected_revision: 1,
                 member_key: "member".into(),
@@ -180,6 +185,7 @@ async fn owned_skill_keeps_native_installation_and_native_source_override() {
         .await
         .unwrap();
     let write = PluginNativeWrite {
+        kind: pioneer_protocol::PackageKind::Plugin,
         plugin_id: id.clone(),
         expected_revision: gate.revision,
         member_key: "member".into(),

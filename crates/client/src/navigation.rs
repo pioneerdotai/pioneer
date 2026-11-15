@@ -26,6 +26,11 @@ pub enum SettingsRoute {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticDestination {
+    Apps,
+    App {
+        app_id: String,
+        component: Option<crate::plugins::PluginComponentKey>,
+    },
     Plugins,
     Plugin {
         plugin_id: String,
@@ -183,6 +188,10 @@ impl ClientNavigationState {
                     SemanticDestination::Plugin {
                         plugin_id,
                         component,
+                    }
+                    | SemanticDestination::App {
+                        app_id: plugin_id,
+                        component,
                     },
             } if !valid(plugin_id)
                 || component.as_ref().is_some_and(|key| {
@@ -268,8 +277,17 @@ impl ClientNavigationState {
             NavigationIntent::SelectWorkspace { workspace_id } => {
                 if self.workspace_id != workspace_id {
                     self.plugin_return = None;
-                    if matches!(self.destination, SemanticDestination::Plugin { .. }) {
-                        self.destination = SemanticDestination::Plugins;
+                    if matches!(
+                        self.destination,
+                        SemanticDestination::Plugin { .. } | SemanticDestination::App { .. }
+                    ) {
+                        self.destination = if self.destination.package_kind()
+                            == Some(pioneer_protocol::PackageKind::App)
+                        {
+                            SemanticDestination::Apps
+                        } else {
+                            SemanticDestination::Plugins
+                        };
                     }
                     self.workspace_id = workspace_id;
                     self.active_thread_id = None;
@@ -310,6 +328,17 @@ impl ClientNavigationState {
             }
             NavigationIntent::BackFromPlugin => {
                 self.destination = match &self.destination {
+                    SemanticDestination::App {
+                        app_id,
+                        component: Some(_),
+                    } => SemanticDestination::App {
+                        app_id: app_id.clone(),
+                        component: None,
+                    },
+                    SemanticDestination::App { .. } => self
+                        .plugin_return
+                        .take()
+                        .unwrap_or(SemanticDestination::Apps),
                     SemanticDestination::Plugin {
                         plugin_id,
                         component: Some(_),
@@ -333,12 +362,16 @@ impl ClientNavigationState {
                 {
                     self.plugin_return = Some(self.destination.clone());
                 }
-                if matches!(destination, SemanticDestination::Plugin { .. })
-                    && !matches!(self.destination, SemanticDestination::Plugin { .. })
-                    && !(matches!(
-                        self.destination,
-                        SemanticDestination::Mcp { server_id: Some(_) }
-                    ) && self.plugin_return.is_some())
+                if matches!(
+                    destination,
+                    SemanticDestination::Plugin { .. } | SemanticDestination::App { .. }
+                ) && !matches!(
+                    self.destination,
+                    SemanticDestination::Plugin { .. } | SemanticDestination::App { .. }
+                ) && !(matches!(
+                    self.destination,
+                    SemanticDestination::Mcp { server_id: Some(_) }
+                ) && self.plugin_return.is_some())
                 {
                     self.plugin_return = Some(self.destination.clone());
                 }
@@ -469,43 +502,47 @@ impl ClientCore {
             p.servers()
                 .iter()
                 .find(|s| s.id == server_id)
-                .and_then(|s| s.plugin_owner.clone())
+                .and_then(|s| s.package_owner())
         }) {
-            return SemanticDestination::Plugin {
-                plugin_id: owner.plugin_id,
-                component: Some(crate::plugins::PluginComponentKey {
+            return SemanticDestination::package(
+                owner.kind,
+                owner.package_id,
+                Some(crate::plugins::PluginComponentKey {
                     kind: "mcp".into(),
                     member_key: owner.member_key,
                 }),
-            };
+            );
         }
-        if let Some(publication) = self
-            .snapshot(&ClientScope::Plugins {
-                workspace_id: workspace.to_owned(),
-            })
-            .and_then(|p| {
-                p.snapshot()
-                    .payload::<crate::plugins::runtime::PluginPublication>()
-            })
-        {
-            if let Some((parent, child)) = publication.plugins.iter().find_map(|parent| {
-                parent
-                    .components
-                    .iter()
-                    .find(|c| c.mcp_installation_id.as_deref() == Some(server_id))
-                    .map(|child| (parent, child))
-            }) {
-                return SemanticDestination::Plugin {
-                    plugin_id: parent.id.clone(),
-                    component: Some(crate::plugins::PluginComponentKey {
-                        kind: child.kind.clone(),
-                        member_key: child.member_key.clone(),
-                    }),
-                };
+        for kind in [
+            pioneer_protocol::PackageKind::Plugin,
+            pioneer_protocol::PackageKind::App,
+        ] {
+            if let Some(p) = self
+                .snapshot(&self.packages(kind).scope(workspace.into()))
+                .and_then(|p| {
+                    p.snapshot()
+                        .payload::<crate::packages::runtime::PluginPublication>()
+                })
+            {
+                if let Some((parent, child)) = p.plugins.iter().find_map(|p| {
+                    p.components
+                        .iter()
+                        .find(|c| c.mcp_installation_id.as_deref() == Some(server_id))
+                        .map(|c| (p, c))
+                }) {
+                    return SemanticDestination::package(
+                        kind,
+                        parent.id.clone(),
+                        Some(crate::plugins::PluginComponentKey {
+                            kind: child.kind.clone(),
+                            member_key: child.member_key.clone(),
+                        }),
+                    );
+                }
             }
         }
         SemanticDestination::Mcp {
-            server_id: Some(server_id.to_owned()),
+            server_id: Some(server_id.into()),
         }
     }
     pub fn navigation_snapshot(&self) -> Arc<ClientNavigationState> {
@@ -1233,5 +1270,55 @@ mod tests {
             ClientTransitionOutcome::Rejected
         );
         assert!(core.snapshot(&ClientScope::Navigation).is_none());
+    }
+}
+
+impl SemanticDestination {
+    pub fn package(
+        kind: pioneer_protocol::PackageKind,
+        id: String,
+        component: Option<crate::plugins::PluginComponentKey>,
+    ) -> Self {
+        match kind {
+            pioneer_protocol::PackageKind::Plugin => Self::Plugin {
+                plugin_id: id,
+                component,
+            },
+            pioneer_protocol::PackageKind::App => Self::App {
+                app_id: id,
+                component,
+            },
+        }
+    }
+    pub fn package_kind(&self) -> Option<pioneer_protocol::PackageKind> {
+        match self {
+            Self::Plugins | Self::Plugin { .. } => Some(pioneer_protocol::PackageKind::Plugin),
+            Self::Apps | Self::App { .. } => Some(pioneer_protocol::PackageKind::App),
+            _ => None,
+        }
+    }
+    pub fn package_details(
+        &self,
+    ) -> Option<(
+        pioneer_protocol::PackageKind,
+        &str,
+        Option<&crate::plugins::PluginComponentKey>,
+    )> {
+        match self {
+            Self::Plugin {
+                plugin_id,
+                component,
+            } => Some((
+                pioneer_protocol::PackageKind::Plugin,
+                plugin_id,
+                component.as_ref(),
+            )),
+            Self::App { app_id, component } => Some((
+                pioneer_protocol::PackageKind::App,
+                app_id,
+                component.as_ref(),
+            )),
+            _ => None,
+        }
     }
 }

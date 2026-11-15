@@ -23,9 +23,14 @@ pub(super) async fn enforce_webhook(request: Request<Body>, next: Next) -> Respo
     enforce_policy(request, next, true).await
 }
 
+pub(super) async fn enforce_app(request: Request<Body>, next: Next) -> Response {
+    enforce_policy(request, next, true).await
+}
+
 async fn enforce_policy(request: Request<Body>, next: Next, allow_body: bool) -> Response {
     let is_view_grant_request = request.uri().path().starts_with(VIEW_GRANT_PATH_PREFIX)
-        || request.uri().path().starts_with("/webhooks/tasks/");
+        || request.uri().path().starts_with("/webhooks/tasks/")
+        || request.uri().path().starts_with("/storage/app-views/");
     // Count the serialized `name: value\r\n` representation plus the final
     // empty line. Hyper also bounds header count; this limit owns aggregate
     // bytes and must not omit per-field framing overhead.

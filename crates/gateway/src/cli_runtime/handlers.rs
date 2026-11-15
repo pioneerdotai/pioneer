@@ -2739,7 +2739,7 @@ impl MessageProcessor {
                 let guards = self
                     .acquire_plugin_launch_guards(&pending.workspace_id, turn)
                     .await?;
-                super::super::message::plugins::validate_cli_plugin_selection(
+                super::super::message::packages::validate_cli_plugin_selection(
                     self.crud_store.as_ref(),
                     &pending.workspace_id,
                     turn,

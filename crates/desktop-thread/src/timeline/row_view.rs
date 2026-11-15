@@ -154,7 +154,7 @@ impl RowPresentation {
                 pioneer_client::timeline::types::TurnItem::UserMessage { attachments, .. } => {
                     pioneer_client::timeline::labels::parse_user_attachments(attachments)
                         .into_iter()
-                        .filter_map(|attachment| attachment.plugin_icon)
+                        .flat_map(|a| a.plugin_icon.into_iter().chain(a.dark_icon))
                         .collect::<Vec<_>>()
                 }
                 _ => Vec::new(),

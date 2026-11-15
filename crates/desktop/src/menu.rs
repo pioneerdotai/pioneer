@@ -1,6 +1,7 @@
+use gpui_kit::component::input::{Copy, Cut, Paste, SelectAll};
 use gpui_kit::{
-    App, ClipboardItem, KeyBinding, Menu, MenuItem, PromptButton, PromptLevel, SystemMenuType,
-    actions,
+    App, ClipboardItem, KeyBinding, Menu, MenuItem, OsAction, PromptButton, PromptLevel,
+    SystemMenuType, actions,
 };
 
 actions!(
@@ -26,21 +27,36 @@ pub(crate) fn init_system_menus(cx: &mut App) {
         KeyBinding::new(hide_others_key, HideOtherApps, None),
         KeyBinding::new(quit_key, QuitApp, None),
     ]);
-    cx.set_menus(vec![Menu {
-        name: t!("menu.app.name").into(),
-        disabled: false,
-        items: vec![
-            MenuItem::action(t!("menu.app.about"), ShowAbout),
-            MenuItem::separator(),
-            MenuItem::os_submenu(t!("menu.app.services"), SystemMenuType::Services),
-            MenuItem::separator(),
-            MenuItem::action(t!("menu.app.hide"), HideApp),
-            MenuItem::action(t!("menu.app.hide_others"), HideOtherApps),
-            MenuItem::action(t!("menu.app.show_all"), ShowAllApps),
-            MenuItem::separator(),
-            MenuItem::action(t!("menu.app.quit"), QuitApp),
-        ],
-    }]);
+    cx.set_menus(vec![
+        Menu {
+            name: t!("menu.app.name").into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action(t!("menu.app.about"), ShowAbout),
+                MenuItem::separator(),
+                MenuItem::os_submenu(t!("menu.app.services"), SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action(t!("menu.app.hide"), HideApp),
+                MenuItem::action(t!("menu.app.hide_others"), HideOtherApps),
+                MenuItem::action(t!("menu.app.show_all"), ShowAllApps),
+                MenuItem::separator(),
+                MenuItem::action(t!("menu.app.quit"), QuitApp),
+            ],
+        },
+        Menu {
+            name: t!("menu.edit.name").into(),
+            disabled: false,
+            items: vec![
+                // Native selectors let AppKit route editing to the focused WKWebView;
+                // the same actions still belong to the existing GPUI input controls.
+                MenuItem::os_action(t!("menu.edit.cut"), Cut, OsAction::Cut),
+                MenuItem::os_action(t!("menu.edit.copy"), Copy, OsAction::Copy),
+                MenuItem::os_action(t!("menu.edit.paste"), Paste, OsAction::Paste),
+                MenuItem::separator(),
+                MenuItem::os_action(t!("menu.edit.select_all"), SelectAll, OsAction::SelectAll),
+            ],
+        },
+    ]);
 }
 
 fn show_about(_: &ShowAbout, cx: &mut App) {

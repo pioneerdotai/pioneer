@@ -1599,6 +1599,19 @@ async fn setup_cli_runtime_security_harness_for_principal(
     );
     let runtime_home = unique_temp_dir("cli_runtime_security");
     std::fs::create_dir_all(&runtime_home).expect("CLI runtime test home must exist");
+    let mut tool_loop_config = test_tool_loop_config();
+    tool_loop_config.skills.user_roots = vec![
+        runtime_home
+            .join("skills/workspace/{workspaceId}/user")
+            .display()
+            .to_string(),
+    ];
+    tool_loop_config.skills.registry_roots = vec![
+        runtime_home
+            .join("skills/workspace/{workspaceId}/registry")
+            .display()
+            .to_string(),
+    ];
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
     let processor = MessageProcessor::new(
         thread_manager.clone(),
@@ -1608,7 +1621,7 @@ async fn setup_cli_runtime_security_harness_for_principal(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_tool_loop_config(),
+        tool_loop_config,
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone())
     .with_runtime_home_for_tests(runtime_home)
@@ -1679,7 +1692,11 @@ fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
         std::fs::create_dir_all(&member).unwrap();
         std::fs::write(member.join("SKILL.md"), "---\nname: bundled\ndescription: Bundled regression skill\n---\nInstructions\n").unwrap();
         let now = chrono::Utc::now().fixed_offset();
-        harness.crud_store.insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        harness.crud_store.insert_plugin_installation(&pioneer_crud::PackageRecord {
+            kind: pioneer_crud::PackageKind::Plugin,
+            app_manifest_json: None,
+            app_localizations_json: None,
+                operation_error_json: None,
             id: parent_id.clone(), workspace_id: harness.workspace_id.clone(), name: "authoritative-name".into(), version: None, source_upload_id: "upload-plugin".into(), package_path: package.to_string_lossy().into(), data_path: fixture.join("data").to_string_lossy().into(), package_fingerprint: "tree".into(), enabled: true, allow_implicit_invocation: false, state: "installing".into(), revision: 1,
         display_name: None,
         short_description: None,
@@ -1708,7 +1725,7 @@ fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
         let skill_id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
         let child = pioneer_crud::SkillInstallationRecord { skill_id: skill_id.clone(), owner: None, slug: "bundled".into(), version: None, source_kind: "user".into(), scope_key: harness.workspace_id.clone(), source_ref: "plugin".into(), install_path: member.to_string_lossy().into(), trust_level: "community".into(), fingerprint: "member".into(), updated_at_unix: 1, pack_id: None, pack_member_key: None };
         let policy = pioneer_crud::WorkspaceSkillPolicyRecord { id: "policy-plugin".into(), workspace_id: harness.workspace_id.clone(), skill_id: skill_id.clone(), enabled: Some(true), allow_implicit_invocation: Some(false) };
-        harness.crud_store.install_skill_lifecycle_with_ownership(&child, &policy, &[fixture_skill_lifecycle_audit(&skill_id, "bundled", "install", 1)], None, Some(&pioneer_crud::PluginOwnershipWrite { plugin_id: parent_id.clone(), expected_revision: 1, member_key: "bundled".into(), member_path: Some("skills/bundled".into()), package_fingerprint: "member".into(), child_id: skill_id.to_string() }), 1).await.unwrap();
+        harness.crud_store.install_skill_lifecycle_with_ownership(&child, &policy, &[fixture_skill_lifecycle_audit(&skill_id, "bundled", "install", 1)], None, Some(&pioneer_crud::PluginOwnershipWrite { kind:pioneer_protocol::PackageKind::Plugin, plugin_id: parent_id.clone(), expected_revision: 1, member_key: "bundled".into(), member_path: Some("skills/bundled".into()), package_fingerprint: "member".into(), child_id: skill_id.to_string() }), 1).await.unwrap();
         harness.crud_store.settle_plugin_installation(&parent_id, 1, "installed", None).await.unwrap();
         let result = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
         assert_eq!(result.presentation.len(), 1);
@@ -1723,6 +1740,7 @@ fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
         let mut disabled = policy.clone(); disabled.enabled = Some(false);
         let gate=harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&parent_id,1,"updating",true,"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":false}").await.unwrap();
         harness.crud_store.upsert_workspace_skill_policy_with_plugin_change(&disabled,Some(&pioneer_crud::PluginNativeWrite {
+            kind: pioneer_protocol::PackageKind::Plugin,
             plugin_id:parent_id.clone(),expected_revision:gate.revision,member_key:"bundled".into(),child_id:skill_id.to_string(),override_fields_json:"[\"enabled\"]".into(),
             pending_after:"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":true}".into()
         }),2).await.unwrap();
@@ -1747,7 +1765,11 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
     let package = fixture.join("package");
     let parent_id = "P".repeat(21);
     let now = chrono::Utc::now().fixed_offset();
-    let parent = pioneer_entity::plugin_installation::Model {
+    let parent = pioneer_crud::PackageRecord {
+        kind: pioneer_crud::PackageKind::Plugin,
+        app_manifest_json: None,
+        app_localizations_json: None,
+        operation_error_json: None,
         id: parent_id.clone(),
         workspace_id: harness.workspace_id.clone(),
         name: "fixture".into(),
@@ -1833,6 +1855,7 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
                 &[fixture_skill_lifecycle_audit(id, key, "install", 1)],
                 None,
                 Some(&pioneer_crud::PluginOwnershipWrite {
+                    kind: pioneer_protocol::PackageKind::Plugin,
                     plugin_id: parent_id.clone(),
                     expected_revision: 1,
                     member_key: key.into(),
@@ -1898,6 +1921,7 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
                     created_at_unix: 1,
                 },
                 Some(&pioneer_crud::PluginOwnershipWrite {
+                    kind: pioneer_protocol::PackageKind::Plugin,
                     plugin_id: parent_id.clone(),
                     expected_revision: 1,
                     member_key: key.into(),
@@ -1914,6 +1938,7 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
         .crud_store
         .record_plugin_component_failure(
             &pioneer_crud::PluginOwnershipWrite {
+                kind: pioneer_protocol::PackageKind::Plugin,
                 plugin_id: parent_id.clone(),
                 expected_revision: 1,
                 member_key: "secret-failed-skill".into(),
@@ -10286,6 +10311,29 @@ async fn create_finalized_archive_upload(
     file_name: String,
     request_prefix: &str,
 ) -> String {
+    create_finalized_archive_upload_with_purpose(
+        processor,
+        rx,
+        connection_id,
+        workspace_id,
+        archive,
+        file_name,
+        request_prefix,
+        pioneer_protocol::SkillUploadPurpose::Skill,
+    )
+    .await
+}
+
+async fn create_finalized_archive_upload_with_purpose(
+    processor: &MessageProcessor,
+    rx: &mut crate::session::test_support::OutboundTestReceiver,
+    connection_id: u64,
+    workspace_id: &str,
+    archive: Vec<u8>,
+    file_name: String,
+    request_prefix: &str,
+    purpose: pioneer_protocol::SkillUploadPurpose,
+) -> String {
     let sha256 = hex::encode(Sha256::digest(archive.as_slice()));
     let start_request_id = generate_test_request_id(request_prefix, "start");
     let start_request = json!({
@@ -10294,6 +10342,7 @@ async fn create_finalized_archive_upload(
         "method": "skills/upload/start",
         "params": {
             "workspace_id": workspace_id,
+            "purpose": purpose,
             "file_name": file_name,
             "archive_format": SkillArchiveFormat::TarGz,
             "compressed_size_bytes": archive.len(),
@@ -79800,7 +79849,12 @@ async fn setup_workspace_manager_with_connection(
     // Use the normal writer bootstrap path: migrations that change connection
     // pragmas must own their physical lease outside any enclosing transaction.
     // Each migration retains its own atomicity; no fixture consumer exists yet.
-    pioneer_sqlite::SqliteWriteExecutor::new(connection.clone())
+    let writer = pioneer_sqlite::SqliteWriteExecutor::new(connection.clone());
+    writer
+        .apply_pragmas(pioneer_sqlite::SqliteWriteClass::Maintenance)
+        .await
+        .expect("test writer must use Gateway runtime pragmas");
+    writer
         .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
         .await
         .expect("migrations must succeed");
@@ -90773,7 +90827,11 @@ async fn failed_drained_selected_plugin_task_child(tool_calling: bool) {
     let parent = "P".repeat(21);
     let now = chrono::Utc::now().fixed_offset();
     store
-        .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        .insert_plugin_installation(&pioneer_crud::PackageRecord {
+            kind: pioneer_crud::PackageKind::Plugin,
+            app_manifest_json: None,
+            app_localizations_json: None,
+            operation_error_json: None,
             id: parent.clone(),
             workspace_id: workspace.clone(),
             name: "empty-selected".into(),
@@ -91106,7 +91164,11 @@ async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barri
     std::fs::create_dir(temporary.path().join("data")).unwrap();
     let id = "P".repeat(21);
     let now = chrono::Utc::now().fixed_offset();
-    let parent = pioneer_entity::plugin_installation::Model {
+    let parent = pioneer_crud::PackageRecord {
+        kind: pioneer_crud::PackageKind::Plugin,
+        app_manifest_json: None,
+        app_localizations_json: None,
+        operation_error_json: None,
         id: id.clone(),
         workspace_id: workspace.clone(),
         name: "empty".into(),
@@ -91164,6 +91226,7 @@ async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barri
             "plugin-admission-turn",
             &pioneer_protocol::PluginSelectionSnapshot {
                 parents: vec![pioneer_protocol::PluginSelectedParent {
+                    kind: pioneer_protocol::PackageKind::Plugin,
                     id: id.clone(),
                     revision: 1,
                 }],

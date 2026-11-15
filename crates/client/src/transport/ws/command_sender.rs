@@ -4446,3 +4446,203 @@ pub fn plugins_mutate<T: JsonRpcRequestTransport>(
         ),
     }
 }
+
+// Exactly two domain adapters over the existing connection-bound transport.
+pub fn packages_list<T: JsonRpcRequestTransport>(
+    transport: &T,
+    kind: pioneer_protocol::PackageKind,
+    params: pioneer_protocol::PluginsListParams,
+) -> Result<pioneer_protocol::PluginsListResponse> {
+    use pioneer_protocol::*;
+    if kind == PackageKind::Plugin {
+        return plugins_list(transport, params);
+    }
+    let response: AppsListResponse = send_json_rpc_request_typed(
+        transport,
+        methods::APPS_LIST,
+        &AppsListParams {
+            workspace_id: params.workspace_id,
+        },
+        RPC_REQUEST_TIMEOUT,
+    )?;
+    Ok(PluginsListResponse {
+        plugins: response
+            .apps
+            .into_iter()
+            .map(AppItem::into_package)
+            .collect(),
+    })
+}
+pub fn packages_install<T: JsonRpcRequestTransport>(
+    transport: &T,
+    kind: pioneer_protocol::PackageKind,
+    params: pioneer_protocol::PluginsInstallParams,
+) -> Result<pioneer_protocol::PluginItem> {
+    use pioneer_protocol::*;
+    if kind == PackageKind::Plugin {
+        return plugins_install(transport, params);
+    }
+    let response: AppItem = send_json_rpc_request_typed(
+        transport,
+        methods::APPS_INSTALL,
+        &AppsInstallParams {
+            workspace_id: params.workspace_id,
+            upload_id: params.upload_id,
+            expected_fingerprint: params.expected_fingerprint,
+        },
+        RPC_REQUEST_TIMEOUT,
+    )?;
+    Ok(response.into_package())
+}
+pub fn packages_set_enabled<T: JsonRpcRequestTransport>(
+    transport: &T,
+    kind: pioneer_protocol::PackageKind,
+    params: pioneer_protocol::PluginsSetEnabledParams,
+) -> Result<pioneer_protocol::PluginItem> {
+    use pioneer_protocol::*;
+    if kind == PackageKind::Plugin {
+        return plugins_set_enabled(transport, params);
+    }
+    let response: AppItem = send_json_rpc_request_typed(
+        transport,
+        methods::APPS_SET_ENABLED,
+        &AppsSetEnabledParams {
+            workspace_id: params.workspace_id,
+            app_id: params.plugin_id,
+            expected_revision: params.expected_revision,
+            enabled: params.enabled,
+            allow_implicit_invocation: params.allow_implicit_invocation,
+        },
+        RPC_REQUEST_TIMEOUT,
+    )?;
+    Ok(response.into_package())
+}
+pub fn packages_preview<T: JsonRpcRequestTransport>(
+    transport: &T,
+    kind: pioneer_protocol::PackageKind,
+    params: pioneer_protocol::PluginsSourceParams,
+) -> Result<pioneer_protocol::PluginsPreviewResponse> {
+    use pioneer_protocol::*;
+    if kind == PackageKind::Plugin {
+        return plugins_preview(transport, params);
+    }
+    anyhow::ensure!(params.target.is_none(), "app_install_preview_required");
+    let r: AppsPreviewResponse = send_json_rpc_request_typed(
+        transport,
+        methods::APPS_PREVIEW,
+        &AppsSourceParams {
+            workspace_id: params.workspace_id,
+            upload_id: params.upload_id,
+            target: None,
+        },
+        RPC_REQUEST_TIMEOUT,
+    )?;
+    Ok(r.into_package())
+}
+pub fn packages_update_preview<T: JsonRpcRequestTransport>(
+    transport: &T,
+    kind: pioneer_protocol::PackageKind,
+    params: pioneer_protocol::PluginsUpdatePreviewParams,
+) -> Result<pioneer_protocol::PluginsUpdatePreviewResponse> {
+    use pioneer_protocol::*;
+    if kind == PackageKind::Plugin {
+        return plugins_update_preview(transport, params);
+    }
+    let r: AppsUpdatePreviewResponse = send_json_rpc_request_typed(
+        transport,
+        methods::APPS_PREVIEW,
+        &AppsSourceParams {
+            workspace_id: params.workspace_id,
+            upload_id: params.upload_id,
+            target: Some(AppPreviewTarget {
+                app_id: params.plugin_id,
+                expected_revision: params.expected_revision,
+            }),
+        },
+        RPC_REQUEST_TIMEOUT,
+    )?;
+    Ok(PluginsUpdatePreviewResponse {
+        package: r.package.into_package(),
+        supporting_files_changed: r.supporting_files_changed,
+        added: r.added,
+        updated: r.updated,
+        identity_resets: r.identity_resets,
+        removed: r.removed,
+        authorization_changes: r.authorization_changes,
+    })
+}
+pub fn packages_mutate<T: JsonRpcRequestTransport>(
+    transport: &T,
+    kind: pioneer_protocol::PackageKind,
+    params: pioneer_protocol::PluginsMutateParams,
+) -> Result<pioneer_protocol::PluginsMutationResponse> {
+    use pioneer_protocol::*;
+    if kind == PackageKind::Plugin {
+        return plugins_mutate(transport, params);
+    }
+    let PluginsMutateParams {
+        workspace_id,
+        plugin_id: app_id,
+        expected_revision,
+        intent,
+    } = params;
+    let r: AppsMutationResponse = match intent {
+        PluginManagementIntent::Update {
+            upload_id,
+            expected_fingerprint,
+            confirm_changes,
+        } => send_json_rpc_request_typed(
+            transport,
+            methods::APPS_UPDATE,
+            &AppsUpdateParams {
+                workspace_id,
+                app_id,
+                expected_revision,
+                upload_id,
+                expected_fingerprint,
+                confirm_changes,
+            },
+            RPC_REQUEST_TIMEOUT,
+        )?,
+        PluginManagementIntent::Remove { purge_data } => send_json_rpc_request_typed(
+            transport,
+            methods::APPS_REMOVE,
+            &AppsRemoveParams {
+                workspace_id,
+                app_id,
+                expected_revision,
+                purge_data,
+            },
+            RPC_REQUEST_TIMEOUT,
+        )?,
+        PluginManagementIntent::Retry {
+            components,
+            restore_removed,
+        } => send_json_rpc_request_typed(
+            transport,
+            methods::APPS_RETRY,
+            &AppsRetryParams {
+                workspace_id,
+                app_id,
+                expected_revision,
+                components: (!components.is_empty()).then_some(components),
+                restore_removed,
+            },
+            RPC_REQUEST_TIMEOUT,
+        )?,
+        PluginManagementIntent::Continue => send_json_rpc_request_typed(
+            transport,
+            methods::APPS_CONTINUE,
+            &AppsContinueParams {
+                workspace_id,
+                app_id,
+                expected_revision,
+            },
+            RPC_REQUEST_TIMEOUT,
+        )?,
+    };
+    Ok(PluginsMutationResponse {
+        plugin: r.app.map(AppItem::into_package),
+        removed: r.removed,
+    })
+}

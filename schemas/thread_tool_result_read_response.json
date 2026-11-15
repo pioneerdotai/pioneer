@@ -36,8 +36,8 @@
           "minimum": 0
         },
         "version": {
-          "type": "string",
-          "description": "Opaque authenticated source-version and offset token for thread tools; do not edit. Old tool cursors require restarting."
+          "description": "Opaque authenticated source-version and offset token for thread tools; do not edit. Old tool cursors require restarting.",
+          "type": "string"
         }
       },
       "required": [

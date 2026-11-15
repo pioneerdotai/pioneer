@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PackageOwner",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "$ref": "#/$defs/PackageKind"
+    },
+    "member_key": {
+      "type": "string"
+    },
+    "package_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "kind",
+    "package_id",
+    "member_key"
+  ],
+  "$defs": {
+    "PackageKind": {
+      "description": "Product identity is distinct even when installation mechanics are shared.",
+      "type": "string",
+      "enum": [
+        "plugin",
+        "app"
+      ]
+    }
+  }
+}

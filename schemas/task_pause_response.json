@@ -5,8 +5,12 @@
   "properties": {
     "scheduleOutcome": {
       "anyOf": [
-        { "$ref": "#/$defs/TaskPauseScheduleOutcome" },
-        { "type": "null" }
+        {
+          "$ref": "#/$defs/TaskPauseScheduleOutcome"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "task": {
@@ -24,10 +28,6 @@
     "task"
   ],
   "$defs": {
-    "TaskPauseScheduleOutcome": {
-      "type": "string",
-      "enum": ["paused", "no_future_firings", "not_applied"]
-    },
     "AgentDelegationRouteId": {
       "type": "string",
       "maxLength": 21,
@@ -431,6 +431,23 @@
       "enum": [
         "workspace",
         "user"
+      ]
+    },
+    "NativeServiceModeSelection": {
+      "description": "Explicit choice uses the existing endpoint/credential/model authority proof.\nAbsence means Standard; Inherit belongs to the enclosing model selection.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "authority"
       ]
     },
     "PrincipalId": {
@@ -1269,6 +1286,14 @@
         "keep_running"
       ]
     },
+    "TaskPauseScheduleOutcome": {
+      "type": "string",
+      "enum": [
+        "paused",
+        "no_future_firings",
+        "not_applied"
+      ]
+    },
     "TaskResult": {
       "type": "object",
       "properties": {
@@ -1872,6 +1897,28 @@
         {
           "type": "object",
           "properties": {
+            "appId": {
+              "type": "string"
+            },
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "expectedRevision": {
               "type": "integer",
               "format": "int64"
@@ -1884,6 +1931,7 @@
               "const": "plugin"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "pluginId",
@@ -1911,6 +1959,7 @@
               "const": "skill"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "skillId"
@@ -1927,6 +1976,7 @@
               "const": "skillPack"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "packId"
@@ -1946,6 +1996,7 @@
               "const": "mcpServer"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "name",
@@ -1969,6 +2020,7 @@
               "const": "mcpTool"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "serverName",
@@ -2012,20 +2064,6 @@
     "TurnStartParams": {
       "type": "object",
       "properties": {
-        "context_authority": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "context_window": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
         "agent_delegation_routes": {
           "description": "Explicit, bounded cross-capsule delegations requested for this root\nAgent execution. These are authorization inputs, never prompt content.",
           "type": "array",
@@ -2059,6 +2097,21 @@
               "type": "null"
             }
           ]
+        },
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "description": "User-owned model choice; absent means Auto, not inheritance of a wider override.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "execution_backend": {
           "anyOf": [
@@ -2141,34 +2194,21 @@
             }
           ]
         },
-        "thread_id": {
-          "type": "string"
-        },
-        "turn_id": {
-          "type": "string"
-        },
         "service_mode": {
           "anyOf": [
             {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                },
-                "authority": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "id",
-                "authority"
-              ],
-              "additionalProperties": false
+              "$ref": "#/$defs/NativeServiceModeSelection"
             },
             {
               "type": "null"
             }
           ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
         }
       },
       "required": [

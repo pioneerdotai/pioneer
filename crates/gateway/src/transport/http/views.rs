@@ -65,71 +65,20 @@ pub(super) async fn view_grant_route(
         record_view_grant_route_rejection(&request_id, "query_not_allowed");
         return Err(HttpError::not_found(request_id));
     }
-    let lease = match state.view_grants.resolve(path.opaque_grant.as_str()) {
-        Ok(lease) => lease,
-        Err(ViewGrantError::Concurrency) => {
-            return Err(HttpError::new(
-                HttpErrorKind::TooManyRequests {
-                    retry_after_seconds: 1,
-                },
-                request_id,
-            ));
-        }
-        Err(ViewGrantError::UnknownOrExpired | ViewGrantError::InvalidScope) => {
-            return Err(HttpError::not_found(request_id));
-        }
-        Err(
-            ViewGrantError::Clock
-            | ViewGrantError::ShuttingDown
-            | ViewGrantError::InvalidConfig
-            | ViewGrantError::Capacity,
-        ) => return Err(HttpError::service_unavailable(request_id)),
-    };
-    if lease.grant.protocol_version != crate::transport::protocol::PIONEER_PROTOCOL_VERSION_NUMBER {
-        record_view_grant_route_rejection(&request_id, "protocol_version_mismatch");
-        return Err(HttpError::not_found(request_id));
-    }
-
-    let auth_deadline =
-        Duration::from_secs(state.config.gateway.auth.auth_exchange_timeout_seconds);
-    let principal = tokio::time::timeout(
-        auth_deadline,
-        state.auth_service.resolve_active_view_grant_principal(
-            &lease.grant.scope.gateway_id,
-            &lease.grant.scope.principal_id,
-            &lease.grant.scope.auth_session_id,
-        ),
+    let (context, lease) = admit_view_grant(
+        &state,
+        peer_addr,
+        &headers,
+        path.opaque_grant.as_str(),
+        false,
+        request_id.clone(),
     )
-    .await;
-    let principal = match principal {
-        Ok(Ok(principal)) => principal,
-        Ok(Err(_)) => {
-            state
-                .view_grants
-                .invalidate_session(&lease.grant.scope.auth_session_id);
-            record_view_grant_route_rejection(&request_id, "inactive_auth_session");
-            return Err(HttpError::not_found(request_id));
-        }
-        Err(_) => {
-            record_view_grant_route_rejection(&request_id, "auth_timeout");
-            return Err(HttpError::service_unavailable(request_id));
-        }
-    };
-    let context = AuthenticatedRequestContext::new(
-        Arc::new(principal),
-        Some(request_id.clone()),
-        SourceTransport::HttpStorage,
-        crate::transport::network::resolve_request_network(
-            peer_addr,
-            &headers,
-            &state.config.gateway.trusted_proxy_peers,
-        ),
-        CanonicalMethod::binary("storage/view"),
-    );
+    .await?;
     match lease.grant.scope.subject.clone() {
         ViewGrantSubject::Artifact(scope) => {
             serve_artifact_view(state, context, request_id, method, headers, lease, scope).await
         }
+        ViewGrantSubject::App(_) => Err(HttpError::not_found(request_id)),
         ViewGrantSubject::ThreadFile(scope) => {
             serve_thread_file_view(state, context, request_id, method, headers, lease, scope).await
         }
@@ -428,4 +377,81 @@ mod tests {
         );
         assert_eq!(error.kind(), HttpErrorKind::Conflict);
     }
+}
+
+pub(super) async fn admit_view_grant(
+    state: &GatewayHttpState,
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+    presented: &str,
+    app_resource: bool,
+    request_id: RequestId,
+) -> Result<(AuthenticatedRequestContext, ViewGrantLease), HttpError> {
+    let resolved = if app_resource {
+        state.view_grants.resolve_app(presented).await
+    } else {
+        state.view_grants.resolve(presented)
+    };
+    let lease = match resolved {
+        Ok(lease) => lease,
+        Err(ViewGrantError::Concurrency) => {
+            return Err(HttpError::new(
+                HttpErrorKind::TooManyRequests {
+                    retry_after_seconds: 1,
+                },
+                request_id.clone(),
+            ));
+        }
+        Err(ViewGrantError::UnknownOrExpired | ViewGrantError::InvalidScope) => {
+            return Err(HttpError::not_found(request_id));
+        }
+        Err(
+            ViewGrantError::Clock
+            | ViewGrantError::ShuttingDown
+            | ViewGrantError::InvalidConfig
+            | ViewGrantError::Capacity,
+        ) => return Err(HttpError::service_unavailable(request_id)),
+    };
+    if lease.grant.protocol_version != crate::transport::protocol::PIONEER_PROTOCOL_VERSION_NUMBER {
+        record_view_grant_route_rejection(&request_id.clone(), "protocol_version_mismatch");
+        return Err(HttpError::not_found(request_id));
+    }
+
+    let auth_deadline =
+        Duration::from_secs(state.config.gateway.auth.auth_exchange_timeout_seconds);
+    let principal = tokio::time::timeout(
+        auth_deadline,
+        state.auth_service.resolve_active_view_grant_principal(
+            &lease.grant.scope.gateway_id,
+            &lease.grant.scope.principal_id,
+            &lease.grant.scope.auth_session_id,
+        ),
+    )
+    .await;
+    let principal = match principal {
+        Ok(Ok(principal)) => principal,
+        Ok(Err(_)) => {
+            state
+                .view_grants
+                .invalidate_session(&lease.grant.scope.auth_session_id);
+            record_view_grant_route_rejection(&request_id.clone(), "inactive_auth_session");
+            return Err(HttpError::not_found(request_id));
+        }
+        Err(_) => {
+            record_view_grant_route_rejection(&request_id.clone(), "auth_timeout");
+            return Err(HttpError::service_unavailable(request_id));
+        }
+    };
+    let context = AuthenticatedRequestContext::new(
+        Arc::new(principal),
+        Some(request_id.clone()),
+        SourceTransport::HttpStorage,
+        crate::transport::network::resolve_request_network(
+            peer_addr,
+            &headers,
+            &state.config.gateway.trusted_proxy_peers,
+        ),
+        CanonicalMethod::binary("storage/view"),
+    );
+    Ok((context, lease))
 }

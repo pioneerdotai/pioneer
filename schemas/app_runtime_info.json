@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppRuntimeInfo",
+  "description": "Installation/component state remains on AppItem. This is live execution state.",
+  "type": "object",
+  "properties": {
+    "diagnostic": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "execution_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "logs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "state": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "state",
+    "logs"
+  ]
+}

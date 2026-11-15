@@ -5,6 +5,38 @@
     {
       "type": "object",
       "properties": {
+        "connection_id": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "intent": {
+          "$ref": "#/$defs/PluginIntent"
+        },
+        "kind": {
+          "type": "string",
+          "const": "apps"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id",
+        "intent"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
         "demand": {
           "$ref": "#/$defs/SessionDemand"
         },
@@ -1807,6 +1839,22 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "apps"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "session"
             }
           },
@@ -2677,6 +2725,53 @@
         {
           "type": "object",
           "properties": {
+            "App": {
+              "type": "object",
+              "properties": {
+                "expected_revision": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "icon": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/ImageReference"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "app_id": {
+                  "type": "string"
+                },
+                "dark_icon": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/ImageReference"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                }
+              },
+              "required": [
+                "app_id",
+                "expected_revision"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "App"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "Plugin": {
               "type": "object",
               "properties": {
@@ -2828,6 +2923,26 @@
     },
     "ComposerCatalogIntent": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/ComposerOperationIdentity"
+            },
+            "kind": {
+              "type": "string",
+              "const": "toggle_app"
+            },
+            "app_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "identity",
+            "app_id"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -3032,6 +3147,18 @@
     },
     "ComposerCatalogKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "apps"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -4824,6 +4951,7 @@
     "ComposerPickerKind": {
       "type": "string",
       "enum": [
+        "apps",
         "skills",
         "mcp",
         "plugins"
@@ -8324,6 +8452,44 @@
         {
           "type": "object",
           "properties": {
+            "component": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PluginComponentKey"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "app"
+            },
+            "app_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "app_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "apps"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "kind": {
               "type": "string",
               "const": "plugins"
@@ -9966,6 +10132,27 @@
     },
     "TurnCapabilityKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            },
+            "appId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
         {
           "type": "object",
           "properties": {

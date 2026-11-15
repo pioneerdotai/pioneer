@@ -417,6 +417,23 @@
         "user"
       ]
     },
+    "NativeServiceModeSelection": {
+      "description": "Explicit choice uses the existing endpoint/credential/model authority proof.\nAbsence means Standard; Inherit belongs to the enclosing model selection.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "authority"
+      ]
+    },
     "PrincipalId": {
       "type": "string",
       "maxLength": 21,
@@ -2310,6 +2327,28 @@
         {
           "type": "object",
           "properties": {
+            "appId": {
+              "type": "string"
+            },
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "expectedRevision": {
               "type": "integer",
               "format": "int64"
@@ -2322,6 +2361,7 @@
               "const": "plugin"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "pluginId",
@@ -2349,6 +2389,7 @@
               "const": "skill"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "skillId"
@@ -2365,6 +2406,7 @@
               "const": "skillPack"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "packId"
@@ -2384,6 +2426,7 @@
               "const": "mcpServer"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "name",
@@ -2407,6 +2450,7 @@
               "const": "mcpTool"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "serverName",
@@ -2491,6 +2535,7 @@
           ]
         },
         "context_window": {
+          "description": "User-owned model choice; absent means Auto, not inheritance of a wider override.",
           "type": [
             "integer",
             "null"
@@ -2579,34 +2624,21 @@
             }
           ]
         },
-        "thread_id": {
-          "type": "string"
-        },
-        "turn_id": {
-          "type": "string"
-        },
         "service_mode": {
           "anyOf": [
             {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                },
-                "authority": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "id",
-                "authority"
-              ],
-              "additionalProperties": false
+              "$ref": "#/$defs/NativeServiceModeSelection"
             },
             {
               "type": "null"
             }
           ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
         }
       },
       "required": [

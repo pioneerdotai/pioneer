@@ -10,8 +10,6 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
-    #[sea_orm(column_type = "Text")]
     pub name: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub version: Option<String>,
@@ -57,39 +55,14 @@ pub struct Model {
     pub composer_icon_path: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub composer_icon_revision: Option<String>,
-    #[sea_orm(column_type = "Text", unique)]
-    pub source_upload_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub package_path: String,
-    #[sea_orm(column_type = "Text")]
-    pub data_path: String,
-    #[sea_orm(column_type = "Text")]
-    pub package_fingerprint: String,
-    pub enabled: bool,
-    pub allow_implicit_invocation: bool,
-    #[sea_orm(column_type = "Text")]
-    pub state: String,
-    pub revision: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub pending_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_error: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(has_many)]
-    pub plugin_components: HasMany<super::plugin_component::Entity>,
-    #[sea_orm(has_many)]
-    pub plugin_default_prompts: HasMany<super::plugin_default_prompt::Entity>,
-    #[sea_orm(has_many)]
-    pub plugin_keywords: HasMany<super::plugin_keyword::Entity>,
     #[sea_orm(
         belongs_to,
-        from = "workspace_id",
+        from = "id",
         to = "id",
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub workspace: HasOne<super::workspace::Entity>,
+    pub package_installation: HasOne<super::package_installation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

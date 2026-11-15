@@ -1,7 +1,8 @@
 use crate::assets::PioneerIconName;
 use crate::desktop_navigation::MainRoute;
 use crate::desktop_navigation::{
-    OpenAdministration, OpenMcp, OpenPlugins, OpenProviders, OpenSettings, OpenSkills, OpenThreads,
+    OpenAdministration, OpenApps, OpenMcp, OpenPlugins, OpenProviders, OpenSettings, OpenSkills,
+    OpenThreads,
 };
 use gpui_kit::component::{Icon, button::*, separator::Separator, theme::ActiveTheme, *};
 use gpui_kit::{prelude::*, *};
@@ -71,6 +72,29 @@ pub(crate) fn bottom_bar(
                             move |_, window, cx| target.dispatch_action(&OpenProviders, window, cx)
                         }),
                 )
+                .when(can_manage_capabilities, |this| {
+                    this.child(
+                        Button::new("bottom-bar-open-apps")
+                            .debug_selector(|| "bottom-bar-open-apps".into())
+                            .accessibility_label(t!("apps.title").to_string())
+                            .tooltip(t!("apps.title").to_string())
+                            .ghost()
+                            .small()
+                            .compact()
+                            .child(
+                                Icon::new(PioneerIconName::Plugin)
+                                    .size_3p5()
+                                    .opacity(0.6)
+                                    .when(route == MainRoute::Apps, |this| {
+                                        this.opacity(1.0).text_color(cx.theme().blue)
+                                    }),
+                            )
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| target.dispatch_action(&OpenApps, window, cx)
+                            }),
+                    )
+                })
                 .when(can_manage_capabilities, |this| {
                     this.child(
                         Button::new("bottom-bar-open-plugins")

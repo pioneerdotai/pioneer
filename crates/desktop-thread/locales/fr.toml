@@ -356,3 +356,15 @@
 "chat.composer.model.service_standard" = "Standard"
 
 "chat.composer.model.service_invalid" = "Le niveau enregistré est indisponible. Choisissez Standard ou un autre mode."
+
+"chat.composer.add_menu.apps" = "Ajouter des applications"
+"apps.empty" = "Aucun application installé"
+"apps.error" = "Impossible de charger les applications. Réessayez."
+"apps.loading" = "Chargement des applications…"
+"apps.search" = "Rechercher des applications"
+"apps.select" = "Sélectionner des applications"
+"apps.unavailable" = "Indisponible"
+"apps.retry" = "Réessayer"
+"apps.stale" = "La version sélectionnée n’est plus à jour"
+
+"apps.view" = "App view"

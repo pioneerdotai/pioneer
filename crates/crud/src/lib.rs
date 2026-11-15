@@ -1,5 +1,9 @@
+mod package_record;
+pub use package_record::{PackageKind, PackageRecord, PreparedAppMetadata};
 mod plugins;
-pub use plugins::{PluginNativeWrite, PluginOwnershipWrite};
+pub use plugins::{
+    PackageNativeWrite, PackageOwnershipWrite, PluginNativeWrite, PluginOwnershipWrite,
+};
 mod memory_payload_store;
 pub mod portable_payload_codec;
 #[doc(hidden)]
@@ -16997,13 +17001,19 @@ impl CrudStore {
                             anyhow::bail!("failed to reconcile committed finalization intent");
                         }
                     }
+                    let closed_windows = turn_execution_window::close_active_execution_windows_for_terminal_turn(
+                        &transaction,
+                        turn_id.as_str(),
+                        unix_to_datetime(event_timestamp_secs),
+                    )
+                    .await?;
                     return Ok((TurnFinalizationCommitOutcome::Committed(
                         CommittedTurnFinalization {
                             final_item,
                             turn_completed,
                             already_committed: true,
                         },
-                    ), intent.status != turn_finalization::STATUS_COMMITTED));
+                    ), intent.status != turn_finalization::STATUS_COMMITTED || closed_windows > 0));
                 }
                 if authoritative_status != TurnStatus::InProgress {
                     if intent.status != turn_finalization::STATUS_PREPARED {
@@ -17075,6 +17085,16 @@ impl CrudStore {
                 {
                     anyhow::bail!("turn finalization compare-and-set was lost");
                 }
+                // Both live completion and background reconciliation use this
+                // transaction. Terminal projection and window closure must
+                // commit together; a superseded live publisher may never run
+                // its post-completion cleanup.
+                turn_execution_window::close_active_execution_windows_for_terminal_turn(
+                    &transaction,
+                    turn_id.as_str(),
+                    created_at,
+                )
+                .await?;
                 Ok((TurnFinalizationCommitOutcome::Committed(
                     CommittedTurnFinalization {
                         final_item,
@@ -40774,7 +40794,7 @@ mod tests {
         for (table, column) in [
             ("task_trigger", "webhook_secret_ref"),
             ("task_run", "trigger_input_json"),
-            ("turn", "plugin_selection_json"),
+            ("turn", "package_selection_json"),
         ] {
             if !schema.has_column(table, column).await.unwrap() {
                 schema
@@ -43131,6 +43151,47 @@ mod tests {
             "turn_native_finalize",
         )
         .await;
+        let started = unix_to_datetime(1_700_000_010);
+        store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: "ws_native_finalization".into(),
+                    thread_id: "thr_native_finalization".into(),
+                    turn_id: "turn_native_finalize".into(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Checkpointed,
+                    exhaustion_reason: None,
+                    agent_round_count: 2,
+                    tool_call_count: 0,
+                    provider_token_count: 7,
+                    metadata_json: serde_json::json!({}),
+                    started_at: started,
+                },
+                started,
+                started,
+            )
+            .await
+            .unwrap();
+        let mut completed_item = safe_web_fetch_item("native_finalization_tool");
+        if let TurnItem::WebFetch {
+            status, success, ..
+        } = &mut completed_item
+        {
+            *status = ToolCallStatus::Completed;
+            *success = Some(true);
+        }
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "ws_native_finalization".into(),
+                    thread_id: "thr_native_finalization".into(),
+                    turn_id: "turn_native_finalize".into(),
+                    item: completed_item,
+                },
+                1_700_000_050,
+            )
+            .await
+            .unwrap();
         let final_notification = ItemCompletedNotification {
             workspace_id: "ws_native_finalization".to_owned(),
             thread_id: "thr_native_finalization".to_owned(),
@@ -43214,6 +43275,19 @@ mod tests {
             .expect("startup reconciliation should finish the commit");
         assert_eq!(reconciliation.scanned, 1);
         assert_eq!(reconciliation.committed_count(), 1);
+        let closed_window = restarted
+            .latest_turn_execution_window("turn_native_finalize")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed_window.status, ExecutionWindowStatus::Completed);
+        assert_eq!(
+            closed_window.completed_at,
+            Some(unix_to_datetime(1_700_000_101))
+        );
+        assert_eq!(closed_window.tool_call_count, 1);
+        assert_eq!(closed_window.agent_round_count, 2);
+        assert_eq!(closed_window.provider_token_count, 7);
         projection.begin_pass(&database).await.unwrap();
         let committed = match restarted
             .commit_prepared_turn_finalization("turn_native_finalize", 1_700_000_102)
@@ -43224,6 +43298,15 @@ mod tests {
             outcome => panic!("unexpected duplicate finalization outcome: {outcome:?}"),
         };
         assert!(committed.already_committed);
+        assert_eq!(
+            restarted
+                .latest_turn_execution_window("turn_native_finalize")
+                .await
+                .unwrap()
+                .unwrap(),
+            closed_window,
+            "duplicate finalization must not rewrite a closed window or its statistics"
+        );
         assert!(
             futures_util::FutureExt::now_or_never(projection.wait(None)).is_none(),
             "duplicate finalization ACK must not wake recovery"
@@ -46321,6 +46404,27 @@ mod tests {
             "turn_native_fault",
         )
         .await;
+        let started = unix_to_datetime(1_700_000_010);
+        store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: "ws_native_finalize_fault".into(),
+                    thread_id: "thr_native_finalize_fault".into(),
+                    turn_id: "turn_native_fault".into(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    started_at: started,
+                },
+                started,
+                started,
+            )
+            .await
+            .unwrap();
         let notification = ItemCompletedNotification {
             workspace_id: "ws_native_finalize_fault".to_owned(),
             thread_id: "thr_native_finalize_fault".to_owned(),
@@ -46341,8 +46445,8 @@ mod tests {
             .connection
             .execute_unprepared(
                 "CREATE TRIGGER reject_native_terminal_commit \
-                 BEFORE UPDATE OF status ON turn \
-                 WHEN NEW.id = 'turn_native_fault' AND NEW.status = 'completed' \
+                 BEFORE UPDATE OF status ON turn_execution_window \
+                 WHEN NEW.turn_id = 'turn_native_fault' AND NEW.status = 'completed' \
                  BEGIN SELECT RAISE(ABORT, 'injected terminal commit crash'); END;",
             )
             .await
@@ -46373,6 +46477,16 @@ mod tests {
             .expect("turn lookup should succeed")
             .expect("turn should exist");
         assert_eq!(still_running.status, TurnStatus::InProgress);
+        assert_eq!(
+            store
+                .latest_turn_execution_window("turn_native_fault")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionWindowStatus::Running,
+            "failure of window closure must roll back terminal publication too"
+        );
         store
             .connection
             .execute_unprepared("DROP TRIGGER reject_native_terminal_commit")
@@ -46384,6 +46498,15 @@ mod tests {
             .expect("prepared intent should reconcile");
         assert_eq!(reconciliation.scanned, 1);
         assert_eq!(reconciliation.committed_count(), 1);
+        assert_eq!(
+            store
+                .latest_turn_execution_window("turn_native_fault")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionWindowStatus::Completed
+        );
     }
 
     #[tokio::test]
@@ -48329,7 +48452,7 @@ mod tests {
         pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
             id: Set(turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
-            plugin_selection_json: Set(None),
+            package_selection_json: Set(None),
             status: Set("completed".to_owned()),
             error: Set(None),
             prompt_manifest_json: Set("{}".to_owned()),

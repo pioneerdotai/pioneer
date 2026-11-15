@@ -17,9 +17,91 @@ pub struct SkillUploadArchive {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SkillUploadSourceKind {
+    App,
     Plugin,
     Skill,
     Pack,
+}
+/// App directories are captured from declarations only. Ready archives retain
+/// the existing upload limit and are independently checked at the Gateway.
+pub fn build_app_upload_archive(
+    source: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Result<SkillUploadArchive> {
+    let metadata = fs::symlink_metadata(source)?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "selected_symlink_denied"
+    );
+    if metadata.is_file() {
+        use std::io::Read;
+        const MAX_BYTES: usize = pioneer_apps::MAX_UPLOAD_ARCHIVE_BYTES;
+        anyhow::ensure!(metadata.len() <= MAX_BYTES as u64, "archive_input_limit");
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(source)?;
+        let opened = file.metadata()?;
+        anyhow::ensure!(
+            opened.is_file()
+                && opened.len() == metadata.len()
+                && opened.modified()? == metadata.modified()?,
+            "source_changed"
+        );
+        let mut bytes = Vec::new();
+        let mut reader = (&file).take((MAX_BYTES + 1) as u64);
+        let mut chunk = [0u8; 65536];
+        loop {
+            anyhow::ensure!(!cancelled(), "cancelled");
+            let n = reader.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+            anyhow::ensure!(bytes.len() <= MAX_BYTES, "archive_input_limit");
+        }
+        let after = file.metadata()?;
+        let path_after = fs::symlink_metadata(source)?;
+        anyhow::ensure!(
+            after.len() == opened.len()
+                && after.modified()? == opened.modified()?
+                && !path_after.file_type().is_symlink()
+                && path_after.len() == after.len()
+                && path_after.modified()? == after.modified()?,
+            "source_changed"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                opened.dev() == metadata.dev()
+                    && opened.ino() == metadata.ino()
+                    && path_after.dev() == opened.dev()
+                    && path_after.ino() == opened.ino()
+                    && after.ctime() == opened.ctime()
+                    && after.ctime_nsec() == opened.ctime_nsec(),
+                "source_changed"
+            );
+        }
+        return Ok(SkillUploadArchive {
+            file_name: source
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("app.tar.gz")
+                .into(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+            bytes,
+            uncompressed_size_bytes: 0,
+        });
+    }
+    anyhow::ensure!(metadata.is_dir(), "source_kind");
+    let (_, snapshot) =
+        pioneer_apps::SelectionPlan::capture(source, pioneer_apps::PACKAGE_LIMITS, &cancelled)?;
+    build_app_snapshot_archive(&snapshot, cancelled)
 }
 
 #[derive(Debug)]
@@ -187,6 +269,93 @@ fn build_upload_archive(source_root: &Path, root_name: String) -> Result<SkillUp
         bytes,
         sha256,
         uncompressed_size_bytes,
+    })
+}
+
+/// Archive immutable, selectively captured App bytes, never reread the source project.
+/// The delivery controller retains these bytes through preview/install using an
+/// App-purpose upload; Gateway independently validates the extracted selection.
+pub fn build_app_snapshot_archive(
+    snapshot: &pioneer_packages::Snapshot,
+    cancelled: impl Fn() -> bool,
+) -> Result<SkillUploadArchive> {
+    use pioneer_apps::SelectionPlan;
+    use pioneer_packages::Entry;
+    let manifest = SelectionPlan::validate_package(snapshot)?;
+    let encoder = GzBuilder::new()
+        .mtime(0)
+        .write(Vec::new(), Compression::default());
+    let mut builder = Builder::new(encoder);
+    let root = manifest.slug();
+    let mut root_header = Header::new_gnu();
+    root_header.set_entry_type(tar::EntryType::Directory);
+    root_header.set_mode(snapshot.root_mode());
+    root_header.set_size(0);
+    root_header.set_mtime(0);
+    root_header.set_cksum();
+    builder.append_data(&mut root_header, root, io::empty())?;
+    let mut total = 0u64;
+    struct CancellableBytes<'a, F> {
+        bytes: &'a [u8],
+        cancelled: &'a F,
+    }
+    impl<F: Fn() -> bool> io::Read for CancellableBytes<'_, F> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if (self.cancelled)() {
+                return Err(io::Error::other("cancelled"));
+            }
+            let count = buffer.len().min(self.bytes.len()).min(64 * 1024);
+            buffer[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            Ok(count)
+        }
+    }
+    for (path, entry) in snapshot.entries() {
+        if cancelled() {
+            bail!("cancelled");
+        }
+        let mut header = Header::new_gnu();
+        let bytes = match entry {
+            Entry::Directory { mode } => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_mode(*mode);
+                &[][..]
+            }
+            Entry::File { bytes, mode } => {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(*mode);
+                total = total
+                    .checked_add(bytes.len() as u64)
+                    .context("expanded_limit")?;
+                bytes.as_slice()
+            }
+            Entry::Denied => bail!("denied_entry"),
+        };
+        header.set_size(bytes.len() as u64);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder.append_data(
+            &mut header,
+            format!("{root}/{path}"),
+            CancellableBytes {
+                bytes,
+                cancelled: &cancelled,
+            },
+        )?;
+    }
+    if cancelled() {
+        bail!("cancelled");
+    }
+    let bytes = builder.into_inner()?.finish()?;
+    anyhow::ensure!(
+        bytes.len() <= pioneer_apps::MAX_UPLOAD_ARCHIVE_BYTES,
+        "archive_input_limit"
+    );
+    Ok(SkillUploadArchive {
+        file_name: format!("{root}.tar.gz"),
+        sha256: hex::encode(Sha256::digest(&bytes)),
+        bytes,
+        uncompressed_size_bytes: total,
     })
 }
 
@@ -375,6 +544,50 @@ mod tests {
     use flate2::read::GzDecoder;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tar::Archive;
+
+    #[test]
+    fn app_folder_upload_accepts_a_prebuilt_library_larger_than_ten_mib() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("runtime")).unwrap();
+        let document = serde_json::json!({
+            "slug": "backend-app", "name": "Backend", "version": "1.0.0",
+            "shortDescription": "Prebuilt backend", "developer": {"name": "Author"},
+            "icon": {"light": "icon.png", "dark": "icon.png"},
+            "runtime": {
+                "environment": "node", "cwd": "runtime", "command": ["node", "start.js"],
+                "port": 3000, "readiness": {"path": "/healthz"}
+            }
+        });
+        fs::write(root.path().join("app.json"), document.to_string()).unwrap();
+        fs::write(root.path().join("icon.png"), hex::decode(
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082"
+        ).unwrap()).unwrap();
+        fs::write(
+            root.path().join("runtime/start.js"),
+            b"// Prebuilt entry point\n",
+        )
+        .unwrap();
+        let library_bytes = 18 * 1024 * 1024;
+        fs::File::create(root.path().join("runtime/library.so"))
+            .unwrap()
+            .set_len(library_bytes)
+            .unwrap();
+
+        let upload = build_app_upload_archive(root.path(), || false).unwrap();
+        let mut archive = Archive::new(GzDecoder::new(upload.bytes.as_slice()));
+        let mut library_found = false;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().as_ref() == Path::new("backend-app/runtime/library.so") {
+                assert_eq!(
+                    io::copy(&mut entry, &mut io::sink()).unwrap(),
+                    library_bytes
+                );
+                library_found = true;
+            }
+        }
+        assert!(library_found);
+    }
 
     #[test]
     fn build_skill_upload_archive_is_stable_for_unchanged_input() {

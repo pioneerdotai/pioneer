@@ -2050,7 +2050,9 @@ pub(crate) fn pin_launch_selection_capabilities(
                 }
                 skill_ids.push(skill_id.clone());
             }
-            TurnCapabilityKind::SkillPack { .. } | TurnCapabilityKind::Plugin { .. } => {
+            TurnCapabilityKind::SkillPack { .. }
+            | TurnCapabilityKind::Plugin { .. }
+            | TurnCapabilityKind::App { .. } => {
                 anyhow::bail!("normalized Task launch contains an unexpanded Skill pack");
             }
             TurnCapabilityKind::McpServer { name, scope_kind } => {
@@ -2160,6 +2162,14 @@ pub(crate) fn task_launch_selection_capabilities(
             }
             capability_ids.push(capability.id.clone());
             match &capability.kind {
+                TurnCapabilityKind::App {
+                    app_id,
+                    expected_revision,
+                } if *expected_revision > 0
+                    && capability.id == pioneer_protocol::app_capability_key(app_id) =>
+                {
+                    has_plugins = true;
+                }
                 TurnCapabilityKind::Plugin {
                     plugin_id,
                     expected_revision,
@@ -4247,7 +4257,7 @@ async fn dispatch_agent_action_outbox_row_inner(
         return Err(Failure::InvalidStart.into());
     }
     if let Some(snapshot) = &dispatch.plugin_selection {
-        let _admission = super::plugins::acquire_plugin_selection_admission(
+        let _admission = super::packages::acquire_plugin_selection_admission(
             processor.crud_store.as_ref(),
             &processor.plugin_mutation_locks,
             &execution.workspace_id,
@@ -5829,7 +5839,7 @@ impl AgentActionToolHandler {
         // graph and outbox preparation step above therefore leaves no phantom
         // child Turn behind when it fails.
         let plugin_guards = if let Some(snapshot) = &normalized_capabilities.plugin_selection {
-            let guards = super::plugins::acquire_plugin_selection_admission(
+            let guards = super::packages::acquire_plugin_selection_admission(
                 processor.crud_store.as_ref(),
                 &processor.plugin_mutation_locks,
                 &self.context.workspace_id,

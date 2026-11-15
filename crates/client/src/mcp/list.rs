@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 /// Standalone screens and pickers hide owned records; common catalogs retain them.
 pub fn mcp_is_standalone(server: &McpListItem) -> bool {
-    server.plugin_owner.is_none()
+    !server.is_package_component()
 }
 
 pub const MCP_INSTALL_PENDING_KEY: &str = "__install__";
@@ -188,6 +188,7 @@ mod tests {
     pub(crate) fn server(id: &str, name: &str) -> McpListItem {
         McpListItem {
             plugin_owner: None,
+            package_owner: None,
             id: id.to_owned(),
             name: name.to_owned(),
             display_name: None,

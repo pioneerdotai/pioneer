@@ -23,8 +23,8 @@ mod install;
 mod list;
 pub(in crate::message) use list::mcp_installation_is_disclosed;
 mod oauth;
+pub(crate) mod package;
 mod policy;
-pub(crate) mod portable;
 mod restart;
 mod uninstall;
 
@@ -280,6 +280,7 @@ fn list_item_from_record_with_catalog_and_runtime(
         });
     Ok(McpListItem {
         plugin_owner: None,
+        package_owner: None,
         id: record.id.clone().unwrap_or_default(),
         name: record.name.clone(),
         display_name: record.display_name.clone(),

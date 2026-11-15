@@ -11,25 +11,45 @@ async fn seed_owned_c2_skill(
     workspace: &str,
     root: &std::path::Path,
 ) -> (String, SkillId, TurnCapability) {
-    let parent = "P".repeat(21);
-    let skill = SkillId::new("S".repeat(21)).unwrap();
-    let member = root.join("skills/bundled");
+    seed_owned_c2_package(
+        store,
+        workspace,
+        root,
+        pioneer_protocol::PackageKind::Plugin,
+    )
+    .await
+}
+async fn seed_owned_c2_package(
+    store: &CrudStore,
+    workspace: &str,
+    root: &std::path::Path,
+    kind: pioneer_protocol::PackageKind,
+) -> (String, SkillId, TurnCapability) {
+    let app = kind == pioneer_protocol::PackageKind::App;
+    let parent = if app { "A" } else { "P" }.repeat(21);
+    let skill = SkillId::new(if app { "T" } else { "S" }.repeat(21)).unwrap();
+    let member_name = if app { "bundled-app" } else { "bundled" };
+    let member = root.join(format!("skills/{member_name}"));
     std::fs::create_dir_all(&member).unwrap();
     std::fs::create_dir_all(member.join("scripts")).unwrap();
     std::fs::write(
         member.join("SKILL.md"),
-        "---\nname: bundled\ndescription: Selected packaged skill\n---\nRead scripts/helper.txt\n",
+        format!("---\nname: {member_name}\ndescription: Selected packaged skill\n---\nRead scripts/helper.txt\n"),
     )
     .unwrap();
     std::fs::write(member.join("scripts/helper.txt"), "supporting file").unwrap();
     let now = chrono::Utc::now().fixed_offset();
     store
-        .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        .insert_package_installation(&pioneer_crud::PackageRecord {
+            kind,
+            app_manifest_json:app.then(||serde_json::json!({"slug":"authoritative-app","name":"Authoritative App","version":"1.0.0","shortDescription":"App regression","developer":{"name":"Author"},"icon":{"light":"icon.png","dark":"icon.png"},"skills":"skills"}).to_string()),
+            app_localizations_json:app.then(||"{}".into()),
+            operation_error_json: None,
             id: parent.clone(),
             workspace_id: workspace.into(),
-            name: "authoritative-parent".into(),
+            name:if app{"authoritative-app"}else{"authoritative-parent"}.into(),
             version: None,
-            source_upload_id: "c2-upload".into(),
+            source_upload_id:format!("c2-upload-{}",kind.as_str()),
             package_path: root.to_string_lossy().into(),
             data_path: root.with_extension("data").to_string_lossy().into(),
             package_fingerprint: "context".into(),
@@ -70,11 +90,15 @@ async fn seed_owned_c2_skill(
             &pioneer_crud::SkillInstallationRecord {
                 skill_id: skill.clone(),
                 owner: None,
-                slug: "bundled".into(),
+                slug: member_name.into(),
                 version: None,
                 source_kind: "user".into(),
                 scope_key: workspace.into(),
-                source_ref: "c2-package".into(),
+                source_ref: if app {
+                    format!("app:{parent}:{member_name}")
+                } else {
+                    "c2-package".into()
+                },
                 install_path: member.to_string_lossy().into(),
                 trust_level: "community".into(),
                 fingerprint: "member".into(),
@@ -83,7 +107,7 @@ async fn seed_owned_c2_skill(
                 pack_member_key: None,
             },
             &pioneer_crud::WorkspaceSkillPolicyRecord {
-                id: "c2-policy".into(),
+                id: format!("c2-policy-{}", kind.as_str()),
                 workspace_id: workspace.into(),
                 skill_id: skill.clone(),
                 enabled: Some(true),
@@ -94,10 +118,11 @@ async fn seed_owned_c2_skill(
             )],
             None,
             Some(&pioneer_crud::PluginOwnershipWrite {
+                kind,
                 plugin_id: parent.clone(),
                 expected_revision: 1,
-                member_key: "bundled".into(),
-                member_path: Some("skills/bundled".into()),
+                member_key: member_name.into(),
+                member_path: Some(format!("skills/{member_name}")),
                 package_fingerprint: "member".into(),
                 child_id: skill.to_string(),
             }),
@@ -109,14 +134,8 @@ async fn seed_owned_c2_skill(
         .settle_plugin_installation(&parent, 1, "installed", None)
         .await
         .unwrap();
-    let selection = TurnCapability {
-        id: pioneer_protocol::plugin_capability_key(&parent),
-        label: Some("fabricated-label".into()),
-        kind: TurnCapabilityKind::Plugin {
-            plugin_id: parent.clone(),
-            expected_revision: 1,
-        },
-    };
+    let mut selection = pioneer_protocol::package_capability(kind, &parent, 1);
+    selection.label = Some("fabricated-label".into());
     (parent, skill, selection)
 }
 
@@ -252,7 +271,7 @@ async fn cli_restore_requires_committed_ready_bindings_and_current_parent_author
         .await
         .unwrap();
     assert!(
-        super::super::plugins::validate_cli_plugin_selection(
+        super::super::packages::validate_cli_plugin_selection(
             &harness.crud_store,
             &harness.workspace_id,
             "c2-ready-turn"
@@ -312,7 +331,7 @@ async fn cli_restore_requires_committed_ready_bindings_and_current_parent_author
     assert_eq!(presentation.len(), 1);
     assert!(matches!(
         presentation[0].kind,
-        TurnCapabilityKind::Plugin { .. }
+        TurnCapabilityKind::Plugin { .. } | TurnCapabilityKind::App { .. }
     ));
     let mut omitted = snapshot.clone();
     omitted.children.clear();
@@ -327,7 +346,7 @@ async fn cli_restore_requires_committed_ready_bindings_and_current_parent_author
         .await
         .unwrap();
     assert!(
-        super::super::plugins::validate_cli_plugin_selection(
+        super::super::packages::validate_cli_plugin_selection(
             &harness.crud_store,
             &harness.workspace_id,
             "c2-ready-turn"
@@ -372,7 +391,7 @@ async fn cli_restore_requires_committed_ready_bindings_and_current_parent_author
         .await
         .unwrap();
     assert!(
-        super::super::plugins::validate_cli_plugin_selection(
+        super::super::packages::validate_cli_plugin_selection(
             &harness.crud_store,
             &harness.workspace_id,
             "c2-ready-turn"
@@ -535,7 +554,7 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
     }))
     .unwrap();
     std::fs::write(package.join("plugin.json"), &manifest).unwrap();
-    let snapshot = pioneer_plugins::Snapshot::capture(
+    let snapshot = pioneer_packages::Snapshot::capture(
         &package,
         harness.processor.package_delivery_context().plugin_limits(),
         || false,
@@ -574,7 +593,11 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
     let timestamp = chrono::Utc::now().fixed_offset();
     harness
         .crud_store
-        .insert_plugin_installation(&pioneer_entity::plugin_installation::Model {
+        .insert_plugin_installation(&pioneer_crud::PackageRecord {
+            kind: pioneer_crud::PackageKind::Plugin,
+            app_manifest_json: None,
+            app_localizations_json: None,
+            operation_error_json: None,
             id: parent.clone(),
             workspace_id: harness.workspace_id.clone(),
             name: plan.manifest.name.clone(),
@@ -924,5 +947,590 @@ async fn plugin_policy_rpc_preserves_independent_toggles_and_frozen_task_grants(
         .unwrap();
     assert!(explicit.execution.iter().any(|cap| matches!(&cap.kind,
         TurnCapabilityKind::Skill { skill_id, .. } if skill_id == &skill)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// NOT_RUN / NOT_COMPILED. Native catalog and owner admission, no provider process.
+#[test]
+fn app_selection_preserves_both_parent_domains_and_blocks_owned_leaf_bypass() {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async{
+        let harness=setup_cli_runtime_security_harness(None).await;
+        let root=unique_temp_dir("app-selection-owner");
+        let (app,skill,selected)=seed_owned_c2_package(&harness.crud_store,&harness.workspace_id,&root.join("app"),pioneer_protocol::PackageKind::App).await;
+        let (plugin,_,plugin_selected)=seed_owned_c2_skill(&harness.crud_store,&harness.workspace_id,&root.join("plugin")).await;
+        let result=harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[selected.clone(),plugin_selected.clone()]).await.unwrap();
+        assert_eq!(result.presentation.len(),2);
+        assert_eq!(result.presentation[0].label.as_deref(),Some("Authoritative App"));
+        assert!(matches!(&result.presentation[0].kind,TurnCapabilityKind::App{app_id,expected_revision:1} if app_id==&app));
+        let snapshot=result.plugin_selection.unwrap();assert_eq!(snapshot.parents.len(),2);
+        assert_eq!(snapshot.parents[0].kind,pioneer_protocol::PackageKind::App);
+        assert_eq!(snapshot.parents[1].kind,pioneer_protocol::PackageKind::Plugin);
+        assert!(snapshot.children.iter().any(|c|c.parent_id==app&&c.id==skill.as_str()));
+        let raw=TurnCapability{id:pioneer_protocol::skill_capability_key(&skill),kind:TurnCapabilityKind::Skill{skill_id:skill,pack_id:None},label:None};
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[raw]).await.is_err());
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[pioneer_protocol::package_capability(pioneer_protocol::PackageKind::Plugin,&app,1)]).await.is_err());
+        assert!(harness.processor.normalize_turn_skill_capabilities("foreign-workspace",&[selected.clone()]).await.is_err());
+        let guards=super::super::packages::acquire_plugin_selection_admission(&harness.crud_store,&harness.processor.plugin_mutation_locks,&harness.workspace_id,&snapshot).await.unwrap();drop(guards);
+        harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&app,1,"updating",false,"{\"kind\":\"enable\"}").await.unwrap();
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[selected]).await.is_err());
+        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[plugin_selected]).await.is_ok());
+        assert!(harness.crud_store.find_package_installation(&plugin).await.unwrap().unwrap().enabled);
+        std::fs::remove_dir_all(root).unwrap();
+    });
+}
+
+// NOT_RUN / NOT_COMPILED. Real authenticated transfer and App facade, no providers.
+async fn app_rpc(
+    harness: &mut CliRuntimeSecurityHarness,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let id = pioneer_protocol::generate_id(21);
+    harness
+        .processor
+        .process_request_for_connection(
+            harness.connection_id,
+            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string(),
+        )
+        .await;
+    recv_response_by_id(&mut harness.rx, &id).await.result
+}
+
+async fn install_rpc_app(
+    harness: &mut CliRuntimeSecurityHarness,
+    root: &std::path::Path,
+    slug: &str,
+    decorated_paths: bool,
+    strict_skill: bool,
+) -> pioneer_protocol::AppItem {
+    let package = root.join(slug);
+    std::fs::create_dir_all(package.join("assets")).unwrap();
+    std::fs::create_dir_all(package.join("skills").join(slug)).unwrap();
+    let mut revisions = Vec::new();
+    for (name, size) in [("light", 1), ("dark", 2)] {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(size, size)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = png.into_inner();
+        revisions.push(hex::encode(Sha256::digest(&bytes)));
+        std::fs::write(package.join(format!("assets/{name}.png")), bytes).unwrap();
+    }
+    let path = |name| {
+        if decorated_paths {
+            format!("./assets/{name}.png/")
+        } else {
+            format!("assets/{name}.png")
+        }
+    };
+    let icons = json!({"light":path("light"),"dark":path("dark")});
+    std::fs::write(
+        package.join("app.json"),
+        json!({
+            "slug":slug,"name":format!("App {slug}"),"version":"1.2.3",
+            "shortDescription":"Saved description","developer":{"name":"Author","logo":icons},
+            "icon":icons,"skills":"./skills/","mcp":{"config":"./mcp.json"},
+            "locales":{"en":"en.json"},"defaultLocale":"en"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("en.json"),
+        r#"{"name":"Localized App","shortDescription":"Localized description"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("skills").join(slug).join("SKILL.md"),
+        if strict_skill {
+            format!("---\nname: {slug}\ndescription: App regression skill\n---\nUse this installed skill.\n")
+        } else {
+            // Installation accepts this OpenClaw-compatible definition.
+            // Normalization projects operational members; the native resolver
+            // applies strict execution policy later.
+            "---\nname: Display title\nallowed-tools: [Read]\n---\nUse this installed skill.\n".to_owned()
+        },
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("mcp.json"),
+        json!({"$schema":"native-config-reference","mcpServers":{
+            format!("mcp-{slug}"):{"command":"must-not-start-disabled-fixture",
+                "env":{"TOKEN":"bundled-canary"},"disabled":true,
+                "startup_timeout_sec":5,"tool_timeout_sec":9}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let upload = create_finalized_archive_upload_with_purpose(
+        &harness.processor,
+        &mut harness.rx,
+        harness.connection_id,
+        &harness.workspace_id,
+        build_test_directory_archive(&package),
+        format!("{slug}.tar.gz"),
+        slug,
+        pioneer_protocol::SkillUploadPurpose::App,
+    )
+    .await;
+    assert_eq!(
+        harness
+            .crud_store
+            .find_skill_upload_session(&upload)
+            .await
+            .unwrap()
+            .unwrap()
+            .purpose,
+        "app"
+    );
+    let workspace = harness.workspace_id.clone();
+    let preview: pioneer_protocol::AppsPreviewResponse = serde_json::from_value(
+        app_rpc(
+            harness,
+            methods::APPS_PREVIEW,
+            json!({"workspace_id":workspace,"upload_id":upload}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(preview.components.len(), 2);
+    assert!(preview.diagnostics.is_empty());
+    let installed_wire = app_rpc(
+        harness,
+        methods::APPS_INSTALL,
+        json!({
+            "workspace_id":workspace,"upload_id":upload,"expected_fingerprint":preview.fingerprint
+        }),
+    )
+    .await;
+    assert!(installed_wire.get("slug").is_some());
+    assert!(installed_wire.get("plugin").is_none());
+    let installed: pioneer_protocol::AppItem = serde_json::from_value(installed_wire).unwrap();
+    assert_eq!(installed.slug, slug);
+    assert_eq!(installed.name, "Localized App");
+    assert_eq!(
+        installed.description.as_deref(),
+        Some("Localized description")
+    );
+    assert_eq!(installed.version.as_deref(), Some("1.2.3"));
+    assert_eq!(installed.state, "installed");
+    assert_eq!(installed.status, "installed");
+    assert_eq!(installed.revision, 1);
+    let artwork = installed.metadata.app.as_ref().unwrap();
+    let icon = artwork
+        .icon
+        .as_ref()
+        .expect("both validated themes must reach presentation");
+    assert_eq!(
+        icon.light,
+        pioneer_protocol::ImageReference::app_icon(&workspace, &installed.id, &revisions[0])
+    );
+    assert_eq!(
+        icon.dark,
+        pioneer_protocol::ImageReference::app_icon(&workspace, &installed.id, &revisions[1])
+    );
+    assert_eq!(artwork.composer_icon.as_ref(), Some(icon));
+    assert_eq!(artwork.developer_logo.as_ref(), Some(icon));
+    assert_eq!(
+        artwork.localizations["en"].name.as_deref(),
+        Some("Localized App")
+    );
+    let stored = harness
+        .crud_store
+        .find_package_installation(&installed.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.kind, pioneer_protocol::PackageKind::App);
+    assert_eq!(stored.name, slug);
+    let manifest: serde_json::Value =
+        serde_json::from_str(stored.app_manifest_json.as_deref().unwrap()).unwrap();
+    assert_eq!(manifest["name"], format!("App {slug}"));
+    assert_eq!(stored.package_fingerprint, preview.fingerprint);
+    let skill = installed
+        .components
+        .iter()
+        .find_map(|c| c.skill_id.as_ref())
+        .unwrap();
+    let mcp = installed
+        .components
+        .iter()
+        .find(|c| c.kind == "mcp")
+        .unwrap();
+    let row = harness
+        .crud_store
+        .find_mcp_server_installation("workspace", &workspace, &mcp.member_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.id.as_ref(), mcp.mcp_installation_id.as_ref());
+    assert!(!row.enabled);
+    let native = crate::mcp_service::installation_from_record(&row).unwrap();
+    assert!(!native.required);
+    let pioneer_mcp::McpTransportConfig::Stdio {
+        env,
+        startup_timeout_ms,
+        tool_timeout_ms,
+        ..
+    } = &native.transport
+    else {
+        panic!("expected native stdio");
+    };
+    assert_eq!((*startup_timeout_ms, *tool_timeout_ms), (5000, 9000));
+    let pioneer_mcp::McpConfigValue::SecretRef { ref_id } = &env["TOKEN"] else {
+        panic!("expected native secret ref");
+    };
+    assert_eq!(
+        harness
+            .processor
+            .gateway_secrets
+            .get_mcp_secret(ref_id)
+            .unwrap()
+            .as_deref(),
+        Some("bundled-canary")
+    );
+    let mcp_owner = harness
+        .crud_store
+        .native_package_owner("mcp", row.id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(mcp_owner.kind, pioneer_protocol::PackageKind::App);
+    assert_eq!(mcp_owner.package_id, installed.id);
+    let owner = harness
+        .crud_store
+        .native_package_owner("skill", skill.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.kind, pioneer_protocol::PackageKind::App);
+    assert_eq!(owner.package_id, installed.id);
+    let selected = pioneer_protocol::package_capability(
+        pioneer_protocol::PackageKind::App,
+        &installed.id,
+        installed.revision,
+    );
+    let normalized = harness
+        .processor
+        .normalize_turn_skill_capabilities(&workspace, &[selected])
+        .await
+        .unwrap();
+    assert_eq!(normalized.presentation.len(), 1);
+    assert!(
+        matches!(&normalized.presentation[0].kind, TurnCapabilityKind::App {app_id,expected_revision:1} if app_id==&installed.id)
+    );
+    assert!(
+        normalized.execution.iter().any(
+            |cap| matches!(&cap.kind,TurnCapabilityKind::Skill{skill_id,..} if skill_id==skill)
+        )
+    );
+    assert!(!normalized.execution.iter().any(|cap| matches!(&cap.kind,
+        TurnCapabilityKind::McpServer { name, .. } if name == &mcp.member_key)));
+    let frozen = normalized.plugin_selection.unwrap();
+    assert_eq!(frozen.parents[0].kind, pioneer_protocol::PackageKind::App);
+    assert_eq!(frozen.parents[0].revision, 1);
+    assert!(
+        frozen
+            .children
+            .iter()
+            .any(|child| child.parent_id == installed.id && child.id == skill.as_str())
+    );
+    installed
+}
+
+#[tokio::test]
+async fn app_rpc_install_read_selection_and_damaged_inventory_removal() {
+    let mut harness = setup_cli_runtime_security_harness(None).await;
+    let root = unique_temp_dir("app-rpc-correction");
+    // One scenario owns the real install contract and path→themed presentation
+    // regression. No direct insertion of parent rows or fabricated fingerprints.
+    let a = install_rpc_app(&mut harness, &root, "rpc-app-a", false, true).await;
+    let b = install_rpc_app(&mut harness, &root, "rpc-app-b", true, false).await;
+    let workspace = harness.workspace_id.clone();
+    let list: pioneer_protocol::AppsListResponse = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_LIST,
+            json!({"workspace_id":workspace}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(list.apps.len(), 2);
+    let details: pioneer_protocol::AppItem = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_DETAILS,
+            json!({"workspace_id":workspace,"app_id":a.id}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(details, a);
+    let stored = harness
+        .crud_store
+        .find_package_installation(&a.id)
+        .await
+        .unwrap()
+        .unwrap();
+    for missing in [false, true] {
+        if missing {
+            std::fs::remove_dir_all(&stored.package_path).unwrap();
+        } else {
+            // Keep the manifest and both raster files valid, but change the
+            // selected tree digest: this must hit fingerprint verification.
+            std::fs::copy(
+                std::path::Path::new(&stored.package_path).join("assets/dark.png"),
+                std::path::Path::new(&stored.package_path).join("assets/light.png"),
+            )
+            .unwrap();
+        }
+        let list: pioneer_protocol::AppsListResponse = serde_json::from_value(
+            app_rpc(
+                &mut harness,
+                methods::APPS_LIST,
+                json!({"workspace_id":workspace}),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(list.apps.len(), 2);
+        assert_eq!(list.apps.iter().find(|item| item.id == b.id).unwrap(), &b);
+        let damaged = list.apps.iter().find(|item| item.id == a.id).unwrap();
+        assert_eq!(damaged.slug, a.slug);
+        assert_eq!(damaged.name, a.name);
+        assert_eq!(damaged.version, a.version);
+        assert_eq!(damaged.description, a.description);
+        assert_eq!(damaged.revision, a.revision);
+        assert_eq!(damaged.components, a.components);
+        assert_eq!(damaged.status, "partial");
+        let artwork = damaged.metadata.app.as_ref().unwrap();
+        assert_eq!(
+            artwork.localizations,
+            a.metadata.app.as_ref().unwrap().localizations
+        );
+        assert!(
+            artwork.icon.is_none()
+                && artwork.composer_icon.is_none()
+                && artwork.developer_logo.is_none()
+        );
+        assert!(damaged.metadata.logo.is_none() && damaged.metadata.composer_icon.is_none());
+        let diagnostic = damaged
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "app_package_unavailable")
+            .unwrap();
+        assert!(diagnostic.path.is_empty());
+        assert_eq!(
+            diagnostic.message,
+            "Installed App files could not be verified"
+        );
+        assert!(
+            !serde_json::to_string(damaged)
+                .unwrap()
+                .contains(&stored.package_path)
+        );
+        let details: pioneer_protocol::AppItem = serde_json::from_value(
+            app_rpc(
+                &mut harness,
+                methods::APPS_DETAILS,
+                json!({"workspace_id":workspace,"app_id":a.id}),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(&details, damaged);
+    }
+    let removed: pioneer_protocol::AppsMutationResponse = serde_json::from_value(app_rpc(&mut harness,
+        methods::APPS_REMOVE,json!({"workspace_id":workspace,"app_id":a.id,"expected_revision":a.revision,"purge_data":true})).await).unwrap();
+    assert!(removed.removed && removed.app.is_none());
+    assert!(
+        harness
+            .crud_store
+            .find_package_installation(&a.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let list: pioneer_protocol::AppsListResponse = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_LIST,
+            json!({"workspace_id":workspace}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(list.apps, vec![b]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// NOT_RUN / NOT_COMPILED. Native edits and package updates share real secret storage.
+#[tokio::test]
+async fn app_update_preserves_native_mcp_secret_override() {
+    let mut harness = setup_cli_runtime_security_harness(None).await;
+    let root = unique_temp_dir("app-native-mcp-override");
+    let slug = "native-mcp-override";
+    let app = install_rpc_app(&mut harness, &root, slug, false, true).await;
+    let workspace = harness.workspace_id.clone();
+    let member = app.components.iter().find(|c| c.kind == "mcp").unwrap();
+    let row = harness
+        .crud_store
+        .find_mcp_server_installation("workspace", &workspace, &member.member_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let installed = crate::mcp_service::installation_from_record(&row).unwrap();
+    let pioneer_mcp::McpTransportConfig::Stdio { env, .. } = &installed.transport else {
+        panic!("expected stdio");
+    };
+    let pioneer_mcp::McpConfigValue::SecretRef {
+        ref_id: bundled_ref,
+    } = &env["TOKEN"]
+    else {
+        panic!("expected secret ref");
+    };
+    let edited: pioneer_protocol::McpInstallResponse = serde_json::from_value(app_rpc(
+        &mut harness,methods::MCP_INSTALL,json!({"workspace_id":workspace,
+            "config_json":json!({"mcpServers":{(member.member_key.clone()):{
+                "command":"must-not-start-disabled-fixture","disabled":true,"env":{"TOKEN":"native-user-canary"}
+            }}}).to_string()})).await).unwrap();
+    assert_eq!(edited.servers.len(), 1);
+    assert!(matches!(
+        edited.servers[0].status,
+        pioneer_protocol::McpInstallResultStatus::Updated
+    ));
+    let overridden = harness
+        .crud_store
+        .find_mcp_server_installation("workspace", &workspace, &member.member_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let native = crate::mcp_service::installation_from_record(&overridden).unwrap();
+    let pioneer_mcp::McpTransportConfig::Stdio { env, .. } = &native.transport else {
+        panic!("expected stdio");
+    };
+    let pioneer_mcp::McpConfigValue::SecretRef { ref_id: user_ref } = &env["TOKEN"] else {
+        panic!("expected secret ref");
+    };
+    assert_ne!(user_ref, bundled_ref);
+    assert_eq!(
+        harness
+            .processor
+            .gateway_secrets
+            .get_mcp_secret(user_ref)
+            .unwrap()
+            .as_deref(),
+        Some("native-user-canary")
+    );
+    assert!(
+        harness
+            .processor
+            .gateway_secrets
+            .get_mcp_secret(bundled_ref)
+            .unwrap()
+            .is_none()
+    );
+    let current: pioneer_protocol::AppItem = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_DETAILS,
+            json!({"workspace_id":workspace,"app_id":app.id}),
+        )
+        .await,
+    )
+    .unwrap();
+    let config_path = root.join(slug).join("mcp.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["mcpServers"][&member.member_key]["env"]["TOKEN"] = json!("new-package-canary");
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    // Updating an owned Skill uses native admission too, without the former
+    // package-only strict conformance gate. Runtime policy is unchanged.
+    std::fs::write(
+        root.join(slug).join("skills").join(slug).join("SKILL.md"),
+        "---\nname: Updated title\nallowed-tools: [Read]\n---\nUse updated native skill.\n",
+    )
+    .unwrap();
+    let upload = create_finalized_archive_upload_with_purpose(
+        &harness.processor,
+        &mut harness.rx,
+        harness.connection_id,
+        &workspace,
+        build_test_directory_archive(&root.join(slug)),
+        "update.tar.gz".into(),
+        "native-mcp-update",
+        pioneer_protocol::SkillUploadPurpose::App,
+    )
+    .await;
+    let preview: pioneer_protocol::AppsUpdatePreviewResponse = serde_json::from_value(
+        app_rpc(
+            &mut harness,
+            methods::APPS_PREVIEW,
+            json!({"workspace_id":workspace,"upload_id":upload,
+            "target":{"app_id":app.id,"expected_revision":current.revision}}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert!(
+        preview
+            .authorization_changes
+            .iter()
+            .any(|c| c.kind == "mcp" && c.member_key == member.member_key)
+    );
+    let updated: pioneer_protocol::AppsMutationResponse = serde_json::from_value(app_rpc(&mut harness,
+        methods::APPS_UPDATE,json!({"workspace_id":workspace,"app_id":app.id,"expected_revision":current.revision,
+            "upload_id":upload,"expected_fingerprint":preview.package.fingerprint,"confirm_changes":true})).await).unwrap();
+    let updated = updated.app.unwrap();
+    assert_eq!(updated.state, "installed");
+    assert_eq!(updated.status, "installed");
+    let updated_skill_id = updated
+        .components
+        .iter()
+        .find_map(|component| component.skill_id.as_ref())
+        .unwrap();
+    let updated_skill = harness
+        .crud_store
+        .find_skill_installation(updated_skill_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&updated_skill.install_path).join("SKILL.md"))
+            .unwrap(),
+        "---\nname: Updated title\nallowed-tools: [Read]\n---\nUse updated native skill.\n"
+    );
+    let final_row = harness
+        .crud_store
+        .find_mcp_server_installation("workspace", &workspace, &member.member_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_row.id, overridden.id);
+    assert_eq!(final_row.transport_json, overridden.transport_json);
+    assert_eq!(final_row.auth_json, overridden.auth_json);
+    assert_eq!(final_row.secret_refs_json, overridden.secret_refs_json);
+    assert_eq!(
+        harness
+            .processor
+            .gateway_secrets
+            .get_mcp_secret(user_ref)
+            .unwrap()
+            .as_deref(),
+        Some("native-user-canary")
+    );
+    assert!(
+        harness
+            .processor
+            .gateway_secrets
+            .get_mcp_secret(bundled_ref)
+            .unwrap()
+            .is_none(),
+        "unused package credentials must not be materialized after native override"
+    );
+    let removed:pioneer_protocol::AppsMutationResponse=serde_json::from_value(app_rpc(&mut harness,methods::APPS_REMOVE,
+        json!({"workspace_id":workspace,"app_id":updated.id,"expected_revision":updated.revision,"purge_data":true})).await).unwrap();
+    assert!(removed.removed, "App removal must finish: {removed:?}");
     std::fs::remove_dir_all(root).unwrap();
 }

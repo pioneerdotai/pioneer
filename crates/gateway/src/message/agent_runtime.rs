@@ -12763,11 +12763,35 @@ impl MessageProcessor {
         // Freeze the authored image reference with the user message. Only the Gateway's
         // matching installed revision may supply it; client image references are ignored.
         for attachment in &mut attachments {
+            if let pioneer_protocol::UserMessageAttachment::App { capability } = attachment {
+                capability.icon = None;
+                capability.dark_icon = None;
+                if let Ok(Some(parent)) = self
+                    .crud_store
+                    .find_package_installation(&capability.app_id)
+                    .await
+                {
+                    if parent.kind == pioneer_protocol::PackageKind::App
+                        && parent.workspace_id == workspace_id
+                        && parent.revision == capability.expected_revision
+                        && parent.state == "installed"
+                        && parent.pending_json.is_none()
+                    {
+                        let item = self.package_presentation_item(&parent).await?;
+                        capability.dark_icon = item
+                            .app
+                            .as_ref()
+                            .and_then(|a| a.composer_icon.as_ref())
+                            .map(|i| i.dark.clone());
+                        capability.icon = item.composer_icon;
+                    }
+                }
+            }
             if let pioneer_protocol::UserMessageAttachment::Plugin { capability } = attachment {
                 capability.icon = None;
                 if let Ok(Some(parent)) = self
                     .crud_store
-                    .find_plugin_installation(&capability.plugin_id)
+                    .find_package_installation(&capability.plugin_id)
                     .await
                 {
                     if parent.workspace_id == workspace_id
@@ -13335,6 +13359,7 @@ fn user_message_attachments_from_capabilities_with_lookup<'a>(
                         },
                     }
                 }
+                pioneer_protocol::TurnCapabilityKind::App { app_id, expected_revision } => pioneer_protocol::UserMessageAttachment::App { capability: pioneer_protocol::TurnAppCapabilitySummary { app_id:app_id.clone(), expected_revision:*expected_revision, label:capability.label.clone().ok_or_else(|| anyhow::anyhow!("App presentation missing"))?, icon:None,dark_icon:None } },
                 pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id, expected_revision } => pioneer_protocol::UserMessageAttachment::Plugin { capability: pioneer_protocol::TurnPluginCapabilitySummary { plugin_id: plugin_id.clone(), expected_revision: *expected_revision, label: capability.label.clone().ok_or_else(|| anyhow::anyhow!("plugin presentation missing"))?, icon: None } },
                 pioneer_protocol::TurnCapabilityKind::SkillPack { pack_id } => {
                     let name = pack_names.get(pack_id).ok_or_else(|| {

@@ -46,6 +46,13 @@ impl ImageReference {
             revision,
         }
     }
+    pub fn app_icon(workspace: &str, app: &str, revision: impl Into<String>) -> Self {
+        let revision = revision.into();
+        Self {
+            path: format!("storage/workspaces/{workspace}/apps/{app}/icons/{revision}"),
+            revision,
+        }
+    }
     pub fn plugin_icon(workspace: &str, plugin: &str, revision: impl Into<String>) -> Self {
         let revision = revision.into();
         Self {

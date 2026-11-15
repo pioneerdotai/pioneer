@@ -448,6 +448,13 @@ hide_others = "Masquer les autres"
 show_all = "Tout afficher"
 quit = "Quitter Pioneer"
 
+[menu.edit]
+name = "Édition"
+cut = "Couper"
+copy = "Copier"
+paste = "Coller"
+select_all = "Tout sélectionner"
+
 [menu.about]
 version = "Version %{version}"
 copyright = "© Pioneer Contributors"
@@ -1761,3 +1768,6 @@ callback_rejected = "Connexion refusée. Revenez à Pioneer pour réessayer."
 
 [plugins]
 title = "Plugins"
+
+[apps]
+title = "Applications"

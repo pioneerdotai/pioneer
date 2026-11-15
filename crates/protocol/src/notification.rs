@@ -113,6 +113,7 @@ pub enum GatewayNotification {
     ContextCompressed(ContextCompressedNotification),
     SkillsChanged(SkillsChangedNotification),
     PluginsChanged(crate::PluginsChangedNotification),
+    AppsChanged(crate::AppsChangedNotification),
     SkillsUploadChunkAck(SkillsUploadChunkAckNotification),
     McpOAuthChanged(crate::McpOAuthNotification),
     McpChanged(McpChangedNotification),
@@ -469,6 +470,11 @@ impl GatewayNotification {
                 serde_json::from_value::<ContextCompressedNotification>(params)
                     .ok()
                     .map(Self::ContextCompressed)
+            }
+            crate::constants::methods::APPS_CHANGED => {
+                serde_json::from_value::<crate::AppsChangedNotification>(params)
+                    .ok()
+                    .map(Self::AppsChanged)
             }
             crate::constants::methods::PLUGINS_CHANGED => {
                 serde_json::from_value::<crate::PluginsChangedNotification>(params)

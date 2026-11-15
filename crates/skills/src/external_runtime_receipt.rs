@@ -31,6 +31,8 @@ pub struct ExternalRuntimeSkillReceiptEntry {
     pub install_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_owner: Option<pioneer_protocol::PackageIdentity>,
     pub installed_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
 }
@@ -276,6 +278,7 @@ pub fn prepare_external_runtime_receipt_v2(
             &mut converted,
             ExternalRuntimeSkillReceiptEntry {
                 plugin_id: None,
+                package_owner: None,
                 skill_id: candidate.skill_id.clone(),
                 owner: candidate.owner.clone(),
                 slug: candidate.slug.clone(),
@@ -425,7 +428,16 @@ pub fn external_runtime_skill_is_current(
         && actual.source_kind == expected.source_kind
         && actual.source_folder_hash == expected.source_folder_hash
         && actual.install_path == expected_install_path
-        && actual.plugin_id == expected.plugin_id
+        && pioneer_protocol::PackageIdentity::resolve(
+            actual.package_owner.as_ref(),
+            actual.plugin_id.as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?
+            == pioneer_protocol::PackageIdentity::resolve(
+                expected.package_owner.as_ref(),
+                expected.plugin_id.as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?
         && actual.install_path == destination)
 }
 
@@ -541,6 +553,7 @@ mod tests {
         let leaf_slug = slug.rsplit('/').next().unwrap_or(slug);
         ExternalRuntimeSkillReceiptEntry {
             plugin_id: None,
+            package_owner: None,
             skill_id: test_skill_id(slug),
             owner: Some("workspace".to_owned()),
             slug: leaf_slug.to_owned(),

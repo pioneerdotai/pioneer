@@ -448,6 +448,13 @@ hide_others = "बाकी छुपाएँ"
 show_all = "सभी दिखाएँ"
 quit = "Pioneer से बाहर निकलें"
 
+[menu.edit]
+name = "संपादन"
+cut = "काटें"
+copy = "कॉपी करें"
+paste = "पेस्ट करें"
+select_all = "सभी चुनें"
+
 [menu.about]
 version = "संस्करण %{version}"
 copyright = "© Pioneer Contributors"
@@ -1761,3 +1768,6 @@ callback_rejected = "साइन इन अस्वीकार हुआ। �
 
 [plugins]
 title = "प्लगइन"
+
+[apps]
+title = "ऐप्स"

@@ -13,8 +13,8 @@
     "limit": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 1,
-      "maximum": 100
+      "maximum": 100,
+      "minimum": 1
     },
     "query": {
       "description": "Nonblank natural-language query; no maximum length is imposed.",
@@ -22,9 +22,9 @@
       "minLength": 1
     }
   },
+  "additionalProperties": false,
   "required": [
     "query",
     "limit"
-  ],
-  "additionalProperties": false
+  ]
 }

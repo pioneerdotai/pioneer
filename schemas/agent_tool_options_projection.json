@@ -94,15 +94,6 @@
         "ephemeral"
       ]
     },
-    "AgentToolBackendKind": {
-      "description": "Deliberately contains only a backend class.  Runtime instance IDs and\nprovider/model configuration remain server-side implementation details.",
-      "type": "string",
-      "enum": [
-        "api",
-        "cli",
-        "acp"
-      ]
-    },
     "AgentRouteAction": {
       "type": "string",
       "enum": [
@@ -112,6 +103,15 @@
         "schedule_task",
         "review_task_result",
         "deliver_result"
+      ]
+    },
+    "AgentToolBackendKind": {
+      "description": "Deliberately contains only a backend class.  Runtime instance IDs and\nprovider/model configuration remain server-side implementation details.",
+      "type": "string",
+      "enum": [
+        "api",
+        "cli",
+        "acp"
       ]
     },
     "AgentToolIdentityOption": {

@@ -3,6 +3,42 @@
   "title": "AgentDurableEvent",
   "oneOf": [
     {
+      "description": "Cumulative financial snapshot. Updates one retained row; never a token\ndelta transcript event and never a second charge identity.",
+      "type": "object",
+      "properties": {
+        "item_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "provider_usage_snapshot"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "usage": true,
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "revision",
+        "usage"
+      ]
+    },
+    {
       "description": "A unique output chunk on the acknowledged lane, retained across interruption.",
       "type": "object",
       "properties": {
@@ -1889,6 +1925,22 @@
         "failed"
       ]
     },
+    "ImageReference": {
+      "description": "Immutable image reference. Published paths are authenticated Gateway storage links.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision"
+      ]
+    },
     "ItemCompletedNotification": {
       "type": "object",
       "properties": {
@@ -2638,6 +2690,23 @@
         "catalog_version",
         "fingerprint",
         "selection_reason"
+      ]
+    },
+    "NativeServiceModeSelection": {
+      "description": "Explicit choice uses the existing endpoint/credential/model authority proof.\nAbsence means Standard; Inherit belongs to the enclosing model selection.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "authority"
       ]
     },
     "NativeTerminalEffectGate": {
@@ -4038,6 +4107,11 @@
     "TaskAgentReviewPolicy": {
       "type": "object",
       "properties": {
+        "disableTimeoutAcceptance": {
+          "description": "Mandatory-review marker: never resolve this policy through the legacy review timeout. Legacy records default to false.",
+          "type": "boolean",
+          "default": false
+        },
         "maxRevisionRounds": {
           "type": "integer",
           "format": "uint32",
@@ -4058,11 +4132,6 @@
           "items": {
             "$ref": "#/$defs/TaskResultReviewerSpec"
           }
-        },
-        "disableTimeoutAcceptance": {
-          "description": "Mandatory-review marker: never resolve this policy through the legacy review timeout. Legacy records default to false.",
-          "type": "boolean",
-          "default": false
         }
       },
       "required": [
@@ -8657,8 +8726,41 @@
           "format": "uint64",
           "minimum": 0
         },
+        "omittedPhaseBoundaries": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "outputSizes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolOutputMeasurements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parentOperationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phaseBoundaries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolPhaseBoundary"
+          }
+        },
         "pipelineStage": {
           "type": "string"
+        },
+        "processRunId": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "toolCallId": {
           "type": "string"
@@ -8733,6 +8835,36 @@
         "recoverable_error",
         "fatal_error",
         "partial_success"
+      ]
+    },
+    "ToolOutputMeasurements": {
+      "type": "object",
+      "properties": {
+        "basis": {
+          "type": "string"
+        },
+        "capturedTextBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "modelProjectionTextBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "preparedSourceBytes": {
+          "description": "Prepared handler representation; persistence is a separate acknowledged fact.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "capturedTextBytes",
+        "preparedSourceBytes",
+        "modelProjectionTextBytes",
+        "basis"
       ]
     },
     "ToolOutputPolicySnapshot": {
@@ -8873,6 +9005,41 @@
         "task_subagent",
         "memory_write",
         "agent_action"
+      ]
+    },
+    "ToolPhaseBoundary": {
+      "description": "Content-free source boundaries, bounded per invocation. All mono_ns values\nbelong to the enclosing observation's process_run_id.",
+      "type": "object",
+      "properties": {
+        "attemptId": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "localSequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "monoNs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "phase": {
+          "type": "string"
+        },
+        "tsUnixMs": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "phase",
+        "attemptId",
+        "tsUnixMs",
+        "monoNs",
+        "localSequence"
       ]
     },
     "ToolRecoveryIdempotencyMode": {
@@ -9242,6 +9409,46 @@
         "reason"
       ]
     },
+    "TurnAppCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "appId": {
+          "type": "string"
+        },
+        "darkIcon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "appId",
+        "expectedRevision",
+        "label"
+      ]
+    },
     "TurnCLIRuntimeOptions": {
       "type": "object",
       "properties": {
@@ -9304,6 +9511,28 @@
         {
           "type": "object",
           "properties": {
+            "appId": {
+              "type": "string"
+            },
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "expectedRevision": {
               "type": "integer",
               "format": "int64"
@@ -9316,6 +9545,7 @@
               "const": "plugin"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "pluginId",
@@ -9343,6 +9573,7 @@
               "const": "skill"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "skillId"
@@ -9359,6 +9590,7 @@
               "const": "skillPack"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "packId"
@@ -9378,6 +9610,7 @@
               "const": "mcpServer"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "name",
@@ -9401,6 +9634,7 @@
               "const": "mcpTool"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "serverName",
@@ -11272,12 +11506,6 @@
           "type": "integer",
           "format": "int64"
         },
-        "label": {
-          "type": "string"
-        },
-        "pluginId": {
-          "type": "string"
-        },
         "icon": {
           "anyOf": [
             {
@@ -11286,8 +11514,13 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "pluginId": {
+          "type": "string"
         }
       },
       "required": [
@@ -11573,6 +11806,7 @@
           ]
         },
         "context_window": {
+          "description": "User-owned model choice; absent means Auto, not inheritance of a wider override.",
           "type": [
             "integer",
             "null"
@@ -11661,34 +11895,21 @@
             }
           ]
         },
-        "thread_id": {
-          "type": "string"
-        },
-        "turn_id": {
-          "type": "string"
-        },
         "service_mode": {
           "anyOf": [
             {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                },
-                "authority": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "id",
-                "authority"
-              ],
-              "additionalProperties": false
+              "$ref": "#/$defs/NativeServiceModeSelection"
             },
             {
               "type": "null"
             }
           ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
         }
       },
       "required": [
@@ -12118,6 +12339,22 @@
           "type": "object",
           "properties": {
             "capability": {
+              "$ref": "#/$defs/TurnAppCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
               "$ref": "#/$defs/TurnSkillPackCapabilitySummary"
             },
             "type": {
@@ -12213,22 +12450,6 @@
         "snippet",
         "source"
       ]
-    },
-    "ImageReference": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        },
-        "revision": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "path",
-        "revision"
-      ],
-      "description": "Immutable image reference. Gateway inventory exposes a native storage link, never image bytes."
     }
   }
 }

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use pioneer_crud::SkillUploadSessionRecord;
 use pioneer_protocol::{
-    SkillArchiveFormat, SkillsUploadAbortParams, SkillsUploadAbortResponse,
+    SkillArchiveFormat, SkillUploadPurpose, SkillsUploadAbortParams, SkillsUploadAbortResponse,
     SkillsUploadChunkAckNotification, SkillsUploadChunkHeader, SkillsUploadFinishParams,
     SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse,
 };
@@ -28,7 +28,7 @@ pub(crate) struct MaterializedSkillSource {
     pub source_dir: PathBuf,
     pub cleanup_root: PathBuf,
     pub upload: SkillUploadSessionRecord,
-    pub(in crate::message) package_limits: pioneer_plugins::Limits,
+    pub(in crate::message) package_limits: pioneer_packages::Limits,
     _cleanup: super::TemporaryDirectory,
 }
 
@@ -83,7 +83,10 @@ impl MessageProcessor {
             }
         };
 
-        let context = self.package_delivery_context();
+        let mut context = self.package_delivery_context();
+        if params.purpose == SkillUploadPurpose::App {
+            context = context.for_package(pioneer_protocol::PackageKind::App);
+        }
         self.cleanup_stale_skill_uploads(now_timestamp_secs()).await;
 
         if !matches!(params.archive_format, SkillArchiveFormat::TarGz) {
@@ -832,7 +835,15 @@ impl MessageProcessor {
         let cleanup_root = context
             .materialized_root
             .join(pioneer_protocol::generate_id(21));
-        let limits = context.clone();
+        let mut limits = context.clone();
+        if purpose == "app" {
+            limits = limits.for_package(pioneer_protocol::PackageKind::App);
+        }
+        let package_limits = if purpose == "app" {
+            pioneer_apps::PACKAGE_LIMITS
+        } else {
+            limits.plugin_limits()
+        };
         let cleanup = super::TemporaryDirectory::new()
             .map_err(|error| invalid_materialized_archive_error(request_id, error))?;
         let prepared = crate::message::package_delivery::prepare_cancellable(move |cancellation| {
@@ -840,7 +851,7 @@ impl MessageProcessor {
                 source_dir: cleanup_root.clone(),
                 cleanup_root,
                 upload,
-                package_limits: limits.plugin_limits(),
+                package_limits,
                 _cleanup: cleanup,
             };
             let result = fs::create_dir_all(source.cleanup_root.parent().expect("scratch parent"))
@@ -855,7 +866,7 @@ impl MessageProcessor {
                         limits.max_upload_uncompressed_bytes,
                         limits.max_upload_archive_entries,
                         limits.max_file_bytes,
-                        source.upload.purpose == "plugin",
+                        matches!(source.upload.purpose.as_str(), "plugin" | "app"),
                         cancellation,
                     )
                 });

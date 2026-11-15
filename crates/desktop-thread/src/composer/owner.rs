@@ -416,9 +416,12 @@ impl ComposerView {
             .effective_composer_capabilities()
             .into_iter()
             .filter(|_| self.images_visible)
-            .filter_map(|capability| match capability.kind {
-                ComposerCapabilityKind::Plugin { icon, .. } => icon,
-                _ => None,
+            .flat_map(|capability| match capability.kind {
+                ComposerCapabilityKind::Plugin { icon, .. } => icon.into_iter().collect::<Vec<_>>(),
+                ComposerCapabilityKind::App {
+                    icon, dark_icon, ..
+                } => icon.into_iter().chain(dark_icon).collect(),
+                _ => vec![],
             })
             .collect::<Vec<_>>();
         self.plugin_images.reconcile(icons, cx);
@@ -470,9 +473,14 @@ impl ComposerView {
             let icons = self
                 .effective_composer_capabilities()
                 .into_iter()
-                .filter_map(|capability| match capability.kind {
-                    ComposerCapabilityKind::Plugin { icon, .. } => icon,
-                    _ => None,
+                .flat_map(|capability| match capability.kind {
+                    ComposerCapabilityKind::Plugin { icon, .. } => {
+                        icon.into_iter().collect::<Vec<_>>()
+                    }
+                    ComposerCapabilityKind::App {
+                        icon, dark_icon, ..
+                    } => icon.into_iter().chain(dark_icon).collect(),
+                    _ => vec![],
                 })
                 .collect::<Vec<_>>();
             self.plugin_images.reconcile(icons, cx);

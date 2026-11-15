@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppsSourceParams",
+  "type": "object",
+  "properties": {
+    "target": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AppPreviewTarget"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "upload_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id",
+    "upload_id"
+  ],
+  "$defs": {
+    "AppPreviewTarget": {
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "app_id",
+        "expected_revision"
+      ]
+    }
+  }
+}

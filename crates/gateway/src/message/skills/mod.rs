@@ -478,17 +478,18 @@ pub(crate) fn resolve_root_path(raw: &str, workspace_id: &str) -> PathBuf {
 pub(crate) use lifecycle::source::{SkillInstallSource, SkillUpdateInput};
 
 impl MessageProcessor {
-    pub(crate) async fn revalidate_plugin_upload(
+    pub(crate) async fn revalidate_package_upload(
         &self,
         owner: &AuthenticatedTransferOwner,
         workspace: &str,
         upload: &str,
         id: &RequestId,
+        kind: pioneer_protocol::PackageKind,
     ) -> Result<(), JsonRpcErrorResponse> {
         let record = self
             .revalidate_finalized_upload_locked(owner, workspace, upload, id)
             .await?;
-        if record.purpose != "plugin" {
+        if record.purpose != kind.as_str() {
             return Err(JsonRpcErrorResponse::new(
                 Some(id.clone()),
                 INVALID_PARAMS_CODE,

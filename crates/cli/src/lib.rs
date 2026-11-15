@@ -1,3 +1,6 @@
+// This crate also computes the layout of Gateway's nested startup future.
+#![recursion_limit = "256"]
+
 include!(concat!(env!("OUT_DIR"), "/pioneer-build-section.rs"));
 #[cfg(all(debug_assertions, feature = "computer-use"))]
 mod dev_runtime;

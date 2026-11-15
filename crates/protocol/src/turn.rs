@@ -1555,6 +1555,7 @@ pub struct TurnCapability {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 struct TurnCapabilityWire {
     id: String,
     kind: TurnCapabilityKind,
@@ -1570,6 +1571,15 @@ impl<'de> Deserialize<'de> for TurnCapability {
         let wire = TurnCapabilityWire::deserialize(deserializer)?;
         let expected = match &wire.kind {
             TurnCapabilityKind::Skill { skill_id, .. } => Some(skill_capability_key(skill_id)),
+            TurnCapabilityKind::App {
+                app_id,
+                expected_revision,
+            } => {
+                if app_id.len() != 21 || *expected_revision < 1 {
+                    return Err(serde::de::Error::custom("invalid App selection"));
+                }
+                Some(app_capability_key(app_id))
+            }
             TurnCapabilityKind::Plugin {
                 plugin_id,
                 expected_revision,
@@ -1614,6 +1624,33 @@ pub fn skill_capability_key(skill_id: &SkillId) -> String {
 }
 
 /// Builds the canonical internal key for a selected skill pack capability.
+pub fn app_capability_key(app_id: &str) -> String {
+    format!("app:{app_id}")
+}
+/// Server/client presentation helper; it never expands components or grants authority.
+pub fn package_capability(kind: crate::PackageKind, id: &str, revision: i64) -> TurnCapability {
+    let (key, capability) = match kind {
+        crate::PackageKind::Plugin => (
+            plugin_capability_key(id),
+            TurnCapabilityKind::Plugin {
+                plugin_id: id.into(),
+                expected_revision: revision,
+            },
+        ),
+        crate::PackageKind::App => (
+            app_capability_key(id),
+            TurnCapabilityKind::App {
+                app_id: id.into(),
+                expected_revision: revision,
+            },
+        ),
+    };
+    TurnCapability {
+        id: key,
+        kind: capability,
+        label: None,
+    }
+}
 pub fn plugin_capability_key(plugin_id: &str) -> String {
     format!("plugin:{plugin_id}")
 }
@@ -1640,8 +1677,14 @@ pub fn mcp_tool_capability_key(
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum TurnCapabilityKind {
+    App {
+        #[serde(rename = "appId")]
+        app_id: String,
+        #[serde(rename = "expectedRevision")]
+        expected_revision: i64,
+    },
     Plugin {
         #[serde(rename = "pluginId")]
         plugin_id: String,
@@ -5109,6 +5152,9 @@ pub enum UserMessageAttachment {
     Plugin {
         capability: TurnPluginCapabilitySummary,
     },
+    App {
+        capability: TurnAppCapabilitySummary,
+    },
     SkillPack {
         capability: TurnSkillPackCapabilitySummary,
     },
@@ -5128,6 +5174,17 @@ pub struct TurnPluginCapabilitySummary {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<crate::PluginIcon>,
+}
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnAppCapabilitySummary {
+    pub app_id: String,
+    pub expected_revision: i64,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::PluginIcon>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dark_icon: Option<crate::PluginIcon>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

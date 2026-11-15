@@ -70,10 +70,11 @@ impl McpCatalogView {
         if let Some(w) = self.input.navigation_input.workspace_id() {
             let failed = if let Some((workspace, parent, _)) = &self.plugin_component {
                 self.client
+                    .packages(self.package_kind)
                     .plugin_intent_for(
                         workspace,
                         parent,
-                        pioneer_client::plugins::runtime::PluginIntent::Mcp { intent },
+                        pioneer_client::packages::runtime::PluginIntent::Mcp { intent },
                     )
                     .outcome()
                     != pioneer_client::core::ClientTransitionOutcome::Changed

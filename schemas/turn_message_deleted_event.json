@@ -545,8 +545,7 @@
         },
         "work_owner": {
           "description": "Immutable owner of the admitted work; absent historical wire values own their turn.",
-          "$ref": "#/$defs/TurnWorkOwner",
-          "default": "turn"
+          "$ref": "#/$defs/TurnWorkOwner"
         }
       },
       "required": [

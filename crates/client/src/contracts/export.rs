@@ -12,6 +12,7 @@ pub enum ClientContractDomain {
     Providers,
     Skills,
     Mcp,
+    Apps,
     Settings,
     Tasks,
 }
@@ -183,15 +184,22 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "app_view_publication.json",
+            crate::apps::AppViewPublication,
+            Domain::Apps,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
             "plugin_operation_publication.json",
-            crate::plugins::runtime::PluginOperationPublication,
+            crate::packages::runtime::PluginOperationPublication,
             Domain::Skills,
             Kind::Snapshot,
             Stability::Provisional
         ),
         contract_type!(
             "plugin_publication.json",
-            crate::plugins::runtime::PluginPublication,
+            crate::packages::runtime::PluginPublication,
             Domain::Skills,
             Kind::Snapshot,
             Stability::Provisional
@@ -3256,6 +3264,7 @@ mod tests {
             ClientContractDomain::Providers,
             ClientContractDomain::Skills,
             ClientContractDomain::Mcp,
+            ClientContractDomain::Apps,
             ClientContractDomain::Settings,
             ClientContractDomain::Tasks,
         ] {

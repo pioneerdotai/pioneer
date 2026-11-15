@@ -6,8 +6,12 @@
     "audio_integrity": {
       "description": "Optional on the wire for decoding legacy clients; servers fail closed\nwhen absent. A new client requires version 1 in the start response.",
       "anyOf": [
-        { "$ref": "#/$defs/VoiceAudioIntegrity" },
-        { "type": "null" }
+        {
+          "$ref": "#/$defs/VoiceAudioIntegrity"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "context": {
@@ -22,24 +26,6 @@
     "context"
   ],
   "$defs": {
-    "VoiceAudioIntegrity": {
-      "description": "Counts normalized mono 16 kHz PCM before VAD, never ASR speech or padding.",
-      "type": "object",
-      "properties": {
-        "next_sequence": {
-          "description": "Number of packets, equivalently the sequence immediately after the tail.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "normalized_samples": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        }
-      },
-      "required": ["next_sequence", "normalized_samples"]
-    },
     "AgentExecutionBackend": {
       "oneOf": [
         {
@@ -128,6 +114,23 @@
       "enum": [
         "workspace",
         "user"
+      ]
+    },
+    "NativeServiceModeSelection": {
+      "description": "Explicit choice uses the existing endpoint/credential/model authority proof.\nAbsence means Standard; Inherit belongs to the enclosing model selection.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "authority"
       ]
     },
     "SandboxMode": {
@@ -248,6 +251,28 @@
         {
           "type": "object",
           "properties": {
+            "appId": {
+              "type": "string"
+            },
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "expectedRevision": {
               "type": "integer",
               "format": "int64"
@@ -260,6 +285,7 @@
               "const": "plugin"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "pluginId",
@@ -287,6 +313,7 @@
               "const": "skill"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "skillId"
@@ -303,6 +330,7 @@
               "const": "skillPack"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "packId"
@@ -322,6 +350,7 @@
               "const": "mcpServer"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "name",
@@ -345,6 +374,7 @@
               "const": "mcpTool"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "serverName",
@@ -582,24 +612,31 @@
         }
       ]
     },
+    "VoiceAudioIntegrity": {
+      "description": "Counts normalized mono 16 kHz PCM before VAD, never ASR speech or padding.",
+      "type": "object",
+      "properties": {
+        "next_sequence": {
+          "description": "Number of packets, equivalently the sequence immediately after the tail.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "normalized_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "next_sequence",
+        "normalized_samples"
+      ]
+    },
     "VoiceTurnContext": {
       "description": "Frozen non-audio composer context for voice turn materialization.\n\n`prepared_input` is for existing prepared `UserInput` references such as\nartifacts/local attachment references. It must not contain the future voice\ntranscript; the gateway prepends the transcript as `UserInput::Text` after\nsuccessful transcription.",
       "type": "object",
       "properties": {
-        "context_authority": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "context_window": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
         "capabilities": {
           "description": "Selected skills, MCP tools/servers and related turn capabilities.",
           "type": "array",
@@ -616,6 +653,20 @@
               "type": "null"
             }
           ]
+        },
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "execution_backend": {
           "anyOf": [
@@ -687,6 +738,16 @@
             }
           ]
         },
+        "service_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeServiceModeSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "thread_id": {
           "description": "Thread that receives the gateway-created turn after transcription.",
           "type": "string"
@@ -698,29 +759,6 @@
         "workspace_id": {
           "description": "Workspace active when the voice session starts.\n\n`TurnStartParams` is still thread-scoped; the gateway keeps the\nworkspace here to validate/session-route the frozen voice context.",
           "type": "string"
-        },
-        "service_mode": {
-          "anyOf": [
-            {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                },
-                "authority": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "id",
-                "authority"
-              ],
-              "additionalProperties": false
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "required": [

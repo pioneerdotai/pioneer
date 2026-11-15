@@ -226,6 +226,33 @@ pub struct GatewayHttpResponse {
 pub struct BrowserViewUrl(String);
 
 impl BrowserViewUrl {
+    /// Resolve only an ephemeral App view grant issued by this Gateway.
+    pub fn resolve_app(base: &GatewayBaseUrl, relative: &str) -> Result<Self, GatewayHttpError> {
+        let tail = relative
+            .strip_prefix("/storage/app-views/")
+            .ok_or(GatewayHttpError::InvalidStoragePath)?;
+        let (secret, path) = tail
+            .split_once('/')
+            .ok_or(GatewayHttpError::InvalidStoragePath)?;
+        if secret.len() != 43
+            || !secret
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            || relative.len() > 8192
+            || path.contains(['\\', '\0', '?', '#'])
+            || path.split('/').any(|v| matches!(v, "." | ".."))
+        {
+            return Err(GatewayHttpError::InvalidStoragePath);
+        }
+        let mut url = base
+            .storage_url(relative.trim_end_matches('/'))
+            .map_err(map_base_url_error)?;
+        if relative.ends_with('/') {
+            url.set_path(&format!("{}/", url.path()));
+        }
+        ensure_same_origin(base, &url)?;
+        Ok(Self(url.to_string()))
+    }
     pub fn expose_url(&self) -> &str {
         self.0.as_str()
     }
@@ -1069,5 +1096,35 @@ mod tests {
             classify_response(response).unwrap_err(),
             GatewayHttpError::Conflict
         );
+    }
+}
+
+#[cfg(test)]
+mod app_view_url_regressions {
+    use super::*;
+    #[test]
+    fn app_directory_bootstrap_preserves_gateway_base_path_and_rejects_scope_escape() {
+        let base = GatewayBaseUrl::parse_presentation("https://gateway.example/pioneer/").unwrap();
+        let token = "A".repeat(43);
+        let path = format!("/storage/app-views/{token}/ui/");
+        assert_eq!(
+            BrowserViewUrl::resolve_app(&base, &path)
+                .unwrap()
+                .expose_url(),
+            format!("https://gateway.example/pioneer/storage/app-views/{token}/ui/")
+        );
+        assert_eq!(
+            BrowserViewUrl::resolve_app(&base, &format!("/storage/app-views/{token}/"))
+                .unwrap()
+                .expose_url(),
+            format!("https://gateway.example/pioneer/storage/app-views/{token}/")
+        );
+        for path in [
+            format!("/storage/app-views/{token}/../other"),
+            format!("/storage/app-views/{token}/%2e%2e/other"),
+            "https://other.example/storage/app-views/secret/ui/".into(),
+        ] {
+            assert!(BrowserViewUrl::resolve_app(&base, &path).is_err());
+        }
     }
 }

@@ -220,6 +220,11 @@ impl Render for ThreadAllocationProbe {
         super::DesktopBody {
             layout: self.layout.clone(),
             thread_mounted: true,
+            expanded: false,
+            bottom_app: None,
+            right_app: None,
+            right_width: gpui_kit::px(320.),
+            max_app_height: gpui_kit::px(400.),
             sidebar: div()
                 .size_full()
                 .debug_selector(|| "allocation-sidebar".into())
