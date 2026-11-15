@@ -2353,6 +2353,8 @@ async fn package_reload_preserves_structured_legacy_operation_diagnostic() {
 
 #[tokio::test]
 async fn app_runtime_discovery_has_a_finite_frontier_and_advances_past_a_poison_row() {
+    use sea_orm::EntityTrait;
+
     let store = test_store_with_workspace("ws-runtime").await;
     for index in 0..66 {
         let id = format!("app-{index:03}");
@@ -2362,17 +2364,19 @@ async fn app_runtime_discovery_has_a_finite_frontier_and_advances_past_a_poison_
             serde_json::from_str(row.app_manifest_json.as_deref().unwrap()).unwrap();
         manifest["slug"] = id.into();
         row.app_manifest_json = Some(manifest.to_string());
-        store.insert_package_installation(&row).await.unwrap();
+        if index == 32 {
+            // Persist an interrupted parent-only aggregate. Ordinary CRUD
+            // publishes both rows atomically; extension deletion stays guarded.
+            pioneer_entity::package_installation::Entity::insert(row.operational())
+                .exec(&store.database_connection())
+                .await
+                .unwrap();
+        } else {
+            store.insert_package_installation(&row).await.unwrap();
+        }
     }
     store
         .insert_plugin_installation(&parent("zzz-plugin", "ws-runtime"))
-        .await
-        .unwrap();
-    // Simulate an interrupted/corrupt domain extension through the project's
-    // writer-backed handle; valid CRUD publishes both rows atomically.
-    store
-        .database_connection()
-        .execute_unprepared("DELETE FROM app_installation WHERE id='app-032'")
         .await
         .unwrap();
     let maintenance = store.with_maintenance_access();

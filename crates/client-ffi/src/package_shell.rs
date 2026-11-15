@@ -13,9 +13,16 @@ use std::{
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginShellRequest {
-    AppViewOpen { workspace_id: String, app_id: String },
-    AppViewPoll { ticket: u64 },
-    AppViewClose { ticket: u64 },
+    AppViewOpen {
+        workspace_id: String,
+        app_id: String,
+    },
+    AppViewPoll {
+        ticket: u64,
+    },
+    AppViewClose {
+        ticket: u64,
+    },
     AppParentSnapshot {
         workspace_id: String,
         app_id: String,
@@ -377,12 +384,27 @@ pub(crate) fn execute(
     request: PluginShellRequest,
 ) -> Result<PluginShellResponse, String> {
     match request {
-        PluginShellRequest::AppViewOpen { workspace_id, app_id } => {
-            let ticket = runtime.core.begin_app_view(workspace_id, app_id).map_err(|_| "app_view_unavailable".to_owned())?;
-            Ok(PluginShellResponse { view_ticket: Some(ticket), ..PluginShellResponse::accepted(true) })
+        PluginShellRequest::AppViewOpen {
+            workspace_id,
+            app_id,
+        } => {
+            let ticket = runtime
+                .core
+                .begin_app_view(workspace_id, app_id)
+                .map_err(|_| "app_view_unavailable".to_owned())?;
+            Ok(PluginShellResponse {
+                view_ticket: Some(ticket),
+                ..PluginShellResponse::accepted(true)
+            })
         }
-        PluginShellRequest::AppViewPoll { ticket } => Ok(PluginShellResponse { app_view: runtime.core.app_view_publication(ticket), ..PluginShellResponse::accepted(true) }),
-        PluginShellRequest::AppViewClose { ticket } => { runtime.core.close_app_view(ticket); Ok(PluginShellResponse::accepted(true)) },
+        PluginShellRequest::AppViewPoll { ticket } => Ok(PluginShellResponse {
+            app_view: runtime.core.app_view_publication(ticket),
+            ..PluginShellResponse::accepted(true)
+        }),
+        PluginShellRequest::AppViewClose { ticket } => {
+            runtime.core.close_app_view(ticket);
+            Ok(PluginShellResponse::accepted(true))
+        }
         PluginShellRequest::AppParentSnapshot {
             workspace_id,
             app_id,

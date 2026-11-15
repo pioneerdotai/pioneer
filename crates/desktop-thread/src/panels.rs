@@ -63,7 +63,12 @@ impl ThreadSidePanelHostView {
 impl Render for ThreadSidePanelHostView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.layout.read(cx).selected() {
-            ThreadPanelKind::App => self.layout.read(cx).app().map(|view| view.into_any_element()).unwrap_or_else(|| div().into_any_element()),
+            ThreadPanelKind::App => self
+                .layout
+                .read(cx)
+                .app()
+                .map(|view| view.into_any_element())
+                .unwrap_or_else(|| div().into_any_element()),
             ThreadPanelKind::Artifacts => self.artifacts.clone().into_any_element(),
             ThreadPanelKind::Members => self.members.clone().into_any_element(),
         }

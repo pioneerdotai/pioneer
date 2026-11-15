@@ -1045,8 +1045,9 @@ async fn install_rpc_app(
         if strict_skill {
             format!("---\nname: {slug}\ndescription: App regression skill\n---\nUse this installed skill.\n")
         } else {
-            // Native installation accepts this OpenClaw-compatible definition;
-            // the unchanged default strict execution policy keeps it hidden.
+            // Installation accepts this OpenClaw-compatible definition.
+            // Normalization projects operational members; the native resolver
+            // applies strict execution policy later.
             "---\nname: Display title\nallowed-tools: [Read]\n---\nUse this installed skill.\n".to_owned()
         },
     )
@@ -1218,11 +1219,10 @@ async fn install_rpc_app(
     assert!(
         matches!(&normalized.presentation[0].kind, TurnCapabilityKind::App {app_id,expected_revision:1} if app_id==&installed.id)
     );
-    assert_eq!(
+    assert!(
         normalized.execution.iter().any(
             |cap| matches!(&cap.kind,TurnCapabilityKind::Skill{skill_id,..} if skill_id==skill)
-        ),
-        strict_skill
+        )
     );
     assert!(!normalized.execution.iter().any(|cap| matches!(&cap.kind,
         TurnCapabilityKind::McpServer { name, .. } if name == &mcp.member_key)));
@@ -1531,6 +1531,6 @@ async fn app_update_preserves_native_mcp_secret_override() {
     );
     let removed:pioneer_protocol::AppsMutationResponse=serde_json::from_value(app_rpc(&mut harness,methods::APPS_REMOVE,
         json!({"workspace_id":workspace,"app_id":updated.id,"expected_revision":updated.revision,"purge_data":true})).await).unwrap();
-    assert!(removed.removed);
+    assert!(removed.removed, "App removal must finish: {removed:?}");
     std::fs::remove_dir_all(root).unwrap();
 }

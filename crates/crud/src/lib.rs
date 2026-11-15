@@ -43172,13 +43172,21 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut completed_item = safe_web_fetch_item("native_finalization_tool");
+        if let TurnItem::WebFetch {
+            status, success, ..
+        } = &mut completed_item
+        {
+            *status = ToolCallStatus::Completed;
+            *success = Some(true);
+        }
         store
             .materialize_item_completed(
                 ItemCompletedNotification {
                     workspace_id: "ws_native_finalization".into(),
                     thread_id: "thr_native_finalization".into(),
                     turn_id: "turn_native_finalize".into(),
-                    item: safe_web_fetch_item("native_finalization_tool"),
+                    item: completed_item,
                 },
                 1_700_000_050,
             )

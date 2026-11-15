@@ -377,13 +377,7 @@ impl Render for ThreadView {
             );
         let split = h_resizable("thread-artifacts-layout")
             .on_resize(move |state, _, cx| {
-                if let Some(width) = state
-                    .read(cx)
-                    .sizes()
-                    .get(1)
-                    .copied()
-                    .filter(|_| open)
-                {
+                if let Some(width) = state.read(cx).sizes().get(1).copied().filter(|_| open) {
                     let _ = layout.update(cx, |layout, cx| layout.resize(width, cx));
                 }
             })
@@ -1201,23 +1195,43 @@ impl ThreadView {
         let layout = ThreadPanelLayoutStore::for_window(window, cx);
         layout.update(cx, |layout, cx| layout.set_app(app, cx));
     }
-    pub fn set_window_app_bottom(window: &Window, app: Option<AnyView>, height: Pixels, cx: &mut App) {
-        ThreadPanelLayoutStore::for_window(window,cx).update(cx, |layout,cx| layout.set_bottom_app(app,height,cx));
+    pub fn set_window_app_bottom(
+        window: &Window,
+        app: Option<AnyView>,
+        height: Pixels,
+        cx: &mut App,
+    ) {
+        ThreadPanelLayoutStore::for_window(window, cx)
+            .update(cx, |layout, cx| layout.set_bottom_app(app, height, cx));
     }
     pub fn resize_window_app_bottom(window: &Window, height: Pixels, cx: &mut App) {
-        ThreadPanelLayoutStore::for_window(window,cx).update(cx, |layout,cx| layout.resize_app(height,cx));
+        ThreadPanelLayoutStore::for_window(window, cx)
+            .update(cx, |layout, cx| layout.resize_app(height, cx));
     }
     pub fn window_app_panel_visible(window: &Window, cx: &mut App) -> bool {
-        ThreadPanelLayoutStore::for_window(window, cx).read(cx).is_visible(crate::panel_layout::ThreadPanelKind::App)
+        ThreadPanelLayoutStore::for_window(window, cx)
+            .read(cx)
+            .is_visible(crate::panel_layout::ThreadPanelKind::App)
     }
-    pub fn observe_window_app_panel<T: 'static>(window: &mut Window, cx: &mut Context<T>, mut changed: impl FnMut(&mut T, bool, Pixels, &mut Window, &mut Context<T>) + 'static) -> Subscription {
+    pub fn observe_window_app_panel<T: 'static>(
+        window: &mut Window,
+        cx: &mut Context<T>,
+        mut changed: impl FnMut(&mut T, bool, Pixels, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
         let layout = ThreadPanelLayoutStore::for_window(window, cx);
         cx.observe_in(&layout, window, move |owner, layout, window, cx| {
-            let visible = layout.read(cx).is_visible(crate::panel_layout::ThreadPanelKind::App);
+            let visible = layout
+                .read(cx)
+                .is_visible(crate::panel_layout::ThreadPanelKind::App);
             let height = layout.read(cx).app_height();
             changed(owner, visible, height, window, cx);
         })
     }
-    pub fn window_app_panel_width(window: &Window, cx: &App) -> Pixels { ThreadPanelLayoutStore::existing_width(window, cx) }
-    pub fn resize_window_app_panel(window: &Window, width: Pixels, cx: &mut App) { ThreadPanelLayoutStore::for_window(window, cx).update(cx, |layout,cx| layout.resize(width,cx)); }
+    pub fn window_app_panel_width(window: &Window, cx: &App) -> Pixels {
+        ThreadPanelLayoutStore::existing_width(window, cx)
+    }
+    pub fn resize_window_app_panel(window: &Window, width: Pixels, cx: &mut App) {
+        ThreadPanelLayoutStore::for_window(window, cx)
+            .update(cx, |layout, cx| layout.resize(width, cx));
+    }
 }

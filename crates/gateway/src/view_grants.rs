@@ -1012,10 +1012,10 @@ mod tests {
         let clock = Arc::new(TestClock::new(1000));
         let service = service(&config, clock.clone(), 31);
         let first_scope = app_scope("1", "app-a", "execution-a");
-        let first = service.mint(first_scope.clone()).unwrap();
+        let first = extract_secret(service.mint(first_scope.clone()).unwrap());
         let second_scope = app_scope("1", "app-b", "execution-b");
-        let second = service.mint(second_scope.clone()).unwrap();
-        let lease = service.resolve(first.secret.as_str()).unwrap();
+        let second = extract_secret(service.mint(second_scope.clone()).unwrap());
+        let lease = service.resolve(first.as_str()).unwrap();
         let mut foreign = first_scope.clone();
         foreign.subject = ViewGrantSubject::App(AppViewGrantScope {
             workspace_id: "ws".into(),
@@ -1023,11 +1023,11 @@ mod tests {
             execution_id: "execution-b".into(),
         });
         assert_eq!(
-            service.renew_app(first.secret.as_str(), &foreign),
+            service.renew_app(first.as_str(), &foreign),
             Err(ViewGrantError::InvalidScope)
         );
         assert_eq!(
-            service.close_app(first.secret.as_str(), &foreign),
+            service.close_app(first.as_str(), &foreign),
             Err(ViewGrantError::InvalidScope)
         );
         let mut execution_scope = first_scope.clone();
@@ -1042,37 +1042,30 @@ mod tests {
         session_scope.auth_session_id = AuthSessionId::new(format!("T{}", "0".repeat(20))).unwrap();
         for invalid in [execution_scope, principal_scope, session_scope] {
             assert_eq!(
-                service.renew_app(first.secret.as_str(), &invalid),
+                service.renew_app(first.as_str(), &invalid),
                 Err(ViewGrantError::InvalidScope)
             );
             assert_eq!(
-                service.close_app(first.secret.as_str(), &invalid),
+                service.close_app(first.as_str(), &invalid),
                 Err(ViewGrantError::InvalidScope)
             );
         }
         clock.advance(60);
+        assert_eq!(service.app_scope(first.as_str()).unwrap(), first_scope);
         assert_eq!(
-            service.app_scope(first.secret.as_str()).unwrap(),
-            first_scope
-        );
-        assert_eq!(
-            service
-                .renew_app(first.secret.as_str(), &first_scope)
-                .unwrap(),
+            service.renew_app(first.as_str(), &first_scope).unwrap(),
             1180
         );
-        service
-            .renew_app(second.secret.as_str(), &second_scope)
-            .unwrap();
+        service.renew_app(second.as_str(), &second_scope).unwrap();
         clock.advance(61);
-        assert!(service.app_scope(first.secret.as_str()).is_ok());
+        assert!(service.app_scope(first.as_str()).is_ok());
         service.invalidate_app_views("ws", Some("app-a"), None);
         assert!(lease.invalidated());
-        assert!(service.app_scope(first.secret.as_str()).is_err());
-        assert!(service.app_scope(second.secret.as_str()).is_ok());
+        assert!(service.app_scope(first.as_str()).is_err());
+        assert!(service.app_scope(second.as_str()).is_ok());
         clock.advance(60);
         assert_eq!(
-            service.renew_app(second.secret.as_str(), &second_scope),
+            service.renew_app(second.as_str(), &second_scope),
             Err(ViewGrantError::UnknownOrExpired)
         );
     }
@@ -1084,18 +1077,18 @@ mod tests {
         let clock = Arc::new(TestClock::new(1000));
         let service = service(&config, clock.clone(), 32);
         let scope = app_scope("1", "app-a", "execution-a");
-        let issued = service.mint(scope.clone()).unwrap();
-        let active = service.resolve_app(issued.secret.as_str()).await.unwrap();
-        let mut waiting = Box::pin(service.resolve_app(issued.secret.as_str()));
+        let issued = extract_secret(service.mint(scope.clone()).unwrap());
+        let active = service.resolve_app(issued.as_str()).await.unwrap();
+        let mut waiting = Box::pin(service.resolve_app(issued.as_str()));
         assert!(waiting.as_mut().now_or_never().is_none());
         drop(active);
         let active = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
             .await
             .unwrap()
             .unwrap();
-        let mut revoked = Box::pin(service.resolve_app(issued.secret.as_str()));
+        let mut revoked = Box::pin(service.resolve_app(issued.as_str()));
         assert!(revoked.as_mut().now_or_never().is_none());
-        service.close_app(issued.secret.as_str(), &scope).unwrap();
+        service.close_app(issued.as_str(), &scope).unwrap();
         assert!(active.invalidated());
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(1), revoked)
@@ -1103,9 +1096,9 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
-        let expires = service.mint(scope).unwrap();
-        let held = service.resolve_app(expires.secret.as_str()).await.unwrap();
-        let mut waiting = Box::pin(service.resolve_app(expires.secret.as_str()));
+        let expires = extract_secret(service.mint(scope).unwrap());
+        let held = service.resolve_app(expires.as_str()).await.unwrap();
+        let mut waiting = Box::pin(service.resolve_app(expires.as_str()));
         assert!(waiting.as_mut().now_or_never().is_none());
         clock.advance(config.view_grant_ttl_secs + 1);
         drop(held);
@@ -1115,9 +1108,9 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
-        let artifact = service.mint(super::tests::scope("2")).unwrap();
+        let artifact = extract_secret(service.mint(super::tests::scope("2")).unwrap());
         assert!(matches!(
-            service.resolve_app(artifact.secret.as_str()).await,
+            service.resolve_app(artifact.as_str()).await,
             Err(ViewGrantError::InvalidScope)
         ));
     }

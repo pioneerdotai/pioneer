@@ -14,8 +14,8 @@ mod contracts;
 mod diagnostics;
 mod gateway;
 mod invitation;
-mod pending_requests;
 mod package_shell;
+mod pending_requests;
 mod presentation;
 #[cfg(feature = "schema")]
 pub mod schema;

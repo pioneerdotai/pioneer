@@ -1,4 +1,4 @@
-use super::{Arc, PluginItem, PluginPublication, PackageCatalogView, SemanticDestination};
+use super::{Arc, PackageCatalogView, PluginItem, PluginPublication, SemanticDestination};
 use gpui_kit::{AppContext, TestAppContext};
 use pioneer_client::{core::*, navigation::NavigationIntent};
 use pioneer_desktop_foundation::{
@@ -103,7 +103,10 @@ fn scoped_publications_update_plugin_details_without_redrawing_unchanged_content
         gpui_kit::component::Root::new(view, window, cx)
     });
     let view = root.read_with(cx, |root, _| {
-        root.view().clone().downcast::<PackageCatalogView>().unwrap()
+        root.view()
+            .clone()
+            .downcast::<PackageCatalogView>()
+            .unwrap()
     });
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
@@ -303,7 +306,10 @@ fn accepted_update_keeps_exact_upload_through_other_parent_and_uncertain_settlem
         gpui_kit::component::Root::new(view, window, cx)
     });
     let view = root.read_with(cx, |root, _| {
-        root.view().clone().downcast::<PackageCatalogView>().unwrap()
+        root.view()
+            .clone()
+            .downcast::<PackageCatalogView>()
+            .unwrap()
     });
     let mut publication = PluginPublication {
         revision: 1,
@@ -492,7 +498,10 @@ fn publication_replaces_child_only_when_native_locator_changes_and_releases_old_
         gpui_kit::component::Root::new(view, window, cx)
     });
     let view = root.read_with(cx, |root, _| {
-        root.view().clone().downcast::<PackageCatalogView>().unwrap()
+        root.view()
+            .clone()
+            .downcast::<PackageCatalogView>()
+            .unwrap()
     });
     let mut plugin = parent("A");
     plugin
@@ -598,7 +607,10 @@ fn missing_parent_uses_admission_authorization_and_connection_states(cx: &mut Te
         )
     });
     let view = root.read_with(cx, |root, _| {
-        root.view().clone().downcast::<PackageCatalogView>().unwrap()
+        root.view()
+            .clone()
+            .downcast::<PackageCatalogView>()
+            .unwrap()
     });
     assert!(!view.read_with(cx, |v, _| v.connected()));
     assert_eq!(
@@ -729,7 +741,10 @@ fn apps_navigation_uses_its_live_scope_and_ignores_retired_app_publications(
         gpui_kit::component::Root::new(view, window, cx)
     });
     let view = root.read_with(cx, |root, _| {
-        root.view().clone().downcast::<PackageCatalogView>().unwrap()
+        root.view()
+            .clone()
+            .downcast::<PackageCatalogView>()
+            .unwrap()
     });
     assert_eq!(
         view.read_with(cx, |view, _| view.kind),

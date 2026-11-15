@@ -188,5 +188,10 @@ impl Render for PackageCatalogView {
     }
 }
 
-pub enum PackageCatalogEvent { OpenApp { workspace_id: String, app_id: String } }
+pub enum PackageCatalogEvent {
+    OpenApp {
+        workspace_id: String,
+        app_id: String,
+    },
+}
 impl EventEmitter<PackageCatalogEvent> for PackageCatalogView {}

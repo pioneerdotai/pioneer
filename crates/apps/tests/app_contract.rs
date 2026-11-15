@@ -314,7 +314,6 @@ fn app_loader_supports_declared_component_combinations_and_rejects_invalid_artwo
     }
 }
 
-
 fn runtime_manifest() -> Value {
     let mut document = manifest();
     document["runtime"] = json!({"environment":"native","artifacts":{

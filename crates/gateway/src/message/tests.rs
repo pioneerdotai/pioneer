@@ -1599,6 +1599,19 @@ async fn setup_cli_runtime_security_harness_for_principal(
     );
     let runtime_home = unique_temp_dir("cli_runtime_security");
     std::fs::create_dir_all(&runtime_home).expect("CLI runtime test home must exist");
+    let mut tool_loop_config = test_tool_loop_config();
+    tool_loop_config.skills.user_roots = vec![
+        runtime_home
+            .join("skills/workspace/{workspaceId}/user")
+            .display()
+            .to_string(),
+    ];
+    tool_loop_config.skills.registry_roots = vec![
+        runtime_home
+            .join("skills/workspace/{workspaceId}/registry")
+            .display()
+            .to_string(),
+    ];
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
     let processor = MessageProcessor::new(
         thread_manager.clone(),
@@ -1608,7 +1621,7 @@ async fn setup_cli_runtime_security_harness_for_principal(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_tool_loop_config(),
+        tool_loop_config,
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone())
     .with_runtime_home_for_tests(runtime_home)
@@ -79836,7 +79849,12 @@ async fn setup_workspace_manager_with_connection(
     // Use the normal writer bootstrap path: migrations that change connection
     // pragmas must own their physical lease outside any enclosing transaction.
     // Each migration retains its own atomicity; no fixture consumer exists yet.
-    pioneer_sqlite::SqliteWriteExecutor::new(connection.clone())
+    let writer = pioneer_sqlite::SqliteWriteExecutor::new(connection.clone());
+    writer
+        .apply_pragmas(pioneer_sqlite::SqliteWriteClass::Maintenance)
+        .await
+        .expect("test writer must use Gateway runtime pragmas");
+    writer
         .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
         .await
         .expect("migrations must succeed");

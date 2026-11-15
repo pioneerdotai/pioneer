@@ -299,7 +299,10 @@ pub fn canonical_app_locale(value: &str) -> Result<String, &'static str> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct AppViewParams { pub workspace_id: String, pub app_id: String }
+pub struct AppViewParams {
+    pub workspace_id: String,
+    pub app_id: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AppViewBootstrap {
     pub package_revision: i64,
@@ -308,7 +311,6 @@ pub struct AppViewBootstrap {
     pub execution_id: String,
     pub title: String,
 }
-
 
 /// Installation/component state remains on AppItem. This is live execution state.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -321,6 +323,10 @@ pub struct AppRuntimeInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct AppViewLeaseParams { pub relative_url: crate::AuthSecretString }
+pub struct AppViewLeaseParams {
+    pub relative_url: crate::AuthSecretString,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct AppViewLeaseResponse { pub expires_at: u64 }
+pub struct AppViewLeaseResponse {
+    pub expires_at: u64,
+}

@@ -1320,13 +1320,7 @@ impl RenderOnce for DesktopBody {
                 {
                     pioneer_desktop_thread::ThreadView::resize_window_app_panel(window, width, cx);
                 }
-                if let Some(width) = state
-                    .read(cx)
-                    .sizes()
-                    .first()
-                    .copied()
-                    .filter(|_| visible)
-                {
+                if let Some(width) = state.read(cx).sizes().first().copied().filter(|_| visible) {
                     let _ = layout.update(cx, |layout, cx| layout.set_sidebar_width(width, cx));
                 }
             })

@@ -257,15 +257,58 @@ impl PackageCatalogView {
                 .description_for_locale(plugin.description.as_deref(), &rust_i18n::locale()),
             |header, description| header.description(description),
         )
-        .when(!manage && self.kind == pioneer_client::plugins::PackageKind::App && plugin.metadata.app.as_ref().is_some_and(|m| m.has_ui), |header| header.actions(
-            Button::new("open-app-view-read").small().label(t!("apps.open_view").to_string()).disabled(!plugin.enabled).on_click(cx.listener({ let app_id=plugin.id.clone(); move |view,_,_,cx| { if let Some(workspace_id)=view.workspace.clone() { cx.emit(PackageCatalogEvent::OpenApp { workspace_id, app_id: app_id.clone() }); } } }))
-        ))
+        .when(
+            !manage
+                && self.kind == pioneer_client::plugins::PackageKind::App
+                && plugin.metadata.app.as_ref().is_some_and(|m| m.has_ui),
+            |header| {
+                header.actions(
+                    Button::new("open-app-view-read")
+                        .small()
+                        .label(t!("apps.open_view").to_string())
+                        .disabled(!plugin.enabled)
+                        .on_click(cx.listener({
+                            let app_id = plugin.id.clone();
+                            move |view, _, _, cx| {
+                                if let Some(workspace_id) = view.workspace.clone() {
+                                    cx.emit(PackageCatalogEvent::OpenApp {
+                                        workspace_id,
+                                        app_id: app_id.clone(),
+                                    });
+                                }
+                            }
+                        })),
+                )
+            },
+        )
         .when(manage, |header| {
             header.actions(
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .when(self.kind == pioneer_client::plugins::PackageKind::App && plugin.metadata.app.as_ref().is_some_and(|m| m.has_ui), |row| row.child(Button::new("open-app-view").small().label(t!("apps.open_view").to_string()).disabled(busy || !plugin.enabled).on_click(cx.listener({ let app_id = plugin.id.clone(); move |view, _, _, cx| { if let Some(workspace_id) = view.workspace.clone() { cx.emit(PackageCatalogEvent::OpenApp { workspace_id, app_id: app_id.clone() }); } } }))))
+                    .when(
+                        self.kind == pioneer_client::plugins::PackageKind::App
+                            && plugin.metadata.app.as_ref().is_some_and(|m| m.has_ui),
+                        |row| {
+                            row.child(
+                                Button::new("open-app-view")
+                                    .small()
+                                    .label(t!("apps.open_view").to_string())
+                                    .disabled(busy || !plugin.enabled)
+                                    .on_click(cx.listener({
+                                        let app_id = plugin.id.clone();
+                                        move |view, _, _, cx| {
+                                            if let Some(workspace_id) = view.workspace.clone() {
+                                                cx.emit(PackageCatalogEvent::OpenApp {
+                                                    workspace_id,
+                                                    app_id: app_id.clone(),
+                                                });
+                                            }
+                                        }
+                                    })),
+                            )
+                        },
+                    )
                     .child(
                         Button::new("plugin-header-enabled")
                             .xsmall()

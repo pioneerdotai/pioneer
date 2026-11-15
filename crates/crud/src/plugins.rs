@@ -1017,16 +1017,25 @@ impl CrudStore {
 }
 
 impl CrudStore {
-    pub async fn app_runtime_page(&self, after: &str, through: &str) -> Result<Vec<(String, Option<PackageRecord>)>> {
+    pub async fn app_runtime_page(
+        &self,
+        after: &str,
+        through: &str,
+    ) -> Result<Vec<(String, Option<PackageRecord>)>> {
         let db = self.connection.begin_read().await?;
         let rows = plugins::app_runtime_page(&db, after, through, 64).await?;
         db.commit().await?;
         // Authored JSON parsing happens after releasing reader capacity. A
         // rejected row advances the raw frontier without blocking later Apps.
-        Ok(rows.into_iter().map(|(parent,app)| { let id=parent.id.clone(); (id, PackageRecord::project(parent,None,app).ok()) }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(parent, app)| {
+                let id = parent.id.clone();
+                (id, PackageRecord::project(parent, None, app).ok())
+            })
+            .collect())
     }
 }
-
 
 impl CrudStore {
     pub async fn app_runtime_frontier(&self) -> Result<Option<String>> {

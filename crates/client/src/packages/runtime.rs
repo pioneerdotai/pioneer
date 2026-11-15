@@ -2394,8 +2394,8 @@ pub(crate) mod tests {
             owner.sender = Some(sender);
             owner.publications.insert("workspace".into(), ready);
         }
-        let first = core.acquire_plugin_demand("workspace", Some(&a.id));
-        let second = core.acquire_plugin_demand("workspace", Some(&b.id));
+        let first = core.acquire_plugin_demand(&owner_core, "workspace", Some(&a.id));
+        let second = core.acquire_plugin_demand(&owner_core, "workspace", Some(&b.id));
         assert!(receiver.try_recv().is_err());
         let origin = core.plugin_command_origin();
         let mut foreign = origin.clone();

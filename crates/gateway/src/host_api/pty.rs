@@ -163,6 +163,10 @@ impl Drop for Pty {
                         libc::kill(-pid, libc::SIGKILL);
                     }
                 }
+                // The I/O workers are cancelled above. On Darwin, slave close
+                // can wait for echoed output to drain even after SIGKILL;
+                // release the master before waiting for the child to exit.
+                self.master.lock().unwrap_or_else(|e| e.into_inner()).take();
             }
             let _ = child.kill();
             let _ = child.wait();

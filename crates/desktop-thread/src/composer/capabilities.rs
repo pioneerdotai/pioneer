@@ -363,10 +363,9 @@ impl ComposerView {
                 capabilities.can_use_mcp,
                 t!("chat.composer.capability_picker.search_mcp").to_string(),
             ),
-            ComposerPickerKind::Apps => (
-                capabilities.can_use_skills,
-                t!("apps.search").to_string(),
-            ),
+            ComposerPickerKind::Apps => {
+                (capabilities.can_use_skills, t!("apps.search").to_string())
+            }
             ComposerPickerKind::Plugins => (
                 capabilities.can_use_skills && capabilities.can_use_mcp,
                 t!("plugins.search").to_string(),
