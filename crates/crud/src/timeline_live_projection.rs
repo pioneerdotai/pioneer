@@ -1514,6 +1514,9 @@ mod tests {
     ) -> turn_item_entity::Model {
         let created_at = unix_to_datetime(10);
         turn_item_entity::Model {
+            portable_identity: String::new(),
+            portable_revision: 0,
+            payload_payload_id: None,
             id: "row_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             item_id: "task_anchor".to_owned(),

@@ -64221,6 +64221,8 @@ mod tests {
             Migrator::up(&connection, None)
                 .await
                 .expect("migrations must succeed");
+            let store = CrudStore::new(connection);
+            let connection = store.database_connection();
             let timestamp = 1_700_000_000;
             let thread_id = format!("thr_replay_actor_{suffix}");
             let turn_id = format!("turn_replay_actor_{suffix}");
