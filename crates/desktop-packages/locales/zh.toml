@@ -129,6 +129,8 @@ blocked = "已阻止"
 disabled = "已禁用"
 
 [apps]
+unsupported_title = "应用不可用"
+unsupported_intel_mac = "此 Gateway 运行在不支持应用的 Intel Mac 上。请连接到受支持平台上的 Gateway。"
 open_view = "Open App"
 empty_description = "安装应用以扩展智能体的能力。"
 title = "应用"

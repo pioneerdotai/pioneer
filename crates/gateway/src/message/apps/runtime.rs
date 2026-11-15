@@ -563,12 +563,12 @@ impl MessageProcessor {
             anyhow::ensure!(snapshot.tree_digest() == expected, "apps.package_changed");
             Ok(pioneer_apps::load_for_architecture(
                 &snapshot,
-                provision::architecture()?,
+                super::architecture()?,
             )?)
         });
         let package = tokio::select! { _ = cancel.cancelled() => bail!("apps.cancelled"), result = preparing => result? };
         let runtime = package.manifest.runtime().context("apps.runtime_missing")?;
-        let architecture = provision::architecture()?;
+        let architecture = super::architecture()?;
         let artifact = runtime.artifact(architecture)?;
         let image = provision::image(runtime.environment)?;
         let backend = self

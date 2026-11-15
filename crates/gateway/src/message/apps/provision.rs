@@ -3,13 +3,8 @@ use anyhow::{Context, Result, bail};
 use microsandbox::{LocalBackend, MicrosandboxError};
 use std::{path::Path, sync::Arc};
 
-pub(in crate::message) fn architecture() -> Result<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") | ("linux", "aarch64") | ("windows", "aarch64") => Ok("linux/arm64"),
-        ("linux", "x86_64") | ("windows", "x86_64") => Ok("linux/amd64"),
-        _ => bail!("apps.unsupported_host_platform"),
-    }
-}
+use super::architecture;
+
 pub(super) fn backend(root: &Path) -> Result<Arc<LocalBackend>> {
     architecture()?;
     let home = root.join("msb");

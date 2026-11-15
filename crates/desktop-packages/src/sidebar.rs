@@ -30,6 +30,9 @@ impl Render for PluginsSidebar {
             return div().into_any_element();
         };
         let view = owner.read(cx);
+        if view.apps_unsupported() {
+            return div().size_full().bg(cx.theme().sidebar).into_any_element();
+        }
         let manage = view
             .workspace
             .as_deref()

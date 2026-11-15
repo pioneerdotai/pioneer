@@ -1,6 +1,11 @@
 //! App lifecycle, execution authority and UI admission over the neutral package coordinator.
 mod authority;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 pub(super) mod provision;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+pub(crate) mod runtime;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[path = "apps/unsupported.rs"]
 pub(crate) mod runtime;
 mod ui;
 use super::packages::plugin_error;
@@ -9,12 +14,26 @@ use pioneer_protocol::constants::methods;
 use pioneer_protocol::*;
 use serde_json::json;
 
+pub(in crate::message) fn architecture() -> anyhow::Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") | ("linux", "aarch64") | ("windows", "aarch64") => Ok("linux/arm64"),
+        ("linux", "x86_64") | ("windows", "x86_64") => Ok("linux/amd64"),
+        _ => anyhow::bail!(APPS_UNSUPPORTED_HOST_PLATFORM),
+    }
+}
+
 impl MessageProcessor {
     pub(in crate::message) async fn apps_request(
         &self,
         context: &RequestContext,
         request: JsonRpcRequest,
     ) {
+        if architecture().is_err() {
+            let mut error = plugin_error(&request.id, APPS_UNSUPPORTED_HOST_PLATFORM);
+            error.error.data = Some(json!({"code": APPS_UNSUPPORTED_HOST_PLATFORM}));
+            self.send_error(context.connection_id(), error).await;
+            return;
+        }
         if matches!(
             request.method.as_str(),
             methods::APPS_RENEW_VIEW | methods::APPS_CLOSE_VIEW
