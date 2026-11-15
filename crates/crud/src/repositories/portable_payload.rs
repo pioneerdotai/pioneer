@@ -151,6 +151,8 @@ pub(crate) enum Family {
     CliMapping,
     TaskHistory,
     TaskEvent,
+    TurnEvent,
+    TurnItem,
 }
 impl Family {
     fn spec(self) -> (&'static str, &'static str, &'static str) {
@@ -160,6 +162,8 @@ impl Family {
             Self::CliMapping => ("turn_cli_runtime_binding", "turn_id", "input_mapping_json"),
             Self::TaskHistory => ("task_run_conversation_snapshot", "run_id", "history_json"),
             Self::TaskEvent => ("task_event", "id", "payload_json"),
+            Self::TurnEvent => ("turn_event", "id", "payload"),
+            Self::TurnItem => ("turn_item", "id", "payload"),
         }
     }
     fn observed(self) -> observe::Family {
@@ -169,6 +173,8 @@ impl Family {
             Self::CliMapping => observe::Family::CliMapping,
             Self::TaskHistory => observe::Family::TaskHistory,
             Self::TaskEvent => observe::Family::TaskEvent,
+            Self::TurnEvent => observe::Family::TurnEvent,
+            Self::TurnItem => observe::Family::TurnItem,
         }
     }
     pub(crate) fn name(self) -> &'static str {
@@ -178,6 +184,8 @@ impl Family {
             Self::CliMapping => "cli.mapping",
             Self::TaskHistory => "task.history",
             Self::TaskEvent => "task.event",
+            Self::TurnEvent => "turn.event",
+            Self::TurnItem => "turn.item",
         }
     }
 }
@@ -188,6 +196,8 @@ fn observed_family(name: &str) -> observe::Family {
         "cli.mapping" => observe::Family::CliMapping,
         "task.history" => observe::Family::TaskHistory,
         "task.event" => observe::Family::TaskEvent,
+        "turn.event" => observe::Family::TurnEvent,
+        "turn.item" => observe::Family::TurnItem,
         _ => observe::Family::Mixed,
     }
 }
@@ -243,7 +253,7 @@ fn codec_observed<T>(
     operation(&mut observation.0)
 }
 
-// The only varying schema facts are these five existing Entity columns. Keep
+// The varying schema facts are the installed payload Entity columns. Keep
 // ordinary owner access typed rather than dispatching SQL table/column strings.
 macro_rules! target {
     ($family:expr, |$entity:ident, $col:ident, $key:ident, $field:ident, $reference:ident| $body:block) => {{
@@ -272,6 +282,8 @@ macro_rules! target {
                 HistoryJsonPayloadId
             ),
             Family::TaskEvent => apply!(task_event, Id, PayloadJson, PayloadJsonPayloadId),
+            Family::TurnEvent => apply!(turn_event, Id, Payload, PayloadPayloadId),
+            Family::TurnItem => apply!(turn_item, Id, Payload, PayloadPayloadId),
         }
     }};
 }
@@ -298,6 +310,9 @@ struct PendingKey {
 // Use the same admission for the finite ceiling and every pending page.
 fn pending_locator_condition(family: Family) -> Condition {
     match family {
+        Family::TurnEvent | Family::TurnItem => {
+            Condition::all().add(Expr::cust("portable_identity <> ''"))
+        }
         Family::TaskHistory => Condition::all().add(
             pioneer_entity::task_run_conversation_snapshot::Column::FrozenManifestId.is_null(),
         ),
@@ -382,12 +397,12 @@ async fn pending_sources(
 #[derive(Default)]
 pub struct PortablePayloadProgress {
     family: usize,
-    finished: [bool; 5],
+    finished: [bool; 7],
     pending: Option<Preparation>,
-    after: [Option<String>; 5],
+    after: [Option<String>; 7],
     // Finite per-pass fence only: reset/re-discover after EOF. A hot stream
     // of higher keys cannot prevent revisiting logical updates below cursor.
-    upper: [Option<String>; 5],
+    upper: [Option<String>; 7],
     cleanup_after: Option<String>,
     cleanup_upper: Option<String>,
     cleanup_finished: bool,
@@ -492,9 +507,11 @@ impl PortablePayloadProgress {
             Family::CliMapping,
             Family::TaskHistory,
             Family::TaskEvent,
+            Family::TurnEvent,
+            Family::TurnItem,
         ];
         if self.finished.iter().all(|done| *done) {
-            self.finished = [false; 5];
+            self.finished = [false; 7];
             self.cleanup_finished = false;
             self.cleanup_upper = None;
             return Ok(false);
@@ -719,10 +736,35 @@ impl Preparation {
             let source_identity = &self.identity;
             let source_stamp = &self.owner_stamp;
             let (table, _, column) = family.spec();
-            // Select rowid only; the driver holds this exact guard's snapshot
-            // while reading a native TEXT/BLOB range on the same reader.
+            let physical = if let Some(backing) = match family {
+                Family::TurnEvent => Some("_turn_event_zstd"),
+                Family::TurnItem => Some("_turn_item_zstd"),
+                _ => None,
+            } {
+                // Native blobs require a physical table. Source metadata stays
+                // on the Entity path; schema discovery reads no payload bytes.
+                let exists = store
+                    .run_background_database_quantum(|| async {
+                        Ok(store
+                            .connection
+                            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                                DbBackend::Sqlite,
+                                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                                [backing.into()],
+                            ))
+                            .await?
+                            .is_some())
+                    })
+                    .await?;
+                if exists { backing } else { table }
+            } else {
+                table
+            };
+            // The guard and native range share one read snapshot. Alias the
+            // physical storage with its logical Entity name so the same typed
+            // columns, ownership predicates and CAS guard remain authoritative.
             let guard = target!(family, |Target, Col, key, field, reference| {
-                Target::find()
+                let mut query = Target::find()
                     .select_only()
                     .expr(Expr::col((Alias::new(table), Alias::new("rowid"))))
                     .filter(key.eq(source_owner))
@@ -735,8 +777,14 @@ impl Preparation {
                     .filter(Col::PortableIdentity.eq(source_identity))
                     .filter(Expr::cust(owner_stamp_sql(family)).eq(source_stamp))
                     .filter(Expr::cust(eligibility_sql(family)))
-                    .limit(1)
-                    .build(DbBackend::Sqlite)
+                    .limit(1);
+                if physical != table {
+                    query
+                        .query()
+                        .from_clear()
+                        .from_as(Alias::new(physical), Alias::new(table));
+                }
+                query.build(DbBackend::Sqlite)
             });
             let read_phase = observe::stage(observe::Stage::SourceRead);
             let row = store
@@ -744,7 +792,10 @@ impl Preparation {
                     Ok(store
                         .connection
                         .read_blob_range(
-                            pioneer_sqlite::SqliteBlobSource { table, column },
+                            pioneer_sqlite::SqliteBlobSource {
+                                table: physical,
+                                column,
+                            },
                             guard.clone(),
                             u64::try_from(source_offset - 1)?,
                             count,
@@ -1690,6 +1741,12 @@ fn terminal_admission_sql(family: Family) -> &'static str {
         Family::TaskHistory => {
             "EXISTS(SELECT 1 FROM task_run r WHERE r.id=task_run_conversation_snapshot.run_id AND r.task_id=task_run_conversation_snapshot.task_id AND r.status IN ('succeeded','failed','blocked','cancelled','timed_out')) AND (source_turn_id IS NULL OR EXISTS(SELECT 1 FROM turn t WHERE t.id=task_run_conversation_snapshot.source_turn_id AND t.status IN ('completed','failed','interrupted','blocked')))"
         }
+        Family::TurnEvent => {
+            "portable_identity<>'' AND EXISTS(SELECT 1 FROM turn t WHERE t.id=turn_event.turn_id AND t.status IN ('completed','failed','interrupted','blocked') AND NOT EXISTS(SELECT 1 FROM turn_event e WHERE e.turn_id=t.id AND e.sequence>COALESCE((SELECT s.projected_through_sequence FROM turn_event_projection_stream_state s WHERE s.turn_id=t.id),-1)))"
+        }
+        Family::TurnItem => {
+            "portable_identity<>'' AND coalesce(active_attempt_status,'')<>'running' AND NOT EXISTS(SELECT 1 FROM turn_item_attempt a WHERE a.turn_id=turn_item.turn_id AND a.item_id=turn_item.item_id AND a.status='running') AND EXISTS(SELECT 1 FROM turn t WHERE t.id=turn_item.turn_id AND t.status IN ('completed','failed','interrupted','blocked') AND NOT EXISTS(SELECT 1 FROM turn_event e WHERE e.turn_id=t.id AND e.sequence>COALESCE((SELECT s.projected_through_sequence FROM turn_event_projection_stream_state s WHERE s.turn_id=t.id),-1)))"
+        }
         Family::TaskEvent => {
             "(turn_id IS NULL OR EXISTS(SELECT 1 FROM turn et WHERE et.id=task_event.turn_id AND et.status IN ('completed','failed','interrupted','blocked'))) AND ((run_id IS NOT NULL AND EXISTS(SELECT 1 FROM task_run r WHERE r.id=task_event.run_id AND r.task_id=task_event.task_id AND r.status IN ('succeeded','failed','blocked','cancelled','timed_out'))) OR (run_id IS NULL AND NOT EXISTS(SELECT 1 FROM task_run r WHERE r.task_id=task_event.task_id AND r.status NOT IN ('succeeded','failed','blocked','cancelled','timed_out')) AND NOT EXISTS(SELECT 1 FROM task owner JOIN turn creator ON creator.id=owner.created_by_turn_id WHERE owner.id=task_event.task_id AND creator.status NOT IN ('completed','failed','interrupted','blocked'))))"
         }
@@ -1710,6 +1767,12 @@ fn eligibility_sql(family: Family) -> String {
         }
         Family::CliMapping => {
             " AND EXISTS(SELECT 1 FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_cli_runtime_binding.turn_id AND th.workspace_id=turn_cli_runtime_binding.workspace_id AND t.thread_id=turn_cli_runtime_binding.thread_id)"
+        }
+        Family::TurnEvent => {
+            " AND EXISTS(SELECT 1 FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_event.turn_id AND t.thread_id=turn_event.thread_id)"
+        }
+        Family::TurnItem => {
+            " AND EXISTS(SELECT 1 FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_item.turn_id)"
         }
         Family::TaskEvent => " AND EXISTS(SELECT 1 FROM task t WHERE t.id=task_event.task_id)",
     };
@@ -1758,7 +1821,25 @@ async fn publish(
         if let Some(projection) = &prepared.projection {
             update = update.col_expr(field, Expr::value(projection.clone()));
         }
-        update.exec(&tx).await?.rows_affected
+        let changed = update.exec(&tx).await?.rows_affected;
+        if changed == 0 && matches!(family, Family::TurnEvent | Family::TurnItem) {
+            // INSTEAD OF UPDATE reports zero. A reserved unique staged ID can
+            // appear on this owner only if this exact publication succeeded.
+            u64::from(
+                Target::find()
+                    .select_only()
+                    .column(key)
+                    .filter(key.eq(owner))
+                    .filter(reference.eq(&prepared.header.id))
+                    .filter(Col::PortableIdentity.eq(identity))
+                    .into_tuple::<String>()
+                    .one(&tx)
+                    .await?
+                    .is_some(),
+            )
+        } else {
+            changed
+        }
     });
     if affected == 1 {
         let published = value::Entity::update_many()
@@ -1860,6 +1941,12 @@ async fn clear_blocks(store: &CrudStore, id: &str) -> Result<bool> {
 // preparation captured before it. Only fixed-size relational facts are read.
 fn owner_stamp_sql(family: Family) -> &'static str {
     match family {
+        Family::TurnEvent => {
+            "coalesce((SELECT json_array(th.workspace_id,t.thread_id,t.status) FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_event.turn_id),'')"
+        }
+        Family::TurnItem => {
+            "coalesce((SELECT json_array(th.workspace_id,t.thread_id,t.status) FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_item.turn_id),'')"
+        }
         Family::ToolText | Family::ToolMetadata => {
             "coalesce((SELECT json_array(th.workspace_id,t.thread_id,t.status) FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=tool_output_chunk.turn_id),'')"
         }

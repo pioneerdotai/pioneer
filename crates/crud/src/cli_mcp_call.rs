@@ -106,6 +106,13 @@ impl CrudStore {
             )
             .await?;
             let confirmed_replay = if let Some(event) = accepted {
+                let event = crate::repositories::turn_payload::hydrate_events(
+                    &self.connection,
+                    vec![event],
+                )
+                .await?
+                .pop()
+                .unwrap();
                 let payload: TurnEventPayload = serde_json::from_str(&event.payload)?;
                 match payload {
                     TurnEventPayload::ItemCompleted(saved)
@@ -219,13 +226,14 @@ impl CrudStore {
                         .await?;
                         anyhow::ensure!(
                             current.is_some_and(|event| event.id == confirmed.id
-                                && event.payload == confirmed.payload),
+                                && event.portable_identity == confirmed.portable_identity
+                                && event.portable_revision == confirmed.portable_revision),
                             "CLI MCP canonical completion changed during replay"
                         );
                         transaction.rollback().await?;
                         return Ok(false);
                     }
-                    if let Some(item) = turn::find_turn_item(
+                    if let Some(item) = turn::find_turn_item_metadata(
                         &transaction,
                         &notification.turn_id,
                         &identity.native_item_id,
@@ -320,7 +328,7 @@ pub(crate) async fn cli_mcp_observation_is_superseded<C: ConnectionTrait>(
     // A replayed observation preceding completion must still create/update its
     // original attempt. Only admission of a new observation uses this fallback.
     Ok(before_sequence.is_none()
-        && turn::find_turn_item(db, turn_id, item.item_id())
+        && turn::find_turn_item_metadata(db, turn_id, item.item_id())
             .await?
             .is_some_and(|item| item.status.as_deref() != Some("in_progress")))
 }

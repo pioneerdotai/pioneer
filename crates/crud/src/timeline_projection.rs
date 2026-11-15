@@ -760,6 +760,9 @@ mod tests {
     fn turn_item_row(item_type: &str, status: Option<&str>, payload: &str) -> turn_item::Model {
         let now = chrono::Utc::now().into();
         turn_item::Model {
+            portable_identity: String::new(),
+            portable_revision: 0,
+            payload_payload_id: None,
             id: "row_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             item_id: "item_1".to_owned(),

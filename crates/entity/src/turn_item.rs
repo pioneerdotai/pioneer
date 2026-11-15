@@ -24,6 +24,11 @@ pub struct Model {
     pub lease_expires_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub portable_revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub portable_identity: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub payload_payload_id: Option<String>,
     #[sea_orm(has_one)]
     pub agent_action_timeline_target: HasOne<super::agent_action_timeline_target::Entity>,
 }

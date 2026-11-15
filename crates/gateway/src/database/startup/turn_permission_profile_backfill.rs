@@ -765,12 +765,15 @@ async fn backfill_full_access_turn_security_snapshot_batch(
 }
 
 async fn backfill_turn_event_batch(db: &pioneer_sqlite::SqliteDatabase) -> Result<u64> {
+    // This existing historical repair runs before maintenance on upgrade.
+    // Admitted INSERTs are produced by the current domain writers; never parse
+    // their physical PPAY projection as legacy JSON or rewrite their storage.
     let candidates = LegacyTurnEventPayload::find_by_statement(Statement::from_string(
         db.get_database_backend(),
         format!(
             "SELECT id, payload \
              FROM turn_event \
-             WHERE (\
+             WHERE CASE WHEN portable_identity='' THEN ((\
                     json_type(payload, '$.payload.turn') = 'object' \
                     AND (\
                         json_type(payload, '$.payload.turn.permission_profile') IS NULL \
@@ -789,7 +792,7 @@ async fn backfill_turn_event_batch(db: &pioneer_sqlite::SqliteDatabase) -> Resul
                 OR (\
                     json_extract(payload, '$.kind') = 'turn_tool_loop_budget_exceeded' \
                     AND json_extract(payload, '$.payload.action') = 'fail_turn'\
-               ) \
+               )) ELSE 0 END \
              ORDER BY created_at, id \
              LIMIT {TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE}",
         ),
@@ -882,7 +885,14 @@ fn json_column_update_statement(
     values.extend(updates.into_iter().map(|(id, _)| id.into()));
     Ok(Some(Statement::from_sql_and_values(
         backend,
-        format!("UPDATE {table} SET {column} = {update_case} WHERE id IN ({placeholders})"),
+        format!(
+            "UPDATE {table} SET {column} = {update_case} WHERE id IN ({placeholders}){}",
+            if table == "turn_event" {
+                " AND portable_identity='' AND payload_payload_id IS NULL"
+            } else {
+                ""
+            }
+        ),
         values,
     )))
 }
@@ -1122,7 +1132,7 @@ mod tests {
             db.get_database_backend(),
             "SELECT COUNT(*) AS count \
              FROM turn_event \
-             WHERE (\
+             WHERE CASE WHEN portable_identity='' THEN ((\
                     json_type(payload, '$.payload.turn') = 'object' \
                     AND (\
                         json_type(payload, '$.payload.turn.permission_profile') IS NULL \
@@ -1141,7 +1151,7 @@ mod tests {
                 OR (\
                     json_extract(payload, '$.kind') = 'turn_tool_loop_budget_exceeded' \
                     AND json_extract(payload, '$.payload.action') = 'fail_turn'\
-               )",
+               )) ELSE 0 END",
         ))
         .one(db)
         .await
@@ -1187,7 +1197,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
+        Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
             .await
             .expect("migrations must succeed");
 
@@ -1533,6 +1543,7 @@ mod tests {
             .to_string()),
             idempotency_key: Set(None),
             created_at: Set(now),
+            ..Default::default()
         })
         .exec(&connection)
         .await
@@ -1560,6 +1571,7 @@ mod tests {
             .to_string()),
             idempotency_key: Set(None),
             created_at: Set(now),
+            ..Default::default()
         })
         .exec(&connection)
         .await
@@ -1603,6 +1615,7 @@ mod tests {
         )
         .await
         .expect("version one backfill marker should insert");
+        Migrator::up(&connection, None).await.unwrap();
         let summary = backfill_once(&store, runtime_home.path())
             .await
             .expect("backfill should run");

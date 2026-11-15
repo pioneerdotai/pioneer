@@ -888,8 +888,8 @@ async fn count_turn_execution_window_terminal_items_query<C: ConnectionTrait>(
     Ok(counts)
 }
 
-pub async fn list_turn_execution_window_items<C: ConnectionTrait>(
-    db: &C,
+pub async fn list_turn_execution_window_items(
+    db: &pioneer_sqlite::SqliteDatabase,
     turn_id: &str,
     started_at: DateTimeWithTimeZone,
 ) -> Result<Vec<TurnItem>> {
@@ -902,6 +902,7 @@ pub async fn list_turn_execution_window_items<C: ConnectionTrait>(
         .await
         .context("failed to list turn_item rows for execution-window checkpoint")?;
 
+    let rows = super::turn_payload::hydrate_items(db, rows).await?;
     rows.into_iter()
         .map(|row| {
             serde_json::from_str::<TurnItem>(row.payload.as_str()).with_context(|| {

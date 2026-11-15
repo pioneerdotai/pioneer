@@ -859,6 +859,7 @@ INSERT INTO turn_event_projection_state (
             payload: Set(legacy_payload_json),
             created_at: Set(now),
             idempotency_key: Set(Some(legacy_idempotency_key.clone())),
+            ..Default::default()
         })
         .exec(&db)
         .await
