@@ -134,6 +134,8 @@ blocked = "Заблокирован"
 disabled = "Выключен"
 
 [apps]
+unsupported_title = "Приложения недоступны"
+unsupported_intel_mac = "Этот Gateway запущен на Intel Mac, который не поддерживает приложения. Подключитесь к Gateway на поддерживаемой платформе."
 open_view = "Open App"
 empty_description = "Установите приложения и расширьте возможности агентов."
 description = "Установленные приложения для текущего пространства."

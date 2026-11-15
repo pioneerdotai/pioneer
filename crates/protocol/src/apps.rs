@@ -1,4 +1,7 @@
 //! Installed Apps are a product domain distinct from provider-facing RuntimeAppInfo.
+/// Stable Apps admission failure for an unsupported Gateway host.
+pub const APPS_UNSUPPORTED_HOST_PLATFORM: &str = "apps.unsupported_host_platform";
+
 use crate::{
     PluginComponentItem, PluginComponentKey, PluginDiagnostic, PluginItem, PluginMetadata,
 };

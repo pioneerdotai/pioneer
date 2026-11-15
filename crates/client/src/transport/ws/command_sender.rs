@@ -3081,6 +3081,48 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
+    #[test]
+    fn apps_catalog_unsupported_host_is_a_stable_machine_failure() {
+        struct UnsupportedTransport(Option<&'static str>);
+        impl JsonRpcRequestTransport for UnsupportedTransport {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: JsonRpcResponseSender,
+            ) -> std::result::Result<(), String> {
+                response
+                    .send(Err(crate::rpc::JsonRpcResponseError::server(
+                        Some(pioneer_protocol::INVALID_REQUEST_CODE),
+                        "apps.unsupported_host_platform",
+                        self.0.map(str::to_owned),
+                    )))
+                    .expect("response delivered");
+                Ok(())
+            }
+        }
+        for code in [
+            Some("apps.unsupported_host_platform"),
+            None,
+            Some("another_failure"),
+        ] {
+            let error = packages_list(
+                &UnsupportedTransport(code),
+                pioneer_protocol::PackageKind::App,
+                pioneer_protocol::PluginsListParams {
+                    workspace_id: "workspace".into(),
+                },
+            )
+            .unwrap_err();
+            if code == Some("apps.unsupported_host_platform") {
+                assert_eq!(error.to_string(), "apps.unsupported_host_platform");
+            } else {
+                // Peer message text alone must not classify the Gateway as unsupported.
+                assert_ne!(error.to_string(), "apps.unsupported_host_platform");
+            }
+        }
+    }
+
     struct FakeTransport;
 
     impl JsonRpcRequestTransport for FakeTransport {
@@ -4464,7 +4506,16 @@ pub fn packages_list<T: JsonRpcRequestTransport>(
             workspace_id: params.workspace_id,
         },
         RPC_REQUEST_TIMEOUT,
-    )?;
+    )
+    .map_err(|error| {
+        if json_rpc_response_error(&error).and_then(|response| response.machine_code())
+            == Some(APPS_UNSUPPORTED_HOST_PLATFORM)
+        {
+            anyhow!(APPS_UNSUPPORTED_HOST_PLATFORM)
+        } else {
+            error
+        }
+    })?;
     Ok(PluginsListResponse {
         plugins: response
             .apps

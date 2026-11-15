@@ -119,7 +119,7 @@ pub(super) fn load_package(snapshot: &Snapshot, kind: PackageKind) -> anyhow::Re
         PackageKind::App => {
             let app = pioneer_apps::load_for_architecture(
                 snapshot,
-                super::super::apps::provision::architecture().unwrap_or("unsupported"),
+                super::super::apps::architecture().unwrap_or("unsupported"),
             )?;
             let doc = app.manifest.document();
             let presentation = PackagePresentation {
@@ -149,6 +149,6 @@ pub(super) fn select_package_snapshot(
     }
     pioneer_apps::SelectionPlan::select_architecture(
         &snapshot,
-        super::super::apps::provision::architecture().unwrap_or("unsupported"),
+        super::super::apps::architecture().unwrap_or("unsupported"),
     )
 }

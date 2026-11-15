@@ -129,6 +129,8 @@ blocked = "Bloquée"
 disabled = "Désactivée"
 
 [apps]
+unsupported_title = "Applications indisponibles"
+unsupported_intel_mac = "Ce Gateway fonctionne sur un Mac Intel, qui ne prend pas en charge les applications. Connectez-vous à un Gateway sur une plateforme compatible."
 open_view = "Open App"
 empty_description = "Installez des applications pour étendre les capacités de vos agents."
 title = "Applications"

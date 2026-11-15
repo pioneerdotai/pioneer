@@ -172,8 +172,23 @@ pub struct PackageCatalogView {
     _publications: Task<()>,
     _upload_changes: Subscription,
 }
+impl PackageCatalogView {
+    fn apps_unsupported(&self) -> bool {
+        self.kind == pioneer_client::plugins::PackageKind::App
+            && self.input.error.as_deref() == Some(pioneer_protocol::APPS_UNSUPPORTED_HOST_PLATFORM)
+    }
+}
+
 impl Render for PackageCatalogView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.apps_unsupported() {
+            return pioneer_desktop_foundation::catalog_empty_state(
+                t!("apps.unsupported_title").to_string(),
+                t!("apps.unsupported_intel_mac").to_string(),
+                None,
+                cx,
+            );
+        }
         if let Some(child) = &self.child_details {
             return div()
                 .size_full()
