@@ -1,5 +1,5 @@
 //! Isolated process and completion regressions; run only after external review.
-use super::super::ThreadTitleJobState;
+use super::super::{ThreadTitleJobState, ThreadTitleRecovery};
 use super::*;
 use pioneer_protocol::TurnStartParams;
 use std::os::unix::fs::PermissionsExt;
@@ -7,7 +7,14 @@ use std::os::unix::fs::PermissionsExt;
 const FALLBACK: &str = "first user request";
 
 fn waiting_for_source(text: &str) -> ThreadTitleJobState {
-    ThreadTitleJobState::AwaitingSuccessfulTurn(text.into())
+    waiting_with_budget(text, 2)
+}
+
+fn waiting_with_budget(text: &str, remaining: u8) -> ThreadTitleJobState {
+    ThreadTitleJobState::AwaitingSuccessfulTurn(ThreadTitleRecovery {
+        text: text.into(),
+        remaining,
+    })
 }
 
 fn configure_title_process(processor: &mut MessageProcessor, fixture: &std::path::Path) {
@@ -26,6 +33,9 @@ with (home/'inputs').open('a') as inputs:
 with (home/'starts').open('a') as trace:
     trace.write(str(os.getpid())+'\n')
 if (home/'hang').exists(): time.sleep(600)
+if (home/'failure').exists():
+    print('authentication failed', file=sys.stderr)
+    sys.exit(23)
 for event in [
     {'type':'thread.started','thread_id':'isolated-title'},
     {'type':'turn.started'},
@@ -104,7 +114,12 @@ async fn wait_for_title_state(
     .unwrap();
 }
 
-async fn exhaust_title_deadline(processor: &MessageProcessor, thread: &str, source: &str) {
+async fn exhaust_title_deadline(
+    processor: &MessageProcessor,
+    thread: &str,
+    source: &str,
+    remaining: u8,
+) {
     let timeout = processor
         .load_cli_runtime_instances()
         .unwrap()
@@ -115,7 +130,12 @@ async fn exhaust_title_deadline(processor: &MessageProcessor, thread: &str, sour
     tokio::time::pause();
     tokio::time::advance(Duration::from_millis(timeout + 1)).await;
     tokio::time::resume();
-    wait_for_title_state(processor, thread, Some(waiting_for_source(source))).await;
+    wait_for_title_state(
+        processor,
+        thread,
+        Some(waiting_with_budget(source, remaining)),
+    )
+    .await;
 }
 
 async fn prepare_final(processor: &MessageProcessor, workspace: &str, thread: &str, turn: &str) {
@@ -287,7 +307,7 @@ async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names(
         };
         processor.spawn_initial_thread_title_task(thread.into(), Some(source.into()));
         wait_for_process(fixture.path(), 1).await;
-        exhaust_title_deadline(&processor, thread, source).await;
+        exhaust_title_deadline(&processor, thread, source, 2).await;
         assert_eq!(
             process_count(fixture.path()),
             1,
@@ -310,7 +330,7 @@ async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names(
             processor.recover_thread_title(thread.into()),
             processor.recover_thread_title(thread.into())
         );
-        exhaust_title_deadline(&processor, thread, source).await;
+        exhaust_title_deadline(&processor, thread, source, 1).await;
         assert_eq!(process_count(fixture.path()), 2);
 
         if attachment_first {
@@ -323,7 +343,7 @@ async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names(
                 .await
                 .unwrap();
             processor.recover_thread_title(thread.into()).await;
-            wait_for_title_state(&processor, thread, Some(waiting_for_source(source))).await;
+            wait_for_title_state(&processor, thread, Some(waiting_with_budget(source, 1))).await;
             assert_eq!(
                 process_count(fixture.path()),
                 2,
@@ -342,7 +362,7 @@ async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names(
                 .await
                 .get(thread)
                 .cloned(),
-            Some(waiting_for_source(source))
+            Some(waiting_with_budget(source, 1))
         );
         assert_eq!(
             process_count(fixture.path()),
@@ -399,6 +419,48 @@ async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names(
             );
         }
     }
+}
+
+#[tokio::test]
+async fn title_process_exit_recovers_only_after_completion_and_exhausts_its_budget() {
+    let thread = "title-process-failure";
+    let input = vec![UserInput::Text {
+        text: FALLBACK.into(),
+        text_elements: vec![],
+    }];
+    let (mut processor, store, _) = setup_execution_window_terminal_turn_with_input_and_mode(
+        thread,
+        "title-process-first",
+        &input,
+        None,
+    )
+    .await;
+    let fixture = tempfile::tempdir().unwrap();
+    configure_title_process(&mut processor, fixture.path());
+    std::fs::remove_file(fixture.path().join("hang")).unwrap();
+    std::fs::write(fixture.path().join("failure"), "").unwrap();
+    processor.spawn_initial_thread_title_task(thread.into(), Some(FALLBACK.into()));
+    for count in 1..=3 {
+        wait_for_process(fixture.path(), count).await;
+        let waiting = (count < 3).then(|| waiting_with_budget(FALLBACK, (3 - count) as u8));
+        wait_for_title_state(&processor, thread, waiting).await;
+        assert_eq!(
+            store
+                .get_thread_model(thread)
+                .await
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some(FALLBACK)
+        );
+        processor.recover_thread_title(thread.into()).await;
+    }
+    assert_eq!(
+        process_count(fixture.path()),
+        3,
+        "the recovery budget cannot start a fourth request"
+    );
 }
 
 #[tokio::test]

@@ -1,8 +1,7 @@
 //! Nonpersistent Claude print service, independently owned for each portion.
-//! The restricted profile is pinned to the published @anthropic-ai/claude-code
-//! 2.1.79 implementation. In that release SIMPLE skips hooks/context/agents
-//! without changing the native OAuth/keychain reader. Newer `--bare` has a
-//! different authentication contract and must not silently replace this profile.
+//! The restricted profile is enforced by explicit CLI controls and validated
+//! initialization/result frames, never by a release string. SIMPLE preserves
+//! native OAuth/keychain authentication; `--bare` is not an auth-equivalent mode.
 use crate::process::{
     CLIAgentProcess, CLIAgentProcessSpawnConfig, SensitiveEnvironment, spawn_cli_agent_process,
 };
@@ -17,7 +16,6 @@ use tokio::{
     time::Instant,
 };
 
-const RELEASE: &str = "2.1.79";
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -88,20 +86,8 @@ impl ClaudeService {
             "unsupported Claude service effort"
         );
         let run = async {
-            // The probe is also supervised and consumes the same attempt deadline.
-            // It invokes no prompt, auth probe or working user launcher.
-            let version = self.invoke(None, &[], deadline, 4096).await?;
-            ensure!(
-                std::str::from_utf8(&version)?.trim() == format!("{RELEASE} (Claude Code)"),
-                "unsupported Claude service capability version"
-            );
             let output = self
-                .invoke(
-                    Some(&request),
-                    request.input.as_bytes(),
-                    deadline,
-                    MAX_BYTES,
-                )
+                .invoke(&request, request.input.as_bytes(), deadline, MAX_BYTES)
                 .await?;
             let value = serde_json::from_slice::<Value>(&output)?;
             confirmed_completion(&value, &request.model).map_err(|error| {
@@ -112,14 +98,14 @@ impl ClaudeService {
         };
         let result = match tokio::time::timeout_at(deadline, run).await {
             Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("Claude service deadline exceeded")),
+            Err(_) => Err(crate::service::ClaudeServiceDeadline.into()),
         };
         self.cleanup().await?;
         result
     }
     async fn invoke(
         &self,
-        request: Option<&ClaudeServiceRequest>,
+        request: &ClaudeServiceRequest,
         input: &[u8],
         deadline: Instant,
         cap: usize,
@@ -132,7 +118,7 @@ impl ClaudeService {
                 "Claude service deadline exceeded"
             );
             let directory = tempfile::tempdir()?;
-            let config = process_config(&self.config, directory.path(), request);
+            let config = process_config(&self.config, directory.path(), request)?;
             let mut process = spawn_cli_agent_process(&config)?;
             let (stdout, mut stdin) = process.take_stdio()?;
             *owner = Some(Attempt {
@@ -153,10 +139,19 @@ impl ClaudeService {
                 Ok::<_, anyhow::Error>(output)
             };
             let exchange = async {
-                let (_, output) =
-                    tokio::try_join!(async { write.await.map_err(anyhow::Error::from) }, read)?;
-                let status = owner.as_mut().unwrap().process.wait().await?;
-                ensure_process_outcome(&output, status.success())?;
+                let (written, output) = tokio::join!(write, read);
+                let output = output?;
+                let process = &mut owner.as_mut().unwrap().process;
+                let status = process.wait().await?;
+                if !status.success() || written.is_err() {
+                    let stderr = process.stderr().lines().await;
+                    let metadata =
+                        crate::service::ServiceProcessFailure::from_status(status, &stderr);
+                    let error = ensure_process_outcome(&output, false)
+                        .err()
+                        .unwrap_or_else(|| anyhow::anyhow!("Claude service process failed"));
+                    return Err(error.context(metadata));
+                }
                 Ok(output)
             };
             exchange.await
@@ -180,57 +175,55 @@ impl ClaudeService {
 fn process_config(
     config: &ClaudeServiceConfig,
     cwd: &Path,
-    request: Option<&ClaudeServiceRequest>,
-) -> CLIAgentProcessSpawnConfig {
+    request: &ClaudeServiceRequest,
+) -> Result<CLIAgentProcessSpawnConfig> {
+    let config_dir = crate::process::expand_home_path(&config.config_dir, None)?;
     let mut spawn = CLIAgentProcessSpawnConfig::codex_app_server(&config.executable, "");
     spawn.home_path = None;
-    spawn.args = vec!["--version".into()];
     spawn = spawn
         .with_cwd(cwd)
         .with_environment(&config.environment)
-        .with_stderr_ring_lines(0)
-        .with_env("CLAUDE_CONFIG_DIR", &config.config_dir)
+        .with_stderr_ring_lines(8)
+        .with_env("CLAUDE_CONFIG_DIR", config_dir.to_string_lossy())
         .with_env("CLAUDE_CODE_SIMPLE", "1")
         .with_env_removed("CLAUDECODE");
-    if let Some(request) = request {
-        spawn.args = [
-            "-p",
-            "--no-session-persistence",
-            "--output-format",
-            "json",
-            "--verbose",
-            "--tools",
-            "",
-            "--disallowedTools",
-            "*",
-            "--strict-mcp-config",
-            "--mcp-config",
-            "{\"mcpServers\":{}}",
-            "--setting-sources",
-            "",
-            "--disable-slash-commands",
-            "--no-chrome",
-            "--permission-mode",
-            "dontAsk",
-            "--settings",
-            "{\"disableAllHooks\":true,\"enabledPlugins\":{},\"autoMemoryEnabled\":false}",
-            "--model",
-            &request.model,
-            "--system-prompt",
-            &request.instructions,
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-        if let Some(effort) = &request.effort {
-            spawn.args.extend(["--effort".into(), effort.clone()]);
-        }
-        spawn = spawn.with_env(
-            "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
-            request.output_cap.to_string(),
-        );
+    spawn.args = [
+        "-p",
+        "--no-session-persistence",
+        "--output-format",
+        "json",
+        "--verbose",
+        "--tools",
+        "",
+        "--disallowedTools",
+        "*",
+        "--strict-mcp-config",
+        "--mcp-config",
+        "{\"mcpServers\":{}}",
+        "--setting-sources",
+        "",
+        "--disable-slash-commands",
+        "--no-chrome",
+        "--permission-mode",
+        "dontAsk",
+        "--settings",
+        "{\"disableAllHooks\":true,\"enabledPlugins\":{},\"autoMemoryEnabled\":false}",
+        "--model",
+        &request.model,
+        "--system-prompt",
+        &request.instructions,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    if let Some(effort) = &request.effort {
+        spawn.args.extend(["--effort".into(), effort.clone()]);
     }
-    spawn
+    spawn = spawn.with_env(
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+        request.output_cap.to_string(),
+    );
+    Ok(spawn)
 }
 /// Production nonzero-exit rejection boundary. Only a parsed native terminal
 /// result contributes metrics; malformed/incomplete transcripts are not mined.
@@ -251,7 +244,7 @@ pub fn ensure_process_outcome(output: &[u8], success: bool) -> Result<()> {
     anyhow::bail!("Claude service process failed")
 }
 
-// In the pinned release, verbose JSON includes the init frame carrying the
+// Verbose JSON must include the init frame carrying the
 // model resolved by the CLI itself. This preserves native alias/environment
 // resolution without guessing a model or accepting a fallback during generation.
 fn terminal_value(value: &Value) -> &Value {
@@ -516,8 +509,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_print_processes_validate_version_and_release_after_timeout_and_cancel() {
-        let fixture = tempfile::tempdir().unwrap();
+    async fn fresh_print_expands_auth_without_version_gate_and_cleans_up() {
+        let user_home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let fixture = tempfile::tempdir_in(&user_home).unwrap();
         let home = fixture.path().join("auth");
         std::fs::create_dir(&home).unwrap();
         let executable = fixture.path().join("mock-claude");
@@ -530,8 +524,7 @@ kind = 'version' if args == ['--version'] else 'print'
 with (home / 'trace').open('a') as out:
     out.write(json.dumps({'pid':os.getpid(),'cwd':os.getcwd(),'kind':kind}) + '\n')
 if kind == 'version':
-    print('0.0.0 (Claude Code)' if (home / 'unsupported').exists() else '2.1.79 (Claude Code)')
-    sys.exit(0)
+    raise AssertionError('print service must not gate on CLI release')
 assert args[0] == '-p'
 for flag in ['--no-session-persistence','--strict-mcp-config','--disable-slash-commands','--no-chrome']:
     assert flag in args
@@ -551,7 +544,7 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let service = Arc::new(ClaudeService::new(ClaudeServiceConfig {
             executable: executable.to_string_lossy().into_owned(),
-            config_dir: home.to_string_lossy().into_owned(),
+            config_dir: format!("~/{}", home.strip_prefix(&user_home).unwrap().display()),
             environment: SensitiveEnvironment::new(),
         }));
         for _ in 0..2 {
@@ -591,27 +584,27 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
             .await
             .unwrap()
             .unwrap();
-        std::fs::write(home.join("unsupported"), "yes").unwrap();
+        std::fs::remove_file(home.join("hang")).unwrap();
         assert!(
             service
                 .summarize(request(), Duration::from_secs(5))
                 .await
-                .is_err()
+                .is_ok()
         );
         let trace = std::fs::read_to_string(home.join("trace")).unwrap();
         let rows = trace
             .lines()
             .map(|s| serde_json::from_str::<Value>(s).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 9); // four probes + prints, then only the unsupported probe
+        assert_eq!(rows.len(), 5); // only the five owned print attempts
         assert_eq!(
             rows.iter()
                 .map(|v| v["pid"].as_u64().unwrap())
                 .collect::<HashSet<_>>()
                 .len(),
-            9
+            5
         );
-        assert_eq!(rows.iter().filter(|v| v["kind"] == "print").count(), 4);
+        assert_eq!(rows.iter().filter(|v| v["kind"] == "print").count(), 5);
         for row in rows {
             assert!(!Path::new(row["cwd"].as_str().unwrap()).exists());
         }

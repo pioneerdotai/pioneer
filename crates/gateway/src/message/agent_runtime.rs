@@ -12876,7 +12876,10 @@ impl MessageProcessor {
             else {
                 return;
             };
-            let text = Arc::clone(text);
+            let text = text.clone();
+            if text.remaining == 0 {
+                return;
+            }
             runtime.insert(thread_id.clone(), ThreadTitleJobState::Pending);
             text
         };
@@ -12896,7 +12899,7 @@ impl MessageProcessor {
         &self,
         thread_id: String,
         current_turn_first_user_text: Option<String>,
-        recovery_source: Option<Arc<str>>,
+        recovery_source: Option<ThreadTitleRecovery>,
     ) {
         let processor = self.clone();
         tokio::spawn(async move {
@@ -12905,6 +12908,11 @@ impl MessageProcessor {
                     thread_id.as_str(),
                     current_turn_first_user_text.as_deref(),
                     recovery_source.as_deref(),
+                    recovery_source
+                        .as_ref()
+                        .map_or(TITLE_JOB_MAX_RECOVERIES, |source| {
+                            source.remaining.saturating_sub(1)
+                        }),
                 )
                 .await
             {
@@ -12916,10 +12924,13 @@ impl MessageProcessor {
                 processor
                     .record_title_job_state(
                         thread_id.as_str(),
-                        recovery_source.map_or(
-                            ThreadTitleJobState::FailedNonRetriable,
-                            ThreadTitleJobState::DeferredUntilSuccessfulTurn,
-                        ),
+                        recovery_source.map_or(ThreadTitleJobState::FailedNonRetriable, |source| {
+                            if source.remaining > 0 {
+                                ThreadTitleJobState::DeferredUntilSuccessfulTurn(source)
+                            } else {
+                                ThreadTitleJobState::FailedNonRetriable
+                            }
+                        }),
                         TITLE_JOB_MAX_ATTEMPTS,
                     )
                     .await;
@@ -12984,6 +12995,7 @@ impl MessageProcessor {
         thread_id: &str,
         current_turn_first_user_text: Option<&str>,
         recovery_source: Option<&str>,
+        remaining_recoveries: u8,
     ) -> Result<()> {
         self.record_title_job_state(thread_id, ThreadTitleJobState::Pending, 0)
             .await;
@@ -13085,25 +13097,34 @@ impl MessageProcessor {
                     return Ok(());
                 }
                 Err(error) => {
-                    if error
-                        .downcast_ref::<pioneer_cli_agent_runtime::service::CodexServiceDeadline>()
-                        .is_some()
+                    let recoverable = if let Some(failure) =
+                        error.downcast_ref::<pioneer_cli_agent_runtime::service::ServiceFailure>()
                     {
-                        // Only the selected Codex title service emits this type.
-                        // Release ownership before exposing a recovery ticket.
-                        warn!(
-                            thread_id,
-                            attempt,
-                            "Codex title deadline exhausted; waiting for a successful user turn"
-                        );
-                        self.record_title_job_state(
-                            thread_id,
-                            ThreadTitleJobState::DeferredUntilSuccessfulTurn(
-                                user_text.as_str().into(),
-                            ),
-                            attempt,
+                        matches!(
+                            failure.class,
+                            pioneer_protocol::ProviderFailureClass::NetworkTransient
+                                | pioneer_protocol::ProviderFailureClass::RateLimit
+                                | pioneer_protocol::ProviderFailureClass::Provider5xx
                         )
-                        .await;
+                    } else {
+                        error.is::<pioneer_cli_agent_runtime::service::CodexServiceDeadline>()
+                            || error
+                                .is::<pioneer_cli_agent_runtime::service::ClaudeServiceDeadline>()
+                            || error
+                                .is::<pioneer_cli_agent_runtime::service::ServiceProcessFailure>()
+                    };
+                    if recoverable {
+                        // Retry only after another successful user turn, with
+                        // a finite recovery budget and the original trusted input.
+                        let state = if remaining_recoveries > 0 {
+                            ThreadTitleJobState::DeferredUntilSuccessfulTurn(ThreadTitleRecovery {
+                                text: user_text.as_str().into(),
+                                remaining: remaining_recoveries,
+                            })
+                        } else {
+                            ThreadTitleJobState::FailedNonRetriable
+                        };
+                        self.record_title_job_state(thread_id, state, attempt).await;
                         return Ok(());
                     }
                     if attempt >= TITLE_JOB_MAX_ATTEMPTS {
