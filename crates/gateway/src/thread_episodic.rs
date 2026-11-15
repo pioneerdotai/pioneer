@@ -14486,17 +14486,29 @@ mod tests {
                 .hits
                 .is_empty()
         );
-        let wrong = ThreadEpisodicIndexEmbedding::new(
-            pioneer_memory::ThreadEpisodicEmbeddingIdentity::new("test", "other-model", 2, false),
-            vec![1.0, 0.0],
-        )
-        .unwrap();
-        let mismatch = backend
-            .search_page(semantic, 10, None, Some(wrong))
-            .await
+        for (provider, model, dimension, normalized, vector) in [
+            ("test", "other-model", 3, false, vec![1.0, 0.0, 0.0]),
+            ("test", "axis", 2, false, vec![1.0, 0.0]),
+            ("other-provider", "axis", 3, false, vec![1.0, 0.0, 0.0]),
+            ("test", "axis", 3, true, vec![1.0, 0.0, 0.0]),
+        ] {
+            let wrong = ThreadEpisodicIndexEmbedding::new(
+                pioneer_memory::ThreadEpisodicEmbeddingIdentity::new(
+                    provider, model, dimension, normalized,
+                ),
+                vector,
+            )
             .unwrap();
-        assert!(mismatch.hits.is_empty());
-        assert!(!mismatch.warnings.is_empty());
+            let mismatch = backend
+                .search_page(semantic.clone(), 10, None, Some(wrong))
+                .await
+                .unwrap();
+            assert!(
+                mismatch.hits.is_empty(),
+                "{provider}/{model}/{dimension}/{normalized}"
+            );
+            assert!(!mismatch.warnings.is_empty());
+        }
         let database = maintenance.database_connection();
         let transaction = database.begin().await.unwrap();
         transaction.execute_unprepared("UPDATE thread_episodic_items SET search_text='rolledbackneedle' WHERE item_id='atomic'").await.unwrap();
@@ -14626,6 +14638,161 @@ mod tests {
                 .chain(&second.hits)
                 .all(|hit| { hit.rank_score() > 0.25 && hit.rank_score() <= 0.5 })
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_shared_vector_occurrences_keep_stable_rank_ties_across_pages() {
+        let (store, workspace) = setup_thread_episodic_store().await;
+        let text = "sharedrankneedle same canonical text";
+        let artifact = store
+            .insert_thread_episodic_embedding_artifact_if_absent(
+                NewThreadEpisodicEmbeddingArtifactRecord {
+                    id: "shared_rank_artifact".into(),
+                    workspace_id: workspace.clone(),
+                    pipeline_identity_hash: "test-pipeline".into(),
+                    input_hash: source_text_hash(text),
+                    provider_id: "test".into(),
+                    model: "axis".into(),
+                    dimension: 3,
+                    normalized: false,
+                    vector: vec![8.0, 0.0, 0.0],
+                },
+                1_700_000_000,
+            )
+            .await
+            .unwrap();
+        // Insert in the opposite order to the stable IDs used for rank ties.
+        for (index, id) in [
+            "z_shared_source",
+            "m_shared_source",
+            "a_shared_source",
+            "d_confirmed_copy",
+            "0_hidden_copy",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let item_id = format!("shared_{index}");
+            let turn_id = format!("turn_shared_{index}");
+            let source = TurnItem::UserMessage {
+                id: item_id.clone(),
+                text: text.into(),
+                attachments: Vec::new(),
+            };
+            materialize_thread_with_item(
+                &store,
+                &workspace,
+                "sql_search_thread",
+                &turn_id,
+                source.clone(),
+                1_700_000_000,
+            )
+            .await;
+            let committed = committed_item_ingestion_input_from_parts(
+                &workspace,
+                "sql_search_thread",
+                &turn_id,
+                source,
+            )
+            .unwrap();
+            let item = store
+                .upsert_thread_episodic_item(
+                    NewThreadEpisodicItemRecord {
+                        id: Some(id.into()),
+                        workspace_id: workspace.clone(),
+                        thread_id: "sql_search_thread".into(),
+                        turn_id,
+                        item_id,
+                        source_actor_role: StoreThreadEpisodicSourceActorRole::User,
+                        source_runtime_kind: ThreadEpisodicSourceRuntimeKind::UserTurn,
+                        source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
+                        visibility: if id == "0_hidden_copy" {
+                            ThreadEpisodicItemVisibility::InternalHidden
+                        } else {
+                            ThreadEpisodicItemVisibility::UserVisible
+                        },
+                        status: ThreadEpisodicItemStatus::PendingIndex,
+                        text_hash: item_text_hash(&committed, text),
+                        source_text_hash: source_text_hash(text),
+                        // Only confirmed copies share a logical source. The other
+                        // occurrences deliberately share text and vector, but not identity.
+                        projection_group_id: format!(
+                            "projection_{}",
+                            if matches!(id, "d_confirmed_copy" | "0_hidden_copy") {
+                                "a_shared_source"
+                            } else {
+                                id
+                            }
+                        ),
+                        language_hint: None,
+                        token_estimate: 8,
+                        indexed_at: None,
+                        deleted_at: None,
+                    },
+                    1_700_000_000,
+                )
+                .await
+                .unwrap();
+            store
+                .mark_thread_episodic_item_indexed(
+                    &item.id,
+                    ThreadEpisodicItemIndexedUpdate {
+                        projection_guard: None,
+                        search_text: text.into(),
+                        embedding_artifact_id: Some(artifact.id.clone()),
+                    },
+                    1_700_000_001,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let backend = SqliteThreadEpisodicBackend::new(store);
+        let embedding = ThreadEpisodicIndexEmbedding::new(
+            pioneer_memory::ThreadEpisodicEmbeddingIdentity::new("test", "axis", 3, false),
+            vec![2.0, 0.0, 0.0],
+        )
+        .unwrap();
+        for mode in [
+            ThreadEpisodicSearchMode::Lexical,
+            ThreadEpisodicSearchMode::Semantic,
+            ThreadEpisodicSearchMode::Auto,
+        ] {
+            let mut request = sql_search_request(&workspace, "sharedrankneedle");
+            request.profile.mode = mode;
+            let first = backend
+                .search_page(request.clone(), 2, None, Some(embedding.clone()))
+                .await
+                .unwrap();
+            assert_eq!(first.hits.len(), 2);
+            assert!(first.next_cursor.is_some());
+            let second = backend
+                .search_page(request, 2, first.next_cursor, Some(embedding.clone()))
+                .await
+                .unwrap();
+            assert_eq!(second.hits.len(), 1);
+            assert!(second.next_cursor.is_none());
+            let expected = [
+                ("a_shared_source", "shared_2", "turn_shared_2", 1),
+                ("m_shared_source", "shared_1", "turn_shared_1", 3),
+                ("z_shared_source", "shared_0", "turn_shared_0", 4),
+            ];
+            for (hit, (id, item_id, turn_id, rank)) in
+                first.hits.into_iter().chain(second.hits).zip(expected)
+            {
+                assert_eq!(hit.index_item_id, id, "{mode:?}");
+                assert_eq!(hit.item_id, item_id);
+                assert_eq!(hit.turn_id, turn_id);
+                assert_eq!(
+                    hit.lexical_rank,
+                    (mode != ThreadEpisodicSearchMode::Semantic).then_some(rank)
+                );
+                assert_eq!(
+                    hit.semantic_rank,
+                    (mode != ThreadEpisodicSearchMode::Lexical).then_some(rank)
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -14810,36 +14977,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_lexical_snippet_shows_late_unicode_match_within_character_budget() {
+    async fn sqlite_lexical_snippets_keep_short_text_and_late_unicode_context() {
         let (store, workspace) = setup_thread_episodic_store().await;
-        let text = format!(
+        let long_text = format!(
             "{} левый контекст latecontextneedle правый контекст",
             "далеко начало ".repeat(2000)
         );
-        let (item, job, resolved) =
-            sql_search_pending(&store, &workspace, "late_snippet", &text).await;
-        assert_eq!(
-            sql_search_publish(&store, &item, &job, &resolved, None)
+        let short_text = "shortcontextneedle я просил писать миграции через SeaORM и оставлять raw SQL только для неподдерживаемых операций";
+        for (id, text, query) in [
+            ("late_snippet", long_text.as_str(), "latecontextneedle"),
+            ("short_snippet", short_text, "shortcontextneedle"),
+        ] {
+            let (item, job, resolved) = sql_search_pending(&store, &workspace, id, text).await;
+            assert_eq!(
+                sql_search_publish(&store, &item, &job, &resolved, None)
+                    .await
+                    .unwrap(),
+                ThreadEpisodicIndexAttemptOutcome::Applied
+            );
+            let mut request = sql_search_request(&workspace, query);
+            request.profile.snippet_chars = 120;
+            let page = SqliteThreadEpisodicBackend::new(store.clone())
+                .search_page(request, 10, None, None)
                 .await
-                .unwrap(),
-            ThreadEpisodicIndexAttemptOutcome::Applied
-        );
-        let mut request = sql_search_request(&workspace, "latecontextneedle");
-        request.profile.snippet_chars = 120;
-        let page = SqliteThreadEpisodicBackend::new(store)
-            .search_page(request, 10, None, None)
-            .await
-            .unwrap();
-        assert_eq!(page.hits.len(), 1);
-        let hit = &page.hits[0];
-        assert_eq!(hit.index_item_id, item.id);
-        assert!(hit.text.contains("latecontextneedle"));
-        assert!(hit.text.contains("контекст"));
-        assert!(hit.text.chars().count() <= 120);
-        assert_eq!(
-            hit.metadata.get("pioneer.thread_episodic.source_text_hash"),
-            Some(&item.source_text_hash)
-        );
+                .unwrap();
+            assert_eq!(page.hits.len(), 1);
+            let hit = &page.hits[0];
+            assert_eq!(hit.index_item_id, item.id);
+            assert!(hit.text.contains(query));
+            assert!(hit.text.chars().count() <= 120);
+            if id == "short_snippet" {
+                assert_eq!(hit.text, text);
+            } else {
+                assert!(hit.text.contains("контекст"));
+            }
+            assert_eq!(
+                hit.metadata.get("pioneer.thread_episodic.source_text_hash"),
+                Some(&item.source_text_hash)
+            );
+        }
     }
 
     #[tokio::test]

@@ -772,14 +772,30 @@ pub struct ThreadEpisodicSearchAccess {
 /// Equal-weight reciprocal-rank policy, independent of the storage engine.
 /// Its top score is 1 when both branches rank a result first. A single first
 /// rank scores 0.5; this scale is suitable for the existing 0..1 thresholds.
-pub const THREAD_SEARCH_RRF_K: f64 = 60.0;
+pub const THREAD_SEARCH_RRF_K: f64 = 10.0;
+/// Invalidates continuation positions when ranking/grouping changes.
+pub const THREAD_SEARCH_RANKING_VERSION: u32 = 2;
 pub fn thread_search_rank_score(lexical_rank: Option<i64>, semantic_rank: Option<i64>) -> f32 {
     let contribution = |rank: Option<i64>| {
         rank.filter(|rank| *rank > 0).map_or(0.0, |rank| {
             (THREAD_SEARCH_RRF_K + 1.0) / (THREAD_SEARCH_RRF_K + rank as f64)
         })
     };
-    ((contribution(lexical_rank) + contribution(semantic_rank)) / 2.0) as f32
+    let score = (contribution(lexical_rank) + contribution(semantic_rank)) / 2.0;
+    // Monotonic calibration preserves SQL order and the existing recall scale:
+    // a lone rank r still scores 61/(2*(60+r)), including 0.25 at rank 62.
+    // Above the single-branch ceiling, retain the 0.5..1 agreement range.
+    // This avoids silently dropping lexical/semantic-only recall candidates
+    // when sharpening fusion, without changing any caller's cutoff settings.
+    if score <= 0.5 {
+        const SINGLE_BRANCH_SCORE_K: f64 = 60.0;
+        ((SINGLE_BRANCH_SCORE_K + 1.0) * score
+            / (2.0 * (SINGLE_BRANCH_SCORE_K - THREAD_SEARCH_RRF_K) * score
+                + THREAD_SEARCH_RRF_K
+                + 1.0)) as f32
+    } else {
+        score as f32
+    }
 }
 
 #[derive(Debug, Clone)]
