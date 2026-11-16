@@ -13138,6 +13138,16 @@ impl MessageProcessor {
                                 .is::<pioneer_cli_agent_runtime::service::ServiceProcessFailure>()
                     };
                     if recoverable {
+                        warn!(
+                            thread_id,
+                            attempt,
+                            remaining_recoveries,
+                            process_failure = ?error.downcast_ref::<pioneer_cli_agent_runtime::service::ServiceProcessFailure>(),
+                            provider_failure = ?error.downcast_ref::<pioneer_cli_agent_runtime::service::ServiceFailure>(),
+                            deadline = error.is::<pioneer_cli_agent_runtime::service::CodexServiceDeadline>()
+                                || error.is::<pioneer_cli_agent_runtime::service::ClaudeServiceDeadline>(),
+                            "title generation deferred after service failure"
+                        );
                         // Retry only after another successful user turn, with
                         // a finite recovery budget and the original trusted input.
                         let state = if remaining_recoveries > 0 {
