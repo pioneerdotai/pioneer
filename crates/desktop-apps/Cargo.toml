@@ -14,3 +14,5 @@ anyhow.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
 url.workspace = true
+rand.workspace = true
+tokio.workspace = true
