@@ -3,7 +3,6 @@ use crate::table::*;
 use chrono::{Local, TimeZone};
 use gpui_kit::component::{
     StyledExt,
-    button::*,
     collapsible::Collapsible,
     separator::Separator,
     table::{DataTable, TableState},
@@ -61,11 +60,6 @@ impl SkillsCatalogView {
         let health_detail =
             skill_health::skill_health_detail(&self.input.skills_health_details, &skill.skill_id)
                 .cloned();
-        let is_pending = self.is_skill_pending(&skill.skill_id);
-        let can_manage = self
-            .principal_presentation_capabilities()
-            .can_manage_capabilities;
-        let desktop_entity = cx.entity().clone();
         let skill_summary = skill_presentation::skill_summary_presentation(&skill);
         let version_label = skill_summary
             .version
@@ -89,80 +83,7 @@ impl SkillsCatalogView {
                 pioneer_desktop_foundation::CatalogDetailsHeader::new(skill.slug.clone())
                     .status(status_label, status_color)
                     .when_some(owner, |header, owner| header.owner(owner.to_owned()))
-                    .description(skill.description.clone())
-                    .when(can_manage, |this| {
-                        this.actions(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Button::new(self.ui_id(&skill.skill_id.to_string(), "enabled"))
-                                        .xsmall()
-                                        .compact()
-                                        .h_6()
-                                        .px_3()
-                                        .when(skill.policy.enabled, |this| this.primary())
-                                        .when(!skill.policy.enabled, |this| this.outline())
-                                        .disabled(is_pending)
-                                        .label(t!("skills.button.enabled").to_string())
-                                        .on_click({
-                                            let desktop_entity = desktop_entity.clone();
-                                            let skill_id = skill.skill_id.clone();
-                                            let next_enabled = !skill.policy.enabled;
-                                            let allow_implicit =
-                                                skill.policy.allow_implicit_invocation;
-                                            move |_, _, cx| {
-                                                let _ = desktop_entity.update(cx, |view, cx| {
-                                                    view.set_skill_policy(
-                                                        skill_id.clone(),
-                                                        next_enabled,
-                                                        allow_implicit,
-                                                        cx,
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }),
-                                )
-                                .child(
-                                    Button::new(
-                                        self.ui_id(&skill.skill_id.to_string(), "implicit"),
-                                    )
-                                    .xsmall()
-                                    .compact()
-                                    .h_6()
-                                    .px_3()
-                                    .when(skill.policy.allow_implicit_invocation, |this| {
-                                        this.primary()
-                                    })
-                                    .when(!skill.policy.allow_implicit_invocation, |this| {
-                                        this.outline()
-                                    })
-                                    .disabled(
-                                        is_pending
-                                            || !skill.policy.allow_implicit_invocation_editable,
-                                    )
-                                    .label(t!("skills.button.implicit").to_string())
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let skill_id = skill.skill_id.clone();
-                                        let enabled = skill.policy.enabled;
-                                        let next_implicit = !skill.policy.allow_implicit_invocation;
-                                        move |_, _, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.set_skill_policy(
-                                                    skill_id.clone(),
-                                                    enabled,
-                                                    next_implicit,
-                                                    cx,
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                                ),
-                        )
-                    }),
+                    .description(skill.description.clone()),
             )
             .child(
                 v_flex()
@@ -222,7 +143,9 @@ impl SkillsCatalogView {
                     .child(self.render_recent_audit_section(
                         detail_diagnostics.recent_audit.as_slice(),
                         cx,
-                    )),
+                    ))
+                    .child(Separator::horizontal())
+                    .child(self.render_skill_policy_settings(&skill, cx)),
             )
             .into_any_element()
     }

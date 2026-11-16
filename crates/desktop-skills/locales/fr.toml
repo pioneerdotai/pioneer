@@ -168,3 +168,8 @@ empty_audit = "Aucun événement d'audit pour le moment."
 [skills.catalog]
 source = "Source"
 trust = "Confiance"
+
+[skills.settings]
+title = "Paramètres"
+enabled_description = "Rend cette compétence disponible pour les agents dans l’espace de travail actuel."
+implicit_description = "Autorise les agents à appliquer automatiquement cette compétence même si elle n’est pas explicitement nommée dans la demande."

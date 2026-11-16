@@ -147,3 +147,13 @@ repair_notice = "继续中断的操作、重新应用设置或移除应用。"
 fresh_package_required = "保存的包不可用或已更改，请选择新包或移除应用。"
 reapply_native_change = "组件更改未保存，请在设置中重新应用或移除应用。"
 retained_notice = "数据属于此应用 ID。请更新此 ID 或明确删除数据。新安装不会自动关联旧数据。"
+
+[plugins.details_settings]
+title = "设置"
+enabled_description = "在当前工作区中启用此插件及其功能。"
+implicit_description = "允许智能体自动使用此插件，即使请求中未明确提及它。"
+
+[apps.details_settings]
+title = "设置"
+enabled_description = "使此应用可在当前工作区中使用。"
+implicit_description = "允许智能体自动使用此应用，即使请求中未明确提及它。"

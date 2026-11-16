@@ -42,6 +42,7 @@ pub use catalog_presentation::{
 };
 
 mod catalog_details_header;
+mod catalog_icon;
 pub use catalog_details_header::CatalogDetailsHeader;
 
 mod catalog_card;
@@ -53,3 +54,9 @@ pub use image_views::{ImageViewConfig, ImageViewPort, ImageViews};
 
 mod catalog_summary_card;
 pub use catalog_summary_card::CatalogSummaryCard;
+
+mod settings_surface;
+pub use settings_surface::{settings_divider, settings_group, settings_row, settings_section};
+
+mod catalog_list;
+pub use catalog_list::reconcile_catalog_list;

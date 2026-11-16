@@ -5,6 +5,7 @@ use gpui_kit::{prelude::*, *};
 #[derive(gpui_kit::IntoElement)]
 pub struct CatalogDetailsHeader {
     icon: Option<AnyElement>,
+    icon_size: Rems,
     title: SharedString,
     owner: Option<SharedString>,
     description: Option<SharedString>,
@@ -16,6 +17,7 @@ impl CatalogDetailsHeader {
     pub fn new(title: impl Into<SharedString>) -> Self {
         Self {
             icon: None,
+            icon_size: rems(2.),
             title: title.into(),
             owner: None,
             description: None,
@@ -24,8 +26,15 @@ impl CatalogDetailsHeader {
         }
     }
 
-    pub fn icon(mut self, icon: impl IntoElement) -> Self {
-        self.icon = Some(icon.into_any_element());
+    /// The header owns icon geometry; the supplied image fills its slot.
+    pub fn icon(mut self, icon: impl IntoElement + Styled) -> Self {
+        self.icon = Some(icon.size_full().into_any_element());
+        self
+    }
+
+    /// Sets the icon's side length; the shared catalogue mask scales with it.
+    pub fn icon_size(mut self, size: Rems) -> Self {
+        self.icon_size = size;
         self
     }
 
@@ -72,64 +81,69 @@ impl RenderOnce for CatalogDetailsHeader {
                             .min_w_0()
                             .items_start()
                             .gap_3()
-                            .child(div().children(self.icon))
+                            .when_some(self.icon, |view, icon| {
+                                view.child(
+                                    crate::catalog_icon::catalog_icon(icon, self.icon_size)
+                                        .mt_1p5(),
+                                )
+                            })
                             .child(
-                                v_flex().flex_1().min_w_0().gap_3().child(
-                                    v_flex()
-                                        .w_full()
-                                        .min_w_0()
-                                        .child(
-                                            h_flex()
-                                                .w_full()
-                                                .min_w_0()
-                                                .items_baseline()
-                                                .gap_1()
-                                                .when_some(self.owner, |this, owner| {
-                                                    this.child(
-                                                        div()
-                                                            .flex_none()
-                                                            .text_base()
-                                                            .font_medium()
-                                                            .opacity(0.6)
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
-                                                            .text_ellipsis()
-                                                            .child(owner),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .flex_none()
-                                                            .text_base()
-                                                            .opacity(0.6)
-                                                            .child("/"),
-                                                    )
-                                                })
-                                                .child(
+                                v_flex()
+                                    .flex_1()
+                                    .w_full()
+                                    .min_w_0()
+                                    .gap_0()
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .min_w_0()
+                                            .items_baseline()
+                                            .gap_1()
+                                            .when_some(self.owner, |this, owner| {
+                                                this.child(
                                                     div()
-                                                        .min_w_0()
+                                                        .flex_none()
                                                         .text_base()
-                                                        .font_semibold()
+                                                        .font_medium()
+                                                        .opacity(0.6)
                                                         .overflow_hidden()
                                                         .whitespace_nowrap()
                                                         .text_ellipsis()
-                                                        .child(self.title),
-                                                ),
-                                        )
-                                        .when_some(self.description, |view, description| {
-                                            view.child(
+                                                        .child(owner),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_base()
+                                                        .opacity(0.6)
+                                                        .child("/"),
+                                                )
+                                            })
+                                            .child(
                                                 div()
-                                                    .w_full()
                                                     .min_w_0()
-                                                    .text_sm()
-                                                    .line_height(relative(1.35))
-                                                    .opacity(0.6)
+                                                    .text_base()
+                                                    .font_semibold()
                                                     .overflow_hidden()
-                                                    .whitespace_normal()
-                                                    .line_clamp(3)
-                                                    .child(description),
-                                            )
-                                        }),
-                                ),
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .child(self.title),
+                                            ),
+                                    )
+                                    .when_some(self.description, |view, description| {
+                                        view.child(
+                                            div()
+                                                .w_full()
+                                                .min_w_0()
+                                                .text_sm()
+                                                .line_height(relative(1.35))
+                                                .opacity(0.6)
+                                                .overflow_hidden()
+                                                .whitespace_normal()
+                                                .line_clamp(3)
+                                                .child(description),
+                                        )
+                                    }),
                             ),
                     )
                     .when_some(self.status, |row, (label, color)| {

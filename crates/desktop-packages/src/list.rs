@@ -117,8 +117,7 @@ impl PackageCatalogView {
         )
         .icon(
             self.plugin_images
-                .element(plugin.metadata.logo_for_theme(cx.theme().mode.is_dark()))
-                .size_8(),
+                .element(plugin.metadata.logo_for_theme(cx.theme().mode.is_dark())),
         )
         .description(
             plugin
@@ -140,15 +139,14 @@ impl PackageCatalogView {
         });
         v_flex()
             .w_full()
-            .h(px(pioneer_desktop_foundation::CatalogCard::HEIGHT + 10.))
-            .pb(px(10.))
+            .pb_2p5()
             .child(
                 Button::new(SharedString::from(format!("plugin-{}", plugin.id)))
                     .accessibility_label(plugin.name.clone())
                     .cursor_default()
                     .text()
                     .w_full()
-                    .h_full()
+                    .h_auto()
                     .p_0()
                     .justify_start()
                     .rounded_lg()

@@ -147,3 +147,13 @@ repair_notice = "Continúa la acción interrumpida, reaplica los ajustes o elimi
 fresh_package_required = "El paquete guardado no está disponible o cambió. Elige otro o elimina el aplicación."
 reapply_native_change = "El cambio no se guardó. Reaplícalo en Ajustes o elimina el aplicación."
 retained_notice = "Los datos pertenecen a este ID. Actualiza este aplicación o borra sus datos explícitamente. Una instalación nueva no los recupera automáticamente."
+
+[plugins.details_settings]
+title = "Ajustes"
+enabled_description = "Activa este complemento y sus funciones en el espacio de trabajo actual."
+implicit_description = "Permite a los agentes usar este complemento automáticamente aunque no se mencione explícitamente en la solicitud."
+
+[apps.details_settings]
+title = "Ajustes"
+enabled_description = "Hace que esta aplicación esté disponible en el espacio de trabajo actual."
+implicit_description = "Permite a los agentes usar esta aplicación automáticamente aunque no se mencione explícitamente en la solicitud."

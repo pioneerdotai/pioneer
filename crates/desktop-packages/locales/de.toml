@@ -147,3 +147,13 @@ repair_notice = "Unterbrochene Aktion fortsetzen, Einstellungen erneut anwenden 
 fresh_package_required = "Gespeichertes Paket fehlt oder wurde geändert. Neues wählen oder App entfernen."
 reapply_native_change = "Änderung nicht gespeichert. In Einstellungen erneut anwenden oder App entfernen."
 retained_notice = "Daten gehören zu dieser App-ID. Neues Update für diese ID wählen oder Daten ausdrücklich löschen. Neue Installationen verbinden sie nicht automatisch."
+
+[plugins.details_settings]
+title = "Einstellungen"
+enabled_description = "Aktiviert dieses Plugin und seine Funktionen im aktuellen Arbeitsbereich."
+implicit_description = "Erlaubt Agenten, dieses Plugin automatisch zu verwenden, auch wenn es in der Anfrage nicht ausdrücklich genannt wird."
+
+[apps.details_settings]
+title = "Einstellungen"
+enabled_description = "Stellt diese App im aktuellen Arbeitsbereich bereit."
+implicit_description = "Erlaubt Agenten, diese App automatisch zu verwenden, auch wenn sie in der Anfrage nicht ausdrücklich genannt wird."

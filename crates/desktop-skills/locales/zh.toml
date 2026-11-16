@@ -168,3 +168,8 @@ empty_audit = "尚无审计事件。"
 [skills.catalog]
 source = "来源"
 trust = "信任"
+
+[skills.settings]
+title = "设置"
+enabled_description = "使智能体可在当前工作区中使用此技能。"
+implicit_description = "允许智能体自动应用此技能，即使请求中未明确提及它。"

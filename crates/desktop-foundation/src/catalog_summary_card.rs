@@ -11,7 +11,6 @@ pub struct CatalogSummaryCard {
     pending: bool,
 }
 impl CatalogSummaryCard {
-    pub const HEIGHT: f32 = 78.0;
     pub fn new(
         title: String,
         capability_labels: Vec<String>,
@@ -39,8 +38,9 @@ impl CatalogSummaryCard {
 impl RenderOnce for CatalogSummaryCard {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         h_flex()
+            .id("catalog-summary-card")
             .w_full()
-            .h(px(Self::HEIGHT))
+            .min_w_0()
             .pt_3()
             .px_4()
             .pb_3()
@@ -54,7 +54,7 @@ impl RenderOnce for CatalogSummaryCard {
             .child(
                 v_flex()
                     .flex_1()
-                    .h_full()
+                    .min_w_0()
                     .gap_1()
                     .child(
                         h_flex()
@@ -64,11 +64,11 @@ impl RenderOnce for CatalogSummaryCard {
                             .gap_2()
                             .child(div().text_sm().font_semibold().child(self.title)),
                     )
-                    .child(div().flex_1())
                     .child(
                         h_flex().justify_between().items_center().gap_2().child(
                             h_flex()
                                 .items_center()
+                                .flex_wrap()
                                 .gap_2()
                                 .children(
                                     self.capability_labels
@@ -86,6 +86,10 @@ impl RenderOnce for CatalogSummaryCard {
                         ),
                     ),
             )
-            .child(crate::catalog_status_badge(self.status_label, self.status_color).mt_1p5())
+            .child(
+                crate::catalog_status_badge(self.status_label, self.status_color)
+                    .flex_none()
+                    .mt_1p5(),
+            )
     }
 }
