@@ -6,10 +6,11 @@
 use super::terminate_child_process;
 use super::{
     apply_process_spawn_plan_environment, apply_shell_sandbox_backend, configure_process_group,
-    decode_shell_bytes, kill_process_tree,
+    decode_shell_bytes, kill_process_tree, spawn_shell_command,
 };
 use crate::{ExecCommandArgs, ToolError, build_process_spawn_plan};
 use pioneer_protocol::TurnExecutionSecuritySnapshot;
+use process_wrap::tokio::ChildWrapper;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -136,9 +137,11 @@ impl ProcessTerminal {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         process.kill_on_drop(true);
-        let mut child = process.spawn().map_err(|error| {
+        let mut child = spawn_shell_command(process).map_err(|error| {
             ToolError::execution_failed(format!("failed to start terminal: {error}"))
         })?;
+        #[cfg(windows)]
+        let mut process_group = child.id();
         let output = Arc::new(Mutex::new(OutputBuffer {
             output: String::new(),
             limit,
@@ -147,10 +150,10 @@ impl ProcessTerminal {
             changed: watch::channel(0).0,
         }));
         let mut readers = tokio::task::JoinSet::new();
-        if let Some(stdout) = child.stdout.take() {
+        if let Some(stdout) = child.stdout().take() {
             readers.spawn(read_output(stdout, output.clone()));
         }
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = child.stderr().take() {
             readers.spawn(read_output(stderr, output.clone()));
         }
         let stop = CancellationToken::new();
@@ -175,12 +178,19 @@ impl ProcessTerminal {
             let status = tokio::select! {
                 biased;
                 _ = stopped.cancelled() => terminate_child_process(&mut child).await.map_err(|error| error.to_string()),
-                result = child.wait() => result.map_err(|error| format!("terminal wait failed: {error}")),
+                result = super::shell_parent_wait(&mut child) => result.map_err(|error| format!("terminal wait failed: {error}")),
                 _ = tokio::time::sleep(Duration::from_millis(_plan.timeout_ms)) => {
                     let result = terminate_child_process(&mut child).await.map_err(|error| error.to_string());
                     output_for_worker.lock().expect("terminal output mutex poisoned").read_error = Some("terminal exceeded the resolved process time budget".to_owned());
                     result
                 }
+            };
+            // The Windows wrapper owns the captured job, including descendants
+            // that outlive the parent. Confirm its cleanup before publishing exit.
+            #[cfg(windows)]
+            let status = match super::confirm_shell_group(&mut child, &mut process_group).await {
+                Ok(()) => status,
+                Err(error) => Err(error.to_string()),
             };
             let drained = timeout(PIPE_DRAIN_GRACE, async {
                 while let Some(result) = readers.join_next().await {
