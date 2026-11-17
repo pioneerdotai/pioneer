@@ -5,6 +5,11 @@ on:
   pull_request:
   merge_group:
 
+# Keep only the latest run for each PR/branch; other refs stay independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -23,8 +28,6 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
