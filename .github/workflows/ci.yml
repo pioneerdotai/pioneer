@@ -70,6 +70,8 @@ jobs:
     env: &linux-env
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       CARGO_BUILD_JOBS: 2
+      # Whisper binaries are archived here and executed on different shard hosts.
+      GGML_NATIVE: "OFF"
 
     steps:
       - uses: actions/checkout@v5
@@ -108,7 +110,7 @@ jobs:
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-v1
+          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-ggml-portable-v2
 
       - name: rustfmt-check
         shell: bash
