@@ -43,6 +43,13 @@ pub struct PostTurnToolSummary {
     pub error_class: Option<pioneer_protocol::ToolErrorClass>,
 }
 
+#[derive(FromQueryResult)]
+struct PostTurnToolCandidate {
+    #[sea_orm(nested)]
+    row: turn_item::Model,
+    cursor_created_at: String,
+}
+
 pub async fn post_turn_tool_summaries(
     db: &pioneer_sqlite::SqliteDatabase,
     turn_id: &str,
@@ -53,7 +60,9 @@ pub async fn post_turn_tool_summaries(
     // at a time so large portable results cannot accumulate while filtering.
     const PAGE_ROWS: u64 = 1;
     let mut result = Vec::new();
-    let mut after: Option<(DateTimeWithTimeZone, String)> = None;
+    // SQLite orders the stored TEXT. Re-encoding its timestamp through chrono
+    // can change that text (for example T/Z to spaces/+00:00) and repeat a page.
+    let mut after: Option<(String, String)> = None;
     loop {
         let mut query = turn_item::Entity::find()
             .filter(turn_item::Column::TurnId.eq(turn_id))
@@ -64,18 +73,40 @@ pub async fn post_turn_tool_summaries(
         if let Some((time, id)) = &after {
             query = query.filter(
                 Condition::any()
-                    .add(turn_item::Column::CreatedAt.gt(*time))
+                    .add(turn_item::Column::CreatedAt.gt(time.clone()))
                     .add(
                         Condition::all()
-                            .add(turn_item::Column::CreatedAt.eq(*time))
+                            .add(turn_item::Column::CreatedAt.eq(time.clone()))
                             .add(turn_item::Column::ItemId.gt(id)),
                     ),
             );
         }
-        let rows = super::turn_payload::items(db, query).await?;
+        let (rows, cursor) = crate::CrudStore::new(db.clone())
+            .run_scoped_database_quantum(|| async {
+                let candidates = query
+                    .clone()
+                    .expr_as(
+                        Expr::col((turn_item::Entity, turn_item::Column::CreatedAt))
+                            .cast_as(Alias::new("TEXT")),
+                        "cursor_created_at",
+                    )
+                    .into_model::<PostTurnToolCandidate>()
+                    .all(db)
+                    .await?;
+                let cursor = candidates
+                    .last()
+                    .map(|c| (c.cursor_created_at.clone(), c.row.item_id.clone()));
+                let rows = super::turn_payload::hydrate_items(
+                    db,
+                    candidates.into_iter().map(|c| c.row).collect(),
+                )
+                .await?;
+                Ok((rows, cursor))
+            })
+            .await?;
         let eof = rows.len() < PAGE_ROWS as usize;
+        after = cursor;
         for row in rows {
-            after = Some((row.created_at, row.item_id.clone()));
             let value = super::turn_payload::json1_value(&row.payload)?;
             let Some(tool) = value.get("toolName").and_then(|v| v.as_str()) else {
                 continue;
