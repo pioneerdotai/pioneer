@@ -30573,7 +30573,7 @@ impl CrudStore {
         // Select the same latest transition before JSON work. The second
         // relational read revalidates its exact incarnation/revision and the
         // latest-transition fence, so no mixed snapshot can authorize a job.
-        let Some(source) = repositories::turn_payload::events(
+        let source = repositories::turn_payload::events(
             &self.connection,
             pioneer_entity::turn_event::Entity::find()
                 .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
@@ -30587,27 +30587,24 @@ impl CrudStore {
                 .limit(1),
         )
         .await?
-        .pop() else {
-            return Ok(None);
+        .pop();
+        let event = if let Some(source) = source.as_ref().filter(|s| s.event_type == "turn/blocked")
+        {
+            // Preserve malformed-JSON errors; portable integrity was checked by hydration.
+            serde_json::from_str::<serde::de::IgnoredAny>(&source.payload)?;
+            match serde_json::from_str(&source.payload) {
+                Ok(CanonicalTurnEventPayload::TurnBlocked(event)) => Some(event),
+                _ => None,
+            }
+        } else {
+            None
         };
-        if source.event_type != "turn/blocked" {
-            return Ok(None);
-        }
-        // Preserve JSON1's malformed-JSON error before the existing optional
-        // typed diagnostic match. Portable integrity was checked by hydration.
-        serde_json::from_str::<serde::de::IgnoredAny>(&source.payload)?;
-        let Ok(CanonicalTurnEventPayload::TurnBlocked(event)) =
-            serde_json::from_str(&source.payload)
-        else {
-            return Ok(None);
-        };
-        let Some(job_id) = event
-            .resume
+        let job_id = event
             .as_ref()
-            .and_then(|r| r.blocked_recovery_job_id.clone())
-        else {
-            return Ok(None);
-        };
+            .and_then(|event| event.resume.as_ref())
+            .and_then(|resume| resume.blocked_recovery_job_id.clone());
+        // Even without a transition, prepare the same relational read as before:
+        // missing required schema must remain a database error, not successful None.
         let row = self.connection.query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             "SELECT t.error, j.diagnostic FROM turn t \
@@ -30621,9 +30618,12 @@ impl CrudStore {
              AND o.turn_id = j.turn_id AND o.item_id = j.item_id AND o.item_type = j.item_type \
              AND o.recovery_status = j.status AND o.attempt_number = MAX(j.run_count, 1) \
              AND o.error_message = COALESCE(j.last_error, j.reason, 'recovery reached a terminal outcome')",
-            vec![job_id.clone().into(), turn_id.into(), source.id.into(), source.portable_identity.into(), source.portable_revision.into()],
+            vec![job_id.clone().into(), turn_id.into(), source.as_ref().map(|s| s.id.clone()).into(), source.as_ref().map(|s| s.portable_identity.clone()).into(), source.as_ref().map(|s| s.portable_revision).into()],
         )).await?;
         let Some(row) = row else { return Ok(None) };
+        let (Some(event), Some(job_id)) = (event, job_id) else {
+            return Ok(None);
+        };
         let error: Option<String> = row.try_get("", "error")?;
         let diagnostic: Option<String> = row.try_get("", "diagnostic")?;
         let diagnostic = diagnostic.as_deref().and_then(|value| {
