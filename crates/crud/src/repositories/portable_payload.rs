@@ -779,8 +779,7 @@ impl Preparation {
                     .filter(Expr::cust(eligibility_sql(family)))
                     .limit(1);
                 if physical != table {
-                    query
-                        .query()
+                    QueryTrait::query(&mut query)
                         .from_clear()
                         .from_as(Alias::new(physical), Alias::new(table));
                 }
