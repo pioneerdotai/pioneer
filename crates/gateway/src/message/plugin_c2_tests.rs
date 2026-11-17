@@ -1672,7 +1672,7 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
         .unwrap();
     assert!(
         mcp.iter()
-            .any(|server| server.name == format!("dev_{id}_mcp-{slug}"))
+            .any(|server| server.name == format!("mcp-{slug}-dev"))
     );
     assert!(
         mcp.iter()

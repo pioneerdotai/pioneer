@@ -17,8 +17,14 @@ fn package_install_plan(
 }
 
 pub(crate) fn package_server_name(parent: &pioneer_crud::PackageRecord, member: &str) -> String {
-    if super::super::apps::dev::is_dev(parent) {
-        format!("dev_{}_{}", parent.id, member)
+    server_name(member, super::super::apps::dev::is_dev(parent))
+}
+
+// Public names distinguish dev from production; installation IDs and ownership
+// remain the authority for routing and conflict checks in the native installer.
+fn server_name(member: &str, development: bool) -> String {
+    if development {
+        format!("{member}-dev")
     } else {
         member.into()
     }
@@ -32,11 +38,7 @@ pub(crate) fn package_install_plan_mode(
     owner: &PluginOwnershipWrite,
     development: bool,
 ) -> Result<McpInstallPlan> {
-    let name = if development {
-        format!("dev_{}_{}", owner.plugin_id, owner.member_key)
-    } else {
-        owner.member_key.clone()
-    };
+    let name = server_name(&owner.member_key, development);
     let config = pioneer_packages::package_mcp::resolve_for(
         server,
         root,
