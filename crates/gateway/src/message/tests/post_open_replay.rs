@@ -157,9 +157,11 @@ impl Fixture {
 
 #[tokio::test]
 async fn held_native_live_and_orphan_replay_release_dispatcher_and_cannot_reopen_terminal() {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        for orphan in [false, true] {
-            let mut f = Fixture::new(orphan).await;
+    for orphan in [false, true] {
+        // Fixture setup/teardown is independent of dispatcher progress. Give
+        // each live/orphan scenario its own unchanged watchdog budget.
+        let mut f = Fixture::new(orphan).await;
+        tokio::time::timeout(Duration::from_secs(20), async {
             let (entered, release) = f.pause();
             let (id, mut opening) = f.open("held").await;
             entered.await.unwrap();
@@ -238,7 +240,7 @@ async fn held_native_live_and_orphan_replay_release_dispatcher_and_cannot_reopen
             }
             if !orphan {
                 assert_eq!(
-                    f.responder.await.unwrap(),
+                    (&mut f.responder).await.unwrap(),
                     pioneer_tools::PermissionApprovalResolution::AllowOnce
                 );
             }
@@ -250,10 +252,10 @@ async fn held_native_live_and_orphan_replay_release_dispatcher_and_cannot_reopen
                 .unwrap()
                 .unwrap();
             assert!(stored.response_json.unwrap().contains("allow_once"));
-        }
-    })
-    .await
-    .expect("post-open dispatcher watchdog");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("post-open dispatcher watchdog (orphan={orphan})"));
+    }
 }
 
 #[tokio::test]
