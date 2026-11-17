@@ -187,6 +187,10 @@ jobs:
       - name: archive-workspace-tests
         id: archive
         shell: bash
+        env:
+          # Concurrent workspace test builds exhausted most runner RAM and swap.
+          # Serialize Cargo jobs while retaining the full archive and shard coverage.
+          CARGO_BUILD_JOBS: 1
         run: |
           set -euo pipefail
           # Archive compilation has exited with SIGTERM without a Cargo error.
