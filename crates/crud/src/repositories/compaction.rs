@@ -3128,7 +3128,7 @@ pub(crate) async fn tool_result_access_source(
     else {
         return Ok(None);
     };
-    let value = super::turn_payload::json1_value(&row.payload)?;
+    let value = super::turn_payload::json1_fields(&row.payload, &["toolName"])?;
     let tool = value.get("toolName").and_then(|v| v.as_str());
     let arguments = if matches!(
         tool,
@@ -3139,6 +3139,7 @@ pub(crate) async fn tool_result_access_source(
                 | "threads_tools_result_read"
         )
     ) {
+        let value = super::turn_payload::json1_fields(&row.payload, &["arguments"])?;
         match value.get("arguments") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(text)) => {
