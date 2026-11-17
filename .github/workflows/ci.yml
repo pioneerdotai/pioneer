@@ -184,6 +184,9 @@ jobs:
 
       - name: archive-workspace-tests
         id: archive
+        env:
+          # Concurrent workspace test compilations nearly exhaust RAM and swap.
+          CARGO_BUILD_JOBS: 1
         shell: bash
         run: |
           set -euo pipefail
@@ -205,6 +208,8 @@ jobs:
             exit "$archive_status"
           }
           trap archive_exit EXIT
+          # Bash otherwise runs EXIT with status 0 when the runner sends TERM.
+          trap 'exit 143' TERM
           archive_resources
           /usr/bin/time -v cargo nextest archive --locked --workspace --features pioneer-cli/computer-use \
             --archive-file "$RUNNER_TEMP/nextest-tests.tar.zst"
