@@ -2547,7 +2547,9 @@ mod tests {
             "known descriptors must not form a pending compression tail"
         );
         assert!(
-            reads.0.load(std::sync::atomic::Ordering::SeqCst) - before <= 6,
+            // One cleanup frontier plus seven family frontiers. Excluded
+            // descriptors must not add any reads as their catalog grows.
+            reads.0.load(std::sync::atomic::Ordering::SeqCst) - before <= 8,
             "an excluded descriptor catalog must reach EOF without walking its rows"
         );
         assert_eq!(
