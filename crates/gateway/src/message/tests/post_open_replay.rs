@@ -157,9 +157,9 @@ impl Fixture {
 
 #[tokio::test]
 async fn held_native_live_and_orphan_replay_release_dispatcher_and_cannot_reopen_terminal() {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        for orphan in [false, true] {
-            let mut f = Fixture::new(orphan).await;
+    for orphan in [false, true] {
+        let mut f = Fixture::new(orphan).await;
+        tokio::time::timeout(Duration::from_secs(20), async {
             let (entered, release) = f.pause();
             let (id, mut opening) = f.open("held").await;
             entered.await.unwrap();
@@ -250,10 +250,10 @@ async fn held_native_live_and_orphan_replay_release_dispatcher_and_cannot_reopen
                 .unwrap()
                 .unwrap();
             assert!(stored.response_json.unwrap().contains("allow_once"));
-        }
-    })
-    .await
-    .expect("post-open dispatcher watchdog");
+        })
+        .await
+        .expect("post-open dispatcher watchdog");
+    }
 }
 
 #[tokio::test]
@@ -409,9 +409,9 @@ pub(super) async fn renew_same_subject(sessions: &SessionManager, connection: Co
 
 #[tokio::test]
 async fn native_replay_and_live_terminal_survive_same_socket_renewal_without_lost_cards() {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        for orphan in [false, true] {
-            let mut f = Fixture::new(orphan).await;
+    for orphan in [false, true] {
+        let mut f = Fixture::new(orphan).await;
+        tokio::time::timeout(Duration::from_secs(20), async {
             let (entered, release) = f.pause();
             let (id, mut opening) = f.open("renewal").await;
             entered.await.unwrap();
@@ -513,10 +513,10 @@ async fn native_replay_and_live_terminal_survive_same_socket_renewal_without_los
             f.outbound
                 .try_send_data(Message::Text("same socket remains live".into()))
                 .unwrap();
-        }
-    })
-    .await
-    .expect("native renewal watchdog");
+        })
+        .await
+        .expect("native renewal watchdog");
+    }
 }
 
 #[tokio::test]
