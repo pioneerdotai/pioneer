@@ -3675,12 +3675,6 @@ mod tests {
         assert_eq!(backing_table_count, 0);
 
         insert_turn_items(&connection, 3).await;
-        let item = store
-            .get_turn_item("turn_item_zstd", "item_0")
-            .await
-            .expect("new turn_item should read through CrudStore")
-            .expect("new turn_item should exist");
-        assert!(matches!(item, TurnItem::AgentMessage { .. }));
 
         let backing_table_after_insert = query_i64(
             &connection,
@@ -3691,6 +3685,12 @@ mod tests {
 
         insert_turn_items_with_offset(&connection, 120, 1_000).await;
         Migrator::up(&connection, None).await.unwrap();
+        let item = store
+            .get_turn_item("turn_item_zstd", "item_0")
+            .await
+            .expect("new turn_item should read through CrudStore")
+            .expect("new turn_item should exist");
+        assert!(matches!(item, TurnItem::AgentMessage { .. }));
         let compression = run_startup_once(&store, TURN_ITEM_PAYLOAD, None, 1.0)
             .await
             .expect("turn_item compression should enable after enough rows accumulate");

@@ -40719,6 +40719,7 @@ mod tests {
                         candidate.name(),
                         "m20261027_000001_portable_payload"
                             | "m20261027_000005_portable_task_event"
+                            | "m20261115_000001_portable_turn_payload"
                     ) && !migrations
                         .iter()
                         .any(|migration| migration.name() == candidate.name())
