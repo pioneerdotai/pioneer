@@ -98,7 +98,7 @@ struct SessionHost {
     snapshot_order: Mutex<u64>,
     services: AcpRuntimeServices,
     state: Mutex<State>,
-    events: mpsc::Sender<RuntimeEvent>,
+    events: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     stopped: CancellationToken,
 }
 
@@ -247,7 +247,12 @@ impl SessionHost {
     }
     async fn emit(&self, event: RuntimeEvent) -> schema::Result<()> {
         self.events
-            .send(event)
+            .send(pioneer_observability::work::WorkItem::new(
+                event,
+                pioneer_observability::work::Boundary::EventLane,
+                pioneer_observability::work::WorkKind::Event,
+                pioneer_observability::work::ExecutorRole::Event,
+            ))
             .await
             .map_err(|_| schema::Error::internal_error())
     }
@@ -1351,7 +1356,7 @@ pub(crate) struct AcpSession {
     cwd: PathBuf,
     host: Arc<SessionHost>,
     bridge: Option<AcpMcpBridge>,
-    events: Mutex<Option<mpsc::Receiver<RuntimeEvent>>>,
+    events: Mutex<Option<mpsc::Receiver<pioneer_observability::work::WorkItem<RuntimeEvent>>>>,
     prompt_worker: AsyncMutex<Option<JoinHandle<()>>>,
     pending_preparation: AsyncMutex<Option<(String, String, u64, TurnExecutionSecuritySnapshot)>>,
     auth_terminal: AsyncMutex<Option<(String, Arc<acp::auth_terminal::AuthTerminal>)>>,
@@ -1367,7 +1372,9 @@ impl AcpSession {
         limits: CliMcpRuntimeLimits,
         invoker: Arc<dyn TurnMcpInvoker>,
         services: AcpRuntimeServices,
-    ) -> Result<Self> {
+        startup_owner: &CLIAgentRuntimeSessionStartup,
+    ) -> Result<Arc<Self>> {
+        startup_owner.check_admission()?;
         ensure!(
             matches!(
                 spec.continuation,
@@ -1387,6 +1394,24 @@ impl AcpSession {
                 },
             ))),
             None => invoker,
+        };
+        let launch = acp::Launch {
+            executable: config.binary_path.clone(),
+            args: config
+                .app_server_args
+                .iter()
+                .chain(spec.options.app_server_args.iter())
+                .cloned()
+                .collect(),
+            cwd: spec
+                .options
+                .cwd
+                .clone()
+                .context("ACP requires workspace cwd")?,
+            env: super::config::acp_launch_environment(&config, &spec.options.env)?,
+            env_remove: Vec::new(),
+            stderr_ring_lines: 128,
+            process_generation: instance.generation(),
         };
         let bridge = match &spec.mcp {
             CliMcpSessionLaunch::Acp(projection)
@@ -1439,24 +1464,12 @@ impl AcpSession {
             events: tx,
             stopped: CancellationToken::new(),
         });
-        let launch = acp::Launch {
-            executable: config.binary_path.clone(),
-            args: config
-                .app_server_args
-                .iter()
-                .chain(spec.options.app_server_args.iter())
-                .cloned()
-                .collect(),
-            cwd: spec
-                .options
-                .cwd
-                .clone()
-                .context("ACP requires workspace cwd")?,
-            env: super::config::acp_launch_environment(&config, &spec.options.env)?,
-            env_remove: Vec::new(),
-            stderr_ring_lines: 128,
-            process_generation: instance.generation(),
-        };
+        if let Err(error) = startup_owner.check_admission() {
+            if let Some(bridge) = &bridge {
+                bridge.close().await?;
+            }
+            return Err(error);
+        }
         let connection = match acp::Connection::spawn(
             &launch,
             host.clone(),
@@ -1471,35 +1484,12 @@ impl AcpSession {
             Ok(connection) => Arc::new(connection),
             Err(error) => {
                 if let Some(bridge) = &bridge {
-                    bridge.close().await;
+                    bridge.close().await?;
                 }
                 return Err(error);
             }
         };
-        let startup = async {
-            if let Some(bridge) = &bridge {
-                bridge
-                    .serve(
-                        connection
-                            .process_id()
-                            .await
-                            .context("ACP process id unavailable")?,
-                        invoker,
-                        limits,
-                    )
-                    .await?;
-            }
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        if let Err(error) = startup {
-            let _ = connection.close().await;
-            if let Some(bridge) = &bridge {
-                bridge.close().await;
-            }
-            return Err(error);
-        }
-        Ok(Self {
+        let session = Arc::new(Self {
             cwd: launch.cwd.clone(),
             connection,
             host,
@@ -1510,7 +1500,31 @@ impl AcpSession {
             auth_terminal: AsyncMutex::new(None),
             skill_tooling,
             skill_runtime: AsyncMutex::new(None),
-        })
+        });
+        startup_owner.retain_session(session.clone());
+
+        let serving = async {
+            if let Some(bridge) = &session.bridge {
+                bridge
+                    .serve(
+                        session
+                            .connection
+                            .process_id()
+                            .await
+                            .context("ACP process id unavailable")?,
+                        invoker,
+                        limits,
+                    )
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::select! {
+            result = serving => result?,
+            _ = startup_owner.cancelled() => anyhow::bail!("ACP startup was stopped"),
+        }
+        startup_owner.check_admission()?;
+        Ok(session)
     }
     fn servers(&self) -> Result<Vec<schema::McpServer>> {
         self.bridge
@@ -1640,6 +1654,13 @@ impl AcpSession {
 #[async_trait]
 impl CLIAgentRuntimeSession for AcpSession {
     async fn close(&self) -> Result<()> {
+        self.stop_and_wait().await?;
+        self.cleanup_after_stop().await
+    }
+    async fn stop_and_wait(&self) -> Result<()> {
+        if let Some(bridge) = &self.bridge {
+            bridge.request_stop();
+        }
         self.host.state.lock().expect("ACP host state").retiring = true;
         if let Some(tooling) = &self.skill_tooling {
             tooling.clear().await;
@@ -1649,13 +1670,16 @@ impl CLIAgentRuntimeSession for AcpSession {
             terminal.close().await?;
         }
         let result = self.connection.close().await;
-        if let Some(bridge) = &self.bridge {
-            bridge.close().await;
-        }
         if let Some(worker) = self.prompt_worker.lock().await.take() {
             let _ = worker.await;
         }
         result
+    }
+    async fn cleanup_after_stop(&self) -> Result<()> {
+        if let Some(bridge) = &self.bridge {
+            bridge.close().await?;
+        }
+        Ok(())
     }
     async fn prepare_for_replacement(&self) -> Result<()> {
         {
@@ -1817,7 +1841,7 @@ impl CLIAgentRuntimeSession for AcpSession {
                 // is owned and awaited; its existing driver drains after release.
                 let cleanup = self.connection.retire().await;
                 if let Some(bridge) = &self.bridge {
-                    bridge.close().await;
+                    bridge.close().await?;
                 }
                 cleanup.context("ACP configuration process retirement failed")?;
                 Err(error)
@@ -2571,11 +2595,16 @@ impl CLIAgentRuntimeSession for AcpSession {
             active.request = Some(pending.id().clone());
             // Ordered dispatcher cannot project updates until this mutex is
             // released; the already-reserved ingress slot establishes start.
-            permit.send(RuntimeEvent::TurnStarted(RuntimeTurnStarted {
-                native_thread_id: Some(native_thread.into()),
-                native_turn_id: native_turn.into(),
-                native: None,
-            }));
+            permit.send(pioneer_observability::work::WorkItem::new(
+                RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                    native_thread_id: Some(native_thread.into()),
+                    native_turn_id: native_turn.into(),
+                    native: None,
+                }),
+                pioneer_observability::work::Boundary::EventLane,
+                pioneer_observability::work::WorkKind::Event,
+                pioneer_observability::work::ExecutorRole::Event,
+            ));
             Ok(pending)
         };
         let pending = if let Some(bridge) = &self.bridge {

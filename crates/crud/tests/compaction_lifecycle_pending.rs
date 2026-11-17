@@ -1553,6 +1553,13 @@ async fn lifecycle_repeated_started_keeps_one_attempt_and_completed_finishes_it(
     let (_file, store, _) = fixture(false).await;
     operation(&store, "op", "running", NOW + 60_000).await;
     let running = state(&store, "op").await;
+    use futures_util::FutureExt;
+    let signal_database = store.database_connection();
+    let mut consumers = ["projection", "maintenance.zstd", "maintenance.receipts"]
+        .map(|domain| signal_database.work_signal(domain).subscribe());
+    for consumer in &mut consumers {
+        consumer.begin_pass(&signal_database).await.unwrap();
+    }
     let started = Event::ItemStarted(pioneer_protocol::ItemStartedNotification {
         workspace_id: "ws".into(),
         thread_id: "thread".into(),
@@ -1569,6 +1576,13 @@ async fn lifecycle_repeated_started_keeps_one_attempt_and_completed_finishes_it(
         .compaction_materialize_lifecycle("op", running.generation, started.clone(), NOW / 1000)
         .await
         .unwrap();
+    for consumer in &mut consumers {
+        assert!(
+            consumer.changed().now_or_never().is_some(),
+            "published service item wakes durable event owners"
+        );
+        consumer.begin_pass(&signal_database).await.unwrap();
+    }
     let db = store.with_maintenance_access().database_connection();
     let first = turn_item::Entity::find()
         .filter(turn_item::Column::ItemId.eq("compaction:op"))
@@ -1582,6 +1596,12 @@ async fn lifecycle_repeated_started_keeps_one_attempt_and_completed_finishes_it(
         .compaction_materialize_lifecycle("op", running.generation, started, NOW / 1000 + 100)
         .await
         .unwrap();
+    for consumer in &mut consumers {
+        assert!(
+            consumer.changed().now_or_never().is_none(),
+            "idempotent started replay has no new event work"
+        );
+    }
     let repeated = turn_item::Entity::find_by_id(&first.id)
         .one(&db)
         .await

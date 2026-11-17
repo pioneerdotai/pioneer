@@ -281,6 +281,110 @@ mod tests {
         }
     }
 
+    #[test]
+    fn effective_agents_changes_refresh_provider_rules_without_rewriting_prior_projection() {
+        let root =
+            std::env::temp_dir().join(format!("pioneer_agents_delivery_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let compile = |resolved: Option<&ResolvedAgentsDocPrompt>| {
+            let runtime_sections = resolved
+                .map(|doc| {
+                    let contribution = thread_agents_doc_prompt_contribution(doc).unwrap();
+                    crate::PromptRuntimeSectionInput {
+                        id: crate::PromptRuntimeSectionId::BuiltIn(
+                            PromptRuntimeBuiltInSectionId::AgentsMd,
+                        ),
+                        title: contribution.title.map(|title| title.as_str().to_owned()),
+                        content: contribution.content.as_str().to_owned(),
+                        max_chars: contribution.max_chars,
+                        truncated: contribution.truncated,
+                    }
+                })
+                .into_iter()
+                .collect();
+            crate::compile_instruction_delivery_plan(
+                crate::compile_prompt(crate::PromptCompileInput {
+                    workspace_root: root.clone(),
+                    profile: crate::PromptProfile::AssistantFull,
+                    skills_prompt: None,
+                    retry_instruction: None,
+                    include_tool_recovery_policy: false,
+                    include_task_orchestration_policy: false,
+                    include_threads_policy: false,
+                    include_html_policy: false,
+                    continue_generation_hint: false,
+                    runtime_sections,
+                    dynamic_sections: vec![],
+                    dynamic_context: None,
+                    extra_system: None,
+                    limits: crate::PromptLimits::default(),
+                })
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut doc = ResolvedAgentsDocPrompt {
+            id: "agents-root".to_owned(),
+            version: 1,
+            content: "Use project root conventions".to_owned(),
+            source_path: vec![],
+        };
+        let root_scope = compile(Some(&doc));
+        let frozen = root_scope.provider_instructions.clone();
+        assert!(frozen.text.contains("Use project root conventions"));
+        assert!(
+            !root_scope
+                .turn_context
+                .text
+                .contains("Use project root conventions")
+        );
+        // IDs, versions and source paths are metadata; equal effective rules
+        // retain equal instructions even after a scope move.
+        doc.id = "agents-nested".to_owned();
+        doc.version = 2;
+        doc.source_path = vec!["nested".to_owned()];
+        assert_eq!(compile(Some(&doc)).provider_instructions, frozen);
+        doc.content = "Use nested project conventions".to_owned();
+        let nested_scope = compile(Some(&doc));
+        assert_ne!(nested_scope.provider_instructions, frozen);
+        assert!(
+            nested_scope
+                .provider_instructions
+                .text
+                .contains("Use nested project conventions")
+        );
+        assert!(
+            !nested_scope
+                .provider_instructions
+                .text
+                .contains("Use project root conventions")
+        );
+        doc.version += 1;
+        doc.content = "Updated nested conventions".to_owned();
+        let edited = compile(Some(&doc));
+        assert!(
+            edited
+                .provider_instructions
+                .text
+                .contains("Updated nested conventions")
+        );
+        assert!(
+            !edited
+                .provider_instructions
+                .text
+                .contains("Use nested project conventions")
+        );
+        let removed = compile(None);
+        assert!(
+            !removed
+                .provider_instructions
+                .text
+                .contains("Updated nested conventions")
+        );
+        assert!(!removed.provider_instructions.text.contains("AGENTS_MD"));
+        assert_eq!(root_scope.provider_instructions, frozen);
+    }
+
     #[tokio::test]
     async fn agents_doc_hook_resolves_effective_conversation_thread() {
         let resolver = Arc::new(CapturingResolver::default());

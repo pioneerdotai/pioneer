@@ -41,6 +41,19 @@ async fn ready(store: &CrudStore) {
 async fn seed(store: &CrudStore, turn_id: &str, count: i64, watermark: i64) {
     let db = store.database_connection();
     let now = chrono::Utc::now().fixed_offset();
+    pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
+        id: sea_orm::Set(turn_id.into()),
+        thread_id: sea_orm::Set("thread".into()),
+        status: sea_orm::Set("completed".into()),
+        prompt_manifest_json: sea_orm::Set("{}".into()),
+        mentions_json: sea_orm::Set("[]".into()),
+        created_at: sea_orm::Set(now),
+        updated_at: sea_orm::Set(now),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .unwrap();
     streams::ensure_healthy(&db, "thread", turn_id, now)
         .await
         .unwrap();
@@ -90,39 +103,10 @@ async fn seed_compacted_history(store: &CrudStore) {
 }
 
 async fn discovered_turn<C: ConnectionTrait>(db: &C, after: Option<&str>) -> Option<String> {
-    next_stream(db, after)
+    next_stream(db, after, None)
         .await
         .unwrap()
         .map(|stream| stream.turn_id)
-}
-
-#[tokio::test]
-async fn fully_compacted_history_has_no_discovery_candidates() {
-    let store = store().await;
-    seed_compacted_history(&store).await;
-    ready(&store).await;
-    let db = store.database_connection();
-    assert_eq!(
-        stream::Entity::find().count(&db).await.unwrap(),
-        COMPACTED_HISTORY_TURNS
-    );
-    assert!(discovered_turn(&db, None).await.is_none());
-    assert!(discovered_turn(&db, Some("history-10000")).await.is_none());
-    let outcome = store
-        .cleanup_projection_receipts_quantum(None)
-        .await
-        .unwrap();
-    assert!(outcome.backfill_ready);
-    assert!(outcome.last_turn_id.is_none());
-    assert_eq!(outcome.rows_deleted, 0);
-    assert_eq!(outcome.source_bytes, 0);
-    assert!(!outcome.deferred);
-    assert!(!outcome.failed);
-    assert_eq!(receipt::Entity::find().count(&db).await.unwrap(), 0);
-    assert_eq!(
-        turn_event::Entity::find().count(&db).await.unwrap(),
-        COMPACTED_HISTORY_TURNS
-    );
 }
 
 #[tokio::test]
@@ -151,6 +135,13 @@ async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() 
     .unwrap();
     ready(&store).await;
 
+    let upper = store
+        .projection_receipt_cleanup_upper_bound()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(upper, candidates[2]);
+
     // Check the access path against the current schema without pinning names.
     let partial_indexes = db
         .query_all_raw(Statement::from_string(
@@ -172,7 +163,7 @@ async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() 
 
     // Explain both production statements with their original bind values.
     for after in [None, Some(candidates[0])] {
-        let mut statement = discovery_statement(after);
+        let mut statement = discovery_statement(after, None, false);
         assert!(statement.sql.contains("status = 'healthy'"));
         statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
         let plan = db
@@ -212,7 +203,7 @@ async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() 
             Some(expected)
         );
         let outcome = store
-            .cleanup_projection_receipts_quantum(after.as_deref())
+            .cleanup_projection_receipts_quantum(after.as_deref(), None)
             .await
             .unwrap();
         assert_eq!(outcome.last_turn_id.as_deref(), Some(expected));
@@ -230,6 +221,21 @@ async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() 
         turn_event::Entity::find().count(&db).await.unwrap(),
         COMPACTED_HISTORY_TURNS + 7
     );
+    seed(&store, "zz-new-suffix", 2, 2).await;
+    assert!(
+        next_stream(&db, Some(&upper), Some(&upper))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        next_stream(&db, Some(&upper), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .turn_id,
+        "zz-new-suffix"
+    );
 }
 
 #[tokio::test]
@@ -242,7 +248,7 @@ async fn index_membership_follows_projection_cleanup_quarantine_and_restore() {
     insert_event(&store, "turn", 1, "pending").await;
     assert!(discovered_turn(&db, None).await.is_none());
     let empty = store
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert!(empty.last_turn_id.is_none());
@@ -310,7 +316,7 @@ async fn index_membership_follows_projection_cleanup_quarantine_and_restore() {
     assert!(streams::restore(&db, "turn", "turn-2", now).await.unwrap());
     assert_eq!(discovered_turn(&db, None).await.as_deref(), Some("turn"));
     let cleaned = store
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert_eq!(cleaned.rows_deleted, 1);
@@ -355,7 +361,7 @@ async fn discovery_excludes_invalid_compaction_boundaries_and_preserves_receipts
             .unwrap();
         assert!(discovered_turn(&db, None).await.is_none());
         let empty = store
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap();
         assert!(empty.last_turn_id.is_none());
@@ -380,7 +386,7 @@ async fn byte_budget_can_end_a_quantum_before_the_row_limit() {
         .await
         .unwrap();
     let first = store
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert_eq!(first.rows_deleted, 1);
@@ -388,7 +394,7 @@ async fn byte_budget_can_end_a_quantum_before_the_row_limit() {
     assert_eq!(boundary(&store, "turn").await, 1);
     assert_eq!(
         store
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .rows_deleted,
@@ -402,7 +408,7 @@ async fn waits_for_backfill_and_requires_maintenance_reads_and_writes() {
     seed(&store, "turn", 2, 2).await;
     assert!(
         !store
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .backfill_ready
@@ -420,7 +426,7 @@ async fn waits_for_backfill_and_requires_maintenance_reads_and_writes() {
             .await
             .unwrap();
         let outcome = store
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap();
         assert!(!outcome.backfill_ready);
@@ -439,7 +445,7 @@ async fn waits_for_backfill_and_requires_maintenance_reads_and_writes() {
     let wrong_scope = store.with_maintenance_reads_and_critical_writes();
     assert!(
         wrong_scope
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .is_err()
     );
@@ -452,7 +458,7 @@ async fn waits_for_backfill_and_requires_maintenance_reads_and_writes() {
     );
     assert_eq!(
         store
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .rows_deleted,
@@ -466,7 +472,7 @@ async fn bounded_cleanup_resumes_and_observes_the_retained_suffix() {
     seed(&store, "turn", 130, 130).await;
     ready(&store).await;
     let first = store
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert_eq!(first.rows_deleted, RECEIPT_CLEANUP_MAX_ROWS);
@@ -483,14 +489,14 @@ async fn bounded_cleanup_resumes_and_observes_the_retained_suffix() {
     let restarted = CrudStore::new(db.clone()).with_maintenance_access();
     assert_eq!(
         restarted
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .rows_deleted,
         2
     );
     let empty = restarted
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert_eq!(empty.rows_deleted, 0);
@@ -516,7 +522,7 @@ async fn legacy_gap_is_not_bridged_by_compaction_or_restart_observation() {
     ready(&store).await;
     assert_eq!(
         store
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .rows_deleted,
@@ -526,7 +532,7 @@ async fn legacy_gap_is_not_bridged_by_compaction_or_restart_observation() {
     let restarted = CrudStore::new(db.clone()).with_maintenance_access();
     assert_eq!(
         restarted
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .rows_deleted,
@@ -534,7 +540,7 @@ async fn legacy_gap_is_not_bridged_by_compaction_or_restart_observation() {
     );
     assert_eq!(
         restarted
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .rows_deleted,
@@ -582,13 +588,13 @@ async fn unfinished_receipts_and_quarantined_streams_survive_without_stalling_ot
             .unwrap();
         ready(&store).await;
         let first = store
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap();
         assert_eq!(first.rows_deleted, 1);
         assert!(first.deferred);
         let second = store
-            .cleanup_projection_receipts_quantum(first.last_turn_id.as_deref())
+            .cleanup_projection_receipts_quantum(first.last_turn_id.as_deref(), None)
             .await
             .unwrap();
         assert_eq!(second.rows_deleted, 1);
@@ -619,7 +625,7 @@ async fn unfinished_receipts_and_quarantined_streams_survive_without_stalling_ot
         .unwrap();
     ready(&store).await;
     let outcome = store
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert!(outcome.last_turn_id.is_none());
@@ -652,7 +658,7 @@ async fn oversized_receipt_and_canonical_gap_are_deferred() {
         .unwrap();
     ready(&store).await;
     let first = store
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert!(first.deferred);
@@ -669,7 +675,7 @@ async fn oversized_receipt_and_canonical_gap_are_deferred() {
     );
     assert_eq!(
         store
-            .cleanup_projection_receipts_quantum(first.last_turn_id.as_deref())
+            .cleanup_projection_receipts_quantum(first.last_turn_id.as_deref(), None)
             .await
             .unwrap()
             .rows_deleted,
@@ -694,7 +700,7 @@ async fn oversized_receipt_and_canonical_gap_are_deferred() {
             .unwrap()
     );
     let gap = store
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert_eq!(gap.rows_deleted, 1);
@@ -716,7 +722,7 @@ async fn oversized_receipt_and_canonical_gap_are_deferred() {
             .is_some()
     );
     let next = store
-        .cleanup_projection_receipts_quantum(gap.last_turn_id.as_deref())
+        .cleanup_projection_receipts_quantum(gap.last_turn_id.as_deref(), None)
         .await
         .unwrap();
     assert_eq!(next.last_turn_id.as_deref(), Some("b"));
@@ -744,7 +750,7 @@ async fn stale_preparation_is_revalidated_under_the_writer() {
         seed(&store, "turn", 2, 2).await;
         ready(&store).await;
         let db = store.database_connection();
-        let prepared = prepare(&db, next_stream(&db, None).await.unwrap().unwrap())
+        let prepared = prepare(&db, next_stream(&db, None, None).await.unwrap().unwrap())
             .await
             .unwrap();
         db.execute_unprepared(mutation).await.unwrap();
@@ -765,7 +771,7 @@ async fn boundary_failure_rolls_back_deletion_and_does_not_starve_next_stream() 
     let db = store.database_connection();
     db.execute_unprepared("CREATE TRIGGER reject_cleanup_boundary BEFORE UPDATE OF receipts_compacted_through_sequence ON turn_event_projection_stream_state WHEN NEW.turn_id = 'a' BEGIN SELECT RAISE(ABORT, 'injected failure'); END").await.unwrap();
     let first = store
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert!(first.failed);
@@ -776,7 +782,7 @@ async fn boundary_failure_rolls_back_deletion_and_does_not_starve_next_stream() 
     assert_eq!(discovered_turn(&db, None).await.as_deref(), Some("a"));
     assert_eq!(
         store
-            .cleanup_projection_receipts_quantum(first.last_turn_id.as_deref())
+            .cleanup_projection_receipts_quantum(first.last_turn_id.as_deref(), None)
             .await
             .unwrap()
             .rows_deleted,
@@ -787,7 +793,7 @@ async fn boundary_failure_rolls_back_deletion_and_does_not_starve_next_stream() 
         .unwrap();
     let restarted = CrudStore::new(db.clone()).with_maintenance_access();
     let retried = restarted
-        .cleanup_projection_receipts_quantum(None)
+        .cleanup_projection_receipts_quantum(None, None)
         .await
         .unwrap();
     assert_eq!(retried.last_turn_id.as_deref(), Some("a"));
@@ -804,7 +810,7 @@ async fn concurrent_projection_and_repeated_preparation_preserve_the_new_suffix(
     seed(&store, "turn", 2, 2).await;
     ready(&store).await;
     let db = store.database_connection();
-    let prepared = prepare(&db, next_stream(&db, None).await.unwrap().unwrap())
+    let prepared = prepare(&db, next_stream(&db, None, None).await.unwrap().unwrap())
         .await
         .unwrap();
     insert_event(&store, "turn", 3, "pending").await;
@@ -857,7 +863,7 @@ async fn concurrent_projection_and_repeated_preparation_preserve_the_new_suffix(
     let restarted = CrudStore::new(db.clone()).with_maintenance_access();
     assert_eq!(
         restarted
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .rows_deleted,
@@ -875,7 +881,7 @@ async fn new_claims_and_atomic_watermark_updates_continue_after_all_receipts_are
     ready(&store).await;
     assert_eq!(
         store
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .rows_deleted,
@@ -917,7 +923,7 @@ async fn new_claims_and_atomic_watermark_updates_continue_after_all_receipts_are
     );
     assert_eq!(
         store
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .rows_deleted,
@@ -951,7 +957,7 @@ async fn cleanup_reads_canonical_keys_through_the_production_zstd_view() {
     .unwrap();
     assert_eq!(
         store
-            .cleanup_projection_receipts_quantum(None)
+            .cleanup_projection_receipts_quantum(None, None)
             .await
             .unwrap()
             .rows_deleted,
@@ -1031,7 +1037,7 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
     // read and the empty indexed discovery, even while the writer is occupied.
     let empty = tokio::time::timeout(
         Duration::from_secs(1),
-        store.cleanup_projection_receipts_quantum(None),
+        store.cleanup_projection_receipts_quantum(None, None),
     )
     .await
     .unwrap()
@@ -1039,6 +1045,9 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
     assert!(empty.backfill_ready);
     assert!(empty.last_turn_id.is_none());
     assert_eq!(empty.rows_deleted, 0);
+    assert_eq!(empty.source_bytes, 0);
+    assert!(!empty.deferred);
+    assert!(!empty.failed);
     assert!(events.0.lock().unwrap().is_empty());
     {
         let observed = reads.0.lock().unwrap();
@@ -1079,6 +1088,15 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
             2
         );
     }
+    assert_eq!(receipt::Entity::find().count(&database).await.unwrap(), 0);
+    assert_eq!(
+        stream::Entity::find().count(&database).await.unwrap(),
+        COMPACTED_HISTORY_TURNS
+    );
+    assert_eq!(
+        turn_event::Entity::find().count(&database).await.unwrap(),
+        COMPACTED_HISTORY_TURNS
+    );
     blocker.rollback().await.unwrap();
     seed(&store, "turn", 2, 2).await;
     let blocker = database.begin().await.unwrap();
@@ -1087,7 +1105,7 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
     // Exhausted discovery must finish while the only writer is occupied.
     let empty = tokio::time::timeout(
         Duration::from_secs(1),
-        store.cleanup_projection_receipts_quantum(Some("zzzz")),
+        store.cleanup_projection_receipts_quantum(Some("zzzz"), None),
     )
     .await
     .unwrap()
@@ -1095,7 +1113,7 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
     assert!(empty.last_turn_id.is_none());
     assert!(events.0.lock().unwrap().is_empty());
 
-    let mut work = Box::pin(store.cleanup_projection_receipts_quantum(None));
+    let mut work = Box::pin(store.cleanup_projection_receipts_quantum(None, None));
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             tokio::select! {
@@ -1133,7 +1151,7 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
     assert_eq!(
         tokio::time::timeout(
             Duration::from_secs(1),
-            store.cleanup_projection_receipts_quantum(None)
+            store.cleanup_projection_receipts_quantum(None, None)
         )
         .await
         .unwrap()
@@ -1144,4 +1162,120 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
     drop(store);
     database.close().await.unwrap();
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn running_turn_receipts_wait_for_terminal_and_resume_invalidates_preparation() {
+    let store = store().await;
+    seed(&store, "turn", 3, 3).await;
+    ready(&store).await;
+    let db = store.database_connection();
+    for status in ["in_progress", "completed", "failed", "interrupted"] {
+        turn::Entity::update_many()
+            .col_expr(turn::Column::Status, Expr::value(status))
+            .filter(turn::Column::Id.eq("turn"))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            discovered_turn(&db, None).await.is_some(),
+            status != "in_progress"
+        );
+    }
+    let selected = next_stream(&db, None, None).await.unwrap().unwrap();
+    let prepared = prepare(&db, selected).await.unwrap();
+    // A genuine state change between reader preparation and writer apply.
+    turn::Entity::update_many()
+        .col_expr(turn::Column::Status, Expr::value("in_progress"))
+        .filter(turn::Column::Id.eq("turn"))
+        .exec(&db)
+        .await
+        .unwrap();
+    let tx = db.begin().await.unwrap();
+    assert_eq!(apply(&tx, &prepared).await.unwrap(), 0);
+    tx.commit().await.unwrap();
+    assert_eq!(boundary(&store, "turn").await, 0);
+    assert_eq!(receipt::Entity::find().count(&db).await.unwrap(), 3);
+    turn::Entity::update_many()
+        .col_expr(turn::Column::Status, Expr::value("completed"))
+        .filter(turn::Column::Id.eq("turn"))
+        .exec(&db)
+        .await
+        .unwrap();
+    let restarted = CrudStore::new(db.clone()).with_maintenance_access();
+    assert_eq!(
+        restarted
+            .cleanup_projection_receipts_quantum(None, None)
+            .await
+            .unwrap()
+            .rows_deleted,
+        3
+    );
+    assert_eq!(boundary(&restarted, "turn").await, 3);
+}
+
+#[tokio::test]
+async fn addressed_batches_freeze_the_frontier_preserve_other_turns_and_recover_on_restart() {
+    let store = store().await;
+    seed(&store, "a", 130, 130).await;
+    seed(&store, "b", 1, 1).await;
+    ready(&store).await;
+    let first = store
+        .cleanup_projection_receipts_for_turn("a", None)
+        .await
+        .unwrap();
+    assert_eq!(first.rows_deleted, 128);
+    assert_eq!(first.through_sequence, Some(130));
+    assert_eq!(boundary(&store, "b").await, 0);
+    insert_event(&store, "a", 131, "projected").await;
+    let db = store.database_connection();
+    assert!(
+        streams::advance_projected_through(&db, "a", 130, 131, chrono::Utc::now().fixed_offset())
+            .await
+            .unwrap()
+    );
+    let second = store
+        .cleanup_projection_receipts_for_turn("a", first.through_sequence)
+        .await
+        .unwrap();
+    assert_eq!(second.rows_deleted, 2);
+    assert_eq!(boundary(&store, "a").await, 130);
+    assert_eq!(
+        store
+            .cleanup_projection_receipts_for_turn("a", first.through_sequence)
+            .await
+            .unwrap()
+            .rows_deleted,
+        0
+    );
+    assert!(
+        receipt::Entity::find_by_id("a-131")
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // A later notification opens a new frontier for the same ID, not an
+    // inventory of B or any other old stream.
+    assert_eq!(
+        store
+            .cleanup_projection_receipts_for_turn("a", None)
+            .await
+            .unwrap()
+            .rows_deleted,
+        1
+    );
+    assert_eq!(boundary(&store, "b").await, 0);
+    let restarted = CrudStore::new(db).with_maintenance_access();
+    // Process-local hints may disappear on restart; durable recovery is enough.
+    assert_eq!(
+        restarted
+            .cleanup_projection_receipts_quantum(None, None)
+            .await
+            .unwrap()
+            .last_turn_id
+            .as_deref(),
+        Some("b")
+    );
+    assert_eq!(boundary(&restarted, "b").await, 1);
 }

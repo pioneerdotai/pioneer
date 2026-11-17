@@ -25,7 +25,7 @@ Inspect `reviewContent`, not only `candidate.result.summary`. Summary is deliber
 
 ## Child Result Is Bad Or Missing Evidence
 
-Use `task_revise` with specific feedback. Avoid vague prompts.
+For a pending candidate from requireReview:true work, use task_revise with specific feedback. With requireReview:false the result completes automatically and cannot be reopened through task_revise. Report the defect and follow the user's instructions for any additional work. Select true before launching assignments that need this correction lifecycle. Avoid vague feedback.
 
 Bad:
 
@@ -57,8 +57,8 @@ If the parent answered while attached tasks were still active or waiting for rev
 Recover by:
 
 1. waiting on the active runs;
-2. reviewing candidates;
-3. accepting/revising/cancelling;
+2. inspecting completed results and any pending review candidates;
+3. accepting/revising pending candidates or cancelling active work when appropriate;
 4. sending a corrected synthesis.
 
 ## Stuck Or Failed Attached Work
@@ -72,13 +72,13 @@ Inspect:
 - result candidates;
 - child thread evidence when available.
 
-Use `task_result(candidateId)` before looking for child-thread or database workarounds. Direct database access is not part of the review protocol and must not be required to accept or revise a candidate.
+For a known candidate ID, use task_result(candidateId) before looking for child-thread or database workarounds. Direct database access is not part of the review protocol and must not be required to accept or revise a candidate.
 
 An unchanged `running` run, absent result, repeated `task_get` output, or repeated `task_wait` timeouts does not by itself establish a stall. Heartbeats show liveness, while recorded activity shows only that the runtime observed work; neither promises a result. Missing activity data is unknown. Wait again for active attached work after a wait timeout. Use a confirmed error, changed user request, unsafe or irrelevant work, or another concrete reason when deciding to cancel or repeat work.
 
 Then choose:
 
-- revise if the candidate is close;
+- revise if a review-required candidate is pending and close;
 - cancel if the child is wrong, unsafe, or no longer useful;
 - detach if the parent can continue and the work should keep running;
 - explain clearly if the runtime lacks the required capability.

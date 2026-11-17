@@ -19,6 +19,27 @@
     "enforcement": {
       "$ref": "#/$defs/TurnSecurityEnforcementStatus"
     },
+    "native_context": {
+      "description": "Financial context authorization for this exact Native/API execution.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativeContextBudget"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "native_summary": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativeSummaryContext"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "network": {
       "$ref": "#/$defs/TurnNetworkPolicySnapshot"
     },
@@ -101,6 +122,115 @@
         "supports_request_permissions"
       ]
     },
+    "NativeContextBudget": {
+      "description": "Durable local authorization and budget for one Native/API provider authority/model.\nNever sent to a provider or accepted as a child tool's requested variant.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "instance": {
+          "type": "string"
+        },
+        "manual_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_input": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_output": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model": {
+          "type": "string"
+        },
+        "service_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeServiceModePlan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "instance",
+        "model",
+        "context_window"
+      ]
+    },
+    "NativeServiceModePlan": {
+      "description": "Frozen semantic contract. Prices are captured separately per physical request.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "parameters": {
+          "$ref": "#/$defs/ServiceModeParameters"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "parameters"
+      ]
+    },
+    "NativeSummaryContext": {
+      "description": "API summarizer selection and its resolved budget, captured with a Native launch.",
+      "type": "object",
+      "properties": {
+        "budget": {
+          "$ref": "#/$defs/NativeContextBudget"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inherits_working": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "budget",
+        "inherits_working"
+      ]
+    },
+    "OpenAiTier": {
+      "type": "string",
+      "enum": [
+        "priority",
+        "flex",
+        "ultrafast"
+      ]
+    },
     "PermissionBehavior": {
       "type": "string",
       "enum": [
@@ -123,6 +253,124 @@
         "none",
         "optional",
         "required"
+      ]
+    },
+    "ServiceModeParameters": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "neutral"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "open_ai_standard"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "anthropic_standard"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bedrock_standard"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "open_ai_tier"
+            },
+            "tier": {
+              "$ref": "#/$defs/OpenAiTier"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "tier"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "open_ai_pro"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "beta": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "anthropic_fast"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bedrock_nested_ultrafast"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
       ]
     },
     "ToolPermissionPolicySnapshot": {

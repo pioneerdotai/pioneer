@@ -202,6 +202,9 @@ impl Fixture {
     }
     async fn turn_in_schema(&self, id: &str, completed: bool, historical: bool) -> Result<()> {
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws-cleanup".into(),
             id: "thread-cleanup".into(),
             name: None,
@@ -222,6 +225,7 @@ impl Fixture {
             turns: vec![],
         };
         let mut turn = Turn {
+            work_owner: Default::default(),
             id: id.into(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -535,6 +539,9 @@ async fn preserves_retained_rows_and_coalesces_waiting_active_events() -> Result
     let revision = f
         .scalar("SELECT revision FROM native_event_cleanup_job WHERE turn_id='active'")
         .await?;
+    use futures_util::FutureExt;
+    let mut wake = f.db.work_signal("maintenance.native").subscribe();
+    wake.begin_pass(&f.db).await?;
     for i in 0..10 {
         f.event(
             &format!("delta-{i}"),
@@ -550,6 +557,10 @@ async fn preserves_retained_rows_and_coalesces_waiting_active_events() -> Result
             .await?,
         revision
     );
+    assert!(
+        wake.wait(None).now_or_never().is_none(),
+        "active-turn deltas must not wake terminal cleanup"
+    );
     assert_eq!(run(&f.db, 10).await?.jobs_examined, 0);
     f.event(
         "current-runtime-late",
@@ -559,6 +570,10 @@ async fn preserves_retained_rows_and_coalesces_waiting_active_events() -> Result
         8,
     )
     .await?;
+    assert!(
+        wake.wait(None).now_or_never().is_some(),
+        "late raw events for terminal Turns must wake cleanup"
+    );
     assert_eq!(run(&f.db, 11).await?.events_deleted, 1);
     Ok(())
 }
@@ -1156,73 +1171,72 @@ async fn bootstrap_cursor_rolls_back_with_job_registration_failure() -> Result<(
 }
 
 #[tokio::test]
-async fn queued_cleanup_matches_baseline_retained_id_set() -> Result<()> {
-    let baseline = Fixture::open().await?;
-    let addressed = Fixture::open().await?;
-    for f in [&baseline, &addressed] {
-        f.turn("done", true).await?;
-        f.turn("active", false).await?;
-        for i in 0..160 {
-            f.event(
-                &format!("history-{i:03}"),
-                Some("done"),
-                "codex",
-                if i % 10 == 0 {
-                    "item/completed"
-                } else {
-                    "turn/completed"
-                },
-                128,
-            )
-            .await?;
-        }
-        f.event("active", Some("active"), "codex", "item/completed", 128)
-            .await?;
-        f.event("orphan", None, "codex", "item/completed", 128)
-            .await?;
-        f.event("wrong", Some("done"), "wrong", "item/completed", 128)
-            .await?;
-        f.event("oversized", Some("done"), "codex", "item/completed", 262145)
-            .await?;
+async fn queued_cleanup_keeps_exact_retained_ids_across_sparse_history() -> Result<()> {
+    let f = Fixture::open().await?;
+    f.turn("done", true).await?;
+    f.turn("active", false).await?;
+    for i in 0..160 {
+        f.event(
+            &format!("history-{i:03}"),
+            Some("done"),
+            "codex",
+            if i % 10 == 0 {
+                "item/completed"
+            } else {
+                "turn/completed"
+            },
+            128,
+        )
+        .await?;
     }
-    let mut cursor = 0;
+    f.event("active", Some("active"), "codex", "item/completed", 128)
+        .await?;
+    f.event("orphan", None, "codex", "item/completed", 128)
+        .await?;
+    f.event("wrong", Some("done"), "wrong", "item/completed", 128)
+        .await?;
+    f.event("oversized", Some("done"), "codex", "item/completed", 262145)
+        .await?;
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM cli_runtime_native_event")
+            .await?,
+        164
+    );
+    let maintenance = f.store.with_maintenance_access();
+    let mut deleted = 0;
     let mut finished = false;
     for _ in 0..20 {
-        let m = baseline
-            .store
-            .with_maintenance_access()
-            .cleanup_native_events_baseline_quantum(cursor)
-            .await?;
-        match m.last_rowid {
-            Some(next) => cursor = next,
-            None => {
-                finished = true;
-                break;
-            }
-        }
-    }
-    assert!(finished);
-    finished = false;
-    for now in 1..20 {
-        if run(&addressed.db, now).await?.jobs_examined == 0 {
+        let metrics = maintenance.cleanup_native_events_quantum().await?;
+        deleted += metrics.events_deleted;
+        if metrics.jobs_examined == 0 {
             finished = true;
             break;
         }
     }
-    assert!(finished);
-    async fn ids(f: &Fixture) -> Result<Vec<String>> {
-        let rows =
-            f.db.query_all_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT id FROM cli_runtime_native_event ORDER BY id",
-            ))
-            .await?;
-        Ok(rows
-            .iter()
-            .map(|row| row.try_get_by_index(0))
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-    assert_eq!(ids(&baseline).await?, ids(&addressed).await?);
+    assert!(finished, "cleanup should settle within the bounded fixture");
+    assert_eq!(deleted, 16);
+    let rows =
+        f.db.query_all_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT id FROM cli_runtime_native_event ORDER BY id",
+        ))
+        .await?;
+    let retained = rows
+        .iter()
+        .map(|row| row.try_get_by_index(0))
+        .collect::<Result<Vec<String>, _>>()?;
+    let mut expected: Vec<String> = ["active", "orphan", "oversized", "wrong"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    expected.extend(
+        (0..160)
+            .filter(|i| i % 10 != 0)
+            .map(|i| format!("history-{i:03}")),
+    );
+    expected.sort();
+    assert_eq!(retained.len(), 148);
+    assert_eq!(retained, expected);
     Ok(())
 }
 
@@ -1306,4 +1320,21 @@ async fn migration_schema_and_marker_roll_back_together_after_index_failure() ->
     );
     assert!(bootstrap(&f.db).await?.complete);
     Ok(())
+}
+
+#[tokio::test]
+async fn retry_deadline_ignores_dependency_waiters_and_preserves_subsecond_due_time() {
+    let f = Fixture::open().await.unwrap();
+    assert_eq!(f.store.native_event_cleanup_deadline().await.unwrap(), None);
+    f.sql("INSERT INTO native_event_cleanup_job(turn_id,state,available_at,last_served_at,revision) VALUES('blocked','waiting',1,0,1),('retry','queued',1900000000000001,0,1)")
+        .await.unwrap();
+    assert_eq!(
+        f.store.native_event_cleanup_deadline().await.unwrap(),
+        Some(1_900_000_001),
+        "round up a real retry; never repeatedly wake before microsecond eligibility"
+    );
+    f.sql("UPDATE native_event_cleanup_job SET state='waiting' WHERE turn_id='retry'")
+        .await
+        .unwrap();
+    assert_eq!(f.store.native_event_cleanup_deadline().await.unwrap(), None);
 }

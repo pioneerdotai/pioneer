@@ -83,6 +83,12 @@ struct TurnWorkItemsSnapshot {
     removed_work_item_ids: Vec<String>,
 }
 
+enum TurnWorkProjectionRead {
+    Present(turn_work_projection::Model),
+    DetachedAbsent { revision: (i64, i64) },
+    Absent,
+}
+
 #[derive(Default)]
 struct UserMessageTimelineBatch {
     turns: HashMap<String, Turn>,
@@ -158,6 +164,24 @@ impl MessageProcessor {
             return;
         }
 
+        // One persisted row for this operation, before any peer keys/ready ack.
+        // Hidden reads remain valid; sidebar membership is separate from ThreadRead.
+        let sidebar_visible = match self.crud_store.get_thread_by_id(thread_id).await {
+            Ok(Some(thread)) if thread.workspace_id == authorization.workspace_id() => {
+                thread.sidebar_visibility == "visible"
+            }
+            _ => {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+        let push_mutation = sidebar_visible
+            .then(|| self.begin_push_mutation(connection_id, authorization.workspace_id(), true))
+            .flatten();
         let response_payload = match self
             .crud_store
             .mark_thread_read(pioneer_crud::MarkThreadReadRequest {
@@ -200,6 +224,23 @@ impl MessageProcessor {
                 return;
             }
         };
+        if sidebar_visible {
+            self.dirty_push_peers(
+                request_context,
+                &response_payload.workspace_id,
+                Some(&response_payload.thread_id),
+                None,
+            );
+        }
+        if let Some(mutation) = push_mutation {
+            mutation.finish(
+                Some((
+                    response_payload.thread_id.clone(),
+                    response_payload.unread_count,
+                )),
+                None,
+            );
+        }
         log_thread_read_outcome(
             thread_id,
             through_turn_id,
@@ -255,6 +296,11 @@ impl MessageProcessor {
         request_id: RequestId,
         params: ThreadTimelinePageParams,
     ) {
+        let mut page_observation = pioneer_observability::opening::Measure::start(
+            pioneer_observability::opening::Phase::TimelinePage,
+            &pioneer_observability::scenario::Correlation::capture(),
+            &[],
+        );
         let connection_id = request_context.connection_id();
         if authorization.thread_id() != params.thread_id.trim() {
             self.send_error(
@@ -262,6 +308,7 @@ impl MessageProcessor {
                 AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Rejected);
             return;
         }
         if params.thread_id.trim().is_empty() {
@@ -277,6 +324,7 @@ impl MessageProcessor {
                 ),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Rejected);
             return;
         }
 
@@ -289,6 +337,7 @@ impl MessageProcessor {
                         error.into_error_response(request_id, methods::THREAD_TIMELINE_PAGE),
                     )
                     .await;
+                    page_observation.finish(pioneer_observability::opening::Result::Rejected);
                     return;
                 }
             };
@@ -305,6 +354,7 @@ impl MessageProcessor {
                     error.into_error_response(request_id, methods::THREAD_TIMELINE_PAGE),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Rejected);
                 return;
             }
         };
@@ -353,6 +403,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -367,6 +418,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -377,6 +429,7 @@ impl MessageProcessor {
                 AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
+            page_observation.finish(pioneer_observability::opening::Result::Failed);
             trace.finish_failure();
             return;
         }
@@ -454,6 +507,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -485,6 +539,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -513,10 +568,28 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
         };
+        if let Err(error) = self
+            .enrich_codex_retry_notices(request_context, &mut blocks)
+            .await
+        {
+            self.send_error(
+                connection_id,
+                timeline_public_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to load Codex retry notices: {error:#}"),
+                ),
+            )
+            .await;
+            page_observation.finish(pioneer_observability::opening::Result::Failed);
+            trace.finish_failure();
+            return;
+        }
         trace.record_items(
             pioneer_observability::GatewayOperationItemKind::ThreadTimelineMaterializedBlocks,
             u64::try_from(blocks.len()).unwrap_or(u64::MAX),
@@ -545,6 +618,7 @@ impl MessageProcessor {
                         ),
                     )
                     .await;
+                    page_observation.finish(pioneer_observability::opening::Result::Failed);
                     trace.finish_failure();
                     return;
                 }
@@ -563,14 +637,6 @@ impl MessageProcessor {
             u64::try_from(blocks.len()).unwrap_or(u64::MAX),
         );
 
-        let connection_workspace_stage = trace.stage(
-            pioneer_observability::GatewayOperationStage::ThreadTimelineConnectionWorkspaceSet,
-        );
-        self.session_manager
-            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-            .await;
-        connection_workspace_stage.succeed();
-
         let response_payload = ThreadTimelinePageResponse {
             workspace_id,
             thread_id: requested_thread_id,
@@ -580,6 +646,9 @@ impl MessageProcessor {
         };
         let response_encode_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelineResponseEncode);
+        self.foreground_starts
+            .before_thread_snapshot(&response_payload.thread_id)
+            .await;
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => {
                 response_encode_stage.succeed();
@@ -596,6 +665,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                page_observation.finish(pioneer_observability::opening::Result::Failed);
                 trace.finish_failure();
                 return;
             }
@@ -610,10 +680,12 @@ impl MessageProcessor {
                 error = %format!("{error:#}"),
                 "failed to send thread/timeline/page response"
             );
+            page_observation.finish(pioneer_observability::opening::Result::Failed);
             trace.finish_failure();
             return;
         }
         response_send_stage.succeed();
+        page_observation.finish(pioneer_observability::opening::Result::Returned);
         trace.finish_success();
     }
 
@@ -680,35 +752,15 @@ impl MessageProcessor {
             }
         };
 
-        let work_projection = match self
-            .crud_store
-            .get_turn_work_projection(params.turn_id.as_str())
+        let projection_read = match self
+            .load_scoped_turn_work_projection(
+                authorization.workspace_id(),
+                &params.thread_id,
+                &params.turn_id,
+            )
             .await
         {
-            Ok(Some(projection))
-                if projection.thread_id == params.thread_id
-                    && projection.workspace_id == authorization.workspace_id() =>
-            {
-                Some(projection)
-            }
-            Ok(Some(_)) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        format!(
-                            "invalid params for `{}`: turn `{}` does not belong to thread `{}`",
-                            methods::TURN_WORK_PAGE,
-                            params.turn_id,
-                            params.thread_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-            Ok(None) => None,
+            Ok(read) => read,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -722,21 +774,33 @@ impl MessageProcessor {
                 return;
             }
         };
+        let (work_projection, absent_revision) = match projection_read {
+            TurnWorkProjectionRead::Present(projection) => (Some(projection), None),
+            TurnWorkProjectionRead::DetachedAbsent { revision } => (None, Some(revision)),
+            TurnWorkProjectionRead::Absent => (None, None),
+        };
 
         let Some(work_projection) = work_projection else {
-            let (source_high_watermark, projection_updated_at_unix_micros) = match self
-                .crud_store
-                .get_turn_event_projection_stream_state(params.turn_id.as_str())
-                .await
-            {
-                Ok(state) => state
+            // Other lawful empty page cases retain their existing behavior.
+            let revision = match absent_revision {
+                Some(revision) => Ok(revision),
+                None => self
+                    .crud_store
+                    .get_turn_event_projection_stream_state(&params.turn_id)
+                    .await
                     .map(|state| {
-                        (
-                            state.projected_through_sequence,
-                            state.updated_at_unix_micros,
-                        )
-                    })
-                    .unwrap_or_default(),
+                        state
+                            .map(|state| {
+                                (
+                                    state.projected_through_sequence,
+                                    state.updated_at_unix_micros,
+                                )
+                            })
+                            .unwrap_or_default()
+                    }),
+            };
+            let (source_high_watermark, projection_updated_at_unix_micros) = match revision {
+                Ok(revision) => revision,
                 Err(error) => {
                     self.send_error(
                         connection_id,
@@ -751,9 +815,6 @@ impl MessageProcessor {
                 }
             };
             let workspace_id = authorization.workspace_id().to_owned();
-            self.session_manager
-                .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-                .await;
             let response_payload = TurnWorkPageResponse {
                 workspace_id,
                 thread_id: params.thread_id,
@@ -765,6 +826,9 @@ impl MessageProcessor {
                 items: Vec::new(),
                 page: TimelinePageInfo::default(),
             };
+            self.foreground_starts
+                .before_turn_snapshot(&response_payload.thread_id, &response_payload.turn_id)
+                .await;
             let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
                 Ok(response) => response,
                 Err(error) => {
@@ -851,10 +915,6 @@ impl MessageProcessor {
             }
         };
 
-        self.session_manager
-            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-            .await;
-
         let response_payload = TurnWorkPageResponse {
             workspace_id,
             thread_id: params.thread_id,
@@ -866,6 +926,9 @@ impl MessageProcessor {
             items: snapshot.items,
             page: page_info,
         };
+        self.foreground_starts
+            .before_turn_snapshot(&response_payload.thread_id, &response_payload.turn_id)
+            .await;
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => response,
             Err(error) => {
@@ -937,68 +1000,16 @@ impl MessageProcessor {
         work_item_ids.sort();
         work_item_ids.dedup();
 
-        let work_projection = match self
-            .crud_store
-            .get_turn_work_projection(params.turn_id.as_str())
+        let response_payload = match self
+            .load_turn_work_items_response(
+                authorization.workspace_id(),
+                &params.thread_id,
+                &params.turn_id,
+                work_item_ids,
+            )
             .await
         {
-            Ok(Some(projection))
-                if projection.thread_id == params.thread_id
-                    && projection.workspace_id == authorization.workspace_id() =>
-            {
-                projection
-            }
-            Ok(Some(_)) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        format!(
-                            "invalid params for `{}`: turn `{}` does not belong to thread `{}`",
-                            methods::TURN_WORK_ITEMS_GET,
-                            params.turn_id,
-                            params.thread_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-            Ok(None) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "turn work projection for turn `{}` was not found",
-                            params.turn_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to load turn work projection: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        let snapshot = match self
-            .load_consistent_turn_work_items_snapshot(work_projection, work_item_ids)
-            .await
-        {
-            Ok(snapshot) => snapshot,
+            Ok(response) => response,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -1012,22 +1023,9 @@ impl MessageProcessor {
                 return;
             }
         };
-
-        let workspace_id = snapshot.projection.workspace_id.clone();
-        self.session_manager
-            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        self.foreground_starts
+            .before_turn_snapshot(&response_payload.thread_id, &response_payload.turn_id)
             .await;
-
-        let response_payload = TurnWorkItemsGetResponse {
-            workspace_id,
-            thread_id: params.thread_id,
-            turn_id: params.turn_id,
-            projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
-            source_high_watermark: snapshot.projection.source_high_watermark,
-            projection_updated_at_unix_micros: snapshot.projection.updated_at.timestamp_micros(),
-            items: snapshot.items,
-            removed_work_item_ids: snapshot.removed_work_item_ids,
-        };
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => response,
             Err(error) => {
@@ -1051,6 +1049,75 @@ impl MessageProcessor {
                 "failed to send turn/work/items/get response"
             );
         }
+    }
+
+    // Authorization is established by dispatch. This read independently validates
+    // authoritative scope, including when there is no Work row to validate.
+    async fn load_scoped_turn_work_projection(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<TurnWorkProjectionRead> {
+        let owner = self
+            .crud_store
+            .get_turn_work_owner(workspace_id, thread_id, turn_id)
+            .await?
+            .context("Turn is absent from the authorized scope")?;
+        if owner == pioneer_crud::TurnWorkOwner::DetachedTask {
+            let revision = self
+                .crud_store
+                .get_detached_turn_work_tombstone(workspace_id, thread_id, turn_id)
+                .await?
+                .context("detached Work absence is not confirmed by a healthy projected stream")?;
+            return Ok(TurnWorkProjectionRead::DetachedAbsent { revision });
+        }
+        let Some(projection) = self.crud_store.get_turn_work_projection(turn_id).await? else {
+            return Ok(TurnWorkProjectionRead::Absent);
+        };
+        anyhow::ensure!(
+            projection.workspace_id == workspace_id && projection.thread_id == thread_id,
+            "Work projection does not belong to the authorized scope"
+        );
+        Ok(TurnWorkProjectionRead::Present(projection))
+    }
+
+    async fn load_turn_work_items_response(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        work_item_ids: Vec<String>,
+    ) -> Result<TurnWorkItemsGetResponse> {
+        let (revision, items, removed_work_item_ids) = match self
+            .load_scoped_turn_work_projection(workspace_id, thread_id, turn_id)
+            .await?
+        {
+            TurnWorkProjectionRead::Present(projection) => {
+                let snapshot = self
+                    .load_consistent_turn_work_items_snapshot(projection, work_item_ids)
+                    .await?;
+                (
+                    turn_work_projection_revision(&snapshot.projection),
+                    snapshot.items,
+                    snapshot.removed_work_item_ids,
+                )
+            }
+            TurnWorkProjectionRead::DetachedAbsent { revision } => {
+                (revision, Vec::new(), work_item_ids)
+            }
+            TurnWorkProjectionRead::Absent => bail!("Turn Work projection was not found"),
+        };
+        Ok(TurnWorkItemsGetResponse {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
+            source_high_watermark: revision.0,
+            projection_updated_at_unix_micros: revision.1,
+            items,
+            removed_work_item_ids,
+        })
     }
 
     async fn load_thread_timeline_rows(
@@ -1748,60 +1815,33 @@ impl MessageProcessor {
             }
         }
 
-        let item_turn_ids = item_targets
-            .iter()
-            .map(|(turn_id, _)| turn_id.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let turn_items = if item_turn_ids.is_empty() {
-            HashMap::new()
-        } else {
-            self.crud_store
-                .list_turn_items_with_status_by_type_for_turns(
-                    item_turn_ids.as_slice(),
-                    "agent_message",
-                )
-                .await?
-        };
+        let turn_items = self
+            .crud_store
+            .get_timeline_assistant_items(&rows[0].workspace_id, thread_id, &item_targets)
+            .await?;
         let mut items = HashMap::new();
         let mut statuses = HashMap::new();
-        let mut html = HashMap::new();
+        let mut html_targets = Vec::new();
         for (turn_id, item_id) in &item_targets {
-            let (item, status) = turn_items
-                .get(turn_id.as_str())
-                .and_then(|items| items.iter().find(|(item, _)| item.item_id() == item_id))
+            let (item, status, is_final) = turn_items
+                .get(&(turn_id.clone(), item_id.clone()))
                 .with_context(|| {
                     format!("assistant message item `{item_id}` for turn `{turn_id}` was not found")
                 })?;
-            if !matches!(item, TurnItem::AgentMessage { .. }) {
-                bail!("assistant message timeline target is not an Agent message");
-            }
-            let is_final = turn_items
-                .get(turn_id)
-                .and_then(|items| {
-                    items.iter().rev().find(|(item, _)| {
-                        matches!(
-                            item,
-                            TurnItem::AgentMessage {
-                                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
-                                ..
-                            }
-                        )
-                    })
-                })
-                .is_some_and(|(final_item, _)| final_item.item_id() == item_id);
-            if is_final || pioneer_protocol::task_delivery_id_from_result_item_id(item_id).is_some()
+            if *is_final
+                || pioneer_protocol::task_delivery_id_from_result_item_id(item_id).is_some()
             {
-                let publications = self
-                    .html_publications_for_agent_response(
-                        &rows[0].workspace_id,
-                        thread_id,
-                        turn_id,
-                        item_id,
-                    )
-                    .await?;
-                html.insert((turn_id.clone(), item_id.clone()), publications);
+                html_targets.push((
+                    turn_id.clone(),
+                    item_id.clone(),
+                    matches!(
+                        item,
+                        pioneer_protocol::TurnItem::AgentMessage {
+                            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                            ..
+                        }
+                    ),
+                ));
             }
             statuses.insert(
                 (turn_id.clone(), item_id.clone()),
@@ -1809,6 +1849,10 @@ impl MessageProcessor {
             );
             items.insert((turn_id.clone(), item_id.clone()), item.clone());
         }
+
+        let html = self
+            .html_publications_for_agent_responses(&rows[0].workspace_id, thread_id, &html_targets)
+            .await?;
 
         let authors = self
             .timeline_row_authors(&turns, turn_ids.as_slice())
@@ -1896,7 +1940,7 @@ impl MessageProcessor {
                     .map(|projected| projected.author.clone())
                     .or_else(|| direct_authors_by_turn.get(turn_id.as_str()).cloned())
             } else if let Some(execution) = executions_by_turn.get(turn_id)
-                && execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+                && execution.executor_kind.is_cli_runtime()
                 && let Some(runtime_id) = execution.executor_key.as_deref()
             {
                 let source_key = (execution.workspace_id.clone(), runtime_id.to_owned());
@@ -2207,6 +2251,96 @@ impl MessageProcessor {
         })
     }
 
+    async fn enrich_codex_retry_notices(
+        &self,
+        request_context: &RequestContext,
+        blocks: &mut [TimelineBlock],
+    ) -> Result<()> {
+        use crate::authorization::{AuthorizationResolver, AuthorizationService, ResourceAction};
+        let source_turns = blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                TimelineBlockKind::DetachedTaskRun { task, .. } => task.child_turn_id.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let reads = self
+            .crud_store
+            .codex_retry_notice_reads(&source_turns)
+            .await?;
+        if reads.is_empty() {
+            return Ok(());
+        }
+        let principal = request_context.principal();
+        let action = ResourceAction::ThreadRead;
+        let gate = AuthorizationService::new().authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            action,
+        );
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        let requested = blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                TimelineBlockKind::DetachedTaskRun { task, .. }
+                    if task
+                        .child_turn_id
+                        .as_ref()
+                        .is_some_and(|id| reads.contains_key(id)) =>
+                {
+                    task.child_thread_id
+                        .as_ref()
+                        .map(|child| (block.workspace_id.clone(), child.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let authorized = resolver
+            .authorize_internal_thread_page(principal, &gate, action, &requested)
+            .await?;
+        let mut indices = Vec::new();
+        let mut targets = Vec::new();
+        for (index, block) in blocks.iter().enumerate() {
+            let TimelineBlockKind::DetachedTaskRun { task, .. } = &block.kind else {
+                continue;
+            };
+            let (Some(child), Some(child_turn), Some(turn_id)) =
+                (&task.child_thread_id, &task.child_turn_id, &block.turn_id)
+            else {
+                continue;
+            };
+            if reads.contains_key(child_turn)
+                && authorized.contains(&(block.workspace_id.clone(), child.clone()))
+            {
+                indices.push(index);
+                targets.push(pioneer_crud::CodexRetryNoticeTarget {
+                    workspace_id: block.workspace_id.clone(),
+                    thread_id: block.thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    task: task.clone(),
+                });
+            }
+        }
+        let notices = self
+            .crud_store
+            .codex_retry_notices_for_tasks(&targets, &reads)
+            .await?;
+        anyhow::ensure!(
+            notices.len() == indices.len(),
+            "retry notice batch lost a page target"
+        );
+        for (index, notices) in indices.into_iter().zip(notices) {
+            if let TimelineBlockKind::DetachedTaskRun {
+                codex_retry_notices,
+                ..
+            } = &mut blocks[index].kind
+            {
+                *codex_retry_notices = notices;
+            }
+        }
+        Ok(())
+    }
+
     async fn detached_task_run_timeline_block_kind(
         &self,
         row: &thread_timeline_block::Model,
@@ -2231,7 +2365,11 @@ impl MessageProcessor {
                 row.block_id
             ));
         };
-        Ok(TimelineBlockKind::DetachedTaskRun { task, author })
+        Ok(TimelineBlockKind::DetachedTaskRun {
+            task,
+            author,
+            codex_retry_notices: Vec::new(),
+        })
     }
 
     async fn turn_work_items_from_rows(
@@ -2825,6 +2963,7 @@ mod timeline_handler_unit_tests {
             role_label: None,
         };
         Turn {
+            work_owner: Default::default(),
             id: "turn".to_owned(),
             status: pioneer_protocol::TurnStatus::InProgress,
             turn_kind: pioneer_protocol::TurnKind::TaskRun,

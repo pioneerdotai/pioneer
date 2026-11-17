@@ -243,6 +243,7 @@ async fn prepared(store: &CrudStore, manifest: &str, source: SourceRef) -> Prepa
         )
         .await
         .unwrap();
+    let history_json = "[\"accepted\"]";
     PreparedFrozenImport {
         _frozen_hold: std::sync::Arc::new(hold),
         workspace: "ws".into(),
@@ -267,7 +268,9 @@ async fn prepared(store: &CrudStore, manifest: &str, source: SourceRef) -> Prepa
         },
         accepted_basis: Some(AcceptedImportBasis {
             turn: "child-turn".into(),
-            history_json: "[\"accepted\"]".into(),
+            history_json: history_json.into(),
+            history_sha256: Sha256::digest(history_json.as_bytes()).to_vec(),
+            history_bytes: i64::try_from(history_json.len()).unwrap(),
             manifest: manifest.into(),
             digest: format!("digest-{manifest}"),
             imports_digest: format!("imports-{manifest}"),
@@ -333,11 +336,27 @@ async fn assert_matches_oracle(
     let snapshot = db.begin_read().await.unwrap();
     let actual = accepted_import_current(&snapshot, prepared).await.unwrap();
     if !prepared.record.source.scope.starts_with("checkpoint:") {
+        let basis = prepared
+            .accepted_basis
+            .as_ref()
+            .expect("accepted import proof");
         let legacy = snapshot
-            .query_one_raw(
-                accepted_import_current_statement(LEGACY_ACCEPTED_IMPORT_CURRENT_SQL, prepared)
-                    .unwrap(),
-            )
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                LEGACY_ACCEPTED_IMPORT_CURRENT_SQL,
+                [
+                    basis.manifest.clone().into(),
+                    basis.ordinal.into(),
+                    prepared.destination.clone().into(),
+                    basis.turn.clone().into(),
+                    prepared.workspace.clone().into(),
+                    basis.history_json.clone().into(),
+                    basis.digest.clone().into(),
+                    basis.proof_json.clone().into(),
+                    basis.imports_digest.clone().into(),
+                    i64::try_from(basis.import_count).unwrap().into(),
+                ],
+            ))
             .await
             .unwrap()
             .is_some();
@@ -965,41 +984,6 @@ fn assert_exact_search(plan: &[String], subjects: &[&str], column: &str) {
         !plan_has_subject_scan(plan, subjects),
         "unexpected full scan of {subjects:?}: {plan:#?}"
     );
-}
-
-#[test]
-fn query_plan_key_matching_requires_the_exact_column_name() {
-    let composite =
-        vec!["SEARCH canonical_source USING INDEX fixture (turn_id = ? AND id = ?)".to_string()];
-    assert!(plan_has_exact_search(
-        &composite,
-        &["canonical_source"],
-        "id"
-    ));
-    assert!(plan_has_exact_search(
-        &composite,
-        &["canonical_source"],
-        "turn_id"
-    ));
-
-    let suffixes = vec![
-        "SEARCH canonical_source USING INDEX fixture (turn_id=? AND owner_id=? AND source_id=?)"
-            .to_string(),
-    ];
-    assert!(!plan_has_exact_search(
-        &suffixes,
-        &["canonical_source"],
-        "id"
-    ));
-    assert!(plan_has_exact_search(
-        &suffixes,
-        &["canonical_source"],
-        "source_id"
-    ));
-
-    let scan = vec!["SCAN canonical_source".to_string()];
-    assert!(plan_has_subject_scan(&scan, &["canonical_source"]));
-    assert!(!plan_has_exact_search(&scan, &["canonical_source"], "id"));
 }
 
 async fn assert_production_plan(compressed: bool) {

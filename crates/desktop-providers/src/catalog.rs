@@ -41,6 +41,7 @@ pub(super) fn provider_logo_path(provider_id: &str) -> &'static str {
         "ollama" => "logos/providers/ollama.svg",
         "openai" => "logos/providers/openai.svg",
         "openrouter" => "logos/providers/openrouter.svg",
+        "vercel-ai-gateway" => "logos/providers/vercel.svg",
         "telnyx" => "logos/providers/telnyx.svg",
         "xai" => "logos/providers/xai.svg",
         "together" => "logos/providers/together.svg",

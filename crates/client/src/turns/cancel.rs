@@ -155,6 +155,7 @@ mod tests {
             thread_id: "thread".to_owned(),
             workspace_id: "workspace".to_owned(),
             turn: pioneer_protocol::Turn {
+                work_owner: Default::default(),
                 id: "turn".to_owned(),
                 status: TurnStatus::Interrupted,
                 turn_kind: Default::default(),

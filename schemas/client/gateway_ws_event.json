@@ -383,6 +383,33 @@
           "required": [
             "exact"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "object",
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                },
+                "provider_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "model_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "model"
+          ]
         }
       ]
     },
@@ -2013,6 +2040,9 @@
         "failed"
       ]
     },
+    "GatewayBaseUrl": {
+      "type": "string"
+    },
     "GatewayEndpointKind": {
       "type": "string",
       "enum": [
@@ -2022,6 +2052,22 @@
     },
     "GatewayNotification": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "apps_changed"
+            },
+            "params": {
+              "$ref": "#/$defs/AppsChangedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -2767,6 +2813,22 @@
             },
             "params": {
               "$ref": "#/$defs/SkillsChangedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "plugins_changed"
+            },
+            "params": {
+              "$ref": "#/$defs/PluginsChangedNotification"
             }
           },
           "required": [
@@ -3666,6 +3728,17 @@
             "null"
           ]
         },
+        "public_base_url": {
+          "description": "Present only for the currently authenticated relay connection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayBaseUrl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "state": {
           "$ref": "#/$defs/GatewayRemoteAccessState",
           "default": "disabled"
@@ -3831,6 +3904,10 @@
             "effective_enabled": false,
             "phase": "disabled"
           }
+        },
+        "transcribe_while_recording": {
+          "type": "boolean",
+          "default": true
         }
       }
     },
@@ -5740,6 +5817,26 @@
         }
       ]
     },
+    "PluginsChangedNotification": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "plugin_id",
+        "revision"
+      ]
+    },
     "PolicyGeneration": {
       "description": "Durable, monotonically increasing authorization policy/ACL generation.\nZero is reserved for an uninitialized process and is never persisted.",
       "type": "integer",
@@ -5866,7 +5963,6 @@
       "type": "string",
       "enum": [
         "turn_pre_prompt_context",
-        "turn_post_preflight_prompt_context",
         "turn_pre_prompt_compile",
         "runtime_turn_pre_context"
       ]
@@ -5962,13 +6058,19 @@
       ]
     },
     "ProviderErrorReason": {
-      "description": "Allowlisted OpenRouter Chat Completions metadata.error_type values.\nDiagnostic only: these values must not drive recovery policy.",
+      "description": "Allowlisted provider error reasons, never raw provider messages or values.\nDiagnostic only: these values must not drive recovery policy.",
       "type": "string",
       "enum": [
         "context_length_exceeded",
         "max_tokens_exceeded",
         "token_limit_exceeded",
         "string_too_long",
+        "missing_required_parameter",
+        "unsupported_parameter",
+        "invalid_parameter_value",
+        "invalid_parameter_type",
+        "responses_missing_required_item",
+        "responses_unpaired_tool_call",
         "authentication",
         "permission_denied",
         "payment_required",
@@ -5992,6 +6094,35 @@
         "server",
         "timeout",
         "unmapped"
+      ]
+    },
+    "ProviderErrorResponse": {
+      "description": "Original provider error response, bounded by the transport limit for local storage.\nDebug output deliberately omits all payloads; public prose never uses them.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "processingError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "streamContext": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "body",
+        "truncated"
       ]
     },
     "ProviderFailureClass": {
@@ -6321,6 +6452,16 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0
+        },
+        "rawResponse": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "requestId": {
           "anyOf": [
@@ -7590,6 +7731,11 @@
           "items": {
             "$ref": "#/$defs/TaskResultReviewerSpec"
           }
+        },
+        "disableTimeoutAcceptance": {
+          "description": "Mandatory-review marker: never resolve this policy through the legacy review timeout. Legacy records default to false.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -9086,6 +9232,17 @@
         "updatedAt": {
           "type": "integer",
           "format": "int64"
+        },
+        "triggerInput": {
+          "description": "External data accepted for this occurrence, preserved across retries.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRunTriggerInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -9145,6 +9302,13 @@
         "run"
       ]
     },
+    "TaskRunInputEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "base64"
+      ]
+    },
     "TaskRunStartedNotification": {
       "type": "object",
       "properties": {
@@ -9173,6 +9337,27 @@
         "blocked",
         "cancelled",
         "timed_out"
+      ]
+    },
+    "TaskRunTriggerInput": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "contentType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encoding": {
+          "$ref": "#/$defs/TaskRunInputEncoding"
+        }
+      },
+      "required": [
+        "encoding",
+        "body"
       ]
     },
     "TaskScheduledNotification": {
@@ -9301,6 +9486,13 @@
         "updatedAt": {
           "type": "integer",
           "format": "int64"
+        },
+        "webhookSecretRef": {
+          "description": "Opaque keystore reference; the bearer secret is never persisted here.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -9799,6 +9991,20 @@
     "Thread": {
       "type": "object",
       "properties": {
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "agent_nickname": {
           "type": [
             "string",
@@ -9886,6 +10092,29 @@
         },
         "workspace_id": {
           "type": "string"
+        },
+        "service_mode": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "authority": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "authority"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -11324,6 +11553,11 @@
         "turn_kind": {
           "$ref": "#/$defs/TurnKind",
           "default": "conversation"
+        },
+        "work_owner": {
+          "description": "Immutable owner of the admitted work; absent historical wire values own their turn.",
+          "$ref": "#/$defs/TurnWorkOwner",
+          "default": "turn"
         }
       },
       "required": [
@@ -11508,6 +11742,48 @@
     },
     "TurnCapabilityKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            },
+            "appId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "pluginId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
+            }
+          },
+          "required": [
+            "type",
+            "pluginId",
+            "expectedRevision"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -13497,6 +13773,37 @@
         "resolution"
       ]
     },
+    "TurnPluginCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "expectedRevision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "label": {
+          "type": "string"
+        },
+        "pluginId": {
+          "type": "string"
+        },
+        "icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "pluginId",
+        "expectedRevision",
+        "label"
+      ]
+    },
     "TurnProcessPolicySnapshot": {
       "type": "object",
       "properties": {
@@ -13655,6 +13962,20 @@
     "TurnStartParams": {
       "type": "object",
       "properties": {
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "agent_delegation_routes": {
           "description": "Explicit, bounded cross-capsule delegations requested for this root\nAgent execution. These are authorization inputs, never prompt content.",
           "type": "array",
@@ -13775,6 +14096,29 @@
         },
         "turn_id": {
           "type": "string"
+        },
+        "service_mode": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "authority": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "authority"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -14034,6 +14378,14 @@
         "threadId",
         "turnId",
         "reason"
+      ]
+    },
+    "TurnWorkOwner": {
+      "description": "Canonical work ownership, persisted at admission independently of authorship.",
+      "type": "string",
+      "enum": [
+        "turn",
+        "detached_task"
       ]
     },
     "TurnWorkPresentation": {
@@ -14519,6 +14871,22 @@
           "type": "object",
           "properties": {
             "capability": {
+              "$ref": "#/$defs/TurnPluginCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
               "$ref": "#/$defs/TurnSkillPackCapabilitySummary"
             },
             "type": {
@@ -14775,6 +15143,57 @@
       "required": [
         "revision",
         "workspace_id"
+      ]
+    },
+    "ImageReference": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision"
+      ],
+      "description": "Immutable image reference. Gateway inventory exposes a native storage link, never image bytes."
+    },
+    "AppsChangedNotification": {
+      "type": "object",
+      "properties": {
+        "runtime_only": {
+          "type": "boolean",
+          "default": false
+        },
+        "execution_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "app_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "app_id",
+        "revision"
       ]
     }
   }

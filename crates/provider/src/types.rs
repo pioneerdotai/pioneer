@@ -1,3 +1,11 @@
+/// Safe identity of the operation selected before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderUsageProfile {
+    pub api: String,
+    pub api_version: Option<String>,
+    pub route: Option<String>,
+}
+
 use pioneer_protocol::ProviderFailureClass;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -16,6 +24,7 @@ pub struct ProviderFailureClassification {
     /// Retains the registry's network fallback after the unsafe source is dropped.
     /// Internal transport fact, never serialized into public diagnostics.
     pub is_network_error: bool,
+    pub raw_response: Option<pioneer_protocol::ProviderErrorResponse>,
     pub error_reason: Option<pioneer_protocol::ProviderErrorReason>,
     pub request_id: Option<pioneer_protocol::ProviderRequestId>,
     pub class: ProviderFailureClass,
@@ -28,6 +37,7 @@ impl ProviderFailureClassification {
     pub fn new(class: ProviderFailureClass) -> Self {
         Self {
             is_network_error: false,
+            raw_response: None,
             error_reason: None,
             request_id: None,
             class,
@@ -61,11 +71,25 @@ impl ProviderStreamDiagnostics {
     }
 }
 
+/// How live result text may be projected into the consumer UI. Semantic phase
+/// still comes exclusively from message events; previews never accept history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProviderMessageDelivery {
+    /// Preserve the existing incremental result-item delivery.
+    #[default]
+    Incremental,
+    /// Show typed message text as previews and publish the result only after
+    /// successful request termination, including messages whose phase is already
+    /// known. StartProvisional also opts into this behavior when first observed.
+    Provisional,
+}
+
 /// A provider stream and its request-owned facts, consumed by agent deadlines.
 /// Facts do not produce chunks or reset the first/inter-chunk deadline.
 pub struct ProviderStream {
     pub stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
     pub diagnostics: ProviderStreamDiagnostics,
+    pub message_delivery: ProviderMessageDelivery,
 }
 
 impl ProviderStream {
@@ -75,6 +99,7 @@ impl ProviderStream {
         Self {
             stream,
             diagnostics: ProviderStreamDiagnostics::default(),
+            message_delivery: ProviderMessageDelivery::default(),
         }
     }
 }
@@ -233,6 +258,7 @@ pub struct ProviderInputCapabilities {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderTimeoutPolicy {
+    pub use_default_flex_timeouts: bool,
     pub connect_timeout: Duration,
     pub first_chunk_timeout: Duration,
     pub inter_chunk_idle_timeout: Duration,
@@ -241,6 +267,37 @@ pub struct ProviderTimeoutPolicy {
 }
 
 impl ProviderTimeoutPolicy {
+    /// Flex extends only the built-in defaults. Explicit non-default limits and
+    /// the operation's end-to-end deadline remain authoritative.
+    pub fn for_service_mode(
+        mut self,
+        plan: Option<&pioneer_protocol::NativeServiceModePlan>,
+    ) -> Self {
+        if self.use_default_flex_timeouts
+            && plan.is_some_and(|plan| {
+                matches!(
+                    plan.parameters,
+                    pioneer_protocol::ServiceModeParameters::OpenAiTier {
+                        tier: pioneer_protocol::OpenAiTier::Flex
+                    }
+                )
+            })
+        {
+            let defaults = Self::default();
+            let flex = Duration::from_secs(600);
+            if self.first_chunk_timeout == defaults.first_chunk_timeout {
+                self.first_chunk_timeout = flex;
+            }
+            if self.inter_chunk_idle_timeout == defaults.inter_chunk_idle_timeout {
+                self.inter_chunk_idle_timeout = flex;
+            }
+            if self.non_stream_request_timeout == defaults.non_stream_request_timeout {
+                self.non_stream_request_timeout = flex;
+            }
+        }
+        self
+    }
+
     pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
     pub const DEFAULT_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
     pub const DEFAULT_INTER_CHUNK_IDLE_TIMEOUT_SECS: u64 = 180;
@@ -254,6 +311,7 @@ impl ProviderTimeoutPolicy {
         max_stream_duration_secs: Option<u64>,
     ) -> Self {
         Self {
+            use_default_flex_timeouts: false,
             connect_timeout: Duration::from_secs(connect_timeout_secs.max(1)),
             first_chunk_timeout: Duration::from_secs(first_chunk_timeout_secs.max(1)),
             inter_chunk_idle_timeout: Duration::from_secs(inter_chunk_idle_timeout_secs.max(1)),
@@ -266,13 +324,15 @@ impl ProviderTimeoutPolicy {
 
 impl Default for ProviderTimeoutPolicy {
     fn default() -> Self {
-        Self::from_secs(
+        let mut policy = Self::from_secs(
             Self::DEFAULT_CONNECT_TIMEOUT_SECS,
             Self::DEFAULT_FIRST_CHUNK_TIMEOUT_SECS,
             Self::DEFAULT_INTER_CHUNK_IDLE_TIMEOUT_SECS,
             Self::DEFAULT_NON_STREAM_REQUEST_TIMEOUT_SECS,
             None,
-        )
+        );
+        policy.use_default_flex_timeouts = true;
+        policy
     }
 }
 
@@ -437,7 +497,7 @@ impl MessageContentPart {
 /// provider/model target. The payload remains provider-owned; the history
 /// projection may extract explicitly typed human-readable fields when a
 /// completed round is moved to an incompatible target.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderReplayState {
     pub provider: String,
     /// Exact model whose continuation contract produced this state. Legacy
@@ -447,6 +507,12 @@ pub struct ProviderReplayState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub payload: JsonValue,
+}
+
+impl std::fmt::Debug for ProviderReplayState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProviderReplayState { opaque: true }")
+    }
 }
 
 impl ProviderReplayState {
@@ -546,6 +612,10 @@ pub struct MessageProvenance {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
+    /// Pioneer-owned delivery metadata. Never serialized by provider wire adapters.
+    /// Input constructors and provider-response parsers leave it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_context: Option<serde_json::Value>,
     #[serde(skip)]
     pub provenance: Option<MessageProvenance>,
     pub role: Role,
@@ -567,6 +637,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::System,
             content: content.into(),
@@ -581,6 +652,7 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::User,
             content: content.into(),
@@ -595,6 +667,7 @@ impl ChatMessage {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Assistant,
             content: content.into(),
@@ -609,6 +682,7 @@ impl ChatMessage {
 
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Tool,
             content: content.into(),
@@ -643,6 +717,7 @@ impl ChatMessage {
         provider_replay_state: Option<ProviderReplayState>,
     ) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Assistant,
             content: content.map(Into::into).unwrap_or_default(),
@@ -661,6 +736,7 @@ impl ChatMessage {
         content: impl Into<String>,
     ) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::Tool,
             content: content.into(),
@@ -675,6 +751,7 @@ impl ChatMessage {
 
     pub fn user_parts(parts: Vec<MessageContentPart>) -> Self {
         Self {
+            application_context: None,
             provenance: None,
             role: Role::User,
             content: String::new(),
@@ -801,6 +878,8 @@ impl From<ModelInputItem> for ChatMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledPromptPayload {
+    #[serde(skip)]
+    pub observation_manifest: Option<serde_json::Value>,
     pub stable_system_text: String,
     pub dynamic_system_text: String,
     pub boundary_marker: String,
@@ -846,6 +925,10 @@ impl CompiledPromptPayload {
 
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
+    /// Host-owned positional proposal. Never an execution grant or delivery ACK.
+    /// Not part of canonical messages or public protocol contracts.
+    pub tool_declarations: Option<crate::tool_declarations::ToolDeclarations>,
+    pub service_mode: Option<pioneer_protocol::NativeServiceModePlan>,
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f32>,
@@ -985,6 +1068,8 @@ pub struct ProviderCallIdentity {
 /// identity of every requested operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalProviderRoundEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_copies: Option<Vec<crate::messages::ProviderRoundUiCopy>>,
     pub version: u8,
     pub round_id: String,
     pub termination: ProviderTermination,
@@ -1046,6 +1131,10 @@ pub struct TokenUsage {
     pub semantics: Option<String>,
     pub raw_usage: Option<serde_json::Value>,
     pub generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_comparison_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_diagnostics: Option<serde_json::Value>,
     pub reported_model: Option<String>,
     pub service_tier: Option<String>,
     pub request_id: Option<String>,
@@ -1062,6 +1151,9 @@ impl TokenUsage {
     /// Stream fields are cumulative snapshots. Duplicate events replace values;
     /// partial native deltas preserve previously reported categories.
     pub fn update(&mut self, snapshot: &Self) {
+        let unresolved_native_input = self.semantics.as_deref()
+            == Some("aihubmix_claude_input_unresolved")
+            || snapshot.semantics.as_deref() == Some("aihubmix_claude_input_unresolved");
         macro_rules! update {
             ($($field:ident),*) => {$(if snapshot.$field.is_some() {
                 self.$field = snapshot.$field.clone();
@@ -1079,6 +1171,8 @@ impl TokenUsage {
             service_tier,
             semantics,
             generation_id,
+            prompt_cache_comparison_response_id,
+            prompt_cache_diagnostics,
             request_id,
             provider,
             model,
@@ -1089,6 +1183,18 @@ impl TokenUsage {
             accounting
         );
         if let Some(raw) = &snapshot.raw_usage {
+            let cli = matches!(
+                self.provider.as_deref(),
+                Some("codex-cli" | "claude-cli" | "opencode-cli")
+            );
+            // A later partial snapshot cannot restore evidence already discarded
+            // earlier in this call. This is CLI-only; API merge stays unchanged.
+            let truncation = ["responses_truncated", "model_usage_truncated"].map(|key| {
+                self.raw_usage
+                    .as_ref()
+                    .is_some_and(|prior| prior["cli_statistics"][key] == true)
+                    || raw["cli_statistics"][key] == true
+            });
             let target = self.raw_usage.get_or_insert_with(|| serde_json::json!({}));
             if let (Some(target), Some(raw)) = (target.as_object_mut(), raw.as_object()) {
                 fn merge(
@@ -1096,6 +1202,11 @@ impl TokenUsage {
                     raw: &serde_json::Map<String, serde_json::Value>,
                 ) {
                     for (key, value) in raw {
+                        // A partial usage envelope may explicitly omit a whole
+                        // details object. It cannot erase earlier observations.
+                        if value.is_null() && target.contains_key(key) {
+                            continue;
+                        }
                         if let (Some(existing), Some(incoming)) = (
                             target
                                 .get_mut(key)
@@ -1110,7 +1221,24 @@ impl TokenUsage {
                 }
                 merge(target, raw);
             }
+            let statistics = cli.then(|| {
+                let mut statistics = crate::usage::bounded_cli_statistics(
+                    &self.raw_usage.as_ref().unwrap()["cli_statistics"],
+                );
+                for (key, truncated) in ["responses_truncated", "model_usage_truncated"]
+                    .into_iter()
+                    .zip(truncation)
+                {
+                    if truncated {
+                        statistics[key] = serde_json::json!(true);
+                    }
+                }
+                statistics
+            });
             self.raw_usage = self.raw_usage.as_ref().map(crate::usage::bounded_usage);
+            if let Some(statistics) = statistics {
+                self.raw_usage.as_mut().unwrap()["cli_statistics"] = statistics;
+            }
         }
         // Gemini thoughts are separate from candidates. A partial cumulative
         // snapshot must not replace the earlier candidate count with thoughts.
@@ -1123,16 +1251,32 @@ impl TokenUsage {
                     .get("thoughtsTokenCount")
                     .and_then(serde_json::Value::as_u64);
                 self.output_tokens = match (candidates, thoughts) {
-                    (Some(c), t) => c.checked_add(t.unwrap_or(0)),
-                    (None, Some(t)) => Some(t),
+                    (Some(c), Some(t)) => c.checked_add(t),
                     _ => None,
                 };
             }
         }
+        if matches!(
+            self.semantics.as_deref(),
+            Some("inclusive_cache_and_reasoning" | "inclusive_cache_separate_thoughts")
+        ) {
+            self.uncached_input_tokens = self.input_tokens.and_then(|input| {
+                input
+                    .checked_sub(self.cache_read_input_tokens?)?
+                    .checked_sub(self.cache_write_input_tokens?)
+            });
+        }
+        if unresolved_native_input {
+            self.semantics = Some("aihubmix_claude_input_unresolved".into());
+            // Later native evidence can invalidate an earlier prompt-only
+            // partial total. Preserve observed categories, not that guess.
+            self.input_tokens = None;
+            self.uncached_input_tokens = None;
+        }
         if self.semantics.as_deref() == Some("exclusive_cache") {
             self.input_tokens = self.uncached_input_tokens.and_then(|i| {
-                i.checked_add(self.cache_read_input_tokens.unwrap_or(0))?
-                    .checked_add(self.cache_write_input_tokens.unwrap_or(0))
+                i.checked_add(self.cache_read_input_tokens?)?
+                    .checked_add(self.cache_write_input_tokens?)
             });
         }
     }
@@ -1140,6 +1284,7 @@ impl TokenUsage {
 
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
+    pub messages: Vec<crate::messages::ProviderMessage>,
     pub text: String,
     pub usage: Option<TokenUsage>,
     pub termination: ProviderTermination,
@@ -1156,6 +1301,7 @@ pub struct ChatResponse {
 
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
+    pub message: Option<crate::messages::ProviderMessageMetadata>,
     pub usage: Option<TokenUsage>,
     pub delta: String,
     pub reasoning_delta: Option<String>,
@@ -1170,6 +1316,7 @@ pub struct StreamChunk {
 impl StreamChunk {
     pub fn usage(usage: TokenUsage) -> Self {
         Self {
+            message: None,
             usage: Some(usage),
             ..Self::delta("")
         }
@@ -1182,6 +1329,7 @@ impl StreamChunk {
 
     pub fn delta(text: impl Into<String>) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: text.into(),
             reasoning_delta: None,
@@ -1194,6 +1342,7 @@ impl StreamChunk {
 
     pub fn reasoning(text: impl Into<String>) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: Some(text.into()),
@@ -1206,6 +1355,7 @@ impl StreamChunk {
 
     pub fn tool_calls(tool_calls: Vec<ProviderToolCall>) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: None,
@@ -1218,6 +1368,7 @@ impl StreamChunk {
 
     pub fn provider_replay_state(state: ProviderReplayState) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: None,
@@ -1230,6 +1381,7 @@ impl StreamChunk {
 
     pub fn final_chunk_with(termination: ProviderTermination) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: None,
@@ -1274,6 +1426,30 @@ impl ProviderResponseLimits {
         &self,
         response: &ChatResponse,
     ) -> Result<(), ProviderResponseTooLarge> {
+        if response.messages.len() > crate::ProviderMessageCollector::MAX_MESSAGES {
+            return Err(ProviderResponseTooLarge::new(
+                "response_messages",
+                crate::ProviderMessageCollector::MAX_MESSAGES,
+                response.messages.len(),
+            ));
+        }
+        let bytes = crate::messages::message_bytes(&response.messages);
+        self.validate_text_bytes(
+            response.messages.iter().map(|m| m.text.len()).sum(),
+            "message_text",
+        )?;
+        self.validate_retained_bytes(
+            bytes
+                .saturating_add(response.text.len())
+                .saturating_add(response.reasoning_content.as_deref().map_or(0, str::len))
+                .saturating_add(tool_calls_bytes(&response.tool_calls))
+                .saturating_add(
+                    response
+                        .provider_replay_state
+                        .as_ref()
+                        .map_or(0, replay_state_bytes),
+                ),
+        )?;
         self.validate_accumulated(
             response.text.as_str(),
             response.reasoning_content.as_deref().unwrap_or_default(),
@@ -1468,6 +1644,25 @@ pub struct ProviderCapabilities {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn flex_profile_is_request_local_and_preserves_explicit_limits() {
+        use pioneer_protocol::{NativeServiceModePlan, OpenAiTier, ServiceModeParameters as P};
+        let plan = NativeServiceModePlan {
+            id: "flex".into(),
+            parameters: P::OpenAiTier {
+                tier: OpenAiTier::Flex,
+            },
+        };
+        let defaults = ProviderTimeoutPolicy::default();
+        assert_eq!(defaults.for_service_mode(None), defaults);
+        let flex = defaults.for_service_mode(Some(&plan));
+        assert_eq!(flex.first_chunk_timeout, Duration::from_secs(600));
+        assert_eq!(flex.non_stream_request_timeout, Duration::from_secs(600));
+        let explicit = ProviderTimeoutPolicy::from_secs(12, 13, 14, 15, Some(16));
+        assert_eq!(explicit.for_service_mode(Some(&plan)), explicit);
+        assert_eq!(defaults.first_chunk_timeout, Duration::from_secs(180));
+    }
     use super::*;
 
     #[test]
@@ -1634,21 +1829,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_response_default_usage() {
-        let resp = ChatResponse {
-            text: "Hello".into(),
-            usage: None,
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            provider_replay_state: None,
-            termination: ProviderTermination::Complete,
-        };
-        assert!(resp.usage.is_none());
-        assert!(resp.reasoning_content.is_none());
-        assert!(resp.tool_calls.is_empty());
-    }
-
-    #[test]
     fn provider_response_limits_reject_oversized_logical_fields() {
         let mut limits = ProviderResponseLimits::default();
         limits.max_text_bytes = 3;
@@ -1713,17 +1893,6 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_with_values() {
-        let usage = TokenUsage {
-            input_tokens: Some(100),
-            output_tokens: Some(50),
-            ..Default::default()
-        };
-        assert_eq!(usage.input_tokens, Some(100));
-        assert_eq!(usage.output_tokens, Some(50));
-    }
-
-    #[test]
     fn model_input_item_to_chat_message() {
         let item = ModelInputItem::tool_result(
             "call_1",
@@ -1741,6 +1910,7 @@ mod tests {
     #[test]
     fn compiled_prompt_sections_preserve_stable_then_dynamic_order() {
         let compiled = CompiledPromptPayload {
+            observation_manifest: None,
             stable_system_text: "Stable".to_owned(),
             dynamic_system_text: "Dynamic".to_owned(),
             boundary_marker: "<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->".to_owned(),
@@ -1755,6 +1925,8 @@ mod tests {
     #[test]
     fn rendered_messages_with_compiled_prompt_uses_canonical_full_text() {
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "test-model".to_owned(),
             messages: vec![
                 ChatMessage::system("legacy prompt"),
@@ -1767,6 +1939,7 @@ mod tests {
             parallel_tool_calls: None,
             reasoning: None,
             compiled_prompt: Some(CompiledPromptPayload {
+                observation_manifest: None,
                 stable_system_text: "Stable".to_owned(),
                 dynamic_system_text: "Dynamic".to_owned(),
                 boundary_marker: "<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->".to_owned(),
@@ -1816,5 +1989,75 @@ mod provenance_tests {
         wire["provenance"] = serde_json::to_value(provenance).unwrap();
         let received: ChatMessage = serde_json::from_value(wire).unwrap();
         assert_eq!(received.provenance, None);
+    }
+}
+
+#[cfg(test)]
+mod cache_partial_update_regression {
+    use super::TokenUsage;
+    #[test]
+    fn unresolved_native_envelope_invalidates_prior_prompt_only_total() {
+        let mut usage = TokenUsage {
+            input_tokens: Some(22),
+            uncached_input_tokens: Some(22),
+            output_tokens: Some(7),
+            ..Default::default()
+        };
+        let native = TokenUsage {
+            cache_read_input_tokens: Some(6266),
+            cache_write_input_tokens: Some(0),
+            semantics: Some("aihubmix_claude_input_unresolved".into()),
+            ..Default::default()
+        };
+        usage.update(&native);
+        usage.update(&native);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.uncached_input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, Some(6266));
+        assert_eq!(usage.cache_write_input_tokens, Some(0));
+        assert_eq!(usage.output_tokens, Some(7));
+        usage.raw_usage = Some(
+            serde_json::json!({"claude_cache_tokens_details":{"cache_read_input_tokens":6266}}),
+        );
+        usage.update(&TokenUsage {
+            input_tokens: Some(22),
+            output_tokens: Some(9),
+            semantics: Some("inclusive_cache_and_reasoning".into()),
+            raw_usage: Some(serde_json::json!({"claude_cache_tokens_details":null})),
+            ..Default::default()
+        });
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, Some(6266));
+        assert_eq!(
+            usage.raw_usage.unwrap()["claude_cache_tokens_details"]["cache_read_input_tokens"],
+            6266
+        );
+    }
+
+    #[test]
+    fn partial_inclusive_totals_recompute_uncached_with_checked_categories() {
+        let mut usage = TokenUsage {
+            input_tokens: Some(100),
+            cache_read_input_tokens: Some(60),
+            cache_write_input_tokens: Some(10),
+            uncached_input_tokens: Some(30),
+            semantics: Some("inclusive_cache_and_reasoning".into()),
+            ..Default::default()
+        };
+        usage.update(&TokenUsage {
+            input_tokens: Some(120),
+            ..Default::default()
+        });
+        assert_eq!(usage.uncached_input_tokens, Some(50));
+        usage.update(&TokenUsage {
+            cache_read_input_tokens: Some(111),
+            ..Default::default()
+        });
+        assert_eq!(usage.uncached_input_tokens, None);
+        usage.update(&TokenUsage {
+            cache_write_input_tokens: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(usage.uncached_input_tokens, Some(9));
     }
 }

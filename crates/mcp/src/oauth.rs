@@ -147,6 +147,18 @@ pub(crate) struct ManagedHttpClient {
     pub installation: McpServerInstallation,
 }
 impl ManagedHttpClient {
+    fn request_headers(
+        &self,
+        auth_token: Option<&str>,
+        mut headers: HashMap<HeaderName, HeaderValue>,
+    ) -> HashMap<HeaderName, HeaderValue> {
+        // Managed authorization wins when it is present, for every MCP server.
+        if self.authorized.is_some() || auth_token.is_some() {
+            headers.remove(&http::header::AUTHORIZATION);
+        }
+        headers
+    }
+
     async fn checked<T>(
         &self,
         result: Result<T, StreamableHttpError<reqwest_0_13::Error>>,
@@ -321,6 +333,7 @@ impl StreamableHttpClient for ManagedHttpClient {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
+        let custom_headers = self.request_headers(auth_token.as_deref(), custom_headers);
         let result = async {
             match &self.authorized {
                 Some(c) => {
@@ -349,6 +362,7 @@ impl StreamableHttpClient for ManagedHttpClient {
         BoxStream<'static, Result<sse_stream::Sse, sse_stream::Error>>,
         StreamableHttpError<Self::Error>,
     > {
+        let custom_headers = self.request_headers(auth_token.as_deref(), custom_headers);
         let result = async {
             match &self.authorized {
                 Some(c) => {
@@ -379,6 +393,7 @@ impl StreamableHttpClient for ManagedHttpClient {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let custom_headers = self.request_headers(auth_token.as_deref(), custom_headers);
         let result = async {
             match &self.authorized {
                 Some(c) => {
@@ -419,6 +434,47 @@ impl StreamableHttpClient for ManagedHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_uses_one_policy_for_every_installation_origin() {
+        let installation = crate::parse_install_config(
+            r#"{"mcpServers":{"http":{"url":"https://example.org/mcp","headers":{"Authorization":"Bearer fallback"}}}}"#,
+            crate::InstallParseContext {
+                scope_kind: crate::McpScopeKind::Workspace,
+                scope_key: "workspace".into(),
+                default_enabled: true,
+                default_allow_implicit_invocation: false,
+            },
+        ).unwrap().items.into_iter().next().unwrap().installation.unwrap();
+        let mut client = ManagedHttpClient {
+            plain: reqwest_0_13::Client::new(),
+            authorized: None,
+            owner: None,
+            id: "http".into(),
+            installation,
+        };
+        let headers = HashMap::from([
+            (
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer fallback"),
+            ),
+            (
+                HeaderName::from_static("x-context"),
+                HeaderValue::from_static("keep"),
+            ),
+        ]);
+        for source in [
+            serde_json::json!({}),
+            serde_json::json!({"plugin_id":"parent"}),
+        ] {
+            client.installation.source_ref = source;
+            assert!(client.installation.explicit_authorization_overrides_oauth());
+            assert_eq!(client.request_headers(None, headers.clone()), headers);
+            let generated = client.request_headers(Some("generated"), headers.clone());
+            assert!(!generated.contains_key(&http::header::AUTHORIZATION));
+            assert_eq!(generated[&HeaderName::from_static("x-context")], "keep");
+        }
+    }
 
     struct CauseProvider {
         notified: tokio::sync::Notify,

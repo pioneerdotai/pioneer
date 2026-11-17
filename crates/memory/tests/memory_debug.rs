@@ -505,7 +505,7 @@ async fn memory_debug_inspects_recall_hook_audit_trace() {
                 subscription_id: HookSubscriptionId::new("subscription.memory_debug")
                     .expect("valid subscription id"),
                 hook_id: HookId::new("memory.active_recall").expect("valid hook id"),
-                phase: HookPhase::TurnPostPreflightPromptContext,
+                phase: HookPhase::TurnPrePromptContext,
                 status: HookRunStatus::Succeeded,
                 scope: Some(HookRunScope {
                     kind: HookRunScopeKind::Turn,

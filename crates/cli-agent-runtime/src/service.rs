@@ -13,6 +13,26 @@ impl std::fmt::Display for ServiceFailure {
 }
 impl std::error::Error for ServiceFailure {}
 
+/// The isolated Codex process exhausted its end-to-end service budget.
+/// Callers may choose their own retry policy without parsing error messages.
+#[derive(Debug)]
+pub struct CodexServiceDeadline;
+impl std::fmt::Display for CodexServiceDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Codex service deadline exceeded")
+    }
+}
+impl std::error::Error for CodexServiceDeadline {}
+
+#[derive(Debug)]
+pub struct ClaudeServiceDeadline;
+impl std::fmt::Display for ClaudeServiceDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Claude service deadline exceeded")
+    }
+}
+impl std::error::Error for ClaudeServiceDeadline {}
+
 /// Safe stage context survives anyhow propagation without persisting raw errors.
 #[derive(Debug)]
 pub struct ServiceStage(pub &'static str);
@@ -23,6 +43,56 @@ impl std::fmt::Display for ServiceStage {
 }
 impl std::error::Error for ServiceStage {}
 
+/// Process-owned failure metadata. No stderr text, prompt or credentials escape
+/// the service boundary; classification is diagnostic, not a retry receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceProcessFailure {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub class: &'static str,
+}
+impl ServiceProcessFailure {
+    pub(crate) fn from_status(status: std::process::ExitStatus, stderr: &[String]) -> Self {
+        let text = stderr.join("\n").to_ascii_lowercase();
+        let class = if text.contains("unexpected argument") || text.contains("unrecognized option")
+        {
+            "unsupported_arguments"
+        } else if text.contains("error loading config") || text.contains("error parsing") {
+            "configuration"
+        } else if text.contains("not logged in")
+            || text.contains("authentication")
+            || text.contains("unauthorized")
+            || text.contains("login required")
+        {
+            "authentication"
+        } else {
+            "process_exit"
+        };
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
+        Self {
+            exit_code: status.code(),
+            signal,
+            class,
+        }
+    }
+}
+impl std::fmt::Display for ServiceProcessFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CLI service process failure: {} (exit={:?}, signal={:?})",
+            self.class, self.exit_code, self.signal
+        )
+    }
+}
+impl std::error::Error for ServiceProcessFailure {}
+
 /// CLI-owned counters only; exclude transcripts, errors, native session state
 /// and arbitrary identifiers from an otherwise much larger terminal result.
 pub(crate) fn bounded_usage(value: &serde_json::Value) -> serde_json::Value {
@@ -31,6 +101,7 @@ pub(crate) fn bounded_usage(value: &serde_json::Value) -> serde_json::Value {
         "input_tokens",
         "output_tokens",
         "cached_input_tokens",
+        "cache_write_input_tokens",
         "cache_read_input_tokens",
         "cache_creation_input_tokens",
         "reasoning_tokens",
@@ -39,6 +110,44 @@ pub(crate) fn bounded_usage(value: &serde_json::Value) -> serde_json::Value {
         if let Some(count) = value["usage"][key].as_u64() {
             result.insert(key.into(), count.into());
         }
+    }
+    for key in ["cache_creation", "server_tool_use"] {
+        let bounded = crate::usage::claude_usage(&value["usage"]);
+        if let Some(value) = bounded.get(key) {
+            result.insert(key.into(), value.clone());
+        }
+    }
+    for key in [
+        "duration_ms",
+        "duration_api_ms",
+        "num_turns",
+        "ttft_ms",
+        "ttft_stream_ms",
+        "time_to_request_ms",
+        "time_to_request_from_spawn_ms",
+    ] {
+        if let Some(n) = value[key].as_u64() {
+            result.insert(key.into(), n.into());
+        }
+    }
+    let claude = crate::usage::claude_result(value);
+    if value["modelUsage"].is_object() {
+        result.insert("model_usage".into(), claude["model_usage"].clone());
+        result.insert(
+            "model_usage_truncated".into(),
+            claude["model_usage_truncated"].clone(),
+        );
+        result.insert(
+            "model_usage_scope".into(),
+            "session_snapshot_including_subagents".into(),
+        );
+    }
+    if value["total_cost_usd"].is_number() {
+        result.insert("cost_basis".into(), "claude_sdk_estimate".into());
+        result.insert(
+            "cost_scope".into(),
+            "session_snapshot_including_subagents".into(),
+        );
     }
     if let Some(cost) = value["total_cost_usd"]
         .as_f64()
@@ -55,7 +164,16 @@ pub(crate) fn bounded_usage(value: &serde_json::Value) -> serde_json::Value {
 pub(crate) fn bounded_codex_usage(value: &serde_json::Value) -> serde_json::Value {
     let mut result = bounded_usage(value);
     // Codex exec does not report Claude SDK cost estimates.
-    result.as_object_mut().unwrap().remove("total_cost_usd");
+    for key in [
+        "total_cost_usd",
+        "cost_basis",
+        "cost_scope",
+        "model_usage_truncated",
+        "model_usage",
+        "model_usage_scope",
+    ] {
+        result.as_object_mut().unwrap().remove(key);
+    }
     if let Some(count) = value["usage"]["reasoning_output_tokens"].as_u64() {
         result["reasoning_output_tokens"] = count.into();
     }

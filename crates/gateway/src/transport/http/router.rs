@@ -1,11 +1,12 @@
 use axum::Router;
 use axum::middleware;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use super::GatewayHttpState;
 use super::avatars::{agent_avatar_route, member_avatar_route};
 use super::content::{artifact_content_route, artifact_projection_route};
 use super::health::{health, native_diagnostics, ready};
+use super::plugins::{app_icon_route, plugin_icon_route};
 use super::views::view_grant_route;
 
 pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
@@ -14,6 +15,7 @@ pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
         Some(state.message_processor.clone()),
     )
         .route("/", get(crate::transport::ws::root_websocket))
+        .route("/apps/host", get(crate::host_api::websocket))
         .route(
             "/storage/workspaces/{workspace_id}/artifacts/{artifact_id}/versions/{version_id}/content",
             get(artifact_content_route).head(artifact_content_route),
@@ -34,7 +36,21 @@ pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
             "/storage/system/agent/avatar/{avatar_revision}",
             get(agent_avatar_route).head(agent_avatar_route),
         )
+        .route(
+            "/storage/workspaces/{workspace_id}/plugins/{plugin_id}/icons/{icon_revision}",
+            get(plugin_icon_route).head(plugin_icon_route),
+        )
+        .route("/storage/workspaces/{workspace_id}/apps/{app_id}/icons/{icon_revision}", get(app_icon_route).head(app_icon_route))
         .layer(middleware::from_fn(super::header_policy::enforce))
+        .merge(Router::new().route("/storage/app-views/{grant}/", axum::routing::any(super::apps::app_view_root)).route("/storage/app-views/{grant}/{*path}", axum::routing::any(super::apps::app_view)).layer(middleware::from_fn(super::header_policy::enforce_app)))
+        .merge(
+            Router::new()
+                .route(
+                    "/webhooks/tasks/{trigger_id}/{secret}",
+                    post(super::webhooks::task_webhook_route),
+                )
+                .layer(middleware::from_fn(super::header_policy::enforce_webhook)),
+        )
         .with_state(state)
 }
 

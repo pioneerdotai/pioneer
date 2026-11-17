@@ -4,8 +4,44 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../../../config/default.toml");
+const DEV_CONFIG_TOML: &str = include_str!("../../../config/dev.toml");
+pub const DEV_GATEWAY_BUNDLE_ID: &str = "ai.pioneer.gateway.dev";
+
+/// Runtime configuration selection, independent of compiler optimizations and
+/// debug assertions. The CLI may select it once, before foreground startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeEnvironment {
+    Development,
+    Production,
+}
+
+static RUNTIME_ENVIRONMENT: OnceLock<RuntimeEnvironment> = OnceLock::new();
+
+impl RuntimeEnvironment {
+    pub fn current() -> Self {
+        *RUNTIME_ENVIRONMENT.get_or_init(|| {
+            if cfg!(debug_assertions) {
+                Self::Development
+            } else {
+                Self::Production
+            }
+        })
+    }
+
+    /// Select before loading configuration or starting runtime threads. An
+    /// initialized process cannot switch homes underneath existing owners.
+    pub fn select_for_foreground_gateway(self) -> Result<()> {
+        let selected = RUNTIME_ENVIRONMENT.get_or_init(|| self);
+        anyhow::ensure!(
+            *selected == self,
+            "runtime environment was already selected; restart Gateway to change it"
+        );
+        Ok(())
+    }
+}
 
 // Bootstrap constant: this file may override AppConfig values, so we need its name
 // before AppConfig is available.
@@ -42,11 +78,11 @@ pub struct GatewayConfig {
     pub listen_addr: String,
     pub outbound_queue_capacity: usize,
     #[serde(default)]
+    pub outbound: GatewayOutboundConfig,
+    #[serde(default)]
     pub trusted_proxy_peers: Vec<IpAddr>,
     #[serde(default = "default_gateway_keepawake")]
     pub keepawake: bool,
-    #[serde(default)]
-    pub preflight_model: GatewayMemoryModelSelectionConfig,
     #[serde(default)]
     pub telemetry: GatewayTelemetryConfig,
     pub thread: GatewayThreadConfig,
@@ -76,6 +112,8 @@ pub struct GatewayConfig {
     pub artifacts: GatewayArtifactsConfig,
     #[serde(default)]
     pub resilience: GatewayResilienceConfig,
+    #[serde(default)]
+    pub context_compaction: GatewayContextCompactionConfig,
     pub auth: GatewayAuthConfig,
 }
 
@@ -85,6 +123,10 @@ pub struct GatewayVoiceConfig {
     pub models_dir: String,
     #[serde(default)]
     pub transcription_strategy: GatewayVoiceTranscriptionStrategy,
+    /// Selects the session pipeline. Legacy transcription_strategy values do
+    /// not override this setting: both previously used incremental sessions.
+    #[serde(default = "default_gateway_voice_transcribe_while_recording")]
+    pub transcribe_while_recording: bool,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -98,6 +140,7 @@ impl Default for GatewayVoiceConfig {
         Self {
             models_dir: default_gateway_voice_models_dir(),
             transcription_strategy: GatewayVoiceTranscriptionStrategy::default(),
+            transcribe_while_recording: true,
             enabled: false,
             provider: None,
             model: None,
@@ -115,6 +158,10 @@ impl GatewayVoiceConfig {
 
 fn default_gateway_voice_models_dir() -> String {
     "models/voice".to_owned()
+}
+
+const fn default_gateway_voice_transcribe_while_recording() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -143,8 +190,6 @@ pub struct GatewayTaskReviewConfig {
     pub enabled: bool,
     #[serde(default = "default_tasks_review_allow_task_create_review_policy")]
     pub allow_task_create_review_policy: bool,
-    #[serde(default = "default_tasks_review_parent_review_for_attached_agent_tasks")]
-    pub default_parent_review_for_immediate_attached_agent_tasks: bool,
     #[serde(default = "default_tasks_review_max_revision_rounds")]
     pub default_max_revision_rounds: u32,
     #[serde(default = "default_tasks_review_auto_accept_after_seconds")]
@@ -223,8 +268,6 @@ impl Default for GatewayTaskReviewConfig {
         Self {
             enabled: default_tasks_review_enabled(),
             allow_task_create_review_policy: default_tasks_review_allow_task_create_review_policy(),
-            default_parent_review_for_immediate_attached_agent_tasks:
-                default_tasks_review_parent_review_for_attached_agent_tasks(),
             default_max_revision_rounds: default_tasks_review_max_revision_rounds(),
             auto_accept_after_seconds: default_tasks_review_auto_accept_after_seconds(),
         }
@@ -237,10 +280,6 @@ const fn default_tasks_review_enabled() -> bool {
 
 const fn default_tasks_review_allow_task_create_review_policy() -> bool {
     false
-}
-
-const fn default_tasks_review_parent_review_for_attached_agent_tasks() -> bool {
-    true
 }
 
 const fn default_tasks_review_max_revision_rounds() -> u32 {
@@ -325,6 +364,53 @@ impl Default for GatewayArtifactsConfig {
             view_grants_per_session: default_gateway_artifacts_view_grants_per_session(),
             view_grant_streams: default_gateway_artifacts_view_grant_streams(),
         }
+    }
+}
+
+/// Activity window for optional preparation of the main conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GatewayContextCompactionConfig {
+    pub hot_conversation_window_secs: u64,
+}
+
+impl Default for GatewayContextCompactionConfig {
+    fn default() -> Self {
+        Self {
+            hot_conversation_window_secs: 28_800,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GatewayContextCompactionConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Wire {
+            hot_conversation_window_secs: u64,
+        }
+        impl Default for Wire {
+            fn default() -> Self {
+                Self {
+                    hot_conversation_window_secs: GatewayContextCompactionConfig::default()
+                        .hot_conversation_window_secs,
+                }
+            }
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        // Keep conversion to the durable signed millisecond clock bounded.
+        if wire.hot_conversation_window_secs == 0
+            || wire.hot_conversation_window_secs > i64::MAX as u64 / 1_000
+        {
+            return Err(serde::de::Error::custom(
+                "hot_conversation_window_secs must be positive and fit signed milliseconds",
+            ));
+        }
+        Ok(Self {
+            hot_conversation_window_secs: wire.hot_conversation_window_secs,
+        })
     }
 }
 
@@ -714,21 +800,12 @@ pub struct GatewayMemoryConfig {
     /// Enables the durable memory product surface for the gateway.
     #[serde(default = "default_gateway_memory_enabled")]
     pub enabled: bool,
-    /// Relative runtime-home directory where memvid capsules are stored.
-    #[serde(default = "default_gateway_memory_capsules_dir")]
-    pub capsules_dir: String,
     /// Allows user/global memories to be used when a request has no narrower workspace scope.
     #[serde(default = "default_gateway_memory_allow_global_user")]
     pub allow_global_user_by_default: bool,
     /// Allows agent/global memories to be used when explicitly enabled by config.
     #[serde(default = "default_gateway_memory_allow_global_agent")]
     pub allow_global_agent_by_default: bool,
-    /// Enables deterministic pre-turn recall into the prompt context.
-    #[serde(default = "default_gateway_memory_deterministic_recall_enabled")]
-    pub deterministic_recall_enabled: bool,
-    /// Enables active recall planning before prompt compilation.
-    #[serde(default = "default_gateway_memory_active_recall_enabled")]
-    pub active_recall_enabled: bool,
     /// Exposes explicit memory tools to capable model providers.
     #[serde(default = "default_gateway_memory_tools_enabled")]
     pub tools_enabled: bool,
@@ -738,9 +815,6 @@ pub struct GatewayMemoryConfig {
     /// Runs post-turn extraction as background hook work instead of blocking the user turn.
     #[serde(default = "default_gateway_memory_background_extraction_enabled")]
     pub background_extraction_enabled: bool,
-    /// Provider/model used by active recall planner. Defaults to the thread model.
-    #[serde(default)]
-    pub active_recall_model: GatewayMemoryModelSelectionConfig,
     /// Provider/model used by proactive memory writes. Defaults to the thread model.
     #[serde(default)]
     pub proactive_writes_model: GatewayMemoryModelSelectionConfig,
@@ -756,27 +830,15 @@ impl Default for GatewayMemoryConfig {
     fn default() -> Self {
         Self {
             enabled: default_gateway_memory_enabled(),
-            capsules_dir: default_gateway_memory_capsules_dir(),
             allow_global_user_by_default: default_gateway_memory_allow_global_user(),
             allow_global_agent_by_default: default_gateway_memory_allow_global_agent(),
-            deterministic_recall_enabled: default_gateway_memory_deterministic_recall_enabled(),
-            active_recall_enabled: default_gateway_memory_active_recall_enabled(),
             tools_enabled: default_gateway_memory_tools_enabled(),
             proactive_writes_enabled: default_gateway_memory_proactive_writes_enabled(),
             background_extraction_enabled: default_gateway_memory_background_extraction_enabled(),
-            active_recall_model: GatewayMemoryModelSelectionConfig::default(),
             proactive_writes_model: GatewayMemoryModelSelectionConfig::default(),
             debug_trace_enabled: false,
             strict_diagnostics_enabled: false,
         }
-    }
-}
-
-impl GatewayMemoryConfig {
-    pub fn resolve_capsules_root(&self, runtime_home: &Path) -> Result<PathBuf> {
-        let capsules_dir =
-            normalize_runtime_dir_path(self.capsules_dir.as_str(), "gateway.memory.capsules_dir")?;
-        Ok(runtime_home.join(capsules_dir))
     }
 }
 
@@ -806,16 +868,13 @@ pub struct GatewayThreadEpisodicConfig {
     /// Hard cap for backend candidate work.
     #[serde(default = "default_gateway_thread_episodic_max_candidate_work")]
     pub max_candidate_work: u32,
-    /// Maximum current-thread segments searched per recall.
-    #[serde(default = "default_gateway_thread_episodic_max_segments")]
-    pub max_segments: u64,
     /// Adaptive retrieval minimum relevancy cutoff.
     #[serde(default = "default_gateway_thread_episodic_min_relevancy")]
     pub min_relevancy: f32,
     /// Adaptive retrieval minimum result count.
     #[serde(default = "default_gateway_thread_episodic_min_results")]
     pub min_results: u32,
-    /// Snippet chars requested from memvid search.
+    /// Maximum characters returned per search snippet.
     #[serde(default = "default_gateway_thread_episodic_snippet_chars")]
     pub snippet_chars: u32,
     /// Index worker batch limit.
@@ -830,10 +889,7 @@ pub struct GatewayThreadEpisodicConfig {
     /// Max retry attempts before terminal failure.
     #[serde(default = "default_gateway_thread_episodic_max_attempts")]
     pub max_attempts: i64,
-    /// Segment rotation threshold based on memvid utilization stats.
-    #[serde(default = "default_gateway_thread_episodic_near_capacity_percent")]
-    pub near_capacity_percent: f64,
-    /// Opt-in vector search projection settings for thread episodic workspace capsules.
+    /// Vector search settings for the workspace episodic projection.
     #[serde(default)]
     pub vector_search: GatewayThreadEpisodicVectorSearchConfig,
 }
@@ -849,7 +905,6 @@ impl Default for GatewayThreadEpisodicConfig {
             max_hit_chars: default_gateway_thread_episodic_max_hit_chars(),
             default_max_candidates: default_gateway_thread_episodic_max_candidates(),
             max_candidate_work: default_gateway_thread_episodic_max_candidate_work(),
-            max_segments: default_gateway_thread_episodic_max_segments(),
             min_relevancy: default_gateway_thread_episodic_min_relevancy(),
             min_results: default_gateway_thread_episodic_min_results(),
             snippet_chars: default_gateway_thread_episodic_snippet_chars(),
@@ -857,7 +912,6 @@ impl Default for GatewayThreadEpisodicConfig {
             retry_base_delay_secs: default_gateway_thread_episodic_retry_base_delay_secs(),
             retry_max_delay_secs: default_gateway_thread_episodic_retry_max_delay_secs(),
             max_attempts: default_gateway_thread_episodic_max_attempts(),
-            near_capacity_percent: default_gateway_thread_episodic_near_capacity_percent(),
             vector_search: GatewayThreadEpisodicVectorSearchConfig::default(),
         }
     }
@@ -923,6 +977,8 @@ pub enum GatewayThreadEpisodicVectorProviderConfig {
     OpenAi,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "vercel-ai-gateway")]
+    VercelAiGateway,
     #[serde(rename = "local")]
     Local,
 }
@@ -992,27 +1048,63 @@ pub struct GatewayThreadConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(from = "GatewayProviderConfigWire")]
 pub struct GatewayProviderConfig {
-    #[serde(
-        default = "default_provider_non_stream_request_timeout_secs",
-        alias = "default_timeout_secs"
-    )]
     pub non_stream_request_timeout_secs: u64,
-    #[serde(default = "default_provider_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
-    #[serde(default = "default_provider_first_chunk_timeout_secs")]
     pub first_chunk_timeout_secs: u64,
-    #[serde(default = "default_provider_inter_chunk_idle_timeout_secs")]
     pub inter_chunk_idle_timeout_secs: u64,
-    #[serde(default)]
     pub max_stream_duration_secs: Option<u64>,
-    #[serde(default)]
     pub attachments: GatewayProviderAttachmentsConfig,
+    /// Provenance only, not a configurable override. Explicit timeout settings
+    /// remain authoritative even when numerically equal to built-in defaults.
+    pub use_default_flex_timeouts: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct GatewayProviderConfigWire {
+    #[serde(default, alias = "default_timeout_secs")]
+    non_stream_request_timeout_secs: Option<u64>,
+    #[serde(default)]
+    connect_timeout_secs: Option<u64>,
+    #[serde(default)]
+    first_chunk_timeout_secs: Option<u64>,
+    #[serde(default)]
+    inter_chunk_idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_stream_duration_secs: Option<u64>,
+    #[serde(default)]
+    attachments: GatewayProviderAttachmentsConfig,
+}
+impl From<GatewayProviderConfigWire> for GatewayProviderConfig {
+    fn from(wire: GatewayProviderConfigWire) -> Self {
+        let use_default_flex_timeouts = wire.non_stream_request_timeout_secs.is_none()
+            && wire.first_chunk_timeout_secs.is_none()
+            && wire.inter_chunk_idle_timeout_secs.is_none();
+        Self {
+            non_stream_request_timeout_secs: wire
+                .non_stream_request_timeout_secs
+                .unwrap_or_else(default_provider_non_stream_request_timeout_secs),
+            connect_timeout_secs: wire
+                .connect_timeout_secs
+                .unwrap_or_else(default_provider_connect_timeout_secs),
+            first_chunk_timeout_secs: wire
+                .first_chunk_timeout_secs
+                .unwrap_or_else(default_provider_first_chunk_timeout_secs),
+            inter_chunk_idle_timeout_secs: wire
+                .inter_chunk_idle_timeout_secs
+                .unwrap_or_else(default_provider_inter_chunk_idle_timeout_secs),
+            max_stream_duration_secs: wire.max_stream_duration_secs,
+            attachments: wire.attachments,
+            use_default_flex_timeouts,
+        }
+    }
 }
 
 impl Default for GatewayProviderConfig {
     fn default() -> Self {
         Self {
+            use_default_flex_timeouts: true,
             non_stream_request_timeout_secs: default_provider_non_stream_request_timeout_secs(),
             connect_timeout_secs: default_provider_connect_timeout_secs(),
             first_chunk_timeout_secs: default_provider_first_chunk_timeout_secs(),
@@ -1413,6 +1505,46 @@ impl<'de> Deserialize<'de> for GatewayCliAgentRuntimeConfig {
             command_heartbeat: wire.command_heartbeat,
         })
     }
+}
+
+/// Per-connection admitted payload, including the writer; not an RSS limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewayOutboundConfig {
+    pub payload_bytes: usize,
+    pub reserved_payload_bytes: usize,
+    pub write_timeout_ms: u64,
+}
+impl Default for GatewayOutboundConfig {
+    fn default() -> Self {
+        Self {
+            payload_bytes: 64 * 1024 * 1024,
+            reserved_payload_bytes: 16 * 1024 * 1024,
+            write_timeout_ms: 30_000,
+        }
+    }
+}
+impl GatewayConfig {
+    pub fn validate_outbound(&self) -> Result<()> {
+        if self.outbound_queue_capacity < 2
+            || self.outbound_queue_capacity > max_outbound_capacity()
+        {
+            bail!("gateway.outbound_queue_capacity must be between 2 and usize::MAX / 8");
+        }
+        if self.outbound.reserved_payload_bytes == 0
+            || self.outbound.reserved_payload_bytes >= self.outbound.payload_bytes
+        {
+            bail!("gateway.outbound reserved bytes must be positive and below total payload bytes");
+        }
+        if self.outbound.write_timeout_ms == 0 || self.outbound.write_timeout_ms > 86_400_000 {
+            bail!("gateway.outbound.write_timeout_ms must be between 1 and 86400000");
+        }
+        Ok(())
+    }
+}
+// Tokio semaphore's maximum permits, without adding a runtime dependency here.
+const fn max_outbound_capacity() -> usize {
+    usize::MAX >> 3
 }
 
 impl GatewayConfig {
@@ -1899,86 +2031,14 @@ impl Default for GatewayWebToolsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayComputerUseToolsConfig {
-    #[serde(default = "default_computer_use_artifacts_subdir")]
-    pub artifacts_subdir: String,
-    #[serde(default = "default_computer_use_retention_hours")]
-    pub retention_hours: u64,
     #[serde(default = "default_computer_use_max_total_bytes")]
     pub max_total_bytes: u64,
-    #[serde(default = "default_computer_use_run_max_steps_default")]
-    pub run_max_steps_default: u32,
-    #[serde(default = "default_computer_use_snapshot_transport_max_bytes")]
-    pub snapshot_transport_max_bytes: usize,
-    #[serde(default = "default_computer_use_snapshot_transport_max_side_px")]
-    pub snapshot_transport_max_side_px: u32,
-    #[serde(default = "default_computer_use_snapshot_transport_min_side_px")]
-    pub snapshot_transport_min_side_px: u32,
-    #[serde(default = "default_computer_use_snapshot_downscale_factor")]
-    pub snapshot_downscale_factor: f64,
-    #[serde(default = "default_computer_use_accessibility_tree_max_depth")]
-    pub accessibility_tree_max_depth: usize,
-    #[serde(default = "default_computer_use_accessibility_tree_max_nodes")]
-    pub accessibility_tree_max_nodes: usize,
-    #[serde(default = "default_computer_use_accessibility_tree_max_serialized_bytes")]
-    pub accessibility_tree_max_serialized_bytes: usize,
-    #[serde(default = "default_computer_use_accessibility_tree_text_max_chars")]
-    pub accessibility_tree_text_max_chars: usize,
-    #[serde(default = "default_computer_use_semantic_action_timeout_ms")]
-    pub semantic_action_timeout_ms: u64,
-    #[serde(default = "default_computer_use_app_activation_timeout_ms")]
-    pub app_activation_timeout_ms: u64,
-    #[serde(default = "default_computer_use_input_simulation_enabled")]
-    pub input_simulation_enabled: bool,
-    #[serde(default = "default_computer_use_launch_if_missing_default")]
-    pub launch_if_missing_default: bool,
-    #[serde(default)]
-    pub allowed_launch_commands: Vec<String>,
-    #[serde(default = "default_computer_use_preflight_screenshot_probe_enabled")]
-    pub preflight_screenshot_probe_enabled: bool,
-    #[serde(default = "default_computer_use_max_consecutive_same_snapshot_hash")]
-    pub max_consecutive_same_snapshot_hash: u32,
-    #[serde(default = "default_computer_use_max_consecutive_same_action_signature")]
-    pub max_consecutive_same_action_signature: u32,
-    #[serde(default = "default_computer_use_max_consecutive_no_progress_steps")]
-    pub max_consecutive_no_progress_steps: u32,
-    #[serde(default = "default_computer_use_max_recovery_attempts_per_step")]
-    pub max_recovery_attempts_per_step: u32,
-    #[serde(default = "default_computer_use_max_recovery_attempts_per_run")]
-    pub max_recovery_attempts_per_run: u32,
 }
 
 impl Default for GatewayComputerUseToolsConfig {
     fn default() -> Self {
         Self {
-            artifacts_subdir: default_computer_use_artifacts_subdir(),
-            retention_hours: default_computer_use_retention_hours(),
             max_total_bytes: default_computer_use_max_total_bytes(),
-            run_max_steps_default: default_computer_use_run_max_steps_default(),
-            snapshot_transport_max_bytes: default_computer_use_snapshot_transport_max_bytes(),
-            snapshot_transport_max_side_px: default_computer_use_snapshot_transport_max_side_px(),
-            snapshot_transport_min_side_px: default_computer_use_snapshot_transport_min_side_px(),
-            snapshot_downscale_factor: default_computer_use_snapshot_downscale_factor(),
-            accessibility_tree_max_depth: default_computer_use_accessibility_tree_max_depth(),
-            accessibility_tree_max_nodes: default_computer_use_accessibility_tree_max_nodes(),
-            accessibility_tree_max_serialized_bytes:
-                default_computer_use_accessibility_tree_max_serialized_bytes(),
-            accessibility_tree_text_max_chars:
-                default_computer_use_accessibility_tree_text_max_chars(),
-            semantic_action_timeout_ms: default_computer_use_semantic_action_timeout_ms(),
-            app_activation_timeout_ms: default_computer_use_app_activation_timeout_ms(),
-            input_simulation_enabled: default_computer_use_input_simulation_enabled(),
-            launch_if_missing_default: default_computer_use_launch_if_missing_default(),
-            allowed_launch_commands: Vec::new(),
-            preflight_screenshot_probe_enabled:
-                default_computer_use_preflight_screenshot_probe_enabled(),
-            max_consecutive_same_snapshot_hash:
-                default_computer_use_max_consecutive_same_snapshot_hash(),
-            max_consecutive_same_action_signature:
-                default_computer_use_max_consecutive_same_action_signature(),
-            max_consecutive_no_progress_steps:
-                default_computer_use_max_consecutive_no_progress_steps(),
-            max_recovery_attempts_per_step: default_computer_use_max_recovery_attempts_per_step(),
-            max_recovery_attempts_per_run: default_computer_use_max_recovery_attempts_per_run(),
         }
     }
 }
@@ -2083,20 +2143,8 @@ const fn default_tool_retry_max_retries_per_tool_name_per_episode() -> u32 {
     16
 }
 
-fn default_computer_use_artifacts_subdir() -> String {
-    "tools/computer_use".to_owned()
-}
-
-const fn default_computer_use_retention_hours() -> u64 {
-    24
-}
-
 const fn default_computer_use_max_total_bytes() -> u64 {
     1024 * 1024 * 1024
-}
-
-const fn default_computer_use_run_max_steps_default() -> u32 {
-    300
 }
 
 const fn default_gateway_keepawake() -> bool {
@@ -2107,24 +2155,12 @@ const fn default_gateway_memory_enabled() -> bool {
     true
 }
 
-fn default_gateway_memory_capsules_dir() -> String {
-    "memory/capsules".to_owned()
-}
-
 const fn default_gateway_memory_allow_global_user() -> bool {
     true
 }
 
 const fn default_gateway_memory_allow_global_agent() -> bool {
     false
-}
-
-const fn default_gateway_memory_deterministic_recall_enabled() -> bool {
-    true
-}
-
-const fn default_gateway_memory_active_recall_enabled() -> bool {
-    true
 }
 
 const fn default_gateway_memory_tools_enabled() -> bool {
@@ -2171,10 +2207,6 @@ const fn default_gateway_thread_episodic_max_candidate_work() -> u32 {
     128
 }
 
-const fn default_gateway_thread_episodic_max_segments() -> u64 {
-    16
-}
-
 const fn default_gateway_thread_episodic_min_relevancy() -> f32 {
     0.25
 }
@@ -2201,10 +2233,6 @@ const fn default_gateway_thread_episodic_retry_max_delay_secs() -> i64 {
 
 const fn default_gateway_thread_episodic_max_attempts() -> i64 {
     5
-}
-
-const fn default_gateway_thread_episodic_near_capacity_percent() -> f64 {
-    85.0
 }
 
 const fn default_gateway_thread_episodic_vector_normalized() -> bool {
@@ -2244,78 +2272,6 @@ const fn default_gateway_hook_recovery_max_concurrent() -> usize {
 
 const fn default_gateway_hook_recovery_stale_running_after_ms() -> u64 {
     120_000
-}
-
-const fn default_computer_use_snapshot_transport_max_bytes() -> usize {
-    8 * 1024 * 1024
-}
-
-const fn default_computer_use_snapshot_transport_max_side_px() -> u32 {
-    1280
-}
-
-const fn default_computer_use_snapshot_transport_min_side_px() -> u32 {
-    320
-}
-
-const fn default_computer_use_snapshot_downscale_factor() -> f64 {
-    0.85
-}
-
-const fn default_computer_use_accessibility_tree_max_depth() -> usize {
-    6
-}
-
-const fn default_computer_use_accessibility_tree_max_nodes() -> usize {
-    200
-}
-
-const fn default_computer_use_accessibility_tree_max_serialized_bytes() -> usize {
-    192 * 1024
-}
-
-const fn default_computer_use_accessibility_tree_text_max_chars() -> usize {
-    160
-}
-
-const fn default_computer_use_semantic_action_timeout_ms() -> u64 {
-    30_000
-}
-
-const fn default_computer_use_app_activation_timeout_ms() -> u64 {
-    5_000
-}
-
-const fn default_computer_use_input_simulation_enabled() -> bool {
-    true
-}
-
-const fn default_computer_use_launch_if_missing_default() -> bool {
-    false
-}
-
-const fn default_computer_use_preflight_screenshot_probe_enabled() -> bool {
-    true
-}
-
-const fn default_computer_use_max_consecutive_same_snapshot_hash() -> u32 {
-    6
-}
-
-const fn default_computer_use_max_consecutive_same_action_signature() -> u32 {
-    8
-}
-
-const fn default_computer_use_max_consecutive_no_progress_steps() -> u32 {
-    4
-}
-
-const fn default_computer_use_max_recovery_attempts_per_step() -> u32 {
-    2
-}
-
-const fn default_computer_use_max_recovery_attempts_per_run() -> u32 {
-    12
 }
 
 const fn default_provider_non_stream_request_timeout_secs() -> u64 {
@@ -3192,7 +3148,79 @@ impl InstallState {
 
 impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
-        load_config_from_sources(DEFAULT_CONFIG_TOML, config_override_candidates())
+        load_profile_config(
+            RuntimeEnvironment::current() == RuntimeEnvironment::Development,
+            workspace_local_config_path(),
+            user_override_config_path(),
+            std::env::var_os("PIONEER_CONFIG").map(PathBuf::from),
+        )
+    }
+
+    /// Debug commands share one isolated contour, including commands issued by
+    /// Desktop and a service manager without the developer's shell environment.
+    /// Validate before creating a home, preparing CUA or touching a registration.
+    pub fn validate_development_context(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.home_directory == ".pioneer.dev"
+                && self.gateway.service_name == "com.pioneer.gateway.dev"
+                && self.install.unix_root_directory_name == "pioneer-dev"
+                && self.install.macos_root_directory_name == "PioneerDev"
+                && self.install.windows_root_directory_name == "PioneerDev"
+                && self.install.managed_directory_name == "managed-dev"
+                && self.install.macos_associated_bundle_identifier == DEV_GATEWAY_BUNDLE_ID
+                && self.gateway.remote_access.service_name == "pioneer_gateway_dev"
+                && !self
+                    .gateway
+                    .legacy_service_names
+                    .iter()
+                    .any(|name| name.trim().eq_ignore_ascii_case("com.pioneer.gateway")),
+            "debug Gateway requires the isolated dev home, service, install root and Gateway identity"
+        );
+        let listen: std::net::SocketAddr = self
+            .gateway
+            .listen_addr
+            .parse()
+            .context("invalid dev Gateway listen address")?;
+        let remote: std::net::SocketAddr = self
+            .gateway
+            .remote_access
+            .local_addr
+            .parse()
+            .context("invalid dev remote-access local address")?;
+        anyhow::ensure!(
+            listen.port() != 0
+                && listen.port() != 17878
+                && remote.ip().is_loopback()
+                && remote.port() == listen.port()
+                && self.desktop.mcp_oauth.callback_port.get() != 37643,
+            "dev Gateway, remote access and Desktop callback must use ports separate from prod"
+        );
+        let home = self.runtime_home_dir()?;
+        for (value, field) in [
+            (&self.install_state_file_name, "install_state_file_name"),
+            (
+                &self.gateway.settings_file_name,
+                "gateway.settings_file_name",
+            ),
+            (
+                &self.gateway.database.file_name,
+                "gateway.database.file_name",
+            ),
+        ] {
+            let file = normalize_runtime_file_name(value, field)?;
+            ensure_development_path(&home.join(file))?;
+        }
+        let remote_dir = Path::new(&self.gateway.remote_access.runtime_dir);
+        anyhow::ensure!(
+            !remote_dir.as_os_str().is_empty()
+                && remote_dir
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_))),
+            "dev remote-access runtime must stay inside the dev home"
+        );
+        ensure_development_path(&home.join(remote_dir))?;
+        ensure_development_path(&home.join("gateway-runtime"))?;
+        Ok(())
     }
 
     pub fn runtime_home_dir(&self) -> Result<PathBuf> {
@@ -3449,13 +3477,70 @@ pub fn save_install_state(path: &Path, state: &InstallState) -> Result<()> {
     Ok(())
 }
 
-fn config_override_candidates() -> Vec<PathBuf> {
-    ordered_config_overrides(
-        cfg!(debug_assertions),
-        workspace_local_config_path(),
-        user_override_config_path(),
-        std::env::var_os("PIONEER_CONFIG").map(PathBuf::from),
-    )
+/// Reject directory aliases before any dev write. In particular .pioneer.dev
+/// must never be a link to the production home. Missing paths are safe to create.
+pub fn ensure_development_path(path: &Path) -> Result<()> {
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    anyhow::ensure!(
+                        metadata.file_attributes() & 0x400 == 0,
+                        "dev path must not traverse a reparse point: {}",
+                        ancestor.display()
+                    );
+                }
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "dev path must not traverse a symbolic link: {}",
+                    ancestor.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("cannot inspect dev path"),
+        }
+    }
+    Ok(())
+}
+
+fn load_profile_config(
+    debug: bool,
+    workspace: PathBuf,
+    user: Option<PathBuf>,
+    explicit: Option<PathBuf>,
+) -> Result<AppConfig, ConfigError> {
+    let explicit_required = explicit.is_some();
+    let paths = ordered_config_overrides(debug, workspace.clone(), user, explicit);
+    let mut builder =
+        Config::builder().add_source(File::from_str(DEFAULT_CONFIG_TOML, FileFormat::Toml));
+    if debug {
+        // Versioned defaults must not replace safe developer network settings.
+        // The Gateway association is distinct from Desktop's local bundle ID;
+        // reassert only that association before user and explicit overrides.
+        builder = builder
+            .add_source(File::from_str(DEV_CONFIG_TOML, FileFormat::Toml))
+            .add_source(File::from(workspace.as_path()).required(false))
+            .add_source(File::from_str(
+                &format!(
+                    "[install]\nmacos_associated_bundle_identifier = {DEV_GATEWAY_BUNDLE_ID:?}\n"
+                ),
+                FileFormat::Toml,
+            ));
+    }
+    for (index, path) in paths.iter().enumerate().skip(usize::from(debug)) {
+        builder = builder.add_source(
+            File::from(path.as_path()).required(explicit_required && index + 1 == paths.len()),
+        );
+    }
+    let config: AppConfig = builder.build()?.try_deserialize()?;
+    if debug {
+        config
+            .validate_development_context()
+            .map_err(|error| ConfigError::Message(format!("{error:#}")))?;
+    }
+    Ok(config)
 }
 
 fn ordered_config_overrides(
@@ -3474,6 +3559,7 @@ fn ordered_config_overrides(
     candidates
 }
 
+#[cfg(test)]
 fn load_config_from_sources(
     default_config_toml: &str,
     override_paths: Vec<PathBuf>,
@@ -3485,54 +3571,8 @@ fn load_config_from_sources(
         builder = builder.add_source(File::from(path.as_path()).required(false));
     }
 
-    let mut config: AppConfig = builder.build()?.try_deserialize()?;
-    migrate_gateway_preflight_model_from_legacy_overrides(&mut config, override_paths.as_slice());
+    let config: AppConfig = builder.build()?.try_deserialize()?;
     Ok(config)
-}
-
-fn migrate_gateway_preflight_model_from_legacy_overrides(
-    config: &mut AppConfig,
-    override_paths: &[PathBuf],
-) {
-    if override_paths_contain_toml_path(override_paths, &["gateway", "preflight_model"]) {
-        return;
-    }
-
-    if override_paths_contain_toml_path(
-        override_paths,
-        &["gateway", "memory", "active_recall_model"],
-    ) {
-        config.gateway.preflight_model = config.gateway.memory.active_recall_model.clone();
-    }
-}
-
-fn override_paths_contain_toml_path(override_paths: &[PathBuf], path: &[&str]) -> bool {
-    override_paths.iter().any(|override_path| {
-        let Ok(content) = std::fs::read_to_string(override_path) else {
-            return false;
-        };
-        let Ok(value) = toml::from_str::<toml::Value>(content.as_str()) else {
-            return false;
-        };
-        toml_value_has_path(&value, path)
-    })
-}
-
-fn toml_value_has_path(value: &toml::Value, path: &[&str]) -> bool {
-    if path.is_empty() {
-        return true;
-    }
-
-    for end in 1..=path.len() {
-        let key = path[..end].join(".");
-        if let Some(next) = value.get(key.as_str())
-            && toml_value_has_path(next, &path[end..])
-        {
-            return true;
-        }
-    }
-
-    false
 }
 
 fn workspace_local_config_path() -> PathBuf {
@@ -3550,7 +3590,7 @@ fn user_override_config_path() -> Option<PathBuf> {
 }
 
 fn user_config_directory_name() -> &'static str {
-    if cfg!(debug_assertions) {
+    if RuntimeEnvironment::current() == RuntimeEnvironment::Development {
         "pioneer-dev"
     } else {
         "pioneer"
@@ -3559,6 +3599,25 @@ fn user_config_directory_name() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn native_flex_distinguishes_omitted_timeouts_from_explicit_default_values() {
+        let implicit: super::GatewayProviderConfig = toml::from_str("").unwrap();
+        assert!(implicit.use_default_flex_timeouts);
+        assert_eq!(implicit.non_stream_request_timeout_secs, 120);
+        for input in [
+            "first_chunk_timeout_secs = 180",
+            "non_stream_request_timeout_secs = 120",
+            "inter_chunk_idle_timeout_secs = 180",
+            "default_timeout_secs = 120",
+        ] {
+            let explicit: super::GatewayProviderConfig = toml::from_str(input).unwrap();
+            assert!(!explicit.use_default_flex_timeouts);
+        }
+        let embedded = load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).unwrap();
+        assert!(embedded.gateway.provider.use_default_flex_timeouts);
+        assert_eq!(embedded.gateway.provider.first_chunk_timeout_secs, 180);
+    }
     use super::{
         DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeInstancesConfig,
         GatewayCliAgentRuntimeKindConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
@@ -3570,6 +3629,246 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn debug_profile_has_a_versioned_contour_without_local_config() {
+        let missing = unique_temp_file_path("absent-local-config");
+        let config = super::load_profile_config(true, missing.clone(), None, None).unwrap();
+        assert_eq!(config.home_directory, ".pioneer.dev");
+        assert_eq!(config.gateway.service_name, "com.pioneer.gateway.dev");
+        assert_eq!(config.gateway.listen_addr, "0.0.0.0:18778");
+        assert_eq!(config.gateway.remote_access.local_addr, "127.0.0.1:18778");
+        assert_eq!(
+            config.gateway.remote_access.service_name,
+            "pioneer_gateway_dev"
+        );
+        assert_eq!(
+            config.install.macos_associated_bundle_identifier,
+            "ai.pioneer.gateway.dev"
+        );
+        assert_eq!(config.install.managed_directory_name, "managed-dev");
+        assert_eq!(config.desktop.mcp_oauth.callback_port.get(), 37644);
+        let production = super::load_profile_config(false, missing, None, None).unwrap();
+        assert_eq!(production.home_directory, ".pioneer");
+        assert_eq!(production.gateway.service_name, "com.pioneer.gateway");
+        assert_eq!(production.gateway.listen_addr, "0.0.0.0:17878");
+        assert_eq!(
+            production.install.macos_associated_bundle_identifier,
+            "ai.pioneer.gateway"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn foreground_production_selection_uses_production_config_across_reloads() {
+        const FIXTURE: &str = "PIONEER_TEST_FOREGROUND_PRODUCTION_CONFIG";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = PathBuf::from(root);
+            super::RuntimeEnvironment::Production
+                .select_for_foreground_gateway()
+                .unwrap();
+            let user = super::user_override_config_path().unwrap();
+            assert!(
+                user.starts_with(&root),
+                "fixture must not touch real user config"
+            );
+            assert_eq!(user.parent().unwrap().file_name().unwrap(), "pioneer");
+            fs::create_dir_all(user.parent().unwrap()).unwrap();
+            fs::write(&user, "[gateway]\nlisten_addr = '127.0.0.1:19078'\n").unwrap();
+            let dev = user.parent().unwrap().parent().unwrap().join("pioneer-dev");
+            fs::create_dir_all(&dev).unwrap();
+            fs::write(
+                dev.join("config.toml"),
+                "home_directory = '.pioneer.dev'\n[gateway]\nlisten_addr = '127.0.0.1:19079'\n",
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let config = super::AppConfig::load().unwrap();
+                assert_eq!(config.home_directory, ".pioneer");
+                assert_eq!(config.gateway.listen_addr, "127.0.0.1:19078");
+                assert_eq!(config.gateway.service_name, "com.pioneer.gateway");
+                assert_eq!(
+                    config.install.macos_associated_bundle_identifier,
+                    "ai.pioneer.gateway"
+                );
+            }
+            assert!(
+                super::RuntimeEnvironment::Development
+                    .select_for_foreground_gateway()
+                    .is_err()
+            );
+            assert!(
+                !root.join("home/.pioneer").exists(),
+                "loading configuration must not start Gateway"
+            );
+            return;
+        }
+        // Process-local selection must not change the environment of parallel tests.
+        let root = unique_temp_file_path("foreground-production-config");
+        fs::create_dir_all(root.join("home")).unwrap();
+        let name = format!(
+            "{}::foreground_production_selection_uses_production_config_across_reloads",
+            module_path!().split_once("::").unwrap().1
+        );
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name])
+            .env(FIXTURE, &root)
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env_remove("PIONEER_CONFIG")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn debug_profile_preserves_settings_precedence_and_owns_gateway_identity() {
+        let workspace = unique_temp_file_path("dev-workspace");
+        let user = unique_temp_file_path("dev-user");
+        let explicit = unique_temp_file_path("dev-explicit");
+        write_file(
+            &workspace,
+            "[install]\nmacos_associated_bundle_identifier = 'ai.pioneer.macos.dev'\n[gateway]\nkeepawake = true\noutbound_queue_capacity = 7\nlisten_addr = '127.0.0.1:18779'\n[gateway.remote_access]\nlocal_addr = '127.0.0.1:18779'\n",
+        );
+        write_file(
+            &user,
+            "[gateway]\noutbound_queue_capacity = 8\nlisten_addr = '127.0.0.1:18780'\n[gateway.remote_access]\nlocal_addr = '127.0.0.1:18780'\n",
+        );
+        write_file(
+            &explicit,
+            "[gateway]\noutbound_queue_capacity = 9\nlisten_addr = '127.0.0.1:18781'\n[gateway.remote_access]\nlocal_addr = '127.0.0.1:18781'\n",
+        );
+        for (user_path, selected, expected, port) in [
+            (None, None, 7, 18779),
+            (Some(user.clone()), None, 8, 18780),
+            (Some(user.clone()), Some(explicit.clone()), 9, 18781),
+        ] {
+            let config =
+                super::load_profile_config(true, workspace.clone(), user_path, selected).unwrap();
+            assert!(config.gateway.keepawake);
+            assert_eq!(config.gateway.outbound_queue_capacity, expected);
+            assert_eq!(
+                config.install.macos_associated_bundle_identifier,
+                "ai.pioneer.gateway.dev"
+            );
+            assert_eq!(config.gateway.listen_addr, format!("127.0.0.1:{port}"));
+            assert_eq!(
+                config.gateway.remote_access.local_addr,
+                format!("127.0.0.1:{port}")
+            );
+        }
+        for path in [workspace, user, explicit] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn debug_profile_accepts_nested_relative_files_and_rejects_escapes() {
+        let explicit = unique_temp_file_path("dev-nested-paths");
+        write_file(
+            &explicit,
+            "install_state_file_name = 'state/install-state.toml'\n[gateway]\nsettings_file_name = 'settings/gateway.toml'\n[gateway.database]\nfile_name = 'data/gateway.db'\n",
+        );
+        let config = super::load_profile_config(
+            true,
+            unique_temp_file_path("missing-local"),
+            None,
+            Some(explicit.clone()),
+        )
+        .unwrap();
+        let home = config.runtime_home_dir().unwrap();
+        assert_eq!(
+            config.install_state_path().unwrap(),
+            home.join("state/install-state.toml")
+        );
+        assert_eq!(config.gateway.settings_file_name, "settings/gateway.toml");
+        assert_eq!(config.gateway.database.file_name, "data/gateway.db");
+        for field in [
+            "install_state_file_name",
+            "gateway.settings_file_name",
+            "gateway.database.file_name",
+        ] {
+            for path in ["../.pioneer/foreign.toml", "/absolute/foreign.toml"] {
+                let contents = match field.split_once('.') {
+                    Some((section, key)) => format!("[{section}]\n{key} = {path:?}\n"),
+                    None => format!("{field} = {path:?}\n"),
+                };
+                write_file(&explicit, &contents);
+                let error = super::load_profile_config(
+                    true,
+                    unique_temp_file_path("missing-local"),
+                    None,
+                    Some(explicit.clone()),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains(field), "{field}: {error}");
+            }
+        }
+        fs::remove_file(explicit).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nested_dev_file_rejects_an_intermediate_alias_to_production() {
+        let root = unique_temp_file_path("dev-nested-alias");
+        fs::create_dir_all(root.join(".pioneer.dev")).unwrap();
+        fs::create_dir(root.join(".pioneer")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let production = root.join(".pioneer/gateway.db");
+        fs::write(&production, b"production fixture remains untouched").unwrap();
+        std::os::unix::fs::symlink(root.join(".pioneer"), root.join(".pioneer.dev/data")).unwrap();
+        let error =
+            super::ensure_development_path(&root.join(".pioneer.dev/data/gateway.db")).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(
+            fs::read(production).unwrap(),
+            b"production fixture remains untouched"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn debug_profile_rejects_explicit_production_overlap() {
+        let explicit = unique_temp_file_path("dev-prod-overlap");
+        for contents in [
+            "home_directory = '.pioneer'",
+            "[gateway]\nservice_name = 'com.pioneer.gateway'",
+            "[gateway]\nlegacy_service_names = ['com.pioneer.gateway']",
+            "[gateway]\nlegacy_service_names = ['COM.PIONEER.GATEWAY']",
+            "[gateway]\nlegacy_service_names = ['CoM.PiOnEeR.GaTeWaY']",
+            "[gateway]\nlegacy_service_names = ['  COM.PIONEER.GATEWAY  ']",
+            "[gateway]\nlegacy_service_names = ['  CoM.PiOnEeR.GaTeWaY  ']",
+            "[install]\nmacos_root_directory_name = 'Pioneer'",
+            "[install]\nmacos_associated_bundle_identifier = 'ai.pioneer.gateway'",
+            "[gateway]\nlisten_addr = '0.0.0.0:17878'",
+            "[gateway.remote_access]\nservice_name = 'pioneer_gateway'",
+            "[gateway.remote_access]\nlocal_addr = '127.0.0.1:17878'",
+            "[gateway.database]\nfile_name = '../.pioneer/gateway.db'",
+            "[desktop.mcp_oauth]\ncallback_port = 37643",
+        ] {
+            write_file(&explicit, contents);
+            let error = super::load_profile_config(
+                true,
+                unique_temp_file_path("missing-local"),
+                None,
+                Some(explicit.clone()),
+            )
+            .unwrap_err();
+            let text = error.to_string();
+            if contents.contains("legacy_service_names") {
+                assert!(
+                    text.contains("debug Gateway requires the isolated dev home, service, install root and Gateway identity"),
+                    "legacy prod overlap must fail dev validation: {contents}: {text}"
+                );
+            }
+            assert!(
+                text.contains("dev") || text.contains("gateway.database.file_name"),
+                "{contents}: {text}"
+            );
+        }
+        fs::remove_file(explicit).unwrap();
+    }
 
     #[test]
     fn install_state_roundtrip() {
@@ -3728,16 +4027,8 @@ service_name = "com.pioneer.gateway.env"
         );
         assert_eq!(config.gateway.service_name, "com.pioneer.gateway");
         assert!(!config.gateway.keepawake);
-        assert!(config.gateway.preflight_model.is_thread_model());
         assert!(config.gateway.tasks.review.enabled);
         assert!(!config.gateway.tasks.review.allow_task_create_review_policy);
-        assert!(
-            config
-                .gateway
-                .tasks
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(config.gateway.tasks.review.default_max_revision_rounds, 5);
         assert_eq!(config.gateway.tasks.review.auto_accept_after_seconds, 300);
         assert!(!config.gateway.cli_agent_runtime.enabled);
@@ -4164,6 +4455,72 @@ hard_secs = 0
         assert_eq!(config.provider_stream_items.hard_secs, 1_800);
     }
 
+    // Contract: shipped defaults use 24 hours, while older config files retain
+    // eight hours. User layers may override either; invalid durations are rejected.
+    // Existing resilience tests exercise operation deadlines, not this layer.
+    #[test]
+    fn conversation_compaction_window_defaults_and_user_override() {
+        let config = load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            86_400
+        );
+        let mut legacy: toml::Value = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        legacy["gateway"]
+            .as_table_mut()
+            .unwrap()
+            .remove("context_compaction");
+        let legacy = toml::to_string(&legacy).unwrap();
+        let config = load_config_from_sources(&legacy, Vec::new()).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            28_800
+        );
+
+        let user_override = unique_temp_file_path("conversation-compaction-window");
+        write_file(
+            &user_override,
+            "[gateway.context_compaction]\nhot_conversation_window_secs = 3600\n",
+        );
+        let config = load_config_from_sources(&legacy, vec![user_override.clone()]).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            3_600
+        );
+        // The empty section is also backward compatible when the field is absent.
+        write_file(&user_override, "[gateway.context_compaction]\n");
+        let config = load_config_from_sources(&legacy, vec![user_override.clone()]).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            28_800
+        );
+        for invalid in ["0", "-1", "9223372036854776", "18446744073709551616"] {
+            write_file(
+                &user_override,
+                &format!(
+                    "[gateway.context_compaction]\nhot_conversation_window_secs = {invalid}\n"
+                ),
+            );
+            assert!(
+                load_config_from_sources(&legacy, vec![user_override.clone()]).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        let _ = fs::remove_file(user_override);
+    }
+
     #[test]
     fn gateway_resilience_config_preserves_valid_context_compaction_policy() {
         let config = toml::from_str::<GatewayResilienceConfig>(
@@ -4213,112 +4570,6 @@ recovery_grace_secs = 1801
                 "invalid context compaction policy must fail closed: {invalid}"
             );
         }
-    }
-
-    #[test]
-    fn settings_gateway_preflight_model_config_defaults_to_thread() {
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).expect("load default config");
-
-        assert!(config.gateway.preflight_model.is_thread_model());
-    }
-
-    #[test]
-    fn settings_gateway_preflight_model_config_accepts_custom_override() {
-        let workspace_override = unique_temp_file_path("gateway-preflight-model-config");
-        write_file(
-            &workspace_override,
-            r#"
-[gateway]
-preflight_model = { source = "custom", model_provider = "planner-provider", model = "planner-model" }
-"#,
-        );
-
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                .expect("load config with preflight model override");
-
-        assert_eq!(
-            config.gateway.preflight_model,
-            GatewayMemoryModelSelectionConfig::custom("planner-provider", "planner-model")
-        );
-
-        let _ = fs::remove_file(workspace_override);
-    }
-
-    #[test]
-    fn settings_migration_gateway_preflight_model_copies_legacy_memory_active_recall_model() {
-        let workspace_override = unique_temp_file_path("gateway-preflight-model-migration");
-        write_file(
-            &workspace_override,
-            r#"
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#,
-        );
-
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                .expect("load config with legacy active recall model");
-
-        assert_eq!(
-            config.gateway.preflight_model,
-            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
-        );
-        assert_eq!(
-            config.gateway.memory.active_recall_model,
-            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
-        );
-
-        let _ = fs::remove_file(workspace_override);
-    }
-
-    #[test]
-    fn migration_toml_path_detection_handles_nested_tables() {
-        let content = r#"
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#;
-        let value = toml::from_str::<toml::Value>(content).expect("toml should parse");
-
-        assert!(super::toml_value_has_path(
-            &value,
-            &["gateway", "memory", "active_recall_model"]
-        ));
-        assert!(!super::toml_value_has_path(
-            &value,
-            &["gateway", "preflight_model"]
-        ));
-    }
-
-    #[test]
-    fn settings_migration_gateway_preflight_model_preserves_explicit_new_setting() {
-        let workspace_override = unique_temp_file_path("gateway-preflight-model-mixed");
-        write_file(
-            &workspace_override,
-            r#"
-[gateway]
-preflight_model = { source = "custom", model_provider = "new-provider", model = "new-model" }
-
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#,
-        );
-
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                .expect("load config with mixed preflight settings");
-
-        assert_eq!(
-            config.gateway.preflight_model,
-            GatewayMemoryModelSelectionConfig::custom("new-provider", "new-model")
-        );
-        assert_eq!(
-            config.gateway.memory.active_recall_model,
-            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
-        );
-
-        let _ = fs::remove_file(workspace_override);
     }
 
     #[test]
@@ -4411,139 +4662,8 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
                 .runtime_recheck_on_tool_call
         );
         assert_eq!(
-            config.gateway.tools.computer_use.artifacts_subdir,
-            "tools/computer_use"
-        );
-        assert_eq!(config.gateway.tools.computer_use.retention_hours, 24);
-        assert_eq!(
             config.gateway.tools.computer_use.max_total_bytes,
             1024 * 1024 * 1024
-        );
-        assert_eq!(config.gateway.tools.computer_use.run_max_steps_default, 300);
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .snapshot_transport_max_bytes,
-            8 * 1024 * 1024
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .snapshot_transport_max_side_px,
-            1280
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .snapshot_transport_min_side_px,
-            320
-        );
-        assert_eq!(
-            config.gateway.tools.computer_use.snapshot_downscale_factor,
-            0.85
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_max_depth,
-            6
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_max_nodes,
-            200
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_max_serialized_bytes,
-            192 * 1024
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_text_max_chars,
-            160
-        );
-        assert_eq!(
-            config.gateway.tools.computer_use.semantic_action_timeout_ms,
-            30_000
-        );
-        assert_eq!(
-            config.gateway.tools.computer_use.app_activation_timeout_ms,
-            5_000
-        );
-        assert!(config.gateway.tools.computer_use.input_simulation_enabled);
-        assert!(!config.gateway.tools.computer_use.launch_if_missing_default);
-        assert!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .allowed_launch_commands
-                .is_empty()
-        );
-        assert!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .preflight_screenshot_probe_enabled
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_consecutive_same_snapshot_hash,
-            6
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_consecutive_same_action_signature,
-            8
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_consecutive_no_progress_steps,
-            4
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_recovery_attempts_per_step,
-            2
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_recovery_attempts_per_run,
-            12
         );
         assert_eq!(
             config.gateway.provider.attachments.max_bytes_per_attachment,
@@ -4597,15 +4717,11 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(execution_windows.total.max_windows_per_turn, None);
         assert_eq!(execution_windows.total.max_tool_calls_per_turn, None);
         assert!(config.gateway.memory.enabled);
-        assert_eq!(config.gateway.memory.capsules_dir, "memory/capsules");
         assert!(config.gateway.memory.allow_global_user_by_default);
         assert!(!config.gateway.memory.allow_global_agent_by_default);
-        assert!(config.gateway.memory.deterministic_recall_enabled);
-        assert!(config.gateway.memory.active_recall_enabled);
         assert!(config.gateway.memory.tools_enabled);
         assert!(config.gateway.memory.proactive_writes_enabled);
         assert!(config.gateway.memory.background_extraction_enabled);
-        assert!(config.gateway.memory.active_recall_model.is_thread_model());
         assert!(
             config
                 .gateway
@@ -4615,14 +4731,7 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         );
         assert!(!config.gateway.memory.debug_trace_enabled);
         assert!(!config.gateway.memory.strict_diagnostics_enabled);
-        assert_eq!(
-            config
-                .gateway
-                .memory
-                .resolve_capsules_root(PathBuf::from("/tmp/pioneer-runtime").as_path())
-                .expect("memory capsules root should resolve"),
-            PathBuf::from("/tmp/pioneer-runtime/memory/capsules")
-        );
+
         assert_eq!(config.gateway.voice.models_dir, "models/voice");
         assert_eq!(
             config.gateway.voice.transcription_strategy,
@@ -4647,7 +4756,6 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.gateway.thread_episodic.max_hit_chars, 1_200);
         assert_eq!(config.gateway.thread_episodic.default_max_candidates, 32);
         assert_eq!(config.gateway.thread_episodic.max_candidate_work, 128);
-        assert_eq!(config.gateway.thread_episodic.max_segments, 16);
         assert_eq!(config.gateway.thread_episodic.min_relevancy, 0.25);
         assert_eq!(config.gateway.thread_episodic.min_results, 1);
         assert_eq!(config.gateway.thread_episodic.snippet_chars, 360);
@@ -4655,7 +4763,6 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.gateway.thread_episodic.retry_base_delay_secs, 30);
         assert_eq!(config.gateway.thread_episodic.retry_max_delay_secs, 900);
         assert_eq!(config.gateway.thread_episodic.max_attempts, 5);
-        assert_eq!(config.gateway.thread_episodic.near_capacity_percent, 85.0);
         assert!(!config.gateway.thread_episodic.vector_search.enabled);
         assert_eq!(config.gateway.thread_episodic.vector_search.provider, None);
         assert_eq!(config.gateway.thread_episodic.vector_search.model, None);
@@ -4680,23 +4787,6 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
     }
 
     #[test]
-    fn gateway_memory_config_rejects_unsafe_capsule_dirs() {
-        for capsules_dir in ["", "/tmp/memory", "../memory", "memory/../capsules", "."] {
-            let config = super::GatewayMemoryConfig {
-                capsules_dir: capsules_dir.to_owned(),
-                ..super::GatewayMemoryConfig::default()
-            };
-
-            assert!(
-                config
-                    .resolve_capsules_root(PathBuf::from("/tmp/pioneer-runtime").as_path())
-                    .is_err(),
-                "capsules_dir `{capsules_dir}` must be rejected"
-            );
-        }
-    }
-
-    #[test]
     fn gateway_voice_config_rejects_unsafe_model_dirs() {
         for models_dir in ["", "/tmp/models", "../models", "models/../voice", "."] {
             let config = super::GatewayVoiceConfig {
@@ -4716,12 +4806,14 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
     #[test]
     fn gateway_voice_config_selection_defaults_disabled_and_roundtrips() {
         let defaults = super::GatewayVoiceConfig::default();
+        assert!(defaults.transcribe_while_recording);
         assert!(!defaults.enabled);
         assert_eq!(defaults.provider, None);
         assert_eq!(defaults.model, None);
 
         let serialized = toml::to_string(&super::GatewayVoiceConfig {
             enabled: true,
+            transcribe_while_recording: false,
             provider: Some(super::GatewayVoiceInputProviderConfig::Local),
             model: Some("parakeet-tdt-0.6b-v3".to_owned()),
             ..super::GatewayVoiceConfig::default()
@@ -4731,6 +4823,7 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
             toml::from_str(serialized.as_str()).expect("voice config should deserialize");
 
         assert!(roundtrip.enabled);
+        assert!(!roundtrip.transcribe_while_recording);
         assert_eq!(
             roundtrip.provider,
             Some(super::GatewayVoiceInputProviderConfig::Local)
@@ -4740,18 +4833,30 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
     }
 
     #[test]
+    fn legacy_voice_strategy_values_preserve_incremental_mode_without_explicit_boolean() {
+        for strategy in ["buffered_gateway_session", "experimental_streaming"] {
+            let legacy: super::GatewayVoiceConfig =
+                toml::from_str(&format!("transcription_strategy = \"{strategy}\""))
+                    .expect("legacy strategy remains supported");
+            assert!(legacy.transcribe_while_recording);
+            let explicit: super::GatewayVoiceConfig = toml::from_str(&format!(
+                "transcription_strategy = \"{strategy}\"\ntranscribe_while_recording = false"
+            ))
+            .expect("explicit session mode");
+            assert!(!explicit.transcribe_while_recording);
+        }
+    }
+
+    #[test]
     fn gateway_memory_product_config_defaults_are_safe_and_useful() {
         let config = GatewayMemoryConfig::default();
 
         assert!(config.enabled);
         assert!(config.allow_global_user_by_default);
         assert!(!config.allow_global_agent_by_default);
-        assert!(config.deterministic_recall_enabled);
-        assert!(config.active_recall_enabled);
         assert!(config.tools_enabled);
         assert!(config.proactive_writes_enabled);
         assert!(config.background_extraction_enabled);
-        assert!(config.active_recall_model.is_thread_model());
         assert!(config.proactive_writes_model.is_thread_model());
         assert!(!config.debug_trace_enabled);
         assert!(!config.strict_diagnostics_enabled);
@@ -4769,7 +4874,6 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.max_hit_chars, 1_200);
         assert_eq!(config.default_max_candidates, 32);
         assert_eq!(config.max_candidate_work, 128);
-        assert_eq!(config.max_segments, 16);
         assert_eq!(config.min_relevancy, 0.25);
         assert_eq!(config.min_results, 1);
         assert_eq!(config.snippet_chars, 360);
@@ -4777,7 +4881,6 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.retry_base_delay_secs, 30);
         assert_eq!(config.retry_max_delay_secs, 900);
         assert_eq!(config.max_attempts, 5);
-        assert_eq!(config.near_capacity_percent, 85.0);
         assert!(!config.vector_search.enabled);
         assert_eq!(config.vector_search.provider, None);
         assert_eq!(config.vector_search.model, None);
@@ -4802,7 +4905,6 @@ default_prompt_chars = 1000
         assert_eq!(config.default_prompt_chars, 1_000);
         assert_eq!(config.max_prompt_chars, 12_000);
         assert_eq!(config.index_batch_limit, 16);
-        assert_eq!(config.near_capacity_percent, 85.0);
         assert!(!config.vector_search.enabled);
         assert_eq!(config.vector_search.provider, None);
         assert_eq!(config.vector_search.model, None);
@@ -4892,22 +4994,6 @@ embedding_dimension = 384
         assert_eq!(config.total.max_wall_clock_ms_per_turn, None);
         assert_eq!(config.total.max_provider_tokens_per_turn, None);
         assert_eq!(config.total.max_consecutive_no_progress_windows, 3);
-    }
-
-    #[test]
-    fn gateway_tools_config_deserializes_missing_execution_windows_with_defaults() {
-        let config = toml::from_str::<super::GatewayToolsConfig>(
-            r#"
-[budget]
-max_agent_rounds_per_turn = 7
-max_tool_calls_per_turn = 11
-"#,
-        )
-        .expect("gateway tools config should deserialize with omitted execution_windows");
-
-        assert_eq!(config.budget.max_agent_rounds_per_turn, 7);
-        assert_eq!(config.budget.max_tool_calls_per_turn, 11);
-        assert!(config.execution_windows.is_none());
     }
 
     #[test]
@@ -5048,11 +5134,6 @@ enabled = false
 
         assert!(!config.review.enabled);
         assert!(!config.review.allow_task_create_review_policy);
-        assert!(
-            config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(config.review.default_max_revision_rounds, 5);
         assert_eq!(config.review.auto_accept_after_seconds, 300);
     }
@@ -5062,21 +5143,16 @@ enabled = false
         let config = toml::from_str::<GatewayMemoryConfig>(
             r#"
 enabled = false
-capsules_dir = "memory/custom-capsules"
 "#,
         )
         .expect("gateway memory config should deserialize with defaults");
 
         assert!(!config.enabled);
-        assert_eq!(config.capsules_dir, "memory/custom-capsules");
         assert!(config.allow_global_user_by_default);
         assert!(!config.allow_global_agent_by_default);
-        assert!(config.deterministic_recall_enabled);
-        assert!(config.active_recall_enabled);
         assert!(config.tools_enabled);
         assert!(config.proactive_writes_enabled);
         assert!(config.background_extraction_enabled);
-        assert!(config.active_recall_model.is_thread_model());
         assert!(config.proactive_writes_model.is_thread_model());
         assert!(!config.debug_trace_enabled);
         assert!(!config.strict_diagnostics_enabled);
@@ -5183,18 +5259,11 @@ model = " claude-sonnet "
     fn gateway_memory_product_config_serializes_stable_field_names() {
         let config = GatewayMemoryConfig {
             enabled: true,
-            capsules_dir: "memory/capsules".to_owned(),
             allow_global_user_by_default: true,
             allow_global_agent_by_default: false,
-            deterministic_recall_enabled: true,
-            active_recall_enabled: true,
             tools_enabled: false,
             proactive_writes_enabled: false,
             background_extraction_enabled: false,
-            active_recall_model: GatewayMemoryModelSelectionConfig::custom(
-                "planner-provider",
-                "planner-model",
-            ),
             proactive_writes_model: GatewayMemoryModelSelectionConfig::custom(
                 "extractor-provider",
                 "extractor-model",
@@ -5205,17 +5274,12 @@ model = " claude-sonnet "
 
         let serialized = toml::to_string(&config).expect("gateway memory config should serialize");
         assert!(serialized.contains("enabled = true"));
-        assert!(serialized.contains("capsules_dir = \"memory/capsules\""));
+
         assert!(serialized.contains("allow_global_user_by_default = true"));
         assert!(serialized.contains("allow_global_agent_by_default = false"));
-        assert!(serialized.contains("deterministic_recall_enabled = true"));
-        assert!(serialized.contains("active_recall_enabled = true"));
         assert!(serialized.contains("tools_enabled = false"));
         assert!(serialized.contains("proactive_writes_enabled = false"));
         assert!(serialized.contains("background_extraction_enabled = false"));
-        assert!(serialized.contains("active_recall_model"));
-        assert!(serialized.contains("model_provider = \"planner-provider\""));
-        assert!(serialized.contains("model = \"planner-model\""));
         assert!(serialized.contains("proactive_writes_model"));
         assert!(serialized.contains("model_provider = \"extractor-provider\""));
         assert!(serialized.contains("model = \"extractor-model\""));
@@ -5232,9 +5296,7 @@ model = " claude-sonnet "
         let serialized = toml::to_string(&GatewayMemoryConfig::default())
             .expect("gateway memory config should serialize");
 
-        assert!(serialized.contains("active_recall_model = \"thread\""));
         assert!(serialized.contains("proactive_writes_model = \"thread\""));
-        assert!(!serialized.contains("[active_recall_model]"));
         assert!(!serialized.contains("[proactive_writes_model]"));
     }
 
@@ -5521,5 +5583,32 @@ token_refresh_leeway_seconds = 300
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod outbound_policy_tests {
+    use super::*;
+    #[test]
+    fn outbound_custom_policy_rejects_impossible_reserves_and_overflow() {
+        let mut config: AppConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        config.gateway.validate_outbound().unwrap();
+        for capacity in [0, 1, usize::MAX] {
+            config.gateway.outbound_queue_capacity = capacity;
+            assert!(config.gateway.validate_outbound().is_err());
+        }
+        config.gateway.outbound_queue_capacity = 2;
+        config.gateway.outbound.payload_bytes = usize::MAX;
+        config.gateway.outbound.reserved_payload_bytes = 1;
+        config.gateway.validate_outbound().unwrap();
+        for reserved in [0, usize::MAX] {
+            config.gateway.outbound.reserved_payload_bytes = reserved;
+            assert!(config.gateway.validate_outbound().is_err());
+        }
+        config.gateway.outbound.reserved_payload_bytes = 1;
+        for timeout in [0, u64::MAX] {
+            config.gateway.outbound.write_timeout_ms = timeout;
+            assert!(config.gateway.validate_outbound().is_err());
+        }
     }
 }

@@ -16,6 +16,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{notifications::effects::ClientEffect, runtime::ClientRuntime};
 
+// Per-thread gates exercise the snapshot/predicate registration race without
+// changing production ownership or notification behavior.
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static IDENTITY_BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static SEND_READINESS_BEFORE_WAIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
 macro_rules! counter_type {
     ($name:ident) => {
         #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -180,8 +188,11 @@ pub enum ClientScope {
     Artifact {
         thread_id: String,
     },
-    Avatar {
-        principal_id: String,
+    // Keep the established wire shape; this scope now carries any native image.
+    #[serde(rename = "avatar")]
+    Image {
+        #[serde(rename = "principal_id")]
+        key: String,
     },
     AdministrationOperation,
     AdministrationPage {
@@ -214,6 +225,12 @@ pub enum ClientScope {
     SkillsAction {
         workspace_id: String,
         target: String,
+    },
+    Plugins {
+        workspace_id: String,
+    },
+    Apps {
+        workspace_id: String,
     },
     SkillsUpload {
         workspace_id: String,
@@ -261,6 +278,16 @@ pub enum ClientDemand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
+    Apps {
+        workspace_id: String,
+        connection_id: Option<u64>,
+        intent: crate::packages::runtime::PluginIntent,
+    },
+    Plugins {
+        workspace_id: String,
+        connection_id: Option<u64>,
+        intent: crate::packages::runtime::PluginIntent,
+    },
     SessionDemand {
         demand: crate::gateway::session_driver::SessionDemand,
     },
@@ -551,6 +578,7 @@ impl SerializedClientPayload {
 }
 
 pub struct ClientSnapshot {
+    update: Option<pioneer_observability::updates::UpdateContext>,
     scope: ClientScope,
     revisions: ClientRevisions,
     sequence: ClientChangeSequence,
@@ -561,6 +589,20 @@ pub struct ClientSnapshot {
 impl ClientSnapshot {
     fn from_draft(draft: ClientPublicationDraft, sequence: ClientChangeSequence) -> Arc<Self> {
         Arc::new(Self {
+            update: match &draft.scope {
+                ClientScope::Timeline { thread_id } => pioneer_observability::updates::capture()
+                    .or_else(|| {
+                        pioneer_observability::updates::UpdateContext::source(
+                            pioneer_observability::updates::ContentHint::new(
+                                thread_id,
+                                None,
+                                pioneer_observability::updates::Change::Recovery,
+                                0,
+                            ),
+                        )
+                    }),
+                _ => None,
+            },
             scope: draft.scope,
             revisions: draft.revisions,
             sequence,
@@ -600,6 +642,10 @@ pub struct ClientPublicationReference(
 );
 
 impl ClientPublicationReference {
+    pub fn update_context(&self) -> Option<pioneer_observability::updates::UpdateContext> {
+        self.0.update.clone()
+    }
+
     /// Transaction delta carried by delivery, never retained in a scoped snapshot.
     pub fn timeline_change(&self) -> Option<Arc<crate::timeline::presentation::TimelineChangeSet>> {
         self.1.clone()
@@ -796,14 +842,20 @@ pub enum ClientSubscriptionEvent {
 struct SubscriptionQueue {
     scope: ClientScope,
     capacity: NonZeroUsize,
-    events: Mutex<VecDeque<ClientSubscriptionEvent>>,
+    observer: pioneer_observability::queues::QueueObserver,
+    events: Mutex<VecDeque<pioneer_observability::work::WorkItem<ClientSubscriptionEvent>>>,
     latest_sequence: Mutex<Option<ClientChangeSequence>>,
     closed: std::sync::atomic::AtomicBool,
 }
 
 impl SubscriptionQueue {
     fn push(&self, sequence: ClientChangeSequence, publication: ClientPublicationReference) {
+        use pioneer_observability::{
+            queues::{QueueBytes, QueueOutcome},
+            work::{Boundary, ExecutorRole, WorkItem, WorkKind},
+        };
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            self.observer.outcome(QueueOutcome::Rejected, 1);
             return;
         }
         let predecessor = self
@@ -816,31 +868,55 @@ impl SubscriptionQueue {
             .lock()
             .expect("client subscriber queue poisoned");
         if events.len() >= self.capacity.get() {
+            self.observer
+                .outcome(QueueOutcome::Dropped, events.len() as u64);
             events.clear();
-            events.push_back(ClientSubscriptionEvent::ResnapshotRequired {
-                scope: self.scope.clone(),
-                latest_sequence: sequence,
-            });
+            self.observer.current(0, QueueBytes::Unsupported);
+            events.push_back(
+                WorkItem::new(
+                    ClientSubscriptionEvent::ResnapshotRequired {
+                        scope: self.scope.clone(),
+                        latest_sequence: sequence,
+                    },
+                    Boundary::ClientPublication,
+                    WorkKind::ClientPublication,
+                    ExecutorRole::ClientController,
+                )
+                .observed(self.observer.clone(), QueueBytes::Unsupported),
+            );
+            self.observer.outcome(QueueOutcome::Resnapshot, 1);
+            self.observer.native_item_head(events.len(), events.front());
             return;
         }
-
-        if let Some(ClientSubscriptionEvent::ResnapshotRequired {
-            latest_sequence, ..
-        }) = events.back_mut()
-        {
-            *latest_sequence = sequence;
-            return;
+        if let Some(item) = events.back_mut() {
+            if let ClientSubscriptionEvent::ResnapshotRequired {
+                latest_sequence, ..
+            } = &mut item.value
+            {
+                *latest_sequence = sequence;
+                self.observer.outcome(QueueOutcome::Coalesced, 1);
+                return;
+            }
         }
-
-        events.push_back(ClientSubscriptionEvent::Publication {
-            sequence,
-            predecessor,
-            publication,
-        });
+        events.push_back(
+            WorkItem::new(
+                ClientSubscriptionEvent::Publication {
+                    sequence,
+                    predecessor,
+                    publication,
+                },
+                Boundary::ClientPublication,
+                WorkKind::ClientPublication,
+                ExecutorRole::ClientController,
+            )
+            .observed(self.observer.clone(), QueueBytes::Unsupported),
+        );
+        self.observer.native_item_head(events.len(), events.front());
     }
 }
 
 pub struct ClientSubscription {
+    pending_work: Mutex<pioneer_observability::work::WorkCarrier>,
     id: u64,
     queue: Arc<SubscriptionQueue>,
     core: Weak<ClientCore>,
@@ -851,12 +927,41 @@ impl ClientSubscription {
         &self.queue.scope
     }
 
-    pub fn try_next(&self) -> Option<ClientSubscriptionEvent> {
-        self.queue
-            .events
+    /// Local causal metadata for the last delivery, consumed by Desktop's
+    /// binding router. It never enters the wire/FFI payload schema.
+    pub fn pending_work(&self) -> pioneer_observability::work::WorkCarrier {
+        self.pending_work
             .lock()
-            .expect("client subscriber queue poisoned")
-            .pop_front()
+            .expect("subscription work poisoned")
+            .clone()
+    }
+    pub fn try_next(&self) -> Option<ClientSubscriptionEvent> {
+        let (event, work, observer) = {
+            let mut events = self
+                .queue
+                .events
+                .lock()
+                .expect("client subscriber queue poisoned");
+            let item = events.pop_front()?;
+            let observer = item.queue.as_ref().map(|(queue, _)| queue.clone());
+            let received = item.received(
+                pioneer_observability::work::Boundary::ClientPublication,
+                pioneer_observability::work::WorkKind::ClientPublication,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            );
+            self.queue
+                .observer
+                .native_item_head(events.len(), events.front());
+            (received.0, received.1, observer)
+        };
+        *self
+            .pending_work
+            .lock()
+            .expect("subscription work poisoned") = work.complete_handoff();
+        if let Some(observer) = observer {
+            observer.outcome(pioneer_observability::queues::QueueOutcome::Processed, 1);
+        }
+        Some(event)
     }
 }
 
@@ -872,7 +977,7 @@ impl Drop for ClientSubscription {
                 .remove(&self.id);
             core.thread_subscription_changed(&self.queue.scope, false);
             core.composer_subscription_changed(&self.queue.scope, false);
-            core.avatar_subscription_changed(&self.queue.scope, false);
+            core.image_subscription_changed(&self.queue.scope, false);
             core.task_inbox_subscription_changed(&self.queue.scope, false);
             core.task_review_subscription_changed(&self.queue.scope, false);
             core.approval_action_subscription_changed(&self.queue.scope, false);
@@ -887,11 +992,19 @@ impl Drop for ClientSubscription {
             core.artifact_subscription_changed(&self.queue.scope, false);
             core.workspace_subscription_changed(&self.queue.scope, false);
         }
-        self.queue
+        let mut events = self
+            .queue
             .events
             .lock()
-            .expect("client subscriber queue poisoned")
-            .clear();
+            .expect("client subscriber queue poisoned");
+        self.queue.observer.outcome(
+            pioneer_observability::queues::QueueOutcome::Dropped,
+            events.len() as u64,
+        );
+        self.queue
+            .observer
+            .current(0, pioneer_observability::queues::QueueBytes::Unsupported);
+        events.clear();
     }
 }
 
@@ -925,10 +1038,15 @@ struct ClientPartitions {
     publications: HashMap<ClientScope, Arc<ClientSnapshot>>,
     demands: HashMap<ClientScope, DemandState>,
     operations: HashMap<ClientOperationId, OperationState>,
+    journal_observer: Option<pioneer_observability::queues::QueueObserver>,
     change_journal: VecDeque<JournalChangeSet>,
 }
 
 impl ClientPartitions {
+    fn journal_observer(&mut self) -> pioneer_observability::queues::QueueObserver {
+        self.journal_observer.get_or_insert_with(||pioneer_observability::queues::QueueObserver::new(pioneer_observability::queues::QueueKind::ClientPublications,Some(128),"retained publication journal; bytes unsupported; reads are replay, not new input or dequeue")).clone()
+    }
+
     fn prune_change_journal(&mut self) {
         // Deltas in an unusable prefix are obsolete too. Check on both commit
         // and polling, so draining the final delivery also releases old rows
@@ -938,7 +1056,15 @@ impl ClientPartitions {
             .iter()
             .rposition(JournalChangeSet::is_obsolete)
         {
+            self.journal_observer().outcome(
+                pioneer_observability::queues::QueueOutcome::Stale,
+                (index + 1) as u64,
+            );
             self.change_journal.drain(..=index);
+            self.journal_observer().current(
+                self.change_journal.len(),
+                pioneer_observability::queues::QueueBytes::Unsupported,
+            );
         }
     }
 }
@@ -964,7 +1090,11 @@ pub struct ClientCore {
         Mutex<crate::settings::model_picker::SettingsModelPickerController>,
     pub(crate) settings_runtime: Mutex<crate::settings::runtime::SettingsRuntime>,
     pub(crate) agents_documents: Mutex<crate::agents_doc::runtime::DocumentRuntime>,
-    pub(crate) skills_controller: Mutex<crate::skills::operations::SkillsController>,
+    pub(crate) plugins_controller: Mutex<crate::packages::runtime::PluginController>,
+    pub(crate) app_views: Mutex<crate::apps::AppViews>,
+    pub(crate) apps_controller: Mutex<crate::packages::runtime::PluginController>,
+    pub(crate) capability_operations:
+        Mutex<crate::package_delivery::operations::CapabilityOperations>,
     pub(crate) skills_store: Mutex<crate::skills::store::SkillsStore>,
     pub(crate) mcp_controller: Mutex<crate::mcp::operations::McpController>,
     pub(crate) mcp_oauth: Mutex<crate::mcp::oauth::OAuthController>,
@@ -1001,15 +1131,23 @@ pub struct ClientCore {
     pub(crate) approval_actions:
         Mutex<crate::cli_runtime::approval_actions::ApprovalActionController>,
     pub(crate) task_reviews: Mutex<crate::tasks::review_controller::TaskReviewActionController>,
-    pub(crate) avatar_store: Mutex<crate::avatars::AvatarStore>,
+    pub(crate) image_store: Mutex<crate::images::ImageStore>,
     pub(crate) workspace_catalog: Mutex<crate::workspaces::catalog::WorkspaceCatalogStore>,
     pub(crate) workspace_controller: Mutex<crate::workspaces::controller::WorkspaceController>,
     pub(crate) task_notifications: Mutex<crate::tasks::notifications::TaskNotificationController>,
     transport_runtime: ClientRuntime,
     pub(crate) thread_request_sender:
-        Mutex<Option<std::sync::mpsc::Sender<crate::threads::registry::ThreadControllerRequest>>>,
+        Mutex<Option<crate::threads::registry::ThreadControllerSender>>,
     thread_request_task: Mutex<Option<std::thread::JoinHandle<()>>>,
-    pub(crate) presentation_sender: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    pub(crate) presentation_sender: Mutex<
+        Option<
+            std::sync::mpsc::SyncSender<(
+                pioneer_observability::work::WorkCarrier,
+                pioneer_observability::queues::QueueObserver,
+            )>,
+        >,
+    >,
+    pub(crate) presentation_observer: pioneer_observability::queues::QueueObserver,
     presentation_task: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub(crate) thread_registry: Mutex<crate::threads::registry::ThreadRegistry>,
     pub(crate) timeline_started: std::time::Instant,
@@ -1022,6 +1160,7 @@ pub struct ClientCore {
     pub(crate) gateway_transport_leases:
         Mutex<crate::gateway::session_controller::GatewayTransportLeases>,
     pub(crate) gateway_transport_ready: std::sync::Condvar,
+    pub(crate) send_readiness: Arc<(Mutex<u64>, std::sync::Condvar)>,
     gateway_task: Mutex<Option<std::thread::JoinHandle<()>>>,
     stopped: std::sync::atomic::AtomicBool,
     partitions: Mutex<ClientPartitions>,
@@ -1029,6 +1168,77 @@ pub struct ClientCore {
     next_subscription_id: Mutex<u64>,
     publication_signal: tokio::sync::watch::Sender<ClientChangeSequence>,
     publication_ready: std::sync::Condvar,
+}
+
+pub(crate) struct HistoryAuthority {
+    auth: (u64, Option<u64>),
+    transport: Option<crate::transport::ws::runtime::ConnectionRequestTransport>,
+}
+impl HistoryAuthority {
+    pub(crate) fn capture(core: &ClientCore) -> Self {
+        let auth = core.current_auth_ticket();
+        let transport = auth.1.map(|c| {
+            core.transport_runtime
+                .ws_command_sender()
+                .requests_for_connection(c)
+        });
+        Self { auth, transport }
+    }
+    pub(crate) fn observation_scope(
+        &self,
+    ) -> (
+        (u64, Option<u64>),
+        Option<crate::transport::ws::runtime::ConnectionScope>,
+    ) {
+        (
+            self.auth,
+            self.transport
+                .as_ref()
+                .and_then(|transport| transport.scope()),
+        )
+    }
+    pub(crate) fn is_current(&self, core: &ClientCore) -> bool {
+        self.auth == core.current_auth_ticket()
+            && self
+                .transport
+                .as_ref()
+                .is_none_or(|t| t.scope().is_none() || t.is_current())
+    }
+    // Apply lock order: identity -> registry -> HTTP access -> captured socket.
+    // Decoding precedes these guards; publication and cancellation follow them.
+    pub(crate) fn lock<'a>(&'a self, core: &'a ClientCore) -> (impl Sized + 'a, bool) {
+        let identity = core
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        let current = identity.history_ticket_matches(self.auth.0);
+        (identity, current)
+    }
+    pub(crate) fn lock_transport(&self) -> (impl Sized + '_, bool) {
+        let guard = self
+            .transport
+            .as_ref()
+            .map(|t| t.history_apply_fence(self.auth.1));
+        let current = guard.as_ref().is_some_and(|g| g.1);
+        (guard, current)
+    }
+}
+
+struct HistoryFlight {
+    correlation: pioneer_observability::scenario::Correlation,
+    reservation: u64,
+    response: crate::rpc::JsonRpcResponseSender,
+    receiver: std::sync::mpsc::Receiver<crate::rpc::JsonRpcResponseResult>,
+    transport: Option<crate::transport::ws::runtime::ConnectionRequestTransport>,
+    auth: (u64, Option<u64>),
+    apply: crate::threads::registry::HistoryApply,
+    work: pioneer_observability::work::WorkCarrier,
+    queue: Option<pioneer_observability::queues::QueueObserver>,
+}
+impl Drop for HistoryFlight {
+    fn drop(&mut self) {
+        self.response.cancel();
+    }
 }
 
 impl Drop for ClientCore {
@@ -1182,7 +1392,12 @@ impl Default for ClientCore {
 impl ClientCore {
     pub fn new() -> Self {
         Self {
-            skills_controller: Mutex::new(crate::skills::operations::SkillsController::default()),
+            plugins_controller: Mutex::default(),
+            apps_controller: Mutex::default(),
+            app_views: Mutex::default(),
+            capability_operations: Mutex::new(
+                crate::package_delivery::operations::CapabilityOperations::default(),
+            ),
             agents_documents: Mutex::new(Default::default()),
             onboarding: Mutex::new(Default::default()),
             settings_runtime: Mutex::new(Default::default()),
@@ -1216,7 +1431,7 @@ impl ClientCore {
             composer_catalog_requests: Mutex::default(),
             approval_actions: Mutex::default(),
             task_reviews: Mutex::default(),
-            avatar_store: Mutex::default(),
+            image_store: Mutex::default(),
             workspace_catalog: Mutex::default(),
             workspace_controller: Mutex::default(),
             task_notifications: Mutex::default(),
@@ -1226,6 +1441,11 @@ impl ClientCore {
             thread_request_sender: Mutex::default(),
             thread_request_task: Mutex::default(),
             presentation_sender: Mutex::default(),
+            presentation_observer: pioneer_observability::queues::QueueObserver::new(
+                pioneer_observability::queues::QueueKind::ClientController,
+                Some(1),
+                "coalesced wake tokens; zero payload bytes; processed=input handoff to coalescing, materialization cycle separate",
+            ),
             presentation_task: Mutex::default(),
             identity_authorization: Mutex::default(),
             capability_read_gate: Mutex::default(),
@@ -1234,6 +1454,7 @@ impl ClientCore {
             session_transport: Mutex::default(),
             gateway_transport_leases: Mutex::default(),
             gateway_transport_ready: std::sync::Condvar::new(),
+            send_readiness: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
             gateway_session: Mutex::default(),
             gateway_task: Mutex::default(),
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -1419,6 +1640,7 @@ impl ClientCore {
         &self,
         owner: &crate::gateway::session_controller::GatewaySessionController,
     ) {
+        self.notify_send_readiness();
         let publication = owner.publication();
         if self
             .snapshot(&ClientScope::Session)
@@ -1537,6 +1759,15 @@ impl ClientCore {
                 ),
             })]
         });
+        partitions.journal_observer().outcome(
+            pioneer_observability::queues::QueueOutcome::Replay,
+            changes.len() as u64,
+        );
+        if gap {
+            partitions
+                .journal_observer()
+                .outcome(pioneer_observability::queues::QueueOutcome::Resnapshot, 1);
+        }
         ClientPublicationBatch {
             closed: self.is_stopped(),
             effects,
@@ -1546,14 +1777,76 @@ impl ClientCore {
         }
     }
 
+    /// Capture before reading the owner predicate. Never acquire another owner
+    /// lock while holding the signal lock; publishers may signal under theirs.
+    pub(crate) fn send_readiness_sequence(&self) -> u64 {
+        *self
+            .send_readiness
+            .0
+            .lock()
+            .expect("Send readiness poisoned")
+    }
+
+    pub(crate) fn notify_send_readiness(&self) {
+        let mut sequence = self
+            .send_readiness
+            .0
+            .lock()
+            .expect("Send readiness poisoned");
+        *sequence = sequence
+            .checked_add(1)
+            .expect("Send readiness sequence exhausted");
+        self.send_readiness.1.notify_all();
+    }
+
+    pub(crate) fn wait_send_readiness(
+        &self,
+        sequence: u64,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        SEND_READINESS_BEFORE_WAIT.with_borrow_mut(|hook| {
+            if let Some(hook) = hook.as_mut() {
+                hook();
+            }
+        });
+        let current = self
+            .send_readiness
+            .0
+            .lock()
+            .expect("Send readiness poisoned");
+        if *current == sequence && !self.is_stopped() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            anyhow::ensure!(!remaining.is_zero(), "Send deadline exceeded");
+            drop(
+                self.send_readiness
+                    .1
+                    .wait_timeout(current, remaining)
+                    .expect("Send readiness wait poisoned"),
+            );
+        }
+        anyhow::ensure!(!self.is_stopped(), "Client stopped");
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "Send deadline exceeded"
+        );
+        Ok(())
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn shutdown(&self) {
+        self.retire_app_views();
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.thread_registry
+            .lock()
+            .expect("thread registry poisoned")
+            .retire_opening(pioneer_observability::opening::Result::Unconfirmed);
+        self.cancel_composer_send_budgets();
         self.session_driver
             .lock()
             .expect("session driver poisoned")
@@ -1584,7 +1877,12 @@ impl ClientCore {
             .lock()
             .expect("settings owner poisoned")
             .stop();
-        self.skills_controller
+        self.plugins_controller
+            .lock()
+            .expect("plugins poisoned")
+            .stop();
+        self.apps_controller.lock().expect("apps poisoned").stop();
+        self.capability_operations
             .lock()
             .expect("Skills controller poisoned")
             .stop();
@@ -1641,7 +1939,7 @@ impl ClientCore {
             .lock()
             .expect("composer store poisoned")
             .clear();
-        self.avatar_store
+        self.image_store
             .lock()
             .expect("avatar store poisoned")
             .invalidate();
@@ -1710,7 +2008,14 @@ impl ClientCore {
         {
             let mut partitions = self.partitions.lock().expect("client partitions poisoned");
             partitions.publications.clear();
+            partitions.journal_observer().outcome(
+                pioneer_observability::queues::QueueOutcome::Dropped,
+                partitions.change_journal.len() as u64,
+            );
             partitions.change_journal.clear();
+            partitions
+                .journal_observer()
+                .current(0, pioneer_observability::queues::QueueBytes::Unsupported);
             let pending_effects = std::mem::take(&mut partitions.platform_effects);
             for (id, pending) in pending_effects {
                 partitions
@@ -1738,11 +2043,18 @@ impl ClientCore {
             queue
                 .closed
                 .store(true, std::sync::atomic::Ordering::Release);
-            queue
+            let mut events = queue
                 .events
                 .lock()
-                .expect("client subscriber queue poisoned")
-                .clear();
+                .expect("client subscriber queue poisoned");
+            queue.observer.outcome(
+                pioneer_observability::queues::QueueOutcome::Dropped,
+                events.len() as u64,
+            );
+            events.clear();
+            queue
+                .observer
+                .current(0, pioneer_observability::queues::QueueBytes::Unsupported);
         }
         subscribers.clear();
         self.stop_mcp_oauth();
@@ -1788,20 +2100,39 @@ impl ClientCore {
             _ => {}
         }
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
+            if let pioneer_protocol::GatewayNotification::AppsChanged(event) = notification {
+                self.invalidate_app_views(event);
+                if event.runtime_only {
+                    return None;
+                }
+                self.refresh_skills(&event.workspace_id);
+                self.refresh_mcp(&event.workspace_id);
+                self.packages(pioneer_protocol::PackageKind::App)
+                    .refresh_plugin_publication(&event.workspace_id);
+                return None;
+            }
+            if let pioneer_protocol::GatewayNotification::PluginsChanged(event) = notification {
+                self.refresh_skills(&event.workspace_id);
+                self.refresh_mcp(&event.workspace_id);
+                self.refresh_plugin_publication(&event.workspace_id);
+                return None;
+            }
             self.observe_administration_notification(notification);
             self.observe_provider_runtime_notification(notification);
             if self.observe_acp_session_notification(notification) {
                 return None;
             }
             if self.observe_mcp_oauth_notification(notification) {
+                self.refresh_plugins_for_native_notification(notification);
                 return None;
             }
             if self.observe_mcp_notification(notification) {
+                self.refresh_plugins_for_native_notification(notification);
                 return None;
             }
-            if let pioneer_protocol::GatewayNotification::SkillsChanged(notification) = notification
-            {
-                self.refresh_skills(&notification.workspace_id);
+            if let pioneer_protocol::GatewayNotification::SkillsChanged(event) = notification {
+                self.refresh_skills(&event.workspace_id);
+                self.refresh_plugins_for_native_notification(notification);
                 return None;
             }
             self.observe_composer_voice_notification(notification);
@@ -1870,6 +2201,7 @@ impl ClientCore {
         core.start_settings_controller();
         core.start_settings_model_picker_controller();
         core.start_onboarding_controller();
+        core.start_plugins_controller();
         core.start_skills_controller();
         core.start_skills_operation_controller();
         core.start_provider_operation_controller();
@@ -1905,17 +2237,21 @@ impl ClientCore {
             std::thread::Builder::new()
                 .name("client-thread-presentation".into())
                 .spawn(move || {
-                    while presentation_receiver.recv().is_ok() {
+                    while let Ok(first_wake) = presentation_receiver.recv() {
+                        let first_work = Self::receive_presentation_wake(first_wake);
                         // A fixed window has bounded latency even during a continuous stream.
                         std::thread::sleep(std::time::Duration::from_millis(8));
-                        while presentation_receiver.try_recv().is_ok() {}
+                        let mut links = first_work;
+                        while let Ok(wake) = presentation_receiver.try_recv() {
+                            links.merge_link(&Self::receive_presentation_wake(wake));
+                        }
                         let Some(core) = weak_presentation.upgrade() else {
                             break;
                         };
                         if core.is_stopped() {
                             break;
                         }
-                        core.materialize_demanded_timelines();
+                        core.materialize_presentation_cycle(links);
                     }
                 })
                 .expect("Client presentation task could not start"),
@@ -1928,11 +2264,116 @@ impl ClientCore {
         core
     }
 
+    fn receive_presentation_wake(
+        (work, queue): (
+            pioneer_observability::work::WorkCarrier,
+            pioneer_observability::queues::QueueObserver,
+        ),
+    ) -> pioneer_observability::work::WorkCarrier {
+        queue.dequeued(pioneer_observability::queues::QueueBytes::Known(0));
+        let mut processing = queue.processing();
+        processing.processed(); // input consumed into coalescing, not UI/materialization completion
+        work
+    }
+    fn materialize_presentation_cycle(&self, links: pioneer_observability::work::WorkCarrier) {
+        use pioneer_observability::work::{Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind};
+        let mut cycle = WorkCarrier::independent(
+            Boundary::Timer,
+            WorkKind::ClientPublication,
+            Trigger::Reconcile,
+            ExecutorRole::ClientController,
+        );
+        cycle.merge_link(&links);
+        cycle.run(|| self.materialize_demanded_timelines());
+    }
+
+    pub(crate) fn opening_content_current(&self, id: &str, generation: u64, revision: u64) -> bool {
+        self.partitions
+            .lock()
+            .expect("client partitions poisoned")
+            .publications
+            .get(&ClientScope::Timeline {
+                thread_id: id.to_owned(),
+            })
+            .and_then(|snapshot| {
+                snapshot.payload::<crate::timeline::presentation::TimelineSnapshot>()
+            })
+            .is_some_and(|snapshot| {
+                snapshot.generation() == generation && snapshot.revision() == revision
+            })
+    }
+    pub(crate) fn opening_publications_current(
+        &self,
+        id: &str,
+        input: &crate::composer::store::ComposerPublication,
+        identity: &Arc<crate::gateway::identity_authorization::IdentityAuthorizationPublication>,
+        capability: Option<&Arc<crate::threads::capabilities::ThreadCapabilityPublication>>,
+        session: &crate::gateway::session_controller::GatewaySessionPublication,
+        runtime: Option<&Arc<crate::providers::runtime::ProviderRuntimePublication>>,
+    ) -> bool {
+        let partitions = self.partitions.lock().expect("client partitions poisoned");
+        let current_input = partitions
+            .publications
+            .get(&ClientScope::Composer {
+                thread_id: id.to_owned(),
+            })
+            .and_then(|snapshot| snapshot.payload::<crate::composer::store::ComposerPublication>());
+        let current_identity = partitions.publications.get(&ClientScope::Administration { workspace_id: None }).and_then(|snapshot| snapshot.payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>());
+        let current_capability = partitions
+            .publications
+            .get(&ClientScope::ThreadCapability {
+                thread_id: id.to_owned(),
+            })
+            .and_then(|snapshot| {
+                snapshot.payload::<crate::threads::capabilities::ThreadCapabilityPublication>()
+            });
+        let current_session =
+            partitions
+                .publications
+                .get(&ClientScope::Session)
+                .and_then(|snapshot| {
+                    snapshot
+                        .payload::<crate::gateway::session_controller::GatewaySessionPublication>()
+                });
+        let runtime_current = runtime.is_none_or(|runtime| {
+            partitions
+                .publications
+                .get(&ClientScope::ProviderRuntime {
+                    workspace_id: runtime.workspace_id().to_owned(),
+                })
+                .and_then(|snapshot| {
+                    snapshot.payload::<crate::providers::runtime::ProviderRuntimePublication>()
+                })
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, runtime))
+        });
+        runtime_current
+            && current_input.as_ref().is_some_and(|current| {
+                std::ptr::eq(Arc::as_ptr(current), input)
+                    && current.has_same_submission_prerequisites(input)
+                    && current.domain().selected_permission_mode
+                        == input.domain().selected_permission_mode
+                    && current.selected_permission_mode_allowed()
+                        == input.selected_permission_mode_allowed()
+            })
+            && current_identity
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, identity))
+            && match (current_capability.as_ref(), capability) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+            && current_session.as_ref().is_some_and(|current| {
+                current.startup.transport_revision == session.startup.transport_revision
+                    && current.startup.transport_ready == session.startup.transport_ready
+            })
+    }
     pub(crate) fn start_thread_request_controller(
         self: &Arc<Self>,
         #[cfg(test)] waiting: Option<std::sync::mpsc::Sender<Option<std::time::Duration>>>,
     ) {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = crate::threads::history_scheduler::channel();
         *self
             .thread_request_sender
             .lock()
@@ -1945,6 +2386,7 @@ impl ClientCore {
             std::thread::Builder::new()
                 .name("client-thread-requests".into())
                 .spawn(move || {
+                    let mut flights: Vec<HistoryFlight> = Vec::new();
                     loop {
                         let Some(core) = weak_requests.upgrade() else {
                             break;
@@ -1952,6 +2394,228 @@ impl ClientCore {
                         if core.is_stopped() {
                             break;
                         }
+                        core.retire_thread_controller_jobs();
+                        let mut index = 0;
+                        while index < flights.len() {
+                            let flight = &flights[index];
+                            let current = receiver.applicable(flight.reservation)
+                                && HistoryAuthority {
+                                    auth: flight.auth,
+                                    transport: flight.transport.clone(),
+                                }
+                                .is_current(&core);
+                            if !current || std::time::Instant::now() >= flight.response.deadline() {
+                                flight.response.cancel();
+                            }
+                            let result = match flight.receiver.try_recv() {
+                                Ok(result) => Some(result.map_err(anyhow::Error::new)),
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    Some(Err(anyhow::anyhow!("history response owner dropped")))
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            };
+                            let Some(result) = result else {
+                                index += 1;
+                                continue;
+                            };
+                            let mut flight = flights.remove(index);
+                            let apply =
+                                std::mem::replace(&mut flight.apply, Box::new(|_, _, _| None));
+                            // Physical retirement is not logical finalization. Discard
+                            // stale payloads, but run the same reducer's exact-generation
+                            // error path so continuing-session rotation cannot strand work.
+                            let result = if current {
+                                result
+                            } else {
+                                Err(anyhow::anyhow!("History request authority retired"))
+                            };
+                            let mut applying = pioneer_observability::opening::Measure::start(
+                                pioneer_observability::opening::Phase::Apply,
+                                &flight.correlation,
+                                &[],
+                            );
+                            let continuation = flight.work.run(|| {
+                                flight.correlation.run(|| {
+                                    apply(
+                                        &core,
+                                        result,
+                                        Some(&HistoryAuthority {
+                                            auth: flight.auth,
+                                            transport: flight.transport.clone(),
+                                        }),
+                                    )
+                                    .map(|request| {
+                                        Self::history_continuation(request, flight.queue.clone())
+                                    })
+                                })
+                            });
+                            applying.finish(pioneer_observability::opening::Result::Returned);
+                            receiver.finish_active(flight.reservation, continuation);
+                        }
+
+                        // Discovery is an intentional independent reconciliation pass.
+                        // It publishes jobs only; RPC execution stays with the scheduler.
+                        pioneer_observability::work::WorkCarrier::independent(
+                            pioneer_observability::work::Boundary::Timer,
+                            pioneer_observability::work::WorkKind::ClientCommand,
+                            pioneer_observability::work::Trigger::Reconcile,
+                            pioneer_observability::work::ExecutorRole::ClientController,
+                        )
+                        .run(|| {
+                            core.drive_due_thread_resumes();
+                            core.drive_timeline_requests();
+                            core.drive_thread_subscriptions();
+                        });
+                        let item = {
+                            let registry = core
+                                .thread_registry
+                                .lock()
+                                .expect("thread registry poisoned");
+                            receiver.take_ready_by(|request| {
+                                registry.controller_request_interactive(request)
+                            })
+                        };
+                        if let Some((reservation, item)) = item {
+                            let queue = item.queue.as_ref().map(|(q, _)| q.clone());
+                            let (request, work) = item.received(
+                                pioneer_observability::work::Boundary::StdThread,
+                                pioneer_observability::work::WorkKind::ClientCommand,
+                                pioneer_observability::work::ExecutorRole::ClientController,
+                            );
+                            let mut processing = queue.as_ref().map(|q| q.processing());
+                            // Capture network authority before domain preparation, then
+                            // revalidate it before sending or accepting any payload.
+                            let HistoryAuthority { auth, transport } =
+                                HistoryAuthority::capture(&core);
+                            let observation_current = request.observation_current();
+                            let correlation = request.correlation();
+                            let mut preparation = pioneer_observability::opening::Measure::start(
+                                pioneer_observability::opening::Phase::Prepare,
+                                &correlation,
+                                &[],
+                            );
+                            let prepared = work
+                                .run(|| correlation.run(|| core.prepare_history_request(request)));
+                            preparation.finish(pioneer_observability::opening::Result::Returned);
+                            if let Some(processing) = &mut processing {
+                                processing.processed();
+                            }
+                            if let Some(prepared) = prepared {
+                                if let Some(identity) = &prepared.identity {
+                                    let registry = core
+                                        .thread_registry
+                                        .lock()
+                                        .expect("thread registry poisoned");
+                                    receiver.refine(
+                                        reservation,
+                                        identity.clone(),
+                                        identity.current(&registry),
+                                    );
+                                }
+                                let deadline =
+                                    std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT;
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let response = crate::rpc::JsonRpcResponseSender::new_with_wake(
+                                    tx,
+                                    deadline,
+                                    receiver.completion_wake(),
+                                );
+                                // The producer captured causal context before scheduler handoff.
+                                // Observe before attach can retire the response owner; never
+                                // inherit an unrelated ambient span from this worker.
+                                let rpc_context = prepared.rpc.as_ref().and_then(|(method, _)| {
+                                    use pioneer_observability::scenario;
+                                    scenario::rpc_boundary(method)
+                                        .filter(|_| observation_current)
+                                        .map(|_| {
+                                            work.run(|| {
+                                                correlation.run(|| response.observe_rpc(method))
+                                            })
+                                        })
+                                });
+                                if !receiver.attach(reservation, response.clone())
+                                    || core.current_auth_ticket() != auth
+                                    || transport
+                                        .as_ref()
+                                        .is_some_and(|t| t.scope().is_some() && !t.is_current())
+                                {
+                                    response.cancel();
+                                }
+                                let payload = prepared.rpc.map(|(method, params)| {
+                                    let prepare = || {
+                                        crate::rpc::build_json_rpc_request_payload(method, params)
+                                    };
+                                    if let Some(correlation) = &rpc_context {
+                                        correlation.run(prepare)
+                                    } else {
+                                        prepare()
+                                    }
+                                });
+                                // Registration precedes send: inline completion cannot be lost.
+                                flights.push(HistoryFlight {
+                                    correlation,
+                                    reservation,
+                                    response: response.clone(),
+                                    receiver: rx,
+                                    transport: transport.clone(),
+                                    auth,
+                                    apply: prepared.apply,
+                                    work: work.clone(),
+                                    queue,
+                                });
+                                work.run(|| {
+                                    use pioneer_observability::work::{
+                                        Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind,
+                                    };
+                                    WorkCarrier::child(
+                                        Boundary::ClientRpc,
+                                        WorkKind::ClientRpc,
+                                        Trigger::Rpc,
+                                        ExecutorRole::ClientController,
+                                    )
+                                    .run(|| match payload {
+                                        Some(Ok(payload)) => {
+                                            use crate::rpc::JsonRpcRequestTransport;
+                                            if let Err(error) = transport
+                                                .as_ref()
+                                                .ok_or_else(|| {
+                                                    "History transport unavailable".to_owned()
+                                                })
+                                                .and_then(|transport| {
+                                                    transport.send_json_rpc_request(
+                                                        payload.request_id,
+                                                        payload.payload,
+                                                        response.clone(),
+                                                    )
+                                                })
+                                            {
+                                                let _ = response.send(Err(
+                                                    crate::rpc::JsonRpcResponseError::transport(
+                                                        error,
+                                                    ),
+                                                ));
+                                            }
+                                        }
+                                        Some(Err(error)) => {
+                                            let _ = response.send(Err(
+                                                crate::rpc::JsonRpcResponseError::transport(
+                                                    format!("{error:#}"),
+                                                ),
+                                            ));
+                                        }
+                                        None => {
+                                            let _ = response.send(Ok(serde_json::Value::Null));
+                                        }
+                                    });
+                                });
+                            } else {
+                                receiver.finish_active(reservation, None);
+                            }
+                            continue;
+                        }
+                        // Elapsed discovery timers have just been serviced. If
+                        // admission is blocked by a flight, only its completion
+                        // or a future timer can change eligibility.
                         let delay = [
                             core.next_thread_resume_delay(),
                             core.next_timeline_request_delay(),
@@ -1959,58 +2623,141 @@ impl ClientCore {
                         ]
                         .into_iter()
                         .flatten()
+                        .filter(|d| flights.is_empty() || !d.is_zero())
+                        .chain(flights.iter().map(|f| {
+                            f.response
+                                .deadline()
+                                .saturating_duration_since(std::time::Instant::now())
+                        }))
                         .min();
                         #[cfg(test)]
                         if let Some(waiting) = &waiting {
                             let _ = waiting.send(delay);
                         }
                         drop(core);
-                        let request = match delay {
-                            Some(delay) => match receiver.recv_timeout(delay) {
-                                Ok(r) => Some(r),
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                                Err(_) => break,
-                            },
-                            None => match receiver.recv() {
-                                Ok(r) => Some(r),
-                                Err(_) => break,
-                            },
-                        };
-                        let Some(core) = weak_requests.upgrade() else {
-                            break;
-                        };
-                        if core.is_stopped() {
+                        if !receiver.wait_ready(delay) {
                             break;
                         }
-                        match request {
-                            Some(crate::threads::registry::ThreadControllerRequest::Read(
-                                request,
-                            )) => core.execute_timeline_read(request),
-                            Some(crate::threads::registry::ThreadControllerRequest::Semantic(
-                                request,
-                            )) => core.execute_thread_semantic_request(
-                                &core.transport_runtime.ws_command_sender(),
-                                request,
-                            ),
-                            Some(crate::threads::registry::ThreadControllerRequest::Subscribe(
-                                request,
-                            )) => core.execute_thread_subscription_request(request),
-                            Some(crate::threads::registry::ThreadControllerRequest::Binding {
-                                id,
-                                workspace,
-                                generation,
-                            }) => {
-                                core.execute_thread_cli_binding_request(&id, &workspace, generation)
-                            }
-                            _ => {}
-                        }
-                        core.drive_due_thread_resumes();
-                        core.drive_timeline_requests();
-                        core.drive_thread_subscriptions();
                     }
                 })
                 .expect("Client thread request task could not start"),
         );
+    }
+
+    fn history_continuation(
+        request: crate::threads::registry::ThreadControllerRequest,
+        queue: Option<pioneer_observability::queues::QueueObserver>,
+    ) -> pioneer_observability::work::WorkItem<crate::threads::registry::ThreadControllerRequest>
+    {
+        use pioneer_observability::work::{Boundary, ExecutorRole, WorkItem, WorkKind};
+        let item = WorkItem::new(
+            request,
+            Boundary::StdThread,
+            WorkKind::ClientCommand,
+            ExecutorRole::ClientController,
+        );
+        if let Some(queue) = queue {
+            item.observed(
+                queue,
+                pioneer_observability::queues::QueueBytes::Unsupported,
+            )
+        } else {
+            item
+        }
+    }
+
+    fn prepare_history_request(
+        &self,
+        request: crate::threads::registry::ThreadControllerRequest,
+    ) -> Option<crate::threads::registry::PreparedHistory> {
+        use crate::threads::registry::ThreadControllerRequest as R;
+        match request {
+            R::Semantic(request) => {
+                self.prepare_thread_semantic_request(request)
+                    .map(|mut prepared| crate::threads::registry::PreparedHistory {
+                        identity: None,
+                        rpc: prepared.rpc.take(),
+                        apply: Box::new(move |core, result, authority| {
+                            core.complete_thread_semantic_request(prepared, result, authority)
+                                .map(R::Semantic)
+                        }),
+                    })
+            }
+            R::Read(request) => self.prepare_timeline_read(request),
+            R::ResumeJob(request) => self.prepare_thread_resume_quantum(request),
+            R::Binding {
+                id,
+                workspace,
+                generation,
+            } => self.prepare_thread_cli_binding_request(id, workspace, generation),
+            R::Subscribe(request) => {
+                self.execute_thread_subscription_request(request);
+                None
+            }
+            R::Resume => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn dispatch_thread_controller_item(
+        &self,
+        item: pioneer_observability::work::WorkItem<
+            crate::threads::registry::ThreadControllerRequest,
+        >,
+    ) -> Option<
+        pioneer_observability::work::WorkItem<crate::threads::registry::ThreadControllerRequest>,
+    > {
+        use pioneer_observability::work::{Boundary, ExecutorRole, WorkItem, WorkKind};
+        let queue = item.queue.as_ref().map(|(q, _)| q.clone());
+        let (request, work) = item.received(
+            Boundary::StdThread,
+            WorkKind::ClientCommand,
+            ExecutorRole::ClientController,
+        );
+        let mut processing = queue.as_ref().map(|q| q.processing());
+        let continuation = work.run(|| {
+            self.execute_thread_controller_request(request)
+                .map(|request| {
+                    let item = WorkItem::new(
+                        request,
+                        Boundary::StdThread,
+                        WorkKind::ClientCommand,
+                        ExecutorRole::ClientController,
+                    );
+                    if let Some(queue) = &queue {
+                        item.observed(
+                            queue.clone(),
+                            pioneer_observability::queues::QueueBytes::Unsupported,
+                        )
+                    } else {
+                        item
+                    }
+                })
+        });
+        if let Some(processing) = &mut processing {
+            processing.processed();
+        }
+        continuation
+    }
+
+    #[cfg(test)]
+    fn execute_thread_controller_request(
+        &self,
+        request: crate::threads::registry::ThreadControllerRequest,
+    ) -> Option<crate::threads::registry::ThreadControllerRequest> {
+        let prepared = self.prepare_history_request(request)?;
+        let result = prepared.rpc.as_ref().map_or_else(
+            || Ok(serde_json::Value::Null),
+            |(method, params)| {
+                crate::rpc::send_json_rpc_request_value(
+                    &self.transport_runtime.ws_command_sender(),
+                    method,
+                    params.clone(),
+                    crate::rpc::RPC_REQUEST_TIMEOUT,
+                )
+            },
+        );
+        (prepared.apply)(self, result, None)
     }
 
     pub(crate) fn start_gateway_event_dispatcher(self: &Arc<Self>) {
@@ -2024,7 +2771,7 @@ impl ClientCore {
                         let Some(core) = weak.upgrade() else {
                             return;
                         };
-                        core.route_gateway_event(&event);
+                        core.dispatch_local_gateway_event(event);
                     }
                 }
             })
@@ -2033,6 +2780,39 @@ impl ClientCore {
             .gateway_task
             .lock()
             .expect("Gateway task owner poisoned") = Some(task);
+    }
+
+    fn dispatch_local_gateway_event(
+        &self,
+        item: pioneer_observability::work::WorkItem<crate::transport::ws::GatewayWsEvent>,
+    ) {
+        let queue = item.queue.as_ref().map(|(q, _)| q.clone());
+        let (event, work) = item.received(
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::ExecutorRole::ClientController,
+        );
+        let mut processing = queue.as_ref().map(|q| q.processing());
+        work.run(|| {
+            let update = pioneer_observability::updates::capture().map(|update| {
+                update.with_authorization(self.authorization_connection_generation())
+            });
+            let dispatch = || {
+                let mut route = pioneer_observability::updates::StageObservation::start(
+                    pioneer_observability::updates::Stage::ClientRoute,
+                );
+                self.route_gateway_event(&event);
+                route.finish(pioneer_observability::updates::Fact::Returned);
+            };
+            if let Some(update) = update {
+                update.run(dispatch);
+            } else {
+                dispatch();
+            }
+        });
+        if let Some(processing) = &mut processing {
+            processing.processed();
+        }
     }
 
     /// Process-local Gateway transport handle; no domain state or event delivery to shells.
@@ -2047,7 +2827,7 @@ impl ClientCore {
     ) -> ClientSubscription {
         self.thread_subscription_changed(&scope, true);
         self.composer_subscription_changed(&scope, true);
-        self.avatar_subscription_changed(&scope, true);
+        self.image_subscription_changed(&scope, true);
         self.task_inbox_subscription_changed(&scope, true);
         self.task_review_subscription_changed(&scope, true);
         self.approval_action_subscription_changed(&scope, true);
@@ -2067,6 +2847,11 @@ impl ClientCore {
             .get(&scope)
             .map(|snapshot| snapshot.sequence());
         let queue = Arc::new(SubscriptionQueue {
+            observer: pioneer_observability::queues::QueueObserver::new(
+                pioneer_observability::queues::QueueKind::ClientSubscriptions,
+                Some(capacity.get()),
+                "unsupported: shared publication retained bytes; processed=handoff to shell, not UI apply",
+            ),
             scope,
             capacity,
             events: Mutex::new(VecDeque::with_capacity(capacity.get())),
@@ -2098,6 +2883,7 @@ impl ClientCore {
         }
         drop(partitions);
         ClientSubscription {
+            pending_work: Mutex::new(Default::default()),
             id,
             queue,
             core: Arc::downgrade(self),
@@ -2148,6 +2934,7 @@ impl ClientCore {
     }
     pub fn dispatch(&self, intent: ClientIntent) -> ClientTransition {
         if self.is_stopped() {
+            self.observe_rejected_opening_intent(&intent);
             let mut partitions = self.partitions.lock().expect("client partitions poisoned");
             partitions.transition_sequence.advance();
             return Self::transition_without_publication(
@@ -2201,6 +2988,29 @@ impl ClientCore {
             ClientIntent::ComposerModelPicker { intent } => {
                 return self.composer_model_picker_intent(intent.clone());
             }
+            ClientIntent::Apps {
+                workspace_id,
+                connection_id,
+                intent,
+            } => {
+                return if self.current_auth_ticket().1 == *connection_id {
+                    self.packages(pioneer_protocol::PackageKind::App)
+                        .plugin_intent(workspace_id, intent.clone())
+                } else {
+                    self.reject_intent()
+                };
+            }
+            ClientIntent::Plugins {
+                workspace_id,
+                connection_id,
+                intent,
+            } => {
+                return if self.current_auth_ticket().1 == *connection_id {
+                    self.plugin_intent(workspace_id, intent.clone())
+                } else {
+                    self.reject_intent()
+                };
+            }
             ClientIntent::ComposerCatalog { intent } => {
                 return self.composer_catalog_intent(intent.clone());
             }
@@ -2236,6 +3046,9 @@ impl ClientCore {
             }
             ClientIntent::Timeline { intent } => {
                 let plan = self.timeline_intent(intent.clone());
+                let rejected = plan.dispatch_failed
+                    || !plan.rejected.is_empty()
+                    || !plan.rejected_reads.is_empty();
                 let changed = plan != Default::default();
                 let mut partitions = self.partitions.lock().expect("client partitions poisoned");
                 if changed {
@@ -2243,7 +3056,9 @@ impl ClientCore {
                 }
                 return Self::transition_without_publication(
                     &partitions,
-                    if changed {
+                    if rejected {
+                        ClientTransitionOutcome::Rejected
+                    } else if changed {
                         ClientTransitionOutcome::Changed
                     } else {
                         ClientTransitionOutcome::Noop
@@ -2305,13 +3120,14 @@ impl ClientCore {
         if outcome == ClientTransitionOutcome::Changed {
             self.thread_demand_changed(&thread_scope, thread_demand);
             self.composer_demand_changed(&thread_scope, thread_demand);
-            self.avatar_demand_changed(&thread_scope, thread_demand);
+            self.image_demand_changed(&thread_scope, thread_demand);
             self.task_inbox_demand_changed(&thread_scope, thread_demand);
             self.task_review_demand_changed(&thread_scope, thread_demand);
             self.approval_action_demand_changed(&thread_scope, thread_demand);
             self.message_revision_demand_changed(&thread_scope, thread_demand);
             self.message_deletion_demand_changed(&thread_scope, thread_demand);
             self.composer_catalog_demand_changed(&thread_scope, thread_demand);
+            self.plugin_demand_changed(&thread_scope, thread_demand);
             self.mcp_binding_demand_changed(&thread_scope, thread_demand);
             self.skills_binding_demand_changed(&thread_scope, thread_demand);
             self.document_demand_changed(&thread_scope, thread_demand);
@@ -2494,6 +3310,15 @@ impl ClientCore {
         drafts: Vec<ClientPublicationDraft>,
         effects: Vec<ClientEffectPlan>,
     ) -> ClientTransition {
+        let work = pioneer_observability::work::WorkCarrier::child(
+            pioneer_observability::work::Boundary::ClientPublication,
+            pioneer_observability::work::WorkKind::ClientPublication,
+            pioneer_observability::work::Trigger::Event,
+            pioneer_observability::work::ExecutorRole::ClientController,
+        );
+        let _context = work.enter();
+        let mut observed = pioneer_observability::live::WorkGuard::start(work.context(), false);
+        pioneer_observability::live::progress(pioneer_observability::live::Stage::Publication);
         let mut partitions = self.partitions.lock().expect("client partitions poisoned");
         let wake_presentation = drafts
             .iter()
@@ -2521,6 +3346,7 @@ impl ClientCore {
         if wake_workspace_draft {
             self.queue_workspace_draft_reconciliation();
         }
+        observed.finish(pioneer_observability::work::Outcome::Completed);
         transition
     }
 
@@ -2574,6 +3400,13 @@ impl ClientCore {
                                 |equal| equal(draft.payload.as_ref(), current.payload.as_ref()),
                             )
                         {
+                            if matches!(draft.scope, ClientScope::Timeline { .. }) {
+                                let mut no_change =
+                                    pioneer_observability::updates::StageObservation::start(
+                                        pioneer_observability::updates::Stage::Publication,
+                                    );
+                                no_change.finish(pioneer_observability::updates::Fact::NoChange);
+                            }
                             continue;
                         }
                         if draft.revisions == current_revisions {
@@ -2649,6 +3482,20 @@ impl ClientCore {
             }
             let effects = accepted_effects;
 
+            // Reconcile only accepted publications. A rejected or stale draft
+            // cannot cancel the budget of a newer Composer operation. This also
+            // covers the identity fence's direct commit_publications path.
+            for draft in &changed_drafts {
+                if let ClientScope::Composer { thread_id } = &draft.scope {
+                    self.reconcile_composer_send_budget(
+                        thread_id,
+                        draft
+                            .payload
+                            .downcast_ref::<crate::composer::store::ComposerPublication>(),
+                    );
+                }
+            }
+
             if changed_drafts.is_empty() && effects.is_empty() {
                 return Self::transition_without_publication(
                     &partitions,
@@ -2711,10 +3558,21 @@ impl ClientCore {
             partitions.prune_change_journal();
             if partitions.change_journal.len() == 128 {
                 partitions.change_journal.pop_front();
+                partitions
+                    .journal_observer()
+                    .outcome(pioneer_observability::queues::QueueOutcome::Dropped, 1);
             }
             partitions
                 .change_journal
                 .push_back(JournalChangeSet::new(transition.changes().as_ref()));
+            partitions
+                .journal_observer()
+                .enqueued(pioneer_observability::queues::QueueBytes::Unsupported);
+            let journal_depth = partitions.change_journal.len();
+            partitions.journal_observer().current(
+                journal_depth,
+                pioneer_observability::queues::QueueBytes::Unsupported,
+            );
             self.deliver_change_set(transition.changes().as_ref());
             self.publication_signal.send_replace(sequence);
             self.publication_ready.notify_all();
@@ -2769,7 +3627,7 @@ impl ClientCore {
                 .lock()
                 .expect("activation owner poisoned")
                 .invalidate();
-            self.avatar_store
+            self.image_store
                 .lock()
                 .expect("avatar store poisoned")
                 .invalidate_access();
@@ -2781,6 +3639,7 @@ impl ClientCore {
                 .invalidate();
         }
         if evict_protected {
+            self.retire_workspace_push();
             self.task_notifications
                 .lock()
                 .expect("task inbox poisoned")
@@ -2798,6 +3657,7 @@ impl ClientCore {
             self.fence_mcp_oauth();
             self.invalidate_skills();
             self.invalidate_skills_operations();
+            self.invalidate_plugin_publications();
             self.invalidate_provider_operations();
             self.cancel_artifact_downloads(None);
             self.cancel_composer_requests();
@@ -2838,13 +3698,20 @@ impl ClientCore {
             }
             registry
         });
+        #[cfg(test)]
+        if let Some(hook) = IDENTITY_BEFORE_COMMIT.with_borrow_mut(Option::take) {
+            hook();
+        }
         let mut partitions = self.partitions.lock().expect("client partitions poisoned");
         if !evict_protected && partitions.publications
             .get(&ClientScope::Administration { workspace_id: None })
             .and_then(|snapshot| snapshot.payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>())
             .is_some_and(|current| current.as_ref() == projections)
         {
-            return self.commit_publications(&mut partitions, vec![], vec![]);
+            let transition = self.commit_publications(&mut partitions, vec![], vec![]);
+            drop(partitions);
+            self.notify_send_readiness();
+            return transition;
         }
         let authority = ClientMutationAuthority { _private: () };
         let next_revisions = |scope: &ClientScope| {
@@ -2958,29 +3825,53 @@ impl ClientCore {
             }
             // A slow consumer must resnapshot after the fence, rather than
             // receive historical protected values followed by their eviction.
+            partitions.journal_observer().outcome(
+                pioneer_observability::queues::QueueOutcome::Dropped,
+                partitions.change_journal.len() as u64,
+            );
             partitions.change_journal.clear();
+            partitions
+                .journal_observer()
+                .current(0, pioneer_observability::queues::QueueBytes::Unsupported);
             let subscribers = self
                 .subscribers
                 .lock()
                 .expect("client subscriber registry poisoned");
             for queue in subscribers.values().filter_map(Weak::upgrade) {
                 if drafts.iter().any(|draft| draft.scope == queue.scope) {
-                    queue
+                    let mut events = queue
                         .events
                         .lock()
-                        .expect("client subscriber queue poisoned")
-                        .clear();
+                        .expect("client subscriber queue poisoned");
+                    queue.observer.outcome(
+                        pioneer_observability::queues::QueueOutcome::Dropped,
+                        events.len() as u64,
+                    );
+                    events.clear();
+                    queue
+                        .observer
+                        .current(0, pioneer_observability::queues::QueueBytes::Unsupported);
                 }
             }
         }
         let transition = self.commit_publications(&mut partitions, drafts, vec![]);
         drop(partitions);
+        // Runtime waiters read the committed Administration snapshot, not the
+        // identity owner mutex. Publish their predicate before signalling.
+        self.notify_send_readiness();
         if let Some(registry) = presentation_fence.as_mut() {
             registry.synchronize_publication_revisions(transition.changes().publications());
         }
         drop(presentation_fence);
         drop(composer_fence);
         drop(document_fence);
+        if evict_protected {
+            self.retire_thread_controller_jobs();
+            // Identity callers still own I here. Retain the invalidation's
+            // read obligations; admission resumes with other feature demands
+            // after the caller releases I, never recursively inside commit.
+        }
+        self.wake_thread_timeline_requests();
         self.update_thread_presentation_identity(principal);
         // Identity commits bypass transition() while applying the access fence.
         // Resume consumers waiting for workspace capabilities/model metadata too.
@@ -3013,6 +3904,493 @@ impl ClientCore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn budgeted_runtime_read_rechecks_identity_snapshot_after_commit() {
+        use crate::{
+            gateway::identity_authorization::{
+                IdentityAuthorizationPublication, IdentityPublicationChange,
+            },
+            providers::runtime::ProviderRuntimeRequestState,
+            rpc::{JsonRpcRequestTransport, JsonRpcResponseSender, RequestBudget},
+            transport::ws::GatewayWsEvent,
+        };
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        struct RuntimeReplies(mpsc::Sender<JsonRpcResponseSender>);
+        impl JsonRpcRequestTransport for RuntimeReplies {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                response: JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: pioneer_protocol::JsonRpcRequest =
+                    serde_json::from_str(&payload).unwrap();
+                assert_eq!(
+                    request.method,
+                    pioneer_protocol::constants::methods::CLI_RUNTIME_LIST
+                );
+                assert_eq!(
+                    request.params,
+                    Some(serde_json::json!({"workspace_id": "workspace"}))
+                );
+                self.0.send(response).map_err(|error| error.to_string())
+            }
+        }
+        struct Cleanup(Arc<ClientCore>, RequestBudget);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.1.cancel();
+                self.0.shutdown();
+            }
+        }
+        let core = crate::catalog_test_support::client();
+        let budget = RequestBudget::new(Instant::now() + Duration::from_secs(60));
+        let _cleanup = Cleanup(core.clone(), budget.clone());
+        let watchdog = Duration::from_secs(5);
+        let connected = |connection_id| GatewayWsEvent::Connected {
+            connection_id,
+            endpoint_id: "endpoint".into(),
+            endpoint_name: "Synthetic".into(),
+            gateway_base_url: pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                "https://synthetic.invalid",
+            )
+            .unwrap(),
+        };
+        core.transport_runtime().inject_test_event(connected(7));
+        core.transport_runtime().drain_ws_events();
+        let (requests, request_rx) = mpsc::channel();
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(RuntimeReplies(requests)));
+        core.start_provider_runtime_controller();
+        let old_epoch = core.provider_runtime_epoch();
+        assert_eq!(old_epoch.2, Some(7));
+        let (checked, checked_rx) = mpsc::channel();
+        let (proceed, proceed_rx) = mpsc::channel();
+        let (finished, finished_rx) = mpsc::channel();
+        let waiter_core = core.clone();
+        let waiter_budget = budget.clone();
+        let waiter = std::thread::spawn(move || {
+            let predicate_core = waiter_core.clone();
+            let mut waits = 0;
+            SEND_READINESS_BEFORE_WAIT.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    waits += 1;
+                    if waits <= 2 {
+                        assert_eq!(predicate_core.provider_runtime_epoch(), old_epoch);
+                        assert_eq!(
+                            *predicate_core
+                                .provider_runtime_snapshot("workspace")
+                                .unwrap()
+                                .request(),
+                            ProviderRuntimeRequestState::Loading
+                        );
+                        checked.send(waits).unwrap();
+                        proceed_rx.recv_timeout(watchdog).unwrap();
+                    }
+                }))
+            });
+            let result =
+                waiter_core.read_provider_runtimes_with_budget("workspace", true, &waiter_budget);
+            SEND_READINESS_BEFORE_WAIT.with_borrow_mut(|hook| *hook = None);
+            finished.send(result).unwrap();
+        });
+        assert_eq!(checked_rx.recv_timeout(watchdog).unwrap(), 1);
+        let old_reply = request_rx.recv_timeout(watchdog).unwrap();
+        let loading = core.provider_runtime_snapshot("workspace").unwrap();
+        let scope = ClientScope::Administration { workspace_id: None };
+        let mut identity = (*core
+            .snapshot(&scope)
+            .unwrap()
+            .snapshot()
+            .payload::<IdentityAuthorizationPublication>()
+            .unwrap())
+        .clone();
+        identity.connection_id = Some(8); // connection only: authority generations/capabilities stay intact
+        core.transport_runtime().inject_test_event(connected(8));
+        core.transport_runtime().drain_ws_events();
+        let (before_commit, before_commit_rx) = mpsc::channel();
+        let (commit, commit_rx) = mpsc::channel();
+        let publisher_core = core.clone();
+        let publisher = std::thread::spawn(move || {
+            IDENTITY_BEFORE_COMMIT.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    before_commit.send(()).unwrap();
+                    commit_rx.recv_timeout(watchdog).unwrap();
+                }))
+            });
+            // Use the real publication owner with an immutable projection;
+            // only the connection changes, not the authorization policy.
+            publisher_core
+                .publish_identity_authorization(&identity, IdentityPublicationChange::Update)
+        });
+        before_commit_rx.recv_timeout(watchdog).unwrap();
+        // Consume a pre-commit signal and then read old Loading again. This is
+        // deliberately no rescue notification after the predicate is committed.
+        core.notify_send_readiness();
+        proceed.send(()).unwrap();
+        assert_eq!(checked_rx.recv_timeout(watchdog).unwrap(), 2);
+        commit.send(()).unwrap();
+        assert_eq!(
+            publisher.join().unwrap().outcome(),
+            ClientTransitionOutcome::Changed
+        );
+        assert_eq!(
+            core.provider_runtime_epoch(),
+            (old_epoch.0, old_epoch.1, Some(8))
+        );
+        let response = |revision, id| {
+            serde_json::json!({"revision": revision, "runtimes": [{
+                "runtime_id": id, "kind": "codex", "display_name": id, "enabled": true,
+                "status": {"state": "ready"}, "capabilities": pioneer_protocol::RuntimeCapabilities::default()
+            }]})
+        };
+        old_reply.send(Ok(response(99, "stale"))).unwrap();
+        // Registration follows the old predicate read and the identity commit.
+        // Only a correctly ordered identity signal can advance this real waiter.
+        proceed.send(()).unwrap();
+        let current_reply = request_rx.recv_timeout(watchdog).expect(
+            "identity commit must advance the budgeted runtime consumer before its deadline",
+        );
+        // The serial worker processed the old response before this new RPC.
+        // Its stale completion, and the new Loading intent, published no result.
+        assert!(Arc::ptr_eq(
+            &loading,
+            &core.provider_runtime_snapshot("workspace").unwrap()
+        ));
+        current_reply.send(Ok(response(1, "current"))).unwrap();
+        let result = finished_rx.recv_timeout(watchdog).unwrap().unwrap();
+        assert_eq!(result.revision, 1);
+        assert_eq!(result.runtimes.len(), 1);
+        assert_eq!(result.runtimes[0].runtime_id, "current");
+        assert!(
+            request_rx.try_recv().is_err(),
+            "one replacement request, no unrelated controller rescue"
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn local_dispatch_publication_handoff_and_materialization_keep_causality() {
+        use pioneer_observability::{
+            live::{self, JournalPayload, WorkState},
+            work::{
+                self, Boundary, ExecutorRole, Outcome, Trigger, WorkCarrier, WorkItem, WorkKind,
+            },
+        };
+        let _lock = crate::OBSERVABILITY_TEST_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        let mut fixture_core = ClientCore::new();
+        fixture_core.presentation_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(1),
+            "fixture common presentation lane",
+        );
+        let core = Arc::new(fixture_core);
+        struct Cleanup {
+            core: Arc<ClientCore>,
+            enabled: bool,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.core.shutdown();
+                pioneer_observability::set_telemetry_enabled(self.enabled);
+            }
+        }
+        let _cleanup = Cleanup {
+            core: core.clone(),
+            enabled: old,
+        };
+        let parent = WorkCarrier::independent(
+            Boundary::StdThread,
+            WorkKind::ClientCommand,
+            Trigger::Event,
+            ExecutorRole::ClientController,
+        );
+        let outer = WorkCarrier::independent(
+            Boundary::StdThread,
+            WorkKind::ClientCommand,
+            Trigger::Event,
+            ExecutorRole::ClientController,
+        );
+        // Accepted local transport event must produce a real Session publication
+        // under its carried owner, not just complete a wrapper around a reject.
+        parent.run(|| {
+            core.transport_runtime.inject_test_event(
+                crate::transport::ws::GatewayWsEvent::Connecting {
+                    connection_id: 0,
+                    endpoint_id: "fixture".into(),
+                    endpoint_name: "Fixture".into(),
+                    endpoint_kind: crate::gateway::types::GatewayEndpointKind::Local,
+                },
+            )
+        });
+        let connecting = core
+            .transport_runtime
+            .drain_ws_events()
+            .into_iter()
+            .next()
+            .expect("synchronous injected event");
+        let connecting_context = connecting.carrier.context().unwrap();
+        outer.run(|| {
+            core.dispatch_local_gateway_event(connecting);
+            assert_eq!(work::current(), outer.context());
+        });
+        assert!(core.snapshot(&ClientScope::Session).is_some());
+        assert!(live::snapshot().unwrap().journal.iter().any(|record| matches!(&record.payload,
+            JournalPayload::Work(w) if w.context.parent == Some(connecting_context.token) && w.context.kind == WorkKind::ClientPublication)));
+        let mut fixture_thread = pioneer_protocol::Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
+            workspace_id: "ws".into(),
+            id: "thread".into(),
+            name: None,
+            preview: String::new(),
+            preview_author: None,
+            mode: pioneer_protocol::ThreadMode::Chat,
+            model: "fixture".into(),
+            model_provider: "fixture".into(),
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 2,
+            status: pioneer_protocol::ThreadStatus::Idle,
+            origin_kind: pioneer_protocol::ThreadOriginKind::User,
+            sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        core.upsert_thread(fixture_thread.clone());
+        fixture_thread.name = Some("observed update".into());
+        fixture_thread.updated_at = 3;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = crate::transport::ws::client::GatewayWsEventSender::from(tx);
+        let payload = serde_json::json!({"jsonrpc":"2.0", "method":pioneer_protocol::constants::events::THREAD_UPDATED,
+            "params":pioneer_protocol::ThreadUpdatedNotification {thread:fixture_thread.clone(),placement:None}}).to_string();
+        parent.run(|| {
+            assert!(matches!(
+                crate::transport::ws::decode::process_text_payload(
+                    &payload,
+                    0,
+                    &mut crate::rpc::PendingJsonRpcRequests::default(),
+                    &mut HashMap::new(),
+                    &mut crate::rpc::PendingJsonRpcRequests::default(),
+                    &sender,
+                ),
+                Some(pioneer_protocol::GatewayNotification::ThreadUpdated(_))
+            ));
+        });
+        let item = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("valid notification reaches local dispatch");
+        let event_context = item.carrier.context().unwrap();
+        assert_eq!(event_context.parent, parent.context().map(|c| c.token));
+        outer.run(|| {
+            core.dispatch_local_gateway_event(item);
+            assert_eq!(work::current(), outer.context());
+        });
+        let observed = core.thread_coordinator_snapshot("thread").unwrap();
+        assert_eq!(observed.thread().unwrap().name, fixture_thread.name);
+        assert!(live::snapshot().unwrap().journal.iter().any(|record| matches!(&record.payload,
+            JournalPayload::Work(w) if w.context.parent == Some(event_context.token) && w.context.kind == WorkKind::ClientPublication)));
+        let (sender, rx) = crate::threads::history_scheduler::channel();
+
+        *core.thread_request_sender.lock().unwrap() = Some(sender.clone());
+        struct BindingTransport(Arc<Mutex<Option<work::WorkContext>>>);
+        impl crate::rpc::JsonRpcRequestTransport for BindingTransport {
+            fn send_json_rpc_request(
+                &self,
+                _id: String,
+                _payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                *self.0.lock().unwrap() = work::current();
+                response
+                    .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                        "fixture binding rejection",
+                    )))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        let observed_rpc = Arc::new(Mutex::new(None));
+        *core
+            .transport_runtime
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(BindingTransport(observed_rpc.clone())));
+        parent.run(|| core.schedule_thread_cli_binding("thread", "ws").unwrap());
+        let item = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("local request delivered");
+        let request_context = item.carrier.context().unwrap();
+        assert_eq!(request_context.parent, parent.context().map(|c| c.token));
+        outer.run(|| {
+            core.dispatch_thread_controller_item(item);
+            assert_eq!(work::current(), outer.context());
+        });
+        let rpc = observed_rpc
+            .lock()
+            .unwrap()
+            .expect("real Binding handler reached the RPC factory");
+        assert_eq!(rpc.kind, WorkKind::ClientRpc);
+        assert_eq!(rpc.parent, Some(request_context.token));
+        assert!(live::snapshot().unwrap().journal.iter().any(|record| matches!(&record.payload,
+            JournalPayload::Work(w) if w.context.token == rpc.token && w.state == WorkState::Terminal(Outcome::Failed))));
+        // A following item without local metadata is a root, never the previous item.
+        core.dispatch_thread_controller_item(WorkItem::from_carrier(
+            crate::threads::registry::ThreadControllerRequest::Resume,
+            WorkCarrier::default(),
+            None,
+        ));
+        let (closed, closed_rx) = crate::threads::history_scheduler::channel();
+        drop(closed_rx);
+        parent.run(|| {
+            assert!(
+                closed
+                    .send(crate::threads::registry::ThreadControllerRequest::Binding {
+                        id: "thread".into(),
+                        workspace: "ws".into(),
+                        generation: 1
+                    })
+                    .is_err()
+            )
+        });
+        assert!(live::snapshot().unwrap().journal.iter().any(|record| matches!(&record.payload,
+            JournalPayload::Work(w) if w.context.parent == parent.context().map(|c| c.token) && w.state == WorkState::Terminal(Outcome::Cancelled))));
+        let scope = ClientScope::Navigation;
+        let subscription = core.subscribe(scope.clone(), NonZeroUsize::new(4).unwrap());
+        parent.run(|| {
+            core.publish(
+                &authority(),
+                scope.clone(),
+                revisions(1),
+                Arc::new(1u64),
+                vec![],
+            );
+        });
+        subscription.try_next().unwrap();
+        let delivered = subscription.pending_work().context().unwrap();
+        assert!(
+            !live::snapshot()
+                .unwrap()
+                .active
+                .iter()
+                .any(|w| w.context.token == delivered.token)
+        );
+        let execution = subscription
+            .pending_work()
+            .execution_child(WorkKind::ClientPublication, ExecutorRole::DesktopForeground);
+        assert_eq!(execution.context().unwrap().parent, Some(delivered.token));
+        execution.run(|| {});
+        core.publish(
+            &authority(),
+            scope.clone(),
+            revisions(2),
+            Arc::new(2u64),
+            vec![],
+        );
+        let undelivered = subscription.queue.events.lock().unwrap()[0]
+            .carrier
+            .context()
+            .unwrap()
+            .token;
+        drop(subscription);
+        let snapshot = live::snapshot().unwrap();
+        let terminals = |token| {
+            snapshot
+                .journal
+                .iter()
+                .filter_map(move |r| match &r.payload {
+                    JournalPayload::Work(w)
+                        if w.context.token == token
+                            && matches!(w.state, WorkState::Terminal(_)) =>
+                    {
+                        Some(w.state)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            terminals(delivered.token),
+            [WorkState::Terminal(Outcome::Completed)]
+        );
+        assert_eq!(
+            terminals(undelivered),
+            [WorkState::Terminal(Outcome::Cancelled)]
+        );
+        assert_eq!(
+            terminals(event_context.token),
+            [WorkState::Terminal(Outcome::Completed)]
+        );
+        assert_eq!(
+            terminals(request_context.token),
+            [WorkState::Terminal(Outcome::Completed)]
+        );
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        *core.presentation_sender.lock().unwrap() = Some(wake_tx);
+        parent.run(|| {
+            core.wake_thread_presentation();
+            core.wake_thread_presentation();
+        });
+        core.materialize_presentation_cycle(ClientCore::receive_presentation_wake(
+            wake_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("local request delivered"),
+        ));
+        let snapshot = live::snapshot().unwrap();
+        let wakes = snapshot
+            .queues
+            .iter()
+            .find(|q| q.byte_definition == "fixture common presentation lane")
+            .unwrap();
+        assert_eq!(
+            (
+                wakes.offered,
+                wakes.enqueued,
+                wakes.dequeued,
+                wakes.processed,
+                wakes.coalesced,
+                wakes.depth
+            ),
+            (2, 1, 1, 1, 1, 0)
+        );
+        assert!(live::snapshot().unwrap().journal.iter().any(|r| matches!(&r.payload, JournalPayload::Work(w) if w.context.kind == WorkKind::ClientPublication && w.context.trigger == Trigger::Reconcile && w.context.parent.is_none() && w.context.links.contains(&parent.context().map(|c| c.token)))));
+        assert_eq!(work::current(), None);
+        let old_item = parent.run(|| {
+            WorkItem::new(
+                crate::threads::registry::ThreadControllerRequest::Resume,
+                Boundary::StdThread,
+                WorkKind::ClientCommand,
+                ExecutorRole::ClientController,
+            )
+        });
+        let old_context = old_item.carrier.context().unwrap();
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        core.dispatch_thread_controller_item(old_item);
+        let snapshot = live::snapshot().unwrap();
+        assert!(
+            !snapshot
+                .active
+                .iter()
+                .any(|w| w.context.token == old_context.token)
+        );
+        assert!(snapshot.journal.iter().any(|r| matches!(&r.payload, JournalPayload::Work(w) if w.context.parent.is_none() && w.context.consent_generation != old_context.consent_generation)));
+    }
     #[test]
     fn publication_journal_releases_consumed_superseded_payloads() {
         let core = Arc::new(ClientCore::new());
@@ -3634,8 +5012,8 @@ mod tests {
         let operation = ClientOperationId::new("avatar-read").unwrap();
         core.publish(
             &authority(),
-            ClientScope::Avatar {
-                principal_id: "principal-a".to_owned(),
+            ClientScope::Image {
+                key: "principal-a".to_owned(),
             },
             revisions(1),
             Arc::new("ready"),

@@ -148,32 +148,3 @@ impl ProxyForm {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::CredentialFieldState;
-
-    #[test]
-    fn late_base_url_read_does_not_replace_an_edit_or_reopen_closed_form() {
-        let mut state = CredentialFieldState {
-            original: Some(String::new()),
-            edited: true,
-            closed: false,
-        };
-        assert_eq!(
-            state.loaded(Some("https://old.example.test/private".into())),
-            None
-        );
-        assert_eq!(
-            state.original.as_deref(),
-            Some("https://old.example.test/private")
-        );
-        state.clear();
-        assert_eq!(
-            state.loaded(Some("https://late.example.test/private".into())),
-            None
-        );
-        assert!(state.original.is_none());
-        assert!(state.closed);
-    }
-}

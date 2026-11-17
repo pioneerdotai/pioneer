@@ -11,6 +11,7 @@ pub mod projection;
 pub mod commands;
 
 pub(crate) mod controller;
+pub(crate) mod push;
 
 pub mod intents;
 pub use pioneer_protocol::{

@@ -21,19 +21,15 @@ const IDLE_INTERVAL: Duration = Duration::from_secs(60);
 // result records EOF; budgets, scope steps, errors and cancellation do not.
 #[derive(Default)]
 struct DiscoveryAdmission {
-    next_probe: [Option<Instant>; 2],
+    done: [bool; 2],
 }
 impl DiscoveryAdmission {
-    fn ready(&self, path: usize, now: Instant) -> bool {
-        self.next_probe[path].is_none_or(|at| now >= at)
+    fn ready(&self, path: usize) -> bool {
+        !self.done[path]
     }
 
-    fn completed(&mut self, path: usize, more: bool, now: Instant) {
-        self.next_probe[path] = if more {
-            None
-        } else {
-            Some(now + IDLE_INTERVAL)
-        };
+    fn completed(&mut self, path: usize, more: bool) {
+        self.done[path] = !more;
     }
 }
 
@@ -42,15 +38,120 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
     let mut progress = FrozenStorageLifetimeProgress::default();
     let mut lifetime = false;
     let mut admission = DiscoveryAdmission::default();
+    let database = store.database_connection();
+    let mut wake = database.work_signal("maintenance.frozen").subscribe();
+    let mut released = database
+        .work_signal("maintenance.frozen.release")
+        .subscribe();
+    let mut begin = true;
+    let mut force_full = true;
+    let mut retry_pending = false;
     loop {
+        if begin {
+            if force_full {
+                // Recovery inventories all releases observed before it starts.
+                // Later releases keep their own unacknowledged frontier.
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = released.begin_keyed_pass(&database) => {},
+                }
+            }
+            let keys = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                result = wake.begin_keyed_pass(&database) => match result {
+                    Ok(keys) => keys,
+                    Err(_) => {
+                        tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            _ = tokio::time::sleep(IDLE_INTERVAL) => {},
+                        }
+                        continue;
+                    }
+                },
+            };
+            let keys = if force_full { None } else { keys };
+            let restarted = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                result = progress.restart_for_changes(&store, keys) => result,
+            };
+            match restarted {
+                Ok(conversion) => {
+                    force_full = false;
+                    admission = DiscoveryAdmission {
+                        done: [!conversion, false],
+                    };
+                }
+                Err(_) => {
+                    force_full = true;
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        _ = tokio::time::sleep(IDLE_INTERVAL) => {},
+                    }
+                    continue;
+                }
+            }
+            begin = false;
+        }
         let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
-            outcome = batch(&store, &mut progress, &mut lifetime, &mut admission, BATCH_STEPS, BATCH_TIME) => outcome,
+            outcome = crate::database::attribution::scope_database_workload_result(pioneer_observability::DatabaseWorkload::FrozenStorageMaintenance, pioneer_observability::DatabaseOperationSite::FrozenStorageBatch,batch(&store, &mut progress, &mut lifetime, &mut admission, BATCH_STEPS, BATCH_TIME)) => outcome,
         };
         let pause = match outcome {
-            Ok(more) => pause_after_batch(more, &admission, Instant::now()),
+            Ok(true) => BATCH_PAUSE,
+            Ok(false) if retry_pending => {
+                retry_pending = false;
+                force_full = true;
+                begin = true;
+                IDLE_INTERVAL
+            }
+            Ok(false) => {
+                let deadline = tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    result = progress.next_retry_deadline(&store) => match result {
+                        Ok(deadline) => deadline,
+                        Err(_) => {
+                            tokio::select! {
+                                _ = cancellation.cancelled() => return,
+                                _ = tokio::time::sleep(IDLE_INTERVAL) => {},
+                            }
+                            force_full = true;
+                            begin = true;
+                            continue;
+                        }
+                    },
+                };
+                let release_only = tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = wake.wait(deadline) => false,
+                    _ = released.changed() => true,
+                };
+                if release_only {
+                    // The releasing reader supplies exactly the blocked manifest.
+                    // Do not acknowledge unrelated source changes on this branch.
+                    let keys = released.begin_keyed_pass(&database).await;
+                    match keys {
+                        Ok(keys) => match tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            result = progress.restart_for_changes(&store, keys) => result,
+                        } {
+                            Ok(conversion) => {
+                                admission = DiscoveryAdmission {
+                                    done: [!conversion, false],
+                                };
+                                continue;
+                            }
+                            Err(_) => force_full = true,
+                        },
+                        Err(_) => force_full = true,
+                    }
+                }
+                begin = true;
+                continue;
+            }
             Err(_) => {
+                retry_pending = true;
                 tracing::warn!(
                     "frozen storage maintenance quantum failed; original history preserved"
                 );
@@ -59,7 +160,7 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
         };
         tokio::select! {
             _ = cancellation.cancelled() => return,
-            _ = tokio::time::sleep(pause) => {},
+            _ = pioneer_observability::live::sleeping(pause,tokio::time::sleep(pause)) => {},
         }
     }
 }
@@ -73,10 +174,10 @@ async fn batch(
     time_limit: Duration,
 ) -> anyhow::Result<bool> {
     let started = Instant::now();
-    progress.revisit_completed_cleanup(started, IDLE_INTERVAL);
+
     // A per-batch conversion budget is distinct from actual discovery EOF.
     // Completed paths remain latched across batches while the other advances.
-    let mut finished = [!admission.ready(0, started), !admission.ready(1, started)];
+    let mut finished = [!admission.ready(0), !admission.ready(1)];
     let mut steps = 0;
     let mut conversion_steps = 0;
     while !finished.iter().all(|done| *done)
@@ -95,7 +196,7 @@ async fn batch(
         };
         steps += 1;
         finished[path] = !more;
-        admission.completed(path, more, Instant::now());
+        admission.completed(path, more);
         if conversion_steps == BATCH_CONVERSION_STEPS {
             finished[0] = true;
         }
@@ -106,8 +207,7 @@ async fn batch(
         // cancellation and other tasks a cooperative scheduling point.
         tokio::task::yield_now().await;
     }
-    let now = Instant::now();
-    Ok(admission.ready(0, now) || admission.ready(1, now))
+    Ok(admission.ready(0) || admission.ready(1))
 }
 
 fn can_start_step(
@@ -117,21 +217,6 @@ fn can_start_step(
     time_limit: Duration,
 ) -> bool {
     steps < step_limit && (steps == 0 || elapsed < time_limit)
-}
-
-fn pause_after_batch(more: bool, admission: &DiscoveryAdmission, now: Instant) -> Duration {
-    if more {
-        BATCH_PAUSE
-    } else {
-        // Lifetime may finish partway through conversion's cooldown (or vice
-        // versa). Wake for the earliest probe, without adding another minute.
-        admission
-            .next_probe
-            .iter()
-            .flatten()
-            .min()
-            .map_or(BATCH_PAUSE, |at| at.saturating_duration_since(now))
-    }
 }
 
 #[cfg(test)]
@@ -311,8 +396,8 @@ mod tests {
         );
         assert_eq!(
             observer.operations() - before,
-            2,
-            "time budget stops the NEXT operation, after one complete scope step"
+            3,
+            "time budget stops the NEXT operation after frontier, scope page and witness"
         );
         let before = observer.operations();
         assert!(
@@ -350,11 +435,28 @@ mod tests {
             }
         }
         assert!(eof);
-        assert!(admission.next_probe.iter().all(Option::is_some));
-        let pause = pause_after_batch(false, &admission, Instant::now());
-        assert!(pause > Duration::ZERO && pause <= IDLE_INTERVAL);
-        // Advance only admission time; no real minute-long wait in this fixture.
-        admission.next_probe = [Some(Instant::now()); 2];
+        assert!(admission.done.iter().all(|done| *done));
+        let operations = observer.operations();
+        assert!(
+            !batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                1,
+                BATCH_TIME
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            observer.operations(),
+            operations,
+            "completed discovery performs no SQL"
+        );
+        // Relevant mutation starts a new discovery epoch.
+        admission = DiscoveryAdmission::default();
+        progress = FrozenStorageLifetimeProgress::default();
         assert!(
             batch(
                 &store,
@@ -366,7 +468,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            "fresh round revisits after idle"
+            "fresh round revisits after invalidation"
         );
         assert_eq!(
             store.database_connection().read_class(),
@@ -433,12 +535,8 @@ mod tests {
         );
         assert_eq!(
             observer.operations() - operations,
-            2,
-            "only current scope step completes after wait"
-        );
-        assert_eq!(
-            pause_after_batch(true, &DiscoveryAdmission::default(), Instant::now()),
-            BATCH_PAUSE
+            3,
+            "only current scope step (frontier, page and witness) completes after wait"
         );
 
         let held = store.database_connection().begin_read().await.unwrap();
@@ -496,30 +594,390 @@ mod tests {
         assert!(!admits(BATCH_STEPS, Duration::ZERO));
         assert!(!admits(1, BATCH_TIME));
         assert!(!admits(1, Duration::from_secs(30)));
-        // A DB queue wait ends this batch, but cannot multiply the next pause.
-        assert_eq!(
-            pause_after_batch(true, &DiscoveryAdmission::default(), Instant::now()),
-            Duration::from_millis(1)
-        );
-        let now = Instant::now();
         for first in 0..2 {
             let mut admission = DiscoveryAdmission::default();
-            admission.completed(first, false, now);
-            admission.completed(1 - first, false, now + Duration::from_secs(40));
-            assert_eq!(
-                pause_after_batch(false, &admission, now + Duration::from_secs(40)),
-                Duration::from_secs(20)
-            );
-            assert_eq!(
-                pause_after_batch(false, &admission, now + IDLE_INTERVAL),
-                Duration::ZERO
-            );
-            assert!(admission.ready(first, now + IDLE_INTERVAL));
-            assert!(!admission.ready(1 - first, now + IDLE_INTERVAL));
+            admission.completed(first, false);
+            admission.completed(1 - first, false);
+            assert!(!admission.ready(first));
+            assert!(!admission.ready(1 - first));
         }
     }
     #[tokio::test]
-    async fn conversion_eof_survives_batches_and_due_probe_discovers_new_work() {
+    async fn one_released_manifest_finishes_without_revisiting_retained_histories() {
+        use pioneer_entity::compaction_frozen_history as history;
+        use sea_orm::EntityTrait;
+        use sha2::{Digest, Sha256};
+        let (_directory, store, observer) = fixture_with_metadata(64).await;
+        let mut holds = Vec::new();
+        for index in 0..64 {
+            holds.push(
+                store
+                    .compaction_finish_frozen_history_held(
+                        "ws",
+                        "thread",
+                        &FrozenHistoryRef {
+                            format: 1,
+                            manifest_id: format!("metadata-{index:04}"),
+                            messages: 0,
+                            identity_sha256: hex::encode(Sha256::digest([])),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut lifetime = false;
+        let mut admission = DiscoveryAdmission::default();
+        let mut finished = false;
+        for _ in 0..2048 {
+            if !batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                BATCH_STEPS,
+                BATCH_TIME,
+            )
+            .await
+            .unwrap()
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(
+            finished,
+            "startup must reach checked EOF with retaining readers"
+        );
+        let db = store.database_connection();
+        let mut release = db.work_signal("maintenance.frozen.release").subscribe();
+        release.begin_pass(&db).await.unwrap();
+        drop(holds.remove(0));
+        let keys = release.begin_keyed_pass(&db).await.unwrap();
+        assert_eq!(
+            keys.as_deref(),
+            Some(["m:metadata-0000".to_owned()].as_slice())
+        );
+        let before = observer.operations();
+        let conversion = progress.restart_for_changes(&store, keys).await.unwrap();
+        admission = DiscoveryAdmission {
+            done: [!conversion, false],
+        };
+        finished = false;
+        for _ in 0..256 {
+            if !batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                BATCH_STEPS,
+                BATCH_TIME,
+            )
+            .await
+            .unwrap()
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(
+            finished,
+            "the addressed expiry and its physical work must drain"
+        );
+        assert!(
+            observer.operations() - before < 128,
+            "one changed identity must not repeat preparations for 63 other ready histories"
+        );
+        assert_eq!(
+            history::Entity::find_by_id("metadata-0000")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            1
+        );
+        for index in 1..64 {
+            assert_eq!(
+                history::Entity::find_by_id(format!("metadata-{index:04}"))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expired,
+                0
+            );
+        }
+        drop(holds);
+    }
+
+    #[tokio::test]
+    async fn metadata_refresh_is_quiet_and_root_replacement_addresses_both_identities() {
+        use pioneer_crud::NewCliRuntimeThreadBinding;
+        use sha2::{Digest, Sha256};
+        let (_directory, store, _) = fixture_with_metadata(0).await;
+        let db = store.database_connection();
+        let mut html = db.work_signal("maintenance.html").subscribe();
+        html.begin_pass(&db).await.unwrap();
+        let mut wake = db.work_signal("maintenance.frozen").subscribe();
+        wake.begin_keyed_pass(&db).await.unwrap();
+        let before = store
+            .get_cli_runtime_thread_binding("thread")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut update = NewCliRuntimeThreadBinding {
+            thread_id: before.thread_id,
+            workspace_id: before.workspace_id,
+            runtime_id: before.runtime_id,
+            runtime_kind: before.runtime_kind,
+            native_thread_id: before.native_thread_id,
+            native_session_id: before.native_session_id,
+            native_root_thread_id: before.native_root_thread_id,
+            native_cwd: before.native_cwd,
+            native_model: Some("metadata-refresh".into()),
+            resume_cursor_json: before.resume_cursor_json,
+            status: before.status,
+            created_at: before.created_at,
+            updated_at: before.updated_at + chrono::Duration::seconds(1),
+        };
+        let refreshed = store
+            .upsert_cli_runtime_thread_binding(update.clone())
+            .await
+            .unwrap();
+        assert_eq!(refreshed.native_model.as_deref(), Some("metadata-refresh"));
+        assert!(
+            futures_util::FutureExt::now_or_never(wake.wait(None)).is_none(),
+            "metadata refresh leaves root identity and cleanup eligibility unchanged"
+        );
+        assert!(
+            futures_util::FutureExt::now_or_never(html.wait(None)).is_none(),
+            "session/model metadata does not release HTML ownership"
+        );
+        let previous_cursor = update.resume_cursor_json.clone();
+        let mut bookkeeping: serde_json::Value = serde_json::from_str(&previous_cursor).unwrap();
+        bookkeeping["cursorBookkeeping"] = "next-item".into();
+        update.resume_cursor_json = bookkeeping.to_string();
+        store
+            .update_cli_runtime_thread_resume_cursor(
+                "thread",
+                &update.native_thread_id,
+                &previous_cursor,
+                update.resume_cursor_json.clone(),
+                update.updated_at,
+            )
+            .await
+            .unwrap();
+        assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_none());
+        assert!(
+            futures_util::FutureExt::now_or_never(html.wait(None)).is_none(),
+            "changed cursor JSON with the same history does not release HTML"
+        );
+        let replacement = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "replacement".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
+        store
+            .compaction_begin_frozen_history("ws", "thread", &replacement)
+            .await
+            .unwrap();
+        let hold = store
+            .compaction_finish_frozen_history_held("ws", "thread", &replacement)
+            .await
+            .unwrap();
+        wake.begin_keyed_pass(&db).await.unwrap();
+        let mut cursor: serde_json::Value =
+            serde_json::from_str(&update.resume_cursor_json).unwrap();
+        cursor["pioneerContext"]["contextHistoryJson"] =
+            serde_json::to_string(&replacement).unwrap().into();
+        html.begin_pass(&db).await.unwrap();
+        update.resume_cursor_json = cursor.to_string();
+        store
+            .upsert_cli_runtime_thread_binding(update)
+            .await
+            .unwrap();
+        assert_eq!(
+            wake.begin_keyed_pass(&db).await.unwrap(),
+            Some(vec!["m:live".into(), "m:replacement".into()])
+        );
+        assert!(
+            futures_util::FutureExt::now_or_never(html.wait(None)).is_some(),
+            "root replacement must preserve the HTML lifetime wake"
+        );
+        drop(hold);
+    }
+
+    #[tokio::test]
+    async fn source_invalidation_registers_new_work_without_repeating_legacy_inventory() {
+        use pioneer_entity::compaction_frozen_history as history;
+        use sea_orm::EntityTrait;
+        use sha2::{Digest, Sha256};
+
+        let (_directory, store, observer) = fixture_with_metadata(128).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut lifetime = false;
+        let mut admission = DiscoveryAdmission::default();
+        let mut idle = false;
+        for _ in 0..2048 {
+            if !batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                BATCH_STEPS,
+                BATCH_TIME,
+            )
+            .await
+            .unwrap()
+            {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle, "the initial legacy inventory must finish");
+        let db = store.database_connection();
+        let mut wake = db.work_signal("maintenance.frozen").subscribe();
+        wake.begin_pass(&db).await.unwrap();
+        let descriptor = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "new-after-idle".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
+        store
+            .compaction_begin_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        let _capture = store
+            .compaction_finish_frozen_history_held("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_some());
+        let keys = wake.begin_keyed_pass(&db).await.unwrap();
+        let conversion = progress.restart_for_changes(&store, keys).await.unwrap();
+        admission = DiscoveryAdmission {
+            done: [!conversion, false],
+        };
+        lifetime = false;
+        let before = observer.operations();
+        // One new manifest must not pay for another 128-header legacy walk.
+        // Count all reader operations, not a particular SQL shape or call order.
+        for _ in 0..16 {
+            batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                1,
+                BATCH_TIME,
+            )
+            .await
+            .unwrap();
+            let registered = history::Entity::find_by_id("new-after-idle")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .storage_registered;
+            assert!(
+                observer.operations() - before < 64,
+                "source invalidation must not repeat the old scope inventory"
+            );
+            if registered == 1 {
+                return;
+            }
+        }
+        panic!("new supported work must be registered without a legacy scan");
+    }
+
+    #[tokio::test]
+    async fn conversion_release_reopens_lifetime_after_eof() {
+        use pioneer_entity::compaction_frozen_history as history;
+        use sea_orm::EntityTrait;
+        let (_directory, store, _) = fixture_with_metadata(0).await;
+        let db = store.database_connection();
+        // Remove the fixture's logical owner before either finite traversal.
+        db.execute_unprepared("DELETE FROM thread_cli_runtime_binding")
+            .await
+            .unwrap();
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        // Establish conversion scope/layouts but stop before activation.
+        for _ in 0..64 {
+            store
+                .compact_frozen_storage_quantum(&mut progress)
+                .await
+                .unwrap();
+            let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM compaction_frozen_layout WHERE manifest_id='live' AND pending=1".to_owned())).await.unwrap().unwrap();
+            if row.try_get::<i64>("", "n").unwrap() > 0 {
+                break;
+            }
+        }
+        let mut eof = false;
+        for _ in 0..512 {
+            if !progress.quantum(&store).await.unwrap() {
+                eof = true;
+                break;
+            }
+        }
+        assert!(eof);
+        assert_eq!(
+            history::Entity::find_by_id("live")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            0
+        );
+        let mut wake = db.work_signal("maintenance.frozen").subscribe();
+        wake.begin_pass(&db).await.unwrap();
+        for _ in 0..128 {
+            if !store
+                .compact_frozen_storage_quantum(&mut progress)
+                .await
+                .unwrap()
+            {
+                break;
+            }
+        }
+        assert!(futures_util::FutureExt::now_or_never(wake.wait(None)).is_some());
+        wake.begin_pass(&db).await.unwrap();
+        assert!(
+            !store
+                .compact_frozen_storage_quantum(&mut progress)
+                .await
+                .unwrap()
+        );
+        assert!(
+            futures_util::FutureExt::now_or_never(wake.wait(None)).is_none(),
+            "completed conversion must stay quiet"
+        );
+        // Same owner follows the production invalidation boundary. No producer,
+        // timer, hold release or restart is needed to make expiry eligible.
+        wake.begin_pass(&db).await.unwrap();
+        progress = FrozenStorageLifetimeProgress::default();
+        for _ in 0..512 {
+            if !progress.quantum(&store).await.unwrap() {
+                break;
+            }
+        }
+        assert_eq!(
+            history::Entity::find_by_id("live")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn conversion_eof_survives_batches_and_invalidation_discovers_new_work() {
         use pioneer_entity::{
             compaction_frozen_history as history, compaction_frozen_layout as layout,
         };
@@ -531,7 +989,7 @@ mod tests {
             let mut progress = FrozenStorageLifetimeProgress::default();
             let mut lifetime = false;
             let mut admission = DiscoveryAdmission::default();
-            admission.next_probe[1] = Some(Instant::now() + Duration::from_secs(3600));
+            admission.done[1] = true;
             let mut useful = 0;
             for _ in 0..128 {
                 let more = batch(
@@ -544,7 +1002,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                if admission.next_probe[0].is_some() {
+                if admission.done[0] {
                     assert!(!more);
                     break;
                 }
@@ -558,7 +1016,7 @@ mod tests {
                 useful > 4,
                 "scope and staged layout validation took bounded steps"
             );
-            let eof = admission.next_probe[0].expect("actual conversion EOF");
+            assert!(admission.done[0], "actual conversion EOF");
             assert_eq!(
                 history::Entity::find_by_id("live")
                     .one(&store.database_connection())
@@ -580,8 +1038,8 @@ mod tests {
                     .all(|row| row.active == 1 && row.pending == 0 && row.failed == 0)
             );
 
-            admission.next_probe[1] = None;
-            // Initial locator and proof discovery each issue one metadata read.
+            admission.done[1] = false;
+            // Locator and proof discovery each capture a frontier and read a page.
             // Repeating the three conversion discovery reads would change the count.
             for _ in 0..2 {
                 let before = observer.operations();
@@ -597,8 +1055,8 @@ mod tests {
                     .await
                     .unwrap()
                 );
-                assert_eq!(observer.operations() - before, 1);
-                assert_eq!(admission.next_probe[0], Some(eof));
+                assert_eq!(observer.operations() - before, 2);
+                assert!(admission.done[0]);
             }
             if finish_lifetime {
                 let mut idle = false;
@@ -622,8 +1080,8 @@ mod tests {
                     idle,
                     "lifetime reaches its real EOF during conversion cooldown"
                 );
-                assert_eq!(admission.next_probe[0], Some(eof));
-                assert!(admission.next_probe[1].is_some());
+                assert!(admission.done[0]);
+                assert!(admission.done[1]);
             }
 
             let new = FrozenHistoryRef {
@@ -663,12 +1121,8 @@ mod tests {
                     before,
                     "cooldown performs no SQL or RAM quantum"
                 );
-                assert!(pause_after_batch(false, &admission, Instant::now()) > Duration::ZERO);
             } else {
-                assert!(
-                    admission.next_probe[1].is_none(),
-                    "lifetime is still admitted"
-                );
+                assert!(!admission.done[1], "lifetime is still admitted");
             }
             assert_eq!(
                 history::Entity::find_by_id("new-work")
@@ -680,7 +1134,7 @@ mod tests {
                 0
             );
 
-            admission.next_probe[0] = Some(Instant::now());
+            admission.done[0] = false;
             assert!(
                 batch(
                     &store,
@@ -693,7 +1147,7 @@ mod tests {
                 .await
                 .unwrap()
             );
-            assert!(admission.next_probe[0].is_none());
+            assert!(!admission.done[0]);
             assert_eq!(
                 history::Entity::find_by_id("new-work")
                     .one(&store.database_connection())
@@ -751,6 +1205,8 @@ mod tests {
             attempts: 0,
             retries: 0,
             portion_attempts: 0,
+            overflow_rejections: 0,
+            overflow_input_ceiling: None,
             corrections: 0,
             target_tokens: 10,
             source_text_projection_version: 0,
@@ -769,6 +1225,9 @@ mod tests {
             [serde_json::to_string(&state).unwrap().into()],
         )).await.unwrap();
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "p".into(),
             model: "m".into(),
@@ -800,10 +1259,10 @@ mod tests {
         let reads = observer.operations();
         let writes = observer.writes.lock().unwrap().len();
         assert!(progress.quantum(&store).await.unwrap());
-        assert_eq!(
-            observer.operations() - reads,
-            2,
-            "candidate + exact-key preflight, no reverse read"
+        let preflight_reads = observer.operations() - reads;
+        assert!(
+            (2..=3).contains(&preflight_reads),
+            "discard preflight must stay within its bounded maintenance read budget"
         );
         assert_eq!(observer.writes.lock().unwrap().len(), writes);
         assert!(
@@ -845,10 +1304,7 @@ mod tests {
             .await
             .unwrap()
         );
-        assert_eq!(
-            admission.next_probe, [None; 2],
-            "scope/budget stop is not EOF"
-        );
+        assert_eq!(admission.done, [false; 2], "scope/budget stop is not EOF");
 
         let held = store.database_connection().begin_read().await.unwrap();
         {
@@ -867,7 +1323,7 @@ mod tests {
             }
             // Dropping this owned future cancels the queued operation.
         }
-        assert_eq!(admission.next_probe, [None; 2]);
+        assert_eq!(admission.done, [false; 2]);
         drop(held);
         store
             .database_connection()
@@ -888,10 +1344,104 @@ mod tests {
             .await
             .is_err()
         );
-        assert_eq!(
-            admission.next_probe, [None; 2],
-            "DB errors do not latch EOF"
-        );
+        assert_eq!(admission.done, [false; 2], "DB errors do not latch EOF");
+    }
+
+    // Distinct lifecycle proof: the actual run future stays parked, including
+    // across elapsed pacing/backoff intervals, with protected pending work.
+    #[tokio::test]
+    async fn protected_pending_owner_parks_without_clock_rescans() {
+        let (_directory, store, observer) = fixture_with_metadata(0).await;
+        let db = store.database_connection();
+        for index in 0..7 {
+            let id = format!("protected-{index}");
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready) VALUES(?1,'ws','thread','fixture','fixture',0,0,0,0,0)",
+                [id.clone().into()])).await.unwrap();
+            let kind = i64::from(index != 0);
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES(?1,?2,0,1)",
+                [id.clone().into(), kind.into()])).await.unwrap();
+            let sql = if kind == 0 {
+                "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,0,'{}',2)"
+            } else {
+                "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,0,0,'event','e','v','thread','{}',2)"
+            };
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [id.into()],
+            ))
+            .await
+            .unwrap();
+        }
+        tokio::time::pause();
+        let cancellation = CancellationToken::new();
+        let mut worker = Box::pin(run(Arc::new(store.clone()), cancellation.clone()));
+        let mut previous = (0, 0);
+        let mut quiet = 0;
+        for _ in 0..200_000 {
+            assert!(futures_util::poll!(&mut worker).is_pending());
+            let current = (
+                observer.reads.lock().unwrap().len(),
+                observer.writes.lock().unwrap().len(),
+            );
+            let readers_idle = matches!(
+                observer
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|event| !matches!(event, SqliteReadEvent::OperationFinished { .. })),
+                Some(SqliteReadEvent::AdmissionReleased {
+                    active: 0,
+                    queue_depth: 0,
+                    ..
+                })
+            );
+            let writers_idle = matches!(
+                observer.writes.lock().unwrap().last(),
+                Some(SqliteWriteEvent::Released { .. })
+            );
+            if current == previous && readers_idle && writers_idle {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+            previous = current;
+            if quiet == 2000 {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(quiet, 2000, "finite backlog must park the real owner");
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(3600)).await;
+            for _ in 0..1000 {
+                assert!(futures_util::poll!(&mut worker).is_pending());
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                (
+                    observer.reads.lock().unwrap().len(),
+                    observer.writes.lock().unwrap().len()
+                ),
+                previous,
+                "no read/write admission, housekeeping, or clock rescan after EOF"
+            );
+        }
+        cancellation.cancel();
+        worker.await;
+        // Pool acquisition uses real SQLite worker I/O after the virtual-time proof.
+        tokio::time::resume();
+        let pending = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id LIKE 'protected-%' AND pending=1 AND retry_at=0")).await.unwrap().unwrap();
+        assert_eq!(pending.try_get::<i64>("", "n").unwrap(), 7);
+        let retained = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT (SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id LIKE 'protected-%') + (SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id LIKE 'protected-%') AS n")).await.unwrap().unwrap();
+        assert_eq!(retained.try_get::<i64>("", "n").unwrap(), 7);
     }
 
     #[tokio::test]

@@ -707,8 +707,25 @@ mod tests {
             .build()
             .expect("local executor");
         for durable in [false, true] {
-            let subscriber =
-                tracing_subscriber::registry().with(sentry::integrations::tracing::layer());
+            let subscriber = tracing_subscriber::registry()
+                .with(
+                    sentry::integrations::tracing::SpanLayer::new()
+                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                )
+                .with(
+                    sentry::integrations::tracing::BreadcrumbLayer::new().with_filter(
+                        tracing_subscriber::filter::filter_fn(|metadata| {
+                            matches!(
+                                *metadata.level(),
+                                tracing::Level::WARN | tracing::Level::INFO
+                            )
+                        }),
+                    ),
+                )
+                .with(
+                    sentry::integrations::tracing::ErrorLayer::new()
+                        .with_filter(tracing_subscriber::filter::LevelFilter::ERROR),
+                );
             // with_captured_events installs an isolated hub and TestTransport;
             // no default/global client and no network transport are used.
             let events = sentry::test::with_captured_events(|| {

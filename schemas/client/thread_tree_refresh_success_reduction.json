@@ -342,7 +342,6 @@
       "type": "string",
       "enum": [
         "turn_pre_prompt_context",
-        "turn_post_preflight_prompt_context",
         "turn_pre_prompt_compile",
         "runtime_turn_pre_context"
       ]
@@ -452,6 +451,20 @@
             "null"
           ]
         },
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "created_at": {
           "type": "integer",
           "format": "int64"
@@ -527,6 +540,29 @@
         },
         "workspace_id": {
           "type": "string"
+        },
+        "service_mode": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "authority": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "authority"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -903,6 +939,11 @@
         "turn_kind": {
           "$ref": "#/$defs/TurnKind",
           "default": "conversation"
+        },
+        "work_owner": {
+          "description": "Immutable owner of the admitted work; absent historical wire values own their turn.",
+          "$ref": "#/$defs/TurnWorkOwner",
+          "default": "turn"
         }
       },
       "required": [
@@ -1043,6 +1084,14 @@
         "Failed",
         "Interrupted",
         "Blocked"
+      ]
+    },
+    "TurnWorkOwner": {
+      "description": "Canonical work ownership, persisted at admission independently of authorship.",
+      "type": "string",
+      "enum": [
+        "turn",
+        "detached_task"
       ]
     }
   }

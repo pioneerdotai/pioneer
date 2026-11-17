@@ -22,31 +22,46 @@ pub fn process_text_payload(
         String,
         Sender<std::result::Result<SkillsUploadChunkAckNotification, String>>,
     >,
-    pending_artifact_upload_chunks: &mut HashMap<
-        String,
-        Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
-    >,
-    event_tx: &Sender<GatewayWsEvent>,
+    pending_artifact_upload_chunks: &mut PendingJsonRpcRequests,
+    event_tx: &super::client::GatewayWsEventSender,
 ) -> Option<GatewayNotification> {
+    let received_at = pioneer_observability::telemetry_enabled().then(std::time::Instant::now);
+    let mut decode = pioneer_observability::updates::StageObservation::start(
+        pioneer_observability::updates::Stage::ClientDecode,
+    );
     let value = match serde_json::from_str::<JsonValue>(payload) {
         Ok(value) => value,
-        Err(_) => return None,
+        Err(_) => {
+            decode.finish(pioneer_observability::updates::Fact::Rejected);
+            return None;
+        }
     };
 
     if let Some((response_id, response)) = decode_json_rpc_response_value(&value) {
         let Some(response_tx) = pending_requests.remove(response_id.as_str()) else {
+            decode.finish(pioneer_observability::updates::Fact::Rejected);
             return None;
         };
 
         let _ = response_tx.send(response);
+        decode.finish(pioneer_observability::updates::Fact::Returned);
         return None;
     }
 
     let mut notification = match serde_json::from_value::<JsonRpcNotification>(value) {
         Ok(notification) => notification,
-        Err(_) => return None,
+        Err(_) => {
+            decode.finish(pioneer_observability::updates::Fact::Rejected);
+            return None;
+        }
     };
 
+    let mut update = notification.params.as_mut().and_then(|params| {
+        pioneer_observability::updates::receive(&notification.method, params, connection_id).0
+    });
+    if let Some(update) = update.as_mut() {
+        update.received_at(received_at);
+    }
     if let Some(params) = notification.params.as_mut() {
         pioneer_observability::turn_startup::observe_notification(&notification.method, params);
         pioneer_observability::turn_startup::strip_notification_metadata(params);
@@ -68,17 +83,25 @@ pub fn process_text_payload(
     {
         let key = upload_ack_key(ack.upload_id.as_str(), ack.offset);
         if let Some(response_tx) = pending_artifact_upload_chunks.remove(&key) {
-            let _ = response_tx.send(Ok(ack.clone()));
+            let _ = response_tx.send(Ok(serde_json::to_value(&ack).expect("artifact chunk ACK")));
         }
     }
 
     let notification = GatewayNotification::from_jsonrpc(notification);
     if let Some(notification) = notification.clone() {
-        let _ = event_tx.send(GatewayWsEvent::Notification {
-            connection_id,
-            notification,
-        });
+        let send = || {
+            event_tx.send(GatewayWsEvent::Notification {
+                connection_id,
+                notification,
+            })
+        };
+        let _ = if let Some(update) = update {
+            update.run(send)
+        } else {
+            send()
+        };
     }
+    decode.finish(pioneer_observability::updates::Fact::Returned);
     notification
 }
 
@@ -101,20 +124,15 @@ pub fn fail_pending_upload_chunks(
 }
 
 pub fn fail_pending_artifact_upload_chunks(
-    pending_upload_chunks: &mut HashMap<
-        String,
-        Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
-    >,
+    pending_upload_chunks: &mut PendingJsonRpcRequests,
     error: &str,
 ) {
-    fail_pending_transfer_chunks(pending_upload_chunks, error);
+    pending_upload_chunks.fail_all(error);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind};
-    use crate::transport::ws::GatewayWsConnectSpec;
     use pioneer_protocol::{
         AccessChangeKind, AccessChangeOutcome, GatewayNotification, TurnItem, WorkspaceChangeKind,
         constants::events,
@@ -122,27 +140,13 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
-    fn spec() -> GatewayWsConnectSpec {
-        GatewayWsConnectSpec {
-            endpoint_id: "remote".to_owned(),
-            endpoint_name: "Remote".to_owned(),
-            endpoint_kind: GatewayEndpointKind::Remote,
-            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
-                "127.0.0.1:22000",
-            )
-            .unwrap(),
-            auth_token: None,
-            session: None,
-            timings: GatewayWsTimings::from_millis(100, 200, 300, 400, 1_000, 0).expect("timings"),
-        }
-    }
-
     #[test]
     fn decode_routes_unknown_gateway_notification() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let payload = json!({
             "jsonrpc": "2.0",
             "method": "item/tool.started",
@@ -165,7 +169,8 @@ mod tests {
 
         let event = event_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("expected websocket event");
+            .expect("expected websocket event")
+            .value;
         assert!(matches!(
             event,
             GatewayWsEvent::Notification {
@@ -178,9 +183,10 @@ mod tests {
     #[test]
     fn decode_routes_typed_item_completed_notification() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let payload = json!({
             "jsonrpc": "2.0",
             "method": events::ITEM_COMPLETED,
@@ -225,7 +231,8 @@ mod tests {
 
         let event = event_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("expected websocket event");
+            .expect("expected websocket event")
+            .value;
         let GatewayWsEvent::Notification {
             notification: GatewayNotification::ItemCompleted(notification),
             ..
@@ -239,9 +246,10 @@ mod tests {
     #[test]
     fn decode_routes_thread_updated_notification() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let payload = json!({
             "jsonrpc": "2.0",
             "method": "thread/updated",
@@ -274,7 +282,8 @@ mod tests {
 
         let event = event_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("expected websocket event");
+            .expect("expected websocket event")
+            .value;
         let GatewayWsEvent::Notification {
             notification: GatewayNotification::ThreadUpdated(notification),
             ..
@@ -290,9 +299,10 @@ mod tests {
     #[test]
     fn decode_routes_workspace_changed_notification() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let payload = json!({
             "jsonrpc": "2.0",
             "method": events::WORKSPACE_CHANGED,
@@ -321,7 +331,8 @@ mod tests {
 
         let event = event_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("expected websocket event");
+            .expect("expected websocket event")
+            .value;
         let GatewayWsEvent::Notification {
             notification: GatewayNotification::WorkspaceChanged(notification),
             ..
@@ -337,9 +348,10 @@ mod tests {
     #[test]
     fn decode_routes_minimal_access_changed_notification() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let payload = json!({
             "jsonrpc": "2.0",
             "method": events::ACCESS_CHANGED,
@@ -363,7 +375,8 @@ mod tests {
 
         let event = event_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("expected websocket event");
+            .expect("expected websocket event")
+            .value;
         let GatewayWsEvent::Notification {
             notification: GatewayNotification::AccessChanged(notification),
             ..
@@ -380,11 +393,18 @@ mod tests {
     #[test]
     fn decode_routes_artifact_upload_ack_to_pending_sender() {
         let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        pending_artifact_upload_chunks.insert(upload_ack_key("artifact_upload_1", 0), ack_tx);
+        pending_artifact_upload_chunks.insert(
+            upload_ack_key("artifact_upload_1", 0),
+            crate::rpc::JsonRpcResponseSender::new(
+                ack_tx,
+                std::time::Instant::now() + Duration::from_secs(1),
+            ),
+        );
         let payload = json!({
             "jsonrpc": "2.0",
             "method": events::ARTIFACT_UPLOAD_CHUNK_ACK,
@@ -412,6 +432,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("expected artifact ack")
             .expect("ack should be ok");
+        let ack: ArtifactUploadChunkAckNotification = serde_json::from_value(ack).unwrap();
         assert_eq!(ack.workspace_id, "ws_1");
         assert_eq!(ack.upload_id, "artifact_upload_1");
         assert!(pending_artifact_upload_chunks.is_empty());
@@ -421,10 +442,17 @@ mod tests {
     fn decode_routes_json_rpc_response_to_pending_request() {
         let mut pending_requests = PendingJsonRpcRequests::default();
         let mut pending_upload_chunks = HashMap::new();
-        let mut pending_artifact_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = PendingJsonRpcRequests::default();
         let (response_tx, response_rx) = std::sync::mpsc::channel();
-        pending_requests.insert("req_1".to_owned(), response_tx);
+        pending_requests.insert(
+            "req_1".to_owned(),
+            crate::rpc::JsonRpcResponseSender::new(
+                response_tx,
+                std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+            ),
+        );
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
         let payload = json!({
             "jsonrpc": "2.0",
             "id": "req_1",
@@ -450,10 +478,49 @@ mod tests {
         );
         assert!(pending_requests.is_empty());
     }
+}
 
+#[cfg(test)]
+mod update_handoff_tests {
+    use super::*;
     #[test]
-    fn decode_helper_keeps_upload_ack_key_contract() {
-        let _ = spec();
-        assert_eq!(upload_ack_key("upload_1", 42), "upload_1:42");
+    fn typed_delta_and_optional_correlation_survive_the_real_event_channel() {
+        let _lock = crate::OBSERVABILITY_TEST_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(true);
+        let payload = serde_json::json!({"jsonrpc":"2.0","method":"item/agent_message/delta","params":{
+            "workspace_id":"workspace","thread_id":"thread","turn_id":"turn","item_id":"item","delta":"abc",
+            "_pioneer_update":{"v":1,"trace":"11111111111111111111111111111111","span":"2222222222222222","flags":1,"origin":0,"complete":true},
+            "_pioneer_telemetry":{"not_a_valid_startup":true}
+        }}).to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = super::super::client::GatewayWsEventSender::from(sender);
+        process_text_payload(
+            &payload,
+            17,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &sender,
+        );
+        let (event, work) = receiver.recv().unwrap().received(
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::ExecutorRole::ClientController,
+        );
+        assert!(matches!(event, GatewayWsEvent::Notification {
+            connection_id:17, notification: GatewayNotification::ItemDelta(ref delta)
+        } if delta.delta == "abc"));
+        work.run(|| {
+            let context =
+                pioneer_observability::updates::capture().expect("selected decoder sidecar");
+            assert_eq!(context.hint().unwrap().item.as_deref(), Some("item"));
+            assert!(context.elapsed().is_some());
+            assert_eq!(
+                pioneer_observability::work::current().unwrap().trace_id,
+                Some([0x11; 16])
+            );
+        });
+        pioneer_observability::set_telemetry_enabled(old);
     }
 }

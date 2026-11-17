@@ -12,15 +12,14 @@ pub use manifest_failure::{
     MemoryManifestFailure, MemoryManifestFailureClass, MemoryManifestFailureStage,
     is_invalid_stored_memory_data,
 };
-mod memvid;
 mod ownership_route;
 mod policy;
 mod quality;
 mod quality_gate;
 mod ranking;
-mod recall;
 mod recall_visibility;
 mod service;
+mod sqlite;
 mod thread_episodic;
 mod thread_episodic_embedding;
 mod write;
@@ -59,7 +58,6 @@ pub use lifecycle::{
     candidate_transition_is_candidate_scoped, memory_transition_removes_product_visibility,
     memory_transition_restores_product_eligibility, validate_lifecycle_transition,
 };
-pub use memvid::{MemvidMemoryBackend, MemvidMemoryBackendConfig, memvid_search_request};
 pub use policy::{MemoryPolicyDecision, MemoryPolicyEngine};
 pub use quality::{
     MemoryOntologyClassification, MemoryQualityAuditItemKind, MemoryQualityAuditRecord,
@@ -67,35 +65,27 @@ pub use quality::{
     audit_memory_candidate_quality, audit_memory_record_quality, classify_memory_source_context,
     classify_semantic_memory_fact, resolve_semantic_write_source_context,
 };
-pub use recall::{
-    MemoryModeRecallParams, MemoryModeRecallResponse, MemoryRecallItem, MemoryRecallMode,
-    MemoryRecallParams, MemoryRecallResponse, MemoryRecallTarget,
-};
 pub use service::MemoryService;
+pub use sqlite::SqliteMemoryBackend;
 pub use thread_episodic::{
-    MemvidThreadEpisodicBackend, PioneerAdaptiveCutoff, PioneerAdaptiveCutoffConfig,
-    PioneerAdaptiveCutoffDiagnostics, PioneerAdaptiveCutoffReason,
-    ThreadEpisodicAdaptiveRetrievalImplementation, ThreadEpisodicCandidateSuppression,
-    ThreadEpisodicCandidateSuppressionReason, ThreadEpisodicExactSourceTarget,
-    ThreadEpisodicFilteredSearchCandidates, ThreadEpisodicMemvidAskRetrievalMode,
-    ThreadEpisodicMemvidBackend, ThreadEpisodicMemvidBackendCapabilities,
-    ThreadEpisodicMemvidCapabilityState, ThreadEpisodicMemvidError,
-    ThreadEpisodicMemvidFailureKind, ThreadEpisodicMemvidFeatureAudit,
-    ThreadEpisodicMemvidIndexEmbedding, ThreadEpisodicMemvidIndexOutput,
-    ThreadEpisodicMemvidIndexRequest, ThreadEpisodicMemvidSearchHit,
-    ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidSearchRequest,
-    ThreadEpisodicMemvidSearchSegment, ThreadEpisodicMemvidStats, ThreadEpisodicRankedSearchHit,
-    ThreadEpisodicRankingContext, ThreadEpisodicSearchDiagnostics, ThreadEpisodicSearchProfile,
-    ThreadEpisodicSearchProfileKind, ThreadEpisodicWorkspaceOwnership,
-    filter_thread_episodic_search_candidates, lock_thread_episodic_workspace,
-    rank_thread_episodic_search_hits, remove_thread_episodic_capsule_file,
-    thread_episodic_memvid_metadata, thread_episodic_storage_uri_from_path,
-    thread_episodic_workspace_releases, try_lock_thread_episodic_workspace,
+    PioneerAdaptiveCutoff, PioneerAdaptiveCutoffConfig, PioneerAdaptiveCutoffDiagnostics,
+    PioneerAdaptiveCutoffReason, SqliteThreadEpisodicBackend, THREAD_EPISODIC_INDEX_BATCH_BYTES,
+    THREAD_EPISODIC_INDEX_BATCH_ITEMS, ThreadEpisodicCandidateSuppression,
+    ThreadEpisodicCandidateSuppressionReason, ThreadEpisodicFilteredSearchCandidates,
+    ThreadEpisodicIndexDocument, ThreadEpisodicIndexEmbedding, ThreadEpisodicRankedSearchHit,
+    ThreadEpisodicRetrievalMode, ThreadEpisodicSearchBackend, ThreadEpisodicSearchDiagnostics,
+    ThreadEpisodicSearchError, ThreadEpisodicSearchFailureKind, ThreadEpisodicSearchHit,
+    ThreadEpisodicSearchOutput, ThreadEpisodicSearchPage, ThreadEpisodicSearchProfile,
+    ThreadEpisodicSearchProfileKind, ThreadEpisodicSearchRequest, ThreadEpisodicValidationResult,
+    ThreadEpisodicWorkspaceOwnership, filter_thread_episodic_search_candidates,
+    lock_thread_episodic_workspace, rank_thread_episodic_search_hits,
+    thread_episodic_source_metadata, thread_episodic_workspace_releases,
+    try_lock_thread_episodic_workspace,
 };
 pub use thread_episodic_embedding::{
     ThreadEpisodicEmbeddingDiagnostic, ThreadEpisodicEmbeddingError,
     ThreadEpisodicEmbeddingErrorKind, ThreadEpisodicEmbeddingFailureClass,
     ThreadEpisodicEmbeddingIdentity, ThreadEpisodicEmbeddingProvider,
-    ThreadEpisodicEmbeddingSafeLogFields, ThreadEpisodicMemvidEmbedder,
+    ThreadEpisodicEmbeddingSafeLogFields,
 };
 pub use write::{build_memory_canonical_key, semantic_memory_fingerprint};

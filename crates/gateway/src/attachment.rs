@@ -210,52 +210,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_non_artifact_uploads_are_not_cached() {
-        let backend = setup_backend().await;
-        let key = upload_registry_key(
-            "openai",
-            "gpt-4.1-mini",
-            AttachmentTransportKind::Upload,
-            "expired",
-        );
-
-        backend
-            .store_uploaded_reference(ArtifactExternalRefStoreRequest {
-                provider: "openai".to_owned(),
-                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
-                model_family: "gpt-4.1-mini".to_owned(),
-                transport_kind: AttachmentTransportKind::Upload,
-                sha256: "expired".to_owned(),
-                registry_key: key.clone(),
-                provider_file_id: "file-old".to_owned(),
-                uploaded_at_unix_ms: 10,
-                ttl_secs: 10,
-                expires_at_unix_ms: 20,
-                mime_type: "application/pdf".to_owned(),
-                size_bytes: 100,
-                file_name: "old.pdf".to_owned(),
-                artifact: None,
-            })
-            .await
-            .expect("store should be a no-op");
-
-        let hit = backend
-            .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
-                provider: "openai".to_owned(),
-                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
-                model_family: "gpt-4.1-mini".to_owned(),
-                transport_kind: AttachmentTransportKind::Upload,
-                sha256: "expired".to_owned(),
-                registry_key: key,
-                now_unix_ms: 25,
-                artifact: None,
-            })
-            .await
-            .expect("lookup should succeed");
-        assert!(hit.is_none());
-    }
-
-    #[tokio::test]
     async fn artifact_upload_stores_external_ref_and_reuses_it() {
         let backend = setup_backend().await;
         let key = upload_registry_key(

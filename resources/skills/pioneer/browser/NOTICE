@@ -1,0 +1,11 @@
+Pioneer browser skill
+
+Source: agent-browser 0.39.4, Vercel Labs.
+https://github.com/vercel-labs/agent-browser
+Source paths: skills/agent-browser and skill-data.
+License: Apache-2.0; the original license is included in LICENSE.
+
+SKILL.md, references/ and templates/ were adapted for Pioneer: local reference
+routing, native/CLI bindings, task-specific sessions, credential handling,
+artifact delivery, and setup/troubleshooting. Existing Pioneer Linux/AppArmor
+guidance was retained.

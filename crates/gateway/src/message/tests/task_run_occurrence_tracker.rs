@@ -2,13 +2,27 @@ use super::*;
 use crate::message::reconciliation_diagnostics::{Operation, Reporter};
 use pioneer_entity::{task_run, task_run_occurrence_reconcile_pending as pending, turn};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 
 const NOW: i64 = 4_000_000_000;
 
 async fn fixture() -> (MessageProcessor, Arc<CrudStore>) {
     let (processor, store, workspace) =
         setup_execution_window_terminal_turn("tracker_thread", "tracker_0").await;
+    // This fixture's direct source inserts exercise the released tracker.
+    // Restore it through the real cutover down owner, retaining current schema.
+    let db = store.database_connection();
+    pioneer_sqlite::apply_sqlite_pragmas(&db).await.unwrap();
+    let tx = db.begin().await.unwrap();
+    let cutover = Migrator::migrations()
+        .into_iter()
+        .find(|m| m.name() == "m20261101_000102_idle_task_occurrence_tracking_cutover")
+        .unwrap();
+    cutover
+        .down(&migration::SchemaManager::new(&*tx))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let thread = processor
         .thread_manager
         .thread_get("tracker_thread")
@@ -64,6 +78,14 @@ async fn fixture() -> (MessageProcessor, Arc<CrudStore>) {
                 .await
                 .unwrap();
         }
+        // The setup's first Turn is already terminal. Establish the same
+        // real parent mismatch for it and each newly materialized occurrence.
+        turn::Entity::update_many()
+            .col_expr(turn::Column::Status, Expr::val("in_progress"))
+            .filter(turn::Column::Id.eq(&id))
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
         task_run::Entity::insert(task_run::ActiveModel {
             id: Set(id.clone()),
             task_id: Set("tracker_task".into()),
@@ -573,4 +595,70 @@ async fn failed_pending_observation_and_unknown_state_never_report_occurrence_re
             b.message.as_deref() != Some("reconciliation recovered after observed failures")
         })
     }));
+}
+
+#[tokio::test]
+async fn compatibility_audit_failure_keeps_partial_summary_while_healthy_tickets_repair() {
+    let (processor, store) = fixture().await;
+    let db = store.database_connection();
+    turn::Entity::update_many()
+        .col_expr(turn::Column::PromptManifestJson, Expr::val("{}"))
+        .filter(turn::Column::Id.eq("tracker_0"))
+        .exec(&db)
+        .await
+        .unwrap();
+    // Leave a genuine missed obligation behind an ineffective producer.
+    db.execute_unprepared("CREATE TRIGGER task_run_occurrence_reconcile_foreign AFTER UPDATE OF status ON turn BEGIN SELECT 1; END").await.unwrap();
+    pending::Entity::delete_by_id("tracker_0")
+        .exec(&db)
+        .await
+        .unwrap();
+    db.execute_unprepared("CREATE TRIGGER reject_compatibility_parent BEFORE INSERT ON task_run_occurrence_reconcile_pending WHEN NEW.run_id='tracker_0' BEGIN SELECT RAISE(ABORT,'missed obligation'); END").await.unwrap();
+    let summary = processor
+        .reconcile_task_run_occurrences_at(NOW, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.changed, 64,
+        "healthy durable tickets survive discovery failure"
+    );
+    assert!(summary.first_error.is_some());
+    assert_eq!(summary.queue_state_errors, 1);
+    assert_eq!(
+        summary.pending, None,
+        "queue emptiness cannot establish complete historical coverage"
+    );
+    assert!(
+        pending::Entity::find_by_id("tracker_0")
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    db.execute_unprepared("DROP TRIGGER reject_compatibility_parent")
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        processor
+            .reconcile_task_run_occurrences_at(NOW, 64)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        turn::Entity::find_by_id("tracker_0")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+    assert_eq!(
+        processor
+            .reconcile_task_run_occurrences_at(NOW, 64)
+            .await
+            .unwrap()
+            .pending,
+        Some(false)
+    );
 }

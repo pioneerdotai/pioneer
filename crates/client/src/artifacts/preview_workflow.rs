@@ -281,6 +281,10 @@ impl ClientCore {
                     .enable_all()
                     .build()
                     .expect("artifact preview runtime unavailable");
+                let _runtime_observer = pioneer_observability::runtime::register(
+                    runtime.handle(),
+                    pioneer_observability::runtime::RuntimeRole::ClientHttp,
+                );
                 while let Ok(request) = receiver.recv() {
                     let Some(core) = weak.upgrade() else {
                         return;
@@ -298,11 +302,14 @@ impl ClientCore {
                     drop(core);
                     let result = (|| {
                         let service = ArtifactHttpPreviewService::new(session?);
-                        let data = runtime.block_on(service.fetch_thumbnail(
-                            &request.workspace_id,
-                            &request.artifact,
-                            request.cancellation.clone(),
-                        ))?;
+                        let data = _runtime_observer.block_on(
+                            &runtime,
+                            service.fetch_thumbnail(
+                                &request.workspace_id,
+                                &request.artifact,
+                                request.cancellation.clone(),
+                            ),
+                        )?;
                         anyhow::ensure!(
                             weak.upgrade()
                                 .is_some_and(|core| core.artifact_preview_matches(&request)),

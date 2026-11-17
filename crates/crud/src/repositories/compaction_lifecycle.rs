@@ -21,7 +21,7 @@ pub(crate) async fn compaction_stop_execution(
     thread: &str,
     owner: &str,
     turn: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let store = store.with_maintenance_reads_and_critical_writes();
     store
         .run_serialized_write(|| async {
@@ -44,19 +44,20 @@ pub(crate) async fn compaction_stop_execution(
                 .one(&tx)
                 .await?;
             ensure!(scoped_turn.is_some(), "compaction Stop scope mismatch");
-            compaction_context::Entity::insert(compaction_context::ActiveModel {
-                workspace_id: sea_orm::Set(workspace.to_owned()),
-                thread_id: sea_orm::Set(thread.to_owned()),
-                owner: sea_orm::Set(owner.to_owned()),
-                ..Default::default()
-            })
-            .on_conflict(
-                OnConflict::columns([compaction_context::Column::Owner])
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec_without_returning(&tx)
-            .await?;
+            let context_inserted =
+                compaction_context::Entity::insert(compaction_context::ActiveModel {
+                    workspace_id: sea_orm::Set(workspace.to_owned()),
+                    thread_id: sea_orm::Set(thread.to_owned()),
+                    owner: sea_orm::Set(owner.to_owned()),
+                    ..Default::default()
+                })
+                .on_conflict(
+                    OnConflict::columns([compaction_context::Column::Owner])
+                        .do_nothing()
+                        .to_owned(),
+                )
+                .exec_without_returning(&tx)
+                .await?;
             let scoped_owner = compaction_context::Entity::find_by_id(owner)
                 .select_only()
                 .column(compaction_context::Column::Owner)
@@ -66,14 +67,15 @@ pub(crate) async fn compaction_stop_execution(
                 .one(&tx)
                 .await?;
             ensure!(scoped_owner.is_some(), "compaction Stop scope mismatch");
-            compaction_execution_stop::Entity::insert(compaction_execution_stop::ActiveModel {
-                owner: sea_orm::Set(owner.to_owned()),
-                turn_id: sea_orm::Set(turn.to_owned()),
-            })
-            .on_conflict(OnConflict::new().do_nothing().to_owned())
-            .exec_without_returning(&tx)
-            .await?;
-            compaction_history_check::Entity::update_many()
+            let stop_inserted =
+                compaction_execution_stop::Entity::insert(compaction_execution_stop::ActiveModel {
+                    owner: sea_orm::Set(owner.to_owned()),
+                    turn_id: sea_orm::Set(turn.to_owned()),
+                })
+                .on_conflict(OnConflict::new().do_nothing().to_owned())
+                .exec_without_returning(&tx)
+                .await?;
+            let finished = compaction_history_check::Entity::update_many()
                 .col_expr(
                     compaction_history_check::Column::State,
                     Expr::val("finished"),
@@ -103,10 +105,16 @@ pub(crate) async fn compaction_stop_execution(
                                 .to_owned(),
                         )),
                 )
+                .filter(
+                    Expr::col(compaction_history_check::Column::State)
+                        .ne("finished")
+                        .or(Expr::col(compaction_history_check::Column::Outcome).is_null())
+                        .or(Expr::col(compaction_history_check::Column::Outcome).ne("cancelled")),
+                )
                 .exec(&tx)
                 .await?;
             tx.commit().await?;
-            Ok(())
+            Ok(context_inserted > 0 || stop_inserted > 0 || finished.rows_affected > 0)
         })
         .await
 }
@@ -448,7 +456,7 @@ impl PreparedLifecycleEvent {
         store: &CrudStore,
         tx: &sea_orm::DatabaseTransaction,
         expires: sea_orm::entity::prelude::DateTimeWithTimeZone,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         ensure!(
             self.existing
                 == Self::read_existing(
@@ -475,7 +483,7 @@ pub(crate) async fn repair_lifecycle(
     prepared: PreparedCompactionLifecycle,
     event: Option<CanonicalTurnEventPayload>,
     timestamp_secs: i64,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let operation_id = prepared.operation_id().to_owned();
     let id = operation_id.as_str();
     ensure!(
@@ -513,13 +521,14 @@ pub(crate) async fn repair_lifecycle(
             .same_inputs(&LifecycleFacts::read(&tx, id).await?)
     {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok((false, false));
     }
+    let mut changed = false;
     if let Some((status, outcome)) = prepared.finish {
-        super::compaction::compaction_finish(&tx, id, status, outcome).await?;
+        changed |= super::compaction::compaction_finish(&tx, id, status, outcome).await?;
     }
     if let Some((generation, state)) = prepared.encoded_runner {
-        compaction_runner_state::Entity::update_many()
+        let updated = compaction_runner_state::Entity::update_many()
             .col_expr(
                 compaction_runner_state::Column::Generation,
                 Expr::val(generation),
@@ -528,9 +537,10 @@ pub(crate) async fn repair_lifecycle(
             .filter(compaction_runner_state::Column::OperationId.eq(id))
             .exec(&tx)
             .await?;
+        changed |= updated.rows_affected > 0;
     }
     if let Some(projected) = projected {
-        projected.apply(store, &tx, expires).await?;
+        changed |= projected.apply(store, &tx, expires).await?;
     }
     // All own triggers have now run. ACK the post-repair generation while the
     // same writer still owns the transaction; an external refresh cannot enter.
@@ -545,7 +555,7 @@ pub(crate) async fn repair_lifecycle(
     )
     .await?;
     tx.commit().await?;
-    Ok(true)
+    Ok((true, changed))
 }
 
 pub(crate) async fn compaction_materialize_lifecycle(
@@ -554,7 +564,7 @@ pub(crate) async fn compaction_materialize_lifecycle(
     generation: u64,
     event: CanonicalTurnEventPayload,
     timestamp_secs: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let terminal = validate_item(operation, &event)?;
     let acknowledge = terminal && event_terminal_item(&event);
     let facts = LifecycleFacts::read(&store.connection, operation).await?;
@@ -597,10 +607,10 @@ pub(crate) async fn compaction_materialize_lifecycle(
         facts.same_inputs(&LifecycleFacts::read(&tx, operation).await?),
         "compaction lifecycle inputs changed"
     );
-    projected.apply(store, &tx, expires).await?;
+    let changed = projected.apply(store, &tx, expires).await?;
     if acknowledge {
         queue::acknowledge(&tx, operation, None).await?;
     }
     tx.commit().await?;
-    Ok(())
+    Ok(changed)
 }

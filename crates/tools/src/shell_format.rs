@@ -55,6 +55,7 @@ pub struct ExecPayloadInput {
     pub force_truncated_stderr: bool,
 }
 
+#[cfg(test)]
 pub fn build_exec_model_payload(input: ExecPayloadInput) -> ExecModelPayload {
     build_exec_model_payload_with_stats(input, None)
 }
@@ -90,6 +91,97 @@ pub fn build_exec_model_payload_with_stats(
         session_id: input.session_id,
         command: input.command,
     }
+}
+
+/// Bound only shell text fields. The caller measures its actual envelope. Metadata
+/// is indivisible: None means the operation must block rather than lose control data.
+pub fn bound_shell_output(
+    value: &serde_json::Value,
+    fits: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    if fits(value) {
+        return Some(value.clone());
+    }
+    let fields = ["stdout", "stderr", "aggregated_output", "output"];
+    let mut minimal = value.clone();
+    let object = minimal.as_object_mut()?;
+    let mut longest = 0;
+    for field in fields {
+        if let Some(text) = value.get(field).and_then(serde_json::Value::as_str) {
+            longest = longest.max(text.chars().count());
+            object.insert(field.into(), "".into());
+            if !text.is_empty() {
+                match object.get_mut("truncated") {
+                    Some(serde_json::Value::Object(flags)) => {
+                        flags.insert(field.into(), true.into());
+                    }
+                    _ => {
+                        object.insert("truncated".into(), true.into());
+                    }
+                }
+            }
+        }
+    }
+    object.insert("model_output_truncated".into(), true.into());
+    if !fits(&minimal) {
+        return None;
+    }
+    let candidate = |count: usize| {
+        let mut candidate = minimal.clone();
+        for field in fields {
+            if let Some(text) = value.get(field).and_then(serde_json::Value::as_str) {
+                let head: String = text.chars().take(count / 2).collect();
+                let tail: String = text
+                    .chars()
+                    .rev()
+                    .take(count - count / 2)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                let excerpt = if text.chars().count() <= count {
+                    text.to_owned()
+                } else if count == 0 {
+                    String::new()
+                } else {
+                    format!("{head}\n... [model output truncated]\n{tail}")
+                };
+                candidate[field] = excerpt.into();
+                if text.chars().count() <= count {
+                    if let Some(flags) = candidate
+                        .get_mut("truncated")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        flags.insert(
+                            field.into(),
+                            value
+                                .get("truncated")
+                                .and_then(|flags| flags.get(field))
+                                .cloned()
+                                .unwrap_or(false.into()),
+                        );
+                    }
+                }
+            }
+        }
+        candidate
+    };
+    let mut low = 0;
+    let mut high = longest;
+    let mut best = minimal.clone();
+    while low <= high {
+        let count = low + (high - low) / 2;
+        let current = candidate(count);
+        if fits(&current) {
+            best = current;
+            low = count + 1;
+        } else if count == 0 {
+            break;
+        } else {
+            high = count - 1;
+        }
+    }
+    Some(best)
 }
 
 pub fn render_exec_ui_text(payload: &ExecModelPayload) -> String {
@@ -174,152 +266,6 @@ mod tests {
         let expected_value: serde_json::Value =
             serde_json::from_str(expected).expect("expected payload should be valid json");
         assert_eq!(actual_value, expected_value);
-    }
-
-    #[test]
-    fn snapshot_success_payload() {
-        let json = payload_json(ExecPayloadInput {
-            exit_code: Some(0),
-            timed_out: false,
-            duration_ms: 12,
-            stdout: "ok\n".to_owned(),
-            stderr: String::new(),
-            session_id: None,
-            command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo ok".to_owned()],
-            max_output_tokens: None,
-            force_truncated_stdout: false,
-            force_truncated_stderr: false,
-        });
-        assert_json_eq(
-            json.as_str(),
-            r#"{
-            "exit_code": 0,
-            "timed_out": false,
-            "duration_ms": 12,
-            "stdout": "ok\n",
-            "stderr": "",
-            "aggregated_output": "ok\n",
-            "truncated": {
-                "stdout": false,
-                "stderr": false,
-                "aggregated_output": false
-            },
-            "command": [
-                "/bin/sh",
-                "-c",
-                "echo ok"
-            ]
-            }"#,
-        );
-    }
-
-    #[test]
-    fn snapshot_non_zero_payload() {
-        let json = payload_json(ExecPayloadInput {
-            exit_code: Some(2),
-            timed_out: false,
-            duration_ms: 44,
-            stdout: String::new(),
-            stderr: "boom".to_owned(),
-            session_id: None,
-            command: vec!["sh".to_owned(), "-c".to_owned(), "exit 2".to_owned()],
-            max_output_tokens: None,
-            force_truncated_stdout: false,
-            force_truncated_stderr: false,
-        });
-        assert_json_eq(
-            json.as_str(),
-            r#"{
-            "exit_code": 2,
-            "timed_out": false,
-            "duration_ms": 44,
-            "stdout": "",
-            "stderr": "boom",
-            "aggregated_output": "boom",
-            "truncated": {
-                "stdout": false,
-                "stderr": false,
-                "aggregated_output": false
-            },
-            "command": [
-                "sh",
-                "-c",
-                "exit 2"
-            ]
-            }"#,
-        );
-    }
-
-    #[test]
-    fn snapshot_signal_payload() {
-        let json = payload_json(ExecPayloadInput {
-            exit_code: None,
-            timed_out: false,
-            duration_ms: 30,
-            stdout: String::new(),
-            stderr: "terminated by signal".to_owned(),
-            session_id: None,
-            command: vec!["sh".to_owned(), "-c".to_owned(), "kill -TERM $$".to_owned()],
-            max_output_tokens: None,
-            force_truncated_stdout: false,
-            force_truncated_stderr: false,
-        });
-        assert_json_eq(
-            json.as_str(),
-            r#"{
-            "timed_out": false,
-            "duration_ms": 30,
-            "stdout": "",
-            "stderr": "terminated by signal",
-            "aggregated_output": "terminated by signal",
-            "truncated": {
-                "stdout": false,
-                "stderr": false,
-                "aggregated_output": false
-            },
-            "command": [
-                "sh",
-                "-c",
-                "kill -TERM $$"
-            ]
-            }"#,
-        );
-    }
-
-    #[test]
-    fn snapshot_timeout_payload() {
-        let json = payload_json(ExecPayloadInput {
-            exit_code: None,
-            timed_out: true,
-            duration_ms: 1_000,
-            stdout: String::new(),
-            stderr: "command timed out".to_owned(),
-            session_id: None,
-            command: vec!["sh".to_owned(), "-c".to_owned(), "sleep 5".to_owned()],
-            max_output_tokens: None,
-            force_truncated_stdout: false,
-            force_truncated_stderr: false,
-        });
-        assert_json_eq(
-            json.as_str(),
-            r#"{
-            "timed_out": true,
-            "duration_ms": 1000,
-            "stdout": "",
-            "stderr": "command timed out",
-            "aggregated_output": "command timed out",
-            "truncated": {
-                "stdout": false,
-                "stderr": false,
-                "aggregated_output": false
-            },
-            "command": [
-                "sh",
-                "-c",
-                "sleep 5"
-            ]
-            }"#,
-        );
     }
 
     #[test]
@@ -426,5 +372,132 @@ mod tests {
             ]
             }"#,
         );
+    }
+
+    #[test]
+    fn shell_exit_states_preserve_exact_json_payloads() {
+        let cases = [
+            // snapshot_success_payload
+            (
+                Some(0),
+                false,
+                12,
+                "ok\n".to_owned(),
+                String::new(),
+                vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo ok".to_owned()],
+                r#"{
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_ms": 12,
+            "stdout": "ok\n",
+            "stderr": "",
+            "aggregated_output": "ok\n",
+            "truncated": {
+                "stdout": false,
+                "stderr": false,
+                "aggregated_output": false
+            },
+            "command": [
+                "/bin/sh",
+                "-c",
+                "echo ok"
+            ]
+            }"#,
+            ),
+            // snapshot_non_zero_payload
+            (
+                Some(2),
+                false,
+                44,
+                String::new(),
+                "boom".to_owned(),
+                vec!["sh".to_owned(), "-c".to_owned(), "exit 2".to_owned()],
+                r#"{
+            "exit_code": 2,
+            "timed_out": false,
+            "duration_ms": 44,
+            "stdout": "",
+            "stderr": "boom",
+            "aggregated_output": "boom",
+            "truncated": {
+                "stdout": false,
+                "stderr": false,
+                "aggregated_output": false
+            },
+            "command": [
+                "sh",
+                "-c",
+                "exit 2"
+            ]
+            }"#,
+            ),
+            // snapshot_signal_payload
+            (
+                None,
+                false,
+                30,
+                String::new(),
+                "terminated by signal".to_owned(),
+                vec!["sh".to_owned(), "-c".to_owned(), "kill -TERM $$".to_owned()],
+                r#"{
+            "timed_out": false,
+            "duration_ms": 30,
+            "stdout": "",
+            "stderr": "terminated by signal",
+            "aggregated_output": "terminated by signal",
+            "truncated": {
+                "stdout": false,
+                "stderr": false,
+                "aggregated_output": false
+            },
+            "command": [
+                "sh",
+                "-c",
+                "kill -TERM $$"
+            ]
+            }"#,
+            ),
+            // snapshot_timeout_payload
+            (
+                None,
+                true,
+                1_000,
+                String::new(),
+                "command timed out".to_owned(),
+                vec!["sh".to_owned(), "-c".to_owned(), "sleep 5".to_owned()],
+                r#"{
+            "timed_out": true,
+            "duration_ms": 1000,
+            "stdout": "",
+            "stderr": "command timed out",
+            "aggregated_output": "command timed out",
+            "truncated": {
+                "stdout": false,
+                "stderr": false,
+                "aggregated_output": false
+            },
+            "command": [
+                "sh",
+                "-c",
+                "sleep 5"
+            ]
+            }"#,
+            ),
+        ];
+        for (exit_code, timed_out, duration_ms, stdout, stderr, command, expected) in cases {
+            let json = payload_json(ExecPayloadInput {
+                exit_code,
+                timed_out,
+                duration_ms,
+                stdout,
+                stderr,
+                session_id: None,
+                command,
+                max_output_tokens: None,
+                force_truncated_stdout: false,
+                force_truncated_stderr: false,
+            });
+            assert_json_eq(json.as_str(), expected);
+        }
     }
 }

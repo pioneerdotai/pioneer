@@ -417,6 +417,9 @@ mod tests {
 
     fn model(id: &str, name: Option<&str>) -> ProviderModelInfo {
         ProviderModelInfo {
+            service_modes: None,
+            context_authority: None,
+            context_tiers: None,
             id: id.to_owned(),
             name: name.map(str::to_owned),
             description: None,
@@ -616,43 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_order_preserves_ordered_provider_values() {
-        assert_eq!(
-            ordered_known_reasoning_effort_options(&[
-                "low".to_owned(),
-                "medium".to_owned(),
-                "high".to_owned()
-            ]),
-            vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()]
-        );
-    }
-
-    #[test]
-    fn reasoning_effort_order_sorts_unordered_known_values() {
-        assert_eq!(
-            ordered_known_reasoning_effort_options(&[
-                "high".to_owned(),
-                "low".to_owned(),
-                "x-high".to_owned(),
-                "low".to_owned()
-            ]),
-            vec!["low".to_owned(), "high".to_owned(), "xhigh".to_owned()]
-        );
-    }
-
-    #[test]
-    fn reasoning_effort_order_drops_unknown_provider_values() {
-        assert_eq!(
-            ordered_known_reasoning_effort_options(&[
-                "low".to_owned(),
-                "turbo-high".to_owned(),
-                "maximum".to_owned(),
-            ]),
-            vec!["low".to_owned(), "max".to_owned()]
-        );
-    }
-
-    #[test]
     fn reasoning_effort_rows_require_supported_model_and_options() {
         assert!(reasoning_effort_rows_for_model(&model("gpt-5", None), None).is_empty());
         assert!(
@@ -663,6 +629,18 @@ mod tests {
             reasoning_effort_rows_for_model(&reasoning_model(Vec::new(), Some(true)), None)
                 .is_empty()
         );
+        assert!(
+            reasoning_effort_rows_for_model(&reasoning_model(vec!["high"], None), Some("high"))
+                .is_empty()
+        );
+        let mut default_only = reasoning_model(Vec::new(), Some(true));
+        default_only
+            .capabilities
+            .reasoning
+            .as_mut()
+            .unwrap()
+            .default_effort = Some("high".into());
+        assert!(reasoning_effort_rows_for_model(&default_only, Some("high")).is_empty());
     }
 
     #[test]
@@ -787,4 +765,191 @@ mod tests {
             "en, de"
         );
     }
+
+    #[test]
+    fn reasoning_effort_order_normalizes_sorts_and_filters_known_values() {
+        for (case, options, expected) in [
+            (
+                "ordered",
+                vec!["low", "medium", "high"],
+                vec!["low", "medium", "high"],
+            ),
+            (
+                "unordered aliases and duplicates",
+                vec!["high", "low", "x-high", "low"],
+                vec!["low", "high", "xhigh"],
+            ),
+            (
+                "unknown and maximum alias",
+                vec!["low", "turbo-high", "maximum"],
+                vec!["low", "max"],
+            ),
+        ] {
+            let options = options.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let expected = expected.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(
+                ordered_known_reasoning_effort_options(&options),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn published_context_rows_resolve_under_the_same_discovery_limit() {
+        let execution = pioneer_protocol::ProviderContextTiers::Tiered {
+            windows: vec![272000, 1050000],
+            price_order_confirmed: true,
+        };
+        for cap in [128000, 800000, 1050000, 1200000] {
+            let mut dto = model("model", None);
+            dto.limits.context_window = Some(cap);
+            dto.context_authority = Some("fixture-authority".into());
+            dto.context_tiers = Some(execution.with_technical_limit(cap));
+            let rows = context_window_rows(&dto, None);
+            assert_eq!(rows[0].window, None);
+            assert!(rows[0].selected);
+            for row in rows {
+                assert_eq!(execution.resolve(cap, row.window), Ok(row.tokens));
+            }
+        }
+    }
+}
+
+/// Model-scoped context choices. Shells only localize the Auto/up-to labels.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ContextWindowRow {
+    pub window: Option<u64>,
+    pub tokens: u64,
+    pub selected: bool,
+}
+
+pub fn context_window_rows(
+    model: &ProviderModelInfo,
+    manual: Option<u64>,
+) -> Vec<ContextWindowRow> {
+    let Some(pioneer_protocol::ProviderContextTiers::Tiered {
+        windows,
+        price_order_confirmed,
+    }) = &model.context_tiers
+    else {
+        return if manual.is_some()
+            && matches!(
+                model.context_tiers,
+                Some(
+                    pioneer_protocol::ProviderContextTiers::NoTiers
+                        | pioneer_protocol::ProviderContextTiers::Excluded
+                )
+            ) {
+            model
+                .limits
+                .context_window
+                .map(|tokens| {
+                    vec![ContextWindowRow {
+                        window: None,
+                        tokens,
+                        selected: false,
+                    }]
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+    };
+    let Some(default) = windows.first() else {
+        return vec![];
+    };
+    let mut rows = vec![ContextWindowRow {
+        window: None,
+        tokens: *default,
+        selected: manual.is_none(),
+    }];
+    if *price_order_confirmed && model.context_authority.is_some() {
+        rows.extend(windows.iter().skip(1).map(|window| ContextWindowRow {
+            window: Some(*window),
+            tokens: *window,
+            selected: manual == Some(*window),
+        }));
+    }
+    rows
+}
+
+/// Shell-neutral rows; prices remain evidence rather than invented flat amounts.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ServiceModeRow {
+    pub id: String,
+    pub label: String,
+    pub selected: bool,
+    pub available: bool,
+}
+
+pub fn service_mode_rows(
+    model: &ProviderModelInfo,
+    choice: Option<&pioneer_protocol::NativeServiceModeSelection>,
+) -> Vec<ServiceModeRow> {
+    use pioneer_protocol::{SourceServiceMode, SourceServiceModes};
+    let mut rows = vec![ServiceModeRow {
+        id: "standard".into(),
+        label: "Standard".into(),
+        selected: choice.is_none(),
+        available: true,
+    }];
+    if let Some(SourceServiceModes::Known(modes)) = &model.service_modes {
+        for state in modes.values() {
+            if let SourceServiceMode::Parsed { descriptor } = state {
+                if rows.iter().any(|row| row.id == descriptor.id) {
+                    continue;
+                }
+                rows.push(ServiceModeRow {
+                    id: descriptor.id.clone(),
+                    label: descriptor.label.clone(),
+                    selected: false,
+                    available: model.context_authority.is_some(),
+                });
+            }
+        }
+    }
+    if let Some(choice) = choice {
+        if let Some(row) = rows.iter_mut().find(|row| {
+            row.id == choice.id
+                && model.context_authority.as_deref() == Some(choice.authority.as_str())
+        }) {
+            row.selected = true;
+        } else if !rows.iter().any(|row| row.id == choice.id) {
+            rows.push(ServiceModeRow {
+                id: choice.id.clone(),
+                label: choice.id.clone(),
+                selected: true,
+                available: false,
+            });
+        }
+    }
+    if rows.len() == 1 && choice.is_none() {
+        vec![]
+    } else {
+        rows
+    }
+}
+
+pub fn service_mode_choice(
+    model: &ProviderModelInfo,
+    id: &str,
+) -> Option<Option<pioneer_protocol::NativeServiceModeSelection>> {
+    if id == "standard" {
+        return Some(None);
+    }
+    let rows = service_mode_rows(model, None);
+    rows.iter()
+        .any(|row| row.id == id && row.available)
+        .then(|| {
+            Some(pioneer_protocol::NativeServiceModeSelection {
+                id: id.into(),
+                authority: model
+                    .context_authority
+                    .clone()
+                    .expect("available mode has authority"),
+            })
+        })
 }

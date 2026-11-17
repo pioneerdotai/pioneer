@@ -107,6 +107,40 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         };
 
         let context = memory_turn_context_from_post_turn_request(&request, input, &config)?;
+        // New sources are self-contained; legacy previews remain explicitly legacy.
+        let sources = [
+            input
+                .extraction_user_text
+                .as_ref()
+                .or(input.user_text.as_ref()),
+            input
+                .extraction_assistant_text
+                .as_ref()
+                .or(input.assistant_text.as_ref()),
+        ];
+        if sources
+            .iter()
+            .flatten()
+            .any(|source| !source.original_size_known)
+        {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.post_turn_extractor.source_completeness_unknown",
+                "legacy source completeness is unknown",
+            ));
+        }
+        if sources
+            .into_iter()
+            .flatten()
+            .any(|source| source.truncated || source.text.chars().count() > config.max_input_chars)
+        {
+            response
+                .diagnostics
+                .push(memory_post_turn_provider_skip_diagnostic(
+                    "source_incomplete",
+                    "memory extraction skipped: source exceeds bounded budget",
+                ));
+            return Ok(response);
+        }
 
         // External runtimes have no ProviderRegistry-backed thread model.
         // Do not invent a fallback provider (or retry an invalid configuration).
@@ -124,48 +158,6 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             return Ok(response);
         }
 
-        let manifest = match write_provider
-            .load_memory_manifest(
-                context.clone(),
-                MemoryManifestRequest {
-                    max_items: config.max_manifest_items,
-                    max_item_chars: config.max_fact_content_chars,
-                },
-            )
-            .await
-        {
-            Ok(manifest) => manifest,
-            Err(failure) => {
-                let error = memory_manifest_hook_error(failure);
-                tracing::warn!(
-                    target: "pioneer::memory_post_turn_extractor",
-                    stage = "manifest_load",
-                    durable = durable_terminal_effect.is_some(),
-                    failure_class = failure.class_name(),
-                    failure_stage = failure.stage.as_str(),
-                    sqlite_primary_code = failure.sqlite_primary_code,
-                    sqlite_extended_code = failure.sqlite_extended_code,
-                    "memory post-turn extractor manifest load failed"
-                );
-                if durable_terminal_effect.is_some() {
-                    return Err(error);
-                }
-                let mut diagnostic = memory_post_turn_provider_skip_diagnostic(
-                    "manifest_failed",
-                    "memory post-turn extractor skipped: manifest loading failed",
-                );
-                diagnostic.metadata.insert(
-                    hook_metadata_key("manifest_failure_code"),
-                    HookValue::Text(failure.code().to_owned()),
-                );
-                for (key, value) in error.metadata {
-                    diagnostic.metadata.insert(key, HookValue::Text(value));
-                }
-                response.diagnostics.push(diagnostic);
-                return Ok(response);
-            }
-        };
-
         let extractor_context = memory_post_turn_extractor_context_from_turn(
             &context,
             config.model.clone().or_else(|| input.model.clone()),
@@ -175,6 +167,55 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                 .or_else(|| input.model_provider.clone()),
             durable_terminal_effect.clone(),
         );
+        let manifest = if let Some(manifest) = extractor_provider
+            .replay_manifest(&extractor_context)
+            .await?
+        {
+            manifest
+        } else {
+            match write_provider
+                .load_memory_manifest(
+                    context.clone(),
+                    MemoryManifestRequest {
+                        max_items: config.max_manifest_items,
+                        max_item_chars: config.max_fact_content_chars,
+                    },
+                )
+                .await
+            {
+                Ok(manifest) => manifest,
+                Err(failure) => {
+                    let error = memory_manifest_hook_error(failure);
+                    tracing::warn!(
+                        target: "pioneer::memory_post_turn_extractor",
+                        stage = "manifest_load",
+                        durable = durable_terminal_effect.is_some(),
+                        failure_class = failure.class_name(),
+                        failure_stage = failure.stage.as_str(),
+                        sqlite_primary_code = failure.sqlite_primary_code,
+                        sqlite_extended_code = failure.sqlite_extended_code,
+                        "memory post-turn extractor manifest load failed"
+                    );
+                    if durable_terminal_effect.is_some() {
+                        return Err(error);
+                    }
+                    let mut diagnostic = memory_post_turn_provider_skip_diagnostic(
+                        "manifest_failed",
+                        "memory post-turn extractor skipped: manifest loading failed",
+                    );
+                    diagnostic.metadata.insert(
+                        hook_metadata_key("manifest_failure_code"),
+                        HookValue::Text(failure.code().to_owned()),
+                    );
+                    for (key, value) in error.metadata {
+                        diagnostic.metadata.insert(key, HookValue::Text(value));
+                    }
+                    response.diagnostics.push(diagnostic);
+                    return Ok(response);
+                }
+            }
+        };
+
         let extractor_request =
             memory_post_turn_extractor_request_from_input(input, manifest, &config);
 
@@ -234,24 +275,73 @@ impl HookHandler for MemoryPostTurnExtractorHook {
 
         let mut write_failure: Option<(crate::MemoryWriteFailure, usize)> = None;
         let mut failure_counts = BTreeMap::new();
-        for (index, fact) in parsed.facts.into_iter().enumerate() {
+        for (index, mut fact) in parsed.facts.into_iter().enumerate() {
+            let fact_source =
+                match validate_post_turn_source(&mut fact, input, &context, source_context_kind) {
+                    Ok(kind) => kind,
+                    Err(reason) => {
+                        stats.validation_rejected_count += 1;
+                        response.diagnostics.push(memory_safe_info_diagnostic(
+                            "memory.post_turn_extractor.source_rejected",
+                            format!("source validation rejected: {reason}"),
+                        ));
+                        continue;
+                    }
+                };
+            if let Some(target) = fact.target_memory_id.as_deref() {
+                let scope = memory_scope_from_semantic_hint(&context, fact.semantic.scope_hint);
+                let canonical = scope.as_ref().and_then(|scope| {
+                    crate::write::build_memory_canonical_key(scope, &fact.semantic).ok()
+                });
+                let supported = fact.semantic.intent == MemoryIntent::ExplicitStore
+                    && fact_source == MemorySourceContextKind::DirectUserConversation
+                    && extraction.manifest.as_ref().is_some_and(|manifest| {
+                        manifest.active.iter().any(|item| {
+                            item.memory_id == target
+                                && item.status == MemoryStatus::Active
+                                && Some(&item.scope) == scope.as_ref()
+                                && item.category == fact.semantic.category
+                                && canonical.as_ref().is_some_and(|key| {
+                                    item.key.as_deref() == Some(key.key.as_str())
+                                })
+                        })
+                    });
+                if !supported {
+                    response.diagnostics.push(memory_safe_info_diagnostic(
+                        "memory.post_turn_extractor.target_rejected",
+                        "correction target is not a supported active identity in the original manifest"));
+                    stats.validation_rejected_count += 1;
+                    continue;
+                }
+                if !policy.explicit_remember {
+                    // Preserve the proposed correction for ordinary review without
+                    // granting the privileged explicit-target update route.
+                    fact.target_memory_id = None;
+                }
+            }
+            if fact.semantic.intent == MemoryIntent::ExplicitStore && !policy.explicit_remember {
+                fact.semantic.intent = MemoryIntent::ImplicitCandidate;
+            }
+            if (fact.semantic.intent == MemoryIntent::ImplicitCandidate
+                && !config.proactive_writes_enabled)
+                || !post_turn_policy_allows_fact(&policy, &fact.semantic)
+            {
+                stats.policy_rejected_count += 1;
+                continue;
+            }
             let Some(params) = memory_semantic_write_params_from_extracted_fact(
                 index,
                 fact,
                 &context,
                 &policy,
                 &config,
-                source_context_kind,
+                fact_source,
                 extractor_model.as_deref(),
                 extractor_model_provider.as_deref(),
             ) else {
                 stats.validation_rejected_count += 1;
                 continue;
             };
-            if !post_turn_policy_allows_fact(&policy, &params.semantic) {
-                stats.policy_rejected_count += 1;
-                continue;
-            }
             stats.write_attempt_count += 1;
             match write_provider
                 .write_semantic_memory(context.clone(), params)
@@ -334,6 +424,7 @@ impl HookHandler for MemoryPostTurnExtractorHook {
 
 struct MemoryPostTurnExtractionOutcome {
     parsed: MemoryPostTurnParsedFacts,
+    manifest: Option<MemoryManifest>,
     model: Option<String>,
     model_provider: Option<String>,
 }
@@ -349,7 +440,7 @@ async fn extract_post_turn_memory_once(
     request: MemoryPostTurnExtractorRequest,
     config: &MemoryPostTurnExtractorConfig,
 ) -> Result<MemoryPostTurnExtractionOutcome, MemoryPostTurnExtractorFailure> {
-    let raw_json = extractor_provider
+    let extracted = extractor_provider
         .extract_post_turn_memory_json(context.clone(), request)
         .await
         .map_err(|error| {
@@ -365,6 +456,7 @@ async fn extract_post_turn_memory_once(
             );
             MemoryPostTurnExtractorFailure::ProviderFailed(error)
         })?;
+    let raw_json = extracted.raw_json;
     let parsed =
         parse_memory_post_turn_extractor_json(raw_json.as_str(), config).map_err(|error| {
             tracing::warn!(
@@ -382,6 +474,7 @@ async fn extract_post_turn_memory_once(
         })?;
     Ok(MemoryPostTurnExtractionOutcome {
         parsed,
+        manifest: extracted.manifest,
         model: context.model,
         model_provider: context.model_provider,
     })

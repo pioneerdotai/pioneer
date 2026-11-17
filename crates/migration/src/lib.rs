@@ -2,7 +2,34 @@ mod m20261015_000001_html_preview_retention;
 mod m20261016_000001_task_completion_inbox;
 mod m20261018_000001_frozen_sweep_work;
 mod m20261018_000001_html_preview_work_selection;
+mod m20261101_000101_idle_task_child_work;
+mod m20261101_000102_idle_task_occurrence_tracking_cutover;
+mod m20261101_000103_idle_html_preview_io_work;
+mod m20261104_000001_capsule_bound_routes;
+mod m20261105_000001_portable_pending_indexes;
+mod m20261108_000001_sqlite_memory_search;
+mod m20261109_000001_execution_observability;
 pub use sea_orm_migration::prelude::*;
+
+mod m20261023_000001_task_webhook;
+mod m20261024_000001_root_conversation_compaction;
+mod m20261026_000001_frozen_locator_discovery_indexes;
+mod m20261026_000002_frozen_proof_discovery_index;
+
+mod m20261026_000001_agent_start_reconciliation_index;
+mod m20261026_000002_agent_action_immediate_terminal_index;
+mod m20261027_000001_portable_payload;
+
+mod m20261027_000002_portable_tool_output;
+mod m20261027_000003_portable_cli_mapping;
+mod m20261027_000004_portable_task_history;
+mod m20261027_000005_portable_task_event;
+mod m20261029_000001_thread_read_creation_order;
+mod m20261106_000001_agent_ledger_deadline_index;
+mod portable_payload_target;
+
+mod m20261111_000001_plugin_ownership;
+mod m20261112_000001_package_installations;
 
 pub struct Migrator;
 
@@ -203,6 +230,28 @@ impl MigratorTrait for Migrator {
             Box::new(m20261016_000001_task_completion_inbox::access_start::Migration),
             Box::new(m20261018_000001_frozen_sweep_work::Migration),
             Box::new(m20261018_000001_thread_unread_start::Migration),
+            Box::new(m20261023_000001_task_webhook::Migration),
+            Box::new(m20261024_000001_root_conversation_compaction::Migration),
+            Box::new(m20261026_000001_frozen_locator_discovery_indexes::Migration),
+            Box::new(m20261026_000002_frozen_proof_discovery_index::Migration),
+            Box::new(m20261026_000001_agent_start_reconciliation_index::Migration),
+            Box::new(m20261026_000002_agent_action_immediate_terminal_index::Migration),
+            Box::new(m20261027_000001_portable_payload::Migration),
+            Box::new(m20261027_000002_portable_tool_output::Migration),
+            Box::new(m20261027_000003_portable_cli_mapping::Migration),
+            Box::new(m20261027_000004_portable_task_history::Migration),
+            Box::new(m20261027_000005_portable_task_event::Migration),
+            Box::new(m20261029_000001_thread_read_creation_order::Migration),
+            Box::new(m20261101_000101_idle_task_child_work::Migration),
+            Box::new(m20261101_000102_idle_task_occurrence_tracking_cutover::Migration),
+            Box::new(m20261101_000103_idle_html_preview_io_work::Migration),
+            Box::new(m20261105_000001_portable_pending_indexes::Migration),
+            Box::new(m20261104_000001_capsule_bound_routes::Migration),
+            Box::new(m20261106_000001_agent_ledger_deadline_index::Migration),
+            Box::new(m20261109_000001_execution_observability::Migration),
+            Box::new(m20261108_000001_sqlite_memory_search::Migration),
+            Box::new(m20261111_000001_plugin_ownership::Migration),
+            Box::new(m20261112_000001_package_installations::Migration),
         ]
     }
 }

@@ -94,6 +94,62 @@ pub struct NewThreadMembership {
     pub now: DateTimeWithTimeZone,
 }
 
+/// Maximum input IDs and returned rows for one authorization-facts query.
+/// Membership queries use at most 130 binds: 128 IDs, scope and row limit.
+pub const AUTHORIZATION_FACTS_BATCH_LIMIT: usize = 128;
+
+pub async fn load_workspace_membership_principal_ids<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    principal_ids: &[PrincipalId],
+) -> Result<Vec<String>> {
+    if principal_ids.len() > AUTHORIZATION_FACTS_BATCH_LIMIT {
+        bail!("workspace authorization facts batch exceeds limit");
+    }
+    if principal_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    workspace_membership::Entity::find()
+        .select_only()
+        .column(workspace_membership::Column::PrincipalId)
+        .filter(workspace_membership::Column::WorkspaceId.eq(workspace_id))
+        .filter(
+            workspace_membership::Column::PrincipalId
+                .is_in(principal_ids.iter().map(ToString::to_string)),
+        )
+        .limit(AUTHORIZATION_FACTS_BATCH_LIMIT as u64)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to load bounded workspace authorization memberships")
+}
+
+pub async fn load_thread_membership_principal_ids<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    principal_ids: &[PrincipalId],
+) -> Result<Vec<String>> {
+    if principal_ids.len() > AUTHORIZATION_FACTS_BATCH_LIMIT {
+        bail!("thread authorization facts batch exceeds limit");
+    }
+    if principal_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    thread_membership::Entity::find()
+        .select_only()
+        .column(thread_membership::Column::PrincipalId)
+        .filter(thread_membership::Column::ThreadId.eq(thread_id))
+        .filter(
+            thread_membership::Column::PrincipalId
+                .is_in(principal_ids.iter().map(ToString::to_string)),
+        )
+        .limit(AUTHORIZATION_FACTS_BATCH_LIMIT as u64)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to load bounded thread authorization memberships")
+}
+
 pub async fn find_workspace_membership<C: ConnectionTrait>(
     db: &C,
     principal_id: &PrincipalId,
@@ -1268,6 +1324,9 @@ mod tests {
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let timestamp = chrono::Utc::now().timestamp();
         let new_thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
             name: Some("Atomic private thread".to_owned()),
@@ -1358,6 +1417,9 @@ mod tests {
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let turn_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
             name: None,
@@ -1379,6 +1441,7 @@ mod tests {
         };
         let permission_profile = pioneer_protocol::default_turn_permission_profile_snapshot();
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -1522,6 +1585,9 @@ mod tests {
         let workspace_thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let workspace_turn_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let workspace_thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             id: workspace_thread_id.clone(),
             visibility: Some(ThreadVisibility::Workspace),
             ..thread.clone()
@@ -1586,6 +1652,9 @@ mod tests {
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let timestamp = chrono::Utc::now().timestamp();
         let new_thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id,
             name: None,
@@ -1703,6 +1772,9 @@ mod tests {
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let timestamp = now.timestamp();
         let new_thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
             name: Some("Managed".to_owned()),
@@ -1899,6 +1971,9 @@ mod tests {
 
         let thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         let new_thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             id: thread_id.clone(),
             workspace_id: fixture.red_workspace_id.clone(),
             name: None,

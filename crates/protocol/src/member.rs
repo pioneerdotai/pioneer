@@ -12,32 +12,14 @@ pub const MEMBER_DISPLAY_NAME_MAX_SCALARS: usize = 128;
 pub const MEMBER_DISPLAY_NAME_MAX_UTF8_BYTES: usize = 512;
 pub const MEMBER_NICKNAME_MIN_LEN: usize = 2;
 pub const MEMBER_NICKNAME_MAX_LEN: usize = 32;
-pub const PROFILE_AVATAR_MAX_DECODED_BYTES: usize = 256 * 1024;
-pub const PROFILE_AVATAR_MAX_DIMENSION: u32 = 1024;
+pub const PROFILE_AVATAR_MAX_DECODED_BYTES: usize = crate::IMAGE_MAX_BYTES;
+pub const PROFILE_AVATAR_MAX_DIMENSION: u32 = crate::IMAGE_MAX_DIMENSION;
 pub const PROFILE_AVATAR_MAX_BASE64_LEN: usize = PROFILE_AVATAR_MAX_DECODED_BYTES.div_ceil(3) * 4;
 pub const MEMBER_DIRECTORY_DEFAULT_LIMIT: u32 = 50;
 pub const MEMBER_DIRECTORY_MAX_LIMIT: u32 = 100;
 pub const MEMBER_DIRECTORY_CURSOR_MAX_BYTES: usize = 1_024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-pub enum ProfileAvatarMediaType {
-    #[serde(rename = "image/png")]
-    Png,
-    #[serde(rename = "image/jpeg")]
-    Jpeg,
-    #[serde(rename = "image/webp")]
-    Webp,
-}
-
-impl ProfileAvatarMediaType {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Png => "image/png",
-            Self::Jpeg => "image/jpeg",
-            Self::Webp => "image/webp",
-        }
-    }
-}
+pub use crate::images::ImageMediaType as ProfileAvatarMediaType;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(try_from = "ProfileAvatarInputWire")]

@@ -13,6 +13,7 @@ use crate::cli_runtime::continuation::{
 };
 use crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions;
 use crate::cli_runtime::mcp::conformance::run_cli_mcp_bridge_conformance;
+use crate::cli_runtime::mcp::facade::CliMcpCallContract;
 use crate::turn_mcp::projection::{
     McpProjectionLimits, McpSelectionReason, ResolvedMcpTurnProjection, ResolvedMcpTurnTool,
 };
@@ -221,7 +222,7 @@ pub async fn run_codex_mcp_deterministic_conformance() -> Result<CodexMcpDetermi
         "recorded Codex lifecycle does not bind to one native item"
     );
 
-    let bridge = run_cli_mcp_bridge_conformance("codex").await?;
+    let bridge = run_cli_mcp_bridge_conformance("codex", CliMcpCallContract::Codex).await?;
     let bridge_cleanup_complete = bridge.grant_revoked_on_eof && bridge.artifacts_removed;
 
     Ok(CodexMcpDeterministicEvidence {

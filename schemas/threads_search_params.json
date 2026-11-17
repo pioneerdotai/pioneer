@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadsSearchParams",
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "limit": {
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 100,
+      "minimum": 1
+    },
+    "query": {
+      "description": "Nonblank natural-language query; no maximum length is imposed.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "query",
+    "limit"
+  ]
+}

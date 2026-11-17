@@ -9,7 +9,7 @@
       "minLength": 1
     },
     "media_type": {
-      "$ref": "#/$defs/ProfileAvatarMediaType"
+      "$ref": "#/$defs/ImageMediaType"
     }
   },
   "additionalProperties": false,
@@ -18,7 +18,7 @@
     "content_base64"
   ],
   "$defs": {
-    "ProfileAvatarMediaType": {
+    "ImageMediaType": {
       "type": "string",
       "enum": [
         "image/png",

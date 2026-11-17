@@ -34,6 +34,7 @@ async fn index_quantum(
     store: &CrudStore,
     after: &mut String,
     imports: &mut Option<PreviewImportIndex>,
+    upper: &str,
 ) -> Result<bool> {
     if let Some(state) = imports.as_ref() {
         let manifest = state.header.manifest.clone();
@@ -95,6 +96,7 @@ async fn index_quantum(
                     .or(col("i", frozen_index::Column::Unknown).eq(Expr::Constant(1.into()))),
             )
             .and_where(col("i", frozen_index::Column::ManifestId).gt(after.as_str()))
+            .and_where(col("i", frozen_index::Column::ManifestId).lte(upper))
             .order_by(("i", frozen_index::Column::ManifestId), Order::Asc);
     } else {
         query
@@ -106,6 +108,7 @@ async fn index_quantum(
                 col("i", frozen_index::Column::ManifestId).eq(col("h", history::Column::Id)),
             )
             .and_where(col("h", history::Column::Id).gt(after.as_str()))
+            .and_where(col("h", history::Column::Id).lte(upper))
             .order_by(("h", history::Column::Id), Order::Asc);
     }
     let row = store.connection.query_one(&query).await?;
@@ -311,7 +314,9 @@ async fn index_quantum(
     if unknown {
         tracing::warn!("HTML preview retention preserved an unknown frozen media scope");
     }
-    store
+    let io_locator = super::html_preview_io_work::HtmlPreviewIoLocator::new(&id);
+    let change = store.connection.work_signal("maintenance.html").changing();
+    let changed = store
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
             let header = history::Entity::find_by_id(&id)
@@ -329,7 +334,7 @@ async fn index_quantum(
                 .await?;
             if header.is_none() {
                 tx.rollback().await?;
-                return Ok(());
+                return Ok(false);
             }
             let changed = frozen_index::Entity::update_many()
                 .col_expr(frozen_index::Column::NextOrdinal, Expr::val(end))
@@ -369,7 +374,7 @@ async fn index_quantum(
                         .scope
                         .strip_prefix("context:")
                         .expect("prepared context source");
-                    frozen_result::Entity::insert(frozen_result::ActiveModel {
+                    let inserted = frozen_result::Entity::insert(frozen_result::ActiveModel {
                         manifest_id: Set(id.clone()),
                         ordinal: Set(*ordinal),
                         reference_json: Set(reference.clone()),
@@ -388,12 +393,28 @@ async fn index_quantum(
                     )
                     .exec_without_returning(&tx)
                     .await?;
+                    if inserted == 1 {
+                        super::html_preview_io_work::request_prepared(
+                            &tx,
+                            super::html_preview_io_work::HtmlPreviewIoFamily::Witness,
+                            &io_locator,
+                            *ordinal,
+                            &workspace,
+                        )
+                        .await?;
+                    }
                 }
             }
             tx.commit().await?;
-            Ok(())
+            Ok(changed == 1)
         })
         .await?;
+    change.completed(
+        changed && !unknown && end == count && row.try_get::<i64>("", "import_count")? == 0,
+    );
+    if changed && !results.is_empty() {
+        store.notify_html_preview_io_work();
+    }
     if !unknown && (end < count || row.try_get::<i64>("", "import_count")? > 0) {
         *after = previous_after;
     }
@@ -565,9 +586,10 @@ async fn index_import_quantum(
         .filter(Expr::col(history::Column::NextImport).eq(Expr::col(history::Column::ImportCount)))
         .filter(history::Column::ImportsSha256.eq(expected))
         .into_query();
-    store
+    let change = store.connection.work_signal("maintenance.html").changing();
+    let changed = store
         .run_serialized_write(|| async {
-            frozen_index::Entity::update_many()
+            let changed = frozen_index::Entity::update_many()
                 .col_expr(
                     frozen_index::Column::Complete,
                     Expr::val(i64::from(done && !unknown)),
@@ -584,10 +606,12 @@ async fn index_import_quantum(
                 .filter(frozen_index::Column::Expired.eq(0))
                 .filter(Expr::exists(header.clone()))
                 .exec(&store.connection)
-                .await?;
-            Ok(())
+                .await?
+                .rows_affected;
+            Ok(changed == 1)
         })
         .await?;
+    change.completed(changed && !unknown);
     // A zero-row guard rejection is terminal for this pass too. The marker
     // remains retaining and a later pass/restart can prepare fresh progress.
     Ok(true)
@@ -603,6 +627,7 @@ async fn unowned<C: ConnectionTrait>(
     turn: &str,
     root_execution: &str,
     readers: &crate::frozen_lifetime::ReaderCounts,
+    released: &pioneer_sqlite::WorkSignal,
 ) -> Result<bool> {
     let row = db
         .query_one(&queries::unowned(workspace, thread, turn, root_execution))
@@ -612,16 +637,20 @@ async fn unowned<C: ConnectionTrait>(
     }
     // Acquisition uses the same serialized writer as retirement. Inspect only
     // currently held roots, not the unbounded set of permanent archive roots.
-    let held_ids: Vec<String> = readers
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .keys()
-        .take(65)
-        .cloned()
-        .collect();
-    if held_ids.len() > 64 {
-        return Ok(false);
-    }
+    let held_ids: Vec<String> = {
+        let mut readers = readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if readers.len() > 64 {
+            // Falling below the bound necessarily releases one of these roots.
+            // Register while holding the release lock; do not retain all roots.
+            for held in readers.values_mut().take(65) {
+                held.block_cleanup(released);
+            }
+            return Ok(false);
+        }
+        readers.keys().cloned().collect()
+    };
     for manifest in held_ids {
         let held = Query::select()
             .expr(Expr::val(1))
@@ -632,13 +661,15 @@ async fn unowned<C: ConnectionTrait>(
                 "h",
                 col("h", history::Column::Id).eq(col("p", frozen_turn::Column::ManifestId)),
             )
-            .and_where(col("p", frozen_turn::Column::ManifestId).eq(manifest))
+            .and_where(col("p", frozen_turn::Column::ManifestId).eq(&manifest))
             .and_where(col("p", frozen_turn::Column::TurnId).eq(turn))
             .and_where(col("h", history::Column::WorkspaceId).eq(workspace))
             .and_where(col("h", history::Column::Expired).eq(0))
             .limit(1)
             .to_owned();
-        if db.query_one(&held).await?.is_some() {
+        if db.query_one(&held).await?.is_some()
+            && crate::frozen_lifetime::cleanup_blocked(readers, &manifest, released)
+        {
             return Ok(false);
         }
     }
@@ -680,64 +711,132 @@ pub fn archive_result(payload: &str) -> Result<String> {
     Ok(serde_json::to_string(&view)?)
 }
 
+// Compact advisory discovery only. Metadata stays behind the individual byte
+// guard and release retains its authoritative writer proof.
+#[derive(sea_orm::FromQueryResult)]
+struct PreviewArtifactHeader {
+    id: String,
+    current_version_id: Option<String>,
+    bytes: i64,
+}
+
 #[derive(Default)]
 pub struct HtmlPreviewRetentionProgress {
     after: String,
+    artifact_pending: VecDeque<PreviewArtifactHeader>,
     index_after: String,
     imports: Option<PreviewImportIndex>,
     input_after: String,
     phase: usize,
     idle: [bool; 3],
+    // Legacy input EOF cannot publish completion after skipping a failed row.
+    input_retry_debt: bool,
+    // Frozen index, legacy inputs and artifact IDs each own a finite pass.
+    // A producer cannot extend an active suffix and postpone wrap forever.
+    upper: [Option<String>; 3],
 }
 impl HtmlPreviewRetentionProgress {
     /// Returns false at discovery EOF. Errors do not pin the cursor to poison
-    /// data; the existing maintenance owner revisits every pass/restart.
+    /// data; the maintenance owner must retain retry debt through pass EOF.
     pub async fn quantum(&mut self, store: &CrudStore) -> Result<bool> {
         while self.idle[self.phase] {
             self.phase = (self.phase + 1) % 3;
         }
         let path = self.phase;
         self.phase = (self.phase + 1) % 3;
+        if self.upper[path].is_none() {
+            self.upper[path] = Some(match path {
+                0 => history::Entity::find()
+                    .select_only()
+                    .column(history::Column::Id)
+                    .order_by_desc(history::Column::Id)
+                    .into_tuple::<String>()
+                    .one(&store.connection)
+                    .await?
+                    .unwrap_or_default(),
+                1 => turn_input::Entity::find()
+                    .select_only()
+                    .column(turn_input::Column::Id)
+                    .order_by_desc(turn_input::Column::Id)
+                    .into_tuple::<String>()
+                    .one(&store.connection)
+                    .await?
+                    .unwrap_or_default(),
+                _ => store.html_preview_artifact_frontier().await?,
+            });
+        }
         let more = match path {
-            0 => index_quantum(store, &mut self.index_after, &mut self.imports).await?,
-            1 => input_adoption_quantum(store, &mut self.input_after).await?,
+            0 => {
+                index_quantum(
+                    store,
+                    &mut self.index_after,
+                    &mut self.imports,
+                    self.upper[0].as_deref().expect("captured frontier"),
+                )
+                .await?
+            }
+            1 => {
+                let retry_debt = self.input_retry_debt;
+                // Cancellation after cursor advancement also keeps the durable
+                // completion gate open when this progress is reused.
+                self.input_retry_debt = true;
+                let more = input_adoption_quantum(
+                    store,
+                    &mut self.input_after,
+                    self.upper[1].as_deref().expect("captured frontier"),
+                    !retry_debt,
+                )
+                .await?;
+                self.input_retry_debt = retry_debt;
+                more
+            }
             _ => self.artifact_quantum(store).await?,
         };
+        if path == 1 && !more {
+            self.input_retry_debt = false;
+        }
         self.idle[path] = !more;
         if self.idle.iter().all(|idle| *idle) {
             self.idle = [false; 3];
+            self.upper = Default::default();
             Ok(false)
         } else {
             Ok(true)
         }
     }
     async fn artifact_quantum(&mut self, store: &CrudStore) -> Result<bool> {
-        let query = artifact::Entity::find()
-            .select_only()
-            .columns([artifact::Column::Id, artifact::Column::CurrentVersionId])
-            .column_as(bytes(Expr::col(artifact::Column::MetadataJson)), "bytes")
-            .filter(artifact::Column::Id.gt(self.after.as_str()))
-            .filter(Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())))
-            .filter(
-                Expr::col(artifact::Column::CreatedByActorId)
-                    .eq(Expr::Constant("html_preview".into())),
-            )
-            .order_by_asc(artifact::Column::Id)
-            .limit(1)
-            .into_query();
-        let row = store.connection.query_one(&query).await?;
-        let Some(row) = row else {
+        if self.artifact_pending.is_empty() {
+            self.artifact_pending = artifact::Entity::find()
+                .select_only()
+                .columns([artifact::Column::Id, artifact::Column::CurrentVersionId])
+                .column_as(bytes(Expr::col(artifact::Column::MetadataJson)), "bytes")
+                .filter(artifact::Column::Id.gt(self.after.as_str()))
+                .filter(
+                    artifact::Column::Id.lte(self.upper[2].as_deref().expect("captured frontier")),
+                )
+                .filter(
+                    Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())),
+                )
+                .filter(
+                    Expr::col(artifact::Column::CreatedByActorId)
+                        .eq(Expr::Constant("html_preview".into())),
+                )
+                .order_by_asc(artifact::Column::Id)
+                .limit(16)
+                .into_model::<PreviewArtifactHeader>()
+                .all(&store.connection)
+                .await?
+                .into();
+        }
+        let Some(row) = self.artifact_pending.pop_front() else {
             self.after.clear();
             return Ok(false);
         };
-        self.after = row.try_get("", "id")?;
-        if row
-            .try_get::<Option<String>>("", "current_version_id")?
-            .is_none()
-        {
+        self.after = row.id;
+        if row.current_version_id.is_none() {
             return Ok(true);
         }
-        if row.try_get::<i64>("", "bytes")? > 1048576 {
+        if row.bytes > 1048576 {
             tracing::warn!("HTML preview retained oversized provenance metadata");
             return Ok(true);
         }
@@ -758,12 +857,19 @@ impl HtmlPreviewRetentionProgress {
 }
 
 async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
+    let released = store.connection.work_signal("maintenance.html.release");
     let metadata: Value = serde_json::from_str(&candidate.metadata_json)?;
     let origin = &metadata["htmlTool"];
     ensure!(
-        origin["version"] == 1 && origin["publication"] == false,
+        matches!(origin["version"].as_u64(), Some(1 | 2)) && origin["publication"] == false,
         "unknown preview provenance"
     );
+    // Version one is the persisted single-theme, three-width layout. Version
+    // two names each frame by appearance and width; formats cannot be mixed.
+    let preview_format = origin["version"]
+        .as_u64()
+        .expect("validated preview version");
+    let six_frames = preview_format == 2;
     let turn = origin["turnId"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -784,6 +890,7 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
         turn,
         &root_execution,
         &store.frozen_readers,
+        &released,
     )
     .await?
     {
@@ -823,10 +930,14 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
             )
             .eq(call),
         )
-        .limit(5)
+        // Source plus six frames, with one sentinel to reject ambiguity.
+        .limit(8)
         .all(&store.connection)
         .await?;
-    ensure!(artifacts.len() <= 4, "ambiguous preview artifact group");
+    ensure!(
+        artifacts.len() <= if six_frames { 7 } else { 4 },
+        "ambiguous preview artifact group"
+    );
     if artifacts.is_empty() {
         return Ok(());
     }
@@ -837,7 +948,25 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
         let meta: Value = serde_json::from_str(&a.metadata_json)?;
         let index = meta["htmlTool"]["index"].as_str().unwrap_or("");
         ensure!(
-            matches!(index, "input" | "360" | "768" | "1024") && indices.insert(index.to_owned()),
+            meta["htmlTool"]["version"].as_u64() == Some(preview_format),
+            "mixed preview capture formats"
+        );
+        let valid_index = if six_frames {
+            matches!(
+                index,
+                "input"
+                    | "light-360"
+                    | "light-768"
+                    | "light-1024"
+                    | "dark-360"
+                    | "dark-768"
+                    | "dark-1024"
+            )
+        } else {
+            matches!(index, "input" | "360" | "768" | "1024")
+        };
+        ensure!(
+            valid_index && indices.insert(index.to_owned()),
             "invalid preview index"
         );
         let v = artifact_version::Entity::find()
@@ -923,6 +1052,7 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
         .map(|c| archive_result(&c.payload))
         .collect::<Result<Vec<_>>>()?;
     let mut metadata_updates = Vec::new();
+    let mut copy_obligations = BTreeSet::new();
     for a in &artifacts {
         let mut m: Value = serde_json::from_str(&a.metadata_json)?;
         m["htmlTool"]["retention"] = json!("released");
@@ -949,10 +1079,27 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
             copies.len() <= 3 && copies.iter().all(|p| p.len() <= 4096),
             "preview copy metadata bound"
         );
+        if !copies.is_empty() {
+            copy_obligations.insert(a.id.clone());
+        }
         m["htmlTool"]["releasedCopies"] = json!(copies);
         metadata_updates.push(serde_json::to_string(&m)?);
     }
-    store
+    let copy_locators = copy_obligations
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                super::html_preview_io_work::HtmlPreviewIoLocator::new(id),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    // Retirement releases physical blob references, including when no readable
+    // copy ticket exists. Reopen GC that already passed this source's key.
+    let payload_change = crate::terminal_cleanup::Change::payload(&store.connection);
+    let changes =
+        ["maintenance.html"].map(|domain| store.connection.work_signal(domain).changing());
+    let changed = store
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
             if !unowned(
@@ -962,11 +1109,12 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
                 turn,
                 &root_execution,
                 &store.frozen_readers,
+                &released,
             )
             .await?
             {
                 tx.rollback().await?;
-                return Ok(());
+                return Ok(false);
             }
             // Recheck mutable adoption/version/identity assumptions inside commit.
             for ((a, v), b) in artifacts.iter().zip(&versions).zip(&bindings) {
@@ -1076,6 +1224,16 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
                     .filter(artifact::Column::WorkspaceId.eq(&a.workspace_id))
                     .exec(&tx)
                     .await?;
+                if copy_obligations.contains(&a.id) {
+                    super::html_preview_io_work::request_prepared(
+                        &tx,
+                        super::html_preview_io_work::HtmlPreviewIoFamily::Copies,
+                        copy_locators.get(&a.id).expect("prepared copy locator"),
+                        0,
+                        &a.workspace_id,
+                    )
+                    .await?;
+                }
                 artifact_version::Entity::delete_many()
                     .filter(artifact_version::Column::Id.eq(&v.id))
                     .filter(artifact_version::Column::ArtifactId.eq(&a.id))
@@ -1084,9 +1242,19 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
                     .await?;
             }
             tx.commit().await?;
-            Ok(())
+            Ok(true)
         })
-        .await
+        .await?;
+    payload_change
+        .complete(&store.connection, changed, &[turn.to_owned()])
+        .await;
+    for change in changes {
+        change.completed(changed);
+    }
+    if changed && !copy_obligations.is_empty() {
+        store.notify_html_preview_io_work();
+    }
+    Ok(())
 }
 
 impl CrudStore {
@@ -1118,6 +1286,19 @@ impl CrudStore {
         String,
         Vec<(String, super::artifact::ArtifactGcBlobCandidateRecord)>,
     )> {
+        let upper = self.html_preview_blob_frontier().await?;
+        self.html_preview_gc_blob_page_through(after, cutoff_ms, &upper)
+            .await
+    }
+    pub async fn html_preview_gc_blob_page_through(
+        &self,
+        after: &str,
+        cutoff_ms: i64,
+        upper: &str,
+    ) -> Result<(
+        String,
+        Vec<(String, super::artifact::ArtifactGcBlobCandidateRecord)>,
+    )> {
         // Page the source rows first, even if every blob still has owners.
         // This bounds work independently of the number of GC candidates.
         let cutoff = chrono::DateTime::from_timestamp_millis(cutoff_ms)
@@ -1144,6 +1325,7 @@ impl CrudStore {
             ])
             .expr_as(orphan, "orphan")
             .and_where(col("b", artifact_blob::Column::Id).gt(after))
+            .and_where(col("b", artifact_blob::Column::Id).lte(upper))
             .order_by(("b", artifact_blob::Column::Id), Order::Asc)
             .limit(16)
             .to_owned();
@@ -1169,6 +1351,15 @@ impl CrudStore {
         &self,
         after: &str,
     ) -> Result<(String, Option<(String, String)>)> {
+        let upper = self.html_preview_artifact_frontier().await?;
+        self.html_preview_released_copies_page_through(after, &upper)
+            .await
+    }
+    pub async fn html_preview_released_copies_page_through(
+        &self,
+        after: &str,
+        upper: &str,
+    ) -> Result<(String, Option<(String, String)>)> {
         let query = artifact::Entity::find()
             .select_only()
             .columns([
@@ -1186,6 +1377,7 @@ impl CrudStore {
                 "metadata_json",
             )
             .filter(artifact::Column::Id.gt(after))
+            .filter(artifact::Column::Id.lte(upper))
             .filter(Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())))
             .filter(
                 Expr::col(artifact::Column::CreatedByActorId)
@@ -1230,15 +1422,106 @@ impl CrudStore {
         previous: &str,
         metadata: &str,
     ) -> Result<()> {
+        self.finish_html_preview_copy_cleanup_commit(id, previous, metadata, None)
+            .await
+            .and_then(|changed| {
+                ensure!(changed, "HTML IO source CAS refused");
+                Ok(())
+            })
+    }
+    pub async fn finish_html_preview_copy_cleanup_claimed(
+        &self,
+        claim: &crate::HtmlPreviewIoClaim,
+        previous: &str,
+        metadata: &str,
+    ) -> Result<bool> {
+        let id = claim.source_id();
+        ensure!(claim.row.family == "copies", "copy claim identity mismatch");
+        self.finish_html_preview_copy_cleanup_commit(id, previous, metadata, Some(claim))
+            .await
+    }
+    async fn finish_html_preview_copy_cleanup_commit(
+        &self,
+        id: &str,
+        previous: &str,
+        metadata: &str,
+        claim: Option<&crate::HtmlPreviewIoClaim>,
+    ) -> Result<bool> {
+        let io_locator = super::html_preview_io_work::HtmlPreviewIoLocator::new(id);
         self.run_serialized_write(|| async {
-            artifact::Entity::update_many()
+            let tx = self.connection.begin().await?;
+            let callback = if claim.is_none() {
+                super::html_preview_io_work::callback_ticket(&tx, "copies", &io_locator, 0).await?
+            } else {
+                None
+            };
+            if let Some(claim) = claim {
+                ensure!(
+                    pioneer_entity::html_preview_io_work::Entity::find()
+                        .filter(super::html_preview_io_work::fence(&claim.row))
+                        .one(&tx)
+                        .await?
+                        .is_some(),
+                    "copy claim fence lost"
+                );
+            }
+            // SQL text equality can be case-insensitive. Lock the current
+            // source (FOR UPDATE on PostgreSQL/MySQL), then compare exact bytes
+            // in Rust before publishing prepared cleanup and ACK. A locking
+            // read also avoids an old InnoDB Repeatable Read snapshot. SQLite
+            // uses the existing serialized writer transaction instead.
+            let current = artifact::Entity::find_by_id(id)
+                .select_only()
+                .columns([
+                    artifact::Column::WorkspaceId,
+                    artifact::Column::CurrentVersionId,
+                    artifact::Column::MetadataJson,
+                ])
+                .filter(
+                    super::html_preview_io_work::io_bytes(
+                        tx.get_database_backend(),
+                        Expr::col(artifact::Column::MetadataJson),
+                    )
+                    .lte(1048576),
+                )
+                .lock_exclusive()
+                .into_tuple::<(String, Option<String>, String)>()
+                .one(&tx)
+                .await?;
+            let Some((workspace, current_version, current_metadata)) = current else {
+                tx.rollback().await?;
+                return Ok(false);
+            };
+            if current_metadata != previous
+                || current_version.is_some()
+                || claim.is_some_and(|claim| workspace != claim.row.workspace_id)
+            {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            let mut update = artifact::Entity::update_many()
                 .col_expr(artifact::Column::MetadataJson, Expr::val(metadata))
                 .filter(artifact::Column::Id.eq(id))
                 .filter(artifact::Column::CurrentVersionId.is_null())
-                .filter(artifact::Column::MetadataJson.eq(previous))
-                .exec(&self.connection)
-                .await?;
-            Ok(())
+                .filter(artifact::Column::MetadataJson.eq(previous));
+            if let Some(claim) = claim {
+                update = update.filter(artifact::Column::WorkspaceId.eq(&claim.row.workspace_id));
+            }
+            if update.exec(&tx).await?.rows_affected != 1 {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            if let Some(claim) = claim {
+                ensure!(
+                    super::html_preview_io_work::ack(&tx, claim).await?,
+                    "copy ACK fence lost"
+                );
+            }
+            if let Some(row) = &callback {
+                super::html_preview_io_work::callback_ack(&tx, row).await?;
+            }
+            tx.commit().await?;
+            Ok(true)
         })
         .await
     }
@@ -1428,7 +1711,12 @@ pub(crate) async fn retain_preview_input<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn input_adoption_quantum(store: &CrudStore, after: &mut String) -> Result<bool> {
+async fn input_adoption_quantum(
+    store: &CrudStore,
+    after: &mut String,
+    upper: &str,
+    may_complete: bool,
+) -> Result<bool> {
     // Supported input projection writers retain previews in their atomic write
     // set, including inputs inserted behind this legacy cursor after completion.
     // Do not cache the gate: a legacy-data migration may need to reopen it.
@@ -1458,11 +1746,18 @@ async fn input_adoption_quantum(store: &CrudStore, after: &mut String) -> Result
         ])
         .column_as(payload_bytes, "bytes")
         .filter(turn_input::Column::Id.gt(after.as_str()))
+        .filter(turn_input::Column::Id.lte(upper))
         .order_by_asc(turn_input::Column::Id)
         .limit(1)
         .into_query();
     let row = store.connection.query_one(&query).await?;
     let Some(row) = row else {
+        if !may_complete {
+            // The owner retains retry debt through the common pass EOF. Keep
+            // the durable gate open so a fresh pass/restart revisits failures.
+            after.clear();
+            return Ok(false);
+        }
         store
             .run_serialized_write(|| async {
                 backfill::Entity::update_many()
@@ -1546,6 +1841,15 @@ impl CrudStore {
         &self,
         after: &(String, i64),
     ) -> Result<(Option<(String, i64)>, Option<HtmlPreviewArchiveWitness>)> {
+        let upper = self.html_preview_witness_frontier().await?;
+        self.html_preview_archive_witness_page_through(after, &upper)
+            .await
+    }
+    pub async fn html_preview_archive_witness_page_through(
+        &self,
+        after: &(String, i64),
+        upper: &(String, i64),
+    ) -> Result<(Option<(String, i64)>, Option<HtmlPreviewArchiveWitness>)> {
         // Page source rows, even if expired/already verified; never search the
         // whole candidate pool inside one background quantum.
         let query = Query::select()
@@ -1578,6 +1882,16 @@ impl CrudStore {
                 .gt(Expr::tuple([
                     Expr::val(after.0.clone()),
                     Expr::val(after.1),
+                ])),
+            )
+            .and_where(
+                Expr::tuple([
+                    col("r", frozen_result::Column::ManifestId),
+                    col("r", frozen_result::Column::Ordinal),
+                ])
+                .lte(Expr::tuple([
+                    Expr::val(upper.0.clone()),
+                    Expr::val(upper.1),
                 ])),
             )
             .order_by(("r", frozen_result::Column::ManifestId), Order::Asc)
@@ -1645,11 +1959,66 @@ impl CrudStore {
         witness: &HtmlPreviewArchiveWitness,
         archive_hash: &str,
     ) -> Result<()> {
+        self.record_html_preview_archive_witness_commit(witness, archive_hash, None)
+            .await
+            .and_then(|changed| {
+                ensure!(changed, "HTML IO source CAS refused");
+                Ok(())
+            })
+    }
+    pub async fn record_html_preview_archive_witness_claimed(
+        &self,
+        claim: &crate::HtmlPreviewIoClaim,
+        witness: &HtmlPreviewArchiveWitness,
+        archive_hash: &str,
+    ) -> Result<bool> {
+        ensure!(
+            claim.row.family == "witness"
+                && claim.source_id() == witness.manifest
+                && claim.row.ordinal == witness.ordinal
+                && claim.row.workspace_id == witness.workspace,
+            "witness claim identity mismatch"
+        );
+        self.record_html_preview_archive_witness_commit(witness, archive_hash, Some(claim))
+            .await
+    }
+    async fn record_html_preview_archive_witness_commit(
+        &self,
+        witness: &HtmlPreviewArchiveWitness,
+        archive_hash: &str,
+        claim: Option<&crate::HtmlPreviewIoClaim>,
+    ) -> Result<bool> {
         ensure!(
             archive_hash.len() == 64 && archive_hash.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid archival hash"
         );
+        let change = self.connection.work_signal("maintenance.html").changing();
         let reference = serde_json::to_string(&witness.reference)?;
+        let io_locator = super::html_preview_io_work::HtmlPreviewIoLocator::new(&witness.manifest);
+        let Some((source_version, source_id, source_turn)) =
+            frozen_result::Entity::find_by_id((witness.manifest.clone(), witness.ordinal))
+                .select_only()
+                .column(frozen_result::Column::SourceVersion)
+                .column(frozen_result::Column::SourceId)
+                .column(frozen_result::Column::TurnId)
+                .into_tuple::<(String, String, String)>()
+                .one(&self.connection)
+                .await?
+        else {
+            change.completed(false);
+            return Ok(false);
+        };
+        let Some(source_revision) = source_version
+            .strip_prefix("revision:")
+            .and_then(|v| v.parse::<i64>().ok())
+        else {
+            change.completed(false);
+            return Ok(false);
+        };
+        if source_version != format!("revision:{source_revision}") {
+            change.completed(false);
+            return Ok(false);
+        }
         let current = queries::canonical_preview()
             .join_as(
                 JoinType::InnerJoin,
@@ -1678,29 +2047,91 @@ impl CrudStore {
             )
             .and_where(col("t", turn_entity::Column::ThreadId).eq(&witness.reference.source_thread))
             .and_where(col("c", turn_llm_context::Column::Payload).eq(&witness.payload))
-            .and_where(
-                revision(col("v", compaction_source_revision::Column::Revision)).eq(Expr::col((
-                    frozen_result::Entity,
-                    frozen_result::Column::SourceVersion,
-                ))),
-            )
+            .and_where(col("v", compaction_source_revision::Column::Revision).eq(source_revision))
             .to_owned();
-        self.run_serialized_write(|| async {
-            frozen_result::Entity::update_many()
-                .col_expr(
-                    frozen_result::Column::ArchiveWireSha256,
-                    Expr::val(archive_hash),
-                )
-                .filter(frozen_result::Column::ManifestId.eq(&witness.manifest))
-                .filter(frozen_result::Column::Ordinal.eq(witness.ordinal))
-                .filter(frozen_result::Column::ReferenceJson.eq(&reference))
-                .filter(frozen_result::Column::ArchiveWireSha256.is_null())
-                .filter(Expr::exists(current.clone()))
-                .exec(&self.connection)
-                .await?;
-            Ok(())
-        })
-        .await
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let callback = if claim.is_none() {
+                    super::html_preview_io_work::callback_ticket(
+                        &tx,
+                        "witness",
+                        &io_locator,
+                        witness.ordinal,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                if let Some(claim) = claim {
+                    ensure!(
+                        pioneer_entity::html_preview_io_work::Entity::find()
+                            .filter(super::html_preview_io_work::fence(&claim.row))
+                            .one(&tx)
+                            .await?
+                            .is_some(),
+                        "witness claim fence lost"
+                    );
+                }
+                let changed = frozen_result::Entity::update_many()
+                    .col_expr(
+                        frozen_result::Column::ArchiveWireSha256,
+                        Expr::val(archive_hash),
+                    )
+                    .filter(frozen_result::Column::ManifestId.eq(&witness.manifest))
+                    .filter(frozen_result::Column::Ordinal.eq(witness.ordinal))
+                    .filter(frozen_result::Column::ReferenceJson.eq(&reference))
+                    .filter(frozen_result::Column::SourceVersion.eq(&source_version))
+                    .filter(frozen_result::Column::SourceId.eq(&source_id))
+                    .filter(frozen_result::Column::TurnId.eq(&source_turn))
+                    .filter(frozen_result::Column::ArchiveWireSha256.is_null())
+                    .filter(Expr::exists(current.clone()))
+                    .exec(&tx)
+                    .await?
+                    .rows_affected;
+                // Zero affected rows alone never establish successful publication.
+                // A concurrent publisher may already have stored this exact receipt;
+                // reread under current domain authority before acknowledging it.
+                if changed != 1 {
+                    let stored = frozen_result::Entity::find_by_id((
+                        witness.manifest.clone(),
+                        witness.ordinal,
+                    ))
+                    .select_only()
+                    .column(frozen_result::Column::ArchiveWireSha256)
+                    .filter(frozen_result::Column::ReferenceJson.eq(&reference))
+                    .filter(frozen_result::Column::SourceVersion.eq(&source_version))
+                    .filter(frozen_result::Column::SourceId.eq(&source_id))
+                    .filter(frozen_result::Column::TurnId.eq(&source_turn))
+                    .filter(Expr::exists(current.clone()))
+                    .lock_exclusive()
+                    .into_tuple::<Option<String>>()
+                    .one(&tx)
+                    .await?;
+                    if !stored.is_some_and(|value| value.as_deref() == Some(archive_hash)) {
+                        tx.rollback().await?;
+                        return Ok((false, false));
+                    }
+                }
+                if let Some(claim) = claim {
+                    ensure!(
+                        super::html_preview_io_work::ack(&tx, claim).await?,
+                        "witness ACK fence lost"
+                    );
+                }
+                if let Some(row) = &callback {
+                    super::html_preview_io_work::callback_ack(&tx, row).await?;
+                }
+                tx.commit().await?;
+                Ok((true, changed == 1))
+            })
+            .await;
+        // A new witness can unblock previews already passed by retirement.
+        // Repeated verification/ACK alone must not invalidate its own pass.
+        if let Ok((_, published)) = &result {
+            change.completed(*published);
+        }
+        result.map(|(accepted, _)| accepted)
     }
 
     /// Only an exact, previously authenticated frozen preview can use this
@@ -1788,3 +2219,358 @@ impl CrudStore {
 #[cfg(test)]
 #[path = "html_preview_retention_tests.rs"]
 mod tests;
+
+impl CrudStore {
+    pub async fn load_html_preview_io_witness(
+        &self,
+        claim: &crate::HtmlPreviewIoClaim,
+    ) -> Result<crate::HtmlPreviewIoSource<HtmlPreviewArchiveWitness>> {
+        use crate::HtmlPreviewIoSource as Source;
+        ensure!(claim.row.family == "witness", "invalid witness family");
+        if !claim.has_valid_point_locator() {
+            return Ok(Source::Quarantine);
+        }
+        let reference_bytes =
+            frozen_result::Entity::find_by_id((claim.source_id().to_owned(), claim.row.ordinal))
+                .select_only()
+                .column_as(
+                    super::html_preview_io_work::io_bytes(
+                        self.connection.get_database_backend(),
+                        Expr::col(frozen_result::Column::ReferenceJson),
+                    ),
+                    "bytes",
+                )
+                .into_tuple::<i64>()
+                .one(&self.connection)
+                .await?;
+        if reference_bytes.is_some_and(|n| n > 524288) {
+            return Ok(Source::Quarantine);
+        }
+        let Some(row) =
+            frozen_result::Entity::find_by_id((claim.source_id().to_owned(), claim.row.ordinal))
+                .filter(
+                    super::html_preview_io_work::io_bytes(
+                        self.connection.get_database_backend(),
+                        Expr::col(frozen_result::Column::ReferenceJson),
+                    )
+                    .lte(524288),
+                )
+                .one(&self.connection)
+                .await?
+        else {
+            return Ok(if reference_bytes.is_none() {
+                Source::Obsolete
+            } else {
+                Source::Retry
+            });
+        };
+        let Some(header) = history::Entity::find_by_id(&row.manifest_id)
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(Source::Retry);
+        };
+        if header.workspace_id != claim.row.workspace_id {
+            if claim.row.workspace_id.is_empty() {
+                // Historical orphan was deliberately timed, not permanently
+                // parked. Restoration can now bind its previously unknown owner.
+                let locator =
+                    super::html_preview_io_work::HtmlPreviewIoLocator::new(claim.source_id());
+                self.run_serialized_write(|| async {
+                    let tx = self.connection.begin().await?;
+                    ensure!(
+                        history::Entity::find_by_id(claim.source_id())
+                            .select_only()
+                            .column(history::Column::WorkspaceId)
+                            .filter(history::Column::WorkspaceId.eq(&header.workspace_id))
+                            .lock_exclusive()
+                            .into_tuple::<String>()
+                            .one(&tx)
+                            .await?
+                            .is_some(),
+                        "restored witness owner changed"
+                    );
+                    super::html_preview_io_work::request_prepared(
+                        &tx,
+                        crate::HtmlPreviewIoFamily::Witness,
+                        &locator,
+                        claim.row.ordinal,
+                        &header.workspace_id,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok(())
+                })
+                .await?;
+                self.notify_html_preview_io_work();
+                return Ok(Source::Retry);
+            }
+            return Ok(Source::Quarantine);
+        }
+        if header.expired != 0 || row.archive_wire_sha256.is_some() {
+            return Ok(Source::Obsolete);
+        }
+        let reference: pioneer_compaction::frozen::FrozenMessageRef =
+            match serde_json::from_str(&row.reference_json) {
+                Ok(reference) => reference,
+                Err(_) => return Ok(Source::Quarantine),
+            };
+        if reference.validate().is_err() {
+            return Ok(Source::Quarantine);
+        }
+        if header.ready != 1 {
+            return Ok(Source::Retry);
+        }
+        let Some(expected_revision) = row
+            .source_version
+            .strip_prefix("revision:")
+            .and_then(|v| v.parse::<i64>().ok())
+        else {
+            return Ok(Source::Quarantine);
+        };
+        if row.source_version != format!("revision:{expected_revision}") {
+            return Ok(Source::Quarantine);
+        }
+        if let Some(revision) = compaction_source_revision::Entity::find_by_id(&row.source_id)
+            .one(&self.connection)
+            .await?
+        {
+            if revision.revision != expected_revision || revision.turn_id != row.turn_id {
+                return Ok(Source::Quarantine);
+            }
+        }
+
+        let canonical = queries::canonical_preview()
+            .and_where(col("c", turn_llm_context::Column::Id).eq(&row.source_id))
+            .and_where(col("c", turn_llm_context::Column::TurnId).eq(&row.turn_id))
+            .and_where(col("v", compaction_source_revision::Column::Revision).eq(expected_revision))
+            .and_where(col("th", thread_entity::Column::WorkspaceId).eq(&header.workspace_id))
+            .to_owned();
+        let payload = turn_llm_context::Entity::find_by_id(&row.source_id)
+            .select_only()
+            .column(turn_llm_context::Column::Payload)
+            .filter(Expr::exists(canonical))
+            .filter(
+                super::html_preview_io_work::io_bytes(
+                    self.connection.get_database_backend(),
+                    Expr::col(turn_llm_context::Column::Payload),
+                )
+                .lte(524288),
+            )
+            .into_tuple::<String>()
+            .one(&self.connection)
+            .await?;
+        if let Some(payload) = payload {
+            return Ok(Source::Ready(HtmlPreviewArchiveWitness {
+                manifest: row.manifest_id.clone(),
+                ordinal: row.ordinal,
+                workspace: header.workspace_id.clone(),
+                owner_thread: header.owner_thread.clone(),
+                reference,
+                payload,
+            }));
+        }
+        // Absence in the canonical join is not evidence of invalid authority.
+        // Restore can publish revision, body, turn and thread in separate steps.
+        let Some((turn_id, kind, tool)) = turn_llm_context::Entity::find_by_id(&row.source_id)
+            .select_only()
+            .columns([
+                turn_llm_context::Column::TurnId,
+                turn_llm_context::Column::Source,
+                turn_llm_context::Column::ToolName,
+            ])
+            .into_tuple::<(String, String, Option<String>)>()
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(Source::Retry);
+        };
+        if turn_id != row.turn_id
+            || kind != "tool_result_v2"
+            || tool.as_deref() != Some("html_preview")
+        {
+            return Ok(Source::Quarantine);
+        }
+        let Some(thread_id) = turn_entity::Entity::find_by_id(&turn_id)
+            .select_only()
+            .column(turn_entity::Column::ThreadId)
+            .into_tuple::<String>()
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(Source::Retry);
+        };
+        let Some(workspace) = thread_entity::Entity::find_by_id(&thread_id)
+            .select_only()
+            .column(thread_entity::Column::WorkspaceId)
+            .into_tuple::<String>()
+            .one(&self.connection)
+            .await?
+        else {
+            return Ok(Source::Retry);
+        };
+        if workspace != header.workspace_id || thread_id != reference.source_thread {
+            return Ok(Source::Quarantine);
+        }
+        let length = turn_llm_context::Entity::find_by_id(&row.source_id)
+            .select_only()
+            .column_as(
+                super::html_preview_io_work::io_bytes(
+                    self.connection.get_database_backend(),
+                    Expr::col(turn_llm_context::Column::Payload),
+                ),
+                "bytes",
+            )
+            .into_tuple::<i64>()
+            .one(&self.connection)
+            .await?;
+        Ok(if length.is_some_and(|n| n > 524288) {
+            Source::Quarantine
+        } else {
+            Source::Retry
+        })
+    }
+
+    pub async fn load_html_preview_io_copies(
+        &self,
+        claim: &crate::HtmlPreviewIoClaim,
+    ) -> Result<crate::HtmlPreviewIoSource<(String, String)>> {
+        use crate::HtmlPreviewIoSource as Source;
+        ensure!(claim.row.family == "copies", "invalid copies family");
+        if !claim.has_valid_point_locator() {
+            return Ok(Source::Quarantine);
+        }
+        // Header and length are compact; oversized metadata is never materialized.
+        let header = artifact::Entity::find_by_id(claim.source_id())
+            .select_only()
+            .column(artifact::Column::WorkspaceId)
+            .column(artifact::Column::CurrentVersionId)
+            .column_as(
+                super::html_preview_io_work::io_bytes(
+                    self.connection.get_database_backend(),
+                    Expr::col(artifact::Column::MetadataJson),
+                ),
+                "bytes",
+            )
+            .into_tuple::<(String, Option<String>, i64)>()
+            .one(&self.connection)
+            .await?;
+        let Some((workspace, current, length)) = header else {
+            return Ok(Source::Obsolete);
+        };
+        if workspace != claim.row.workspace_id {
+            return Ok(Source::Quarantine);
+        }
+        if current.is_some() {
+            return Ok(Source::Obsolete);
+        }
+        if length > 1048576 {
+            return Ok(Source::Quarantine);
+        }
+        let metadata = artifact::Entity::find_by_id(claim.source_id())
+            .select_only()
+            .column(artifact::Column::MetadataJson)
+            .filter(artifact::Column::WorkspaceId.eq(&workspace))
+            .filter(artifact::Column::CurrentVersionId.is_null())
+            .filter(artifact::Column::CreatedByKind.eq("tool"))
+            .filter(artifact::Column::CreatedByActorId.eq("html_preview"))
+            .filter(
+                super::html_preview_io_work::io_bytes(
+                    self.connection.get_database_backend(),
+                    Expr::col(artifact::Column::MetadataJson),
+                )
+                .lte(1048576),
+            )
+            .into_tuple::<String>()
+            .one(&self.connection)
+            .await?;
+        let Some(metadata) = metadata else {
+            return Ok(Source::Retry);
+        };
+        let parsed: Value = match serde_json::from_str(&metadata) {
+            Ok(value) => value,
+            Err(_) => return Ok(Source::Quarantine),
+        };
+        if parsed["htmlTool"]["retention"] != "released"
+            || parsed["htmlTool"]["releasedCopies"]
+                .as_array()
+                .is_none_or(|a| a.is_empty())
+        {
+            return Ok(Source::Obsolete);
+        }
+        Ok(Source::Ready((workspace, metadata)))
+    }
+}
+
+impl CrudStore {
+    /// Future GC eligibility for currently unowned temporary blobs. Source
+    /// changes can invalidate ownership and must wake maintenance separately.
+    pub async fn html_preview_gc_deadline(
+        &self,
+        grace_ms: i64,
+        pass_cutoff_ms: i64,
+    ) -> Result<Option<i64>> {
+        let cutoff = chrono::DateTime::from_timestamp_millis(pass_cutoff_ms)
+            .ok_or_else(|| anyhow::anyhow!("invalid artifact GC cutoff"))?
+            .fixed_offset();
+        let created = artifact_blob::Entity::find()
+            .select_only()
+            .column(artifact_blob::Column::CreatedAt)
+            .filter(artifact_blob::Column::CreatedAt.gt(cutoff))
+            .filter(
+                json_field(
+                    Expr::col(artifact_blob::Column::MetadataJson),
+                    "$.htmlToolTemporary",
+                )
+                .eq(1),
+            )
+            .filter(queries::blob_has_owners("artifact_blob").not())
+            .order_by_asc(artifact_blob::Column::CreatedAt)
+            .into_tuple::<chrono::DateTime<chrono::FixedOffset>>()
+            .one(&self.connection)
+            .await?;
+        Ok(created.map(|at| {
+            let ms = at.timestamp_millis().saturating_add(grace_ms);
+            ms.div_euclid(1000) + i64::from(ms.rem_euclid(1000) != 0)
+        }))
+    }
+}
+
+impl CrudStore {
+    /// Capture once per keyset pass. Later source commits remain invalidations
+    /// for the following pass, including changes behind its current cursor.
+    pub async fn html_preview_artifact_frontier(&self) -> Result<String> {
+        Ok(artifact::Entity::find()
+            .select_only()
+            .column(artifact::Column::Id)
+            .order_by_desc(artifact::Column::Id)
+            .into_tuple::<String>()
+            .one(&self.connection)
+            .await?
+            .unwrap_or_default())
+    }
+    pub async fn html_preview_blob_frontier(&self) -> Result<String> {
+        Ok(artifact_blob::Entity::find()
+            .select_only()
+            .column(artifact_blob::Column::Id)
+            .order_by_desc(artifact_blob::Column::Id)
+            .into_tuple::<String>()
+            .one(&self.connection)
+            .await?
+            .unwrap_or_default())
+    }
+    pub async fn html_preview_witness_frontier(&self) -> Result<(String, i64)> {
+        Ok(frozen_result::Entity::find()
+            .select_only()
+            .columns([
+                frozen_result::Column::ManifestId,
+                frozen_result::Column::Ordinal,
+            ])
+            .order_by_desc(frozen_result::Column::ManifestId)
+            .order_by_desc(frozen_result::Column::Ordinal)
+            .into_tuple::<(String, i64)>()
+            .one(&self.connection)
+            .await?
+            .unwrap_or_default())
+    }
+}

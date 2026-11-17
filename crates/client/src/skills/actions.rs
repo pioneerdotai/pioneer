@@ -426,6 +426,8 @@ mod tests {
         health_status: &str,
     ) -> SkillListItem {
         SkillListItem {
+            plugin_owner: None,
+            package_owner: None,
             skill_id: test_id(slug, source_kind),
             pack: None,
             owner: None,

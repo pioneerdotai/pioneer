@@ -24,6 +24,8 @@ pub enum AttemptPurpose {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FailureKind {
+    /// Confirmed provider context/payload overflow; only the runner may shrink.
+    InputOverflow,
     Transient,
     Permanent,
     InvalidCompletion,
@@ -105,6 +107,12 @@ pub struct RunnerState {
     #[serde(default)]
     pub portion_attempts: u8,
     pub corrections: u8,
+    /// Overflow allowance belongs to this source portion, survives restart and
+    /// admitted resume, and resets only when a candidate advances coverage.
+    #[serde(default)]
+    pub overflow_rejections: u8,
+    #[serde(default)]
+    pub overflow_input_ceiling: Option<u64>,
     pub target_tokens: u64,
     /// Text representation used by persisted character cursors. Version zero
     /// is the legacy canonical payload and is retained for pre-upgrade runs.
@@ -154,6 +162,8 @@ impl RunnerState {
             retries: 0,
             portion_attempts: 0,
             corrections: 0,
+            overflow_rejections: 0,
+            overflow_input_ceiling: None,
             target_tokens,
             source_text_projection_version: COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION,
             cursor: SourceCursor::default(),
@@ -162,6 +172,11 @@ impl RunnerState {
                 purpose: AttemptPurpose::Portion,
             },
         })
+    }
+    /// Local admission for the next representation, in addition to model fits.
+    /// Integrations must refuse preparation if protected framing cannot fit.
+    pub fn input_ceiling(&self) -> Option<u64> {
+        self.overflow_input_ceiling
     }
     pub fn action(&self, now_ms: u64) -> RunnerAction {
         if matches!(
@@ -206,9 +221,18 @@ impl RunnerState {
             } else {
                 self.portion_attempts
             };
-        anyhow::ensure!(consumed < 3, "portion attempt limit exhausted");
+        anyhow::ensure!(
+            self.overflow_rejections <= 4 && consumed >= self.overflow_rejections,
+            "invalid persisted overflow retry counters"
+        );
+        anyhow::ensure!(
+            consumed.saturating_sub(self.overflow_rejections) < 3,
+            "portion attempt limit exhausted"
+        );
         let mut next = self.next()?;
-        next.portion_attempts = consumed + 1;
+        next.portion_attempts = consumed
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("portion attempt counter overflow"))?;
         next.attempts = next
             .attempts
             .checked_add(1)
@@ -247,14 +271,46 @@ impl RunnerState {
             next.phase = RunnerPhase::Failed {
                 kind: FailureKind::Deadline,
             };
-        } else if next.portion_attempts < 3
+        } else if kind == FailureKind::InputOverflow {
+            // The persisted attempt observation is the rejected representation.
+            // Each admitted retry must be strictly smaller than that request;
+            // four steps bound overflow work even across restart/resume.
+            let rejected = self
+                .observation
+                .as_ref()
+                .filter(|observation| observation.number == self.attempts)
+                .map(|observation| observation.estimated_input_tokens)
+                .filter(|size| self.input_ceiling().is_none_or(|ceiling| *size <= ceiling));
+            let step = [85_u64, 70, 50, 35]
+                .get(self.overflow_rejections as usize)
+                .copied();
+            let ceiling = rejected.zip(step).and_then(|(size, share)| {
+                let smaller = (size as u128 * share as u128 / 100) as u64;
+                (smaller > 0 && smaller < size).then_some(smaller)
+            });
+            if let Some(ceiling) = ceiling {
+                next.overflow_rejections = self.overflow_rejections + 1;
+                next.overflow_input_ceiling = Some(
+                    self.overflow_input_ceiling
+                        .map_or(ceiling, |old| old.min(ceiling)),
+                );
+                next.phase = RunnerPhase::Ready { purpose };
+            } else {
+                next.phase = RunnerPhase::Failed { kind };
+            }
+        } else if next
+            .portion_attempts
+            .saturating_sub(self.overflow_rejections)
+            < 3
             && (kind == FailureKind::InvalidCompletion
                 || (kind == FailureKind::Transient && self.retries < 2))
         {
             let retry = if kind == FailureKind::Transient {
                 self.retries
             } else {
-                next.portion_attempts - 1
+                next.portion_attempts
+                    .saturating_sub(self.overflow_rejections)
+                    .saturating_sub(1)
             };
             let delay = [2_000_u64, 8_000][retry as usize].max(retry_after_ms.unwrap_or(0));
             let not_before_ms = now_ms.saturating_add(delay);
@@ -317,6 +373,8 @@ impl RunnerState {
         );
         let mut next = self.next()?;
         next.portion_attempts = 0;
+        next.overflow_rejections = 0;
+        next.overflow_input_ceiling = None;
         next.cursor = cursor;
         next.previous_checkpoint = Some(checkpoint.clone());
         next.phase = RunnerPhase::Candidate {
@@ -415,7 +473,7 @@ impl RunnerState {
         );
         let mut next = self.next()?;
         next.deadline_ms = deadline_ms;
-        next.portion_attempts = 0;
+        next.portion_attempts = next.overflow_rejections;
         next.phase = next.resume_phase.take().unwrap_or(RunnerPhase::Ready {
             purpose: AttemptPurpose::Portion,
         });
@@ -432,10 +490,9 @@ impl RunnerState {
         ) && self.cursor > SourceCursor::default()
             && self.previous_checkpoint.is_some()
             && (self.resume_phase.is_some() || self.corrections == 0)
-            && self
-                .observation
-                .as_ref()
-                .is_none_or(|o| o.failure.is_none())
+            && self.observation.as_ref().is_none_or(|o| {
+                o.failure.is_none() || o.failure == Some(FailureKind::InputOverflow)
+            })
     }
     /// A later admission supplies its existing request budget. Never extend the
     /// interrupted request or reset provider retry/correction budgets. Only
@@ -447,7 +504,7 @@ impl RunnerState {
         );
         let mut next = self.next()?;
         next.deadline_ms = deadline_ms;
-        next.portion_attempts = 0;
+        next.portion_attempts = next.overflow_rejections;
         next.phase = next.resume_phase.take().unwrap_or_else(|| {
             if legacy_final {
                 RunnerPhase::Candidate {
@@ -477,6 +534,195 @@ impl RunnerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn overflow_allowance_does_not_expand_ordinary_invalid_or_transient_retry_limit() {
+        let mut current = state();
+        let kinds = [
+            FailureKind::InputOverflow,
+            FailureKind::InvalidCompletion,
+            FailureKind::InputOverflow,
+            FailureKind::Transient,
+            FailureKind::InputOverflow,
+            FailureKind::InputOverflow,
+            FailureKind::InvalidCompletion,
+        ];
+        let mut now = 0_u64;
+        for kind in kinds {
+            now = match current.phase {
+                RunnerPhase::Backoff { not_before_ms, .. } => now.max(not_before_ms),
+                _ => now.saturating_add(1),
+            };
+            current = restart(&current).claim(now).unwrap();
+            current.observation = Some(AttemptObservation {
+                number: current.attempts,
+                started_ms: now,
+                finished_ms: None,
+                estimated_input_tokens: current.input_ceiling().unwrap_or(100_000),
+                output_cap: current.target_tokens,
+                input_tokens: None,
+                output_tokens: None,
+                completion: None,
+                failure: None,
+                diagnostic: None,
+            });
+            current = current.attempt_failed(kind, now, None).unwrap();
+        }
+        assert_eq!(
+            current.phase,
+            RunnerPhase::Failed {
+                kind: FailureKind::InvalidCompletion
+            }
+        );
+        assert_eq!(current.attempts, 7);
+        assert_eq!(current.overflow_rejections, 4);
+        assert_eq!(current.retries, 1);
+        assert!(restart(&current).claim(100_000).is_err());
+    }
+
+    #[test]
+    fn confirmed_overflow_shrinks_finitely_across_restart_without_advancing_coverage() {
+        let mut current = state();
+        let mut input = 10_000;
+        for (index, ceiling) in [8_500, 5_950, 2_975, 1_041].into_iter().enumerate() {
+            current = restart(&current).claim(index as u64).unwrap();
+            current.observation = Some(AttemptObservation {
+                number: current.attempts,
+                started_ms: index as u64,
+                finished_ms: None,
+                estimated_input_tokens: input,
+                output_cap: current.target_tokens,
+                input_tokens: None,
+                output_tokens: None,
+                completion: None,
+                failure: None,
+                diagnostic: None,
+            });
+            current = restart(&current)
+                .attempt_failed(FailureKind::InputOverflow, index as u64, None)
+                .unwrap();
+            assert_eq!(current.input_ceiling(), Some(ceiling));
+            assert!(ceiling < input);
+            assert_eq!(current.cursor, SourceCursor::default());
+            assert_eq!(current.previous_checkpoint, None);
+            assert_eq!(current.retries, 0);
+            assert_eq!(current.deadline_ms, 900_000);
+            input = ceiling;
+        }
+        let mut final_call = restart(&current).claim(5).unwrap();
+        final_call.observation = Some(AttemptObservation {
+            number: final_call.attempts,
+            started_ms: 5,
+            finished_ms: None,
+            estimated_input_tokens: input,
+            output_cap: final_call.target_tokens,
+            input_tokens: None,
+            output_tokens: None,
+            completion: None,
+            failure: None,
+            diagnostic: None,
+        });
+        let failed = final_call
+            .attempt_failed(FailureKind::InputOverflow, 6, None)
+            .unwrap();
+        assert_eq!(failed.attempts, 5);
+        assert_eq!(
+            failed.phase,
+            RunnerPhase::Failed {
+                kind: FailureKind::InputOverflow
+            }
+        );
+        assert_eq!(restart(&failed).action(7), RunnerAction::Terminal);
+        assert!(failed.claim(7).is_err());
+        assert!(!failed.can_resume_invalid_completion());
+        assert!(!failed.can_resume_deadline());
+    }
+
+    #[test]
+    fn overflow_ceiling_survives_admitted_resume_and_resets_only_on_accepted_progress() {
+        let cursor = SourceCursor {
+            unit: 1,
+            ..Default::default()
+        };
+        let ready = state()
+            .claim(0)
+            .unwrap()
+            .candidate(1, "saved".into(), cursor, false, 1)
+            .unwrap()
+            .candidate_checked(false)
+            .unwrap();
+        let mut attempt = ready.claim(2).unwrap();
+        attempt.observation = Some(AttemptObservation {
+            number: attempt.attempts,
+            started_ms: 2,
+            finished_ms: None,
+            estimated_input_tokens: 1000,
+            output_cap: attempt.target_tokens,
+            input_tokens: None,
+            output_tokens: None,
+            completion: None,
+            failure: None,
+            diagnostic: None,
+        });
+        let smaller = attempt
+            .attempt_failed(FailureKind::InputOverflow, 3, None)
+            .unwrap();
+        let expired = restart(&smaller).terminate(FailureKind::Deadline).unwrap();
+        let resumed = expired.resume_deadline(1_800_000, false).unwrap();
+        assert_eq!(resumed.input_ceiling(), Some(850));
+        assert_eq!(resumed.overflow_rejections, 1);
+        assert_eq!(resumed.cursor, cursor);
+        let stopped = resumed.terminate(FailureKind::Cancelled).unwrap();
+        assert!(stopped.claim(4).is_err());
+        let next = resumed.claim(4).unwrap();
+        let accepted = next
+            .candidate(
+                next.attempts,
+                "smaller".into(),
+                SourceCursor {
+                    unit: 2,
+                    ..Default::default()
+                },
+                false,
+                5,
+            )
+            .unwrap();
+        assert_eq!(accepted.input_ceiling(), None);
+        assert_eq!(accepted.overflow_rejections, 0);
+        assert_eq!(accepted.cursor.unit, 2);
+        // An unclassified/permanent refusal never grants a smaller request.
+        let refused = attempt
+            .attempt_failed(FailureKind::Permanent, 3, None)
+            .unwrap();
+        assert_eq!(refused.input_ceiling(), None);
+        assert_eq!(refused.action(4), RunnerAction::Terminal);
+    }
+
+    #[test]
+    fn legacy_runner_json_and_overflow_without_size_fail_closed() {
+        let mut legacy = serde_json::to_value(state()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("overflow_rejections");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("overflow_input_ceiling");
+        let restored: RunnerState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.input_ceiling(), None);
+        let mut corrupt = restored.clone();
+        corrupt.overflow_rejections = u8::MAX;
+        assert!(corrupt.claim(0).is_err());
+        corrupt.overflow_rejections = 1;
+        assert!(corrupt.claim(0).is_err()); // rejected count cannot exceed claims
+        let failed = restored
+            .claim(0)
+            .unwrap()
+            .attempt_failed(FailureKind::InputOverflow, 1, None)
+            .unwrap();
+        assert_eq!(failed.action(2), RunnerAction::Terminal);
+    }
+
     #[test]
     fn deadline_resume_keeps_final_candidate_and_rejects_nonrecoverable_failures() {
         let candidate = state()

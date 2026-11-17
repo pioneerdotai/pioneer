@@ -169,6 +169,18 @@ description = "Модели Gemini от Google AI"
 title = "GLM"
 description = "GLM и Zhipu-совместимые модели"
 
+[providers.catalog.zai]
+title = "Z.AI"
+description = "Модели GLM через глобальный API Z.AI"
+
+[providers.catalog.glm-coding]
+title = "GLM Coding Plan"
+description = "Подписка GLM для программирования через API для Китая"
+
+[providers.catalog.zai-coding]
+title = "Z.AI Coding Plan"
+description = "Подписка GLM для программирования через глобальный API Z.AI"
+
 [providers.catalog.groq]
 title = "Groq"
 description = "Быстрый вывод на оборудовании Groq"
@@ -192,6 +204,10 @@ description = "GPT и другие модели OpenAI"
 [providers.catalog.openrouter]
 title = "OpenRouter"
 description = "Маршрутизатор для множества провайдеров моделей"
+
+[providers.catalog.vercel-ai-gateway]
+title = "Vercel AI Gateway"
+description = "Доступ к моделям через Vercel AI Gateway"
 
 [providers.catalog.telnyx]
 title = "Telnyx"

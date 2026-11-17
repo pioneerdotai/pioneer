@@ -85,17 +85,15 @@ pub struct ClientActiveThreadSnapshot {
 
 pub fn open_thread(
     core: &ClientCore,
-    runtime: &ClientRuntime,
     request: ClientActiveThreadOpenRequest,
 ) -> anyhow::Result<()> {
-    core.open_thread(&runtime.ws_command_sender(), request.thread)
+    core.open_thread(request.thread)
 }
 pub fn open_thread_by_id(
     core: &ClientCore,
-    runtime: &ClientRuntime,
     request: ClientActiveThreadOpenByIdRequest,
 ) -> anyhow::Result<()> {
-    core.open_thread_by_id(&runtime.ws_command_sender(), &request.thread_id)
+    core.open_thread_by_id(&request.thread_id)
 }
 pub fn open_or_create_new_thread(
     core: &ClientCore,

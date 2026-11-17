@@ -25,6 +25,7 @@ struct Owner {
 #[derive(Default)]
 pub(crate) struct ContextCompactionCoordinator {
     owners: Arc<Mutex<HashMap<(String, String), Weak<Owner>>>>,
+    released: pioneer_sqlite::WorkSignal,
 }
 struct OwnerReference {
     owner: Arc<Owner>,
@@ -51,7 +52,8 @@ impl Drop for OwnerReference {
 pub(crate) struct ContextCompactionLease {
     reference: OwnerReference,
     cancellation: CancellationToken,
-    _guard: OwnedMutexGuard<()>,
+    _guard: Option<OwnedMutexGuard<()>>,
+    released: pioneer_sqlite::WorkSignal,
 }
 impl ContextCompactionLease {
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -62,9 +64,14 @@ impl Drop for ContextCompactionLease {
     fn drop(&mut self) {
         self.cancellation.cancel();
         self.reference.owner.active.send_replace(None);
+        drop(self._guard.take());
+        self.released.notify();
     }
 }
 impl ContextCompactionCoordinator {
+    pub(crate) fn release_subscription(&self) -> pioneer_sqlite::WorkSubscription {
+        self.released.subscribe()
+    }
     pub(crate) async fn acquire(
         &self,
         workspace: &str,
@@ -131,7 +138,8 @@ impl ContextCompactionCoordinator {
         Ok(Some(ContextCompactionLease {
             reference,
             cancellation: child,
-            _guard: guard,
+            _guard: Some(guard),
+            released: self.released.clone(),
         }))
     }
 }
@@ -142,6 +150,8 @@ mod tests {
     #[tokio::test]
     async fn foreground_waits_for_cancelled_background_cleanup_before_entering() {
         let coordinator = Arc::new(ContextCompactionCoordinator::default());
+        let mut released = coordinator.release_subscription();
+        assert!(futures_util::FutureExt::now_or_never(released.changed()).is_none());
         let parent = CancellationToken::new();
         let background = coordinator
             .acquire("ws", "thread", ContextWorkPriority::Background, &parent)
@@ -172,6 +182,11 @@ mod tests {
             "cleanup owner still holds the boundary"
         );
         drop(background);
+        assert!(
+            futures_util::FutureExt::now_or_never(released.changed()).is_some(),
+            "release must wake a parked background owner after capacity is free"
+        );
+
         let foreground = incoming.await.unwrap();
         assert!(!foreground.cancellation().is_cancelled());
         assert!(

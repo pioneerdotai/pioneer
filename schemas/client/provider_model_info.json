@@ -12,6 +12,22 @@
     "capabilities": {
       "$ref": "#/$defs/ProviderModelCapabilities"
     },
+    "context_authority": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "context_tiers": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProviderContextTiers"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "created": {
       "type": [
         "integer",
@@ -77,6 +93,256 @@
           "type": "null"
         }
       ]
+    },
+    "service_modes": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "const": "unknown",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "const": "malformed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "const": "known",
+                  "type": "string"
+                },
+                "modes": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "status": {
+                            "const": "malformed",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "status": {
+                            "const": "unmapped",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "status": {
+                            "const": "parsed",
+                            "type": "string"
+                          },
+                          "descriptor": {
+                            "type": "object",
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "parameters": {
+                                "oneOf": [
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "const": "neutral",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "const": "open_ai_standard",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "const": "anthropic_standard",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "const": "bedrock_standard",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "const": "open_ai_pro",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "const": "bedrock_nested_ultrafast",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "const": "open_ai_tier",
+                                        "type": "string"
+                                      },
+                                      "tier": {
+                                        "enum": [
+                                          "priority",
+                                          "flex",
+                                          "ultrafast"
+                                        ],
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind",
+                                      "tier"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "const": "anthropic_fast",
+                                        "type": "string"
+                                      },
+                                      "beta": {
+                                        "type": [
+                                          "string",
+                                          "null"
+                                        ]
+                                      }
+                                    },
+                                    "required": [
+                                      "kind"
+                                    ],
+                                    "additionalProperties": false
+                                  }
+                                ]
+                              },
+                              "source_provider": {
+                                "type": "string"
+                              },
+                              "source_model": {
+                                "type": "string"
+                              },
+                              "source_api": {
+                                "type": "string"
+                              },
+                              "source_url": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "cost": true
+                            },
+                            "required": [
+                              "id",
+                              "label",
+                              "parameters",
+                              "source_provider",
+                              "source_model",
+                              "source_api"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "descriptor"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "status",
+                "modes"
+              ]
+            }
+          ]
+        }
+      ]
     }
   },
   "required": [
@@ -86,6 +352,72 @@
     "capabilities"
   ],
   "$defs": {
+    "ProviderContextTiers": {
+      "description": "Authority-scoped, normalized context choices. Absence on a discovery DTO means unavailable metadata, distinct from a confirmed model without tiers.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "no_tiers"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "excluded"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "invalid"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "tiered"
+            },
+            "windows": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              }
+            },
+            "price_order_confirmed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "status",
+            "windows",
+            "price_order_confirmed"
+          ]
+        }
+      ]
+    },
     "ProviderModelCapabilities": {
       "type": "object",
       "properties": {
@@ -329,7 +661,6 @@
       "enum": [
         "provider_metadata",
         "cli_metadata",
-        "static_registry",
         "config_override",
         "unknown"
       ]

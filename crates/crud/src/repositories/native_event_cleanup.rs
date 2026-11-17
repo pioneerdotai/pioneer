@@ -329,3 +329,22 @@ pub(crate) async fn bootstrap(db: &SqliteDatabase) -> Result<NativeEventCleanupB
 #[cfg(test)]
 #[path = "native_event_cleanup_tests.rs"]
 mod tests;
+
+impl crate::CrudStore {
+    /// Only queued retries have a clock obligation; waiting jobs require a
+    /// change to their durable dependencies, whose triggers requeue them.
+    pub async fn native_event_cleanup_deadline(&self) -> Result<Option<i64>> {
+        let due = job::Entity::find()
+            .select_only()
+            .column(job::Column::AvailableAt)
+            .filter(job::Column::State.eq("queued"))
+            .filter(job::Column::AvailableAt.gt(0_i64))
+            .order_by_asc(job::Column::AvailableAt)
+            .into_tuple::<i64>()
+            .one(&self.connection)
+            .await?;
+        Ok(due.map(|micros| {
+            micros.div_euclid(1_000_000) + i64::from(micros.rem_euclid(1_000_000) != 0)
+        }))
+    }
+}

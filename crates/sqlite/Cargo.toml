@@ -9,7 +9,9 @@ authors.workspace = true
 test-support = []
 
 [dependencies]
+sqlite-vec = "=0.1.6"
 anyhow.workspace = true
+fs4.workspace = true
 pioneer-observability.workspace = true
 async-trait.workspace = true
 env_logger.workspace = true

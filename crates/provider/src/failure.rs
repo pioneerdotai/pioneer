@@ -186,6 +186,45 @@ pub fn provider_stream_incomplete(error: &anyhow::Error) -> Option<ProviderStrea
         .find_map(|cause| cause.downcast_ref::<ProviderStreamIncomplete>().copied())
 }
 
+/// Internal carrier for HTTP response facts across fallible body diagnostics.
+/// The original diagnostic remains in the chain until endpoint redaction drops it.
+#[derive(Debug)]
+pub(crate) struct ProviderHttpFailure {
+    pub(crate) classification: ProviderFailureClassification,
+    pub(crate) source: anyhow::Error,
+}
+
+impl std::fmt::Display for ProviderHttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for ProviderHttpFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+pub(crate) fn classify_http_error(error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+    if let Some(failure) = error.downcast_ref::<ProviderHttpFailure>() {
+        return Some(failure.classification.clone());
+    }
+    if let Some(oversized) = error.downcast_ref::<crate::types::ProviderHttpErrorBodyTooLarge>() {
+        return Some(classify_http_error_body_too_large(oversized.status));
+    }
+    let request = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())?;
+    let status = request.status().map(|status| status.as_u16())?;
+    let class =
+        classify_provider_failure_class("", ProviderFailureStage::Connect, Some(status), None);
+    let mut classification = ProviderFailureClassification::new(class);
+    classification.http_status = Some(status);
+    classification.is_network_error = true;
+    Some(classification)
+}
+
 /// A bounded error body has no safe provider detail to classify. Preserve the
 /// existing status-only fallback used by agent for this typed transport error.
 pub fn classify_http_error_body_too_large(status: u16) -> ProviderFailureClassification {

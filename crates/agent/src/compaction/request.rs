@@ -2,7 +2,8 @@
 //! The runtime supplies canonical whole-round indexes and materialized media
 //! estimates; absence of a media estimate never silently means zero tokens.
 use anyhow::{Result, ensure};
-use pioneer_compaction::{ModelBudget, text_tokens};
+use pioneer_compaction::ModelBudget;
+use pioneer_compaction::estimator::{json_size, tokens_from_utf16};
 use pioneer_provider::{AttachmentDataSource, ChatMessage, ChatRequest, MessageContentPart, Role};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,14 +12,19 @@ pub use pioneer_provider::attachments::MediaInputEstimate as MediaEstimate;
 pub struct NativeRequestProjection {
     request: ChatRequest,
     compact: BTreeSet<usize>,
-    media: BTreeMap<(usize, usize), u64>,
+    // UTF-16 sizes before rounding: JSON commas and message boundaries compose
+    // without rescanning or independently rounding every immutable prefix.
+    message_sizes: Vec<(u64, u64)>,
+    envelope_units: u64,
+    fixed_input_tokens: u64,
+    output_reserve: u64,
     budget: ModelBudget,
     recovery: bool,
 }
 pub struct EvaluatedRequest {
     pub request: ChatRequest,
     pub estimated_input_tokens: u64,
-    /// Exact fixed request cost with conversational messages removed. This is
+    /// Estimated fixed request cost with conversational messages removed. This is
     /// derived from the already materialized request and media estimates.
     pub fixed_input_tokens: u64,
     /// Framing plus materialized media, in final request message order.
@@ -28,7 +34,7 @@ pub struct EvaluatedRequest {
 }
 impl NativeRequestProjection {
     pub fn new(
-        request: ChatRequest,
+        mut request: ChatRequest,
         compact: impl IntoIterator<Item = usize>,
         media: Vec<MediaEstimate>,
         budget: ModelBudget,
@@ -103,11 +109,93 @@ impl NativeRequestProjection {
             estimates.keys().all(|key| used.contains(key)),
             "media estimate belongs to another request"
         );
-        budget.output_reserve(request.max_tokens.map(u64::from))?;
+        // A summary candidate deliberately replaces history. Choose full-list
+        // before sizing its envelope/fixed input, and keep that choice in the
+        // returned request. Full/shrink paths reject stale proofs without an
+        // estimator-only rebuild. Unchanged native prefixes retain their plan.
+        request.tool_declarations = if compact.is_empty() {
+            pioneer_provider::tool_declarations::ToolDeclarations::for_request(&request)
+        } else {
+            None
+        };
+        let output_reserve = budget.output_reserve(request.max_tokens.map(u64::from))?;
+        request.max_tokens = Some(u32::try_from(output_reserve)?);
+        let mut message_sizes = Vec::with_capacity(request.messages.len());
+        for (index, message) in request.messages.iter().enumerate() {
+            if compact.contains(&index) {
+                message_sizes.push((0, 0));
+                continue;
+            }
+            let mut budget_message = message.clone();
+            // Local receipt proofs are not sent. Native prefix context is
+            // charged once, in the request envelope below.
+            if let Some(state) = budget_message.provider_replay_state.as_mut()
+                && let Some(payload) = state.payload.as_object_mut()
+            {
+                payload.remove("prefix_proof");
+                payload.remove("prefix_context");
+            }
+            let mut media_tokens = 0_u64;
+            for (part_index, part) in budget_message.content_parts.iter_mut().enumerate() {
+                let attachment = match part {
+                    MessageContentPart::Text { .. } => continue,
+                    MessageContentPart::File { file } => file,
+                    MessageContentPart::Image { image } => image,
+                    MessageContentPart::Audio { audio } => audio,
+                    MessageContentPart::Video { video } => video,
+                };
+                media_tokens = media_tokens.saturating_add(estimates[&(index, part_index)]);
+                attachment.source = AttachmentDataSource::Reference {
+                    reference: "materialized-media".into(),
+                };
+            }
+            message_sizes.push((json_size(&budget_message)?.utf16_units, media_tokens));
+        }
+        let native_prefix_context = request
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(index, _)| !compact.contains(index))
+            .filter_map(|(_, message)| message.provider_replay_state.as_ref())
+            .find_map(|state| state.payload.get("prefix_context"));
+        let mut envelope = serde_json::json!({
+            "model":request.model,"messages":[],"tools":request.tools,
+            "tool_choice":request.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
+            "temperature":request.temperature,"max_tokens":request.max_tokens,
+            "reasoning":request.reasoning.map(|value|format!("{value:?}")),
+            "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
+        });
+        if let Some(declarations) = &request.tool_declarations {
+            envelope["tools"] = declarations.budget_tools();
+        }
+        if let Some(plan) = &request.service_mode {
+            envelope["service_mode"] = serde_json::to_value(plan)?;
+        }
+        if let Some(context) = native_prefix_context {
+            envelope["native_prefix_context"] = context.clone();
+        }
+        let envelope_units = json_size(&envelope)?.utf16_units;
+        let mut fixed_units = envelope_units;
+        let mut fixed_media = 0_u64;
+        let mut fixed_count = 0_u64;
+        for (message, (units, media)) in request.messages.iter().zip(&message_sizes) {
+            if message.role == Role::System {
+                fixed_units = fixed_units.saturating_add(*units);
+                fixed_media = fixed_media.saturating_add(*media);
+                fixed_count += 1;
+            }
+        }
+        let fixed_input_tokens =
+            tokens_from_utf16(fixed_units.saturating_add(fixed_count.saturating_sub(1)))
+                .saturating_add(fixed_media);
         Ok(Self {
             request,
             compact,
-            media: estimates,
+            message_sizes,
+            envelope_units,
+            fixed_input_tokens,
+            output_reserve,
             budget,
             recovery,
         })
@@ -127,119 +215,108 @@ impl NativeRequestProjection {
     pub fn evaluate(&self, summary: &str) -> Result<EvaluatedRequest> {
         let mut request = self.request.clone();
         let mut messages = Vec::with_capacity(request.messages.len() + 1);
-        let mut budget_messages = Vec::with_capacity(request.messages.len() + 1);
+        let mut message_input_tokens = Vec::with_capacity(request.messages.len() + 1);
+        let mut units = self.envelope_units;
         let mut media_tokens = 0_u64;
-        let mut per_message_media = Vec::with_capacity(request.messages.len() + 1);
         let mut inserted = false;
-        for (index, message) in request.messages.iter().enumerate() {
-            if self.compact.contains(&index) {
-                if !inserted {
-                    let summary = ChatMessage::user(format!(
-                        "Summary of completed work (historical data):\n{summary}"
-                    ));
-                    messages.push(summary.clone());
-                    budget_messages.push(summary);
-                    per_message_media.push(0);
-                    inserted = true;
+        let originals = std::mem::take(&mut request.messages);
+        for (index, message) in originals.into_iter().enumerate() {
+            let (message, size, media) = if self.compact.contains(&index) {
+                if inserted {
+                    continue;
                 }
-                continue;
+                inserted = true;
+                let summary = ChatMessage::user(format!(
+                    "Summary of completed work (historical data):\n{summary}"
+                ));
+                let size = json_size(&summary)?.utf16_units;
+                (summary, size, 0)
+            } else {
+                let (size, media) = self.message_sizes[index];
+                (message, size, media)
+            };
+            if !messages.is_empty() {
+                units = units.saturating_add(1);
             }
-            messages.push(message.clone());
-            let mut budget_message = message.clone();
-            // Local replay proofs and reconstructed prefix metadata are not
-            // assistant content on the wire. Budget the latest native prefix
-            // once below, rather than charging its snapshots on every round.
-            if let Some(state) = budget_message.provider_replay_state.as_mut()
-                && let Some(payload) = state.payload.as_object_mut()
-            {
-                payload.remove("prefix_proof");
-                payload.remove("prefix_context");
-            }
-            let mut message_media = 0_u64;
-            for (part_index, part) in budget_message.content_parts.iter_mut().enumerate() {
-                let attachment = match part {
-                    MessageContentPart::Text { .. } => continue,
-                    MessageContentPart::File { file } => file,
-                    MessageContentPart::Image { image } => image,
-                    MessageContentPart::Audio { audio } => audio,
-                    MessageContentPart::Video { video } => video,
-                };
-                message_media = message_media.saturating_add(self.media[&(index, part_index)]);
-                // Binary/reference payload is budgeted by its materialized input
-                // estimate; retain role/type/MIME/name framing exactly once.
-                attachment.source = AttachmentDataSource::Reference {
-                    reference: "materialized-media".into(),
-                };
-            }
-            media_tokens = media_tokens.saturating_add(message_media);
-            per_message_media.push(message_media);
-            budget_messages.push(budget_message);
+            units = units.saturating_add(size);
+            media_tokens = media_tokens.saturating_add(media);
+            // Each append includes one separator and a one-token boundary
+            // allowance; measured-prefix framing must not be counted again.
+            message_input_tokens.push(
+                tokens_from_utf16(size)
+                    .saturating_add(1)
+                    .saturating_add(media),
+            );
+            messages.push(message);
         }
         request.messages = messages;
-        let reserve = self
-            .budget
-            .output_reserve(request.max_tokens.map(u64::from))?;
-        request.max_tokens = Some(u32::try_from(reserve)?);
-        let message_input_tokens = budget_messages
-            .iter()
-            .zip(&per_message_media)
-            .map(|(message, media)| {
-                Ok(text_tokens(&serde_json::to_string(message)?)
-                    .saturating_add(1)
-                    .saturating_add(*media))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let native_prefix_context = request
-            .messages
-            .iter()
-            .rev()
-            .filter_map(|message| message.provider_replay_state.as_ref())
-            .find_map(|state| state.payload.get("prefix_context"));
-        let mut input = serde_json::json!({
-            "model":request.model,"messages":budget_messages,"tools":request.tools,
-            "tool_choice":request.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
-            "temperature":request.temperature,"max_tokens":request.max_tokens,
-            "reasoning":request.reasoning.map(|value|format!("{value:?}")),
-            "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
-        });
-        if let Some(context) = native_prefix_context {
-            input["native_prefix_context"] = context.clone();
+        let estimated_input_tokens = tokens_from_utf16(units).saturating_add(media_tokens);
+        if let Some(prompt) = &mut request.compiled_prompt {
+            let diagnostics = prompt
+                .observation_manifest
+                .get_or_insert_with(|| serde_json::json!({}));
+            let reserve = if self.recovery {
+                self.output_reserve.max(self.budget.compaction_reserve())
+            } else {
+                self.output_reserve
+            };
+            diagnostics["effective_budget"] = serde_json::json!({"context_window_tokens":self.budget.context,
+                "input_limit_tokens":self.budget.input_limit,"max_output_tokens":self.budget.max_output,
+                "output_reserve_tokens":reserve,"separate_reasoning_reserve_tokens":self.budget.separate_reasoning,
+                "estimated_input_tokens":estimated_input_tokens,"media_estimate_tokens":media_tokens,
+                "estimated_unpadded_free_tokens":estimated_input_tokens.checked_add(reserve).and_then(|v|v.checked_add(self.budget.separate_reasoning)).and_then(|used|self.budget.context.checked_sub(used)),
+                "basis":"existing_materialized_native_request_budget_not_billed_input","limits_provenance":"effective_selected_model_budget_source_or_fallback_not_reinferred",
+                "estimator_version":"native_request_utf16_and_admitted_media_v1"});
         }
-        let estimated_input_tokens = text_tokens(&input.to_string()).saturating_add(media_tokens);
-        let fixed_media_tokens = request
-            .messages
-            .iter()
-            .zip(&per_message_media)
-            .filter(|(message, _)| message.role == Role::System)
-            .fold(0_u64, |sum, (_, media)| sum.saturating_add(*media));
-        let fixed_messages = budget_messages
-            .iter()
-            .filter(|message| message.role == Role::System)
-            .collect::<Vec<_>>();
-        let fixed_input = serde_json::json!({
-            "model":request.model,"messages":fixed_messages,"tools":request.tools,
-            "tool_choice":request.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
-            "temperature":request.temperature,"max_tokens":request.max_tokens,
-            "reasoning":request.reasoning.map(|value|format!("{value:?}")),
-            "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
-        });
-        let fixed_input_tokens =
-            text_tokens(&fixed_input.to_string()).saturating_add(fixed_media_tokens);
         Ok(EvaluatedRequest {
             request,
             estimated_input_tokens,
-            fixed_input_tokens,
+            fixed_input_tokens: self.fixed_input_tokens,
             message_input_tokens,
-            output_reserve: reserve,
+            output_reserve: self.output_reserve,
             fits: self
                 .budget
-                .fits(estimated_input_tokens, reserve, self.recovery),
+                .fits(estimated_input_tokens, self.output_reserve, self.recovery),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn projected_json_escaping_and_framing_match_the_complete_representation() {
+        let mut source = request();
+        source
+            .messages
+            .insert(0, ChatMessage::system("fixed \"\\\n🌍"));
+        let projection = NativeRequestProjection::new(
+            source,
+            [1],
+            vec![],
+            ModelBudget::new(Some(32_768), None, None),
+            false,
+        )
+        .unwrap();
+        for summary in ["a", "\"\\\n\u{0}🌍漢", "e\u{301} summary"] {
+            let evaluated = projection.evaluate(summary).unwrap();
+            // Independent whole-envelope oracle protects the composition boundary,
+            // rather than repeating its additive size calculation.
+            let wire = serde_json::json!({
+                "model":evaluated.request.model,"messages":evaluated.request.messages,
+                "tools":evaluated.request.tools,"tool_choice":evaluated.request.tool_choice,
+                "parallel_tool_calls":evaluated.request.parallel_tool_calls,
+                "temperature":evaluated.request.temperature,"max_tokens":evaluated.request.max_tokens,
+                "reasoning":null,"system_sections":null,
+            });
+            assert_eq!(
+                evaluated.estimated_input_tokens,
+                pioneer_compaction::text_tokens(&wire.to_string())
+            );
+            assert_eq!(evaluated.request.messages[2].content, "current input");
+            assert_eq!(evaluated.fixed_input_tokens, projection.fixed_input_tokens);
+        }
+    }
+
     #[test]
     fn local_replay_proofs_are_not_charged_as_provider_input() {
         let mut req = request();
@@ -259,6 +336,39 @@ mod tests {
             with_proof.message_input_tokens
         );
         assert_eq!(with_proof.request.messages, req.messages);
+    }
+
+    #[test]
+    fn responses_ciphertext_is_bounded_and_contributes_to_local_budget() {
+        let mut req = request();
+        let mut assistant = ChatMessage::assistant("readable final");
+        assistant.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
+            "openai",
+            "gpt-6.1-sol",
+            serde_json::json!({"schema_version":1,"wire_api":"responses","authority_scope":"synthetic","output":[{"type":"reasoning","id":"rs","summary":[],"encrypted_content":"synthetic"}]}),
+        ));
+        req.messages = vec![assistant];
+        let budget = ModelBudget::new(Some(1048576), None, None);
+        let small =
+            NativeRequestProjection::full(req.clone(), vec![], budget.clone(), false).unwrap();
+        let state = req.messages[0].provider_replay_state.as_mut().unwrap();
+        state.payload["output"][0]["encrypted_content"] = serde_json::json!("a".repeat(256 * 1024));
+        pioneer_provider::ProviderResponseLimits::default()
+            .validate_replay_state(state)
+            .unwrap();
+        let large = NativeRequestProjection::full(req.clone(), vec![], budget, false).unwrap();
+        assert!(large.estimated_input_tokens > small.estimated_input_tokens);
+        assert_eq!(large.request.messages, req.messages);
+        // This existing estimator is deliberately a local admission estimate;
+        // the test makes no claim that it counts actual Responses wire tokens.
+        let state = req.messages[0].provider_replay_state.as_mut().unwrap();
+        state.payload["output"][0]["encrypted_content"] =
+            serde_json::json!("a".repeat(2 * 1024 * 1024));
+        assert!(
+            pioneer_provider::ProviderResponseLimits::default()
+                .validate_replay_state(state)
+                .is_err()
+        );
     }
 
     fn replay_round(id: &str) -> Vec<ChatMessage> {
@@ -441,6 +551,8 @@ mod tests {
     use pioneer_provider::{CompiledPromptPayload, MessageAttachment, ToolDefinition};
     fn request() -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "fixture".into(),
             messages: vec![
                 ChatMessage::user("old history"),
@@ -456,6 +568,234 @@ mod tests {
         }
     }
     #[test]
+    fn positional_definitions_are_charged_once_with_native_framing() {
+        use pioneer_provider::tool_declarations::ToolDeclarations;
+        let mut source = request();
+        source.tools = Some(vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "large schema ".repeat(2000),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        let budget = ModelBudget::new(Some(32768), None, None);
+        let full =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+        let declarations =
+            ToolDeclarations::reconcile(None, &source.messages, source.tools.as_deref().unwrap())
+                .unwrap();
+        source.tool_declarations = Some(declarations);
+        let native =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+        assert!(native.estimated_input_tokens >= full.estimated_input_tokens);
+        assert!(native.estimated_input_tokens < full.estimated_input_tokens + 100);
+        assert!(native.request.tool_declarations.is_some());
+        source.messages.push(ChatMessage::user("append only"));
+        let appended =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+        assert!(appended.request.tool_declarations.is_some());
+        use super::super::controller::{NativeInputReceipt, NativeUsageMeasurement};
+        let before =
+            NativeInputReceipt::for_request(&native.request, "instance", "responses", 1, None)
+                .unwrap();
+        let after =
+            NativeInputReceipt::for_request(&appended.request, "instance", "responses", 1, None)
+                .unwrap();
+        assert_eq!(before.identity.tools_hash, after.identity.tools_hash);
+        assert_eq!(
+            after
+                .calibrated_estimate(
+                    appended.estimated_input_tokens,
+                    &appended.message_input_tokens,
+                    Some(&NativeUsageMeasurement {
+                        receipt: before,
+                        input_tokens: 5000
+                    }),
+                )
+                .unwrap()
+                .measured,
+            5000
+        );
+        source.tools = None;
+        let disabled = NativeRequestProjection::full(source, vec![], budget, false).unwrap();
+        assert!(disabled.request.tool_declarations.is_none());
+        assert!(native.estimated_input_tokens > disabled.estimated_input_tokens + 1000);
+    }
+
+    // Whole serialized fallback envelope is independent of declaration helpers.
+    fn assert_full_list_accounting(evaluated: &EvaluatedRequest) {
+        assert!(evaluated.request.tool_declarations.is_none());
+        let req = &evaluated.request;
+        let mut envelope = serde_json::json!({
+            "model":req.model,"messages":req.messages,"tools":req.tools,
+            "tool_choice":req.tool_choice,"parallel_tool_calls":req.parallel_tool_calls,
+            "temperature":req.temperature,"max_tokens":req.max_tokens,
+            "reasoning":null,"system_sections":null,
+        });
+        assert_eq!(
+            evaluated.estimated_input_tokens,
+            pioneer_compaction::text_tokens(&envelope.to_string())
+        );
+        envelope["messages"] = serde_json::json!(
+            req.messages
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            evaluated.fixed_input_tokens,
+            pioneer_compaction::text_tokens(&envelope.to_string())
+        );
+        assert_eq!(
+            evaluated.message_input_tokens,
+            req.messages
+                .iter()
+                .map(|message| {
+                    pioneer_compaction::text_tokens(&serde_json::to_string(message).unwrap()) + 1
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compaction_candidate_selects_full_list_in_request_budget_and_receipt() {
+        use super::super::controller::{NativeInputReceipt, NativeUsageMeasurement};
+        use pioneer_provider::tool_declarations::ToolDeclarations;
+        let mut source = request();
+        source.model = "gpt-5.4".into();
+        source.messages.insert(0, ChatMessage::system("authority"));
+        source.tools = Some(vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "schema ".repeat(2000),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        source.tool_declarations = Some(
+            ToolDeclarations::reconcile(None, &source.messages, source.tools.as_deref().unwrap())
+                .unwrap(),
+        );
+        let original = serde_json::to_vec(&source.messages).unwrap();
+        let budget = ModelBudget::new(Some(32768), None, None);
+        let native =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+        assert!(native.request.tool_declarations.is_some());
+        let candidate = NativeRequestProjection::new(
+            native.request.clone(),
+            [1],
+            vec![],
+            budget.clone(),
+            false,
+        )
+        .unwrap()
+        .evaluate("completed old work")
+        .unwrap();
+        assert_eq!(
+            candidate.request.messages[1].content,
+            "Summary of completed work (historical data):\ncompleted old work"
+        );
+        assert_full_list_accounting(&candidate);
+        assert_eq!(serde_json::to_vec(&source.messages).unwrap(), original);
+        let fallback_receipt =
+            NativeInputReceipt::for_request(&candidate.request, "instance", "responses", 1, None)
+                .unwrap();
+        // Identical final messages/tools, but a genuinely new native baseline.
+        let mut fresh = candidate.request.clone();
+        fresh.tool_declarations = Some(
+            ToolDeclarations::reconcile(None, &fresh.messages, fresh.tools.as_deref().unwrap())
+                .unwrap(),
+        );
+        let fresh = NativeRequestProjection::full(fresh, vec![], budget, false).unwrap();
+        assert!(fresh.request.tool_declarations.is_some());
+        let native_receipt =
+            NativeInputReceipt::for_request(&fresh.request, "instance", "responses", 1, None)
+                .unwrap();
+        assert_eq!(fallback_receipt.messages, native_receipt.messages);
+        assert_ne!(
+            fallback_receipt.identity.tools_hash,
+            native_receipt.identity.tools_hash
+        );
+        let measured = NativeUsageMeasurement {
+            receipt: native_receipt,
+            input_tokens: 123456,
+        };
+        assert_eq!(
+            fallback_receipt
+                .calibrated_estimate(
+                    candidate.estimated_input_tokens,
+                    &candidate.message_input_tokens,
+                    Some(&measured)
+                )
+                .unwrap()
+                .measured,
+            0
+        );
+        // Even an unnormalized stale request cannot masquerade as native in a receipt.
+        let mut stale = candidate.request.clone();
+        stale.tool_declarations = source.tool_declarations;
+        assert_eq!(
+            NativeInputReceipt::for_request(&stale, "instance", "responses", 1, None)
+                .unwrap()
+                .identity,
+            fallback_receipt.identity
+        );
+    }
+
+    #[test]
+    fn reduced_result_full_uses_current_full_list_without_estimator_only_rebuild() {
+        use super::super::controller::NativeInputReceipt;
+        use pioneer_provider::tool_declarations::ToolDeclarations;
+        let mut source = request();
+        source.messages = vec![
+            ChatMessage::assistant_tool_calls(
+                None::<String>,
+                vec![pioneer_provider::ProviderToolCall {
+                    id: "call".into(),
+                    name: "lookup".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            ChatMessage::tool_result("call", "lookup", "large result ".repeat(4000)),
+            ChatMessage::user("continue"),
+        ];
+        source.tools = Some(vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "current schema ".repeat(1000),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        source.tool_declarations = Some(
+            ToolDeclarations::reconcile(None, &source.messages, source.tools.as_deref().unwrap())
+                .unwrap(),
+        );
+        let budget = ModelBudget::new(Some(65536), None, None);
+        let mut prepared = NativeRequestProjection::full(source, vec![], budget.clone(), false)
+            .unwrap()
+            .request;
+        assert!(prepared.tool_declarations.is_some());
+        let original_result = prepared.messages[1].clone();
+        // Same production reducer used by Gateway shrink_results, without DB setup.
+        prepared.messages[1] = crate::compaction::restored_tool_result_with_budget(
+            &original_result,
+            "saved-source",
+            512,
+        )
+        .unwrap();
+        assert_ne!(prepared.messages[1].content, original_result.content);
+        assert_eq!(
+            prepared.messages[1].tool_call_id,
+            original_result.tool_call_id
+        );
+        assert!(
+            prepared.tool_declarations.is_some(),
+            "exercise the stale proposal boundary"
+        );
+        let stale_receipt =
+            NativeInputReceipt::for_request(&prepared, "instance", "responses", 1, None).unwrap();
+        let reduced = NativeRequestProjection::full(prepared, vec![], budget, false).unwrap();
+        assert_full_list_accounting(&reduced);
+        let receipt =
+            NativeInputReceipt::for_request(&reduced.request, "instance", "responses", 1, None)
+                .unwrap();
+        assert_eq!(stale_receipt.identity, receipt.identity);
+    }
+
+    #[test]
     fn full_target_counts_instructions_schemas_media_and_explicit_output() {
         let budget = ModelBudget::new(Some(4096), None, None);
         let base = NativeRequestProjection::new(request(), [0], vec![], budget.clone(), false)
@@ -467,6 +807,7 @@ mod tests {
         let mut full = request();
         full.max_tokens = Some(3000);
         full.compiled_prompt = Some(CompiledPromptPayload {
+            observation_manifest: None,
             stable_system_text: "instructions ".repeat(500),
             dynamic_system_text: "dynamic".into(),
             boundary_marker: "boundary".into(),

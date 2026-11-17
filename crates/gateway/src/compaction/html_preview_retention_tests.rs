@@ -128,8 +128,20 @@ async fn retain_as_task_basis(
 }
 
 async fn drain_preview_worker(store: &CrudStore, service: &ArtifactService) {
-    let mut progress = crate::database::maintenance::html_previews::Progress::default();
-    for _ in 0..3 {
+    use futures_util::FutureExt;
+    let database = store.database_connection().maintenance();
+    let mut changes = database.work_signal("maintenance.html").subscribe();
+    let mut released = database
+        .work_signal("maintenance.frozen.release")
+        .subscribe();
+    let io = store.html_preview_io_work_notification();
+    // Initial discovery covers older notifications; subsequent passes need a
+    // real producer/release wake, as the production owner does after EOF.
+    let _ = io.notified().now_or_never();
+    let _ = service.html_preview_release_notified().now_or_never();
+    for _ in 0..16 {
+        changes.begin_pass(&database).await.unwrap();
+        let mut progress = crate::database::maintenance::html_previews::Progress::default();
         let mut idle = false;
         for _ in 0..256 {
             if !crate::database::maintenance::html_previews::quantum(store, service, &mut progress)
@@ -141,12 +153,42 @@ async fn drain_preview_worker(store: &CrudStore, service: &ArtifactService) {
             }
         }
         assert!(idle);
+        let source = changes.wait(None).now_or_never().is_some();
+        let release = released.changed().now_or_never().is_some();
+        let io_ready = io.notified().now_or_never().is_some();
+        let activity = service
+            .html_preview_release_notified()
+            .now_or_never()
+            .is_some();
+        if !(source || release || io_ready || activity) {
+            return;
+        }
     }
+    panic!("preview maintenance must quiesce after its own source changes");
 }
 
 #[tokio::test]
 async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_frozen_replay() {
-    let f = fixture("answer", vec![Reply::Success], true, false).await;
+    preview_history_replay(1).await;
+    preview_history_replay(2).await;
+}
+
+async fn preview_history_replay(format_version: u32) {
+    let database_observer = Arc::new(HistoryReadObserver::default());
+    let f = fixture_with_database_observer(
+        "answer",
+        vec![Reply::Success],
+        true,
+        false,
+        Some(database_observer.clone()),
+    )
+    .await;
+    f.store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+
     // The shared fixture starts a raw compaction operation. Publish its exact
     // checkpoint before adding preview history, so it does not remain an
     // unresolved legacy owner that correctly blocks frozen input retirement.
@@ -237,7 +279,19 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
     let mut previews = Vec::new();
     let mut images = Vec::new();
     let mut preview_paths = Vec::new();
-    for width in [360u32, 768, 1024] {
+    let frames = if format_version == 2 {
+        vec![
+            (Some("light"), 360u32),
+            (Some("light"), 768),
+            (Some("light"), 1024),
+            (Some("dark"), 360),
+            (Some("dark"), 768),
+            (Some("dark"), 1024),
+        ]
+    } else {
+        vec![(None, 360u32), (None, 768), (None, 1024)]
+    };
+    for &(appearance, width) in &frames {
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgba8(width, 1)
             .write_to(&mut png, image::ImageFormat::Png)
@@ -266,7 +320,7 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             }),
             metadata: std::collections::BTreeMap::from([(
                 "htmlTool".into(),
-                json!({"version":1,"publication":false,"turnId":"turn","callId":"tool-item","index":width.to_string(),"details":{"width":width}}),
+                json!({"version":format_version,"publication":false,"turnId":"turn","callId":"tool-item","index":appearance.map_or_else(||width.to_string(), |theme|format!("{theme}-{width}")),"details":{"width":width}}),
             )]),
         };
         adoption_request = Some(request.clone());
@@ -289,11 +343,18 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
                 .blob_path("ws", &blob.storage_key)
                 .unwrap(),
         );
-        previews.push(json!({"width":width,"artifact":summary.artifact}));
-        images.push(json!({"width":width,"attachment":resolved.attachment}));
+        let mut preview = json!({"width":width,"artifact":summary.artifact});
+        let mut image = json!({"width":width,"attachment":resolved.attachment});
+        if let Some(appearance) = appearance {
+            preview["appearance"] = json!(appearance);
+            image["appearance"] = json!(appearance);
+        }
+        previews.push(preview);
+        images.push(image);
         parts.push(MessageContentPart::image(resolved.attachment));
     }
     let round = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "round".into(),
         termination: ProviderTermination::ToolCalls,
@@ -311,11 +372,11 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             ordinal: 0,
         }],
     };
-    let mut message = ChatMessage::tool_result(
-        "provider-call",
-        "html_preview",
-        json!({"previews":previews,"llm_context":{"images":images}}).to_string(),
-    );
+    let mut result = json!({"previews":previews,"llm_context":{"images":images}});
+    if format_version == 2 {
+        result["formatVersion"] = json!(2);
+    }
+    let mut message = ChatMessage::tool_result("provider-call", "html_preview", result.to_string());
     message.content_parts = parts;
     for (item, source, payload) in [
         (
@@ -366,7 +427,7 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .flat_map(|m| &m.content_parts)
             .filter(|p| matches!(p, MessageContentPart::Image { .. }))
             .count(),
-        3
+        frames.len()
     );
     // The real completion capture records the permanent compaction_task_output
     // root while the Task is running. This also represents a persisted pre-upgrade
@@ -410,7 +471,7 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .flat_map(|m| &m.content_parts)
             .filter(|p| matches!(p, MessageContentPart::Image { .. }))
             .count(),
-        3
+        frames.len()
     );
     let live_manifest = live.descriptor.manifest_id.clone();
     drop(live);
@@ -465,10 +526,12 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .is_err()
     );
     // A changed owner cannot publish a receipt even if preparation was skipped.
-    f.store
-        .record_html_preview_archive_witness(&wrong_owner, &"a".repeat(64))
-        .await
-        .unwrap();
+    assert!(
+        f.store
+            .record_html_preview_archive_witness(&wrong_owner, &"a".repeat(64))
+            .await
+            .is_err()
+    );
     let stored = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "SELECT archive_wire_sha256 FROM html_preview_frozen_result WHERE manifest_id=?1 AND ordinal=?2",
         [witness.manifest.clone().into(),witness.ordinal.into()])).await.unwrap().unwrap();
@@ -478,9 +541,113 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .unwrap()
             .is_none()
     );
-    super::super::frozen::prepare_html_preview_archive_witness(&f.store, &witness)
+    // Keep durable seed/point tickets timed so this fixture exercises fallback
+    // discovery. The exact source and live task basis above remain authoritative.
+    db.execute_unprepared("UPDATE html_preview_io_work SET state='timed',due_at=9223372036854775807,claim_token=NULL WHERE family IN ('seed_witness','seed_copies') OR state IN ('ready','timed','running','blocked')").await.unwrap();
+    db.execute_unprepared("CREATE TRIGGER fail_fallback_witness BEFORE UPDATE OF archive_wire_sha256 ON html_preview_frozen_result WHEN NEW.archive_wire_sha256 IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture witness commit failure'); END").await.unwrap();
+    let activity = service.html_preview_activity().await;
+    let mut fallback_progress = crate::database::maintenance::html_previews::Progress::default();
+    let mut fallback_failed = false;
+    for _ in 0..256 {
+        if crate::database::maintenance::html_previews::quantum(
+            &f.store,
+            &service,
+            &mut fallback_progress,
+        )
+        .await
+        .is_err()
+        {
+            fallback_failed = true;
+            break;
+        }
+    }
+    assert!(fallback_failed);
+    db.execute_unprepared("DROP TRIGGER fail_fallback_witness")
         .await
         .unwrap();
+    // DDL repair emits no work wake. Witness EOF must independently rewind,
+    // although the activity guard leaves the service's family unfinished.
+    let mut fallback_retried = false;
+    for _ in 0..256 {
+        let _ = crate::database::maintenance::html_previews::quantum(
+            &f.store,
+            &service,
+            &mut fallback_progress,
+        )
+        .await;
+        let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT archive_wire_sha256 FROM html_preview_frozen_result WHERE manifest_id=?1 AND ordinal=?2",
+            [witness.manifest.clone().into(),witness.ordinal.into()])).await.unwrap().unwrap();
+        if row
+            .try_get::<Option<String>>("", "archive_wire_sha256")
+            .unwrap()
+            .is_some()
+        {
+            fallback_retried = true;
+            break;
+        }
+    }
+    assert!(
+        fallback_retried,
+        "witness retry must not wait for unrelated activity release"
+    );
+    assert!(preview_paths.iter().all(|path| path.exists()));
+    drop(activity);
+    db.execute_unprepared(
+        "UPDATE html_preview_io_work SET state='ready',due_at=0 WHERE state='timed'",
+    )
+    .await
+    .unwrap();
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    let audit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let reads = database_observer.reads();
+        let acquired = reads
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    pioneer_sqlite::SqliteReadEvent::AdmissionAcquired { .. }
+                )
+            })
+            .count();
+        let released = reads
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    pioneer_sqlite::SqliteReadEvent::AdmissionReleased { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            acquired, released,
+            "witness digest must not retain reader capacity"
+        );
+        let writes = database_observer.writes();
+        let acquired = writes
+            .iter()
+            .filter(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Acquired { .. }))
+            .count();
+        let released = writes
+            .iter()
+            .filter(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Released { .. }))
+            .count();
+        assert_eq!(
+            acquired, released,
+            "witness digest must not retain writer capacity"
+        );
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let witness_store = f.store.with_maintenance_access();
+    super::super::frozen::HTML_PREVIEW_HASH_CAPACITY_AUDIT
+        .scope(
+            audit,
+            super::super::frozen::prepare_html_preview_archive_witness(&witness_store, &witness),
+        )
+        .await
+        .unwrap();
+    assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(preview_paths.iter().all(|p| p.exists()));
     let mut progress = crate::database::maintenance::html_previews::Progress::default();
     // Complete several bounded passes: index, verification and blob discovery
@@ -575,24 +742,7 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
         .unwrap();
     // A restarted worker reuses persisted receipts and retires only after all
     // temporary owners have released; it never expires/deletes the Task root.
-    let mut progress = crate::database::maintenance::html_previews::Progress::default();
-    for _ in 0..3 {
-        let mut idle = false;
-        for _ in 0..128 {
-            if !crate::database::maintenance::html_previews::quantum(
-                &f.store,
-                &service,
-                &mut progress,
-            )
-            .await
-            .unwrap()
-            {
-                idle = true;
-                break;
-            }
-        }
-        assert!(idle);
-    }
+    drain_preview_worker(&f.store, &service).await;
     assert!(preview_paths.iter().all(|p| !p.exists()));
     for (summary, bytes) in &permanent {
         assert_eq!(
@@ -1313,6 +1463,7 @@ async fn known_rooted_import_without_preview_does_not_pin_an_independent_preview
         json!({"source":summary.artifact}).to_string(),
     );
     let round = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "independent-round".into(),
         termination: ProviderTermination::ToolCalls,
@@ -1340,6 +1491,21 @@ async fn known_rooted_import_without_preview_does_not_pin_an_independent_preview
             "independent-call",
             "tool_result_v2",
             json!({"kind":"json","truncated":false,"value":message}).to_string(),
+        ),
+        (
+            "turn-input-projection",
+            "turn_input_projection_v1",
+            json!({"kind":"json","truncated":false,"value":ChatMessage::user("prepared input")}).to_string(),
+        ),
+        (
+            "runtime-observation",
+            "runtime_context_v1",
+            json!({"kind":"json","truncated":false,"value":ChatMessage::user("runtime observation")}).to_string(),
+        ),
+        (
+            "system-snapshot",
+            "system_snapshot_v1",
+            json!({"kind":"json","truncated":false,"value":ChatMessage::user("")}).to_string(),
         ),
     ] {
         f.store
@@ -1370,6 +1536,15 @@ async fn known_rooted_import_without_preview_does_not_pin_an_independent_preview
     assert!(
         !path.exists(),
         "known ordinary imported context must not pin unrelated preview bytes"
+    );
+    assert_eq!(
+        f.store
+            .list_turn_llm_context("independent-preview-turn")
+            .await
+            .unwrap()
+            .len(),
+        5,
+        "retiring preview bytes must retain the canonical model history"
     );
     let row = db
         .query_one_raw(Statement::from_sql_and_values(

@@ -68,6 +68,7 @@
 
 pub mod administration;
 pub mod agents_doc;
+pub mod apps;
 pub mod artifacts;
 pub mod authorization;
 pub mod avatars;
@@ -80,11 +81,14 @@ pub mod core;
 mod error;
 pub mod gateway;
 pub mod ids;
+pub mod images;
 mod local_file;
 pub mod mcp;
 pub mod navigation;
 pub mod notifications;
+pub mod packages;
 pub mod platform;
+pub mod plugins;
 pub mod providers;
 pub mod request_state;
 pub mod rpc;
@@ -106,3 +110,11 @@ pub use error::{ClientError, ClientResult};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod catalog_test_support;
+
+#[cfg(test)]
+pub(crate) static OBSERVABILITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Shared package delivery for Skills and Plugins.
+pub mod package_delivery;
+#[cfg(test)]
+mod scenario_test_support;

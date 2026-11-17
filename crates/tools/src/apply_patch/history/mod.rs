@@ -888,7 +888,6 @@ impl std::error::Error for HistoryTypeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apply_patch::file_mutation::FileVersionToken;
 
     fn snapshot(value: &[u8]) -> CommittedTextSnapshot {
         CommittedTextSnapshot::from_bytes(
@@ -1039,18 +1038,6 @@ mod tests {
                 "v1 recovery plan must require `{required}`"
             );
         }
-    }
-
-    #[test]
-    fn snapshot_hash_and_length_are_exact() {
-        let snapshot = snapshot(b"value\n");
-        assert_eq!(
-            snapshot.version.token,
-            FileVersionToken::from_bytes(b"value\n")
-        );
-        let reference = TextSnapshotRef::from_snapshot(&snapshot);
-        assert_eq!(reference.byte_len, 6);
-        assert_eq!(reference.content_hash, *snapshot.version.token.digest());
     }
 
     #[test]

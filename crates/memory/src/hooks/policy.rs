@@ -231,24 +231,6 @@ impl MemoryPolicyReasonCode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryClassifierFallbackPolicy {
-    DefaultAllow,
-    StrictDeny,
-    AllowReadOnly,
-}
-
-impl MemoryClassifierFallbackPolicy {
-    pub(super) fn from_str(value: &str) -> Result<Self, MemoryPolicyDecodeError> {
-        match value {
-            "default_allow" => Ok(Self::DefaultAllow),
-            "strict_deny" => Ok(Self::StrictDeny),
-            "allow_read_only" => Ok(Self::AllowReadOnly),
-            _ => Err(MemoryPolicyDecodeError::invalid_value("fallback")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryPolicyDecodeError {
     field: &'static str,
@@ -320,7 +302,7 @@ impl MemoryTurnPolicy {
             forget_target_hint: None,
             reason_code: MemoryPolicyReasonCode::DefaultAllowRead,
             confidence: 1.0,
-            source: MemoryPolicySource::PreMemoryClassifier,
+            source: MemoryPolicySource::DefaultFallback,
             detected_language: None,
             diagnostics: Vec::new(),
         }
@@ -352,7 +334,7 @@ impl MemoryTurnPolicy {
             forget_target_hint,
             reason_code: MemoryPolicyReasonCode::ExplicitForget,
             confidence: 1.0,
-            source: MemoryPolicySource::PreMemoryClassifier,
+            source: MemoryPolicySource::DefaultFallback,
             detected_language: None,
             diagnostics: Vec::new(),
         }
@@ -372,7 +354,7 @@ impl MemoryTurnPolicy {
             forget_target_hint: None,
             reason_code: MemoryPolicyReasonCode::MemoryNoUse,
             confidence: 1.0,
-            source: MemoryPolicySource::PreMemoryClassifier,
+            source: MemoryPolicySource::DefaultFallback,
             detected_language: None,
             diagnostics: Vec::new(),
         }
@@ -392,7 +374,7 @@ impl MemoryTurnPolicy {
             forget_target_hint: None,
             reason_code: MemoryPolicyReasonCode::MemoryNoSave,
             confidence: 1.0,
-            source: MemoryPolicySource::PreMemoryClassifier,
+            source: MemoryPolicySource::DefaultFallback,
             detected_language: None,
             diagnostics: Vec::new(),
         }
@@ -404,34 +386,6 @@ impl MemoryTurnPolicy {
             reason_code,
             0.0,
         )
-    }
-
-    pub fn permissive_classifier_fallback(reason_code: MemoryPolicyReasonCode) -> Self {
-        Self {
-            recall: MemoryRecallPolicy::Allow,
-            prompt: MemoryPromptPolicy::Full,
-            read_tools: MemoryReadToolPolicy::Allow,
-            remember_tool: MemoryMutationToolPolicy::Allow,
-            forget_tool: MemoryMutationToolPolicy::Allow,
-            post_turn_extraction: MemoryExtractionPolicy::Allow,
-            active_memory: MemoryActiveContextPolicy::Allow,
-            explicit_remember: false,
-            explicit_forget: false,
-            forget_target_hint: None,
-            reason_code,
-            confidence: 0.0,
-            source: MemoryPolicySource::DefaultFallback,
-            detected_language: None,
-            diagnostics: Vec::new(),
-        }
-    }
-
-    pub fn strict_deny_fallback(reason_code: MemoryPolicyReasonCode) -> Self {
-        Self::no_use().with_source(MemoryPolicySource::DefaultFallback, reason_code, 0.0)
-    }
-
-    pub fn allow_read_only_fallback(reason_code: MemoryPolicyReasonCode) -> Self {
-        Self::no_save().with_source(MemoryPolicySource::DefaultFallback, reason_code, 0.0)
     }
 
     pub fn with_source(
@@ -461,10 +415,6 @@ impl MemoryTurnPolicy {
             }
         });
         self
-    }
-
-    pub(crate) fn allow_pre_turn_recall(&self) -> bool {
-        self.recall == MemoryRecallPolicy::Allow
     }
 
     pub(crate) fn allow_memory_prompt(&self) -> bool {
@@ -529,8 +479,6 @@ impl MemoryTurnPolicyOverride {
 pub struct MemoryTurnPolicyRequest {
     pub default_policy: MemoryTurnPolicy,
     pub structured_override: Option<MemoryTurnPolicyOverride>,
-    pub classifier_enabled: bool,
-    pub fallback: MemoryClassifierFallbackPolicy,
 }
 
 impl Default for MemoryTurnPolicyRequest {
@@ -538,8 +486,6 @@ impl Default for MemoryTurnPolicyRequest {
         Self {
             default_policy: MemoryTurnPolicy::normal_default_allow(),
             structured_override: None,
-            classifier_enabled: true,
-            fallback: MemoryClassifierFallbackPolicy::DefaultAllow,
         }
     }
 }

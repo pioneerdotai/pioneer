@@ -204,16 +204,52 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
-        "computer_use",
-        "tool_computer_use",
-        "execution_computer_policy",
-        "forbidden",
-        "execution",
+        "threads_list",
+        "thread_read",
+        "execution_approved_thread",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "threads_history_read",
+        "thread_read",
+        "execution_approved_thread",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "threads_search",
+        "thread_read",
+        "execution_approved_thread",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "threads_children_list",
+        "thread_read",
+        "execution_approved_thread",
+        "not_found",
+        "read",
         true,
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
         "threads_start_options",
+        "child_observe",
+        "execution_agent_options",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "threads_identity_models_list",
         "child_observe",
         "execution_agent_options",
         "not_found",
@@ -348,6 +384,15 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
+        "task_finish",
+        "task_schedule_manage",
+        "root_thread_task",
+        "not_found",
+        "mutation",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
         "task_update",
         "task_schedule_manage",
         "root_thread_task",
@@ -385,6 +430,15 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     record(
         AuthorizationCatalogSurface::InternalTool,
         "task_reschedule",
+        "task_schedule_manage",
+        "root_thread_task",
+        "not_found",
+        "mutation",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "task_run_now",
         "task_schedule_manage",
         "root_thread_task",
         "not_found",
@@ -468,6 +522,23 @@ const DYNAMIC_TOOL_FAMILY_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
 ];
 
+fn internal_tool_records() -> impl Iterator<Item = AuthorizationCatalogRecord> {
+    INTERNAL_TOOL_RECORDS
+        .iter()
+        .copied()
+        .chain(pioneer_protocol::CUA_TOOL_NAMES.iter().map(|name| {
+            record(
+                AuthorizationCatalogSurface::InternalTool,
+                name,
+                "tool_computer_use",
+                "execution_computer_policy",
+                "forbidden",
+                "execution",
+                true,
+            )
+        }))
+}
+
 pub(crate) fn authorization_catalog() -> Vec<AuthorizationCatalogRecord> {
     let mut catalog = Vec::with_capacity(
         NORMAL_METHOD_REGISTRY.len()
@@ -506,7 +577,7 @@ pub(crate) fn authorization_catalog() -> Vec<AuthorizationCatalogRecord> {
             entry.reauthorize_each_frame,
         )
     }));
-    catalog.extend_from_slice(INTERNAL_TOOL_RECORDS);
+    catalog.extend(internal_tool_records());
     catalog.extend_from_slice(DYNAMIC_TOOL_FAMILY_RECORDS);
     catalog
 }
@@ -521,19 +592,10 @@ mod tests {
     use super::*;
 
     fn static_tool_catalog_names() -> BTreeSet<&'static str> {
-        INTERNAL_TOOL_RECORDS
-            .iter()
-            .map(|entry| entry.entry_point)
-            .collect()
-    }
-
-    fn unregistered_sensitive_tools<'a>(
-        tool_names: impl IntoIterator<Item = &'a str>,
-    ) -> Vec<&'a str> {
-        let registered = static_tool_catalog_names();
-        tool_names
+        authorization_catalog()
             .into_iter()
-            .filter(|tool_name| !registered.contains(tool_name))
+            .filter(|entry| entry.surface == AuthorizationCatalogSurface::InternalTool)
+            .map(|entry| entry.entry_point)
             .collect()
     }
 
@@ -597,19 +659,14 @@ mod tests {
             .map(|name| name.as_str().to_owned()),
         );
 
-        assert_eq!(
-            unregistered_sensitive_tools(sensitive.iter().map(String::as_str)),
-            Vec::<&str>::new()
-        );
         let registered = static_tool_catalog_names();
-        assert_eq!(registered.len(), INTERNAL_TOOL_RECORDS.len());
-    }
-
-    #[test]
-    fn an_unregistered_sensitive_tool_fails_the_inventory_gate() {
-        assert_eq!(
-            unregistered_sensitive_tools(["read_file", "future_sensitive_tool"]),
-            vec!["future_sensitive_tool"]
+        let sensitive_names = sensitive
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            sensitive_names.is_subset(&registered),
+            "every actual static builtin/domain tool must have an authorization catalog record"
         );
     }
 

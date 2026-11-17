@@ -1,6 +1,4 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "McpActionPublication",
   "type": "object",
   "properties": {
     "field_error": {
@@ -28,13 +26,17 @@
     },
     "state": {
       "$ref": "#/$defs/McpActionState"
+    },
+    "uncertain": {
+      "type": "boolean"
     }
   },
   "required": [
     "operation_id",
     "revision",
     "state",
-    "kind"
+    "kind",
+    "uncertain"
   ],
   "$defs": {
     "McpActionKind": {

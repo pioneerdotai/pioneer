@@ -163,30 +163,6 @@ fn dynamic_tool_registration_candidate(
     storage: &ToolStoragePayload,
 ) -> Option<ArtifactRegistrationCandidate> {
     let metadata = storage_metadata_json(storage)?;
-    if tool_name == "computer_use" {
-        let path = metadata
-            .get("snapshot")
-            .and_then(|value| value.get("path"))
-            .and_then(JsonValue::as_str)
-            .or_else(|| {
-                metadata
-                    .get("llm_context")
-                    .and_then(|value| value.get("attachment"))
-                    .and_then(|value| value.get("path"))
-                    .and_then(JsonValue::as_str)
-            })
-            .or_else(|| metadata.get("path").and_then(JsonValue::as_str))?;
-        return Some(ArtifactRegistrationCandidate {
-            path: PathBuf::from(path),
-            display_name: display_name_from_path(path),
-            mime_type: Some("image/png".to_owned()),
-            kind_hint: Some(ArtifactKind::Screenshot),
-            description: None,
-            sha256: None,
-            size_bytes: None,
-            source: ArtifactRegistrationSource::ComputerUseSnapshot,
-        });
-    }
 
     let path = metadata.get("path").and_then(JsonValue::as_str)?;
     let content_type = metadata
@@ -273,10 +249,8 @@ fn display_name_from_path(path: &str) -> Option<String> {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        DeltaOutputPolicy, LlmOutputPolicy, LlmRetentionPolicy, RecoveryAction,
-        RecoveryOutputPolicy, StorageOutputPolicy, TimelineOutputPolicy, ToolMetadata,
-        ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
-        ToolRecoveryRetryClass,
+        DeltaOutputPolicy, LlmOutputPolicy, LlmRetentionPolicy, RecoveryOutputPolicy,
+        StorageOutputPolicy, TimelineOutputPolicy, ToolOutputPolicySnapshot,
     };
     use serde_json::json;
 
@@ -361,77 +335,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn artifact_registration_computer_use_snapshot_candidate() {
-        let item = TurnItem::DynamicToolCall {
-            id: "call_cu".to_owned(),
-            tool_name: "computer_use".to_owned(),
-            arguments: json!({"action": "snapshot"}),
-            status: ToolCallStatus::Completed,
-            recovery_policy: Some(recovery_policy()),
-            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
-            output_policy: output_policy(),
-            display: Default::default(),
-            storage: ToolStoragePayload::Metadata {
-                metadata: ToolMetadata::from_json(json!({
-                    "snapshot": {"path": "/workspace/snap.png"}
-                })),
-            },
-            recovery: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        };
-
-        let candidates = artifact_registration_candidates_from_completed_item(&item);
-
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(
-            candidates[0].source,
-            ArtifactRegistrationSource::ComputerUseSnapshot
-        );
-        assert_eq!(candidates[0].kind_hint, Some(ArtifactKind::Screenshot));
-    }
-
-    #[test]
-    fn artifact_registration_computer_use_artifact_reads_llm_context_attachment_path() {
-        let item = TurnItem::DynamicToolCall {
-            id: "call_cu".to_owned(),
-            tool_name: "computer_use".to_owned(),
-            arguments: json!({"action": "snapshot"}),
-            status: ToolCallStatus::Completed,
-            recovery_policy: Some(recovery_policy()),
-            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
-            output_policy: output_policy(),
-            display: Default::default(),
-            storage: ToolStoragePayload::Metadata {
-                metadata: ToolMetadata::from_json(json!({
-                    "action": "snapshot",
-                    "session_id": 7,
-                    "llm_context": {
-                        "attachment": {
-                            "path": "/workspace/snap-from-llm-context.png",
-                            "mime_type": "image/png"
-                        }
-                    }
-                })),
-            },
-            recovery: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        };
-
-        let candidates = artifact_registration_candidates_from_completed_item(&item);
-
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(
-            candidates[0].path,
-            PathBuf::from("/workspace/snap-from-llm-context.png")
-        );
-        assert_eq!(candidates[0].kind_hint, Some(ArtifactKind::Screenshot));
-    }
-
     fn download_item(success: bool, truncated: bool) -> TurnItem {
         TurnItem::Download {
             id: "call_download".to_owned(),
@@ -466,19 +369,6 @@ mod tests {
             storage: StorageOutputPolicy::MetadataOnly,
             recovery: RecoveryOutputPolicy::MetadataOnly,
             deltas: DeltaOutputPolicy::Disabled,
-        }
-    }
-
-    fn recovery_policy() -> ToolRecoveryPolicySnapshot {
-        ToolRecoveryPolicySnapshot {
-            retry_class: ToolRecoveryRetryClass::Never,
-            idempotency_mode: ToolRecoveryIdempotencyMode::None,
-            max_attempts: 0,
-            can_resume: false,
-            resolved_action: RecoveryAction::MarkFailed,
-            base_backoff_secs: 0,
-            max_wall_clock_secs: 0,
-            no_progress_limit: 0,
         }
     }
 }

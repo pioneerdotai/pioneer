@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
-use pioneer_entity::{principal_avatar, principal_avatar_revision};
+use pioneer_entity::{gateway_principal, principal_avatar, principal_avatar_revision};
 use pioneer_protocol::{PrincipalId, ProfileAvatarMediaType};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter,
-    Set,
+    QuerySelect, Set, sea_query::JoinType,
 };
 use std::collections::HashMap;
 
@@ -105,6 +105,79 @@ pub async fn delete_principal_avatar(
         .await
         .context("failed to delete principal avatar")?;
     Ok(result.rows_affected == 1)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PrincipalProfileRow {
+    pub display_name: String,
+    pub nickname: String,
+    pub avatar_hash: Option<Vec<u8>>,
+}
+
+#[derive(sea_orm::FromQueryResult)]
+struct PrincipalProfileProjection {
+    display_name: String,
+    nickname: String,
+    revision_id: Option<String>,
+    revision_principal_id: Option<String>,
+    content_hash: Option<Vec<u8>>,
+}
+
+/// Profile metadata only: never selects immutable avatar content. A dangling
+/// current pointer must remain an error rather than silently hiding an avatar.
+pub async fn load_principal_profile<C: ConnectionTrait>(
+    db: &C,
+    principal_id: &PrincipalId,
+) -> Result<Option<PrincipalProfileRow>> {
+    let Some(row) = gateway_principal::Entity::find_by_id(principal_id.to_string())
+        .select_only()
+        .columns([
+            gateway_principal::Column::DisplayName,
+            gateway_principal::Column::Nickname,
+        ])
+        .column(principal_avatar::Column::RevisionId)
+        .column_as(
+            principal_avatar_revision::Column::PrincipalId,
+            "revision_principal_id",
+        )
+        .column(principal_avatar_revision::Column::ContentHash)
+        .join_rev(
+            JoinType::LeftJoin,
+            principal_avatar::Entity::belongs_to(gateway_principal::Entity)
+                .from(principal_avatar::Column::PrincipalId)
+                .to(gateway_principal::Column::Id)
+                .into(),
+        )
+        .join(
+            JoinType::LeftJoin,
+            principal_avatar::Entity::belongs_to(principal_avatar_revision::Entity)
+                .from(principal_avatar::Column::RevisionId)
+                .to(principal_avatar_revision::Column::Id)
+                .into(),
+        )
+        .into_model::<PrincipalProfileProjection>()
+        .one(db)
+        .await
+        .context("failed to load principal profile metadata")?
+    else {
+        return Ok(None);
+    };
+    let avatar_hash = if row.revision_id.is_some() {
+        if row.revision_principal_id.as_deref() != Some(principal_id.as_str()) {
+            bail!("current principal avatar revision is missing or belongs to another principal");
+        }
+        Some(
+            row.content_hash
+                .ok_or_else(|| anyhow::anyhow!("current principal avatar hash is missing"))?,
+        )
+    } else {
+        None
+    };
+    Ok(Some(PrincipalProfileRow {
+        display_name: row.display_name,
+        nickname: row.nickname,
+        avatar_hash,
+    }))
 }
 
 pub async fn load_principal_avatar<C: ConnectionTrait>(

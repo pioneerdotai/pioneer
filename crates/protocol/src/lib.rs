@@ -2,6 +2,16 @@ pub use agent_client_protocol_schema::v1 as acp;
 mod acp_session;
 pub mod acp_validation;
 pub use acp_session::*;
+mod thread_search;
+pub use thread_search::{
+    ThreadsSearchFragment, ThreadsSearchPageFragment, ThreadsSearchParams, ThreadsSearchResponse,
+    ThreadsSearchSource, ThreadsSearchThread,
+};
+mod thread_read;
+pub use thread_read::{
+    ThreadHistoryAnchor, ThreadHistoryDirection, ThreadsChildrenListParams,
+    ThreadsHistoryReadParams, ThreadsListParams,
+};
 mod thread_tool_result;
 pub use thread_tool_result::{
     ThreadToolResultCursor, ThreadToolResultReadParams, ThreadToolResultReadResponse,
@@ -25,11 +35,13 @@ mod client_projection;
 mod gateway_endpoint;
 mod id;
 mod identity;
+mod images;
 mod invitation;
 mod jsonrpc;
 mod markdown;
 mod mcp;
 mod member;
+pub use images::{IMAGE_MAX_BYTES, IMAGE_MAX_DIMENSION, ImageMediaType, ImageReference};
 mod memory;
 mod notification;
 mod patch_history;
@@ -37,11 +49,20 @@ mod provider;
 mod public_error;
 mod recovery_diagnostic;
 pub use recovery_diagnostic::{
-    ProviderErrorReason, ProviderRequestId, RecoveryDiagnostic, RecoveryProviderFailure,
-    RecoveryStopReason,
+    ProviderErrorReason, ProviderErrorResponse, ProviderRequestId, RecoveryDiagnostic,
+    RecoveryProviderFailure, RecoveryStopReason,
 };
+mod apps;
+mod plugins;
+pub use apps::*;
 mod schema;
+mod scoped_push;
+pub use scoped_push::{
+    TaskInboxPatch, ThreadIndicatorPatch, ThreadMetadataPatch, WorkspacePushNotification,
+    WorkspacePushParams, WorkspacePushResponse,
+};
 mod settings;
+pub use plugins::*;
 mod skills;
 mod system_assets;
 mod task;
@@ -53,7 +74,6 @@ mod thread_file;
 mod timeline;
 mod turn;
 mod turn_permissions;
-mod versioned_contract;
 mod voice;
 pub mod voice_contract;
 mod workspace;
@@ -86,8 +106,9 @@ pub use agent_launch::{
     AgentExecutionProfileProjection, AgentExecutionProfileSelection, AgentExecutionSelection,
     AgentIdentitySelection, AgentLaunchSelection, AgentLaunchSelectionError,
     AgentStartOptionsProjection, AgentStartTarget, ChildAgentLaunchGrantMigrationError,
-    ChildAgentLaunchGrantSet, ChildAgentLaunchGrantSetError, ReasoningCeiling, StartAgentIntent,
-    migrate_embedded_child_launch_grant_json_to_current,
+    ChildAgentLaunchGrantSet, ChildAgentLaunchGrantSetError, StartAgentIntent,
+    agent_execution_profile_is_no_wider, agent_identity_has_same_launch_source,
+    migrate_embedded_child_launch_grant_json_to_current, validate_selected_agent_launch_profile,
 };
 pub use agent_route::{
     AgentDelegationRouteCreateParams, AgentDelegationRouteListParams,
@@ -97,14 +118,17 @@ pub use agent_route::{
     AgentRouteStatus, AgentRouteValidationError, validate_agent_route_graph,
 };
 pub use agent_tools::{
-    AgentControlTaskToolInput, AgentCreateThreadToolInput, AgentModelToolCatalogEntry,
+    AgentCatalogFragment, AgentControlTaskToolInput, AgentCreateThreadToolInput,
+    AgentIdentityModelsToolInput, AgentIdentityModelsToolResult, AgentModelToolCatalogEntry,
     AgentModelToolName, AgentPublicOutcome, AgentResultToolInput, AgentReviewTaskToolInput,
     AgentScheduleTaskToolInput, AgentSendMessageToolInput, AgentStartOptionsToolInput,
-    AgentStartToolInput, AgentTaskToolInput, AgentToolBackendKind, AgentToolCapability,
-    AgentToolIdentityChoice, AgentToolIdentityOption, AgentToolLaunchSelection,
+    AgentStartOptionsToolResult, AgentStartToolInput, AgentTaskToolInput, AgentThreadActionResult,
+    AgentToolBackendKind, AgentToolCapability, AgentToolExecutorModels, AgentToolIdentityChoice,
+    AgentToolIdentityOption, AgentToolLaunchSelection, AgentToolModelOption,
     AgentToolOptionsProjection, AgentToolProfileChoice, AgentToolProfileOption,
     AgentToolResultStatus, AgentToolSafeResult, AgentToolTargetOption,
-    AgentToolThreadCreationOption, AgentWaitToolInput, agent_start_options_catalog_entry,
+    AgentToolThreadCreationOption, AgentWaitToolInput, agent_identity_models_catalog_entry,
+    agent_start_options_catalog_entry, agent_turn_start_catalog_entry,
     project_agent_model_tool_catalog,
 };
 pub use app_url::{
@@ -304,13 +328,14 @@ pub use patch_history::{
     TurnPatchStepsPageResponse,
 };
 pub use provider::{
-    ObservedProviderUsageTotals, ProviderConfigureParams, ProviderConfigureResponse,
-    ProviderDefinition, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
-    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    NativeContextBudget, NativeSummaryContext, ObservedProviderUsageTotals,
+    ProviderConfigureParams, ProviderConfigureResponse, ProviderContextTiers, ProviderDefinition,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
     ProviderModelReasoningCapabilities, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
     ProviderSummary, ProviderSummaryCapabilities, ProviderTranscriptionModelMetadata,
-    ReasoningCapabilitySource, observed_provider_usage_totals,
+    ReasoningCapabilitySource, native_context_choice_authority, observed_provider_usage_totals,
 };
 pub use public_error::{PUBLIC_ERROR_VERSION, PublicError, PublicErrorCode, PublicErrorStage};
 pub use settings::{
@@ -340,7 +365,7 @@ pub use skills::{
     SkillLifecycleAuditSummary, SkillLifecycleRemovedSkill, SkillLifecycleResultSkill,
     SkillLifecycleSource, SkillListItem, SkillListParams, SkillListResponse, SkillPackChangedItem,
     SkillPackInstallationItem, SkillPackMembership, SkillPolicyState, SkillSecurityFinding,
-    SkillTrustGateStatus, SkillValidationDiagnostic, SkillWorkspacePolicy,
+    SkillTrustGateStatus, SkillUploadPurpose, SkillValidationDiagnostic, SkillWorkspacePolicy,
     SkillsChangedNotification, SkillsHealthParams, SkillsHealthResponse, SkillsInstallParams,
     SkillsInstallResponse, SkillsPackInstallParams, SkillsPackInstallResponse,
     SkillsPackUninstallParams, SkillsPackUninstallResponse, SkillsPackUpdateParams,
@@ -385,10 +410,11 @@ pub use task::{
     TaskDependencyCondition, TaskDependencyTriggerMode, TaskDependencyTriggerPolicy,
     TaskDetachParams, TaskDetachResponse, TaskDetachedNotification, TaskError, TaskErrorClass,
     TaskEvent, TaskEventPayload, TaskEventsParams, TaskEventsResponse, TaskExecutorKind,
-    TaskExternalTriggerFilter, TaskFailedNotification, TaskGetParams, TaskGetResponse,
-    TaskLifecyclePolicy, TaskListParams, TaskListResponse, TaskManualActor, TaskMetadata,
-    TaskNotificationContext, TaskOperatorDeliveries, TaskOperatorDetails, TaskOwnerKind,
-    TaskParentTerminalAction, TaskPauseParams, TaskPauseResponse, TaskPausedNotification,
+    TaskExternalTriggerFilter, TaskFailedNotification, TaskFinishParams, TaskFinishRequest,
+    TaskFinishResponse, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams,
+    TaskListResponse, TaskManualActor, TaskMetadata, TaskNotificationContext,
+    TaskOperatorDeliveries, TaskOperatorDetails, TaskOwnerKind, TaskParentTerminalAction,
+    TaskPauseParams, TaskPauseResponse, TaskPauseScheduleOutcome, TaskPausedNotification,
     TaskProgressDetails, TaskProgressNotification, TaskQueuedNotification,
     TaskRecoveredNotification, TaskRescheduleParams, TaskRescheduleReason, TaskRescheduleResponse,
     TaskRescheduledNotification, TaskResourceBudget, TaskResult, TaskResultCandidate,
@@ -397,18 +423,19 @@ pub use task::{
     TaskResultReviewerRef, TaskResultReviewerSpec, TaskResumeParams, TaskResumeResponse,
     TaskResumedNotification, TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams,
     TaskReviseResponse, TaskRun, TaskRunCompletedNotification, TaskRunCreatedNotification,
-    TaskRunExecution, TaskRunExecutionStatus, TaskRunFailedNotification,
-    TaskRunStartedNotification, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskScheduledNotification, TaskSchema,
-    TaskStatus, TaskThreadLineage, TaskTimeoutPolicy, TaskTree, TaskTreeChangedNotification,
-    TaskTreeParams, TaskTreeResponse, TaskTrigger, TaskTriggerCatchUpMode,
-    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
-    TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskUpdatedNotification,
-    TaskUserNotification, TaskUserNotificationAcknowledgeParams,
-    TaskUserNotificationAcknowledgeResponse, TaskUserNotificationDeliveredNotification,
-    TaskUserNotificationListParams, TaskUserNotificationListResponse, TaskValue, TaskWaitItem,
-    TaskWaitMode, TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams,
-    TaskWaitResponse, TaskWaitReviewAction, TaskWaitReviewItem, TaskWaitRevisionBlockedReason,
+    TaskRunExecution, TaskRunExecutionStatus, TaskRunFailedNotification, TaskRunInputEncoding,
+    TaskRunNowParams, TaskRunNowResponse, TaskRunStartedNotification, TaskRunStatus,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTriggerInput, TaskRunTurn,
+    TaskRunTurnKind, TaskRunTurnStatus, TaskScheduledNotification, TaskSchema, TaskStatus,
+    TaskThreadLineage, TaskTimeoutPolicy, TaskTree, TaskTreeChangedNotification, TaskTreeParams,
+    TaskTreeResponse, TaskTrigger, TaskTriggerCatchUpMode, TaskTriggerCatchUpPolicy,
+    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem,
+    TaskUpdateParams, TaskUpdateResponse, TaskUpdatedNotification, TaskUserNotification,
+    TaskUserNotificationAcknowledgeParams, TaskUserNotificationAcknowledgeResponse,
+    TaskUserNotificationDeliveredNotification, TaskUserNotificationListParams,
+    TaskUserNotificationListResponse, TaskValue, TaskWaitItem, TaskWaitMode,
+    TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse,
+    TaskWaitReviewAction, TaskWaitReviewItem, TaskWaitRevisionBlockedReason, TaskWebhookScope,
     TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus,
     ThreadLineage, task_delivery_id_from_result_item_id, task_delivery_result_item_id,
 };
@@ -453,25 +480,25 @@ pub use thread_file::{
     THREAD_FILE_VIEW_MAX_BYTES, ThreadFileViewGrantCreateParams, ThreadFileViewGrantCreateResponse,
 };
 pub use timeline::{
-    ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
-    TimelineBlock, TimelineBlockKind, TimelineChangeReason, TimelineCursor, TimelinePageAnchor,
-    TimelinePageInfo, TimelineReplySummary, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
-    TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
-    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
-    TurnWorkStateChangedNotification, TurnWorkTombstone,
+    CodexRetryNotice, ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams,
+    ThreadTimelinePageResponse, TimelineBlock, TimelineBlockKind, TimelineChangeReason,
+    TimelineCursor, TimelinePageAnchor, TimelinePageInfo, TimelineReplySummary, TurnWorkBlock,
+    TurnWorkItem, TurnWorkItemStatus, TurnWorkItemsChangedNotification, TurnWorkItemsGetParams,
+    TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation,
+    TurnWorkState, TurnWorkStateChangedNotification, TurnWorkTombstone,
 };
 pub use turn::{
     AgentExecutionBackend, AgentMessagePhase, BackendSecurityCapabilities, ByteRange,
-    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, ContextCompressedNotification,
-    ContextCompressingNotification, DeltaOutputPolicy, DiagnosticExcerptPolicy,
-    EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT, EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
-    EmptyStrictObligationCollector, ExecutionCheckpointOriginalRequestSummary,
-    ExecutionCheckpointPayload, ExecutionCheckpointProviderBudgetInput,
-    ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointStrictObligation,
-    ExecutionCheckpointToolCallSummary, ExecutionCheckpointToolNoProgressExactVariant,
-    ExecutionCheckpointToolNoProgressState, ExecutionCheckpointToolNoProgressStrategy,
-    ExecutionCheckpointToolSummary, ExecutionCheckpointWindowSummary,
-    ExecutionWindowExhaustionReason, ExecutionWindowStatus,
+    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, CUA_TOOL_NAMES,
+    ContextCompressedNotification, ContextCompressingNotification, DeltaOutputPolicy,
+    DiagnosticExcerptPolicy, EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT,
+    EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION, EmptyStrictObligationCollector,
+    ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointPayload,
+    ExecutionCheckpointProviderBudgetInput, ExecutionCheckpointProviderBudgetSummary,
+    ExecutionCheckpointStrictObligation, ExecutionCheckpointToolCallSummary,
+    ExecutionCheckpointToolNoProgressExactVariant, ExecutionCheckpointToolNoProgressState,
+    ExecutionCheckpointToolNoProgressStrategy, ExecutionCheckpointToolSummary,
+    ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
     HISTORICAL_COMMAND_LLM_PROJECTION_VERSION, HistoricalCommandLlmProjection,
     HistoricalCommandOutput, HistoricalCommandOutputSource, HistoricalCommandRepresentation,
     HistoricalCommandResult, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
@@ -487,26 +514,27 @@ pub use turn::{
     ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind, ReasoningEffort,
     RecoveryAction, RecoveryJobStatus, RecoveryOutputPolicy, RecoveryTrigger, SandboxBackendKind,
     SandboxBackendRequirement, StaticStrictObligationCollector, StorageOutputPolicy,
-    StrictObligationCollector, SystemEventLevel, TURN_EXECUTION_ATTACHMENT_REFERENCE_MAX_COUNT,
-    TURN_EXECUTION_CAPABILITY_MAX_COUNT, TURN_EXECUTION_INPUT_MAX_BYTES,
-    TURN_EXECUTION_INPUT_MAX_ITEMS, TURN_EXECUTION_MENTION_MAX_COUNT,
-    TURN_EXECUTION_REQUEST_MAX_BYTES, TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
-    TURN_EXECUTION_TEXT_ELEMENT_MAX_COUNT, TURN_MESSAGE_INPUT_MAX_BYTES,
-    TURN_MESSAGE_INPUT_MAX_ITEMS, TURN_MESSAGE_MENTION_MAX_COUNT,
+    StrictObligationCollector, SystemEventLevel, TOOL_RESPONSE_MAX_BYTES,
+    TURN_EXECUTION_ATTACHMENT_REFERENCE_MAX_COUNT, TURN_EXECUTION_CAPABILITY_MAX_COUNT,
+    TURN_EXECUTION_INPUT_MAX_BYTES, TURN_EXECUTION_INPUT_MAX_ITEMS,
+    TURN_EXECUTION_MENTION_MAX_COUNT, TURN_EXECUTION_REQUEST_MAX_BYTES,
+    TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION, TURN_EXECUTION_TEXT_ELEMENT_MAX_COUNT,
+    TURN_MESSAGE_INPUT_MAX_BYTES, TURN_MESSAGE_INPUT_MAX_ITEMS, TURN_MESSAGE_MENTION_MAX_COUNT,
     TURN_MESSAGE_REVISION_CURSOR_MAX_BYTES, TURN_MESSAGE_REVISION_PAGE_DEFAULT_LIMIT,
     TURN_MESSAGE_REVISION_PAGE_MAX_LIMIT, TextElement, ThreadReadCursor,
     ThreadReadCursorChangedNotification, ThreadReadParams, ThreadReadPosition, ThreadReadResponse,
     TimelineLane, TimelineOrigin, TimelineOriginKind, TimelineOutputPolicy, ToolCallStatus,
     ToolDisplayPayload, ToolErrorClass, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
     ToolMetadata, ToolMetadataRawKind, ToolMetadataValue, ToolObservation, ToolOutcome,
-    ToolOutcomeStatus, ToolOutputPolicySnapshot, ToolOutputSummary, ToolPermissionPolicySnapshot,
-    ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
-    ToolRecoveryView, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
-    ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-    TurnApprovalScopePolicySnapshot, TurnAuthorSnapshot, TurnBlockedNotification,
-    TurnBlockedResumeMetadata, TurnCLIRuntimeOptions, TurnCancelParams, TurnCancelResponse,
-    TurnCapability, TurnCapabilityKind, TurnCommandRiskPolicy, TurnCompletedNotification,
-    TurnEnvironmentPolicy, TurnExecutionSecuritySnapshot, TurnExecutionWindowBlockedNotification,
+    ToolOutcomeStatus, ToolOutputMeasurements, ToolOutputPolicySnapshot, ToolOutputSummary,
+    ToolPermissionPolicySnapshot, ToolPhaseBoundary, ToolRecoveryIdempotencyMode,
+    ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind,
+    ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution,
+    ToolStoragePayload, Turn, TurnAppCapabilitySummary, TurnApprovalScopePolicySnapshot,
+    TurnAuthorSnapshot, TurnBlockedNotification, TurnBlockedResumeMetadata, TurnCLIRuntimeOptions,
+    TurnCancelParams, TurnCancelResponse, TurnCapability, TurnCapabilityKind,
+    TurnCommandRiskPolicy, TurnCompletedNotification, TurnEnvironmentPolicy,
+    TurnExecutionSecuritySnapshot, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
     TurnFailedNotification, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
@@ -524,20 +552,21 @@ pub use turn::{
     TurnPermissionProfileCap, TurnPermissionProfileSelection, TurnPermissionProfileSnapshot,
     TurnPermissionProfileSource, TurnPermissionRequestOpenedNotification,
     TurnPermissionRequestResolvedNotification, TurnPermissionRequestRespondParams,
-    TurnPermissionRequestRespondResponse, TurnProcessPolicySnapshot, TurnProcessTimeoutPolicy,
-    TurnReasoningSelection, TurnResumeParams, TurnResumeResponse, TurnSandboxMode,
-    TurnSandboxSnapshot, TurnSecurityBackendSnapshot, TurnSecurityCapabilityKind,
+    TurnPermissionRequestRespondResponse, TurnPluginCapabilitySummary, TurnProcessPolicySnapshot,
+    TurnProcessTimeoutPolicy, TurnReasoningSelection, TurnResumeParams, TurnResumeResponse,
+    TurnSandboxMode, TurnSandboxSnapshot, TurnSecurityBackendSnapshot, TurnSecurityCapabilityKind,
     TurnSecurityDegradation, TurnSecurityEnforcementStatus, TurnSecurityExecutionBackendKind,
     TurnSecurityParentCapSnapshot, TurnSecurityRuleProvenance, TurnSecuritySnapshotSource,
     TurnShellPolicy, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
     TurnSkillPackPresentationSummary, TurnStartParams, TurnStartResponse, TurnStartedNotification,
     TurnStatus, TurnStatusChangedNotification, TurnTmpMode, TurnTmpPolicy,
-    TurnToolLoopBudgetExceededNotification, UserInput, UserMessageAttachment, WebFetchLink,
-    WebSearchResultItem, build_execution_checkpoint_original_request_summary,
-    build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
-    build_execution_checkpoint_tool_summary, collect_execution_checkpoint_strict_obligations,
-    context_compaction_status, mcp_server_capability_key, mcp_tool_capability_key,
-    normalize_metadata_reasoning_effort, reasoning_effort_comparison_key,
+    TurnToolLoopBudgetExceededNotification, TurnWorkOwner, UserInput, UserMessageAttachment,
+    WebFetchLink, WebSearchResultItem, app_capability_key,
+    build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
+    build_execution_checkpoint_provider_budget_summary, build_execution_checkpoint_tool_summary,
+    collect_execution_checkpoint_strict_obligations, context_compaction_status,
+    mcp_server_capability_key, mcp_tool_capability_key, normalize_metadata_reasoning_effort,
+    package_capability, plugin_capability_key, reasoning_effort_comparison_key,
     resolve_turn_permission_profile, skill_capability_key, skill_pack_capability_key,
     validate_turn_execution_envelope, validate_turn_message_content,
 };
@@ -556,8 +585,8 @@ pub use voice::{
     VOICE_AUDIO_TARGET_CHANNELS, VOICE_AUDIO_TARGET_CHUNK_BYTES,
     VOICE_AUDIO_TARGET_CHUNK_DURATION_MS, VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ,
     VOICE_CHUNK_FRAME_MAGIC, VoiceAudioEncoding, VoiceAudioFormat, VoiceAudioFormatValidationError,
-    VoiceChunkAckNotification, VoiceChunkFrameHeader, VoiceError, VoiceErrorKind,
-    VoiceFrameDecodeError, VoiceFrameEncodeError, VoiceSessionCancelParams,
+    VoiceAudioIntegrity, VoiceChunkAckNotification, VoiceChunkFrameHeader, VoiceError,
+    VoiceErrorKind, VoiceFrameDecodeError, VoiceFrameEncodeError, VoiceSessionCancelParams,
     VoiceSessionCancelResponse, VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse,
     VoiceSessionOutcome, VoiceSessionResultNotification, VoiceSessionStartContext,
     VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatus, VoiceStatusParams,
@@ -577,3 +606,11 @@ mod model_selection;
 pub use model_selection::{GatewayModelSelection, ModelSelectionTransport};
 
 pub use artifact::{HtmlPublication, compact_html_timeline_item, compact_html_timeline_value};
+
+mod execution_observability;
+pub use execution_observability::*;
+mod service_mode;
+pub use service_mode::{
+    NativeServiceModePlan, NativeServiceModeSelection, OpenAiTier, ServiceModeDescriptor,
+    ServiceModeParameters, SourceServiceMode, SourceServiceModes,
+};

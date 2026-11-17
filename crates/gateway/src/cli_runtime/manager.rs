@@ -13,11 +13,23 @@ use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions;
 use pioneer_cli_agent_runtime::process::SensitiveEnvironment;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::future::Future;
+use std::sync::{
+    Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
+};
+#[path = "manager_ownership.rs"]
+mod ownership;
+use ownership::{CLI_CALLBACK_INSTANCE, CliSessionOwner, StartupWaitGuard};
+pub(crate) use ownership::{
+    CLIAgentRuntimeSessionStartup, CliSessionStopOwner, CliStartupProcessCleanup,
+};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CLIAgentRuntimeSessionKey {
@@ -98,6 +110,9 @@ pub(crate) struct CLIAgentRuntimeTurnSteerResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CLIAgentRuntimeSessionStartOptions {
+    /// Server-derived, committed selection; part of the existing reuse identity
+    /// and discoverable in the same entry before the native factory is polled.
+    pub plugin_selection: Option<pioneer_protocol::PluginSelectionSnapshot>,
     pub cwd: Option<PathBuf>,
     pub approval_policy: Option<String>,
     /// Stable identity of the principal, role, permission ceiling and maximum
@@ -116,7 +131,8 @@ pub(crate) struct CLIAgentRuntimeSessionStartOptions {
 
 pub(crate) struct CLIAgentRuntimeCodexEventReceivers {
     pub process_instance: CliSessionInstanceId,
-    pub notifications: mpsc::Receiver<CodexJsonlRpcNotificationEvent>,
+    pub notifications:
+        mpsc::Receiver<pioneer_observability::work::WorkItem<CodexJsonlRpcNotificationEvent>>,
     pub server_requests: mpsc::Receiver<CodexJsonlRpcServerRequest>,
     pub diagnostics: mpsc::Receiver<CodexJsonlRpcClientDiagnostic>,
 }
@@ -124,7 +140,7 @@ pub(crate) struct CLIAgentRuntimeCodexEventReceivers {
 pub(crate) struct CLIAgentRuntimeEventReceivers {
     pub process_instance: CliSessionInstanceId,
     pub runtime_kind: String,
-    pub events: mpsc::Receiver<RuntimeEvent>,
+    pub events: mpsc::Receiver<pioneer_observability::work::WorkItem<RuntimeEvent>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,6 +228,13 @@ pub(crate) struct CLIAgentRuntimeTurnObservation {
 #[async_trait]
 pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     async fn close(&self) -> Result<()>;
+    /// Separate native drain from root cleanup so Gateway callbacks drain first.
+    async fn stop_and_wait(&self) -> Result<()> {
+        self.close().await
+    }
+    async fn cleanup_after_stop(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// A provider may close its generation after an uncertain dispatch. Other
     /// adapters retain their existing reuse semantics.
@@ -465,6 +488,7 @@ pub(crate) trait CLIAgentRuntimeSessionFactory: Send + Sync {
         &self,
         instance: &CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
+        startup: &CLIAgentRuntimeSessionStartup,
     ) -> Result<Arc<dyn CLIAgentRuntimeSession>>;
 }
 
@@ -479,6 +503,10 @@ pub(crate) trait CLIAgentRuntimeSessionLifecycle: Send + Sync {
 
     async fn after_session_close(&self, _instance: &CliSessionInstanceId) {}
 
+    async fn after_session_close_result(&self, instance: &CliSessionInstanceId) -> Result<()> {
+        self.after_session_close(instance).await;
+        Ok(())
+    }
     async fn shutdown_finished(&self) {}
 }
 
@@ -491,6 +519,17 @@ impl CLIAgentRuntimeSessionLifecycle for NoopCLIAgentRuntimeSessionLifecycle {}
 pub(crate) struct CLIAgentRuntimeSessionHandle {
     instance: CliSessionInstanceId,
     session: Arc<dyn CLIAgentRuntimeSession>,
+    // The cache owns one reference. Every issued handle pins this generation
+    // against idle eviction, including management-only operations without a Turn.
+    last_used_at: Arc<StdMutex<Instant>>,
+}
+
+impl Drop for CLIAgentRuntimeSessionHandle {
+    fn drop(&mut self) {
+        if let Ok(mut last_used_at) = self.last_used_at.lock() {
+            *last_used_at = Instant::now();
+        }
+    }
 }
 
 impl CLIAgentRuntimeSessionHandle {
@@ -502,6 +541,9 @@ impl CLIAgentRuntimeSessionHandle {
         &self.instance
     }
 
+    /// Keep this handle alive through operations on the returned process route.
+    /// Long-lived event pumps retain only the raw route; each request pins its
+    /// exact generation separately so idle pumps do not prevent eviction.
     pub(crate) fn session(&self) -> Arc<dyn CLIAgentRuntimeSession> {
         self.session.clone()
     }
@@ -520,6 +562,7 @@ pub(crate) struct CLIAgentRuntimeMachineRequestResponder {
     instance: CliSessionInstanceId,
     native_request_id: JsonValue,
     session: Arc<dyn CLIAgentRuntimeSession>,
+    _session_use: Option<CLIAgentRuntimeSessionHandle>,
 }
 
 impl std::fmt::Debug for CLIAgentRuntimeMachineRequestResponder {
@@ -533,6 +576,8 @@ impl std::fmt::Debug for CLIAgentRuntimeMachineRequestResponder {
 }
 
 impl CLIAgentRuntimeMachineRequestResponder {
+    /// Origin-bound rejection for an already stale process. Current response
+    /// lanes must use from_handle to retain their idle-use pin.
     pub(crate) fn new(
         instance: CliSessionInstanceId,
         native_request_id: JsonValue,
@@ -542,6 +587,19 @@ impl CLIAgentRuntimeMachineRequestResponder {
             instance,
             native_request_id,
             session,
+            _session_use: None,
+        }
+    }
+
+    pub(crate) fn from_handle(
+        handle: CLIAgentRuntimeSessionHandle,
+        native_request_id: JsonValue,
+    ) -> Self {
+        Self {
+            instance: handle.instance().clone(),
+            native_request_id,
+            session: handle.session(),
+            _session_use: Some(handle),
         }
     }
 
@@ -579,29 +637,47 @@ impl CLIAgentRuntimeMachineRequestResponder {
 struct CLIAgentRuntimeCachedSession {
     // Only this generation's metadata commits and retirement share this gate.
     metadata_commit: Arc<Mutex<()>>,
+    // Pump diagnostics must distinguish deliberate idle retirement from loss
+    // of a live transport, even after this cache entry has been removed.
+    idle_retirement: CancellationToken,
     instance: CliSessionInstanceId,
-    session: Arc<dyn CLIAgentRuntimeSession>,
+    owner: Arc<CliSessionOwner>,
     launch_spec: CliSessionLaunchSpec,
     started_at_ms: u64,
-    last_used_at_ms: u64,
+    last_used_at: Arc<StdMutex<Instant>>,
 }
-
 impl CLIAgentRuntimeCachedSession {
-    fn handle(&self) -> CLIAgentRuntimeSessionHandle {
-        CLIAgentRuntimeSessionHandle {
-            instance: self.instance.clone(),
-            session: self.session.clone(),
+    fn handle(&self) -> Option<CLIAgentRuntimeSessionHandle> {
+        if !self.owner.ready.load(Ordering::Acquire) || self.owner.closing.load(Ordering::Acquire) {
+            return None;
         }
+        Some(CLIAgentRuntimeSessionHandle {
+            instance: self.instance.clone(),
+            session: self.owner.startup.session()?,
+            last_used_at: self.last_used_at.clone(),
+        })
+    }
+
+    fn is_idle_codex(&self, now: Instant, ttl: Duration) -> bool {
+        matches!(
+            self.launch_spec.continuation,
+            crate::cli_runtime::continuation::CliProviderContinuation::CodexRpcThread { .. }
+        ) && Arc::strong_count(&self.last_used_at) == 1
+            && self
+                .last_used_at
+                .lock()
+                .is_ok_and(|last_used_at| now.saturating_duration_since(*last_used_at) >= ttl)
     }
 }
-
 pub(crate) struct CLIAgentRuntimeManager {
     factory: Arc<dyn CLIAgentRuntimeSessionFactory>,
     lifecycle: Arc<dyn CLIAgentRuntimeSessionLifecycle>,
     idle_session_ttl: Duration,
-    sessions: Mutex<HashMap<CLIAgentRuntimeSessionKey, CLIAgentRuntimeCachedSession>>,
-    start_locks: Mutex<HashMap<CLIAgentRuntimeSessionKey, Arc<Mutex<()>>>>,
+    // Only synchronous map access. Never retain this guard over any await.
+    sessions: StdMutex<HashMap<CLIAgentRuntimeSessionKey, CLIAgentRuntimeCachedSession>>,
+    start_locks: Mutex<HashMap<CLIAgentRuntimeSessionKey, Weak<Mutex<()>>>>,
     generations: CliSessionGenerationAllocator,
+    shutting_down: AtomicBool,
 }
 
 impl CLIAgentRuntimeManager {
@@ -628,7 +704,8 @@ impl CLIAgentRuntimeManager {
             factory,
             lifecycle,
             idle_session_ttl,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: StdMutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
             start_locks: Mutex::new(HashMap::new()),
             generations: CliSessionGenerationAllocator::default(),
         })
@@ -683,17 +760,23 @@ impl CLIAgentRuntimeManager {
         launch_spec: CliSessionLaunchSpec,
         now_ms: u64,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
+        if CLI_CALLBACK_INSTANCE
+            .try_with(|id| id.key() == &key)
+            .unwrap_or(false)
+        {
+            bail!("CLI callback cannot wait for acquisition of its own logical session");
+        }
         let start_lock = self.start_lock_for_key(&key).await;
         let startup_wait = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::CliSessionWait,
         );
         let _guard = start_lock.lock().await;
         drop(startup_wait);
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("CLI manager is shutting down");
+        }
 
-        if let Some(handle) = self
-            .touch_reusable_session(&key, &launch_spec, now_ms)
-            .await
-        {
+        if let Some(handle) = self.touch_reusable_session(&key, &launch_spec).await {
             pioneer_observability::turn_startup::session_state(
                 pioneer_observability::turn_startup::SessionState::Reused,
             );
@@ -702,63 +785,41 @@ impl CLIAgentRuntimeManager {
         pioneer_observability::turn_startup::session_state(
             pioneer_observability::turn_startup::SessionState::New,
         );
-        if let Some(stale) = self.session_requiring_restart(&key, &launch_spec).await {
-            pioneer_observability::turn_startup::session_state(
-                pioneer_observability::turn_startup::SessionState::Replaced,
-            );
-            validate_replacement_continuation(&stale.launch_spec, &launch_spec)?;
-            stale
-                .session
-                .validate_replacement_launch(&launch_spec)
-                .await?;
-            stale
-                .session
-                .prepare_for_replacement()
-                .await
-                .map_err(|error| {
-                    anyhow!(
-                        "CLI runtime session `{}/{}/{}` is not safe to replace: {error:#}",
-                        key.workspace_id,
-                        key.runtime_id,
-                        key.thread_id
-                    )
-                })?;
-            let Some(stale) = self.remove_session_instance(&stale.instance).await else {
-                bail!(
-                    "CLI runtime session `{}/{}/{}` changed while preparing replacement",
-                    key.workspace_id,
-                    key.runtime_id,
-                    key.thread_id
+        if let Some(stale) = self.cached(&key) {
+            let metadata = stale.metadata_commit.lock().await;
+            if CLI_CALLBACK_INSTANCE
+                .try_with(|id| id == &stale.instance)
+                .unwrap_or(false)
+            {
+                stale.owner.begin_close(self.lifecycle.clone());
+                bail!("CLI callback replacement requires its own drain");
+            }
+            if !stale.owner.closing.load(Ordering::Acquire) {
+                validate_replacement_continuation(&stale.launch_spec, &launch_spec)?;
+                let session = stale
+                    .owner
+                    .startup
+                    .session()
+                    .ok_or_else(|| anyhow!("CLI startup is unresolved"))?;
+                pioneer_observability::turn_startup::session_state(
+                    pioneer_observability::turn_startup::SessionState::Replaced,
                 );
-            };
-            // Replacement has a stronger provider-owned shutdown order than
-            // ordinary eviction: the session has already proved terminal and
-            // must close its process/helper before the lifecycle revokes the
-            // exact generation. Manual/idle shutdown still uses the early
-            // cancellation hook below.
-            let close_result = stale.session.close().await;
-            let checkpoint_result = if close_result.is_ok() {
-                stale.session.confirm_replacement_checkpoint().await
-            } else {
-                Ok(())
-            };
-            self.lifecycle.after_session_close(&stale.instance).await;
-            close_result.map_err(|error| {
-                anyhow!(
-                    "failed to close stale CLI runtime session `{}/{}/{}`: {error:#}",
-                    key.workspace_id,
-                    key.runtime_id,
-                    key.thread_id
-                )
-            })?;
-            checkpoint_result.map_err(|error| {
-                anyhow!(
-                    "failed to confirm replacement checkpoint for CLI runtime session `{}/{}/{}`: {error:#}",
-                    key.workspace_id,
-                    key.runtime_id,
-                    key.thread_id
-                )
-            })?;
+                session.validate_replacement_launch(&launch_spec).await?;
+                session.prepare_for_replacement().await?;
+                stale
+                    .owner
+                    .replacement_prepared
+                    .store(true, Ordering::Release);
+            }
+            stale.owner.begin_close(self.lifecycle.clone());
+            drop(metadata);
+            stale.owner.close_and_wait(self.lifecycle.clone()).await?;
+            if stale.owner.replacement_prepared.load(Ordering::Acquire) {
+                if let Some(session) = stale.owner.startup.session() {
+                    session.confirm_replacement_checkpoint().await?;
+                }
+            }
+            self.release_stopped(&stale.owner)?;
         }
 
         self.start_and_publish_locked(key, launch_spec, now_ms)
@@ -773,27 +834,35 @@ impl CLIAgentRuntimeManager {
         key: CLIAgentRuntimeSessionKey,
         launch_spec: CliSessionLaunchSpec,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
-        if !matches!(
-            launch_spec.mcp,
-            crate::cli_runtime::continuation::CliMcpSessionLaunch::ManagementOnly
-        ) {
-            bail!("management acquisition requires an isolated management launch");
+        if CLI_CALLBACK_INSTANCE
+            .try_with(|id| id.key() == &key)
+            .unwrap_or(false)
+        {
+            bail!("CLI callback cannot wait for acquisition of its own logical session");
         }
+        anyhow::ensure!(
+            matches!(
+                launch_spec.mcp,
+                crate::cli_runtime::continuation::CliMcpSessionLaunch::ManagementOnly
+            ),
+            "management acquisition requires an isolated management launch"
+        );
         let start_lock = self.start_lock_for_key(&key).await;
         let _guard = start_lock.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("CLI manager is shutting down");
+        }
         let now_ms = current_time_millis();
-        if let Some(handle) = self.touch_any_existing_session(&key, now_ms).await {
+        if let Some(handle) = self.touch_any_existing_session(&key).await {
             if handle.session().is_usable() {
                 return Ok(handle);
             }
-            // A generation already closed by its adapter has no active turn to
-            // preserve. Management still never replaces a usable turn process.
-            if let Some(stale) = self.remove_session_instance(handle.instance()).await {
-                self.lifecycle.before_session_close(&stale.instance).await;
-                let close = stale.session.close().await;
-                self.lifecycle.after_session_close(&stale.instance).await;
-                close?;
-            }
+        }
+        // Closing/not-ready owners have no ready handle, but still own native
+        // cleanup. Under the key gate, drain and release that exact generation
+        // before publishing a replacement. Usable turn processes returned above.
+        if let Some(stale) = self.cached(&key) {
+            self.close_cached(&stale).await?;
         }
         self.start_and_publish_locked(key, launch_spec, now_ms)
             .await
@@ -805,127 +874,257 @@ impl CLIAgentRuntimeManager {
         launch_spec: CliSessionLaunchSpec,
         now_ms: u64,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
-        let _startup_initialize = pioneer_observability::turn_startup::current_stage(
-            pioneer_observability::turn_startup::Stage::CliInitialize,
-        );
         let instance = self.generations.allocate(key.clone())?;
-        let session = match self
-            .factory
-            .start_session_with_launch_spec(&instance, &launch_spec)
-            .await
+        let owner = CliSessionOwner::new(instance.clone());
         {
-            Ok(session) => session,
-            Err(error) => {
-                self.lifecycle.after_session_close(&instance).await;
-                return Err(anyhow!("failed to start CLI runtime session: {error:#}"));
+            let mut sessions = self.sessions.lock().expect("CLI registry poisoned");
+            if self.shutting_down.load(Ordering::Acquire) {
+                bail!("CLI manager is shutting down");
             }
-        };
-        let handle = CLIAgentRuntimeSessionHandle {
-            instance: instance.clone(),
-            session: session.clone(),
-        };
-        let published = {
-            let mut sessions = self.sessions.lock().await;
-            match sessions.entry(key.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(CLIAgentRuntimeCachedSession {
-                        metadata_commit: Arc::new(Mutex::new(())),
-                        instance: instance.clone(),
-                        session: session.clone(),
-                        launch_spec,
-                        started_at_ms: now_ms,
-                        last_used_at_ms: now_ms,
-                    });
-                    true
-                }
-                Entry::Occupied(_) => false,
+            if sessions.contains_key(&key) {
+                bail!("CLI predecessor stop is unresolved");
             }
-        };
-        if !published {
-            self.lifecycle.before_session_close(&instance).await;
-            let close_result = session.close().await;
-            self.lifecycle.after_session_close(&instance).await;
-            close_result.map_err(|error| {
-                anyhow!(
-                    "failed to close unpublished CLI runtime session generation after CAS conflict: {error:#}"
-                )
-            })?;
-            bail!(
-                "CLI runtime session `{}/{}/{}` changed while publishing a new process generation",
-                key.workspace_id,
-                key.runtime_id,
-                key.thread_id
+            sessions.insert(
+                key.clone(),
+                CLIAgentRuntimeCachedSession {
+                    instance: instance.clone(),
+                    owner: owner.clone(),
+                    launch_spec: launch_spec.clone(),
+                    started_at_ms: now_ms,
+                    last_used_at: Arc::new(StdMutex::new(Instant::now())),
+                    metadata_commit: owner.metadata_commit.clone(),
+                    idle_retirement: CancellationToken::new(),
+                },
             );
+            // Registry publication and actual factory task registration are synchronous.
+            let factory = self.factory.clone();
+            let startup = owner.startup.clone();
+            let factory_owner = owner.clone();
+            let lifecycle = self.lifecycle.clone();
+            owner.spawn_start_task(async move {
+                let result = factory
+                    .start_session_with_launch_spec(&instance, &launch_spec, &startup)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                let outcome = result.map(|session| {
+                    startup.retain_session(session);
+                });
+                if outcome.is_err() || factory_owner.closing.load(Ordering::Acquire) {
+                    factory_owner.begin_close(lifecycle);
+                }
+                outcome
+            });
         }
-        Ok(handle)
+        let mut waiter = StartupWaitGuard(owner.clone(), false, self.lifecycle.clone());
+        if let Err(error) = owner.finish_startup().await {
+            owner.request_stop();
+            // Failed cleanup stays in this same registry entry for repeat.
+            owner.close_and_wait(self.lifecycle.clone()).await?;
+            self.release_stopped(&owner)?;
+            return Err(error);
+        }
+        let sessions = self.sessions.lock().expect("CLI registry poisoned");
+        let current = sessions
+            .get(&key)
+            .filter(|cached| cached.instance == owner.instance)
+            .ok_or_else(|| anyhow!("CLI startup identity changed"))?;
+        if owner.closing.load(Ordering::Acquire) || self.shutting_down.load(Ordering::Acquire) {
+            bail!("CLI startup was stopped");
+        }
+        owner.ready.store(true, Ordering::Release);
+        waiter.1 = true;
+        current
+            .handle()
+            .ok_or_else(|| anyhow!("CLI startup did not retain its session"))
     }
 
+    fn cached(&self, key: &CLIAgentRuntimeSessionKey) -> Option<CLIAgentRuntimeCachedSession> {
+        self.sessions
+            .lock()
+            .expect("CLI registry poisoned")
+            .get(key)
+            .cloned()
+    }
+    fn release_stopped(&self, owner: &Arc<CliSessionOwner>) -> Result<()> {
+        if !owner.stopped.load(Ordering::Acquire) {
+            bail!("CLI native stop is unresolved");
+        }
+        let mut sessions = self.sessions.lock().expect("CLI registry poisoned");
+        if sessions
+            .get(owner.instance.key())
+            .is_some_and(|current| current.instance == owner.instance)
+        {
+            sessions.remove(owner.instance.key());
+        }
+        Ok(())
+    }
+    /// Includes accepted factory startup and failed/closing native owners.
+    pub(crate) fn stop_inventory(&self, workspace_id: &str) -> Vec<CliSessionStopOwner> {
+        self.sessions
+            .lock()
+            .expect("CLI registry poisoned")
+            .values()
+            .filter(|entry| entry.instance.key().workspace_id == workspace_id)
+            .map(|entry| CliSessionStopOwner(entry.owner.clone()))
+            .collect()
+    }
+    pub(crate) fn plugin_stop_inventory(
+        &self,
+        workspace: &str,
+        plugin: &str,
+    ) -> Vec<CliSessionStopOwner> {
+        self.sessions
+            .lock()
+            .expect("CLI registry poisoned")
+            .values()
+            .filter(|entry| {
+                entry.instance.key().workspace_id == workspace
+                    && entry
+                        .launch_spec
+                        .options
+                        .plugin_selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.parents.iter().any(|p| p.id == plugin))
+            })
+            .map(|entry| CliSessionStopOwner(entry.owner.clone()))
+            .collect()
+    }
+    pub(crate) fn capture_stop_owner(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> Result<CliSessionStopOwner> {
+        self.cached(instance.key())
+            .filter(|entry| entry.instance == *instance)
+            .map(|entry| CliSessionStopOwner(entry.owner))
+            .ok_or_else(|| anyhow!("CLI instance stop owner is unknown"))
+    }
+
+    /// Bind a Turn to this actual process before any native thread/Turn work.
+    /// This metadata belongs to the existing owner, not a second registry.
+    pub(crate) fn admit_turn_owner(
+        &self,
+        instance: &CliSessionInstanceId,
+        turn: &str,
+    ) -> Result<()> {
+        let entry = self
+            .cached(instance.key())
+            .filter(|entry| entry.instance == *instance)
+            .ok_or_else(|| anyhow!("CLI turn process owner is unknown"))?;
+        entry.owner.admit_turn(turn)
+    }
+
+    pub(crate) fn plugin_selection_for_instance(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> Result<Option<pioneer_protocol::PluginSelectionSnapshot>> {
+        self.cached(instance.key())
+            .filter(|entry| entry.instance == *instance)
+            .map(|entry| entry.launch_spec.options.plugin_selection.clone())
+            .ok_or_else(|| anyhow!("CLI instance launch contract is unknown"))
+    }
+    /// Captured actual owner, caller deadline, never late logical-key lookup.
+    pub(crate) async fn stop_and_wait(
+        &self,
+        captured: &CliSessionStopOwner,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        // Startup holds the key lock while awaiting its factory. Deliver stop
+        // to the captured owner before waiting for that lock or caller deadline.
+        captured.0.begin_close(self.lifecycle.clone());
+        if CLI_CALLBACK_INSTANCE
+            .try_with(|id| id == captured.instance())
+            .unwrap_or(false)
+        {
+            bail!("CLI callback requested stop; its own completion cannot be acknowledged here");
+        }
+        tokio::time::timeout_at(deadline, async {
+            let lock = self.start_lock_for_key(captured.instance().key()).await;
+            let _guard = lock.lock().await;
+            captured.0.close_and_wait(self.lifecycle.clone()).await?;
+            self.release_stopped(&captured.0)
+        })
+        .await
+        .map_err(|_| anyhow!("CLI native stop deadline expired; owner retained"))?
+    }
+    pub(crate) fn spawn_instance_work<F>(&self, instance: &CliSessionInstanceId, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.capture_stop_owner(instance)
+            .is_ok_and(|owner| owner.0.spawn_callback(future))
+    }
+    pub(crate) fn record_instance_failure(&self, instance: &CliSessionInstanceId, error: String) {
+        if let Ok(owner) = self.capture_stop_owner(instance) {
+            owner.0.record_callback_failure(error);
+        }
+    }
+    pub(crate) fn instance_cancellation(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> Result<tokio_util::sync::CancellationToken> {
+        Ok(self.capture_stop_owner(instance)?.0.cancellation.clone())
+    }
     pub(crate) async fn close_session_if_started_at_or_before(
         &self,
         key: &CLIAgentRuntimeSessionKey,
         cutoff_ms: u64,
     ) -> Result<bool> {
-        let start_lock = self.start_lock_for_key(key).await;
-        let _start_guard = start_lock.lock().await;
-        let candidate = self
-            .sessions
-            .lock()
-            .await
-            .get(key)
+        let Some(cached) = self
+            .cached(key)
             .filter(|cached| cached.started_at_ms <= cutoff_ms)
-            .map(|cached| cached.instance.clone());
-        let stale = match candidate {
-            Some(instance) => self.remove_session_instance(&instance).await,
-            None => None,
-        };
-        let Some(stale) = stale else {
+        else {
             return Ok(false);
         };
-        self.lifecycle.before_session_close(&stale.instance).await;
-        let close_result = stale.session.close().await;
-        self.lifecycle.after_session_close(&stale.instance).await;
-        close_result.map_err(|error| {
-            anyhow!(
-                "failed to close stale CLI runtime session `{}/{}/{}` for receipt cutoff `{cutoff_ms}`: {error:#}",
-                key.workspace_id,
-                key.runtime_id,
-                key.thread_id
-            )
-        })?;
+        cached.owner.begin_close(self.lifecycle.clone());
+        if CLI_CALLBACK_INSTANCE
+            .try_with(|id| id.key() == key)
+            .unwrap_or(false)
+        {
+            bail!("CLI callback stop is pending its own drain");
+        }
+        let lock = self.start_lock_for_key(key).await;
+        let _guard = lock.lock().await;
+        let Some(current) = self.cached(key).filter(|current| {
+            current.instance == cached.instance && current.started_at_ms <= cutoff_ms
+        }) else {
+            return Ok(false);
+        };
+        self.close_cached(&current).await
+    }
+    async fn close_cached(&self, cached: &CLIAgentRuntimeCachedSession) -> Result<bool> {
+        if CLI_CALLBACK_INSTANCE
+            .try_with(|id| id == &cached.instance)
+            .unwrap_or(false)
+        {
+            cached.owner.begin_close(self.lifecycle.clone());
+            bail!("CLI callback stop is pending its own drain");
+        }
+        cached.owner.close_and_wait(self.lifecycle.clone()).await?;
+        self.release_stopped(&cached.owner)?;
         Ok(true)
     }
-
     async fn touch_reusable_session(
         &self,
         key: &CLIAgentRuntimeSessionKey,
         launch_spec: &CliSessionLaunchSpec,
-        now_ms: u64,
     ) -> Option<CLIAgentRuntimeSessionHandle> {
-        let mut sessions = self.sessions.lock().await;
+        let mut sessions = self.sessions.lock().expect("CLI registry poisoned");
         let cached = sessions.get_mut(key)?;
-        if cached.session.is_closed()
-            || !cached.session.is_usable()
-            || requires_restart(&cached.launch_spec, launch_spec)
-        {
+        let handle = cached.handle()?;
+        if !handle.session.is_usable() || requires_restart(&cached.launch_spec, launch_spec) {
             return None;
         }
-        // Continuation is resolved before every acquisition. Retain the newest
-        // typed value so a later manifest-driven replacement resumes the exact
-        // persisted provider identity.
         cached.launch_spec.continuation = launch_spec.continuation.clone();
-        cached.last_used_at_ms = now_ms;
-        Some(cached.handle())
+        Some(handle)
     }
-
     async fn touch_any_existing_session(
         &self,
         key: &CLIAgentRuntimeSessionKey,
-        now_ms: u64,
     ) -> Option<CLIAgentRuntimeSessionHandle> {
-        let mut sessions = self.sessions.lock().await;
+        let mut sessions = self.sessions.lock().expect("CLI registry poisoned");
         let cached = sessions.get_mut(key)?;
-        cached.last_used_at_ms = now_ms;
-        Some(cached.handle())
+        let handle = cached.handle()?;
+        Some(handle)
     }
 
     pub(crate) async fn cached_launch_spec(
@@ -934,7 +1133,7 @@ impl CLIAgentRuntimeManager {
     ) -> Option<CliSessionLaunchSpec> {
         self.sessions
             .lock()
-            .await
+            .expect("CLI registry poisoned")
             .get(key)
             .map(|cached| cached.launch_spec.clone())
     }
@@ -943,249 +1142,191 @@ impl CLIAgentRuntimeManager {
         &self,
         key: &CLIAgentRuntimeSessionKey,
     ) -> Option<CLIAgentRuntimeSessionHandle> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
         self.sessions
             .lock()
-            .await
-            .get(key)
-            .map(CLIAgentRuntimeCachedSession::handle)
+            .expect("CLI registry poisoned")
+            .get(key)?
+            .handle()
     }
-
-    /// Keep this instance current through a metadata commit, without retaining
-    /// the registry lock while waiting for the database or another commit.
+    pub(crate) async fn is_current_instance(&self, instance: &CliSessionInstanceId) -> bool {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return false;
+        }
+        self.sessions
+            .lock()
+            .expect("CLI registry poisoned")
+            .get(instance.key())
+            .is_some_and(|cached| {
+                cached.instance == *instance
+                    && cached.owner.ready.load(Ordering::Acquire)
+                    && !cached.owner.closing.load(Ordering::Acquire)
+            })
+    }
     pub(crate) async fn current_instance_guard(
         &self,
         instance: &CliSessionInstanceId,
     ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        let gate = {
-            let sessions = self.sessions.lock().await;
-            let cached = sessions.get(instance.key())?;
-            if cached.instance != *instance {
-                return None;
-            }
-            cached.metadata_commit.clone()
-        };
+        let gate = self
+            .cached(instance.key())
+            .filter(|entry| entry.instance == *instance)?
+            .metadata_commit;
         let guard = gate.lock_owned().await;
         self.is_current_instance(instance).await.then_some(guard)
     }
 
-    pub(crate) async fn is_current_instance(&self, instance: &CliSessionInstanceId) -> bool {
-        self.sessions
-            .lock()
-            .await
-            .get(instance.key())
-            .is_some_and(|cached| cached.instance == *instance)
-    }
-
-    pub(crate) async fn remove_if_generation(&self, instance: &CliSessionInstanceId) -> bool {
-        let removed = self.remove_session_instance(instance).await;
-        if removed.is_some() {
-            // Event-pump EOF means the provider side has already terminated.
-            self.lifecycle.after_session_close(instance).await;
-            true
-        } else {
-            false
-        }
-    }
-
-    async fn session_requiring_restart(
-        &self,
-        key: &CLIAgentRuntimeSessionKey,
-        launch_spec: &CliSessionLaunchSpec,
-    ) -> Option<CLIAgentRuntimeCachedSession> {
-        let sessions = self.sessions.lock().await;
-        let cached = sessions.get(key)?;
-        if !cached.session.is_closed()
-            && cached.session.is_usable()
-            && !requires_restart(&cached.launch_spec, launch_spec)
-        {
-            return None;
-        }
-        Some(cached.clone())
-    }
-
-    async fn remove_session_instance(
+    pub(crate) async fn idle_retirement_signal(
         &self,
         instance: &CliSessionInstanceId,
-    ) -> Option<CLIAgentRuntimeCachedSession> {
-        let _commit = self.current_instance_guard(instance).await?;
-        let mut sessions = self.sessions.lock().await;
-        let current = sessions.get(instance.key())?;
-        if current.instance != *instance {
-            return None;
-        }
-        sessions.remove(instance.key())
+    ) -> Option<CancellationToken> {
+        self.cached(instance.key())
+            .filter(|entry| entry.instance == *instance)
+            .map(|entry| entry.idle_retirement)
     }
 
+    /// EOF closes admission and initiates owned cleanup; it is not stop proof.
+    pub(crate) async fn remove_if_generation(&self, instance: &CliSessionInstanceId) -> bool {
+        let Ok(owner) = self.capture_stop_owner(instance) else {
+            return false;
+        };
+        owner.0.begin_close(self.lifecycle.clone());
+        true
+    }
     async fn start_lock_for_key(&self, key: &CLIAgentRuntimeSessionKey) -> Arc<Mutex<()>> {
         let mut locks = self.start_locks.lock().await;
-        locks
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
     }
-
-    pub(crate) async fn close_idle_sessions(&self) -> Result<usize> {
-        self.close_idle_sessions_at(current_time_millis()).await
-    }
-
-    async fn close_idle_sessions_at(&self, now_ms: u64) -> Result<usize> {
-        let ttl_ms = self.idle_session_ttl.as_millis() as u64;
-        let candidates = self
-            .sessions
+    /// Gateway checks durable execution state under its session transition gate.
+    pub(crate) async fn idle_codex_sessions(&self) -> Vec<CliSessionInstanceId> {
+        let now = Instant::now();
+        self.sessions
             .lock()
-            .await
+            .expect("CLI registry poisoned")
             .values()
-            .filter(|cached| now_ms.saturating_sub(cached.last_used_at_ms) >= ttl_ms)
+            .filter(|cached| cached.is_idle_codex(now, self.idle_session_ttl))
             .map(|cached| cached.instance.clone())
-            .collect::<Vec<_>>();
-        let mut idle_sessions = Vec::new();
-        for instance in candidates {
-            let Some(_commit) = self.current_instance_guard(&instance).await else {
-                continue;
-            };
-            let mut sessions = self.sessions.lock().await;
-            // Touches may have happened while this generation's commit finished.
-            if sessions.get(instance.key()).is_some_and(|cached| {
-                cached.instance == instance
-                    && now_ms.saturating_sub(cached.last_used_at_ms) >= ttl_ms
-            }) && let Some(cached) = sessions.remove(instance.key())
-            {
-                idle_sessions.push((instance.key().clone(), cached));
-            }
-        }
-
-        let closed_count = idle_sessions.len();
-        let mut first_error = None;
-        for (key, cached) in idle_sessions {
-            self.lifecycle.before_session_close(&cached.instance).await;
-            let close_result = cached.session.close().await;
-            self.lifecycle.after_session_close(&cached.instance).await;
-            if let Err(error) = close_result
-                && first_error.is_none()
-            {
-                first_error = Some(anyhow!(
-                    "failed to close idle CLI runtime session `{}/{}/{}`: {error:#}",
-                    key.workspace_id,
-                    key.runtime_id,
-                    key.thread_id
-                ));
-            }
-            self.remove_start_lock(&key).await;
-        }
-        first_error.map_or(Ok(closed_count), Err)
+            .collect()
     }
 
-    pub(crate) async fn close_session(&self, key: &CLIAgentRuntimeSessionKey) -> Result<bool> {
-        let start_lock = self.start_lock_for_key(key).await;
-        let _start_guard = start_lock.lock().await;
-        let instance = self
-            .sessions
-            .lock()
-            .await
-            .get(key)
-            .map(|cached| cached.instance.clone());
-        let session = match instance {
-            Some(instance) => self.remove_session_instance(&instance).await,
-            None => None,
-        };
-        let Some(cached) = session else {
-            return Ok(false);
-        };
-        self.lifecycle.before_session_close(&cached.instance).await;
-        let close_result = cached.session.close().await;
-        self.lifecycle.after_session_close(&cached.instance).await;
-        close_result.map_err(|error| {
-            anyhow!(
-                "failed to close CLI runtime session `{}/{}/{}`: {error:#}",
-                key.workspace_id,
-                key.runtime_id,
-                key.thread_id
-            )
-        })?;
-        self.remove_start_lock(key).await;
-        Ok(true)
-    }
-
-    pub(crate) async fn close_session_instance(
+    pub(crate) async fn close_idle_codex_session(
         &self,
         instance: &CliSessionInstanceId,
     ) -> Result<bool> {
         let start_lock = self.start_lock_for_key(instance.key()).await;
-        let _start_guard = start_lock.lock().await;
-        let cached = self.remove_session_instance(instance).await;
-        let Some(cached) = cached else {
+        let Ok(_start) = start_lock.try_lock() else {
             return Ok(false);
         };
-        self.lifecycle.before_session_close(&cached.instance).await;
-        let close_result = cached.session.close().await;
-        self.lifecycle.after_session_close(&cached.instance).await;
-        close_result.map_err(|error| {
-            anyhow!(
-                "failed to close CLI runtime session `{}/{}/{}` generation {}: {error:#}",
-                instance.key().workspace_id,
-                instance.key().runtime_id,
-                instance.key().thread_id,
-                instance.generation()
-            )
-        })?;
-        self.remove_start_lock(instance.key()).await;
+        let Some(candidate) = self
+            .cached(instance.key())
+            .filter(|entry| entry.instance == *instance)
+        else {
+            return Ok(false);
+        };
+        let Ok(commit) = candidate.metadata_commit.try_lock() else {
+            return Ok(false);
+        };
+        {
+            let sessions = self.sessions.lock().expect("CLI registry poisoned");
+            let Some(current) = sessions
+                .get(instance.key())
+                .filter(|entry| entry.instance == *instance)
+            else {
+                return Ok(false);
+            };
+            // The local candidate clone owns one timestamp reference in addition
+            // to the registry. Issued handles each retain an additional pin.
+            if !matches!(
+                current.launch_spec.continuation,
+                crate::cli_runtime::continuation::CliProviderContinuation::CodexRpcThread { .. }
+            ) || Arc::strong_count(&current.last_used_at) != 2
+                || !current.last_used_at.lock().is_ok_and(|last| {
+                    Instant::now().saturating_duration_since(*last) >= self.idle_session_ttl
+                })
+            {
+                return Ok(false);
+            }
+            current.idle_retirement.cancel();
+            // Close admission under the same registry lock used to issue handles.
+            current.owner.begin_close(self.lifecycle.clone());
+        }
+        drop(commit);
+        candidate
+            .owner
+            .close_and_wait(self.lifecycle.clone())
+            .await?;
+        self.release_stopped(&candidate.owner)?;
         Ok(true)
     }
-
+    pub(crate) async fn close_session(&self, key: &CLIAgentRuntimeSessionKey) -> Result<bool> {
+        // Capture before waiting for the key lock: never close a replacement.
+        let Some(cached) = self.cached(key) else {
+            return Ok(false);
+        };
+        self.close_session_instance(&cached.instance).await
+    }
+    pub(crate) async fn close_session_instance(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> Result<bool> {
+        let Ok(captured) = self.capture_stop_owner(instance) else {
+            return Ok(false);
+        };
+        captured.0.begin_close(self.lifecycle.clone());
+        if CLI_CALLBACK_INSTANCE
+            .try_with(|id| id == instance)
+            .unwrap_or(false)
+        {
+            bail!("CLI callback stop is pending its own drain");
+        }
+        let lock = self.start_lock_for_key(instance.key()).await;
+        let _guard = lock.lock().await;
+        captured.0.close_and_wait(self.lifecycle.clone()).await?;
+        self.release_stopped(&captured.0)?;
+        Ok(true)
+    }
     pub(crate) async fn close_all(&self) -> Result<usize> {
+        let instances = {
+            let sessions = self.sessions.lock().expect("CLI registry poisoned");
+            self.shutting_down.store(true, Ordering::Release);
+            for cached in sessions.values() {
+                cached.owner.begin_close(self.lifecycle.clone());
+            }
+            sessions
+                .values()
+                .map(|cached| cached.instance.clone())
+                .collect::<Vec<_>>()
+        };
         self.lifecycle.shutdown_started().await;
-        let instances = self
-            .sessions
-            .lock()
-            .await
-            .values()
-            .map(|cached| cached.instance.clone())
-            .collect::<Vec<_>>();
-        let mut sessions = Vec::new();
-        for instance in instances {
-            if let Some(cached) = self.remove_session_instance(&instance).await {
-                sessions.push((instance.key().clone(), cached));
-            }
-        }
-        self.start_locks.lock().await.clear();
-
-        let closed_count = sessions.len();
+        let mut count = 0;
         let mut first_error = None;
-        for (key, cached) in sessions {
-            self.lifecycle.before_session_close(&cached.instance).await;
-            let close_result = cached.session.close().await;
-            self.lifecycle.after_session_close(&cached.instance).await;
-            if let Err(error) = close_result
-                && first_error.is_none()
-            {
-                first_error = Some(anyhow!(
-                    "failed to close CLI runtime session `{}/{}/{}`: {error:#}",
-                    key.workspace_id,
-                    key.runtime_id,
-                    key.thread_id
-                ));
+        for instance in instances {
+            match self.close_session_instance(&instance).await {
+                Ok(true) => count += 1,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+                _ => {}
             }
         }
-        self.lifecycle.shutdown_finished().await;
-        first_error.map_or(Ok(closed_count), Err)
+        if first_error.is_none() {
+            self.lifecycle.shutdown_finished().await;
+        }
+        first_error.map_or(Ok(count), Err)
     }
-
-    async fn remove_start_lock(&self, key: &CLIAgentRuntimeSessionKey) {
-        self.start_locks.lock().await.remove(key);
-    }
-
     #[cfg(test)]
     async fn session_count(&self) -> usize {
-        self.sessions.lock().await.len()
+        self.sessions.lock().expect("CLI registry poisoned").len()
     }
-
     #[cfg(test)]
     async fn cached_started_at_ms(&self, key: &CLIAgentRuntimeSessionKey) -> Option<u64> {
-        self.sessions
-            .lock()
-            .await
-            .get(key)
-            .map(|cached| cached.started_at_ms)
+        self.cached(key).map(|cached| cached.started_at_ms)
     }
 }
 
@@ -1260,7 +1401,7 @@ mod tests {
     use super::{
         CLIAgentRuntimeMachineRequestResponder, CLIAgentRuntimeManager, CLIAgentRuntimeSession,
         CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey,
-        CLIAgentRuntimeSessionStartOptions,
+        CLIAgentRuntimeSessionStartOptions, CLIAgentRuntimeSessionStartup,
     };
     use crate::cli_runtime::claude_mcp::{
         ClaudeMcpSessionLaunchProjection, build_claude_mcp_session_launch_projection,
@@ -1287,6 +1428,10 @@ mod tests {
         starts: AtomicUsize,
         closes: Arc<AtomicUsize>,
         release: Option<Arc<Notify>>,
+        startup_wait_for_cancel: bool,
+        startup_entered: Option<Arc<Notify>>,
+        startup_cancel_seen: Option<Arc<Notify>>,
+        startup_cancel_release: Option<Arc<Notify>>,
         close_started: Option<Arc<Notify>>,
         close_release: Option<Arc<Notify>>,
         fail_after: Option<usize>,
@@ -1302,9 +1447,22 @@ mod tests {
             &self,
             _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
             launch_spec: &CliSessionLaunchSpec,
+            startup: &CLIAgentRuntimeSessionStartup,
         ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
             self.launch_specs.lock().await.push(launch_spec.clone());
             let id = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(entered) = &self.startup_entered {
+                entered.notify_one();
+            }
+            if self.startup_wait_for_cancel {
+                startup.cancelled().await;
+                if let Some(seen) = &self.startup_cancel_seen {
+                    seen.notify_one();
+                }
+                if let Some(release) = &self.startup_cancel_release {
+                    release.notified().await;
+                }
+            }
             if let Some(release) = self.release.as_ref() {
                 release.notified().await;
             }
@@ -1525,6 +1683,7 @@ mod tests {
         let key = key("thread-a");
         let options_a = CLIAgentRuntimeSessionStartOptions {
             additional_directories: Vec::new(),
+            plugin_selection: None,
             cwd: None,
             approval_policy: Some("on-request".to_owned()),
             authorization_scope_fingerprint: Some("scope-a".to_owned()),
@@ -1535,6 +1694,7 @@ mod tests {
         };
         let options_b = CLIAgentRuntimeSessionStartOptions {
             additional_directories: Vec::new(),
+            plugin_selection: None,
             cwd: None,
             approval_policy: Some("never".to_owned()),
             authorization_scope_fingerprint: Some("scope-b".to_owned()),
@@ -1915,69 +2075,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_management_acquisition_never_clobbers_active_mcp_launch() {
-        let factory = Arc::new(FakeFactory::default());
-        let manager = manager_with_factory(factory.clone());
-        let key =
-            CLIAgentRuntimeSessionKey::new("ws", "claude", "claude-management").expect("valid key");
-        let provider_session_id = uuid::Uuid::new_v4();
-        let active = manager
-            .get_or_start_with_launch_spec(
-                key.clone(),
-                CliSessionLaunchSpec::claude_new(
-                    CLIAgentRuntimeSessionStartOptions::default(),
-                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-a", 'a')),
-                    provider_session_id,
-                ),
-            )
-            .await
-            .unwrap();
-        let management = manager
-            .existing_or_start_management(
-                key,
-                CliSessionLaunchSpec::codex_management(CLIAgentRuntimeSessionStartOptions {
-                    approval_policy: Some("management-defaults-must-not-replace".to_owned()),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-
-        assert!(active.ptr_eq(&management));
-        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
-        assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
     async fn management_and_fork_acquisition_never_clobbers_mcp_session() {
-        let factory = Arc::new(FakeFactory::default());
-        let manager = manager_with_factory(factory.clone());
-        let key = key("management-no-clobber");
-        let active = manager
-            .get_or_start_with_launch_spec(
-                key.clone(),
+        for (key, launch, approval_policy) in [
+            (
+                key("management-no-clobber"),
                 CliSessionLaunchSpec::codex(
                     CLIAgentRuntimeSessionStartOptions::default(),
                     CliMcpSessionLaunch::Codex(codex_mcp_launch_projection("turn-a", 'a')),
                     Some("native-thread".to_owned()),
                 ),
-            )
-            .await
-            .unwrap();
-        let management = manager
-            .existing_or_start_management(
-                key,
-                CliSessionLaunchSpec::codex_management(CLIAgentRuntimeSessionStartOptions {
-                    approval_policy: Some("different-management-policy".to_owned()),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
+                "different-management-policy",
+            ),
+            (
+                CLIAgentRuntimeSessionKey::new("ws", "claude", "claude-management")
+                    .expect("valid key"),
+                CliSessionLaunchSpec::claude_new(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-a", 'a')),
+                    uuid::Uuid::new_v4(),
+                ),
+                "management-defaults-must-not-replace",
+            ),
+        ] {
+            let factory = Arc::new(FakeFactory::default());
+            let manager = manager_with_factory(factory.clone());
+            let active = manager
+                .get_or_start_with_launch_spec(key.clone(), launch)
+                .await
+                .unwrap();
+            let management = manager
+                .existing_or_start_management(
+                    key,
+                    CliSessionLaunchSpec::codex_management(CLIAgentRuntimeSessionStartOptions {
+                        approval_policy: Some(approval_policy.to_owned()),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(active.ptr_eq(&management));
+            assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
+        }
 
-        assert!(active.ptr_eq(&management));
-        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
-        assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
+        // EOF retains its owner without a ready handle. Management must drain
+        // it both while cleanup is delayed and after cleanup already completed.
+        for drain_before_acquire in [false, true] {
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let factory = Arc::new(FakeFactory {
+                close_started: Some(entered.clone()),
+                close_release: Some(release.clone()),
+                ..Default::default()
+            });
+            let manager = manager_with_factory(factory.clone());
+            let key = key("management-after-eof");
+            let active = manager.get_or_start(key.clone()).await.unwrap();
+            let old_instance = active.instance().clone();
+            let captured = manager.capture_stop_owner(&old_instance).unwrap();
+            assert!(manager.remove_if_generation(&old_instance).await);
+            entered.notified().await;
+            assert!(manager.existing_session(&key).await.is_none());
+            assert_eq!(manager.stop_inventory("ws").len(), 1);
+            assert!(!captured.0.stopped.load(Ordering::Acquire));
+            if drain_before_acquire {
+                release.notify_one();
+                // Actual completion, without manager release, models EOF drain
+                // finishing before the next management request arrives.
+                captured
+                    .0
+                    .close_and_wait(manager.lifecycle.clone())
+                    .await
+                    .unwrap();
+                assert!(captured.0.stopped.load(Ordering::Acquire));
+                assert_eq!(manager.stop_inventory("ws").len(), 1);
+            }
+            let mut acquisition = Box::pin(manager.existing_or_start_management(
+                key.clone(),
+                CliSessionLaunchSpec::codex_management(Default::default()),
+            ));
+            let replacement = if drain_before_acquire {
+                acquisition.await.unwrap()
+            } else {
+                assert!(futures_util::poll!(&mut acquisition).is_pending());
+                assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+                assert_eq!(manager.stop_inventory("ws")[0].instance(), &old_instance);
+                // Cancelling this observer must not cancel the owned drain or
+                // acknowledge completion. The next acquisition joins it again.
+                drop(acquisition);
+                let mut retry = Box::pin(manager.existing_or_start_management(
+                    key.clone(),
+                    CliSessionLaunchSpec::codex_management(Default::default()),
+                ));
+                assert!(futures_util::poll!(&mut retry).is_pending());
+                assert!(!captured.0.stopped.load(Ordering::Acquire));
+                assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+                release.notify_one();
+                retry.await.unwrap()
+            };
+            assert!(captured.0.stopped.load(Ordering::Acquire));
+            assert_ne!(replacement.instance(), &old_instance);
+            assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
+            assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+            assert_eq!(manager.stop_inventory("ws").len(), 1);
+            assert_eq!(
+                manager.stop_inventory("ws")[0].instance(),
+                replacement.instance()
+            );
+            assert!(!manager.remove_if_generation(&old_instance).await);
+            assert!(manager.is_current_instance(replacement.instance()).await);
+        }
     }
 
     #[tokio::test]
@@ -2031,6 +2238,258 @@ mod tests {
         assert_eq!(current.instance(), replacement.instance());
         assert!(manager.remove_if_generation(replacement.instance()).await);
         assert!(manager.existing_session(&key).await.is_none());
+        assert_eq!(manager.stop_inventory("ws").len(), 1);
+        manager
+            .close_session_instance(replacement.instance())
+            .await
+            .unwrap();
+        assert!(manager.stop_inventory("ws").is_empty());
+    }
+
+    #[tokio::test]
+    async fn captured_stop_and_requested_closes_cancel_startup_before_waiting_for_key_lock() {
+        for mode in ["strict", "instance", "cutoff"] {
+            let entered = Arc::new(Notify::new());
+            let factory = Arc::new(FakeFactory {
+                startup_wait_for_cancel: true,
+                startup_entered: Some(entered.clone()),
+                ..Default::default()
+            });
+            let manager = Arc::new(manager_with_factory(factory.clone()));
+            let key = key(mode);
+            let starter = {
+                let manager = manager.clone();
+                let key = key.clone();
+                tokio::spawn(async move {
+                    manager
+                        .get_or_start_at(key, CLIAgentRuntimeSessionStartOptions::default(), 1_000)
+                        .await
+                })
+            };
+            entered.notified().await;
+            let captured = manager.stop_inventory("ws").pop().unwrap();
+            assert!(!captured.0.ready.load(Ordering::Acquire));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                match mode {
+                    "strict" => manager
+                        .stop_and_wait(
+                            &captured,
+                            tokio::time::Instant::now() + Duration::from_secs(1),
+                        )
+                        .await
+                        .unwrap(),
+                    "instance" => {
+                        assert!(
+                            manager
+                                .close_session_instance(captured.instance())
+                                .await
+                                .unwrap()
+                        );
+                    }
+                    _ => {
+                        assert!(
+                            manager
+                                .close_session_if_started_at_or_before(&key, 1_000)
+                                .await
+                                .unwrap()
+                        );
+                    }
+                }
+            })
+            .await
+            .expect("startup cancellation must not depend on the startup key lock");
+            assert!(starter.await.unwrap().is_err());
+            assert!(captured.0.closing.load(Ordering::Acquire));
+            assert!(!captured.0.ready.load(Ordering::Acquire));
+            assert!(manager.stop_inventory("ws").is_empty());
+            assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_stop_deadline_and_cancelled_waiter_retain_closing_before_key_lock() {
+        for cancel_waiter in [false, true] {
+            let entered = Arc::new(Notify::new());
+            let cancelled = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let factory = Arc::new(FakeFactory {
+                startup_wait_for_cancel: true,
+                startup_entered: Some(entered.clone()),
+                startup_cancel_seen: Some(cancelled.clone()),
+                startup_cancel_release: Some(release.clone()),
+                ..Default::default()
+            });
+            let manager = Arc::new(manager_with_factory(factory.clone()));
+            let key = key("startup-stop-deadline");
+            let starter = {
+                let manager = manager.clone();
+                let key = key.clone();
+                tokio::spawn(async move { manager.get_or_start(key).await })
+            };
+            entered.notified().await;
+            let captured = manager.stop_inventory("ws").pop().unwrap();
+            let waiter = {
+                let manager = manager.clone();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    manager
+                        .stop_and_wait(
+                            &captured,
+                            tokio::time::Instant::now()
+                                + if cancel_waiter {
+                                    Duration::from_secs(60)
+                                } else {
+                                    Duration::from_millis(25)
+                                },
+                        )
+                        .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(1), cancelled.notified())
+                .await
+                .expect("stop must signal the factory while startup still owns the lock");
+            if cancel_waiter {
+                waiter.abort();
+                assert!(waiter.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(waiter.await.unwrap().is_err());
+            }
+            assert!(!starter.is_finished());
+            assert!(captured.0.closing.load(Ordering::Acquire));
+            assert!(!captured.0.ready.load(Ordering::Acquire));
+            assert!(captured.0.startup.check_admission().is_err());
+            assert_eq!(manager.stop_inventory("ws").len(), 1);
+            assert!(manager.existing_session(&key).await.is_none());
+            // A factory returning a session after cancellation must never
+            // publish Ready. The retained cleanup still joins/closes it once.
+            release.notify_one();
+            assert!(starter.await.unwrap().is_err());
+            manager
+                .stop_and_wait(
+                    &captured,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            assert!(manager.stop_inventory("ws").is_empty());
+            assert!(!captured.0.ready.load(Ordering::Acquire));
+            assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_stop_closes_admission_without_waiting_for_itself_or_reentrant_key() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = Arc::new(manager_with_factory(factory.clone()));
+        let key = key("callback-stop");
+        let handle = manager.get_or_start(key.clone()).await.unwrap();
+        let captured = manager.capture_stop_owner(handle.instance()).unwrap();
+        let (done, completion) = tokio::sync::oneshot::channel();
+        let callback_manager = manager.clone();
+        let callback_owner = captured.clone();
+        assert!(manager.spawn_instance_work(handle.instance(), async move {
+            assert!(callback_manager.get_or_start(key).await.is_err());
+            assert!(
+                callback_manager
+                    .stop_and_wait(
+                        &callback_owner,
+                        tokio::time::Instant::now() + Duration::from_secs(1)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                callback_manager
+                    .close_session_instance(callback_owner.instance())
+                    .await
+                    .is_err()
+            );
+            assert!(callback_owner.0.closing.load(Ordering::Acquire));
+            done.send(()).unwrap();
+        }));
+        tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .stop_and_wait(
+                &captured,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(manager.stop_inventory("ws").is_empty());
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_stop_deadline_keeps_closing_inventory_until_actual_completion() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let factory = Arc::new(FakeFactory {
+            close_started: Some(entered.clone()),
+            close_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let manager = Arc::new(manager_with_factory(factory.clone()));
+        let key = key("strict-deadline");
+        let handle = manager.get_or_start(key.clone()).await.unwrap();
+        let captured = manager.capture_stop_owner(handle.instance()).unwrap();
+        let waiter = {
+            let manager = manager.clone();
+            let captured = captured.clone();
+            tokio::spawn(async move {
+                manager
+                    .stop_and_wait(
+                        &captured,
+                        tokio::time::Instant::now() + Duration::from_millis(25),
+                    )
+                    .await
+            })
+        };
+        entered.notified().await;
+        assert!(waiter.await.unwrap().is_err());
+        assert_eq!(manager.stop_inventory("ws").len(), 1);
+        assert!(manager.existing_session(&key).await.is_none());
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        manager
+            .stop_and_wait(
+                &captured,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(manager.stop_inventory("ws").is_empty());
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        manager.get_or_start(key).await.unwrap();
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn captured_stop_owner_cannot_stop_a_replacement_and_shutdown_closes_start_admission() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key = key("captured-stop");
+        let old = manager.get_or_start(key.clone()).await.unwrap();
+        let captured = manager.capture_stop_owner(old.instance()).unwrap();
+        manager
+            .close_session_instance(old.instance())
+            .await
+            .unwrap();
+        let replacement = manager.get_or_start(key.clone()).await.unwrap();
+        manager
+            .stop_and_wait(
+                &captured,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(manager.is_current_instance(replacement.instance()).await);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        manager.close_all().await.unwrap();
+        assert!(manager.get_or_start(key).await.is_err());
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -2043,11 +2502,7 @@ mod tests {
             .get_or_start_with_options(key.clone(), CLIAgentRuntimeSessionStartOptions::default())
             .await
             .unwrap();
-        let responder = CLIAgentRuntimeMachineRequestResponder::new(
-            old.instance().clone(),
-            json!(7),
-            old.session(),
-        );
+        let responder = CLIAgentRuntimeMachineRequestResponder::from_handle(old.clone(), json!(7));
         let replacement = manager
             .get_or_start_with_options(
                 key,
@@ -2116,6 +2571,8 @@ mod tests {
         let normal = CLIAgentRuntimeSessionStartOptions::default();
         let skill_enabled = CLIAgentRuntimeSessionStartOptions {
             selected_skills: vec![crate::cli_runtime::skills::CliRuntimeSelectedSkill {
+                plugin_id: None,
+                package_owner: None,
                 install_name: "selected".to_owned(),
                 installed_path: std::path::PathBuf::from("/tmp/selected"),
                 source_folder_hash: "selected-hash".to_owned(),
@@ -2145,12 +2602,18 @@ mod tests {
         let manager = manager_with_factory(factory.clone());
         let key = CLIAgentRuntimeSessionKey::new("ws", "claude", "restored-skills").unwrap();
         let selected = normalize_cli_runtime_selected_skills(
-            ["pioneer-system-tasks", "pioneer-system-subagents"].map(|name| {
-                CliRuntimeSelectedSkill {
-                    install_name: name.to_owned(),
-                    installed_path: std::path::PathBuf::from("/native/skills").join(name),
-                    source_folder_hash: format!("hash-{name}"),
-                }
+            [
+                "html",
+                "pioneer-system-html",
+                "pioneer-system-tasks",
+                "pioneer-system-subagents",
+            ]
+            .map(|name| CliRuntimeSelectedSkill {
+                plugin_id: None,
+                package_owner: None,
+                install_name: name.to_owned(),
+                installed_path: std::path::PathBuf::from("/native/skills").join(name),
+                source_folder_hash: format!("hash-{name}"),
             }),
         )
         .unwrap();
@@ -2192,15 +2655,28 @@ mod tests {
             let mut changed = current.clone();
             match change {
                 "composition" => {
-                    changed.options.selected_skills.pop();
+                    changed
+                        .options
+                        .selected_skills
+                        .retain(|skill| skill.install_name != "html");
                 }
                 "path" => {
-                    changed.options.selected_skills[0].installed_path =
-                        "/native/replaced-skill".into()
+                    changed
+                        .options
+                        .selected_skills
+                        .iter_mut()
+                        .find(|skill| skill.install_name == "pioneer-system-html")
+                        .unwrap()
+                        .installed_path = "/native/replaced-skill".into()
                 }
                 _ => {
-                    changed.options.selected_skills[0].source_folder_hash =
-                        "changed-content".to_owned()
+                    changed
+                        .options
+                        .selected_skills
+                        .iter_mut()
+                        .find(|skill| skill.install_name == "pioneer-system-html")
+                        .unwrap()
+                        .source_folder_hash = "changed-content".to_owned()
                 }
             }
             assert!(requires_restart(&current, &changed), "{change}");
@@ -2274,52 +2750,144 @@ mod tests {
         assert_eq!(manager.session_count().await, 1);
     }
 
-    #[tokio::test]
-    async fn cli_runtime_manager_closes_idle_and_forced_sessions() {
+    #[tokio::test(start_paused = true)]
+    async fn idle_eviction_checks_ttl_and_actual_provider_kind() {
         let factory = Arc::new(FakeFactory::default());
         let manager = manager_with_factory(factory.clone());
-        let key_a = key("thread-a");
-        let key_b = key("thread-b");
-
-        manager
-            .get_or_start_at(
-                key_a.clone(),
-                CLIAgentRuntimeSessionStartOptions::default(),
-                1_000,
-            )
-            .await
-            .expect("session a should start");
-        manager
-            .get_or_start_at(
-                key_b.clone(),
-                CLIAgentRuntimeSessionStartOptions::default(),
-                1_800,
-            )
-            .await
-            .expect("session b should start");
-
-        let idle_closed = manager
-            .close_idle_sessions_at(2_000)
-            .await
-            .expect("idle close should succeed");
-        assert_eq!(idle_closed, 1);
-        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
-        assert_eq!(manager.session_count().await, 1);
-
-        assert!(
-            !manager
-                .close_session(&key_a)
+        let old = manager.get_or_start(key("old")).await.unwrap();
+        let old_instance = old.instance().clone();
+        drop(old);
+        for (runtime_id, launch) in [
+            (
+                "claude",
+                CliSessionLaunchSpec::claude_new(
+                    Default::default(),
+                    CliMcpSessionLaunch::Disabled,
+                    uuid::Uuid::new_v4(),
+                ),
+            ),
+            (
+                "opencode",
+                CliSessionLaunchSpec::opencode(
+                    Default::default(),
+                    CliMcpSessionLaunch::ManagementOnly,
+                    None,
+                ),
+            ),
+        ] {
+            manager
+                .get_or_start_with_launch_spec(
+                    CLIAgentRuntimeSessionKey::new("ws", runtime_id, "other-provider").unwrap(),
+                    launch,
+                )
                 .await
-                .expect("missing close should succeed")
+                .unwrap();
+        }
+        tokio::time::advance(Duration::from_millis(800)).await;
+        let fresh = key("fresh");
+        manager.get_or_start(fresh.clone()).await.unwrap();
+        assert!(manager.idle_codex_sessions().await.is_empty());
+        tokio::time::advance(Duration::from_millis(200)).await;
+        assert_eq!(
+            manager.idle_codex_sessions().await,
+            vec![old_instance.clone()]
         );
         assert!(
             manager
-                .close_session(&key_b)
+                .close_idle_codex_session(&old_instance)
                 .await
-                .expect("forced close should succeed")
+                .unwrap()
         );
+        assert!(
+            !manager
+                .close_idle_codex_session(&old_instance)
+                .await
+                .unwrap()
+        );
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.session_count().await, 3);
+        assert!(manager.close_session(&fresh).await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_candidates_recheck_management_use_release_and_replacement_generation() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key = key("candidate-races");
+        let handle = manager
+            .existing_or_start_management(
+                key.clone(),
+                CliSessionLaunchSpec::codex_management(Default::default()),
+            )
+            .await
+            .unwrap();
+        let first = handle.instance().clone();
+        drop(handle);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(manager.idle_codex_sessions().await, vec![first.clone()]);
+        // The candidate was selected before a management operation acquired it.
+        let management = manager
+            .existing_or_start_management(
+                key.clone(),
+                CliSessionLaunchSpec::codex_management(Default::default()),
+            )
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(!manager.close_idle_codex_session(&first).await.unwrap());
+        drop(management);
+        assert!(!manager.close_idle_codex_session(&first).await.unwrap());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let commit = manager.current_instance_guard(&first).await.unwrap();
+        assert!(!manager.close_idle_codex_session(&first).await.unwrap());
+        drop(commit);
+        let replacement = manager
+            .get_or_start_with_options(
+                key.clone(),
+                CLIAgentRuntimeSessionStartOptions {
+                    approval_policy: Some("never".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let current = replacement.instance().clone();
+        drop(replacement);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!manager.close_idle_codex_session(&first).await.unwrap());
+        assert!(!manager.remove_if_generation(&first).await);
+        assert!(manager.is_current_instance(&current).await);
+        assert!(manager.close_idle_codex_session(&current).await.unwrap());
         assert_eq!(factory.closes.load(Ordering::SeqCst), 2);
-        assert_eq!(manager.session_count().await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_close_keeps_start_lock_until_lifecycle_finishes() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let factory = Arc::new(FakeFactory {
+            close_started: Some(started.clone()),
+            close_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let manager = Arc::new(manager_with_factory(factory.clone()));
+        let key = key("closing");
+        let old = manager.get_or_start(key.clone()).await.unwrap();
+        let instance = old.instance().clone();
+        drop(old);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let close = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.close_idle_codex_session(&instance).await })
+        };
+        started.notified().await;
+        let mut next = Box::pin(manager.get_or_start(key));
+        assert!(futures_util::poll!(&mut next).is_pending());
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        assert!(close.await.unwrap().unwrap());
+        next.await.unwrap();
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -2440,5 +3008,118 @@ mod tests {
         assert_eq!(closed, 2);
         assert_eq!(factory.closes.load(Ordering::SeqCst), 2);
         assert_eq!(manager.session_count().await, 0);
+    }
+
+    // C2 source regression: NOT_RUN / NOT_COMPILED.
+    #[tokio::test]
+    async fn owned_selection_is_visible_before_factory_await_and_revision_change_restarts() {
+        let entered = Arc::new(Notify::new());
+        let factory = Arc::new(FakeFactory {
+            startup_wait_for_cancel: true,
+            startup_entered: Some(entered.clone()),
+            ..Default::default()
+        });
+        let manager = Arc::new(manager_with_factory(factory));
+        let selection = pioneer_protocol::PluginSelectionSnapshot {
+            parents: vec![pioneer_protocol::PluginSelectedParent {
+                kind: pioneer_protocol::PackageKind::Plugin,
+                id: "parent".into(),
+                revision: 1,
+            }],
+            children: Vec::new(),
+            phase: "ready".into(),
+        };
+        let starter = {
+            let manager = manager.clone();
+            let selection = selection.clone();
+            tokio::spawn(async move {
+                manager
+                    .get_or_start_at(
+                        key("owned-startup"),
+                        CLIAgentRuntimeSessionStartOptions {
+                            plugin_selection: Some(selection),
+                            ..Default::default()
+                        },
+                        1_000,
+                    )
+                    .await
+            })
+        };
+        entered.notified().await;
+        assert!(
+            manager
+                .plugin_stop_inventory("other-workspace", "parent")
+                .is_empty()
+        );
+        assert!(
+            manager
+                .plugin_stop_inventory("ws", "other-parent")
+                .is_empty()
+        );
+        let owner = manager.plugin_stop_inventory("ws", "parent").pop().unwrap();
+        assert!(!owner.0.ready.load(Ordering::Acquire));
+        assert_eq!(
+            manager
+                .plugin_selection_for_instance(owner.instance())
+                .unwrap(),
+            Some(selection.clone())
+        );
+        manager
+            .stop_and_wait(&owner, tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(starter.await.unwrap().is_err());
+        assert!(manager.plugin_stop_inventory("ws", "parent").is_empty());
+
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let options = CLIAgentRuntimeSessionStartOptions {
+            plugin_selection: Some(selection.clone()),
+            ..Default::default()
+        };
+        let original = manager
+            .get_or_start_at(key("owned-reuse"), options.clone(), 1_000)
+            .await
+            .unwrap();
+        manager
+            .admit_turn_owner(original.instance(), "old-turn")
+            .unwrap();
+        let captured = manager.capture_stop_owner(original.instance()).unwrap();
+        assert!(captured.owns_turn("old-turn"));
+        let reused = manager
+            .get_or_start_at(key("owned-reuse"), options.clone(), 1_100)
+            .await
+            .unwrap();
+        assert_eq!(original.instance(), reused.instance());
+        let mut revised = options;
+        revised.plugin_selection.as_mut().unwrap().parents[0].revision = 2;
+        let replacement = manager
+            .get_or_start_at(key("owned-reuse"), revised, 1_200)
+            .await
+            .unwrap();
+        manager
+            .admit_turn_owner(replacement.instance(), "replacement-turn")
+            .unwrap();
+        let replacement_owner = manager.capture_stop_owner(replacement.instance()).unwrap();
+        assert!(!replacement_owner.owns_turn("old-turn"));
+        assert!(replacement_owner.owns_turn("replacement-turn"));
+        assert_ne!(replacement.instance(), original.instance());
+        manager
+            .stop_and_wait(
+                &captured,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .existing_session(&key("owned-reuse"))
+                .await
+                .unwrap()
+                .instance(),
+            replacement.instance()
+        );
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        manager.close_all().await.unwrap();
     }
 }

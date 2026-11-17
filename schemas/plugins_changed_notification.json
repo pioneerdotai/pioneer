@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PluginsChangedNotification",
+  "type": "object",
+  "properties": {
+    "plugin_id": {
+      "type": "string"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "plugin_id",
+    "revision"
+  ]
+}

@@ -113,3 +113,20 @@ pub trait ProviderModelPickerPort {
         cx: &mut App,
     );
 }
+
+/// Runs the existing authenticated Client avatar resolver outside the UI thread.
+/// The caller owns cancellation and the returned task; results arrive through
+/// Client avatar publications, just as they do for the timeline.
+pub trait ProviderAvatarPort {
+    fn resolve_agent(
+        &self,
+        revision: String,
+        cancellation: tokio_util::sync::CancellationToken,
+        cx: &mut App,
+    ) -> gpui_kit::Task<
+        Result<
+            pioneer_client::avatars::AgentAvatarCacheResult,
+            pioneer_client::avatars::AvatarCacheError,
+        >,
+    >;
+}

@@ -96,7 +96,9 @@ impl TimelineView {
                 self.consume_all_semantic_prefetch_scroll_intents();
             }
         }
-        self.client.schedule_thread_semantic_request(action);
+        if let Err(error) = self.client.schedule_thread_semantic_request(action) {
+            tracing::warn!(%error, "Timeline admission failed");
+        }
     }
 }
 

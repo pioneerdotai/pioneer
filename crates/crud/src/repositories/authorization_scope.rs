@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Context, Result};
 use pioneer_entity::{
@@ -6,7 +6,9 @@ use pioneer_entity::{
     task, task_execution_admission, task_run, thread, thread_lineage, turn, workspace,
 };
 use pioneer_protocol::{PersistedActorRef, PrincipalId};
-use sea_orm::{ColumnTrait, Condition, ConnectionTrait, EntityName, EntityTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityName, EntityTrait, QueryFilter, QuerySelect,
+};
 
 use super::identity::actor_ref_from_db;
 use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_from_db};
@@ -121,6 +123,156 @@ pub async fn resolve_thread_authorization_scope<C: ConnectionTrait>(
     thread_scope_from_model(db, model).await
 }
 
+/// Page-local facts for the existing internal-child policy. No access decision
+/// is cached or granted here. All reads are bounded metadata projections.
+pub struct InternalThreadAuthorizationFacts {
+    pub child: ThreadAuthorizationScope,
+    pub root: ThreadAuthorizationScope,
+    pub parent_turn_id: String,
+    pub workspace_member: bool,
+    pub root_thread_member: bool,
+    pub root_collaboration_thread_id: Option<String>,
+}
+
+pub async fn load_internal_thread_authorization_facts<C: ConnectionTrait>(
+    db: &C,
+    child_ids: &[String],
+    principal: &PrincipalId,
+) -> Result<Vec<InternalThreadAuthorizationFacts>> {
+    let ids = child_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+    for chunk in ids.chunks(64) {
+        let lineages = thread_lineage::Entity::find()
+            .filter(thread_lineage::Column::ChildThreadId.is_in(chunk.iter().cloned()))
+            .all(db)
+            .await?;
+        let thread_ids = chunk
+            .iter()
+            .cloned()
+            .chain(lineages.iter().map(|l| l.root_thread_id.clone()))
+            .collect::<BTreeSet<_>>();
+        let rows = thread::Entity::find()
+            .select_only()
+            .columns([
+                thread::Column::Id,
+                thread::Column::WorkspaceId,
+                thread::Column::AccessClass,
+                thread::Column::CreatedByActorKind,
+                thread::Column::CreatedByActorId,
+            ])
+            .filter(thread::Column::Id.is_in(thread_ids.iter().cloned()))
+            .into_tuple::<(String, String, String, Option<String>, Option<String>)>()
+            .all(db)
+            .await?;
+        let workspace_ids = rows.iter().map(|r| r.1.clone()).collect::<BTreeSet<_>>();
+        let workspaces = workspace::Entity::find()
+            .select_only()
+            .columns([workspace::Column::Id, workspace::Column::IsActive])
+            .filter(workspace::Column::Id.is_in(workspace_ids.iter().cloned()))
+            .into_tuple::<(String, bool)>()
+            .all(db)
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let workspace_members = pioneer_entity::workspace_membership::Entity::find()
+            .select_only()
+            .column(pioneer_entity::workspace_membership::Column::WorkspaceId)
+            .filter(pioneer_entity::workspace_membership::Column::WorkspaceId.is_in(workspace_ids))
+            .filter(
+                pioneer_entity::workspace_membership::Column::PrincipalId.eq(principal.as_str()),
+            )
+            .into_tuple::<String>()
+            .all(db)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let thread_members = pioneer_entity::thread_membership::Entity::find()
+            .select_only()
+            .column(pioneer_entity::thread_membership::Column::ThreadId)
+            .filter(
+                pioneer_entity::thread_membership::Column::ThreadId
+                    .is_in(thread_ids.iter().cloned()),
+            )
+            .filter(pioneer_entity::thread_membership::Column::PrincipalId.eq(principal.as_str()))
+            .into_tuple::<String>()
+            .all(db)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let root_lineages = thread_lineage::Entity::find()
+            .filter(thread_lineage::Column::ChildThreadId.is_in(thread_ids))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|l| (l.child_thread_id.clone(), l))
+            .collect::<HashMap<_, _>>();
+        let mut scopes = HashMap::new();
+        for (id, workspace_id, access, kind, actor) in rows {
+            let Some(active) = workspaces.get(&workspace_id) else {
+                continue;
+            };
+            let Ok(access_class) = persisted_thread_access_class_from_db(&access) else {
+                continue;
+            };
+            let creator_principal_id = match actor_ref_from_db(kind.as_deref(), actor.as_deref()) {
+                Ok(Some(PersistedActorRef::Principal(p))) => Some(p),
+                Ok(_) => None,
+                Err(_) => continue,
+            };
+            scopes.insert(
+                id.clone(),
+                ThreadAuthorizationScope {
+                    workspace_id,
+                    thread_id: id,
+                    workspace_is_active: *active,
+                    access_class,
+                    creator_principal_id,
+                },
+            );
+        }
+        for lineage in lineages {
+            let (Some(child), Some(root), Some(parent_turn_id)) = (
+                scopes.get(&lineage.child_thread_id),
+                scopes.get(&lineage.root_thread_id),
+                lineage.created_by_turn_id,
+            ) else {
+                continue;
+            };
+            if child.access_class != PersistedThreadAccessClass::Internal
+                || child.thread_id == root.thread_id
+                || child.workspace_id != root.workspace_id
+            {
+                continue;
+            }
+            // authorize_thread also requires an internal root to have valid
+            // non-self lineage, even for an absolute-policy principal.
+            if root.access_class == PersistedThreadAccessClass::Internal
+                && !root_lineages
+                    .get(&root.thread_id)
+                    .is_some_and(|l| l.root_thread_id != root.thread_id)
+            {
+                continue;
+            }
+            result.push(InternalThreadAuthorizationFacts {
+                workspace_member: workspace_members.contains(&root.workspace_id),
+                root_thread_member: thread_members.contains(&root.thread_id),
+                child: child.clone(),
+                root: root.clone(),
+                parent_turn_id,
+                root_collaboration_thread_id: (root.access_class
+                    == PersistedThreadAccessClass::Internal)
+                    .then(|| root_lineages[&root.thread_id].root_thread_id.clone()),
+            });
+        }
+    }
+    Ok(result)
+}
+
 pub async fn resolve_thread_start_authorization_scope<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
@@ -145,26 +297,28 @@ pub async fn resolve_turn_authorization_scope<C: ConnectionTrait>(
     expected_workspace_id: Option<&str>,
     expected_thread_id: Option<&str>,
 ) -> Result<Option<TurnAuthorizationScope>> {
-    let Some(model) = turn::Entity::find_by_id(turn_id.to_owned())
+    let Some((id, thread_id)) = turn::Entity::find_by_id(turn_id.to_owned())
+        .select_only()
+        .columns([turn::Column::Id, turn::Column::ThreadId])
+        .into_tuple::<(String, String)>()
         .one(db)
         .await
         .context("failed to resolve turn authorization scope")?
     else {
         return Ok(None);
     };
-    if expected_thread_id.is_some_and(|expected| expected != model.thread_id.as_str()) {
+    if expected_thread_id.is_some_and(|expected| expected != thread_id.as_str()) {
         return Ok(None);
     }
     let Some(thread) =
-        resolve_thread_authorization_scope(db, model.thread_id.as_str(), expected_workspace_id)
-            .await?
+        resolve_thread_authorization_scope(db, thread_id.as_str(), expected_workspace_id).await?
     else {
         return Ok(None);
     };
     Ok(Some(TurnAuthorizationScope {
         workspace_id: thread.workspace_id.clone(),
         thread_id: thread.thread_id.clone(),
-        turn_id: model.id,
+        turn_id: id,
         thread,
     }))
 }
@@ -943,9 +1097,40 @@ async fn thread_scope_from_model<C: ConnectionTrait>(
     }))
 }
 
-/// One bounded page of executing tasks, using the same causal root and admission
-/// checks as `resolve_task_authorization_scope`. No run history or payload JSON
-/// is loaded. Membership facts are read in the same statement as the scope.
+/// Thin workspace discovery. The cursor is taken before scope filtering, so a
+/// page of inaccessible or malformed tasks cannot stop discovery prematurely.
+async fn list_running_task_ids<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    after_task_id: &str,
+) -> Result<Vec<String>> {
+    use sea_orm::sea_query::{Expr, ExprTrait, Order, Query};
+    let query = Query::select()
+        .distinct()
+        .column((task_run::Entity, task_run::Column::TaskId))
+        .from(task_run::Entity)
+        .cross_join(task::Entity.table_ref())
+        .and_where(
+            Expr::col((task::Entity, task::Column::Id))
+                .equals((task_run::Entity, task_run::Column::TaskId)),
+        )
+        .and_where(Expr::col((task::Entity, task::Column::WorkspaceId)).eq(workspace_id))
+        .and_where(
+            Expr::col((task_run::Entity, task_run::Column::Status)).is_in(["starting", "running"]),
+        )
+        .and_where(Expr::col((task_run::Entity, task_run::Column::TaskId)).gt(after_task_id))
+        .order_by((task_run::Entity, task_run::Column::TaskId), Order::Asc)
+        .limit(512)
+        .to_owned();
+    db.query_all(&query)
+        .await?
+        .into_iter()
+        .map(|row| row.try_get("", "task_id").map_err(Into::into))
+        .collect()
+}
+
+/// One discovery page, with scope lookup bounded independently of active-run
+/// density. Final TaskRead authorization remains the Gateway resolver's job.
 pub async fn list_running_task_scopes<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
@@ -953,7 +1138,6 @@ pub async fn list_running_task_scopes<C: ConnectionTrait>(
     principal_id: &PrincipalId,
     after_task_id: &str,
 ) -> Result<RunningTaskScopePage> {
-    use sea_orm::{Statement, Value};
     if thread_ids.is_empty() {
         return Ok(RunningTaskScopePage::default());
     }
@@ -961,6 +1145,47 @@ pub async fn list_running_task_scopes<C: ConnectionTrait>(
         thread_ids.len() <= 500,
         "task activity candidate batch exceeds tree limit"
     );
+    let ids = list_running_task_ids(db, workspace_id, after_task_id).await?;
+    let mut page = RunningTaskScopePage {
+        after_task_id: ids.last().cloned(),
+        scopes: Vec::new(),
+    };
+    for batch in ids.chunks(128) {
+        page.scopes.extend(
+            list_running_task_scopes_for_ids(db, workspace_id, thread_ids, principal_id, batch)
+                .await?
+                .scopes,
+        );
+    }
+    Ok(page)
+}
+
+/// One bounded page of executing tasks, using the same causal root and admission
+/// checks as `resolve_task_authorization_scope`. No run history or payload JSON
+/// is loaded. Membership facts are read in the same statement as the scope.
+async fn list_running_task_scopes_for_ids<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_ids: &[String],
+    principal_id: &PrincipalId,
+    task_ids: &[String],
+) -> Result<RunningTaskScopePage> {
+    use sea_orm::{Statement, Value};
+    if thread_ids.is_empty() || task_ids.is_empty() {
+        return Ok(RunningTaskScopePage::default());
+    }
+    anyhow::ensure!(
+        thread_ids.len() <= 500,
+        "task activity candidate batch exceeds tree limit"
+    );
+    // DISTINCT selects no run fields. Task/root/thread/turn IDs, lineage child
+    // and admission task are unique: at most one scope row per task. Thus all
+    // <=128 candidates fit LIMIT 128, even with several active runs per task.
+    anyhow::ensure!(
+        task_ids.len() <= 128,
+        "task scope lookup exceeds batch limit"
+    );
+    let task_placeholders = vec!["?"; task_ids.len()].join(",");
     let placeholders = vec!["?"; thread_ids.len()].join(",");
     let sql = format!(
         r#"
@@ -985,7 +1210,7 @@ LEFT JOIN thread_lineage l ON l.child_thread_id = c.id
 JOIN thread rt ON rt.id = CASE WHEN c.access_class = 'internal' THEN l.root_thread_id ELSE c.id END
               AND rt.workspace_id = t.workspace_id
 LEFT JOIN task_execution_admission a ON a.task_id = t.id
-WHERE tr.status IN ('starting', 'running') AND t.workspace_id = ? AND t.id > ?
+WHERE tr.status IN ('starting', 'running') AND t.workspace_id = ? AND t.id IN ({task_placeholders})
   AND rt.id IN ({placeholders}) AND rt.access_class IN ('private', 'workspace')
   AND c.access_class IN ('private', 'workspace', 'internal')
   AND (r.created_by_turn_id IS NULL OR ct.thread_id = c.id)
@@ -997,8 +1222,8 @@ ORDER BY t.id LIMIT 128
         principal_id.to_string().into(),
         principal_id.to_string().into(),
         workspace_id.to_owned().into(),
-        after_task_id.to_owned().into(),
     ];
+    values.extend(task_ids.iter().cloned().map(Into::into));
     values.extend(thread_ids.iter().cloned().map(Into::into));
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(

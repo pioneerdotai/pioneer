@@ -26,6 +26,8 @@ pub struct Model {
     pub aborted_at_unix: Option<i64>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub purpose: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

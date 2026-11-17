@@ -11,6 +11,11 @@ use terminal::TerminalView;
 #[derive(Default)]
 struct ReaderState {
     next: Option<Vec<u8>>,
+    evidence: Option<(
+        pioneer_observability::updates::RenderBatch,
+        pioneer_observability::updates::RenderTarget,
+    )>,
+    observation: Option<pioneer_observability::updates::StageObservation>,
     closed: bool,
     ending: bool,
 }
@@ -25,6 +30,11 @@ pub(super) struct TerminalInput {
 pub(super) struct TerminalReader {
     shared: Arc<ReaderShared>,
     current: Cursor<Vec<u8>>,
+    evidence: Option<(
+        pioneer_observability::updates::RenderBatch,
+        pioneer_observability::updates::RenderTarget,
+    )>,
+    observation: Option<pioneer_observability::updates::StageObservation>,
 }
 impl TerminalInput {
     pub fn new() -> (Self, TerminalReader) {
@@ -36,6 +46,8 @@ impl TerminalInput {
             TerminalReader {
                 shared,
                 current: Cursor::new(Vec::new()),
+                evidence: None,
+                observation: None,
             },
         )
     }
@@ -47,18 +59,40 @@ impl TerminalInput {
         let mut state = self.shared.state.lock().unwrap();
         state.closed = true;
         state.next = None;
+        if let Some((batch, target)) = state.evidence.take() {
+            batch.end(
+                &target,
+                pioneer_observability::updates::RenderEnd::Unconfirmed,
+            );
+        }
+        state.observation.take();
         self.shared.changed.notify_one();
     }
     pub fn replace(&self, text: &str) {
+        let mut observation = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::TerminalReader,
+        );
         let mut state = self.shared.state.lock().unwrap();
         if state.closed || state.ending {
+            observation.finish(pioneer_observability::updates::Fact::Rejected);
             return;
         }
         // Cancel a partial control string, reset the emulator, then replay the
         // authoritative output snapshot through the terminal's public reader seam.
         let mut bytes = b"\x18\x1b\\\x1bc\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07".to_vec();
         bytes.extend_from_slice(text.as_bytes());
+        if let Some(mut previous) = state.observation.take() {
+            previous.finish(pioneer_observability::updates::Fact::Superseded);
+        }
+        state.observation = Some(observation);
         state.next = Some(bytes);
+        if let Some((batch, target)) = state.evidence.take() {
+            batch.end(
+                &target,
+                pioneer_observability::updates::RenderEnd::Superseded,
+            );
+        }
+        state.evidence = pioneer_observability::updates::capture_native();
         self.shared.changed.notify_one();
     }
 }
@@ -75,14 +109,36 @@ impl Read for TerminalReader {
         loop {
             let mut state = self.shared.state.lock().unwrap();
             if state.closed {
+                self.observation.take();
+                if let Some((batch, target)) = self.evidence.take() {
+                    batch.end(
+                        &target,
+                        pioneer_observability::updates::RenderEnd::Unconfirmed,
+                    );
+                }
                 return Ok(0);
             }
             if self.current.position() < self.current.get_ref().len() as u64 {
                 drop(state);
-                return self.current.read(output);
+                let count = self.current.read(output)?;
+                if self.current.position() == self.current.get_ref().len() as u64 {
+                    if let Some((batch, target)) = self.evidence.take() {
+                        batch.observe(
+                            &target,
+                            pioneer_observability::updates::RendererBoundary::TerminalReader,
+                        );
+                    }
+                    if let Some(mut observation) = self.observation.take() {
+                        // Read return precedes emulator consumption and renderer work.
+                        observation.finish(pioneer_observability::updates::Fact::BytesReturned);
+                    }
+                }
+                return Ok(count);
             }
             if let Some(bytes) = state.next.take() {
                 self.current = Cursor::new(bytes);
+                self.evidence = state.evidence.take();
+                self.observation = state.observation.take();
                 drop(state);
                 continue;
             }
@@ -91,6 +147,31 @@ impl Read for TerminalReader {
             }
             drop(self.shared.changed.wait(state).unwrap());
         }
+    }
+}
+impl Drop for TerminalReader {
+    fn drop(&mut self) {
+        // Reader termination is not byte consumption. Retire only diagnostics;
+        // cancellation, buffered bytes and the emulator lifetime stay unchanged.
+        if let Some((batch, target)) = self.evidence.take() {
+            batch.end(
+                &target,
+                pioneer_observability::updates::RenderEnd::Unconfirmed,
+            );
+        }
+        self.observation.take();
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some((batch, target)) = state.evidence.take() {
+            batch.end(
+                &target,
+                pioneer_observability::updates::RenderEnd::Unconfirmed,
+            );
+        }
+        state.observation.take();
     }
 }
 /// A row retains its display after EOF. The input is only a cancellation handle
@@ -441,5 +522,79 @@ mod lifecycle_tests {
         assert!(reader.state.lock().unwrap().closed);
         cx.run_until_parked();
         assert!(weak.upgrade().is_none());
+    }
+}
+
+#[cfg(test)]
+mod update_observation_tests {
+    use super::*;
+    use pioneer_observability::updates::{
+        RenderBatch, RenderTarget, RendererBoundary, UpdateContext,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn pending_replacement_and_partial_read_do_not_report_bytes_before_the_last_read() {
+        let _lock = crate::test_support::UPDATE_OBSERVATION_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(true);
+        let expected = RenderTarget {
+            thread: "thread".into(),
+            generation: 1,
+            row: "row".into(),
+            revision: 2,
+            boundary: RendererBoundary::TerminalReader,
+            part: None,
+        };
+        let batch = RenderBatch::new(UpdateContext::source(None), [expected.clone()]);
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        batch.require_validity(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let (input, mut reader) = TerminalInput::new();
+        batch.with_target(expected.clone(), || input.replace("old"));
+        // Replacing pending bytes must discard their evidence along with bytes.
+        input.replace("replacement");
+        input.finish();
+        let mut byte = [0; 1];
+        while reader.read(&mut byte).unwrap() != 0 {}
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        let batch = RenderBatch::new(UpdateContext::source(None), [expected.clone()]);
+        let observed = callbacks.clone();
+        batch.require_validity(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let (input, mut reader) = TerminalInput::new();
+        batch.with_target(expected.clone(), || input.replace("final"));
+        input.finish();
+        assert_eq!(reader.read(&mut byte).unwrap(), 1);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        while reader.read(&mut byte).unwrap() != 0 {}
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert!(!batch.observe(&expected, RendererBoundary::TerminalReader));
+        let batch = RenderBatch::new(UpdateContext::source(None), [expected.clone()]);
+        let observed = callbacks.clone();
+        batch.require_validity(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let before_drop = callbacks.load(Ordering::SeqCst);
+        let (input, mut reader) = TerminalInput::new();
+        batch.with_target(expected.clone(), || input.replace("detached"));
+        assert_eq!(reader.read(&mut byte).unwrap(), 1);
+        assert!(batch.is_pending());
+        drop(reader);
+        assert!(
+            !batch.is_pending(),
+            "terminated consumer must censor its outstanding target"
+        );
+        assert_eq!(
+            callbacks.load(Ordering::SeqCst),
+            before_drop,
+            "Drop must never report matching byte consumption"
+        );
+        pioneer_observability::set_telemetry_enabled(old);
     }
 }

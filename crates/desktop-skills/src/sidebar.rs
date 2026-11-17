@@ -43,32 +43,21 @@ impl CatalogSidebar {
                                         .justify_start()
                                         .gap_2()
                                         .child({
-                                            let icon_bg = cx.theme().foreground.opacity(0.075);
                                             let icon_bg_hover = cx.theme().foreground.opacity(0.1);
-                                            div()
-                                                .id("skills-sidebar-install-icon")
-                                                .size_6()
-                                                .rounded_full()
-                                                .bg(icon_bg)
-                                                .group_hover(
-                                                    "skills-sidebar-install-btn",
-                                                    move |style| style.bg(icon_bg_hover),
-                                                )
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(
-                                                    Icon::new(IconName::Plus)
-                                                        .size_4()
-                                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY),
-                                                )
+                                            pioneer_desktop_foundation::catalog_sidebar_icon(
+                                                IconName::Plus,
+                                                true,
+                                                cx,
+                                            )
+                                            .id("skills-sidebar-install-icon")
+                                            .group_hover(
+                                                "skills-sidebar-install-btn",
+                                                move |style| style.bg(icon_bg_hover),
+                                            )
                                         })
-                                        .child(
-                                            div()
-                                                .line_height(relative(1.))
-                                                .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                                .child(t!("skills.button.install").to_string()),
-                                        )
+                                        .child(pioneer_desktop_foundation::catalog_sidebar_label(
+                                            t!("skills.button.install").to_string(),
+                                        ))
                                 })
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
@@ -94,25 +83,16 @@ impl CatalogSidebar {
                                     .justify_start()
                                     .gap_2()
                                     .child(
-                                        div()
-                                            .id("skills-sidebar-update-icon")
-                                            .size_6()
-                                            .rounded_full()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(
-                                                Icon::new(PioneerIconName::RefreshCw)
-                                                    .size_4()
-                                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY),
-                                            ),
+                                        pioneer_desktop_foundation::catalog_sidebar_menu_icon(
+                                            PioneerIconName::RefreshCw,
+                                        )
+                                        .id("skills-sidebar-update-icon"),
                                     )
                                     .child(
-                                        div()
-                                            .flex_none()
-                                            .line_height(relative(1.))
-                                            .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                            .child(t!("skills.button.update").to_string()),
+                                        pioneer_desktop_foundation::catalog_sidebar_label(
+                                            t!("skills.button.update").to_string(),
+                                        )
+                                        .flex_none(),
                                     )
                             })
                             .on_click(cx.listener(|view, _, _, cx| {
@@ -127,6 +107,11 @@ impl CatalogSidebar {
     }
 
     pub(crate) fn render_skill_details_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let embedded = self
+            .owner
+            .upgrade()
+            .is_some_and(|owner| owner.read(cx).is_plugin_component());
+
         let desktop_entity = self.owner.clone();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
         let selected_skill = self.navigation_input.skill_id().and_then(|skill_id| {
@@ -152,57 +137,56 @@ impl CatalogSidebar {
                     .pt_4()
                     .px_2()
                     .gap_1()
-                    .child(
-                        Button::new("skills-details-sidebar-back")
-                            .ghost()
-                            .justify_start()
-                            .px_2()
-                            .group("skills-details-sidebar-back-btn")
-                            .child({
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .justify_start()
-                                    .gap_2()
-                                    .child({
-                                        let icon_bg = cx.theme().foreground.opacity(0.075);
-                                        let icon_bg_hover = cx.theme().foreground.opacity(0.1);
-                                        div()
-                                            .id("skills-details-sidebar-back-icon")
-                                            .size_6()
-                                            .rounded_full()
-                                            .bg(icon_bg)
-                                            .group_hover(
-                                                "skills-details-sidebar-back-btn",
-                                                move |style| style.bg(icon_bg_hover),
-                                            )
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(
-                                                Icon::new(IconName::ChevronLeft)
-                                                    .size_5()
-                                                    .ml_neg_px()
-                                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY),
-                                            )
-                                    })
-                                    .child(
-                                        div()
-                                            .line_height(relative(1.))
-                                            .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                            .child(t!("buttons.back").to_string()),
-                                    )
-                            })
-                            .on_click({
-                                let desktop_entity = desktop_entity.clone();
-                                move |_, _, cx| {
-                                    let _ = desktop_entity.update(cx, |view, cx| {
-                                        view.close_skill_details_screen(cx);
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    )
+                    .when(!embedded, |column| {
+                        column.child(
+                            Button::new("skills-details-sidebar-back")
+                                .ghost()
+                                .justify_start()
+                                .px_2()
+                                .group("skills-details-sidebar-back-btn")
+                                .child({
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_start()
+                                        .gap_2()
+                                        .child({
+                                            let icon_bg = cx.theme().foreground.opacity(0.075);
+                                            let icon_bg_hover = cx.theme().foreground.opacity(0.1);
+                                            div()
+                                                .id("skills-details-sidebar-back-icon")
+                                                .size_6()
+                                                .rounded_full()
+                                                .bg(icon_bg)
+                                                .group_hover(
+                                                    "skills-details-sidebar-back-btn",
+                                                    move |style| style.bg(icon_bg_hover),
+                                                )
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    Icon::new(IconName::ChevronLeft)
+                                                        .size_5()
+                                                        .ml_neg_px()
+                                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                                )
+                                        })
+                                        .child(pioneer_desktop_foundation::catalog_sidebar_label(
+                                            t!("buttons.back").to_string(),
+                                        ))
+                                })
+                                .on_click({
+                                    let desktop_entity = desktop_entity.clone();
+                                    move |_, _, cx| {
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.close_skill_details_screen(cx);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                    })
                     .when(can_manage && lifecycle_editable, |this| {
                         this.child(
                             Button::new("skills-details-sidebar-update")
@@ -219,25 +203,14 @@ impl CatalogSidebar {
                                         .justify_start()
                                         .gap_2()
                                         .child(
-                                            div()
-                                                .id("skills-details-sidebar-update-icon")
-                                                .size_6()
-                                                .rounded_full()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(
-                                                    Icon::new(PioneerIconName::RefreshCw)
-                                                        .size_4()
-                                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY),
-                                                ),
+                                            pioneer_desktop_foundation::catalog_sidebar_menu_icon(
+                                                PioneerIconName::RefreshCw,
+                                            )
+                                            .id("skills-details-sidebar-update-icon"),
                                         )
-                                        .child(
-                                            div()
-                                                .line_height(relative(1.))
-                                                .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                                .child(t!("skills.button.update").to_string()),
-                                        )
+                                        .child(pioneer_desktop_foundation::catalog_sidebar_label(
+                                            t!("skills.button.update").to_string(),
+                                        ))
                                 })
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
@@ -273,25 +246,14 @@ impl CatalogSidebar {
                                         .justify_start()
                                         .gap_2()
                                         .child(
-                                            div()
-                                                .id("skills-details-sidebar-uninstall-icon")
-                                                .size_6()
-                                                .rounded_full()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(
-                                                    Icon::new(PioneerIconName::Trash)
-                                                        .size_4()
-                                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY),
-                                                ),
+                                            pioneer_desktop_foundation::catalog_sidebar_menu_icon(
+                                                PioneerIconName::Trash,
+                                            )
+                                            .id("skills-details-sidebar-uninstall-icon"),
                                         )
-                                        .child(
-                                            div()
-                                                .line_height(relative(1.))
-                                                .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                                .child(t!("skills.button.uninstall").to_string()),
-                                        )
+                                        .child(pioneer_desktop_foundation::catalog_sidebar_label(
+                                            t!("skills.button.uninstall").to_string(),
+                                        ))
                                 })
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();

@@ -783,6 +783,9 @@ INSERT INTO turn_event_projection_state (
 
         let store = CrudStore::new(db.clone());
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: canonical_thread_id.to_owned(),
             name: None,
@@ -803,6 +806,7 @@ INSERT INTO turn_event_projection_state (
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),

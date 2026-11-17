@@ -6,8 +6,6 @@ pub fn package(
     memory_provider: Arc<dyn AgentMemoryProvider>,
     memory_write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
     post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
-    policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
-    episodic_recall_provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
     tool_bundle_artifacts: Arc<dyn MemoryToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
 ) -> MemoryHookPackage {
@@ -15,8 +13,6 @@ pub fn package(
         memory_provider,
         memory_write_provider,
         post_turn_extractor_provider,
-        policy_provider,
-        episodic_recall_provider,
         tool_bundle_artifacts,
         memory_config,
     }
@@ -26,8 +22,6 @@ pub struct MemoryHookPackage {
     memory_provider: Arc<dyn AgentMemoryProvider>,
     memory_write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
     post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
-    policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
-    episodic_recall_provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
     tool_bundle_artifacts: Arc<dyn MemoryToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
 }
@@ -39,52 +33,17 @@ impl HookPackage for MemoryHookPackage {
 
     fn definitions(&self) -> Result<Vec<HookDefinition>, HookRegistryError> {
         let memory_config = self.memory_config.clone().normalized();
-        let active_recall_config = memory_config.active_recall.clone();
         let post_turn_extractor_config = memory_config.post_turn_extractor.clone();
         let state = Arc::new(MemoryHookTurnStateStore::default());
 
         let mut definitions = vec![memory_hook_definition(
-            Arc::new(MemoryPolicyClassifierHook {
-                policy_provider: self.policy_provider.clone(),
+            Arc::new(MemoryPolicyHook {
                 state: state.clone(),
             }),
-            MEMORY_POLICY_CLASSIFIER_SUBSCRIPTION_ID,
+            MEMORY_POLICY_SUBSCRIPTION_ID,
             HookPhase::TurnPrePolicy,
             0,
         )];
-
-        if memory_config.deterministic_recall_enabled {
-            definitions.push(memory_hook_definition(
-                Arc::new(MemoryDeterministicRecallHook {
-                    memory_provider: self.memory_provider.clone(),
-                }),
-                MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID,
-                HookPhase::TurnPrePromptContext,
-                0,
-            ));
-        }
-
-        if memory_config.deterministic_recall_enabled
-            && active_recall_config.mode != MemoryActiveRecallMode::Disabled
-        {
-            definitions.push(memory_hook_definition_with_options(
-                Arc::new(ActiveMemoryRecallHook {
-                    memory_provider: self.memory_provider.clone(),
-                    episodic_provider: self.episodic_recall_provider.clone(),
-                    config: active_recall_config.clone(),
-                }),
-                MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID,
-                HookPhase::TurnPostPreflightPromptContext,
-                0,
-                HookExecutionPolicy {
-                    await_policy: HookAwaitPolicy::Deadline,
-                    timeout_ms: Some(active_recall_config.timeout_ms),
-                    max_parallelism: None,
-                },
-                HookSubscriptionDependencies::default(),
-                HookSubscriptionVisibility::Internal,
-            ));
-        }
 
         if memory_config.tools_enabled {
             definitions.push(memory_hook_definition(

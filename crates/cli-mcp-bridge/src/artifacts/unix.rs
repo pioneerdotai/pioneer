@@ -96,11 +96,18 @@ impl PrivateBootstrapArtifact {
     }
 
     pub fn is_consumed(&self) -> Result<bool, PrivateArtifactError> {
-        match fs::symlink_metadata(&self.path) {
+        self.consumed_from_metadata(fs::symlink_metadata(&self.path))
+    }
+
+    fn consumed_from_metadata(
+        &self,
+        metadata: io::Result<fs::Metadata>,
+    ) -> Result<bool, PrivateArtifactError> {
+        match metadata {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
             Err(error) => Err(error.into()),
-            Ok(_) => {
-                if file_identity(&self.path)? != self.identity {
+            Ok(metadata) => {
+                if file_metadata_identity(&metadata)? != self.identity {
                     return Err(PrivateArtifactError::Replaced);
                 }
                 Ok(false)
@@ -207,6 +214,10 @@ fn directory_identity(path: &Path) -> Result<Identity, PrivateArtifactError> {
 
 fn file_identity(path: &Path) -> Result<Identity, PrivateArtifactError> {
     let metadata = fs::symlink_metadata(path)?;
+    file_metadata_identity(&metadata)
+}
+
+fn file_metadata_identity(metadata: &fs::Metadata) -> Result<Identity, PrivateArtifactError> {
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.nlink() != 1
@@ -215,7 +226,7 @@ fn file_identity(path: &Path) -> Result<Identity, PrivateArtifactError> {
     {
         return Err(PrivateArtifactError::Replaced);
     }
-    Ok(identity(&metadata))
+    Ok(identity(metadata))
 }
 
 fn identity(metadata: &fs::Metadata) -> Identity {
@@ -281,9 +292,80 @@ mod tests {
                 & 0o777,
             0o600
         );
+        assert!(!bootstrap.is_consumed().expect("unconsumed bootstrap"));
         bootstrap.cleanup().expect("bootstrap cleanup");
+        assert!(bootstrap.is_consumed().expect("consumed bootstrap"));
         directory.cleanup().expect("directory cleanup");
         assert!(!directory.path().exists());
+    }
+
+    #[test]
+    fn bootstrap_metadata_snapshot_survives_consumption() {
+        let temp = tempfile::tempdir().expect("temp");
+        let directory = create(&temp.path().join("managed"), "snapshot").expect("directory");
+        let bootstrap = directory
+            .write_bootstrap(&document(directory.path()))
+            .expect("bootstrap");
+        let metadata = fs::symlink_metadata(bootstrap.path()).expect("snapshot before consumption");
+        fs::remove_file(bootstrap.path()).expect("consume after snapshot");
+
+        // Control the filesystem boundary locally: the poll received metadata,
+        // then the helper consumed the file before the poll could validate it.
+        assert!(
+            !bootstrap
+                .consumed_from_metadata(Ok(metadata))
+                .expect("valid captured metadata"),
+            "this poll saw the file before consumption"
+        );
+        assert!(bootstrap.is_consumed().expect("next poll sees consumption"));
+    }
+
+    #[test]
+    fn bootstrap_consumption_rejects_unsafe_or_replaced_files() {
+        for case in [
+            "permissions",
+            "hard-link",
+            "symlink",
+            "directory",
+            "replacement",
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let directory = create(&temp.path().join("managed"), "unsafe").expect("directory");
+            let mut bootstrap = directory
+                .write_bootstrap(&document(directory.path()))
+                .expect("bootstrap");
+            let original = directory.path().join("original");
+            match case {
+                "permissions" => {
+                    fs::set_permissions(bootstrap.path(), fs::Permissions::from_mode(0o644))
+                        .expect("unsafe permissions")
+                }
+                "hard-link" => fs::hard_link(bootstrap.path(), &original).expect("hard link"),
+                _ => {
+                    // Keep the old inode alive to make replacement deterministic.
+                    fs::rename(bootstrap.path(), &original).expect("move original");
+                    match case {
+                        "symlink" => std::os::unix::fs::symlink(&original, bootstrap.path())
+                            .expect("symlink"),
+                        "directory" => fs::create_dir(bootstrap.path()).expect("directory"),
+                        "replacement" => {
+                            write_new_private_file(bootstrap.path(), b"replacement")
+                                .expect("replacement");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            assert!(
+                matches!(bootstrap.is_consumed(), Err(PrivateArtifactError::Replaced)),
+                "{case}"
+            );
+            assert!(
+                matches!(bootstrap.cleanup(), Err(PrivateArtifactError::Replaced)),
+                "{case}"
+            );
+            assert!(fs::symlink_metadata(bootstrap.path()).is_ok(), "{case}");
+        }
     }
 
     #[test]

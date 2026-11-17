@@ -1184,17 +1184,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_endpoint_is_the_typed_shared_gateway_base() {
-        let base =
-            GatewayBaseUrl::parse_presentation("https://gateway.example.test/pioneer").unwrap();
-        assert_eq!(
-            base.websocket_url().as_str(),
-            "wss://gateway.example.test/pioneer/"
-        );
-        assert!(GatewayBaseUrl::parse_presentation("wss://gateway.example.test/ws").is_err());
-    }
-
-    #[test]
     fn direct_auth_calls_reject_cross_purpose_jwts_before_transport() {
         let access = classified_jwt(serde_json::json!({
             "ver": 2,

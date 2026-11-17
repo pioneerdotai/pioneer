@@ -28,13 +28,6 @@ pub struct Model {
     pub source_text_hash: String,
     pub language_hint: Option<String>,
     pub token_estimate: i64,
-    pub capsule_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub capsule_ref: Option<String>,
-    pub segment_index: Option<i64>,
-    pub frame_id: Option<i64>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub frame_uri: Option<String>,
     pub indexed_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
@@ -43,6 +36,8 @@ pub struct Model {
     pub projection_group_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub embedding_artifact_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub search_text: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

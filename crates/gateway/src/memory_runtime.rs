@@ -1,15 +1,12 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use pioneer_config::GatewayMemoryConfig;
 use pioneer_crud::CrudStore;
 use pioneer_memory::hooks::MemoryTurnContext;
 use pioneer_memory::{
     MemoryMutationBoundary, MemoryOperationContext, MemoryReadPolicy, MemoryService,
-    MemoryServiceConfig, MemorySourceAccessPolicy, MemvidMemoryBackend,
+    MemoryServiceConfig, MemorySourceAccessPolicy, SqliteMemoryBackend,
 };
 use pioneer_protocol::{MemoryActor, MemoryScope, MemoryScopeKind};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,16 +20,10 @@ pub(crate) struct GatewayMemoryRuntime {
     enabled: bool,
     service: Arc<MemoryService>,
     context_defaults: GatewayMemoryContextDefaults,
-    #[cfg(test)]
-    capsules_root: Option<PathBuf>,
 }
 
 impl GatewayMemoryRuntime {
-    pub(crate) fn from_config(
-        store: Arc<CrudStore>,
-        runtime_home: &Path,
-        config: &GatewayMemoryConfig,
-    ) -> Result<Self> {
+    pub(crate) fn from_config(store: Arc<CrudStore>, config: &GatewayMemoryConfig) -> Result<Self> {
         let context_defaults = GatewayMemoryContextDefaults {
             allow_global_user: config.allow_global_user_by_default,
             allow_global_agent: config.allow_global_agent_by_default,
@@ -43,25 +34,10 @@ impl GatewayMemoryRuntime {
                 enabled: false,
                 service: Arc::new(MemoryService::with_noop_backend(store)),
                 context_defaults,
-                #[cfg(test)]
-                capsules_root: None,
             });
         }
 
-        let capsules_root = config
-            .resolve_capsules_root(runtime_home)
-            .context("failed to resolve gateway memory capsule root")?;
-        std::fs::create_dir_all(capsules_root.as_path()).with_context(|| {
-            format!(
-                "failed to create gateway memory capsule root `{}`",
-                capsules_root.display()
-            )
-        })?;
-
-        let backend = Arc::new(MemvidMemoryBackend::with_capsules_root(
-            store.clone(),
-            capsules_root.clone(),
-        ));
+        let backend = Arc::new(SqliteMemoryBackend::new(store.clone()));
         let service = Arc::new(MemoryService::new(
             store,
             backend,
@@ -72,8 +48,6 @@ impl GatewayMemoryRuntime {
             enabled: true,
             service,
             context_defaults,
-            #[cfg(test)]
-            capsules_root: Some(capsules_root),
         })
     }
 
@@ -175,7 +149,6 @@ impl GatewayMemoryRuntime {
                 allow_global_user: true,
                 allow_global_agent: false,
             },
-            capsules_root: None,
         }
     }
 
@@ -187,11 +160,7 @@ impl GatewayMemoryRuntime {
                 allow_global_user: true,
                 allow_global_agent: false,
             },
-            capsules_root: None,
         }
-    }
-    pub(crate) fn capsules_root(&self) -> Option<&Path> {
-        self.capsules_root.as_deref()
     }
 }
 

@@ -1,6 +1,7 @@
 use super::*;
 use crate::authorization::AuthorizationExternalError;
 use anyhow::{Result, anyhow, bail};
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_protocol::{TaskRunStatus, ThreadMode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -301,11 +302,11 @@ impl MessageProcessor {
 
     pub(super) async fn process_due_task_deliveries(&self, now: i64, limit: u64) -> Result<()> {
         let task_service = self.task_runtime.background_control_service();
-        if task_service
+        let recovery_error = task_service
             .recover_stuck_deliveries(now, limit)
             .await
-            .is_err()
-        {
+            .err();
+        if recovery_error.is_some() {
             warn!(
                 failure_class = "task_delivery_recovery_gateway_discovery_failed",
                 "delivery recovery unavailable; continuing independent due deliveries"
@@ -313,12 +314,21 @@ impl MessageProcessor {
         }
         let deliveries = self.crud_store.list_due_task_deliveries(now, limit).await?;
         for delivery in deliveries {
-            let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) =
-                task_service
-                    .start_delivery(delivery.id.as_str(), now)
-                    .await
-                    .map_err(|error| anyhow!("{error:#}"))?
+            let bus = self.task_runtime.event_bus();
+            bus.observe_closing_delivery(&delivery);
+            let parent = bus.closing_delivery_parent(&delivery.id, delivery.attempt_count);
+            let mut closing = Closing::start(Phase::DestinationAttempt, &parent);
+            closing.delivery_schedule(
+                now.saturating_sub(delivery.created_at).max(0) as u64,
+                delivery.attempt_count,
+            );
+            let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) = closing
+                .correlation()
+                .scope(task_service.start_delivery(delivery.id.as_str(), now))
+                .await
+                .map_err(|error| anyhow!("{error:#}"))?
             else {
+                closing.finish(Fact::Superseded);
                 continue;
             };
             // Delivery can enter a deep CRUD projection chain. Run one
@@ -327,15 +337,26 @@ impl MessageProcessor {
             let processor = self.clone();
             let delivery_execution = delivery.clone();
             let attempt_execution = attempt.clone();
+            let correlation = closing.correlation();
+            let failure_correlation = correlation.clone();
             let execution_result = tokio::time::timeout(
                 Duration::from_secs(60),
                 message_fresh_task(async move {
-                    processor
-                        .execute_task_delivery(delivery_execution, attempt_execution)
+                    correlation
+                        .scope(
+                            processor.execute_task_delivery(delivery_execution, attempt_execution),
+                        )
                         .await
                 }),
             )
             .await;
+            closing.finish(match &execution_result {
+                Ok(Ok(Ok(pioneer_crud::TaskDeliveryTransitionOutcome::Superseded))) => {
+                    Fact::Superseded
+                }
+                Ok(Ok(Ok(_))) => Fact::Returned, // webhook rejection also returns Applied
+                _ => Fact::Unconfirmed, // timeout/join/error cannot disprove a late destination commit
+            });
             let failure_class = match execution_result {
                 Ok(Ok(Ok(pioneer_crud::TaskDeliveryTransitionOutcome::Applied(()))))
                 | Ok(Ok(Ok(pioneer_crud::TaskDeliveryTransitionOutcome::Superseded))) => None,
@@ -345,18 +366,21 @@ impl MessageProcessor {
             };
             if let Some(failure_class) = failure_class {
                 let failed_at = now_timestamp_secs();
-                task_service
-                    .fail_delivery(
+                failure_correlation
+                    .scope(task_service.fail_delivery(
                         delivery,
                         attempt,
                         failure_class.to_owned(),
                         None,
                         None,
                         failed_at,
-                    )
+                    ))
                     .await
                     .map_err(|error| anyhow!("{error:#}"))?;
             }
+        }
+        if let Some(error) = recovery_error {
+            return Err(anyhow!("{error:#}"));
         }
         Ok(())
     }
@@ -367,8 +391,17 @@ impl MessageProcessor {
         attempt: TaskDeliveryAttempt,
     ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
         if delivery.mode != TaskDeliveryMode::None {
-            self.ensure_task_delivery_still_authorized(&delivery)
-                .await?;
+            let mut authorization = Closing::current(Phase::DeliveryAuthorization);
+            let result = authorization
+                .correlation()
+                .scope(self.ensure_task_delivery_still_authorized(&delivery))
+                .await;
+            authorization.finish(if result.is_ok() {
+                Fact::Confirmed
+            } else {
+                Fact::Unconfirmed
+            });
+            result?;
         }
         match delivery.mode {
             TaskDeliveryMode::None => {
@@ -560,28 +593,78 @@ impl MessageProcessor {
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
     ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
-        let outcome = self
-            .task_runtime
-            .background_control_service()
-            .complete_delivery(
-                delivery,
-                attempt,
-                delivered_turn_id,
-                delivered_notification_id,
-                http_status,
-                response_fingerprint,
-                now_timestamp_secs(),
+        let mut closing = Closing::current(Phase::DestinationCommit);
+        let promised = delivery.mode != TaskDeliveryMode::None;
+        let title_recovery = self.composer_title_recovery_target(&delivery).await;
+        let outcome = closing
+            .correlation()
+            .scope(
+                self.task_runtime
+                    .background_control_service()
+                    .complete_delivery(
+                        delivery,
+                        attempt,
+                        delivered_turn_id,
+                        delivered_notification_id,
+                        http_status,
+                        response_fingerprint,
+                        now_timestamp_secs(),
+                    ),
             )
             .await
             .map_err(|error| anyhow!("{error:#}"))?;
         Ok(match outcome {
             pioneer_crud::TaskDeliveryTransitionOutcome::Applied(_) => {
+                closing.finish(if promised {
+                    Fact::Confirmed
+                } else {
+                    Fact::Returned
+                });
+                if let Some(thread_id) = title_recovery {
+                    self.recover_thread_title(thread_id).await;
+                }
                 pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
             }
             pioneer_crud::TaskDeliveryTransitionOutcome::Superseded => {
+                closing.finish(Fact::Superseded);
                 pioneer_crud::TaskDeliveryTransitionOutcome::Superseded
             }
         })
+    }
+
+    async fn composer_title_recovery_target(&self, delivery: &TaskDelivery) -> Option<String> {
+        if delivery.mode != TaskDeliveryMode::Thread || delivery.error_snapshot.is_some() {
+            return None;
+        }
+        let target = delivery.target_thread_id.as_deref()?;
+        if !matches!(
+            self.title_job_runtime.lock().await.get(target),
+            Some(ThreadTitleJobState::AwaitingSuccessfulTurn(_))
+        ) {
+            return None;
+        }
+        let background = self.crud_store.with_maintenance_access();
+        let task = background.get_task(&delivery.task_id).await.ok()??;
+        if !task.runs.iter().any(|run| {
+            run.id == delivery.run_id && run.status == pioneer_protocol::TaskRunStatus::Succeeded
+        }) {
+            return None;
+        }
+        let work = task.task.metadata.as_ref()?.composer_work.as_ref()?;
+        // Only the saved Composer launch identifies the user conversation.
+        // Arbitrary task lineage and the hidden execution thread do not.
+        let launch = &work.launch;
+        if target != launch.thread_id {
+            return None;
+        }
+        let (_, turn) = background
+            .get_turn(&launch.thread_id, &launch.turn_id)
+            .await
+            .ok()??;
+        (turn.status == TurnStatus::Completed
+            && turn.origin == pioneer_protocol::TurnOrigin::User
+            && turn.turn_kind == pioneer_protocol::TurnKind::Conversation)
+            .then(|| launch.thread_id.clone())
     }
 
     async fn prepare_task_delivery_agent_action(
@@ -640,19 +723,17 @@ impl MessageProcessor {
             super::task_agent_executor::select_agent_spec(&task_response, delivery.run_id.as_str())
                 .context("Agent Task delivery has no execution specification")?;
         let policy_generation = self.current_authorization_revision().await?;
-        let (mut adapter, _, _) =
-            super::task_agent_executor::materialize_task_agent_action_binding_for_execution(
-                self,
-                &task_response.task,
-                &agent_spec,
-                execution_id,
-                delivery.run_id.as_str(),
-                execution.home_root_thread_id.as_str(),
-                policy_generation,
-                true,
-            )
-            .await
-            .context("failed to restore exact Task delivery actor")?;
+        let mut adapter = super::task_agent_executor::restore_task_delivery_agent_action_binding(
+            self,
+            &task_response.task,
+            &agent_spec,
+            execution_id,
+            delivery.run_id.as_str(),
+            execution.home_root_thread_id.as_str(),
+            policy_generation,
+        )
+        .await
+        .context("failed to restore exact Task delivery actor")?;
 
         let route_id = actor_contract.delivery.route_id.as_deref();
         let target = if let Some(route_id) = route_id {
@@ -957,6 +1038,9 @@ impl MessageProcessor {
             return Ok(turn_id);
         }
         let turn_params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.clone(),
@@ -1002,6 +1086,8 @@ impl MessageProcessor {
                     .await?
             }
         };
+        let sidebar_visible = turn_outcome.materialization.thread.sidebar_visibility
+            == pioneer_protocol::ThreadSidebarVisibility::Visible;
         let profile_selected_audit = match self.turn_profile_selected_audit_event(&turn_outcome) {
             Ok(event) => event,
             Err(error) => {
@@ -1100,6 +1186,16 @@ impl MessageProcessor {
                         .await;
                     return Err(error);
                 }
+                if sidebar_visible {
+                    self.dirty_push(
+                        &delivery.workspace_id,
+                        Some(thread_id),
+                        None,
+                        None,
+                        false,
+                        None,
+                    );
+                }
                 self.send_notification_to_authorized_thread_connections(
                     thread_id,
                     events::TURN_STARTED,
@@ -1128,7 +1224,7 @@ impl MessageProcessor {
                     &item_completed,
                 )
                 .await;
-                self.notify_semantic_timeline_item_changed(
+                self.notify_semantic_timeline_item_changed_after_indicator_commit(
                     item_completed.workspace_id.as_str(),
                     item_completed.thread_id.as_str(),
                     item_completed.turn_id.as_str(),
@@ -1172,6 +1268,16 @@ impl MessageProcessor {
                         .await;
                     return Err(error);
                 }
+                if sidebar_visible {
+                    self.dirty_push(
+                        &delivery.workspace_id,
+                        Some(thread_id),
+                        None,
+                        None,
+                        false,
+                        None,
+                    );
+                }
                 self.send_notification_to_authorized_thread_connections(
                     thread_id,
                     events::TURN_STARTED,
@@ -1193,8 +1299,10 @@ impl MessageProcessor {
                 .await;
             }
         }
-        self.notify_thread_tree_changed(delivery.workspace_id.clone())
-            .await;
+        if sidebar_visible {
+            self.notify_thread_unread_legacy(&delivery.workspace_id, thread_id)
+                .await;
+        }
         Ok(turn_id)
     }
 
@@ -1244,6 +1352,27 @@ impl MessageProcessor {
         item: TurnItem,
         agent_action: Option<pioneer_crud::AgentCommitInput>,
     ) -> Result<()> {
+        // The destination was loaded above. Reuse its materialized visibility;
+        // only an unloaded target needs a single row in this operation's scope.
+        let sidebar_visible = match self
+            .thread_manager
+            .loaded_thread_sidebar_visibility(workspace_id, thread_id)
+            .await
+        {
+            Some(visibility) => visibility == pioneer_protocol::ThreadSidebarVisibility::Visible,
+            None => {
+                let thread = self
+                    .crud_store
+                    .get_thread_by_id(thread_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("delivery target thread not found"))?;
+                anyhow::ensure!(
+                    thread.workspace_id == workspace_id,
+                    "delivery workspace changed"
+                );
+                thread.sidebar_visibility == "visible"
+            }
+        };
         let started = pioneer_protocol::ItemStartedNotification {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
@@ -1260,6 +1389,9 @@ impl MessageProcessor {
         self.crud_store
             .materialize_task_delivery_item(started.clone(), completed.clone(), now, agent_action)
             .await?;
+        if sidebar_visible {
+            self.dirty_push(workspace_id, Some(thread_id), None, None, false, None);
+        }
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_STARTED, &started)
             .await;
         self.notify_semantic_timeline_item_changed(
@@ -1276,7 +1408,7 @@ impl MessageProcessor {
         self.kick_native_turn_event_deliveries();
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
             .await;
-        self.notify_semantic_timeline_item_changed(
+        self.notify_semantic_timeline_item_changed_after_indicator_commit(
             completed.workspace_id.as_str(),
             completed.thread_id.as_str(),
             completed.turn_id.as_str(),
@@ -1284,6 +1416,10 @@ impl MessageProcessor {
             Some("completed"),
         )
         .await;
+        if sidebar_visible {
+            self.notify_thread_unread_legacy(workspace_id, thread_id)
+                .await;
+        }
         Ok(())
     }
 
@@ -1587,6 +1723,7 @@ mod recovery_failure_tests {
         );
         let diagnostic = pioneer_protocol::RecoveryDiagnostic {
             last_failure: Some(pioneer_protocol::RecoveryProviderFailure {
+                raw_response: None,
                 error_reason: None,
                 request_id: None,
                 class: pioneer_protocol::ProviderFailureClass::AuthOrPermission,
@@ -1622,5 +1759,332 @@ mod recovery_failure_tests {
                 .message
                 .contains("HTTP")
         );
+    }
+}
+
+#[cfg(test)]
+mod historical_grant_delivery_tests {
+    use super::*;
+    use crate::message::tests::task_launch_continuity::{
+        historical_task_fixture, historical_task_fixture_with_delivery_target,
+    };
+    use pioneer_protocol::{TaskDeliveryStatus, TurnItem, TurnItemEventPayload};
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
+        Set,
+    };
+
+    #[tokio::test]
+    async fn historical_result_delivery_and_post_commit_replay_keep_author_receipt_and_originals() {
+        for mode in [TaskDeliveryMode::Thread, TaskDeliveryMode::UserNotification] {
+            let fixture = historical_task_fixture(mode).await;
+            let processor = &fixture.processor;
+            let store = &processor.crud_store;
+            let db = store.database_connection();
+            fixture
+                .install_historical_grants(&[&fixture.execution.id])
+                .await;
+            let actor = store
+                .get_task_actor_contract(&fixture.response.task.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let original = pioneer_crud::load_agent_execution_grant(&db, &fixture.execution.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let author = crate::message::task_agent_executor::exact_agent_execution_author(
+                processor,
+                &fixture.execution.id,
+            )
+            .await
+            .unwrap();
+            let execution_count = pioneer_entity::agent_execution::Entity::find()
+                .count(&db)
+                .await
+                .unwrap();
+            let pending = fixture.complete().await;
+            assert_eq!(
+                store
+                    .get_task_run(&fixture.run.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskRunStatus::Succeeded
+            );
+            let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) =
+                processor
+                    .task_runtime
+                    .service()
+                    .start_delivery(&pending.id, now_timestamp_secs())
+                    .await
+                    .unwrap()
+            else {
+                panic!("fixture must own the delivery attempt")
+            };
+            assert!(delivery.error_snapshot.is_none());
+            processor
+                .ensure_task_delivery_still_authorized(&delivery)
+                .await
+                .unwrap();
+            // Commit the real destination, deliberately leaving its delivery
+            // acknowledgement outstanding as after a Gateway interruption.
+            match mode {
+                TaskDeliveryMode::Thread => {
+                    let turn_id = processor.deliver_to_thread(&delivery).await.unwrap();
+                    let (_, turn) = store
+                        .get_turn("continuity-root", &turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(turn.author.as_ref(), Some(&author));
+                    assert_eq!(turn.status, pioneer_protocol::TurnStatus::Completed);
+                }
+                TaskDeliveryMode::UserNotification => {
+                    let notification = processor
+                        .deliver_user_notification(&delivery)
+                        .await
+                        .unwrap();
+                    assert_eq!(notification.author.as_ref(), author.agent.as_ref());
+                    assert!(notification.delivery_action_receipt_id.is_some());
+                }
+                _ => unreachable!(),
+            }
+            let action_id = pioneer_crud::canonical_agent_id(
+                'A',
+                &format!("task-delivery-action\0{}", delivery.id),
+            );
+            let receipt = pioneer_crud::load_agent_action_receipt(&db, &action_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                receipt.actor_id.as_deref(),
+                Some(fixture.execution.id.as_str())
+            );
+            assert_eq!(receipt.actor_kind, "agent_execution");
+            assert_eq!(receipt.decision, "allowed");
+            assert_eq!(
+                store
+                    .get_task_delivery(&delivery.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskDeliveryStatus::Delivering
+            );
+            // Cold thread cache: recovery must read the committed destination
+            // and authenticate the old author again before acknowledging it.
+            let mut restarted = processor.as_ref().clone();
+            restarted.thread_manager =
+                Arc::new(crate::thread::ThreadManager::new("test-model", "openai"));
+            assert!(matches!(
+                restarted
+                    .execute_task_delivery(delivery.clone(), attempt)
+                    .await
+                    .unwrap(),
+                pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
+            ));
+            let delivered = store
+                .get_task_delivery(&delivery.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered.status, TaskDeliveryStatus::Delivered);
+            assert_eq!(delivered.result_snapshot, delivery.result_snapshot);
+            assert_eq!(
+                pioneer_crud::load_agent_action_receipt(&db, &action_id)
+                    .await
+                    .unwrap(),
+                Some(receipt)
+            );
+            if let Some(turn_id) = delivered.delivered_turn_id.as_deref() {
+                let events = store
+                    .get_turn_item_events("continuity-root", turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let item_id = pioneer_protocol::task_delivery_result_item_id(&delivery.id);
+                assert_eq!(events.events.iter().filter(|event| matches!(&event.payload,
+                    TurnItemEventPayload::ItemCompleted { item: TurnItem::AgentMessage { id, .. }, .. } if id == &item_id)).count(), 1);
+            } else {
+                let notification = pioneer_entity::user_notification_outbox::Entity::find()
+                    .filter(
+                        pioneer_entity::user_notification_outbox::Column::TaskDeliveryId
+                            .eq(&delivery.id),
+                    )
+                    .all(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(notification.len(), 1);
+                let payload: pioneer_protocol::TaskUserNotificationDeliveredNotification =
+                    serde_json::from_str(&notification[0].payload_json).unwrap();
+                assert_eq!(payload.author.as_ref(), author.agent.as_ref());
+            }
+            assert_eq!(
+                store
+                    .get_task_actor_contract(&fixture.response.task.id)
+                    .await
+                    .unwrap(),
+                Some(actor)
+            );
+            assert_eq!(
+                pioneer_crud::load_agent_execution_grant(&db, &fixture.execution.id)
+                    .await
+                    .unwrap(),
+                Some(original)
+            );
+            assert_eq!(
+                pioneer_entity::agent_execution::Entity::find()
+                    .count(&db)
+                    .await
+                    .unwrap(),
+                execution_count
+            );
+            fixture.assert_no_provider_requests();
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_delivery_still_rejects_corrupt_snapshots_and_revoked_authority() {
+        for corruption in ["outer", "nested", "task", "identity", "route"] {
+            let destination_thread_id = if corruption == "route" {
+                "historical-delivery-target"
+            } else {
+                "continuity-root"
+            };
+            let fixture = historical_task_fixture_with_delivery_target(
+                TaskDeliveryMode::Thread,
+                destination_thread_id,
+            )
+            .await;
+            let processor = &fixture.processor;
+            let store = &processor.crud_store;
+            let db = store.database_connection();
+            fixture
+                .install_historical_grants(&[&fixture.execution.id])
+                .await;
+            let route = if corruption == "route" {
+                Some(fixture.add_delivery_route().await)
+            } else {
+                None
+            };
+            let pending = fixture.complete().await;
+            let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) =
+                processor
+                    .task_runtime
+                    .service()
+                    .start_delivery(&pending.id, now_timestamp_secs())
+                    .await
+                    .unwrap()
+            else {
+                panic!("fixture must own the delivery attempt")
+            };
+            if let Some((id, authority, fingerprint, generation)) = route {
+                assert!(
+                    processor
+                        .prepare_task_delivery_agent_action(&delivery, Some(destination_thread_id))
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "historical delivery must pass the active route before revocation"
+                );
+                assert!(
+                    store
+                        .revoke_agent_delegation_route(
+                            &id,
+                            1,
+                            generation,
+                            &authority,
+                            &fingerprint,
+                            pioneer_crud::utc_now()
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+            match corruption {
+                "outer" | "nested" => {
+                    let row = pioneer_crud::load_agent_execution_grant(&db, &fixture.execution.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut value: serde_json::Value =
+                        serde_json::from_str(&row.grant_json).unwrap();
+                    if corruption == "outer" {
+                        value["root_thread_id"] = json!("altered");
+                    } else {
+                        value["child_launch_grant"]["allowServerDerivedEphemeral"] = json!(true);
+                    }
+                    let encoded = value.to_string();
+                    let mut row = row.into_active_model();
+                    if corruption == "nested" {
+                        row.grant_fingerprint =
+                            Set(pioneer_crud::agent_execution_grant_fingerprint(&encoded).unwrap());
+                    }
+                    row.grant_json = Set(encoded);
+                    row.update(&db).await.unwrap();
+                }
+                "task" => {
+                    let row = pioneer_entity::task_actor_contract::Entity::find_by_id(
+                        &fixture.response.task.id,
+                    )
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    let mut value: serde_json::Value = serde_json::from_str(
+                        row.derived_child_launch_grant_json.as_deref().unwrap(),
+                    )
+                    .unwrap();
+                    value["child_launch_grant"]["allowServerDerivedEphemeral"] = json!(true);
+                    let mut row = row.into_active_model();
+                    row.derived_child_launch_grant_json = Set(Some(value.to_string()));
+                    row.update(&db).await.unwrap();
+                }
+                "identity" => {
+                    let row = pioneer_crud::load_agent_identity(&db, "A00000000000000000001")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut row = row.into_active_model();
+                    row.status = Set("retired".into());
+                    row.retired_at = Set(Some(pioneer_crud::utc_now()));
+                    row.update(&db).await.unwrap();
+                }
+                "route" => {}
+                _ => unreachable!(),
+            }
+            assert!(
+                processor
+                    .execute_task_delivery(delivery.clone(), attempt)
+                    .await
+                    .is_err(),
+                "{corruption}"
+            );
+            let action_id = pioneer_crud::canonical_agent_id(
+                'A',
+                &format!("task-delivery-action\0{}", delivery.id),
+            );
+            assert!(
+                pioneer_crud::load_agent_action(&db, &action_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let turn_id = pioneer_crud::canonical_agent_id(
+                'T',
+                &format!("task-delivery-turn\0{}", delivery.id),
+            );
+            assert!(
+                store
+                    .get_turn(destination_thread_id, &turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            fixture.assert_no_provider_requests();
+        }
     }
 }

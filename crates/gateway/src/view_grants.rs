@@ -67,6 +67,7 @@ impl ViewGrantScope {
 pub(crate) enum ViewGrantSubject {
     Artifact(ArtifactViewGrantScope),
     ThreadFile(ThreadFileViewGrantScope),
+    App(AppViewGrantScope),
 }
 
 impl ViewGrantSubject {
@@ -74,6 +75,11 @@ impl ViewGrantSubject {
         match self {
             Self::Artifact(scope) => scope.validate(),
             Self::ThreadFile(scope) => scope.validate(),
+            Self::App(scope) => validate_scope_ids([
+                scope.workspace_id.as_str(),
+                scope.app_id.as_str(),
+                scope.execution_id.as_str(),
+            ]),
         }
     }
 }
@@ -95,6 +101,13 @@ impl ArtifactViewGrantScope {
             self.version_id.as_str(),
         ])
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppViewGrantScope {
+    pub(crate) workspace_id: String,
+    pub(crate) app_id: String,
+    pub(crate) execution_id: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -452,7 +465,10 @@ impl ViewGrantService {
         })
     }
 
-    pub(crate) fn resolve(&self, presented: &str) -> Result<ViewGrantLease, ViewGrantError> {
+    fn resolve_entry(
+        &self,
+        presented: &str,
+    ) -> Result<(ResolvedViewGrant, Arc<Semaphore>, CancellationToken), ViewGrantError> {
         if !valid_presented_secret(presented) {
             record_view_grant_event("rejected", "invalid_secret_format");
             return Err(ViewGrantError::UnknownOrExpired);
@@ -472,14 +488,6 @@ impl ViewGrantService {
             record_view_grant_event("rejected", "unknown_or_expired");
             return Err(ViewGrantError::UnknownOrExpired);
         };
-        let permit = stored
-            .concurrency
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                record_view_grant_event("rejected", "concurrency");
-                ViewGrantError::Concurrency
-            })?;
         let grant = ResolvedViewGrant {
             scope: stored.scope.clone(),
             protocol_version: stored.protocol_version,
@@ -487,7 +495,42 @@ impl ViewGrantService {
             expires_at_unix: stored.expires_at_unix,
         };
         let cancellation = stored.cancellation.clone();
-        drop(state);
+        Ok((grant, stored.concurrency.clone(), cancellation))
+    }
+    pub(crate) fn resolve(&self, presented: &str) -> Result<ViewGrantLease, ViewGrantError> {
+        let (grant, concurrency, cancellation) = self.resolve_entry(presented)?;
+        let permit = concurrency.try_acquire_owned().map_err(|_| {
+            record_view_grant_event("rejected", "concurrency");
+            ViewGrantError::Concurrency
+        })?;
+        Ok(ViewGrantLease {
+            grant,
+            cancellation: cancellation.clone(),
+            cancellation_wait: Box::pin(cancellation.cancelled_owned()),
+            _permit: permit,
+        })
+    }
+    /// App documents share one grant across assets and long-lived streams. A
+    /// short cancellable wait preserves the configured stream bound without
+    /// failing ordinary browser asset bursts at four concurrent requests.
+    pub(crate) async fn resolve_app(
+        &self,
+        presented: &str,
+    ) -> Result<ViewGrantLease, ViewGrantError> {
+        let (grant, concurrency, cancellation) = self.resolve_entry(presented)?;
+        if !matches!(&grant.scope.subject, ViewGrantSubject::App(_)) {
+            return Err(ViewGrantError::InvalidScope);
+        }
+        let permit = tokio::select! {
+            _ = cancellation.cancelled() => return Err(ViewGrantError::UnknownOrExpired),
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), concurrency.acquire_owned()) => result.map_err(|_| ViewGrantError::Concurrency)?.map_err(|_| ViewGrantError::UnknownOrExpired)?,
+        };
+        // A queued browser request must not become authorized by a permit
+        // released after expiry. Read the current lease (renewal may extend it).
+        let current = self.app_scope(presented)?;
+        if current != grant.scope || cancellation.is_cancelled() {
+            return Err(ViewGrantError::UnknownOrExpired);
+        }
         Ok(ViewGrantLease {
             grant,
             cancellation: cancellation.clone(),
@@ -496,6 +539,94 @@ impl ViewGrantService {
         })
     }
 
+    /// Read scope for native lease control without consuming a resource-stream slot.
+    pub(crate) fn app_scope(&self, presented: &str) -> Result<ViewGrantScope, ViewGrantError> {
+        if !valid_presented_secret(presented) {
+            return Err(ViewGrantError::UnknownOrExpired);
+        }
+        let now = self.clock.now_unix()?;
+        let mut state = self.lock_state();
+        if !state.accepting {
+            return Err(ViewGrantError::ShuttingDown);
+        }
+        self.prune_expired_locked(&mut state, now);
+        let grant = state
+            .grants
+            .get(&self.hash_secret(presented))
+            .ok_or(ViewGrantError::UnknownOrExpired)?;
+        if !matches!(&grant.scope.subject, ViewGrantSubject::App(_)) {
+            return Err(ViewGrantError::InvalidScope);
+        }
+        Ok(grant.scope.clone())
+    }
+    /// Native renewal keeps one App origin/base path stable. Neither an expired
+    /// grant nor another principal/session can be adopted by this operation.
+    pub(crate) fn renew_app(
+        &self,
+        presented: &str,
+        scope: &ViewGrantScope,
+    ) -> Result<u64, ViewGrantError> {
+        let now = self.clock.now_unix()?;
+        let hash = self.hash_secret(presented);
+        let mut state = self.lock_state();
+        self.prune_expired_locked(&mut state, now);
+        if !state.accepting {
+            return Err(ViewGrantError::ShuttingDown);
+        }
+        let grant = state
+            .grants
+            .get_mut(&hash)
+            .ok_or(ViewGrantError::UnknownOrExpired)?;
+        if &grant.scope != scope || !matches!(&scope.subject, ViewGrantSubject::App(_)) {
+            return Err(ViewGrantError::InvalidScope);
+        }
+        grant.expires_at_unix = now
+            .checked_add(self.limits.ttl_secs)
+            .ok_or(ViewGrantError::Clock)?;
+        Ok(grant.expires_at_unix)
+    }
+    pub(crate) fn close_app(
+        &self,
+        presented: &str,
+        scope: &ViewGrantScope,
+    ) -> Result<(), ViewGrantError> {
+        let hash = self.hash_secret(presented);
+        let mut state = self.lock_state();
+        let Some(grant) = state.grants.get(&hash) else {
+            return Ok(());
+        };
+        if &grant.scope != scope || !matches!(&scope.subject, ViewGrantSubject::App(_)) {
+            return Err(ViewGrantError::InvalidScope);
+        }
+        let grant = state
+            .grants
+            .remove(&hash)
+            .ok_or(ViewGrantError::UnknownOrExpired)?;
+        grant.cancellation.cancel();
+        if let Some(hashes) = state.by_session.get_mut(&scope.auth_session_id) {
+            hashes.remove(&hash);
+        }
+        state.by_session.retain(|_, hashes| !hashes.is_empty());
+        Ok(())
+    }
+    pub(crate) async fn wait_app_expiry(&self, presented: &str) {
+        let hash = self.hash_secret(presented);
+        loop {
+            let now = match self.clock.now_unix() {
+                Ok(now) => now,
+                Err(_) => return,
+            };
+            let expiry = self
+                .lock_state()
+                .grants
+                .get(&hash)
+                .map(|g| g.expires_at_unix);
+            let Some(expiry) = expiry.filter(|expiry| *expiry > now) else {
+                return;
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(expiry - now)).await;
+        }
+    }
     pub(crate) fn invalidate_session(&self, session_id: &AuthSessionId) -> usize {
         let mut state = self.lock_state();
         let Some(hashes) = state.by_session.remove(session_id) else {
@@ -510,6 +641,37 @@ impl ViewGrantService {
         count
     }
 
+    pub(crate) fn invalidate_app_views(
+        &self,
+        workspace: &str,
+        app: Option<&str>,
+        principal: Option<&PrincipalId>,
+    ) {
+        let mut state = self.lock_state();
+        let revoked: Vec<_> = state
+            .grants
+            .iter()
+            .filter_map(|(hash, grant)| match &grant.scope.subject {
+                ViewGrantSubject::App(scope)
+                    if scope.workspace_id == workspace
+                        && app.is_none_or(|id| id == scope.app_id)
+                        && principal.is_none_or(|p| p == &grant.scope.principal_id) =>
+                {
+                    Some(*hash)
+                }
+                _ => None,
+            })
+            .collect();
+        for hash in revoked {
+            if let Some(grant) = state.grants.remove(&hash) {
+                grant.cancellation.cancel();
+                if let Some(hashes) = state.by_session.get_mut(&grant.scope.auth_session_id) {
+                    hashes.remove(&hash);
+                }
+            }
+        }
+        state.by_session.retain(|_, hashes| !hashes.is_empty());
+    }
     pub(crate) fn begin_shutdown(&self) -> usize {
         let mut state = self.lock_state();
         state.accepting = false;
@@ -830,6 +992,126 @@ mod tests {
         assert!(matches!(
             service.mint(scope("2")),
             Err(ViewGrantError::ShuttingDown)
+        ));
+    }
+
+    fn app_scope(session: &str, app: &str, execution: &str) -> ViewGrantScope {
+        let mut scoped = scope(session);
+        scoped.subject = ViewGrantSubject::App(AppViewGrantScope {
+            workspace_id: "ws".into(),
+            app_id: app.into(),
+            execution_id: execution.into(),
+        });
+        scoped
+    }
+    #[test]
+    fn app_renewal_keeps_resource_slots_free_and_revocation_cancels_only_its_execution() {
+        let mut config = config();
+        config.view_grant_ttl_secs = 120;
+        config.view_grant_streams = 1;
+        let clock = Arc::new(TestClock::new(1000));
+        let service = service(&config, clock.clone(), 31);
+        let first_scope = app_scope("1", "app-a", "execution-a");
+        let first = extract_secret(service.mint(first_scope.clone()).unwrap());
+        let second_scope = app_scope("1", "app-b", "execution-b");
+        let second = extract_secret(service.mint(second_scope.clone()).unwrap());
+        let lease = service.resolve(first.as_str()).unwrap();
+        let mut foreign = first_scope.clone();
+        foreign.subject = ViewGrantSubject::App(AppViewGrantScope {
+            workspace_id: "ws".into(),
+            app_id: "app-b".into(),
+            execution_id: "execution-b".into(),
+        });
+        assert_eq!(
+            service.renew_app(first.as_str(), &foreign),
+            Err(ViewGrantError::InvalidScope)
+        );
+        assert_eq!(
+            service.close_app(first.as_str(), &foreign),
+            Err(ViewGrantError::InvalidScope)
+        );
+        let mut execution_scope = first_scope.clone();
+        execution_scope.subject = ViewGrantSubject::App(AppViewGrantScope {
+            workspace_id: "ws".into(),
+            app_id: "app-a".into(),
+            execution_id: "execution-b".into(),
+        });
+        let mut principal_scope = first_scope.clone();
+        principal_scope.principal_id = PrincipalId::new(format!("Q{}", "0".repeat(20))).unwrap();
+        let mut session_scope = first_scope.clone();
+        session_scope.auth_session_id = AuthSessionId::new(format!("T{}", "0".repeat(20))).unwrap();
+        for invalid in [execution_scope, principal_scope, session_scope] {
+            assert_eq!(
+                service.renew_app(first.as_str(), &invalid),
+                Err(ViewGrantError::InvalidScope)
+            );
+            assert_eq!(
+                service.close_app(first.as_str(), &invalid),
+                Err(ViewGrantError::InvalidScope)
+            );
+        }
+        clock.advance(60);
+        assert_eq!(service.app_scope(first.as_str()).unwrap(), first_scope);
+        assert_eq!(
+            service.renew_app(first.as_str(), &first_scope).unwrap(),
+            1180
+        );
+        service.renew_app(second.as_str(), &second_scope).unwrap();
+        clock.advance(61);
+        assert!(service.app_scope(first.as_str()).is_ok());
+        service.invalidate_app_views("ws", Some("app-a"), None);
+        assert!(lease.invalidated());
+        assert!(service.app_scope(first.as_str()).is_err());
+        assert!(service.app_scope(second.as_str()).is_ok());
+        clock.advance(60);
+        assert_eq!(
+            service.renew_app(second.as_str(), &second_scope),
+            Err(ViewGrantError::UnknownOrExpired)
+        );
+    }
+    #[tokio::test]
+    async fn app_asset_bursts_wait_for_capacity_and_queued_resources_are_revoked() {
+        use futures_util::FutureExt;
+        let mut config = config();
+        config.view_grant_streams = 1;
+        let clock = Arc::new(TestClock::new(1000));
+        let service = service(&config, clock.clone(), 32);
+        let scope = app_scope("1", "app-a", "execution-a");
+        let issued = extract_secret(service.mint(scope.clone()).unwrap());
+        let active = service.resolve_app(issued.as_str()).await.unwrap();
+        let mut waiting = Box::pin(service.resolve_app(issued.as_str()));
+        assert!(waiting.as_mut().now_or_never().is_none());
+        drop(active);
+        let active = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut revoked = Box::pin(service.resolve_app(issued.as_str()));
+        assert!(revoked.as_mut().now_or_never().is_none());
+        service.close_app(issued.as_str(), &scope).unwrap();
+        assert!(active.invalidated());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), revoked)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        let expires = extract_secret(service.mint(scope).unwrap());
+        let held = service.resolve_app(expires.as_str()).await.unwrap();
+        let mut waiting = Box::pin(service.resolve_app(expires.as_str()));
+        assert!(waiting.as_mut().now_or_never().is_none());
+        clock.advance(config.view_grant_ttl_secs + 1);
+        drop(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        let artifact = extract_secret(service.mint(super::tests::scope("2")).unwrap());
+        assert!(matches!(
+            service.resolve_app(artifact.as_str()).await,
+            Err(ViewGrantError::InvalidScope)
         ));
     }
 }

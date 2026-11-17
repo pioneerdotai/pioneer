@@ -113,16 +113,6 @@
             }
           ]
         },
-        "preflight_model": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayMemoryModelSelection"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "telemetry_enabled": {
           "type": [
             "boolean",
@@ -162,16 +152,10 @@
     "GatewayMemorySettings": {
       "type": "object",
       "properties": {
-        "active_recall_enabled": {
-          "type": "boolean"
-        },
         "background_extraction_enabled": {
           "type": "boolean"
         },
         "debug_trace_enabled": {
-          "type": "boolean"
-        },
-        "deterministic_recall_enabled": {
           "type": "boolean"
         },
         "enabled": {
@@ -195,8 +179,6 @@
       },
       "required": [
         "enabled",
-        "deterministic_recall_enabled",
-        "active_recall_enabled",
         "tools_enabled",
         "proactive_writes_enabled",
         "background_extraction_enabled",
@@ -235,6 +217,20 @@
         {
           "type": "object",
           "properties": {
+            "context_authority": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context_window": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
             "instance": {
               "type": "string"
             },
@@ -245,6 +241,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "service_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NativeServiceModeSelection"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "source": {
@@ -493,14 +499,6 @@
           "format": "uint32",
           "minimum": 0
         },
-        "max_segments": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
         "min_relevancy": {
           "type": [
             "number",
@@ -515,13 +513,6 @@
           ],
           "format": "uint32",
           "minimum": 0
-        },
-        "near_capacity_percent": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
         },
         "recall_enabled": {
           "type": [
@@ -568,6 +559,7 @@
       "enum": [
         "openai",
         "openrouter",
+        "vercel-ai-gateway",
         "local"
       ]
     },
@@ -649,6 +641,12 @@
         },
         "retry_install": {
           "type": "boolean"
+        },
+        "transcribe_while_recording": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },
@@ -659,6 +657,23 @@
         "codex",
         "claude",
         "opencode"
+      ]
+    },
+    "NativeServiceModeSelection": {
+      "description": "Explicit choice uses the existing endpoint/credential/model authority proof.\nAbsence means Standard; Inherit belongs to the enclosing model selection.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "authority"
       ]
     }
   }

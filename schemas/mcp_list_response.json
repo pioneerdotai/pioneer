@@ -40,6 +40,26 @@
         "name": {
           "type": "string"
         },
+        "package_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PackageOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plugin_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "policy": {
           "$ref": "#/$defs/McpPolicyState"
         },
@@ -162,6 +182,48 @@
         "stopping",
         "stopped",
         "restarting"
+      ]
+    },
+    "PackageKind": {
+      "description": "Product identity is distinct even when installation mechanics are shared.",
+      "type": "string",
+      "enum": [
+        "plugin",
+        "app"
+      ]
+    },
+    "PackageOwner": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PackageKind"
+        },
+        "member_key": {
+          "type": "string"
+        },
+        "package_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "package_id",
+        "member_key"
+      ]
+    },
+    "PluginOwner": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "plugin_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "member_key"
       ]
     }
   }

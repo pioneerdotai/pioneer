@@ -16,7 +16,6 @@ pub mod agent_execution_resource_state;
 pub mod agent_identity;
 pub mod agent_memory;
 pub mod agent_memory_candidate;
-pub mod agent_memory_capsule;
 pub mod agent_memory_event;
 pub mod agent_memory_identity;
 pub mod agent_memory_policy_decision;
@@ -78,6 +77,7 @@ pub mod compaction_operation_projection;
 pub mod compaction_projection_epoch;
 pub mod compaction_publication_fence;
 pub mod compaction_publication_source_fence;
+pub mod compaction_root_activity;
 pub mod compaction_runner_plan;
 pub mod compaction_runner_state;
 pub mod compaction_source_revision;
@@ -163,7 +163,6 @@ pub mod thread;
 pub mod thread_agents_doc;
 pub mod thread_agents_doc_revision;
 pub mod thread_cli_runtime_binding;
-pub mod thread_episodic_capsules;
 pub mod thread_episodic_embedding_artifacts;
 pub mod thread_episodic_exclusions;
 pub mod thread_episodic_index_jobs;
@@ -215,3 +214,24 @@ pub mod workspace_membership;
 pub mod compaction_checkpoint_event_input;
 pub mod compaction_checkpoint_import;
 pub mod compaction_checkpoint_replay_alias;
+pub mod plugin_installation;
+
+pub mod portable_payload_dictionary;
+
+pub mod portable_payload;
+
+pub mod html_preview_io_work;
+pub mod portable_payload_block;
+
+pub mod plugin_default_prompt;
+pub mod plugin_keyword;
+pub mod task_child_reconcile_pending;
+pub mod task_child_reconcile_scope;
+
+pub mod agent_memory_payloads;
+pub mod execution_observation;
+pub mod execution_tariff;
+
+pub mod app_installation;
+pub mod package_component;
+pub mod package_installation;

@@ -12,6 +12,8 @@ pub struct Model {
     #[sea_orm(unique_key = "uidx_task_run_group_attempt")]
     pub task_id: String,
     pub trigger_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub trigger_input_json: Option<String>,
     pub parent_run_id: Option<String>,
     #[sea_orm(unique_key = "uidx_task_run_group_attempt")]
     pub run_group_id: String,

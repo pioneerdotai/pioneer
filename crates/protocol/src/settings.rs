@@ -102,8 +102,6 @@ pub struct GatewayGeneralSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preflight_model: Option<GatewayMemoryModelSelection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_catalog_proxy: Option<GatewayModelCatalogProxyUpdate>,
 }
 
@@ -210,10 +208,12 @@ pub struct GatewayVoiceInputRuntimeSnapshot {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayVoiceInputSettings {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_transcribe_while_recording")]
+    pub transcribe_while_recording: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<GatewayVoiceInputProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,10 +222,28 @@ pub struct GatewayVoiceInputSettings {
     pub runtime: GatewayVoiceInputRuntimeSnapshot,
 }
 
+const fn default_transcribe_while_recording() -> bool {
+    true
+}
+
+impl Default for GatewayVoiceInputSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            transcribe_while_recording: true,
+            provider: None,
+            model: None,
+            runtime: GatewayVoiceInputRuntimeSnapshot::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayVoiceInputSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcribe_while_recording: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Option<GatewayVoiceInputProvider>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,8 +266,6 @@ pub struct GatewayGeneralSettings {
     #[serde(default = "default_telemetry_enabled")]
     pub telemetry_enabled: bool,
     #[serde(default)]
-    pub preflight_model: GatewayMemoryModelSelection,
-    #[serde(default)]
     pub model_catalog: GatewayModelCatalogSettings,
 }
 
@@ -259,7 +275,6 @@ impl Default for GatewayGeneralSettings {
             compaction_model: Default::default(),
             keepawake: false,
             telemetry_enabled: default_telemetry_enabled(),
-            preflight_model: GatewayMemoryModelSelection::default(),
             model_catalog: GatewayModelCatalogSettings::default(),
         }
     }
@@ -272,8 +287,6 @@ const fn default_telemetry_enabled() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayMemorySettings {
     pub enabled: bool,
-    pub deterministic_recall_enabled: bool,
-    pub active_recall_enabled: bool,
     pub tools_enabled: bool,
     pub proactive_writes_enabled: bool,
     pub background_extraction_enabled: bool,
@@ -287,8 +300,6 @@ impl Default for GatewayMemorySettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            deterministic_recall_enabled: true,
-            active_recall_enabled: true,
             tools_enabled: true,
             proactive_writes_enabled: true,
             background_extraction_enabled: true,
@@ -354,7 +365,6 @@ pub struct GatewayThreadEpisodicSettings {
     pub max_hit_chars: u32,
     pub default_max_candidates: u32,
     pub max_candidate_work: u32,
-    pub max_segments: u32,
     pub min_relevancy: f32,
     pub min_results: u32,
     pub snippet_chars: u32,
@@ -362,7 +372,6 @@ pub struct GatewayThreadEpisodicSettings {
     pub retry_base_delay_secs: i64,
     pub retry_max_delay_secs: i64,
     pub max_attempts: i64,
-    pub near_capacity_percent: f64,
     #[serde(default)]
     pub vector_search: GatewayThreadEpisodicVectorSearchSettings,
 }
@@ -378,7 +387,6 @@ impl Default for GatewayThreadEpisodicSettings {
             max_hit_chars: 1_200,
             default_max_candidates: 32,
             max_candidate_work: 128,
-            max_segments: 16,
             min_relevancy: 0.25,
             min_results: 1,
             snippet_chars: 360,
@@ -386,7 +394,6 @@ impl Default for GatewayThreadEpisodicSettings {
             retry_base_delay_secs: 30,
             retry_max_delay_secs: 900,
             max_attempts: 5,
-            near_capacity_percent: 85.0,
             vector_search: GatewayThreadEpisodicVectorSearchSettings::default(),
         }
     }
@@ -445,6 +452,8 @@ pub enum GatewayThreadEpisodicVectorProvider {
     OpenAi,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "vercel-ai-gateway")]
+    VercelAiGateway,
     #[serde(rename = "local")]
     Local,
 }
@@ -689,6 +698,9 @@ impl Default for GatewayRemoteAccessTransport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayRemoteAccessStatusSnapshot {
+    /// Present only for the currently authenticated relay connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<crate::GatewayBaseUrl>,
     #[serde(default)]
     pub state: GatewayRemoteAccessState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -707,6 +719,7 @@ pub struct GatewayRemoteAccessStatusChangedNotification {
 impl Default for GatewayRemoteAccessStatusSnapshot {
     fn default() -> Self {
         Self {
+            public_base_url: None,
             state: GatewayRemoteAccessState::Disabled,
             error_kind: None,
             message: None,
@@ -780,8 +793,6 @@ pub struct GatewayThreadEpisodicSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_candidate_work: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_segments: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_relevancy: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_results: Option<u32>,
@@ -795,8 +806,6 @@ pub struct GatewayThreadEpisodicSettingsUpdate {
     pub retry_max_delay_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_attempts: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub near_capacity_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_search: Option<GatewayThreadEpisodicVectorSearchSettingsUpdate>,
 }
@@ -902,12 +911,12 @@ fn normalized_optional_model_selection_text(value: Option<&str>, max_len: usize)
 mod tests {
     use super::{
         GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
-        GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemorySettings,
-        GatewayRemoteAccessSettings, GatewaySelfImprovementModelSelection,
-        GatewaySelfImprovementSettings, GatewaySettingsSnapshot, GatewaySettingsUpdate,
-        GatewayThreadEpisodicSettings, GatewayThreadEpisodicSettingsUpdate,
-        GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
-        GatewayThreadEpisodicVectorProviderKeyStatus, GatewayThreadEpisodicVectorRefillStatus,
+        GatewayGeneralSettingsUpdate, GatewayMemorySettings, GatewayRemoteAccessSettings,
+        GatewaySelfImprovementModelSelection, GatewaySelfImprovementSettings,
+        GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewayThreadEpisodicSettings,
+        GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
+        GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorProviderKeyStatus,
+        GatewayThreadEpisodicVectorRefillStatus,
         GatewayThreadEpisodicVectorRefillStatusChangedNotification,
         GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
         GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot,
@@ -918,7 +927,10 @@ mod tests {
 
     #[test]
     fn general_settings_publish_only_supported_controls() {
-        let value = serde_json::to_value(GatewayGeneralSettings::default()).unwrap();
+        let settings = GatewayGeneralSettings::default();
+        assert!(!settings.keepawake);
+        assert!(settings.telemetry_enabled);
+        let value = serde_json::to_value(settings).unwrap();
         let keys: std::collections::BTreeSet<_> = value
             .as_object()
             .unwrap()
@@ -931,7 +943,6 @@ mod tests {
                 "compaction_model",
                 "keepawake",
                 "telemetry_enabled",
-                "preflight_model",
                 "model_catalog"
             ])
         );
@@ -940,15 +951,6 @@ mod tests {
         )
         .unwrap();
         assert!(update.compaction_model.is_some());
-    }
-
-    #[test]
-    fn settings_general_defaults_to_thread_preflight_model() {
-        let settings = GatewayGeneralSettings::default();
-
-        assert!(!settings.keepawake);
-        assert!(settings.telemetry_enabled);
-        assert!(settings.preflight_model.is_thread_model());
     }
 
     #[test]
@@ -1047,30 +1049,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_general_update_roundtrips_preflight_model() {
-        let update = GatewayGeneralSettingsUpdate {
-            compaction_model: None,
-            keepawake: Some(true),
-            telemetry_enabled: Some(false),
-            preflight_model: Some(GatewayMemoryModelSelection::custom(
-                "planner-provider",
-                "planner-model",
-            )),
-            model_catalog_proxy: None,
-        };
-
-        let serialized = serde_json::to_string(&update).expect("settings update should serialize");
-        assert!(serialized.contains("preflight_model"));
-        assert!(serialized.contains("telemetry_enabled"));
-        assert!(serialized.contains("planner-provider"));
-        assert!(serialized.contains("planner-model"));
-
-        let roundtrip: GatewayGeneralSettingsUpdate =
-            serde_json::from_str(serialized.as_str()).expect("settings update should deserialize");
-        assert_eq!(roundtrip, update);
-    }
-
-    #[test]
     fn model_catalog_proxy_update_is_explicit_and_snapshot_never_requires_a_secret() {
         let update = GatewayGeneralSettingsUpdate {
             model_catalog_proxy: Some(super::GatewayModelCatalogProxyUpdate {
@@ -1131,7 +1109,6 @@ mod tests {
                 max_hit_chars: 800,
                 default_max_candidates: 24,
                 max_candidate_work: 96,
-                max_segments: 8,
                 min_relevancy: 0.3,
                 min_results: 2,
                 snippet_chars: 280,
@@ -1139,7 +1116,6 @@ mod tests {
                 retry_base_delay_secs: 10,
                 retry_max_delay_secs: 300,
                 max_attempts: 3,
-                near_capacity_percent: 85.0,
                 vector_search: GatewayThreadEpisodicVectorSearchSettings::default(),
             },
             cli_runtimes: GatewayCliRuntimeSettings {
@@ -1245,6 +1221,10 @@ mod tests {
             (
                 GatewayThreadEpisodicVectorProvider::OpenRouter,
                 "openai/text-embedding-3-small",
+            ),
+            (
+                GatewayThreadEpisodicVectorProvider::VercelAiGateway,
+                "private/team-embedding",
             ),
         ] {
             let settings = GatewayThreadEpisodicVectorSearchSettings {
@@ -1410,6 +1390,7 @@ mod tests {
 
         assert_eq!(snapshot.voice_input, GatewayVoiceInputSettings::default());
         assert!(!snapshot.voice_input.enabled);
+        assert!(snapshot.voice_input.transcribe_while_recording);
         assert_eq!(snapshot.voice_input.provider, None);
         assert_eq!(snapshot.voice_input.model, None);
         assert_eq!(
@@ -1423,6 +1404,7 @@ mod tests {
     fn voice_input_settings_and_update_roundtrip_without_artifact_metadata() {
         let settings = GatewayVoiceInputSettings {
             enabled: true,
+            transcribe_while_recording: false,
             provider: Some(GatewayVoiceInputProvider::Local),
             model: Some("parakeet-tdt-0.6b-v3".to_owned()),
             runtime: GatewayVoiceInputRuntimeSnapshot {
@@ -1446,6 +1428,7 @@ mod tests {
 
         let update = GatewayVoiceInputSettingsUpdate {
             enabled: Some(true),
+            transcribe_while_recording: Some(false),
             provider: Some(Some(GatewayVoiceInputProvider::Local)),
             model: Some(Some("parakeet-tdt-0.6b-v3".to_owned())),
             retry_install: true,
@@ -1459,6 +1442,25 @@ mod tests {
         let default_update = serde_json::to_value(GatewayVoiceInputSettingsUpdate::default())
             .expect("default voice update should serialize");
         assert!(default_update.get("retry_install").is_none());
+        assert!(default_update.get("transcribe_while_recording").is_none());
+    }
+
+    #[test]
+    fn voice_mode_omission_defaults_incremental_but_update_omission_is_not_a_reset() {
+        let settings: GatewayVoiceInputSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "provider": "local",
+            "model": "small"
+        }))
+        .unwrap();
+        assert!(settings.transcribe_while_recording);
+        let partial: GatewayVoiceInputSettingsUpdate =
+            serde_json::from_value(serde_json::json!({"model":"moonshine-base"})).unwrap();
+        assert_eq!(partial.transcribe_while_recording, None);
+        let explicit: GatewayVoiceInputSettingsUpdate =
+            serde_json::from_value(serde_json::json!({"transcribe_while_recording": false}))
+                .unwrap();
+        assert_eq!(explicit.transcribe_while_recording, Some(false));
     }
 
     #[test]

@@ -94,10 +94,12 @@ pub(crate) fn authorize_route(
         // identity. Their creation execution remains audit provenance, not a
         // bearer fence that would make the route unusable by the next
         // occurrence of that same pinned identity.
-        AgentRouteKind::IdentityBound => {}
+        AgentRouteKind::IdentityBound | AgentRouteKind::CapsuleBound => {}
         AgentRouteKind::ExecutionBound => {}
     }
-    if route.source_identity_id.as_ref() != Some(&request.source.identity_id) {
+    if route.kind != AgentRouteKind::CapsuleBound
+        && route.source_identity_id.as_ref() != Some(&request.source.identity_id)
+    {
         return Err(RouteDenyReason::IdentityConstraint);
     }
     if let Some(identity) = request.requested_identity
@@ -277,20 +279,54 @@ mod tests {
     }
 
     #[test]
-    fn cross_capsule_route_accepts_an_authorized_same_workspace_edge() {
-        let source = envelope();
+    fn capsule_route_rebinds_across_execution_and_identity_without_widening_authority() {
+        let mut source = envelope();
+        source.identity_id = AgentIdentityId::new("A12345678901234567891").unwrap();
+        let execution = AgentExecutionId::new("E12345678901234567891").unwrap();
         let mut route = route();
-        route.same_capsule = false;
-        let execution_id = AgentExecutionId::new("E12345678901234567890").unwrap();
+        route.kind = AgentRouteKind::CapsuleBound;
         let target = AgentStartTarget::RoutedThread {
-            route_id: pioneer_protocol::AgentDelegationRouteId::new("R12345678901234567890")
+            route_id: pioneer_protocol::AgentDelegationRouteId::new(route.route_id.clone())
                 .unwrap(),
-            thread_id: "T12345678901234567891".to_owned(),
+            thread_id: route.destination_thread_id.clone(),
         };
-        // Composite route authorization accepts a same-workspace
-        // cross-capsule edge and the commit boundary revalidates its durable
-        // policy and route generations.
-        assert!(authorize_route(&request(&route, &source, &execution_id, &target)).is_ok());
+        assert!(authorize_route(&request(&route, &source, &execution, &target)).is_ok());
+        for old_kind in [
+            AgentRouteKind::ExecutionBound,
+            AgentRouteKind::IdentityBound,
+        ] {
+            let mut old = route.clone();
+            old.kind = old_kind;
+            assert!(authorize_route(&request(&old, &source, &execution, &target)).is_err());
+        }
+        let mut foreign = source.clone();
+        foreign.root_capsule_id = route.destination_capsule_id.clone();
+        assert!(authorize_route(&request(&route, &foreign, &execution, &target)).is_err());
+        let wrong_target = AgentStartTarget::RoutedThread {
+            route_id: pioneer_protocol::AgentDelegationRouteId::new(route.route_id.clone())
+                .unwrap(),
+            thread_id: source.root_capsule_id.clone(),
+        };
+        assert_eq!(
+            authorize_route(&request(&route, &source, &execution, &wrong_target)),
+            Err(RouteDenyReason::TargetMismatch)
+        );
+        let mut denied = request(&route, &source, &execution, &target);
+        denied.source_export_allowed = false;
+        assert_eq!(authorize_route(&denied), Err(RouteDenyReason::SourceExport));
+        denied = request(&route, &source, &execution, &target);
+        denied.disclosure_allowed = false;
+        assert_eq!(authorize_route(&denied), Err(RouteDenyReason::Disclosure));
+        denied = request(&route, &source, &execution, &target);
+        denied.source_policy_generation = 2;
+        assert_eq!(authorize_route(&denied), Err(RouteDenyReason::Generation));
+        route.active = false;
+        assert!(authorize_route(&request(&route, &source, &execution, &target)).is_err());
+        route.active = true;
+        route.expires_at_millis = Some(10);
+        let mut expired = request(&route, &source, &execution, &target);
+        expired.now_millis = Some(10);
+        assert!(authorize_route(&expired).is_err());
     }
 
     #[test]

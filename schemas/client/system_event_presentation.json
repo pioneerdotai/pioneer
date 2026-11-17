@@ -111,6 +111,7 @@
             "RecoveryAttached",
             "RetryScheduled",
             "RetryStarted",
+            "CodexRequestRetried",
             "RecoverySucceeded",
             "RecoveryFailed",
             "ToolLoopBudgetExceeded"

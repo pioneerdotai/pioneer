@@ -112,6 +112,7 @@ struct BridgeState {
     handle: Option<CliMcpBridgeFacadeHandle>,
     active: Option<(String, CliMcpActivationGeneration)>,
     failed: bool,
+    stop_result: Option<std::result::Result<(), String>>,
 }
 
 /// One transport projection of the existing supervisor/coordinator. ACP does
@@ -126,7 +127,7 @@ pub(crate) struct AcpMcpBridge {
     identity: AcpMcpSessionLaunchProjection,
     state: Arc<Mutex<BridgeState>>,
     cancellation: CancellationToken,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<Option<JoinHandle<std::result::Result<(), String>>>>,
 }
 
 impl AcpMcpBridge {
@@ -157,7 +158,7 @@ impl AcpMcpBridge {
         {
             Ok(value) => value,
             Err(error) => {
-                supervisor.revoke_session(&instance).await;
+                supervisor.revoke_session_result(&instance).await?;
                 anyhow::bail!("cannot stage ACP MCP projection: {error:?}");
             }
         };
@@ -205,40 +206,33 @@ impl AcpMcpBridge {
         anyhow::ensure!(owner.is_none(), "ACP MCP server already started");
         *owner = Some(tokio::spawn(async move {
             let serving = async {
-                supervisor
-                    .await_attach(&instance, Duration::from_secs(24 * 60 * 60))
-                    .await?;
+                tokio::select! {
+                    result = supervisor.await_attach(&instance, Duration::from_secs(24 * 60 * 60)) => { result?; },
+                    _ = cancellation.cancelled() => return Ok::<_, anyhow::Error>(()),
+                }
                 let transport = supervisor.take_transport(&instance).await?;
                 let (handle, server) = CliMcpBridgeFacadeServer::build(
-                    transport,
-                    supervisor.coordinator(),
-                    invoker,
-                    generation,
-                    projection,
-                    limits.facade_limits(),
-                )
-                .map_err(|e| anyhow::anyhow!("ACP MCP facade: {e}"))?;
+                    transport, supervisor.coordinator(), invoker, generation,
+                    projection, limits.facade_limits(),
+                    super::mcp::facade::CliMcpCallContract::Acp,
+                ).map_err(|error| anyhow::anyhow!("ACP MCP facade: {error}"))?;
                 {
                     let mut state = state.lock().await;
-                    handle
-                        .set_activation(state.active.as_ref().map(|(_, generation)| *generation))
-                        .await;
+                    handle.set_activation(state.active.as_ref().map(|(_, generation)| *generation)).await;
                     state.handle = Some(handle);
                 }
-                server.run().await.map_err(anyhow::Error::new)
-            };
-            tokio::select! {
-                _ = cancellation.cancelled() => {},
-                result = serving => {
-                    state.lock().await.failed = true;
-                    if result.is_err() {
-                        tracing::warn!(generation = instance.generation(), "ACP managed MCP facade stopped with an error");
+                let running = server.run();
+                tokio::pin!(running);
+                tokio::select! {
+                    result = &mut running => result.map_err(anyhow::Error::new),
+                    _ = cancellation.cancelled() => {
+                        if let Some(handle) = state.lock().await.handle.as_ref() { handle.request_shutdown(); }
+                        running.await.map_err(anyhow::Error::new)
                     }
                 }
-            }
-            // Drop cancellation must revoke the helper/grant too, even when
-            // the session owner cannot complete its ordinary async close.
-            supervisor.revoke_session(&instance).await;
+            }.await;
+            state.lock().await.failed = true;
+            serving.map_err(|error| format!("{error:#}"))
         }));
         Ok(())
     }
@@ -317,12 +311,39 @@ impl AcpMcpBridge {
         Ok(())
     }
 
-    pub(crate) async fn close(&self) {
+    pub(crate) fn request_stop(&self) {
         self.cancellation.cancel();
-        self.supervisor.revoke_session(&self.instance).await;
-        if let Some(worker) = self.worker.lock().await.take() {
-            let _ = worker.await;
+    }
+
+    pub(crate) async fn close(&self) -> Result<()> {
+        self.request_stop();
+        let mut worker = self.worker.lock().await;
+        let outcome = if let Some(task) = worker.as_mut() {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(error) => Err(format!("ACP MCP facade worker failed: {error}")),
+            };
+            worker.take();
+            self.state.lock().await.stop_result = Some(result.clone());
+            result
+        } else {
+            self.state
+                .lock()
+                .await
+                .stop_result
+                .clone()
+                .unwrap_or(Ok(()))
+        };
+        outcome.map_err(anyhow::Error::msg)?;
+        if !self
+            .supervisor
+            .revoke_session_result(&self.instance)
+            .await?
+            && !self.launch.cleanup_confirmed()
+        {
+            anyhow::bail!("ACP MCP cleanup owner is unknown");
         }
+        Ok(())
     }
 }
 

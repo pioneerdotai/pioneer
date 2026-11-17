@@ -2,6 +2,41 @@ use super::*;
 use crate::authorization::AuthorizationExternalError;
 
 impl MessageProcessor {
+    /// Raw discovery for execution-bound launch catalogs and saved profile lookups.
+    pub(super) async fn provider_models_catalog(
+        &self,
+        workspace_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<Vec<ProviderModelInfo>> {
+        let provider = self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id, provider_id)?;
+        Ok(provider
+            .list_models()
+            .await?
+            .into_iter()
+            .map(provider_model_info_to_protocol)
+            .collect())
+    }
+
+    /// Selectable API chat models. Execution-bound profile lookups continue to
+    /// use provider_models_catalog so saved selections remain executable.
+    pub(super) async fn provider_chat_models_for_selection(
+        &self,
+        workspace_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<Vec<ProviderModelInfo>> {
+        let provider = self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id, provider_id)?;
+        Ok(provider
+            .list_models_for_selection(pioneer_provider::selection::ModelPurpose::Chat)
+            .await?
+            .into_iter()
+            .map(provider_model_info_to_protocol)
+            .collect())
+    }
+
     pub(super) async fn provider_list(
         &self,
         request_context: &RequestContext,
@@ -282,31 +317,15 @@ impl MessageProcessor {
             return;
         }
 
-        let provider = match self
-            .provider_registry
-            .get_or_create_for_workspace(workspace_id.as_str(), &params.provider)
+        // Picker policy must not narrow the execution-bound catalog used by
+        // saved launch profiles. Keep that raw discovery method unchanged.
+        match self
+            .provider_chat_models_for_selection(workspace_id.as_str(), &params.provider)
+            .await
         {
-            Ok(p) => p,
-            Err(error) => {
-                let message = if member {
-                    "provider model catalog is unavailable".to_owned()
-                } else {
-                    format!("failed to create provider `{}`: {error:#}", params.provider)
-                };
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-                )
-                .await;
-                return;
-            }
-        };
-
-        match provider.list_models().await {
             Ok(models) => {
                 let protocol_models = models
                     .into_iter()
-                    .map(provider_model_info_to_protocol)
                     .filter(|model| {
                         crate::authorization::AuthorizationService::new().provider_model_allowed(
                             request_context.principal().kind,
@@ -446,7 +465,10 @@ impl MessageProcessor {
             }
         };
 
-        match provider.list_embedding_models().await {
+        match provider
+            .list_models_for_selection(pioneer_provider::selection::ModelPurpose::Embeddings)
+            .await
+        {
             Ok(models) => {
                 let result = ProviderListModelsResponse {
                     provider: params.provider.clone(),
@@ -589,7 +611,10 @@ impl MessageProcessor {
             }
         };
 
-        match provider.list_transcription_models().await {
+        match provider
+            .list_models_for_selection(pioneer_provider::selection::ModelPurpose::Transcription)
+            .await
+        {
             Ok(models) => {
                 let result = ProviderListModelsResponse {
                     provider: params.provider.clone(),
@@ -1439,6 +1464,9 @@ impl MessageProcessor {
 
 fn provider_model_info_to_protocol(m: ProviderModelInfo) -> ProviderModelInfo {
     ProviderModelInfo {
+        service_modes: m.service_modes,
+        context_authority: m.context_authority,
+        context_tiers: m.context_tiers,
         id: m.id,
         name: m.name,
         description: m.description,
@@ -1451,6 +1479,8 @@ fn provider_model_info_to_protocol(m: ProviderModelInfo) -> ProviderModelInfo {
             context_window: m.limits.context_window,
         },
         capabilities: ProviderModelCapabilities {
+            chat: m.capabilities.chat,
+            chat_operation: m.capabilities.chat_operation,
             vision: m.capabilities.vision,
             tool_calling: m.capabilities.tool_calling,
             json_output: m.capabilities.json_output,
@@ -1499,6 +1529,58 @@ mod tests {
     use pioneer_protocol::{
         ArtifactBindingDirection, ArtifactBindingKind, ArtifactKind, ArtifactRole,
     };
+
+    #[test]
+    fn model_catalog_response_preserves_execution_choices() {
+        // These fields are consumed together by the model picker: losing the
+        // authority disables choices; losing the lists hides their controls.
+        let model: ProviderModelInfo = serde_json::from_value(serde_json::json!({
+            "id": "gpt-6.1-sol",
+            "provider": "openai",
+            "limits": {"context_window": 1050000},
+            "capabilities": {"chat": true},
+            "context_authority": "workspace-model-authority",
+            "context_tiers": {
+                "status": "tiered",
+                "windows": [272000, 1050000],
+                "price_order_confirmed": true
+            },
+            "service_modes": {
+                "status": "known",
+                "modes": {
+                    "priority": {
+                        "status": "parsed",
+                        "descriptor": {
+                            "id": "priority",
+                            "label": "Priority",
+                            "parameters": {"kind": "open_ai_tier", "tier": "priority"},
+                            "source_provider": "openai",
+                            "source_model": "gpt-6.1-sol",
+                            "source_api": "openai-responses"
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("model discovery fixture");
+        let response = ProviderListModelsResponse {
+            provider: "openai".into(),
+            models: vec![provider_model_info_to_protocol(model)],
+        };
+        let wire = serde_json::to_value(response).expect("serialize model catalog response");
+        let model = &wire["models"][0];
+        assert_eq!(model["context_authority"], "workspace-model-authority");
+        assert_eq!(model["context_tiers"]["status"], "tiered");
+        assert_eq!(
+            model["context_tiers"]["windows"],
+            serde_json::json!([272000, 1050000])
+        );
+        assert_eq!(model["context_tiers"]["price_order_confirmed"], true);
+        assert_eq!(
+            model["service_modes"]["modes"]["priority"]["descriptor"]["parameters"],
+            serde_json::json!({"kind": "open_ai_tier", "tier": "priority"})
+        );
+    }
 
     fn history_artifact_ref(role: ArtifactRole) -> ConversationArtifactRef {
         ConversationArtifactRef {

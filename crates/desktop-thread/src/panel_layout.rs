@@ -8,6 +8,7 @@ use gpui_kit::{prelude::*, *};
 pub(crate) enum ThreadPanelKind {
     Artifacts,
     Members,
+    App,
 }
 
 pub(crate) struct ThreadPanelOpened(pub ThreadPanelKind);
@@ -16,6 +17,10 @@ pub(crate) struct ThreadPanelLayoutStore {
     selected: ThreadPanelKind,
     open: bool,
     width: Pixels,
+    app: Option<AnyView>,
+    bottom_app: Option<AnyView>,
+    app_height: Pixels,
+    previous: Option<(ThreadPanelKind, bool)>,
 }
 
 impl Default for ThreadPanelLayoutStore {
@@ -24,6 +29,10 @@ impl Default for ThreadPanelLayoutStore {
             selected: ThreadPanelKind::Artifacts,
             open: false,
             width: px(340.),
+            app: None,
+            bottom_app: None,
+            app_height: px(320.),
+            previous: None,
         }
     }
 }
@@ -61,6 +70,59 @@ impl ThreadPanelLayoutStore {
         layout
     }
 
+    pub(crate) fn existing_width(window: &Window, cx: &App) -> Pixels {
+        if !cx.has_global::<WindowPanelLayouts>() {
+            return px(340.);
+        }
+        cx.global::<WindowPanelLayouts>()
+            .layouts
+            .get(&window.window_handle().window_id())
+            .map(|layout| layout.read(cx).width())
+            .unwrap_or(px(340.))
+    }
+    pub(crate) fn bottom_app(&self) -> Option<AnyView> {
+        self.bottom_app.clone()
+    }
+    pub(crate) fn app_height(&self) -> Pixels {
+        self.app_height
+    }
+    pub(crate) fn set_bottom_app(
+        &mut self,
+        app: Option<AnyView>,
+        height: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        self.bottom_app = app;
+        self.app_height = height.clamp(px(180.), px(1200.));
+        cx.notify();
+    }
+    pub(crate) fn resize_app(&mut self, height: Pixels, cx: &mut Context<Self>) {
+        let height = height.clamp(px(180.), px(1200.));
+        if self.app_height != height {
+            self.app_height = height;
+            cx.notify();
+        }
+    }
+    pub(crate) fn app(&self) -> Option<AnyView> {
+        self.app.clone()
+    }
+    pub(crate) fn set_app(&mut self, app: Option<AnyView>, cx: &mut Context<Self>) {
+        if app.is_some() {
+            if self.app.is_none() {
+                self.previous = Some((self.selected, self.open));
+            }
+            self.app = app;
+            self.selected = ThreadPanelKind::App;
+            self.open = true;
+        } else {
+            self.app = None;
+            if let Some((selected, open)) = self.previous.take() {
+                self.selected = selected;
+                self.open = open;
+            }
+        }
+        cx.notify();
+    }
     pub(crate) fn selected(&self) -> ThreadPanelKind {
         self.selected
     }
@@ -105,7 +167,10 @@ impl ThreadPanelLayoutStore {
     }
 }
 
-actions!(thread_panels, [ToggleThreadArtifacts, ToggleThreadMembers]);
+actions!(
+    thread_panels,
+    [ToggleThreadArtifacts, ToggleThreadMembers, ToggleThreadApp]
+);
 
 /// Owns its action/focus region and retained observation. Shell mounts this
 /// opaque child; it never reads panel layout to paint selected buttons.
@@ -133,6 +198,13 @@ impl ThreadPanelControlsView {
             layout.toggle(ThreadPanelKind::Artifacts, cx)
         });
     }
+    fn toggle_app(&mut self, _: &ToggleThreadApp, _: &mut Window, cx: &mut Context<Self>) {
+        self.layout.update(cx, |layout, cx| {
+            if layout.app.is_some() {
+                layout.toggle(ThreadPanelKind::App, cx);
+            }
+        });
+    }
     fn toggle_members(&mut self, _: &ToggleThreadMembers, _: &mut Window, cx: &mut Context<Self>) {
         self.layout
             .update(cx, |layout, cx| layout.toggle(ThreadPanelKind::Members, cx));
@@ -144,6 +216,8 @@ impl Render for ThreadPanelControlsView {
         let layout = self.layout.read(cx);
         let artifacts = layout.is_visible(ThreadPanelKind::Artifacts);
         let members = layout.is_visible(ThreadPanelKind::Members);
+        let app = layout.app.is_some();
+        let app_visible = layout.is_visible(ThreadPanelKind::App);
         h_flex()
             .items_center()
             .gap_1()
@@ -151,6 +225,26 @@ impl Render for ThreadPanelControlsView {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::toggle_artifacts))
             .on_action(cx.listener(Self::toggle_members))
+            .on_action(cx.listener(Self::toggle_app))
+            .when(app, |bar| {
+                bar.child(
+                    Button::new("bottom-bar-toggle-app-sidebar")
+                        .ghost()
+                        .small()
+                        .compact()
+                        .tooltip(t!("apps.view").to_string())
+                        .accessibility_label(t!("apps.view").to_string())
+                        .child(
+                            Icon::new(PioneerIconName::Plugin)
+                                .size_3p5()
+                                .opacity(if app_visible { 1.0 } else { 0.6 }),
+                        )
+                        .on_click({
+                            let focus = self.focus.clone();
+                            move |_, window, cx| focus.dispatch_action(&ToggleThreadApp, window, cx)
+                        }),
+                )
+            })
             .child(
                 Button::new("bottom-bar-toggle-thread-members-sidebar")
                     .ghost()
@@ -341,5 +435,45 @@ mod tests {
         assert!(layout.select(ThreadPanelKind::Artifacts, false));
         assert_eq!(layout.selected(), ThreadPanelKind::Artifacts);
         assert_eq!(layout.width(), px(412.));
+    }
+
+    #[gpui_kit::test]
+    fn app_moves_between_bottom_and_existing_sidebar_and_restores_the_previous_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let layout = cx.new(|_| ThreadPanelLayoutStore::default());
+        let content = cx.new(|cx| ThreadPanelControlsView::new(layout.clone(), cx));
+        let app: gpui_kit::AnyView = content.into();
+        let identity = app.entity_id();
+        layout.update(cx, |layout, cx| {
+            layout.open(ThreadPanelKind::Members, cx);
+            layout.resize(px(412.), cx);
+            layout.set_bottom_app(Some(app.clone()), px(288.), cx);
+        });
+        layout.read_with(cx, |layout, _| {
+            assert!(layout.is_visible(ThreadPanelKind::Members));
+            assert_eq!(layout.bottom_app().unwrap().entity_id(), identity);
+        });
+        layout.update(cx, |layout, cx| {
+            layout.set_bottom_app(None, px(288.), cx);
+            layout.set_app(Some(app.clone()), cx);
+        });
+        layout.read_with(cx, |layout, _| {
+            assert!(layout.is_visible(ThreadPanelKind::App));
+            assert_eq!(layout.app().unwrap().entity_id(), identity);
+            assert_eq!(layout.width(), px(412.));
+        });
+        layout.update(cx, |layout, cx| {
+            layout.set_app(None, cx);
+            layout.set_bottom_app(Some(app), px(288.), cx);
+        });
+        layout.read_with(cx, |layout, _| {
+            assert!(layout.is_visible(ThreadPanelKind::Members));
+            assert_eq!(layout.width(), px(412.));
+            assert_eq!(layout.bottom_app().unwrap().entity_id(), identity);
+            assert_eq!(layout.app_height(), px(288.));
+        });
+        layout.update(cx, |layout, cx| layout.set_bottom_app(None, px(288.), cx));
+        assert!(layout.read_with(cx, |layout, _| layout.bottom_app().is_none()));
     }
 }

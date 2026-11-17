@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnAppCapabilitySummary",
+  "type": "object",
+  "properties": {
+    "appId": {
+      "type": "string"
+    },
+    "darkIcon": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ImageReference"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "expectedRevision": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "icon": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ImageReference"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "label": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "appId",
+    "expectedRevision",
+    "label"
+  ],
+  "$defs": {
+    "ImageReference": {
+      "description": "Immutable image reference. Published paths are authenticated Gateway storage links.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision"
+      ]
+    }
+  }
+}

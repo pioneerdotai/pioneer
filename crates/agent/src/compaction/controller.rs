@@ -2,7 +2,7 @@
 //! transports; the agent retains the actual request receipt and measured input.
 use anyhow::Result;
 use async_trait::async_trait;
-use pioneer_compaction::{RequestIdentity, SourceRef};
+use pioneer_compaction::{InputEstimate, RequestIdentity, SourceRef};
 use pioneer_provider::{ChatRequest, Provider, TokenUsage};
 use pioneer_runtime_events::ExecutionEventHub;
 use sha2::{Digest, Sha256};
@@ -11,6 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct NativeContext {
+    pub context_budget: Option<pioneer_protocol::NativeContextBudget>,
+    pub summary_context: Option<pioneer_protocol::NativeSummaryContext>,
     pub overflow_recovery: bool,
     pub recovery_deadline_ms: Option<u64>,
     pub workspace_id: String,
@@ -44,13 +46,28 @@ impl NativeInputReceipt {
         };
         let instructions_hash = digest(&serde_json::json!({
             "system_sections": request.compiled_prompt.as_ref().map(|v|v.system_sections()),
+            // This is request-level provider context, omitted from per-message
+            // append estimates. Replacing it invalidates an otherwise exact
+            // message-prefix anchor rather than silently charging only the tail.
+            "native_prefix_context": request.messages.iter().rev()
+                .filter_map(|message| message.provider_replay_state.as_ref())
+                .find_map(|state| state.payload.get("prefix_context")),
         }))?;
-        let tools_hash = digest(&serde_json::json!({
+        let mut request_options = serde_json::json!({
             "tools": request.tools, "tool_choice": request.tool_choice,
             "parallel_tool_calls": request.parallel_tool_calls,
             "reasoning": request.reasoning.map(|v|format!("{v:?}")),
             "output_cap": request.max_tokens, "temperature": request.temperature,
-        }))?;
+        });
+        if let Some(declarations) =
+            pioneer_provider::tool_declarations::ToolDeclarations::for_request(request)
+        {
+            request_options["tool_declarations"] = declarations.projection_identity();
+        }
+        if let Some(plan) = &request.service_mode {
+            request_options["service_mode"] = serde_json::to_value(plan)?;
+        }
+        let tools_hash = digest(&request_options)?;
         let messages = request
             .messages
             .iter()
@@ -97,6 +114,19 @@ impl NativeInputReceipt {
         local_messages: &[u64],
         measured: Option<&NativeUsageMeasurement>,
     ) -> Result<u64> {
+        Ok(self
+            .calibrated_estimate(local_complete, local_messages, measured)?
+            .total())
+    }
+
+    /// The receipt covers normalized provider input only. Its generated answer
+    /// and subsequent tool results are unmeasured additions to this exact prefix.
+    pub fn calibrated_estimate(
+        &self,
+        local_complete: u64,
+        local_messages: &[u64],
+        measured: Option<&NativeUsageMeasurement>,
+    ) -> Result<InputEstimate> {
         anyhow::ensure!(
             local_messages.len() == self.messages.len(),
             "missing message estimates"
@@ -104,12 +134,15 @@ impl NativeInputReceipt {
         let Some(measured) = measured.filter(|m| {
             self.identity == m.receipt.identity && self.messages.starts_with(&m.receipt.messages)
         }) else {
-            return Ok(local_complete);
+            return Ok(InputEstimate::local(local_complete));
         };
         let appended = local_messages[measured.receipt.messages.len()..]
             .iter()
             .fold(0_u64, |sum, value| sum.saturating_add(*value));
-        Ok(local_complete.max(measured.input_tokens.saturating_add(appended)))
+        Ok(InputEstimate {
+            measured: measured.input_tokens,
+            estimated: appended,
+        })
     }
 }
 
@@ -196,9 +229,19 @@ impl NativeContextSession {
             .lock()
             .map_err(|_| anyhow::anyhow!("native usage state unavailable"))?
             .clone();
-        let prepare = self
-            .controller
-            .prepare(&self.context, request, measurement, recovery);
+        let operation = pioneer_protocol::generate_id(21);
+        let started = chrono::Utc::now();
+        let mono = std::time::Instant::now();
+        let start_clock = pioneer_observability::work::clock_ms().checked_mul(1_000_000);
+        let prepare = async {
+            publish_preparation(&self.context, &operation, started, start_clock, None).await?;
+            pioneer_provider::usage::scope_causal_parent(
+                format!("item:{}:{operation}", self.context.turn_id),
+                self.controller
+                    .prepare(&self.context, request, measurement, recovery),
+            )
+            .await
+        };
         let work = async {
             if recovery {
                 let deadline = self.recovery_deadline.expect("validated recovery deadline");
@@ -218,8 +261,25 @@ impl NativeContextSession {
         let prepared = tokio::select! { biased;
             _ = self.context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
             result = work => result,
-        }?;
-        Ok(prepared)
+        };
+        // A diagnostic terminal failure cannot repair the operation by running
+        // a paid compaction again. Its acknowledged start remains unconfirmed.
+        let settlement = publish_preparation(
+            &self.context,
+            &operation,
+            started,
+            start_clock,
+            Some((prepared.is_ok(), mono.elapsed())),
+        );
+        tokio::select! { biased;
+            _ = self.context.cancellation.cancelled() => {},
+            _ = async {
+                if recovery {
+                    let _ = tokio::time::timeout_at(self.recovery_deadline.expect("validated recovery deadline"), settlement).await;
+                } else { let _ = settlement.await; }
+            } => {},
+        }
+        prepared
     }
     pub fn provider_deadline(&self) -> Option<tokio::time::Instant> {
         self.recovery_active
@@ -253,6 +313,59 @@ impl NativeContextSession {
     }
 }
 
+async fn publish_preparation(
+    context: &NativeContext,
+    id: &str,
+    started: chrono::DateTime<chrono::Utc>,
+    start_clock: Option<u64>,
+    finished: Option<(bool, std::time::Duration)>,
+) -> Result<()> {
+    use pioneer_protocol::{
+        AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, SystemEventLevel,
+        TurnItem,
+    };
+    let item = TurnItem::SystemEvent {
+        id: id.into(),
+        level: SystemEventLevel::Info,
+        message: "Native context preparation".into(),
+        code: Some("runtime_operation".into()),
+        details: Some(
+            serde_json::json!({"operation_kind":"context_preparation","status":finished.map(|(ok,_)|if ok{"completed"}else{"failed"}).unwrap_or("started"),
+            "source_observation":pioneer_provider::usage::observation_point(),
+            "timing":{"prepared_at":started,"prepared_mono_ns":start_clock,"process_run_id":pioneer_observability::identity::run_identity().run_id,
+                "clock_domain":"observability_work_clock_v1","clock_resolution_ns":1_000_000,
+                "observation_finished_at":finished.map(|_|chrono::Utc::now()),
+                "observation_finished_mono_ns":finished.and_then(|_|pioneer_observability::work::clock_ms().checked_mul(1_000_000)),
+                "elapsed_ns":finished.map(|(_,duration)|duration.as_nanos().min(i64::MAX as u128) as i64),
+                "basis":"context_preparation_scope_including_initial_durable_ack"}}),
+        ),
+    };
+    let event = if finished.is_some() {
+        AgentDurableEvent::ItemCompleted {
+            notification: ItemCompletedNotification {
+                workspace_id: context.workspace_id.clone(),
+                thread_id: context.thread_id.clone(),
+                turn_id: context.turn_id.clone(),
+                item,
+            },
+        }
+    } else {
+        AgentDurableEvent::ItemStarted {
+            notification: ItemStartedNotification {
+                workspace_id: context.workspace_id.clone(),
+                thread_id: context.thread_id.clone(),
+                turn_id: context.turn_id.clone(),
+                item,
+            },
+        }
+    };
+    context
+        .events
+        .publish_durable_and_wait(event)
+        .await
+        .map_err(|_| anyhow::anyhow!("context preparation observation commit unconfirmed"))
+}
+
 impl std::fmt::Debug for NativeContextSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeContextSession")
@@ -266,6 +379,8 @@ mod tests {
     use pioneer_provider::{ChatMessage, ReasoningConfig, ReasoningEffort, ToolDefinition};
     fn request() -> ChatRequest {
         ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "m".into(),
             messages: vec![ChatMessage::user("a")],
             temperature: None,
@@ -280,6 +395,163 @@ mod tests {
     fn receipt(request: &ChatRequest) -> NativeInputReceipt {
         NativeInputReceipt::for_request(request, "instance", "api/authority", 0, None).unwrap()
     }
+    struct UnusedBoundary;
+    #[async_trait]
+    impl NativeContextController for UnusedBoundary {
+        async fn stop(&self, _: &NativeContext) -> Result<()> {
+            unreachable!("usage bookkeeping does not stop")
+        }
+        async fn prepare(
+            &self,
+            _: &NativeContext,
+            _: ChatRequest,
+            _: Option<NativeUsageMeasurement>,
+            _: bool,
+        ) -> Result<NativePreparedRequest> {
+            unreachable!("usage bookkeeping does not prepare")
+        }
+    }
+    #[async_trait]
+    impl Provider for UnusedBoundary {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        async fn chat(&self, _: ChatRequest) -> Result<pioneer_provider::ChatResponse> {
+            unreachable!("usage bookkeeping does not call provider")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, Result<pioneer_provider::StreamChunk>>>
+        {
+            unreachable!("usage bookkeeping does not stream")
+        }
+    }
+    #[test]
+    fn recorded_normalized_usage_does_not_add_cache_output_or_reasoning_and_unknown_clears_anchor()
+    {
+        let context = NativeContext {
+            context_budget: None,
+            summary_context: None,
+            overflow_recovery: false,
+            recovery_deadline_ms: None,
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            conversation_thread_id: None,
+            provider_instance: "instance".into(),
+            provider: Arc::new(UnusedBoundary),
+            events: Arc::new(ExecutionEventHub::new()),
+            cancellation: CancellationToken::new(),
+        };
+        let session = NativeContextSession::new(context, Arc::new(UnusedBoundary));
+        let receipt = receipt(&request());
+        let mut usage = TokenUsage {
+            input_tokens: Some(200),
+            output_tokens: Some(100),
+            cache_read_input_tokens: Some(150),
+            cache_write_input_tokens: Some(20),
+            reasoning_tokens: Some(80),
+            reported_total_tokens: Some(999),
+            ..Default::default()
+        };
+        session.record_usage(receipt.clone(), Some(&usage)).unwrap();
+        {
+            let measured = session.measurement.lock().unwrap();
+            assert_eq!(
+                receipt
+                    .calibrated_estimate(900, &[20], measured.as_ref())
+                    .unwrap(),
+                InputEstimate {
+                    measured: 200,
+                    estimated: 0
+                }
+            );
+        }
+        usage.input_tokens = None;
+        session.record_usage(receipt.clone(), Some(&usage)).unwrap();
+        let measured = session.measurement.lock().unwrap();
+        assert!(measured.is_none());
+        assert_eq!(
+            receipt
+                .calibrated_estimate(900, &[20], measured.as_ref())
+                .unwrap(),
+            InputEstimate::local(900)
+        );
+    }
+
+    #[test]
+    fn changing_native_prefix_context_invalidates_input_anchor() {
+        let mut request = request();
+        request.messages[0].provider_replay_state =
+            Some(pioneer_provider::ProviderReplayState::for_model(
+                "fixture",
+                "m",
+                serde_json::json!({"prefix_context":{"prefix":"old"}}),
+            ));
+        let measured = NativeUsageMeasurement {
+            receipt: receipt(&request),
+            input_tokens: 200,
+        };
+        let mut appended = ChatMessage::assistant("new answer");
+        appended.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
+            "fixture",
+            "m",
+            serde_json::json!({"prefix_context":{"prefix":"replacement"}}),
+        ));
+        request.messages.push(appended);
+        assert_eq!(
+            receipt(&request)
+                .calibrated_estimate(900, &[20, 30], Some(&measured))
+                .unwrap(),
+            InputEstimate::local(900)
+        );
+    }
+
+    #[test]
+    fn usage_anchor_covers_input_only_and_missing_or_shortened_prefix_is_local() {
+        let mut request = request();
+        let measured = NativeUsageMeasurement {
+            receipt: receipt(&request),
+            input_tokens: 200,
+        };
+        request
+            .messages
+            .push(ChatMessage::assistant("generated answer"));
+        request
+            .messages
+            .push(ChatMessage::tool_result("call", "tool", "new result"));
+        let current = receipt(&request);
+        let estimate = current
+            .calibrated_estimate(900, &[20, 30, 40], Some(&measured))
+            .unwrap();
+        assert_eq!(
+            estimate,
+            InputEstimate {
+                measured: 200,
+                estimated: 70
+            }
+        );
+        assert_eq!(estimate.padded(), 281);
+        assert_eq!(
+            current
+                .calibrated_estimate(900, &[20, 30, 40], None)
+                .unwrap(),
+            InputEstimate::local(900)
+        );
+        let shortened = NativeUsageMeasurement {
+            receipt: current,
+            input_tokens: 400,
+        };
+        request.messages.pop();
+        assert_eq!(
+            receipt(&request)
+                .calibrated_estimate(80, &[20, 30], Some(&shortened))
+                .unwrap(),
+            InputEstimate::local(80)
+        );
+    }
+
     #[test]
     fn native_target_identity_tracks_unattributed_runtime_messages() {
         let mut request = request();
@@ -324,7 +596,7 @@ mod tests {
             receipt(&request)
                 .calibrated_input(400, &[20, 30, 40], Some(&measurement))
                 .unwrap(),
-            400
+            270
         );
         for change in 0..4 {
             let mut changed = request.clone();
@@ -381,25 +653,5 @@ mod tests {
                 .calibrated_input(100, &[], Some(&measurement))
                 .is_err()
         );
-    }
-
-    #[test]
-    fn historical_text_projection_invalidates_legacy_token_measurement() {
-        let mut legacy = request();
-        legacy.messages[0].content = "duplicated historical command output".repeat(4);
-        let measurement = NativeUsageMeasurement {
-            receipt: receipt(&legacy),
-            input_tokens: 10_000,
-        };
-        let mut projected = legacy;
-        projected.messages[0].content = "deduplicated historical command output".into();
-        let projected_receipt = receipt(&projected);
-        assert_eq!(
-            projected_receipt
-                .calibrated_input(123, &[123], Some(&measurement))
-                .unwrap(),
-            123
-        );
-        assert_ne!(projected_receipt.messages, measurement.receipt.messages);
     }
 }

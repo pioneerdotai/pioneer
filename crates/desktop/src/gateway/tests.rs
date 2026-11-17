@@ -322,8 +322,8 @@ pub(crate) fn test_config() -> AppConfig {
             listen_addr: "0.0.0.0:17878".to_owned(),
             trusted_proxy_peers: Vec::new(),
             outbound_queue_capacity: 128,
+            outbound: Default::default(),
             keepawake: false,
-            preflight_model: Default::default(),
             telemetry: Default::default(),
             thread: GatewayThreadConfig {
                 default_model: Some("gpt-5.4".to_owned()),
@@ -362,6 +362,7 @@ pub(crate) fn test_config() -> AppConfig {
             hooks: Default::default(),
             artifacts: GatewayArtifactsConfig::default(),
             resilience: Default::default(),
+            context_compaction: Default::default(),
             auth: GatewayAuthConfig {
                 jwt_issuer: "pioneer".to_owned(),
                 jwt_audience: "pioneer-clients".to_owned(),

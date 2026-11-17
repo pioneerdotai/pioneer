@@ -15,6 +15,7 @@ title = "No hay servidores MCP instalados"
 description = "Instala nuevos servidores MCP y amplía las capacidades de tus agentes."
 
 [mcp.dialog]
+replace_owned = "Sustituir la configuración de este servidor"
 install_title = "Instalar servidor MCP"
 install = "Instalar"
 uninstall_title = "¿Desinstalar %{name}?"
@@ -134,6 +135,9 @@ items_count = "Elementos: %{count}"
 keys_count = "Claves: %{count}"
 
 [mcp.error]
+plugin_submitted = "Cambio enviado. Comprueba el estado del servidor antes de reintentar."
+plugin_uncertain = "Resultado desconocido. Actualiza antes de otra acción."
+plugin_change_failed = "Cambio sin confirmar. Actualiza antes de reintentar."
 server_name_required = "El nombre del servidor MCP es obligatorio"
 gateway_not_connected = "La pasarela no está conectada"
 workspace_not_selected = "No se ha seleccionado un espacio de trabajo"

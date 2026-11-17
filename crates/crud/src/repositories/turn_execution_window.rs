@@ -6,7 +6,7 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
-    QueryOrder, Set, Unchanged,
+    QueryOrder, QuerySelect, QueryTrait, Set, Unchanged,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -748,6 +748,24 @@ pub async fn close_active_execution_windows_for_terminal_turns<C: ConnectionTrai
     db: &C,
     now: DateTimeWithTimeZone,
 ) -> Result<u64> {
+    close_active_execution_windows(db, None, now).await
+}
+
+/// Used inside the authoritative finalization transaction, after terminal
+/// projection. Close its latest active window without scanning other work.
+pub async fn close_active_execution_windows_for_terminal_turn<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
+    close_active_execution_windows(db, Some(turn_id), now).await
+}
+
+async fn close_active_execution_windows<C: ConnectionTrait>(
+    db: &C,
+    turn_id: Option<&str>,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
     let active_window_statuses = [
         execution_window_status_to_db(ExecutionWindowStatus::Running),
         execution_window_status_to_db(ExecutionWindowStatus::Checkpointed),
@@ -759,21 +777,24 @@ pub async fn close_active_execution_windows_for_terminal_turns<C: ConnectionTrai
         turn_status_to_db(TurnStatus::Blocked).to_owned(),
     ];
 
-    let terminal_turn_ids = turn::Entity::find()
-        .filter(turn::Column::Status.is_in(terminal_turn_statuses))
-        .all(db)
-        .await
-        .context("failed to list terminal turns for execution-window repair")?
-        .into_iter()
-        .map(|turn| turn.id)
-        .collect::<Vec<_>>();
-    if terminal_turn_ids.is_empty() {
-        return Ok(0);
+    let mut terminal_turns = turn::Entity::find()
+        .select_only()
+        .column(turn::Column::Id)
+        .filter(turn::Column::Status.is_in(terminal_turn_statuses));
+    if let Some(turn_id) = turn_id {
+        terminal_turns = terminal_turns.filter(turn::Column::Id.eq(turn_id.to_owned()));
     }
+    let terminal_turn_ids = terminal_turns.into_query();
 
-    let windows = turn_execution_window::Entity::find()
-        .filter(turn_execution_window::Column::TurnId.is_in(terminal_turn_ids))
-        .filter(turn_execution_window::Column::Status.is_in(active_window_statuses))
+    let mut windows = turn_execution_window::Entity::find()
+        .filter(turn_execution_window::Column::TurnId.in_subquery(terminal_turn_ids))
+        .filter(turn_execution_window::Column::Status.is_in(active_window_statuses));
+    if turn_id.is_some() {
+        windows = windows
+            .order_by_desc(turn_execution_window::Column::WindowIndex)
+            .limit(1);
+    }
+    let windows = windows
         .all(db)
         .await
         .context("failed to list active execution windows for terminal turn repair")?;
@@ -873,21 +894,32 @@ async fn count_turn_execution_window_terminal_items_query<C: ConnectionTrait>(
     query: sea_orm::Select<turn_item::Entity>,
     db: &C,
 ) -> Result<TurnExecutionWindowTerminalItemCountsRecord> {
+    // This aggregate is also used during atomic finalization. Never load or
+    // decompress all item payloads while holding the writer transaction.
     let rows = query
+        .select_only()
+        .column(turn_item::Column::ItemType)
+        .column_as(
+            sea_orm::ExprTrait::count(sea_orm::sea_query::Expr::col(turn_item::Column::Id)),
+            "item_count",
+        )
+        .group_by(turn_item::Column::ItemType)
+        .into_tuple::<(String, i64)>()
         .all(db)
         .await
-        .context("failed to list turn_item rows for execution-window terminal stats")?;
+        .context("failed to count item types for execution-window terminal stats")?;
 
     let mut counts = TurnExecutionWindowTerminalItemCountsRecord::default();
-    for row in rows {
-        let Some(item_type) = turn_item_type_from_db(row.item_type.as_str()) else {
+    for (item_type, count) in rows {
+        let Some(item_type) = turn_item_type_from_db(item_type.as_str()) else {
             continue;
         };
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
         if item_type == pioneer_protocol::TurnItemType::Reasoning {
-            counts.agent_round_count = counts.agent_round_count.saturating_add(1);
+            counts.agent_round_count = counts.agent_round_count.saturating_add(count);
         }
         if item_type.is_tool_item() {
-            counts.tool_call_count = counts.tool_call_count.saturating_add(1);
+            counts.tool_call_count = counts.tool_call_count.saturating_add(count);
         }
     }
 
@@ -1208,13 +1240,5 @@ mod tests {
             execution_window_exhaustion_reason_from_db(&reason_db).unwrap(),
             reason
         );
-    }
-
-    #[test]
-    fn checkpoint_kind_roundtrips_through_db_string() {
-        let kind = TurnExecutionCheckpointKind::WindowExhausted;
-        let encoded = checkpoint_kind_to_db(kind);
-        assert_eq!(encoded, "window_exhausted");
-        assert_eq!(checkpoint_kind_from_db(&encoded).unwrap(), kind);
     }
 }

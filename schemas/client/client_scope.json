@@ -7,6 +7,22 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "apps"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "session"
         }
       },
@@ -742,6 +758,22 @@
         "kind": {
           "type": "string",
           "const": "agents_document"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "plugins"
         },
         "workspace_id": {
           "type": "string"

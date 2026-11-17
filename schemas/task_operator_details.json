@@ -162,6 +162,33 @@
           "required": [
             "exact"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "object",
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                },
+                "provider_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "model_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "model"
+          ]
         }
       ]
     },
@@ -444,6 +471,23 @@
         "user"
       ]
     },
+    "NativeServiceModeSelection": {
+      "description": "Explicit choice uses the existing endpoint/credential/model authority proof.\nAbsence means Standard; Inherit belongs to the enclosing model selection.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "authority"
+      ]
+    },
     "PermissionBehavior": {
       "type": "string",
       "enum": [
@@ -459,13 +503,19 @@
       "pattern": "^[A-Za-z0-9]{21}$"
     },
     "ProviderErrorReason": {
-      "description": "Allowlisted OpenRouter Chat Completions metadata.error_type values.\nDiagnostic only: these values must not drive recovery policy.",
+      "description": "Allowlisted provider error reasons, never raw provider messages or values.\nDiagnostic only: these values must not drive recovery policy.",
       "type": "string",
       "enum": [
         "context_length_exceeded",
         "max_tokens_exceeded",
         "token_limit_exceeded",
         "string_too_long",
+        "missing_required_parameter",
+        "unsupported_parameter",
+        "invalid_parameter_value",
+        "invalid_parameter_type",
+        "responses_missing_required_item",
+        "responses_unpaired_tool_call",
         "authentication",
         "permission_denied",
         "payment_required",
@@ -489,6 +539,35 @@
         "server",
         "timeout",
         "unmapped"
+      ]
+    },
+    "ProviderErrorResponse": {
+      "description": "Original provider error response, bounded by the transport limit for local storage.\nDebug output deliberately omits all payloads; public prose never uses them.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "processingError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "streamContext": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "body",
+        "truncated"
       ]
     },
     "ProviderFailureClass": {
@@ -530,7 +609,7 @@
     "ProviderRequestId": {
       "type": "string",
       "maxLength": 128,
-      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
+      "pattern": "^(gen-|req-|req_|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
     },
     "ProviderTransportKind": {
       "type": "string",
@@ -591,6 +670,16 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0
+        },
+        "rawResponse": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "requestId": {
           "anyOf": [
@@ -1133,6 +1222,11 @@
     "TaskAgentReviewPolicy": {
       "type": "object",
       "properties": {
+        "disableTimeoutAcceptance": {
+          "description": "Mandatory-review marker: never resolve this policy through the legacy review timeout. Legacy records default to false.",
+          "type": "boolean",
+          "default": false
+        },
         "maxRevisionRounds": {
           "type": "integer",
           "format": "uint32",
@@ -1623,6 +1717,31 @@
         "system"
       ]
     },
+    "TaskFinishRequest": {
+      "description": "A user-directed final soft stop; this is not evidence that the goal succeeded.",
+      "type": "object",
+      "properties": {
+        "firstRunNumber": {
+          "description": "Earliest admitted run whose real outcome contributes to the final state.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "requestedAt",
+        "firstRunNumber"
+      ]
+    },
     "TaskLifecyclePolicy": {
       "type": "object",
       "properties": {
@@ -1663,6 +1782,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TaskValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "finishRequest": {
+          "description": "Server-owned durable decision to stop future runs.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskFinishRequest"
             },
             {
               "type": "null"
@@ -2763,6 +2893,50 @@
         {
           "type": "object",
           "properties": {
+            "appId": {
+              "type": "string"
+            },
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "pluginId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "pluginId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "packId": {
               "anyOf": [
                 {
@@ -2781,6 +2955,7 @@
               "const": "skill"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "skillId"
@@ -2797,6 +2972,7 @@
               "const": "skillPack"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "packId"
@@ -2816,6 +2992,7 @@
               "const": "mcpServer"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "name",
@@ -2839,6 +3016,7 @@
               "const": "mcpTool"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "serverName",
@@ -3238,6 +3416,21 @@
             }
           ]
         },
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "description": "User-owned model choice; absent means Auto, not inheritance of a wider override.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "execution_backend": {
           "anyOf": [
             {
@@ -3313,6 +3506,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/SandboxPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "service_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeServiceModeSelection"
             },
             {
               "type": "null"

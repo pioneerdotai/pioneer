@@ -221,6 +221,7 @@
 "timeline.system.capability_kind_skill" = "Skill"
 "timeline.system.checkpoint_label" = "Checkpoint"
 "timeline.system.code" = "Code :"
+"timeline.system.codex_request_retried" = "Codex a signalé une nouvelle tentative de la requête après une défaillance temporaire."
 "timeline.system.continued_label" = "Repris"
 "timeline.system.detail_agent_rounds" = "Tours agent"
 "timeline.system.detail_checkpoint" = "Checkpoint"
@@ -333,6 +334,40 @@
 "timeline.web_search.results_count" = "%{count} résultats"
 "timeline.web_search.running" = "Recherche sur le web"
 "timeline.work_group.completed" = "A travaillé"
+
+"chat.composer.add_menu.plugins" = "Ajouter des plugins"
+"plugins.empty" = "Aucun plugin installé"
+"plugins.error" = "Impossible de charger les plugins. Réessayez."
+"plugins.loading" = "Chargement des plugins…"
+"plugins.search" = "Rechercher des plugins"
+"plugins.select" = "Sélectionner des plugins"
+"plugins.unavailable" = "Indisponible"
+"chat.composer.preparing_send" = "Préparation du message"
+"plugins.retry" = "Réessayer"
+"plugins.stale" = "La version sélectionnée n’est plus à jour"
+
+"chat.composer.model.context_label" = "Fenêtre de contexte"
+"chat.composer.model.context_auto" = "Auto — jusqu’à %{tokens} tokens"
+"chat.composer.model.context_up_to" = "Jusqu’à %{tokens} tokens"
+"chat.composer.model.context_invalid" = "Le choix enregistré est indisponible. Choisissez Auto ou une autre fenêtre."
+
+"chat.composer.model.service_label" = "Niveau de service"
+
+"chat.composer.model.service_standard" = "Standard"
+
+"chat.composer.model.service_invalid" = "Le niveau enregistré est indisponible. Choisissez Standard ou un autre mode."
+
+"chat.composer.add_menu.apps" = "Ajouter des applications"
+"apps.empty" = "Aucun application installé"
+"apps.error" = "Impossible de charger les applications. Réessayez."
+"apps.loading" = "Chargement des applications…"
+"apps.search" = "Rechercher des applications"
+"apps.select" = "Sélectionner des applications"
+"apps.unavailable" = "Indisponible"
+"apps.retry" = "Réessayer"
+"apps.stale" = "La version sélectionnée n’est plus à jour"
+
+"apps.view" = "App view"
 
 [chat.acp]
 prepare = "Préparer la session"

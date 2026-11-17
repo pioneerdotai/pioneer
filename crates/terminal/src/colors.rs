@@ -597,44 +597,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rgb_to_hsla_black() {
-        let rgb = Rgb { r: 0, g: 0, b: 0 };
-        let hsla = rgb_to_hsla(rgb);
-        assert_eq!(hsla.l, 0.0);
-        assert_eq!(hsla.s, 0.0);
-        assert_eq!(hsla.a, 1.0);
-    }
-
-    #[test]
-    fn test_rgb_to_hsla_white() {
-        let rgb = Rgb {
-            r: 255,
-            g: 255,
-            b: 255,
-        };
-        let hsla = rgb_to_hsla(rgb);
-        assert_eq!(hsla.l, 1.0);
-        assert_eq!(hsla.s, 0.0);
-        assert_eq!(hsla.a, 1.0);
-    }
-
-    #[test]
-    fn test_rgb_to_hsla_red() {
-        let rgb = Rgb { r: 255, g: 0, b: 0 };
-        let hsla = rgb_to_hsla(rgb);
-        assert_eq!(hsla.h, 0.0);
-        assert_eq!(hsla.s, 1.0);
-        assert_eq!(hsla.a, 1.0);
-    }
-
-    #[test]
-    fn test_color_palette_default() {
-        let palette = ColorPalette::default();
-        assert_eq!(palette.ansi_colors.len(), 16);
-        assert_eq!(palette.extended_colors.len(), 256);
-    }
-
-    #[test]
     fn test_resolve_named_color() {
         use alacritty_terminal::vte::ansi::NamedColor;
 
@@ -663,5 +625,47 @@ mod tests {
         };
         let hsla = palette.resolve(Color::Spec(rgb), &colors);
         assert_eq!(hsla.a, 1.0);
+    }
+
+    #[test]
+    fn rgb_primary_and_achromatic_colors_have_exact_hsla_components() {
+        for (case, rgb, expected) in [
+            (
+                "black",
+                Rgb { r: 0, g: 0, b: 0 },
+                Hsla {
+                    h: 0.0,
+                    s: 0.0,
+                    l: 0.0,
+                    a: 1.0,
+                },
+            ),
+            (
+                "white",
+                Rgb {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                },
+                Hsla {
+                    h: 0.0,
+                    s: 0.0,
+                    l: 1.0,
+                    a: 1.0,
+                },
+            ),
+            (
+                "red",
+                Rgb { r: 255, g: 0, b: 0 },
+                Hsla {
+                    h: 0.0,
+                    s: 1.0,
+                    l: 0.5,
+                    a: 1.0,
+                },
+            ),
+        ] {
+            assert_eq!(rgb_to_hsla(rgb), expected, "{case}");
+        }
     }
 }

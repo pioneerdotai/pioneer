@@ -7,6 +7,7 @@ license.workspace = true
 gpui-kit = { workspace = true, features = ["component"] }
 pioneer-app-updater = { path = "../desktop-updater" }
 pioneer-client.workspace = true
+pioneer-observability.workspace = true
 anyhow.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true

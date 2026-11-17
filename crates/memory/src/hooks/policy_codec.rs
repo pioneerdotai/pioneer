@@ -263,31 +263,6 @@ pub(super) fn memory_turn_policy_request_from_metadata(
         }
     }
 
-    if let Some(value) = metadata.get(&hook_metadata_key(
-        MEMORY_TURN_POLICY_CLASSIFIER_ENABLED_METADATA_KEY,
-    )) {
-        match value {
-            HookValue::Bool(enabled) => request.classifier_enabled = *enabled,
-            _ => diagnostics
-                .push("memory.policy.metadata_invalid: classifier_enabled invalid_type".to_owned()),
-        }
-    }
-
-    if let Some(value) = metadata.get(&hook_metadata_key(MEMORY_TURN_POLICY_FALLBACK_METADATA_KEY))
-    {
-        match value {
-            HookValue::Text(fallback) => match MemoryClassifierFallbackPolicy::from_str(fallback) {
-                Ok(fallback) => request.fallback = fallback,
-                Err(error) => {
-                    diagnostics.push(format!("memory.policy.metadata_invalid: fallback {error}"))
-                }
-            },
-            _ => {
-                diagnostics.push("memory.policy.metadata_invalid: fallback invalid_type".to_owned())
-            }
-        }
-    }
-
     (request, diagnostics)
 }
 
@@ -303,7 +278,6 @@ pub(super) fn safe_memory_policy_diagnostic(message: &str) -> String {
 }
 
 pub(crate) async fn resolve_memory_turn_policy(
-    provider: Option<&Arc<dyn AgentMemoryTurnPolicyProvider>>,
     context: MemoryTurnPolicyContext,
     request: MemoryTurnPolicyRequest,
 ) -> MemoryTurnPolicy {
@@ -314,7 +288,6 @@ pub(crate) async fn resolve_memory_turn_policy(
             1.0,
         );
     }
-
     if let Some(override_policy) = request.structured_override {
         return override_policy.policy.with_source(
             MemoryPolicySource::StructuredOverride,
@@ -322,83 +295,5 @@ pub(crate) async fn resolve_memory_turn_policy(
             1.0,
         );
     }
-
-    if !request.classifier_enabled {
-        return fallback_policy(
-            request.default_policy,
-            request.fallback,
-            MemoryPolicyReasonCode::ClassifierUnavailable,
-            Some("memory.policy.fallback_used: classifier disabled"),
-        );
-    }
-
-    let Some(provider) = provider else {
-        return fallback_policy(
-            request.default_policy,
-            request.fallback,
-            MemoryPolicyReasonCode::ClassifierUnavailable,
-            Some("memory.policy.fallback_used: classifier provider unavailable"),
-        );
-    };
-
-    match provider
-        .resolve_memory_turn_policy(context, request.clone())
-        .await
-    {
-        Ok(policy) => policy,
-        Err(error) => {
-            let reason_code = fallback_reason_for_classifier_error(error.as_str());
-            fallback_policy(
-                request.default_policy,
-                request.fallback,
-                reason_code,
-                Some(format!(
-                    "memory.policy.classifier_failed: reason={}",
-                    reason_code.as_str()
-                )),
-            )
-        }
-    }
-}
-
-pub(super) fn fallback_reason_for_classifier_error(error: &str) -> MemoryPolicyReasonCode {
-    if error.contains("classifier_unavailable")
-        || error.contains("missing model")
-        || error.contains("failed to create")
-        || error.contains("request failed")
-    {
-        MemoryPolicyReasonCode::ClassifierUnavailable
-    } else {
-        MemoryPolicyReasonCode::ClassifierInvalidJson
-    }
-}
-
-pub(super) fn fallback_policy(
-    _default_policy: MemoryTurnPolicy,
-    fallback: MemoryClassifierFallbackPolicy,
-    reason_code: MemoryPolicyReasonCode,
-    diagnostic: Option<impl Into<String>>,
-) -> MemoryTurnPolicy {
-    // Fallback contract: classifier failures must not disable memory.
-    // Recall, prompt context, tools, active recall, and post-turn extraction
-    // stay available; downstream quality gates decide whether extracted facts
-    // become memory.
-    let mut policy = match fallback {
-        MemoryClassifierFallbackPolicy::DefaultAllow => {
-            MemoryTurnPolicy::permissive_classifier_fallback(reason_code)
-        }
-        MemoryClassifierFallbackPolicy::StrictDeny => {
-            MemoryTurnPolicy::strict_deny_fallback(reason_code)
-        }
-        MemoryClassifierFallbackPolicy::AllowReadOnly => {
-            MemoryTurnPolicy::allow_read_only_fallback(reason_code)
-        }
-    };
-    if let Some(diagnostic) = diagnostic {
-        let diagnostic: String = diagnostic.into();
-        policy
-            .diagnostics
-            .push(safe_memory_policy_diagnostic(diagnostic.as_str()));
-    }
-    policy
+    request.default_policy
 }

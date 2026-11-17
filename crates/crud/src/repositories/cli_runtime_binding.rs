@@ -6,7 +6,7 @@ use pioneer_entity::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, Iterable,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -186,8 +186,17 @@ impl CliRuntimeActiveTurnBindingStatus {
 
 pub const CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX: u64 = 64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CliRuntimeTurnBindingRecord {
+    /// Storage provenance used only by CRUD. Callers receive logical JSON.
+    #[doc(hidden)]
+    pub input_mapping_payload_id: Option<String>,
+    #[doc(hidden)]
+    pub input_mapping_read_hold: Option<super::portable_payload::PayloadReadHold>,
+    #[doc(hidden)]
+    pub input_mapping_revision: i64,
+    #[doc(hidden)]
+    pub input_mapping_identity: String,
     pub turn_id: String,
     pub thread_id: String,
     pub continuation_thread_id: String,
@@ -501,6 +510,8 @@ pub struct CliRuntimePendingRequestListFilter {
     pub initiating_session_id: Option<String>,
     /// Exclusive stable keyset cursor `(created_at, request_id)`.
     pub after: Option<(DateTimeWithTimeZone, String)>,
+    /// Inclusive frontier captured once before a finite background pass.
+    pub through: Option<(DateTimeWithTimeZone, String)>,
     pub limit: Option<u64>,
 }
 
@@ -1143,6 +1154,14 @@ pub(crate) async fn update_turn_control<C: ConnectionTrait>(
     db: &C,
     binding: NewCliRuntimeTurnBinding,
 ) -> Result<CliRuntimeTurnBindingRecord> {
+    update_turn_control_projection(db, binding, true).await
+}
+
+pub(crate) async fn update_turn_control_projection<C: ConnectionTrait>(
+    db: &C,
+    binding: NewCliRuntimeTurnBinding,
+    capture_mapping: bool,
+) -> Result<CliRuntimeTurnBindingRecord> {
     let id = binding.turn_id;
     let result = turn_cli_runtime_binding::Entity::update_many()
         .col_expr(
@@ -1171,7 +1190,7 @@ pub(crate) async fn update_turn_control<C: ConnectionTrait>(
         .exec(db)
         .await?;
     anyhow::ensure!(result.rows_affected == 1, "CLI control identity changed");
-    find_turn_binding(db, &id)
+    find_turn_binding_projection(db, &id, capture_mapping)
         .await?
         .context("CLI control binding missing")
 }
@@ -1186,6 +1205,44 @@ pub async fn find_turn_binding<C: ConnectionTrait>(
         .context("failed to query CLI runtime turn binding")?
         .map(turn_binding_record_from_model)
         .transpose()
+}
+
+// Control reads deliberately omit logical mapping bytes and never acquire a
+// payload hold. A real content reader must reload through the ordinary API.
+fn turn_control_query(
+    query: sea_orm::Select<turn_cli_runtime_binding::Entity>,
+) -> sea_orm::Select<turn_cli_runtime_binding::Entity> {
+    use turn_cli_runtime_binding::Column;
+    query
+        .select_only()
+        .columns(Column::iter().filter(|column| !matches!(column, Column::InputMappingJson)))
+        .column_as(Expr::val(""), "input_mapping_json")
+}
+
+pub(crate) async fn find_turn_binding_projection<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    capture_mapping: bool,
+) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+    if capture_mapping {
+        find_turn_binding(db, turn_id).await
+    } else {
+        find_turn_binding_control(db, turn_id).await
+    }
+}
+
+pub(crate) async fn find_turn_binding_control<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+    turn_control_query(turn_cli_runtime_binding::Entity::find_by_id(
+        turn_id.to_owned(),
+    ))
+    .into_model::<turn_cli_runtime_binding::Model>()
+    .one(db)
+    .await?
+    .map(|model| turn_binding_record_from_model_inner(model, false))
+    .transpose()
 }
 
 /// Project provider identity for a bounded timeline page without loading native payloads.
@@ -1284,12 +1341,13 @@ pub async fn set_turn_mcp_metadata<C: ConnectionTrait>(
     turn_binding_record_from_model(model)
 }
 
-pub async fn set_turn_native_goal_state<C: ConnectionTrait>(
+pub(crate) async fn set_turn_native_goal_state_projection<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
     status: Option<String>,
     native_goal_turn_id: Option<String>,
     observed_at: DateTimeWithTimeZone,
+    capture_mapping: bool,
 ) -> Result<CliRuntimeTurnBindingRecord> {
     if status
         .as_deref()
@@ -1297,21 +1355,23 @@ pub async fn set_turn_native_goal_state<C: ConnectionTrait>(
     {
         return Err(anyhow!("CLI runtime native Goal status cannot be empty"));
     }
-    let model = turn_cli_runtime_binding::Entity::find_by_id(turn_id.to_owned())
-        .one(db)
-        .await
-        .context("failed to query CLI runtime turn binding for native Goal update")?
-        .context("CLI runtime turn binding is missing for native Goal update")?;
-    let mut active: turn_cli_runtime_binding::ActiveModel = model.into();
-    active.native_goal_status = Set(status);
-    active.native_goal_turn_id = Set(native_goal_turn_id);
-    active.native_goal_observed_at = Set(Some(observed_at));
-    active.updated_at = Set(observed_at);
-    let model = active
-        .update(db)
+    use turn_cli_runtime_binding::Column;
+    let result = turn_cli_runtime_binding::Entity::update_many()
+        .col_expr(Column::NativeGoalStatus, Expr::value(status))
+        .col_expr(Column::NativeGoalTurnId, Expr::value(native_goal_turn_id))
+        .col_expr(Column::NativeGoalObservedAt, Expr::value(Some(observed_at)))
+        .col_expr(Column::UpdatedAt, Expr::value(observed_at))
+        .filter(Column::TurnId.eq(turn_id))
+        .exec(db)
         .await
         .context("failed to update CLI runtime native Goal state")?;
-    turn_binding_record_from_model(model)
+    anyhow::ensure!(
+        result.rows_affected == 1,
+        "CLI runtime turn binding is missing for native Goal update"
+    );
+    find_turn_binding_projection(db, turn_id, capture_mapping)
+        .await?
+        .context("CLI runtime turn binding is missing after native Goal update")
 }
 
 pub async fn clear_turn_native_goal_state<C: ConnectionTrait>(
@@ -1415,9 +1475,83 @@ pub async fn list_active_turn_binding_page<C: ConnectionTrait>(
         .collect()
 }
 
+/// Capture a finite active-set frontier; later mutations remain on the owner's
+/// unacknowledged work signal and are revisited in the next pass.
+pub async fn active_turn_binding_frontier<C: ConnectionTrait>(
+    db: &C,
+    status: CliRuntimeActiveTurnBindingStatus,
+) -> Result<Option<(DateTimeWithTimeZone, String)>> {
+    use turn_cli_runtime_binding::Column;
+    Ok(turn_cli_runtime_binding::Entity::find()
+        .filter(Column::Status.eq(status.as_str()))
+        .order_by_desc(Column::CreatedAt)
+        .order_by_desc(Column::TurnId)
+        .limit(1)
+        .one(db)
+        .await?
+        .map(|row| (row.created_at, row.turn_id)))
+}
+
+pub async fn list_active_turn_binding_page_through<C: ConnectionTrait>(
+    db: &C,
+    status: CliRuntimeActiveTurnBindingStatus,
+    after: Option<&(DateTimeWithTimeZone, String)>,
+    through: &(DateTimeWithTimeZone, String),
+) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+    use turn_cli_runtime_binding::Column;
+    active_turn_binding_page_query(status, after)
+        .filter(
+            Expr::tuple([Expr::col(Column::CreatedAt), Expr::col(Column::TurnId)]).lte(
+                Expr::tuple([Expr::value(through.0), Expr::value(through.1.clone())]),
+            ),
+        )
+        .all(db)
+        .await?
+        .into_iter()
+        .map(turn_binding_record_from_model)
+        .collect()
+}
+
+pub(crate) async fn list_active_turn_binding_control_page_through<C: ConnectionTrait>(
+    db: &C,
+    status: CliRuntimeActiveTurnBindingStatus,
+    after: Option<&(DateTimeWithTimeZone, String)>,
+    through: &(DateTimeWithTimeZone, String),
+) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+    use turn_cli_runtime_binding::Column;
+    let query = active_turn_binding_page_query(status, after).filter(
+        Expr::tuple([Expr::col(Column::CreatedAt), Expr::col(Column::TurnId)]).lte(Expr::tuple([
+            Expr::value(through.0),
+            Expr::value(through.1.clone()),
+        ])),
+    );
+    turn_control_query(query)
+        .into_model::<turn_cli_runtime_binding::Model>()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|model| turn_binding_record_from_model_inner(model, false))
+        .collect()
+}
+
 pub async fn list_turn_bindings<C: ConnectionTrait>(
     db: &C,
     filter: CliRuntimeTurnBindingListFilter,
+) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+    list_turn_binding_records(db, filter, true).await
+}
+
+pub(crate) async fn list_turn_binding_controls<C: ConnectionTrait>(
+    db: &C,
+    filter: CliRuntimeTurnBindingListFilter,
+) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+    list_turn_binding_records(db, filter, false).await
+}
+
+async fn list_turn_binding_records<C: ConnectionTrait>(
+    db: &C,
+    filter: CliRuntimeTurnBindingListFilter,
+    capture_mapping: bool,
 ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
     let mut query = turn_cli_runtime_binding::Entity::find();
     if let Some(workspace_id) = filter.workspace_id {
@@ -1444,13 +1578,19 @@ pub async fn list_turn_bindings<C: ConnectionTrait>(
         query = query.limit(limit);
     }
 
+    let query = if capture_mapping {
+        query
+    } else {
+        turn_control_query(query)
+    };
     query
         .order_by_asc(turn_cli_runtime_binding::Column::CreatedAt)
+        .into_model::<turn_cli_runtime_binding::Model>()
         .all(db)
         .await
         .context("failed to list CLI runtime turn bindings")?
         .into_iter()
-        .map(turn_binding_record_from_model)
+        .map(|model| turn_binding_record_from_model_inner(model, capture_mapping))
         .collect()
 }
 
@@ -1745,6 +1885,23 @@ pub async fn resolve_native_turn_owner<C: ConnectionTrait>(
     runtime_id: &str,
     native_turn_id: &str,
 ) -> Result<Option<CliRuntimeNativeTurnOwner>> {
+    resolve_native_turn_owner_record(db, runtime_id, native_turn_id, true).await
+}
+
+pub(crate) async fn resolve_native_turn_control_owner<C: ConnectionTrait>(
+    db: &C,
+    runtime_id: &str,
+    native_turn_id: &str,
+) -> Result<Option<CliRuntimeNativeTurnOwner>> {
+    resolve_native_turn_owner_record(db, runtime_id, native_turn_id, false).await
+}
+
+async fn resolve_native_turn_owner_record<C: ConnectionTrait>(
+    db: &C,
+    runtime_id: &str,
+    native_turn_id: &str,
+    capture_mapping: bool,
+) -> Result<Option<CliRuntimeNativeTurnOwner>> {
     let (attempt, segment) = if let Some(segment) =
         find_execution_segment_by_native_turn(db, runtime_id, native_turn_id).await?
     {
@@ -1759,9 +1916,12 @@ pub async fn resolve_native_turn_owner<C: ConnectionTrait>(
     } else {
         return Ok(None);
     };
-    let binding = find_turn_binding(db, attempt.turn_id.as_str())
-        .await?
-        .context("CLI runtime native turn binding is missing")?;
+    let binding = if capture_mapping {
+        find_turn_binding(db, attempt.turn_id.as_str()).await?
+    } else {
+        find_turn_binding_control(db, attempt.turn_id.as_str()).await?
+    }
+    .context("CLI runtime native turn binding is missing")?;
     if binding.runtime_id != runtime_id
         || binding.turn_id != attempt.turn_id
         || binding.native_thread_id != attempt.native_thread_id
@@ -1903,6 +2063,21 @@ pub async fn find_pending_request<C: ConnectionTrait>(
         .transpose()
 }
 
+pub async fn pending_request_frontier_for_turn<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<(DateTimeWithTimeZone, String)>> {
+    use cli_runtime_pending_request::Column;
+    Ok(cli_runtime_pending_request::Entity::find()
+        .filter(Column::TurnId.eq(turn_id))
+        .order_by_desc(Column::CreatedAt)
+        .order_by_desc(Column::RequestId)
+        .limit(1)
+        .one(db)
+        .await?
+        .map(|row| (row.created_at, row.request_id)))
+}
+
 pub async fn list_pending_requests<C: ConnectionTrait>(
     db: &C,
     filter: CliRuntimePendingRequestListFilter,
@@ -1950,6 +2125,15 @@ pub async fn list_pending_requests<C: ConnectionTrait>(
                         .add(cli_runtime_pending_request::Column::CreatedAt.eq(created_at))
                         .add(cli_runtime_pending_request::Column::RequestId.gt(request_id)),
                 ),
+        );
+    }
+
+    if let Some((created_at, request_id)) = filter.through {
+        use cli_runtime_pending_request::Column;
+        query = query.filter(
+            Expr::tuple([Expr::col(Column::CreatedAt), Expr::col(Column::RequestId)]).lte(
+                Expr::tuple([Expr::value(created_at), Expr::value(request_id)]),
+            ),
         );
     }
 
@@ -2273,16 +2457,26 @@ pub async fn append_native_event_if_absent<C: ConnectionTrait>(
     db: &C,
     event: NewCliRuntimeNativeEvent,
 ) -> Result<CliRuntimeNativeEventRecord> {
-    let id = event.id.clone();
-    cli_runtime_native_event::Entity::insert(active_native_event_from_new(event.clone()))
-        .on_conflict(
-            OnConflict::column(cli_runtime_native_event::Column::Id)
-                .do_nothing()
-                .to_owned(),
-        )
-        .exec_without_returning(db)
+    append_native_event_if_absent_with_outcome(db, event)
         .await
-        .context("failed to persist idempotent CLI runtime native event")?;
+        .map(|(record, _)| record)
+}
+
+pub async fn append_native_event_if_absent_with_outcome<C: ConnectionTrait>(
+    db: &C,
+    event: NewCliRuntimeNativeEvent,
+) -> Result<(CliRuntimeNativeEventRecord, bool)> {
+    let id = event.id.clone();
+    let inserted =
+        cli_runtime_native_event::Entity::insert(active_native_event_from_new(event.clone()))
+            .on_conflict(
+                OnConflict::column(cli_runtime_native_event::Column::Id)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .context("failed to persist idempotent CLI runtime native event")?;
     let existing = find_native_event(db, id.as_str())
         .await?
         .context("idempotent CLI runtime native event disappeared")?;
@@ -2298,7 +2492,7 @@ pub async fn append_native_event_if_absent<C: ConnectionTrait>(
             && existing.payload_redacted_json == event.payload_redacted_json,
         "idempotent CLI runtime native event conflicts with existing identity"
     );
-    Ok(existing)
+    Ok((existing, inserted != 0))
 }
 
 pub async fn find_native_event<C: ConnectionTrait>(
@@ -2736,8 +2930,30 @@ fn provider_session_binding_from_model(
 fn turn_binding_record_from_model(
     model: turn_cli_runtime_binding::Model,
 ) -> Result<CliRuntimeTurnBindingRecord> {
+    turn_binding_record_from_model_inner(model, true)
+}
+
+fn turn_binding_record_from_model_inner(
+    model: turn_cli_runtime_binding::Model,
+    capture_mapping: bool,
+) -> Result<CliRuntimeTurnBindingRecord> {
     let mcp = turn_mcp_metadata_from_model(&model);
+    let read_hold = model
+        .input_mapping_json_payload_id
+        .as_deref()
+        .filter(|_| capture_mapping)
+        .map(|id| {
+            super::portable_payload::PayloadReadHold::capture(
+                id,
+                super::portable_payload::Family::CliMapping,
+            )
+        })
+        .transpose()?;
     Ok(CliRuntimeTurnBindingRecord {
+        input_mapping_payload_id: model.input_mapping_json_payload_id,
+        input_mapping_read_hold: read_hold,
+        input_mapping_revision: model.portable_revision,
+        input_mapping_identity: model.portable_identity,
         turn_id: model.turn_id,
         thread_id: model.thread_id,
         continuation_thread_id: model.continuation_thread_id,
@@ -2921,6 +3137,72 @@ fn native_event_record_from_model(
         sequence: model.sequence,
         created_at: model.created_at,
     })
+}
+
+/// Restore logical bytes only on a released reader boundary or after commit.
+/// Keep provenance for later short writer CAS; never use a reloaded mapping
+/// that could belong to a newer UPSERT in place of the captured record.
+pub(crate) async fn hydrate_record(
+    db: &pioneer_sqlite::SqliteDatabase,
+    mut record: CliRuntimeTurnBindingRecord,
+) -> Result<CliRuntimeTurnBindingRecord> {
+    record.input_mapping_json = super::portable_payload::hydrate_with_hold(
+        db,
+        super::portable_payload::Family::CliMapping,
+        record.input_mapping_payload_id.as_deref(),
+        record.input_mapping_json,
+        record.input_mapping_read_hold.as_ref(),
+    )
+    .await?;
+    record.input_mapping_read_hold = None;
+    Ok(record)
+}
+
+/// Physical cutover changes reference/projection, not logical revision. Writer
+/// guards compare the recorded logical version and every original control fact
+/// without hashing/parsing/decompressing large mapping bytes in a transaction.
+pub(crate) fn same_binding_version(
+    stored: &CliRuntimeTurnBindingRecord,
+    expected: &CliRuntimeTurnBindingRecord,
+) -> bool {
+    stored.input_mapping_identity == expected.input_mapping_identity
+        && stored.input_mapping_revision == expected.input_mapping_revision
+        && same_binding_control(stored, expected)
+}
+
+// Public record equality remains equality of the original logical fields.
+// A physical reference or storage revision is not part of the public value.
+impl PartialEq for CliRuntimeTurnBindingRecord {
+    fn eq(&self, other: &Self) -> bool {
+        same_binding_control(self, other) && self.input_mapping_json == other.input_mapping_json
+    }
+}
+impl Eq for CliRuntimeTurnBindingRecord {}
+
+fn same_binding_control(
+    stored: &CliRuntimeTurnBindingRecord,
+    expected: &CliRuntimeTurnBindingRecord,
+) -> bool {
+    stored.turn_id == expected.turn_id
+        && stored.thread_id == expected.thread_id
+        && stored.continuation_thread_id == expected.continuation_thread_id
+        && stored.workspace_id == expected.workspace_id
+        && stored.runtime_id == expected.runtime_id
+        && stored.runtime_kind == expected.runtime_kind
+        && stored.native_thread_id == expected.native_thread_id
+        && stored.native_turn_id == expected.native_turn_id
+        && stored.request_id == expected.request_id
+        && stored.status == expected.status
+        && stored.model == expected.model
+        && stored.cwd == expected.cwd
+        && stored.sandbox_json == expected.sandbox_json
+        && stored.approval_policy == expected.approval_policy
+        && stored.mcp == expected.mcp
+        && stored.native_goal_status == expected.native_goal_status
+        && stored.native_goal_turn_id == expected.native_goal_turn_id
+        && stored.native_goal_observed_at == expected.native_goal_observed_at
+        && stored.created_at == expected.created_at
+        && stored.updated_at == expected.updated_at
 }
 
 #[cfg(test)]

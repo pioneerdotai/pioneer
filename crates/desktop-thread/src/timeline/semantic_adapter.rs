@@ -7,6 +7,7 @@ impl TimelineRenderModel {
         snapshot: &pioneer_client::timeline::presentation::TimelineSnapshot,
     ) -> Self {
         Self {
+            update: Default::default(),
             snapshot: Some(std::sync::Arc::new(snapshot.clone())),
             revision: snapshot.revision(),
             source_revision: snapshot.source_revision(),

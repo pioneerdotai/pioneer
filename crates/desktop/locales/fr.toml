@@ -54,6 +54,13 @@ remove = "Supprimer la mention"
 cancel = "Annuler la réponse"
 
 [chat.composer.model]
+service_label = "Niveau de service"
+service_standard = "Standard"
+service_invalid = "Le niveau enregistré est indisponible. Choisissez Standard ou un autre mode."
+context_label = "Fenêtre de contexte"
+context_auto = "Auto — jusqu’à %{tokens} tokens"
+context_up_to = "Jusqu’à %{tokens} tokens"
+context_invalid = "Le choix enregistré est indisponible. Choisissez Auto ou une autre fenêtre."
 select_label = "Sélectionner le modèle"
 dialog_title = "Sélectionner le modèle"
 provider_label = "Fournisseur"
@@ -440,6 +447,13 @@ hide = "Masquer Pioneer"
 hide_others = "Masquer les autres"
 show_all = "Tout afficher"
 quit = "Quitter Pioneer"
+
+[menu.edit]
+name = "Édition"
+cut = "Couper"
+copy = "Copier"
+paste = "Coller"
+select_all = "Tout sélectionner"
 
 [menu.about]
 version = "Version %{version}"
@@ -980,13 +994,6 @@ description = "Empêche l'ordinateur de passer en veille pour cause d'inactivit�
 label = "Envoyer la télémétrie"
 description = "Autoriser la collecte de données de diagnostic et de performance."
 
-[settings.general.preflight_model]
-label = "Modèle de preflight"
-description = "Choisissez le fournisseur et le modèle pour la planification interne avant le tour. Par défaut utilise le modèle du fil actuel."
-default = "Par défaut"
-select_model = "Sélectionner un modèle"
-dialog_title = "Sélectionner le modèle de preflight"
-
 [settings.voice_input]
 label = "Saisie vocale"
 description = "Utiliser un modèle de transcription local pour les messages vocaux."
@@ -1041,10 +1048,6 @@ description = "Contrôlez la façon dont Pioneer utilise la mémoire durable."
 [settings.memory.enabled]
 label = "Mémoire"
 description = "Autoriser Pioneer à utiliser les faits enregistrés et les décisions de projet lorsque c'est utile."
-
-[settings.memory.active_recall]
-label = "Rappel actif"
-description = "Exécuter une planification de rappel supplémentaire en lecture seule pour les tâches riches en contexte."
 
 [settings.memory.proactive_writes]
 label = "Écriture proactive"
@@ -1762,3 +1765,9 @@ reason_unknown = "L’opération ne s’est pas terminée comme prévu. Consulte
 [mcp.oauth]
 callback_received = "Réponse acceptée. Consultez le résultat de la connexion dans Pioneer."
 callback_rejected = "Connexion refusée. Revenez à Pioneer pour réessayer."
+
+[plugins]
+title = "Plugins"
+
+[apps]
+title = "Applications"

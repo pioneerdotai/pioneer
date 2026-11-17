@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspacePushParams",
+  "type": "object",
+  "properties": {
+    "epoch": {
+      "type": "string"
+    },
+    "inbox": {
+      "type": "boolean"
+    },
+    "inboxCursor": {
+      "description": "Existing exact keyset frontier; recovery preserves this loaded range.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runIds": {
+      "description": "Loaded inbox identities, used to reconcile membership at bootstrap.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "threadIds": {
+      "description": "Known metadata identities; indicators never discover or create threads.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "tree": {
+      "type": "boolean"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspaceId",
+    "epoch",
+    "tree",
+    "inbox"
+  ]
+}

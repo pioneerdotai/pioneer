@@ -152,6 +152,8 @@ mod tests {
 
     fn mcp_server(id: &str, status: McpServerStatus) -> McpListItem {
         McpListItem {
+            plugin_owner: None,
+            package_owner: None,
             id: id.to_owned(),
             name: id.to_owned(),
             display_name: None,
@@ -293,10 +295,9 @@ mod tests {
         assert_eq!(servers[0].runtime.state, McpRuntimeState::Failed);
         assert_eq!(servers[0].status, McpServerStatus::Failed);
         assert_eq!(details.server.status, McpServerStatus::Failed);
-        assert_eq!(
-            details.management.expect("management").health.runtime.state,
-            McpRuntimeState::Failed
-        );
+        let management = details.management.expect("management");
+        assert_eq!(management.health.status, McpServerStatus::Failed);
+        assert_eq!(management.health.runtime.state, McpRuntimeState::Failed);
     }
 
     #[test]

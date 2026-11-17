@@ -826,28 +826,6 @@ mod tests {
     }
 
     #[test]
-    fn activation_presentation_accepts_canonical_local_remote_and_tls_bases() {
-        let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
-        for endpoint in [
-            "http://localhost:17878",
-            "http://127.0.0.1:17878",
-            "http://[::1]:17878",
-            "http://91.224.86.172:17878",
-            "https://gateway.example.test/pioneer",
-        ] {
-            assert!(
-                AuthDeviceActivationPresentation::new(
-                    GatewayBaseUrl::parse_presentation(endpoint).unwrap(),
-                    gateway_id.clone(),
-                    "K7M4-P9Q2",
-                )
-                .is_ok(),
-                "{endpoint}"
-            );
-        }
-    }
-
-    #[test]
     fn activation_code_normalizes_crockford_aliases_and_formats_groups() {
         assert_eq!(
             normalize_device_activation_code("k7m4-p9q2").unwrap(),

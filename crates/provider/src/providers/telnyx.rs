@@ -551,18 +551,7 @@ impl TelnyxProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("Telnyx API error ({status}): {body}")
+        crate::http::provider_api_error(response, "Telnyx").await
     }
 }
 
@@ -851,6 +840,7 @@ impl crate::traits::Provider for TelnyxProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage,
             termination,
@@ -922,6 +912,9 @@ impl crate::traits::Provider for TelnyxProvider {
             .data
             .into_iter()
             .map(|m| ProviderModelInfo {
+                service_modes: None,
+                context_authority: None,
+                context_tiers: None,
                 id: m.id.clone(),
                 name: None,
                 description: None,
@@ -979,15 +972,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_completions_url_built_correctly() {
-        let provider = TelnyxProvider::new("key");
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://api.telnyx.com/v2/ai/chat/completions"
-        );
-    }
-
-    #[test]
     fn custom_gateway_prefix_routes_chat_and_models() {
         let provider = TelnyxProvider::with_base_url_and_timeout_policy(
             "key",
@@ -1034,17 +1018,19 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
+    fn provider_defaults_preserve_identity_capabilities_and_chat_url() {
         let provider = TelnyxProvider::new("key");
-        assert_eq!(provider.name(), "telnyx");
-    }
 
-    #[test]
-    fn provider_capabilities() {
-        let provider = TelnyxProvider::new("key");
+        assert_eq!(provider.name(), "telnyx");
+
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(!caps.vision);
+
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://api.telnyx.com/v2/ai/chat/completions"
+        );
     }
 }
 

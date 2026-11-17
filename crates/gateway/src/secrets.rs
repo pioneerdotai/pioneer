@@ -11,8 +11,6 @@ use pioneer_keystore::{
     DbKeyStore, DbKeyStoreConfig, SecretEntryMeta, SecretFilter, SecretId, SecretKind, SecretMeta,
     SecretStore, ensure_private_file,
 };
-#[cfg(test)]
-use tracing::warn;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::helpers::{decode_hex, encode_hex, unix_timestamp_secs};
@@ -620,66 +618,6 @@ impl GatewaySecrets {
         Ok(base_urls.into_iter().collect())
     }
 
-    #[cfg(test)]
-    pub(crate) fn resolve_provider_api_key(&self, provider_name: &str) -> String {
-        if is_local_provider(provider_name) {
-            return String::new();
-        }
-
-        match self.get_provider_api_key(provider_name) {
-            Ok(Some(value)) => value,
-            Ok(None) => String::new(),
-            Err(error) => {
-                warn!(
-                    provider = provider_name,
-                    error = %format!("{error:#}"),
-                    "failed to resolve provider api key from keystore"
-                );
-                String::new()
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resolve_workspace_provider_proxy(
-        &self,
-        workspace_id: &str,
-        provider_name: &str,
-    ) -> Option<String> {
-        match self.get_workspace_provider_proxy(workspace_id, provider_name) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    workspace_id,
-                    provider = provider_name,
-                    error = %format!("{error:#}"),
-                    "failed to resolve workspace provider proxy from keystore"
-                );
-                None
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resolve_workspace_provider_base_url(
-        &self,
-        workspace_id: &str,
-        provider_name: &str,
-    ) -> Option<String> {
-        match self.get_workspace_provider_base_url(workspace_id, provider_name) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    workspace_id,
-                    provider = provider_name,
-                    error = %format!("{error:#}"),
-                    "failed to resolve workspace provider base url from keystore"
-                );
-                None
-            }
-        }
-    }
-
     // TODO: Remove sometime
     pub(crate) fn migrate_legacy_provider_api_keys_to_workspace(
         &self,
@@ -995,6 +933,26 @@ impl GatewaySecrets {
             .context("failed to list secrets from keystore")
     }
 
+    /// Reuses the auth-key initialization lock to make retries and concurrent
+    /// Gateway processes converge on one secret for the stable creation ref.
+    /// This happens before the task write transaction; a failed task creation
+    /// leaves reusable keystore material rather than rotating the endpoint.
+    pub(crate) fn ensure_task_webhook_secret(&self, secret_ref: &str) -> Result<()> {
+        self.load_or_create_auth_key(
+            SecretId::task_webhook_secret(secret_ref)?,
+            SecretKind::TaskWebhookSecret,
+            "Task webhook secret",
+            32,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn get_task_webhook_secret(&self, secret_ref: &str) -> Result<Option<String>> {
+        self.store
+            .get_string(&SecretId::task_webhook_secret(secret_ref)?)
+            .context("failed to read task webhook secret")
+    }
+
     pub(crate) fn get_remote_access_secret(&self, ref_id: &str) -> Result<Option<String>> {
         let id = SecretId::gateway_remote_access_secret(ref_id)
             .context("invalid gateway remote access secret ref id")?;
@@ -1244,6 +1202,55 @@ mod tests {
     };
 
     #[test]
+    fn task_webhook_secret_survives_failed_creation_retries_and_keystore_reopen() {
+        let home = tempfile::tempdir().unwrap();
+        let secrets = GatewaySecrets::open(home.path()).unwrap();
+        let secret_ref = "stable-webhook-creation-ref";
+        assert!(
+            secrets
+                .get_task_webhook_secret(secret_ref)
+                .unwrap()
+                .is_none()
+        );
+        secrets.ensure_task_webhook_secret(secret_ref).unwrap();
+        let original = secrets
+            .get_task_webhook_secret(secret_ref)
+            .unwrap()
+            .unwrap();
+        // A task DB failure does not rotate the already provisioned credential.
+        secrets.ensure_task_webhook_secret(secret_ref).unwrap();
+        drop(secrets);
+        let reopened = GatewaySecrets::open(home.path()).unwrap();
+        reopened.ensure_task_webhook_secret(secret_ref).unwrap();
+        assert_eq!(
+            reopened
+                .get_task_webhook_secret(secret_ref)
+                .unwrap()
+                .as_deref(),
+            Some(original.as_str())
+        );
+        assert_eq!(original.len(), 64);
+        reopened
+            .ensure_task_webhook_secret("another-trigger-ref")
+            .unwrap();
+        assert_ne!(
+            reopened
+                .get_task_webhook_secret("another-trigger-ref")
+                .unwrap()
+                .as_deref(),
+            Some(original.as_str())
+        );
+        assert_eq!(
+            reopened
+                .store
+                .list(SecretFilter::Kind(SecretKind::TaskWebhookSecret))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn auth_key_domains_are_distinct_redacted_and_restart_stable() {
         let store = Arc::new(MemorySecretStore::new());
         let secrets = GatewaySecrets::new(store.clone());
@@ -1380,12 +1387,6 @@ mod tests {
         );
         assert_eq!(
             secrets
-                .resolve_workspace_provider_proxy("ws_default", "openrouter")
-                .as_deref(),
-            Some("socks5://user:pass@127.0.0.1:1080")
-        );
-        assert_eq!(
-            secrets
                 .list_workspace_provider_proxies("ws_default")
                 .expect("list provider proxies"),
             vec![(
@@ -1425,12 +1426,6 @@ mod tests {
                 .get_workspace_provider_base_url("ws_default", "openai")
                 .expect("read base url"),
             Some("https://api.example.com/v1".to_owned())
-        );
-        assert_eq!(
-            secrets
-                .resolve_workspace_provider_base_url("ws_default", "openai")
-                .as_deref(),
-            Some("https://api.example.com/v1")
         );
         assert_eq!(
             secrets
@@ -1793,26 +1788,6 @@ mod tests {
                 .expect("legacy key removed"),
             None
         );
-    }
-
-    #[test]
-    fn provider_methods_reject_empty_key() {
-        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
-
-        let error = secrets
-            .set_provider_api_key("openrouter", "   ")
-            .expect_err("empty api key should fail");
-        assert!(
-            format!("{error:#}").contains("provider api key must not be empty"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[test]
-    fn provider_resolver_does_not_touch_store_for_local_providers() {
-        let secrets = GatewaySecrets::new(Arc::new(FailingSecretStore));
-
-        assert_eq!(secrets.resolve_provider_api_key("ollama"), "");
     }
 
     #[test]

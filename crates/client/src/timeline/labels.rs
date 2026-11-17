@@ -159,11 +159,17 @@ pub struct ParsedUserAttachment {
     pub display_name: String,
     pub kind: ParsedUserAttachmentKind,
     pub artifact: Option<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_icon: Option<pioneer_protocol::PluginIcon>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dark_icon: Option<pioneer_protocol::PluginIcon>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ParsedUserAttachmentKind {
+    App,
+    Plugin,
     File,
     Skill,
     Mcp,
@@ -177,12 +183,23 @@ pub fn parse_user_attachments(attachments: &[UserMessageAttachment]) -> Vec<Pars
             display_name: display_name_from_attachment(attachment),
             kind: attachment_kind(attachment),
             artifact: artifact_from_attachment(attachment),
+            dark_icon: match attachment {
+                UserMessageAttachment::App { capability } => capability.dark_icon.clone(),
+                _ => None,
+            },
+            plugin_icon: match attachment {
+                UserMessageAttachment::App { capability } => capability.icon.clone(),
+                UserMessageAttachment::Plugin { capability } => capability.icon.clone(),
+                _ => None,
+            },
         })
         .collect()
 }
 
 pub fn attachment_kind(attachment: &UserMessageAttachment) -> ParsedUserAttachmentKind {
     match attachment {
+        UserMessageAttachment::App { .. } => ParsedUserAttachmentKind::App,
+        UserMessageAttachment::Plugin { .. } => ParsedUserAttachmentKind::Plugin,
         UserMessageAttachment::Skill { .. } | UserMessageAttachment::SkillPack { .. } => {
             ParsedUserAttachmentKind::Skill
         }
@@ -210,6 +227,8 @@ pub fn display_name_from_attachment(attachment: &UserMessageAttachment) -> Strin
                 |pack| format!("{} / {}", pack.label, capability.label),
             );
         }
+        UserMessageAttachment::App { capability } => return capability.label.clone(),
+        UserMessageAttachment::Plugin { capability } => return capability.label.clone(),
         UserMessageAttachment::SkillPack { capability } => return capability.label.clone(),
         UserMessageAttachment::McpServer { capability } => return capability.label.clone(),
         UserMessageAttachment::McpTool { capability } => return capability.label.clone(),
@@ -1189,6 +1208,7 @@ pub enum SystemEventMessage {
     RecoveryAttached,
     RetryScheduled,
     RetryStarted,
+    CodexRequestRetried,
     RecoverySucceeded,
     RecoveryFailed,
     ToolRetryScheduled { tool_name: String },
@@ -1605,6 +1625,10 @@ pub fn system_event_presentation(
         Some("item_recovery_exhausted") => SystemEventPresentation {
             message: SystemEventMessage::RecoveryFailed,
             label: SystemEventLabel::Error,
+        },
+        Some("codex_request_retried") => SystemEventPresentation {
+            message: SystemEventMessage::CodexRequestRetried,
+            label: SystemEventLabel::Retry,
         },
         Some("item_tool_retry_scheduled") => {
             let tool_name = tool_name_from_details(details);

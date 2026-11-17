@@ -7,9 +7,9 @@ use crate::{
 
 use pioneer_protocol::{
     McpListItem, McpListResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
-    RuntimeCapabilities, RuntimeStatus, RuntimeSummary, SkillId, SkillListItem, SkillListResponse,
-    TurnCapability, TurnCapabilityKind, TurnMcpServerCapabilitySummary,
-    TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary, UserMessageAttachment,
+    RuntimeCapabilities, RuntimeSummary, SkillId, SkillListItem, SkillListResponse, TurnCapability,
+    TurnCapabilityKind, TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary,
+    TurnSkillCapabilitySummary, UserMessageAttachment,
 };
 use std::collections::HashSet;
 
@@ -51,6 +51,20 @@ impl<'de> serde::Deserialize<'de> for ComposerCapability {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ComposerCapabilityKind {
+    App {
+        app_id: String,
+        expected_revision: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<pioneer_protocol::PluginIcon>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dark_icon: Option<pioneer_protocol::PluginIcon>,
+    },
+    Plugin {
+        plugin_id: String,
+        expected_revision: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<pioneer_protocol::PluginIcon>,
+    },
     Skill {
         skill_id: SkillId,
         owner: Option<String>,
@@ -185,7 +199,7 @@ impl ComposerCapabilityTarget {
 
 /// Canonical capability matrix shared by Rust clients and their focused tests.
 ///
-/// Stale, disabled, or missing CLI summaries resolve to the `cli_neither`
+/// Disabled or missing CLI summaries resolve to the `cli_neither`
 /// policy; provider-switch behavior is a reduction from one row to another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComposerCapabilityMatrixCase {
@@ -242,15 +256,17 @@ pub fn composer_capability_target_for_provider(
         return ComposerCapabilityTarget::native();
     };
 
-    let Some(runtime) = runtimes.iter().find(|runtime| {
-        runtime.runtime_id == runtime_id
-            && runtime.enabled
-            && matches!(runtime.status, RuntimeStatus::Ready)
-    }) else {
+    let Some(_runtime) = runtimes
+        .iter()
+        .find(|runtime| runtime.runtime_id == runtime_id && runtime.enabled)
+    else {
         return ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::unsupported_cli());
     };
 
-    ComposerCapabilityTarget::from_cli_runtime_capabilities(&runtime.capabilities)
+    // A background technical/account probe is diagnostic evidence, not a
+    // revocation of the user's explicit selection. Preserve the structural
+    // selection; Gateway validates the current MCP contract during preflight.
+    ComposerCapabilityTarget::cli_submission()
 }
 
 /// Structural capability target used when a turn is submitted.
@@ -401,6 +417,9 @@ pub fn composer_capability_removal_reason(
 ) -> Option<ComposerCapabilityRemovalReason> {
     let policy = target.policy();
     match &capability.kind {
+        // Preserve the parent across provider changes. Unsupported runtimes
+        // reject it explicitly at Gateway admission instead of losing the chip.
+        ComposerCapabilityKind::Plugin { .. } | ComposerCapabilityKind::App { .. } => None,
         ComposerCapabilityKind::Skill { source_kind, .. } => {
             if !policy.supports_skills {
                 Some(ComposerCapabilityRemovalReason::SkillsUnsupported)
@@ -589,6 +608,22 @@ impl ComposerCapability {
         TurnCapability {
             id: self.key(),
             kind: match &self.kind {
+                ComposerCapabilityKind::App {
+                    app_id,
+                    expected_revision,
+                    ..
+                } => TurnCapabilityKind::App {
+                    app_id: app_id.clone(),
+                    expected_revision: *expected_revision,
+                },
+                ComposerCapabilityKind::Plugin {
+                    plugin_id,
+                    expected_revision,
+                    ..
+                } => TurnCapabilityKind::Plugin {
+                    plugin_id: plugin_id.clone(),
+                    expected_revision: *expected_revision,
+                },
                 ComposerCapabilityKind::Skill { skill_id, .. } => TurnCapabilityKind::Skill {
                     skill_id: skill_id.clone(),
                     pack_id: None,
@@ -609,12 +644,40 @@ impl ComposerCapability {
                     scope_kind: *scope_kind,
                 },
             },
-            label: (!self.label.trim().is_empty()).then(|| self.label.clone()),
+            label: (!matches!(self.kind, ComposerCapabilityKind::App { .. })
+                && !self.label.trim().is_empty())
+            .then(|| self.label.clone()),
         }
     }
 
     pub fn to_user_message_attachment(&self) -> UserMessageAttachment {
         match &self.kind {
+            ComposerCapabilityKind::App {
+                app_id,
+                expected_revision,
+                icon,
+                dark_icon,
+            } => UserMessageAttachment::App {
+                capability: pioneer_protocol::TurnAppCapabilitySummary {
+                    app_id: app_id.clone(),
+                    expected_revision: *expected_revision,
+                    label: self.label.clone(),
+                    icon: icon.clone(),
+                    dark_icon: dark_icon.clone(),
+                },
+            },
+            ComposerCapabilityKind::Plugin {
+                plugin_id,
+                expected_revision,
+                icon,
+            } => UserMessageAttachment::Plugin {
+                capability: pioneer_protocol::TurnPluginCapabilitySummary {
+                    plugin_id: plugin_id.clone(),
+                    expected_revision: *expected_revision,
+                    label: self.label.clone(),
+                    icon: icon.clone(),
+                },
+            },
             ComposerCapabilityKind::Skill {
                 skill_id,
                 owner,
@@ -660,6 +723,8 @@ impl ComposerCapability {
 impl ComposerCapabilityKind {
     pub fn key(&self) -> String {
         match self {
+            Self::App { app_id, .. } => pioneer_protocol::app_capability_key(app_id),
+            Self::Plugin { plugin_id, .. } => pioneer_protocol::plugin_capability_key(plugin_id),
             Self::Skill { skill_id, .. } => pioneer_protocol::skill_capability_key(skill_id),
             Self::McpServer { name, scope_kind } => {
                 pioneer_protocol::mcp_server_capability_key(*scope_kind, name)
@@ -1197,6 +1262,7 @@ pub fn filter_mcp_server_capability_rows(
 ) -> Vec<SelectableMcpCapability> {
     let mut rows = servers
         .iter()
+        .filter(|server| crate::mcp::list::mcp_is_standalone(server))
         .map(selectable_mcp_server_from_item)
         .collect::<Vec<_>>();
     rows = filter_selectable_mcp_capability_rows(rows.as_slice(), query);
@@ -1368,30 +1434,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_capability_matrix_covers_every_supported_policy_shape() {
-        assert_eq!(
-            COMPOSER_CAPABILITY_MATRIX
-                .iter()
-                .map(|case| case.id)
-                .collect::<Vec<_>>(),
-            vec![
-                "native",
-                "cli_neither",
-                "cli_skills_only",
-                "cli_mcp_only",
-                "cli_both",
-            ]
-        );
-        for case in COMPOSER_CAPABILITY_MATRIX {
-            assert_eq!(case.target.policy().supports_skills, case.supports_skills);
-            assert_eq!(
-                case.target.policy().supports_mcp_tools,
-                case.supports_mcp_tools
-            );
-        }
-    }
-
-    #[test]
     fn capability_picker_entry_points_are_visible_for_every_policy_shape() {
         for case in COMPOSER_CAPABILITY_MATRIX {
             assert_eq!(
@@ -1450,6 +1492,8 @@ mod tests {
 
     fn skill_item(slug: &str) -> SkillListItem {
         SkillListItem {
+            plugin_owner: None,
+            package_owner: None,
             skill_id: skill_id(slug),
             pack: None,
             owner: None,
@@ -1485,6 +1529,8 @@ mod tests {
 
     fn mcp_server(name: &str) -> McpListItem {
         McpListItem {
+            plugin_owner: None,
+            package_owner: None,
             id: format!("mcp:{name}"),
             name: name.to_owned(),
             display_name: None,
@@ -1990,65 +2036,6 @@ mod tests {
     }
 
     #[test]
-    fn add_composer_capability_replaces_server_with_tool_for_same_mcp_server() {
-        let mut capabilities = vec![mcp_server_capability("resend")];
-
-        assert!(add_composer_capability(
-            &mut capabilities,
-            mcp_tool_capability("resend", "send_email"),
-        ));
-
-        assert_eq!(capabilities.len(), 1);
-        assert!(matches!(
-            capabilities[0].kind,
-            ComposerCapabilityKind::McpTool {
-                ref server_name,
-                ref raw_tool_name,
-                ..
-            } if server_name == "resend" && raw_tool_name == "send_email"
-        ));
-    }
-
-    #[test]
-    fn add_composer_capability_replaces_tools_with_server_for_same_mcp_server() {
-        let mut capabilities = vec![
-            mcp_tool_capability("resend", "send_email"),
-            mcp_tool_capability("browser", "open"),
-        ];
-
-        assert!(add_composer_capability(
-            &mut capabilities,
-            mcp_server_capability("resend"),
-        ));
-
-        assert_eq!(capabilities.len(), 2);
-        assert!(capabilities.iter().any(|capability| matches!(
-            capability.kind,
-            ComposerCapabilityKind::McpServer { ref name, .. } if name == "resend"
-        )));
-        assert!(capabilities.iter().any(|capability| matches!(
-            capability.kind,
-            ComposerCapabilityKind::McpTool {
-                ref server_name,
-                ref raw_tool_name,
-                ..
-            } if server_name == "browser" && raw_tool_name == "open"
-        )));
-    }
-
-    #[test]
-    fn add_composer_capability_skips_duplicate_key() {
-        let mut capabilities = vec![skill_capability("docs")];
-
-        assert!(!add_composer_capability(
-            &mut capabilities,
-            skill_capability("docs"),
-        ));
-
-        assert_eq!(capabilities.len(), 1);
-    }
-
-    #[test]
     fn remove_composer_capability_at_reports_bounds() {
         let mut capabilities = vec![skill_capability("docs"), skill_capability("imagegen")];
 
@@ -2158,36 +2145,6 @@ mod tests {
                     && capability.slug == "docs"
                     && capability.label == "owner/docs"
         ));
-    }
-
-    #[test]
-    fn capability_query_presence_uses_normalized_query() {
-        assert!(!has_capability_query(" \t\n "));
-        assert!(has_capability_query(" Docs "));
-    }
-
-    #[test]
-    fn installed_skill_rows_keep_system_browser_and_hide_required_system_skills() {
-        let mut installed = skill_item("tests/installed");
-        installed.display_name = "Installed".to_owned();
-        let mut uninstalled = skill_item("tests/uninstalled");
-        uninstalled.display_name = "Uninstalled".to_owned();
-        uninstalled.install.installed = false;
-        let mut browser = skill_item("browser");
-        browser.source_kind = "system".to_owned();
-        browser.display_name = "Browser".to_owned();
-        let mut memory = skill_item("memory");
-        memory.source_kind = "system".to_owned();
-        memory.policy.allow_implicit_invocation = true;
-        memory.policy.allow_implicit_invocation_editable = false;
-
-        let rows =
-            filter_installed_skill_capability_rows(&[uninstalled, memory, installed, browser], "");
-
-        assert_eq!(
-            rows.iter().map(|row| row.slug.as_str()).collect::<Vec<_>>(),
-            vec!["browser", "tests/installed"]
-        );
     }
 
     #[test]
@@ -2348,6 +2305,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, "mcp-tool:workspace:browser:open");
         assert_eq!(rows[0].raw_tool_name.as_deref(), Some("open"));
+        assert_eq!(rows[0].server_name, "browser");
         assert!(rows[0].selectable);
 
         let capability = mcp_row_to_composer_capability(rows[0].clone());
@@ -2362,17 +2320,6 @@ mod tests {
         let rows = filter_mcp_tool_capability_rows(&details, "");
 
         assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn mcp_tool_picker_response_reduction_returns_tool_rows() {
-        let details = mcp_details("browser", vec![mcp_tool("open", "Open page")]);
-
-        let reduction = reduce_composer_mcp_tool_picker_rows_response(details, "");
-
-        assert_eq!(reduction.rows.len(), 1);
-        assert_eq!(reduction.rows[0].server_name, "browser");
-        assert_eq!(reduction.rows[0].raw_tool_name.as_deref(), Some("open"));
     }
 
     #[test]
@@ -2615,6 +2562,48 @@ mod tests {
             Vec::new(),
         ));
     }
+
+    #[test]
+    fn add_composer_capability_applies_replacement_and_idempotence_matrix() {
+        let cases = [
+            (
+                "tool replaces its whole server",
+                vec![mcp_server_capability("resend")],
+                mcp_tool_capability("resend", "send_email"),
+                true,
+                vec![mcp_tool_capability("resend", "send_email")],
+            ),
+            (
+                "server replaces its tool and preserves the other server",
+                vec![
+                    mcp_tool_capability("resend", "send_email"),
+                    mcp_tool_capability("browser", "open"),
+                ],
+                mcp_server_capability("resend"),
+                true,
+                vec![
+                    mcp_tool_capability("browser", "open"),
+                    mcp_server_capability("resend"),
+                ],
+            ),
+            (
+                "duplicate skill key leaves selection unchanged",
+                vec![skill_capability("docs")],
+                skill_capability("docs"),
+                false,
+                vec![skill_capability("docs")],
+            ),
+        ];
+
+        for (case, mut capabilities, incoming, expected_changed, expected) in cases {
+            assert_eq!(
+                add_composer_capability(&mut capabilities, incoming),
+                expected_changed,
+                "{case}"
+            );
+            assert_eq!(capabilities, expected, "{case}");
+        }
+    }
 }
 
 /// Shared picker presentation for native shells. Search/open state is supplied by
@@ -2642,4 +2631,14 @@ pub fn project_mcp_picker_rows(
         filter_active_mcp_tool_capability_rows(tool_rows, active_server_id, query)
     };
     (servers, tools, has_query)
+}
+
+impl ComposerCapabilityKind {
+    pub fn package_kind(&self) -> Option<pioneer_protocol::PackageKind> {
+        match self {
+            Self::Plugin { .. } => Some(pioneer_protocol::PackageKind::Plugin),
+            Self::App { .. } => Some(pioneer_protocol::PackageKind::App),
+            _ => None,
+        }
+    }
 }

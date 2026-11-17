@@ -41,6 +41,27 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 #[cfg(any(feature = "schema", test))]
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
+        schema_doc!("app_view_publication.json", crate::apps::AppViewPublication),
+        schema_doc!(
+            "plugin_operation_publication.json",
+            crate::packages::runtime::PluginOperationPublication
+        ),
+        schema_doc!(
+            "plugin_publication.json",
+            crate::packages::runtime::PluginPublication
+        ),
+        schema_doc!(
+            "workspace_push_params.json",
+            pioneer_protocol::WorkspacePushParams
+        ),
+        schema_doc!(
+            "workspace_push_response.json",
+            pioneer_protocol::WorkspacePushResponse
+        ),
+        schema_doc!(
+            "workspace_push_notification.json",
+            pioneer_protocol::WorkspacePushNotification
+        ),
         schema_doc!(
             "settings_model_picker_publication.json",
             crate::settings::model_picker::SettingsModelPickerPublication
@@ -157,7 +178,7 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             "gateway_session_publication.json",
             crate::gateway::session_controller::GatewaySessionPublication
         ),
-        schema_doc!("avatar_publication.json", crate::avatars::AvatarPublication),
+        schema_doc!("image_publication.json", crate::images::ImagePublication),
         schema_doc!(
             "turn_cancellation_publication.json",
             crate::turns::cancellation::TurnCancellationPublication
@@ -1365,6 +1386,14 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "task_cancel_response.json",
             pioneer_protocol::TaskCancelResponse
+        ),
+        schema_doc!(
+            "task_finish_params.json",
+            pioneer_protocol::TaskFinishParams
+        ),
+        schema_doc!(
+            "task_finish_response.json",
+            pioneer_protocol::TaskFinishResponse
         ),
         schema_doc!(
             "task_completion_inbox_entry.json",

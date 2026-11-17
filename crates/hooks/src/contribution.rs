@@ -251,90 +251,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_section_contribution_roundtrips() {
-        let contribution = HookContribution::PromptSection(PromptSectionContribution {
-            contribution_id: HookContributionId::new("dynamic.context")
-                .expect("valid contribution id"),
-            section_id: HookSectionId::new("dynamic.context").expect("valid section id"),
-            title: Some(HookPromptSectionTitle::new("Dynamic Context").expect("valid title")),
-            domain: HookDomain::new("test").expect("valid domain"),
-            priority: 10,
-            content: HookPromptContent::new("context").expect("valid content"),
-            max_chars: Some(200),
-            source_refs: Vec::new(),
-            diagnostics: Vec::new(),
-            truncated: false,
-        });
-
-        let value = serde_json::to_value(&contribution).expect("contribution should serialize");
-        assert_eq!(value["kind"], "prompt_section");
-        let decoded: HookContribution =
-            serde_json::from_value(value).expect("contribution should deserialize");
-        assert_eq!(decoded, contribution);
-    }
-
-    #[test]
-    fn prompt_section_declares_required_capability() {
-        let contribution = HookContribution::PromptSection(PromptSectionContribution {
-            contribution_id: HookContributionId::new("dynamic.context")
-                .expect("valid contribution id"),
-            section_id: HookSectionId::new("dynamic.context").expect("valid section id"),
-            title: None,
-            domain: HookDomain::new("test").expect("valid domain"),
-            priority: 10,
-            content: HookPromptContent::new("context").expect("valid content"),
-            max_chars: None,
-            source_refs: Vec::new(),
-            diagnostics: Vec::new(),
-            truncated: false,
-        });
-
-        assert_eq!(contribution.kind_name(), "prompt_section");
-        assert_eq!(
-            contribution
-                .required_capability()
-                .expect("prompt section requires a capability"),
-            HookCapability::new("contribute_prompt_section").expect("valid capability"),
-        );
-    }
-
-    #[test]
-    fn noop_requires_no_capability() {
-        assert_eq!(HookContribution::Noop.required_capability(), None);
-        assert_eq!(HookContribution::Noop.kind_name(), "noop");
-    }
-
-    #[test]
-    fn background_job_contribution_roundtrips_and_declares_capability() {
-        let contribution = HookContribution::BackgroundJob(BackgroundJobContribution {
-            contribution_id: HookContributionId::new("background.extract")
-                .expect("valid contribution id"),
-            job_id: HookBackgroundJobId::new("memory.extract").expect("valid job id"),
-            domain: HookDomain::new("memory").expect("valid domain"),
-            priority: 20,
-            idempotency_key: Some(
-                HookRunIdempotencyKey::new("turn-1:memory.extract").expect("valid key"),
-            ),
-            payload: HookValue::Text("extract durable facts".to_owned()),
-            diagnostics: Vec::new(),
-        });
-
-        let value = serde_json::to_value(&contribution).expect("contribution should serialize");
-        assert_eq!(value["kind"], "background_job");
-        let decoded: HookContribution =
-            serde_json::from_value(value).expect("contribution should deserialize");
-
-        assert_eq!(decoded, contribution);
-        assert_eq!(decoded.kind_name(), "background_job");
-        assert_eq!(
-            decoded
-                .required_capability()
-                .expect("background job requires a capability"),
-            HookCapability::new("schedule_background_job").expect("valid capability"),
-        );
-    }
-
-    #[test]
     fn source_ref_roundtrips() {
         let source = HookSourceRef {
             kind: HookSourceKind::Thread,
@@ -345,41 +261,6 @@ mod tests {
         let decoded: HookSourceRef =
             serde_json::from_value(value).expect("source should deserialize");
         assert_eq!(decoded, source);
-    }
-
-    #[test]
-    fn tool_bundle_contribution_roundtrips() {
-        let contribution = HookContribution::ToolBundle(ToolBundleContribution {
-            contribution_id: HookContributionId::new("test.tool_bundle")
-                .expect("valid contribution id"),
-            bundle_id: HookToolBundleId::new("test.memory_tools").expect("valid bundle id"),
-            domain: HookDomain::new("memory").expect("valid domain"),
-            priority: 20,
-            tool_names: vec![
-                HookToolName::new("memory_search").expect("valid tool name"),
-                HookToolName::new("memory_remember").expect("valid tool name"),
-            ],
-            diagnostics: Vec::new(),
-        });
-
-        let value = serde_json::to_value(&contribution).expect("tool bundle should serialize");
-        assert_eq!(value["kind"], "tool_bundle");
-        let decoded: HookContribution =
-            serde_json::from_value(value).expect("tool bundle should deserialize");
-        assert_eq!(decoded, contribution);
-    }
-
-    #[test]
-    fn audit_contribution_roundtrips() {
-        let contribution = HookContribution::Audit(AuditContribution {
-            event_kind: HookAuditEventKind::new("hook.test").expect("valid event kind"),
-            details: HookValue::Bool(true),
-            safe_for_user: true,
-        });
-        let value = serde_json::to_value(&contribution).expect("audit should serialize");
-        let decoded: HookContribution =
-            serde_json::from_value(value).expect("audit should deserialize");
-        assert_eq!(decoded, contribution);
     }
 
     #[test]
@@ -413,5 +294,114 @@ mod tests {
             serde_json::from_value(value).expect("diagnostic should deserialize");
 
         assert!(decoded.safe_for_user);
+    }
+
+    #[test]
+    fn contribution_wire_kinds_and_capabilities_roundtrip() {
+        for (case, contribution, wire_kind, kind_name, capability) in [
+            (
+                "prompt_section_contribution_roundtrips",
+                HookContribution::PromptSection(PromptSectionContribution {
+                    contribution_id: HookContributionId::new("dynamic.context")
+                        .expect("valid contribution id"),
+                    section_id: HookSectionId::new("dynamic.context").expect("valid section id"),
+                    title: Some(
+                        HookPromptSectionTitle::new("Dynamic Context").expect("valid title"),
+                    ),
+                    domain: HookDomain::new("test").expect("valid domain"),
+                    priority: 10,
+                    content: HookPromptContent::new("context").expect("valid content"),
+                    max_chars: Some(200),
+                    source_refs: Vec::new(),
+                    diagnostics: Vec::new(),
+                    truncated: false,
+                }),
+                "prompt_section",
+                "prompt_section",
+                Some(HookCapability::new("contribute_prompt_section").expect("valid capability")),
+            ),
+            (
+                "prompt_section_declares_required_capability",
+                HookContribution::PromptSection(PromptSectionContribution {
+                    contribution_id: HookContributionId::new("dynamic.context")
+                        .expect("valid contribution id"),
+                    section_id: HookSectionId::new("dynamic.context").expect("valid section id"),
+                    title: None,
+                    domain: HookDomain::new("test").expect("valid domain"),
+                    priority: 10,
+                    content: HookPromptContent::new("context").expect("valid content"),
+                    max_chars: None,
+                    source_refs: Vec::new(),
+                    diagnostics: Vec::new(),
+                    truncated: false,
+                }),
+                "prompt_section",
+                "prompt_section",
+                Some(HookCapability::new("contribute_prompt_section").expect("valid capability")),
+            ),
+            (
+                "noop_requires_no_capability",
+                HookContribution::Noop,
+                "noop",
+                "noop",
+                None,
+            ),
+            (
+                "background_job_contribution_roundtrips_and_declares_capability",
+                HookContribution::BackgroundJob(BackgroundJobContribution {
+                    contribution_id: HookContributionId::new("background.extract")
+                        .expect("valid contribution id"),
+                    job_id: HookBackgroundJobId::new("memory.extract").expect("valid job id"),
+                    domain: HookDomain::new("memory").expect("valid domain"),
+                    priority: 20,
+                    idempotency_key: Some(
+                        HookRunIdempotencyKey::new("turn-1:memory.extract").expect("valid key"),
+                    ),
+                    payload: HookValue::Text("extract durable facts".to_owned()),
+                    diagnostics: Vec::new(),
+                }),
+                "background_job",
+                "background_job",
+                Some(HookCapability::new("schedule_background_job").expect("valid capability")),
+            ),
+            (
+                "tool_bundle_contribution_roundtrips",
+                HookContribution::ToolBundle(ToolBundleContribution {
+                    contribution_id: HookContributionId::new("test.tool_bundle")
+                        .expect("valid contribution id"),
+                    bundle_id: HookToolBundleId::new("test.memory_tools").expect("valid bundle id"),
+                    domain: HookDomain::new("memory").expect("valid domain"),
+                    priority: 20,
+                    tool_names: vec![
+                        HookToolName::new("memory_search").expect("valid tool name"),
+                        HookToolName::new("memory_remember").expect("valid tool name"),
+                    ],
+                    diagnostics: Vec::new(),
+                }),
+                "tool_bundle",
+                "tool_bundle",
+                Some(HookCapability::new("contribute_tool_bundle").expect("valid capability")),
+            ),
+            (
+                "audit_contribution_roundtrips",
+                HookContribution::Audit(AuditContribution {
+                    event_kind: HookAuditEventKind::new("hook.test").expect("valid event kind"),
+                    details: HookValue::Bool(true),
+                    safe_for_user: true,
+                }),
+                "audit",
+                "audit",
+                Some(HookCapability::new("emit_audit").expect("valid capability")),
+            ),
+        ] {
+            let value = serde_json::to_value(&contribution).expect(case);
+            assert_eq!(value["kind"], wire_kind, "{case}");
+            assert_eq!(contribution.kind_name(), kind_name, "{case}");
+            assert_eq!(contribution.required_capability(), capability, "{case}");
+            let decoded: HookContribution = serde_json::from_value(value).expect(case);
+            assert_eq!(decoded, contribution, "{case}");
+            assert_eq!(decoded.kind_name(), kind_name, "{case}");
+            assert_eq!(decoded.required_capability(), capability, "{case}");
+        }
     }
 }

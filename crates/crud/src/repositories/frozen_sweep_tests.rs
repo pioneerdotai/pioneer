@@ -85,7 +85,7 @@ mod durable_sweep {
             }
         }
         for _ in 0..5000 {
-            if !frozen_sweep_work::fanout_step(store).await.unwrap() {
+            if !frozen_sweep_work::fanout_step(store, None).await.unwrap() {
                 return;
             }
         }
@@ -502,9 +502,12 @@ mod durable_sweep {
         .await;
         header(&store, "key", 1, 1, 0).await;
         drain_metadata(&store).await;
-        old.finish(&store, Some(sweep.completion_guard()))
-            .await
-            .unwrap();
+        old.finish(
+            &store,
+            frozen_sweep_work::Completion::Complete(sweep.completion_guard()),
+        )
+        .await
+        .unwrap();
         assert_eq!(pending(&store, "key", 0).await, 1);
         assert!(work(&store, "key", 0).await.revision > old.revision);
         assert!(
@@ -556,10 +559,19 @@ mod durable_sweep {
                 .step(&store, &mut SweepAccounting::default())
                 .await
                 .unwrap(),
-            SweepStep::Retry
+            SweepStep::Blocked
         );
-        selected.finish(&store, None).await.unwrap();
+        selected
+            .finish(&store, frozen_sweep_work::Completion::Blocked)
+            .await
+            .unwrap();
         assert_eq!(pending(&store, "batch-physical", 0).await, 1);
+        assert!(
+            frozen_sweep_work::next_retry_deadline(&store)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(batch_ordinals(&store, 0).await, vec![0, 1, 2, 3]);
         drain_metadata(&store).await;
         let selected = work(&store, "batch-physical", 0).await;
@@ -573,11 +585,68 @@ mod durable_sweep {
         {}
         row(&store, "batch-physical", 0, 4).await; // between terminal step and ack
         selected
-            .finish(&store, Some(sweep.completion_guard()))
+            .finish(
+                &store,
+                frozen_sweep_work::Completion::Complete(sweep.completion_guard()),
+            )
             .await
             .unwrap();
         assert_eq!(pending(&store, "batch-physical", 0).await, 1);
         assert!(batch_ordinals(&store, 0).await.contains(&4));
+    }
+
+    #[tokio::test]
+    async fn addressed_cleanup_and_due_retry_leave_other_containers_pending() {
+        let store = blank(false).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut complete = false;
+        for _ in 0..128 {
+            if !progress.quantum(&store).await.unwrap() {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete, "empty startup recovery must reach checked EOF");
+        for id in ["current", "queued", "deadline", "future"] {
+            header(&store, id, 0, 0, 0).await;
+            row(&store, id, 0, 0).await;
+        }
+        drain_metadata(&store).await;
+        for id in ["deadline", "future"] {
+            work(&store, id, 0)
+                .await
+                .finish(&store, frozen_sweep_work::Completion::Retry)
+                .await
+                .unwrap();
+        }
+        // Advance one existing retry without sleeping or altering its revision.
+        exec(&store, "UPDATE compaction_frozen_sweep_work SET retry_at=1 WHERE manifest_id='deadline' AND kind=0").await;
+        progress
+            .restart_for_changes(&store, Some(vec!["m:current".into()]))
+            .await
+            .unwrap();
+        drain(&store, &mut progress).await;
+        assert_eq!(query(&store, "SELECT count(*) AS n FROM compaction_frozen_message_data WHERE manifest_id='current'").await, 0);
+        assert_eq!(query(&store, "SELECT count(*) AS n FROM compaction_frozen_message_data WHERE manifest_id IN ('queued','deadline','future')").await, 3);
+
+        // A timer wake owns due retries, not unrelated dependency-blocked work.
+        progress
+            .restart_for_changes(&store, Some(Vec::new()))
+            .await
+            .unwrap();
+        drain(&store, &mut progress).await;
+        assert_eq!(query(&store, "SELECT count(*) AS n FROM compaction_frozen_message_data WHERE manifest_id='deadline'").await, 0);
+        assert_eq!(pending(&store, "deadline", 0).await, 0);
+        assert_eq!(query(&store, "SELECT count(*) AS n FROM compaction_frozen_message_data WHERE manifest_id IN ('queued','future')").await, 2);
+        assert_eq!(pending(&store, "queued", 0).await, 1);
+        assert_eq!(pending(&store, "future", 0).await, 1);
+        assert!(
+            progress
+                .next_retry_deadline(&store)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -701,7 +770,7 @@ mod durable_sweep {
     }
 
     #[tokio::test]
-    async fn unknown_scope_refusal_is_delayed_and_repair_can_retry_without_domain_invalidation() {
+    async fn unknown_scope_refusal_parks_and_repair_rechecks_pending_generation() {
         let store = blank(false).await;
         header(&store, "free", 0, 0, 0).await;
         row(&store, "free", 0, 0).await;
@@ -717,7 +786,13 @@ mod durable_sweep {
             .await,
             1
         );
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='free' AND kind=0 AND pending=1 AND retry_at>unixepoch()").await,1);
+        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='free' AND kind=0 AND pending=1 AND retry_at=0").await,1);
+        assert!(
+            frozen_sweep_work::next_retry_deadline(&store)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let revision = work(&store, "free", 0).await.revision;
         exec(
             &store,
@@ -725,19 +800,9 @@ mod durable_sweep {
         )
         .await;
         assert_eq!(work(&store, "free", 0).await.revision, revision);
-        assert!(
-            !FrozenStorageLifetimeProgress::default()
-                .sweep_quantum(&store)
-                .await
-                .unwrap()
-        );
-        // Advance eligibility only, emulating the worker's next idle admission.
-        // Geometry, readiness, and all production safety triggers remain intact.
-        exec(
-            &store,
-            "UPDATE compaction_frozen_sweep_work SET retry_at=0 WHERE manifest_id='free'",
-        )
-        .await;
+        // Emulate the new discovery pass admitted by repair invalidation.
+        // Expected protection is not an error-owned timed retry; no synthetic
+        // retry_at update or idle timer is needed to make this generation due.
         drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
         assert_eq!(
             query(
@@ -777,9 +842,12 @@ mod durable_sweep {
         .await;
         assert_eq!(
             sweep.step(&store, &mut accounting).await.unwrap(),
-            SweepStep::Retry
+            SweepStep::Blocked
         );
-        selected.finish(&store, None).await.unwrap();
+        selected
+            .finish(&store, frozen_sweep_work::Completion::Blocked)
+            .await
+            .unwrap();
         assert_eq!(accounting.rows[0], 209);
         assert_eq!(
             batch_ordinals(&store, 0).await,
@@ -960,7 +1028,7 @@ mod durable_sweep {
     async fn empty_physical_queue_does_not_hide_bootstrap_or_interrupted_fanout() {
         let store = blank(false).await;
         assert!(matches!(
-            frozen_sweep_work::discover(&store, &[], 0, &mut Default::default())
+            frozen_sweep_work::discover(&store, &[], 0, &mut Default::default(), None, false)
                 .await
                 .unwrap(),
             frozen_sweep_work::Admission::Idle
@@ -979,7 +1047,7 @@ mod durable_sweep {
         }
         while frozen_sweep_work::bootstrap_step(&store).await.unwrap() {}
         let before = work(&store, "b", 0).await.revision;
-        assert!(frozen_sweep_work::fanout_step(&store).await.unwrap());
+        assert!(frozen_sweep_work::fanout_step(&store, None).await.unwrap());
         // A failed cursor commit rolls back its enqueue as well.
         exec(&store,"CREATE TRIGGER fixture_fanout_fault BEFORE UPDATE ON compaction_frozen_sweep_consumer WHEN NEW.after_source='b' BEGIN SELECT RAISE(ABORT,'fanout cursor fault'); END").await;
         let mut failed = false;
@@ -989,7 +1057,7 @@ mod durable_sweep {
                 "SELECT revision AS n FROM compaction_frozen_sweep_fanout WHERE id=1",
             )
             .await;
-            if frozen_sweep_work::fanout_step(&store).await.is_err() {
+            if frozen_sweep_work::fanout_step(&store, None).await.is_err() {
                 assert_eq!(
                     query(
                         &store,

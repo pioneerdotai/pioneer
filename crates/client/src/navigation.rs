@@ -26,6 +26,16 @@ pub enum SettingsRoute {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticDestination {
+    Apps,
+    App {
+        app_id: String,
+        component: Option<crate::plugins::PluginComponentKey>,
+    },
+    Plugins,
+    Plugin {
+        plugin_id: String,
+        component: Option<crate::plugins::PluginComponentKey>,
+    },
     Threads,
     AgentsDocument,
     Providers {
@@ -95,6 +105,8 @@ pub struct ClientNavigationState {
     pub(crate) last_active: BTreeMap<String, String>,
     destination: SemanticDestination,
     #[serde(default)]
+    plugin_return: Option<SemanticDestination>,
+    #[serde(default)]
     agents_document_scope: Option<crate::agents_doc::scope::AgentsDocEditorScope>,
     lineage: Vec<TaskThreadLineage>,
     providers: Option<ProviderFilter>,
@@ -109,6 +121,13 @@ impl ClientNavigationState {
     }
     pub fn workspace_id(&self) -> Option<&str> {
         self.workspace_id.as_deref()
+    }
+    /// Local presenter projection for a capability's embedded details. Does not
+    /// publish global navigation or change the active workspace/thread.
+    pub fn with_details_destination(&self, destination: SemanticDestination) -> Self {
+        let mut projected = self.clone();
+        projected.apply(NavigationIntent::Navigate { destination });
+        projected
     }
     pub fn destination(&self) -> &SemanticDestination {
         &self.destination
@@ -158,11 +177,29 @@ impl ClientNavigationState {
             self.workspace_id = None;
             self.active_thread_id = None;
             self.destination = SemanticDestination::Threads;
+            self.plugin_return = None;
         }
     }
     pub(crate) fn apply(&mut self, intent: NavigationIntent) -> ClientTransitionOutcome {
         let valid = |value: &str| !value.trim().is_empty() && value.trim() == value;
         match &intent {
+            NavigationIntent::Navigate {
+                destination:
+                    SemanticDestination::Plugin {
+                        plugin_id,
+                        component,
+                    }
+                    | SemanticDestination::App {
+                        app_id: plugin_id,
+                        component,
+                    },
+            } if !valid(plugin_id)
+                || component.as_ref().is_some_and(|key| {
+                    !matches!(key.kind.as_str(), "skill" | "mcp") || !valid(&key.member_key)
+                }) =>
+            {
+                return ClientTransitionOutcome::Rejected;
+            }
             NavigationIntent::SelectWorkspace { workspace_id }
                 if workspace_id.as_deref().is_some_and(|id| !valid(id)) =>
             {
@@ -239,6 +276,19 @@ impl ClientNavigationState {
             }
             NavigationIntent::SelectWorkspace { workspace_id } => {
                 if self.workspace_id != workspace_id {
+                    self.plugin_return = None;
+                    if matches!(
+                        self.destination,
+                        SemanticDestination::Plugin { .. } | SemanticDestination::App { .. }
+                    ) {
+                        self.destination = if self.destination.package_kind()
+                            == Some(pioneer_protocol::PackageKind::App)
+                        {
+                            SemanticDestination::Apps
+                        } else {
+                            SemanticDestination::Plugins
+                        };
+                    }
                     self.workspace_id = workspace_id;
                     self.active_thread_id = None;
                     self.lineage.clear();
@@ -250,6 +300,7 @@ impl ClientNavigationState {
             } => {
                 if let Some(workspace_id) = workspace_id {
                     if self.workspace_id.as_deref() != Some(&workspace_id) {
+                        self.plugin_return = None;
                         self.lineage.clear();
                     }
                     if let Some(id) = &thread_id {
@@ -275,7 +326,55 @@ impl ClientNavigationState {
                 self.destination = SemanticDestination::AgentsDocument;
                 self.agents_document_scope = Some(scope);
             }
+            NavigationIntent::BackFromPlugin => {
+                self.destination = match &self.destination {
+                    SemanticDestination::App {
+                        app_id,
+                        component: Some(_),
+                    } => SemanticDestination::App {
+                        app_id: app_id.clone(),
+                        component: None,
+                    },
+                    SemanticDestination::App { .. } => self
+                        .plugin_return
+                        .take()
+                        .unwrap_or(SemanticDestination::Apps),
+                    SemanticDestination::Plugin {
+                        plugin_id,
+                        component: Some(_),
+                    } => SemanticDestination::Plugin {
+                        plugin_id: plugin_id.clone(),
+                        component: None,
+                    },
+                    SemanticDestination::Plugin { .. } => self
+                        .plugin_return
+                        .take()
+                        .unwrap_or(SemanticDestination::Plugins),
+                    _ => return ClientTransitionOutcome::Noop,
+                };
+            }
             NavigationIntent::Navigate { destination } => {
+                if matches!(destination, SemanticDestination::Mcp { server_id: Some(_) })
+                    && !matches!(
+                        self.destination,
+                        SemanticDestination::Mcp { server_id: Some(_) }
+                    )
+                {
+                    self.plugin_return = Some(self.destination.clone());
+                }
+                if matches!(
+                    destination,
+                    SemanticDestination::Plugin { .. } | SemanticDestination::App { .. }
+                ) && !matches!(
+                    self.destination,
+                    SemanticDestination::Plugin { .. } | SemanticDestination::App { .. }
+                ) && !(matches!(
+                    self.destination,
+                    SemanticDestination::Mcp { server_id: Some(_) }
+                ) && self.plugin_return.is_some())
+                {
+                    self.plugin_return = Some(self.destination.clone());
+                }
                 match &destination {
                     SemanticDestination::Providers { filter } => self.providers = Some(*filter),
                     SemanticDestination::Administration { route } => self.administration = *route,
@@ -392,11 +491,60 @@ pub enum NavigationIntent {
         entry: TaskThreadLineage,
     },
     PopTaskThread,
+    BackFromPlugin,
     ClearLineage,
     Reset,
 }
 
 impl ClientCore {
+    pub fn mcp_destination(&self, workspace: &str, server_id: &str) -> SemanticDestination {
+        if let Some(owner) = self.mcp_catalog_snapshot(workspace).and_then(|p| {
+            p.servers()
+                .iter()
+                .find(|s| s.id == server_id)
+                .and_then(|s| s.package_owner())
+        }) {
+            return SemanticDestination::package(
+                owner.kind,
+                owner.package_id,
+                Some(crate::plugins::PluginComponentKey {
+                    kind: "mcp".into(),
+                    member_key: owner.member_key,
+                }),
+            );
+        }
+        for kind in [
+            pioneer_protocol::PackageKind::Plugin,
+            pioneer_protocol::PackageKind::App,
+        ] {
+            if let Some(p) = self
+                .snapshot(&self.packages(kind).scope(workspace.into()))
+                .and_then(|p| {
+                    p.snapshot()
+                        .payload::<crate::packages::runtime::PluginPublication>()
+                })
+            {
+                if let Some((parent, child)) = p.plugins.iter().find_map(|p| {
+                    p.components
+                        .iter()
+                        .find(|c| c.mcp_installation_id.as_deref() == Some(server_id))
+                        .map(|c| (p, c))
+                }) {
+                    return SemanticDestination::package(
+                        kind,
+                        parent.id.clone(),
+                        Some(crate::plugins::PluginComponentKey {
+                            kind: child.kind.clone(),
+                            member_key: child.member_key.clone(),
+                        }),
+                    );
+                }
+            }
+        }
+        SemanticDestination::Mcp {
+            server_id: Some(server_id.into()),
+        }
+    }
     pub fn navigation_snapshot(&self) -> Arc<ClientNavigationState> {
         let registry = self
             .thread_registry
@@ -423,14 +571,32 @@ impl ClientCore {
         thread: Option<String>,
         expected_revision: Option<u64>,
     ) -> ClientTransition {
+        let opening = thread.as_deref().map(|id| {
+            self.begin_opening(Some(id), pioneer_observability::opening::Fact::Navigation)
+        });
+        self.open_workspace_thread_observed(workspace, thread, expected_revision, opening)
+    }
+    pub(crate) fn open_workspace_thread_observed(
+        &self,
+        workspace: String,
+        thread: Option<String>,
+        expected_revision: Option<u64>,
+        opening: Option<crate::threads::opening::Handle>,
+    ) -> ClientTransition {
         let mut registry = self
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
         if self.is_stopped() {
+            if let Some(handle) = &opening {
+                handle.finish(pioneer_observability::opening::Result::Rejected);
+            }
             return self.navigation_outcome(ClientTransitionOutcome::Rejected);
         }
         if expected_revision.is_some_and(|revision| revision != registry.navigation_revision) {
+            if let Some(handle) = &opening {
+                handle.finish(pioneer_observability::opening::Result::Superseded);
+            }
             return self.navigation_outcome(ClientTransitionOutcome::Stale);
         }
         registry.navigation.apply(NavigationIntent::ClearLineage);
@@ -441,24 +607,50 @@ impl ClientCore {
             workspace_id: Some(workspace),
             thread_id: thread,
         });
-        self.publish_navigation(&mut registry)
+        self.publish_navigation_observed(&mut registry, opening.as_ref())
     }
     pub fn navigate(
         &self,
         intent: NavigationIntent,
         expected_revision: Option<u64>,
     ) -> ClientTransition {
+        let opening = match &intent {
+            NavigationIntent::SelectThread {
+                thread_id: Some(id),
+                ..
+            } => {
+                Some(self.begin_opening(Some(id), pioneer_observability::opening::Fact::Navigation))
+            }
+            NavigationIntent::PushTaskThread { entry } => Some(self.begin_opening(
+                Some(entry.child_thread_id()),
+                pioneer_observability::opening::Fact::Task,
+            )),
+            NavigationIntent::PopTaskThread => {
+                Some(self.begin_opening(None, pioneer_observability::opening::Fact::Task))
+            }
+            _ => None,
+        };
+        self.navigate_observed(intent, expected_revision, opening)
+    }
+    pub(crate) fn navigate_observed(
+        &self,
+        intent: NavigationIntent,
+        expected_revision: Option<u64>,
+        opening: Option<crate::threads::opening::Handle>,
+    ) -> ClientTransition {
         // Non-settings navigation also runs while applying an authorization fence.
         // Only a protected Settings destination needs to acquire the identity owner.
         let protected_settings = matches!(
             &intent,
-            NavigationIntent::SetSettingsRoute {
-                route: SettingsRoute::Memory | SettingsRoute::SelfImprovement
-            } | NavigationIntent::Navigate {
-                destination: SemanticDestination::Settings {
+            NavigationIntent::BackFromPlugin
+                | NavigationIntent::SetSettingsRoute {
                     route: SettingsRoute::Memory | SettingsRoute::SelfImprovement
                 }
-            }
+                | NavigationIntent::Navigate {
+                    destination: SemanticDestination::Settings {
+                        route: SettingsRoute::Memory | SettingsRoute::SelfImprovement
+                    }
+                }
         );
         let allowed = !protected_settings
             || self
@@ -492,11 +684,23 @@ impl ClientCore {
         {
             ClientTransitionOutcome::Stale
         } else {
+            if matches!(intent, NavigationIntent::BackFromPlugin) {
+                registry.restrict_settings_navigation(allowed);
+            }
             registry.navigation.apply(intent)
         };
         if outcome == ClientTransitionOutcome::Changed {
-            self.publish_navigation(&mut registry)
+            self.publish_navigation_observed(&mut registry, opening.as_ref())
         } else {
+            if let Some(handle) = &opening {
+                handle.finish(match outcome {
+                    ClientTransitionOutcome::Noop => pioneer_observability::opening::Result::Noop,
+                    ClientTransitionOutcome::Stale => {
+                        pioneer_observability::opening::Result::Superseded
+                    }
+                    _ => pioneer_observability::opening::Result::Rejected,
+                });
+            }
             self.navigation_outcome(outcome)
         }
     }
@@ -504,7 +708,22 @@ impl ClientCore {
         &self,
         registry: &mut crate::threads::registry::ThreadRegistry,
     ) -> ClientTransition {
-        match registry.navigation_change() {
+        self.publish_navigation_observed(registry, None)
+    }
+    fn publish_navigation_observed(
+        &self,
+        registry: &mut crate::threads::registry::ThreadRegistry,
+        opening: Option<&crate::threads::opening::Handle>,
+    ) -> ClientTransition {
+        let publication = registry.navigation_change_observed(opening);
+        if let Some(handle) = opening {
+            if publication.is_some() {
+                registry.accept_opening(handle);
+            } else {
+                handle.finish(pioneer_observability::opening::Result::Noop);
+            }
+        }
+        match publication {
             Some(publication) => self.transition_directory(
                 registry,
                 &ClientMutationAuthority { _private: () },
@@ -517,24 +736,42 @@ impl ClientCore {
 }
 impl crate::threads::registry::ThreadRegistry {
     pub(crate) fn restrict_settings_navigation(&mut self, allowed: bool) {
-        if !allowed
-            && matches!(
+        if !allowed {
+            if matches!(
+                self.navigation.plugin_return,
+                Some(SemanticDestination::Settings {
+                    route: SettingsRoute::Memory | SettingsRoute::SelfImprovement
+                })
+            ) {
+                self.navigation.plugin_return = Some(SemanticDestination::Settings {
+                    route: SettingsRoute::Account,
+                });
+            }
+            if matches!(
                 self.navigation.settings_route(),
                 SettingsRoute::Memory | SettingsRoute::SelfImprovement
-            )
-        {
-            self.navigation.apply(NavigationIntent::SetSettingsRoute {
-                route: SettingsRoute::Account,
-            });
+            ) {
+                self.navigation.apply(NavigationIntent::SetSettingsRoute {
+                    route: SettingsRoute::Account,
+                });
+            }
         }
     }
+
     pub(crate) fn reset_navigation(&mut self) {
         self.navigation = ClientNavigationState::default();
     }
     pub(crate) fn navigation_change(&mut self) -> Option<crate::core::ClientPublicationDraft> {
+        self.navigation_change_observed(None)
+    }
+    pub(crate) fn navigation_change_observed(
+        &mut self,
+        opening: Option<&crate::threads::opening::Handle>,
+    ) -> Option<crate::core::ClientPublicationDraft> {
         if self.navigation_publication.as_deref() == Some(&self.navigation) {
             return None;
         }
+        self.opening_navigation(opening);
         // Draft membership changes the directory even when thread metadata is equal
         // (a thread notification may precede the creation response).
         let previous = self.navigation_publication.as_deref();
@@ -576,6 +813,146 @@ mod tests {
             },
             expected_revision: None,
         })
+    }
+    #[test]
+    fn protected_plugin_return_is_normalized_on_permission_change() {
+        for route in [SettingsRoute::Memory, SettingsRoute::SelfImprovement] {
+            let core = crate::catalog_test_support::client();
+            let (generation, connection) = core.current_auth_ticket();
+            let mut permissions = core.authorization_snapshot(None, None).unwrap();
+            permissions.authorization_revision += 1;
+            permissions.global.can_manage_gateway_settings = true;
+            assert_eq!(
+                core.accept_authorization_projection(generation, connection, permissions.clone()),
+                crate::authorization::AuthorizationProjectionAcceptance::Accepted
+            );
+            let protected = SemanticDestination::Settings { route };
+            let parent = SemanticDestination::Plugin {
+                plugin_id: "parent".into(),
+                component: None,
+            };
+            core.navigate(
+                NavigationIntent::Navigate {
+                    destination: protected.clone(),
+                },
+                None,
+            );
+            core.navigate(
+                NavigationIntent::Navigate {
+                    destination: parent.clone(),
+                },
+                None,
+            );
+            core.navigate(NavigationIntent::BackFromPlugin, None);
+            assert_eq!(core.navigation_snapshot().destination(), &protected);
+            core.navigate(
+                NavigationIntent::Navigate {
+                    destination: parent,
+                },
+                None,
+            );
+            let old_revision = core
+                .snapshot(&ClientScope::Navigation)
+                .unwrap()
+                .revisions()
+                .scoped()
+                .get();
+            permissions.authorization_revision += 1;
+            permissions.global.can_manage_gateway_settings = false;
+            let (current_generation, current_connection) = core.current_auth_ticket();
+            assert_eq!(current_connection, connection);
+            assert_eq!(
+                core.accept_authorization_projection(
+                    current_generation,
+                    current_connection,
+                    permissions
+                ),
+                crate::authorization::AuthorizationProjectionAcceptance::Accepted
+            );
+            let (next_generation, next_connection) = core.current_auth_ticket();
+            assert!(next_generation > current_generation);
+            assert_eq!(next_connection, connection);
+            assert_eq!(
+                core.navigate(NavigationIntent::BackFromPlugin, Some(old_revision))
+                    .outcome(),
+                ClientTransitionOutcome::Stale
+            );
+            core.navigate(NavigationIntent::BackFromPlugin, None);
+            assert_eq!(
+                core.navigation_snapshot().destination(),
+                &SemanticDestination::Settings {
+                    route: SettingsRoute::Account
+                }
+            );
+            assert_eq!(
+                core.navigation_snapshot().settings_route(),
+                SettingsRoute::Account
+            );
+        }
+    }
+    #[test]
+    fn plugin_child_back_preserves_parent_and_late_native_resolution_origin() {
+        let core = ClientCore::new();
+        let child = SemanticDestination::Plugin {
+            plugin_id: "parent".into(),
+            component: Some(crate::plugins::PluginComponentKey {
+                kind: "mcp".into(),
+                member_key: "server".into(),
+            }),
+        };
+        // Timeline enters a native route before its catalogue reveals ownership.
+        core.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Mcp {
+                    server_id: Some("server".into()),
+                },
+            },
+            None,
+        );
+        core.navigate(
+            NavigationIntent::Navigate {
+                destination: child.clone(),
+            },
+            None,
+        );
+        core.navigate(NavigationIntent::BackFromPlugin, None);
+        assert_eq!(
+            core.navigation_snapshot().destination(),
+            &SemanticDestination::Plugin {
+                plugin_id: "parent".into(),
+                component: None
+            }
+        );
+        core.navigate(NavigationIntent::BackFromPlugin, None);
+        assert_eq!(
+            core.navigation_snapshot().destination(),
+            &SemanticDestination::Threads
+        );
+        core.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Plugins,
+            },
+            None,
+        );
+        core.navigate(NavigationIntent::Navigate { destination: child }, None);
+        core.navigate(NavigationIntent::BackFromPlugin, None);
+        core.navigate(NavigationIntent::BackFromPlugin, None);
+        assert_eq!(
+            core.navigation_snapshot().destination(),
+            &SemanticDestination::Plugins
+        );
+        let before = core.navigation_snapshot();
+        let rejected = core.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Plugin {
+                    plugin_id: " ".into(),
+                    component: None,
+                },
+            },
+            None,
+        );
+        assert_eq!(rejected.outcome(), ClientTransitionOutcome::Rejected);
+        assert_eq!(core.navigation_snapshot(), before);
     }
     #[test]
     fn opening_a_workspace_thread_is_one_transition_and_rejects_late_navigation() {
@@ -893,5 +1270,55 @@ mod tests {
             ClientTransitionOutcome::Rejected
         );
         assert!(core.snapshot(&ClientScope::Navigation).is_none());
+    }
+}
+
+impl SemanticDestination {
+    pub fn package(
+        kind: pioneer_protocol::PackageKind,
+        id: String,
+        component: Option<crate::plugins::PluginComponentKey>,
+    ) -> Self {
+        match kind {
+            pioneer_protocol::PackageKind::Plugin => Self::Plugin {
+                plugin_id: id,
+                component,
+            },
+            pioneer_protocol::PackageKind::App => Self::App {
+                app_id: id,
+                component,
+            },
+        }
+    }
+    pub fn package_kind(&self) -> Option<pioneer_protocol::PackageKind> {
+        match self {
+            Self::Plugins | Self::Plugin { .. } => Some(pioneer_protocol::PackageKind::Plugin),
+            Self::Apps | Self::App { .. } => Some(pioneer_protocol::PackageKind::App),
+            _ => None,
+        }
+    }
+    pub fn package_details(
+        &self,
+    ) -> Option<(
+        pioneer_protocol::PackageKind,
+        &str,
+        Option<&crate::plugins::PluginComponentKey>,
+    )> {
+        match self {
+            Self::Plugin {
+                plugin_id,
+                component,
+            } => Some((
+                pioneer_protocol::PackageKind::Plugin,
+                plugin_id,
+                component.as_ref(),
+            )),
+            Self::App { app_id, component } => Some((
+                pioneer_protocol::PackageKind::App,
+                app_id,
+                component.as_ref(),
+            )),
+            _ => None,
+        }
     }
 }

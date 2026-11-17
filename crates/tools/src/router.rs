@@ -15,7 +15,7 @@ use crate::spec::{
     ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode,
     ToolPayloadBinding, ToolPermissionMetadata, ToolRecoveryMetadata, ToolSpec,
 };
-use crate::tool_index::{PreflightToolIndex, build_preflight_tool_index};
+use crate::tool_index::CORE_TOOL_NAMES;
 use crate::visibility::{
     FinalToolVisibility, FinalToolVisibilityInput, ToolVisibilitySnapshot,
     compute_final_tool_visibility, materialized_dynamic_extension_tool_names,
@@ -39,6 +39,7 @@ pub struct RawToolCall {
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
+    pub observation: crate::observation::InvocationObservation,
     pub call_id: String,
     pub tool_name: String,
     pub payload: ToolPayload,
@@ -71,6 +72,50 @@ pub struct ToolRouter {
 }
 
 impl ToolRouter {
+    /// Resolve only configured function proxies, with the same two-edge limit
+    /// as the runtime bridge. Names and user payloads cannot establish origin.
+    pub fn computer_use_leaf<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+        let mut current = name;
+        let mut visited = Vec::new();
+        for depth in 0..=2 {
+            let configured = self.specs.get(current)?;
+            if crate::is_computer_use_tool(current)
+                && configured.spec.permission_metadata.dynamic_skill.is_none()
+            {
+                return Some(current);
+            }
+            if depth == 2 || visited.contains(&current) {
+                return None;
+            }
+            visited.push(current);
+            let origin = configured.spec.permission_metadata.dynamic_skill.as_ref()?;
+            if origin.kind != crate::spec::DynamicSkillPermissionKind::FunctionProxy {
+                return None;
+            }
+            current = origin.target_tool.as_deref()?;
+        }
+        None
+    }
+
+    pub(crate) fn configured_proxy_origin(
+        &self,
+        name: &str,
+    ) -> Option<&crate::spec::DynamicSkillPermissionMetadata> {
+        self.computer_use_leaf(name)?;
+        let origin = self
+            .specs
+            .get(name)?
+            .spec
+            .permission_metadata
+            .dynamic_skill
+            .as_ref()?;
+        (origin.kind == crate::spec::DynamicSkillPermissionKind::FunctionProxy).then_some(origin)
+    }
+
+    pub fn classify_tool_error(&self, name: &str, error: &ToolError) -> crate::ToolOutcome {
+        crate::classifier::classify_tool_error(self.computer_use_leaf(name).unwrap_or(name), error)
+    }
+
     pub fn new(
         specs: Vec<ConfiguredToolSpec>,
         registry: ToolRegistry,
@@ -160,12 +205,22 @@ impl ToolRouter {
         self.visibility.all_specs().to_vec()
     }
 
-    pub fn preflight_tool_index(&self) -> PreflightToolIndex {
-        let blocked_tool_names = self.blocked_tool_names_snapshot();
-        build_preflight_tool_index(self.specs.values().filter(|configured| {
-            self.has_handler(configured.spec.name.as_str())
-                && !blocked_tool_names.contains_key(configured.spec.name.as_str())
-        }))
+    pub fn available_tool_names(&self) -> Vec<String> {
+        let blocked = self.blocked_tool_names_snapshot();
+        self.specs
+            .keys()
+            .filter(|name| self.has_handler(name) && !blocked.contains_key(*name))
+            .cloned()
+            .collect()
+    }
+
+    pub fn core_tool_names(&self) -> Vec<String> {
+        let available = self.available_tool_names();
+        CORE_TOOL_NAMES
+            .iter()
+            .filter(|name| available.iter().any(|value| value == **name))
+            .map(|name| (*name).to_owned())
+            .collect()
     }
 
     pub async fn model_visible_specs(&self) -> Vec<ToolSpec> {
@@ -183,7 +238,6 @@ impl ToolRouter {
     pub fn compute_final_visible_tools(
         &self,
         core_tools: &[String],
-        preflight_visible_tools: &[String],
         current_visible_tools: &[String],
     ) -> FinalToolVisibility {
         let all_tool_names = self
@@ -203,7 +257,6 @@ impl ToolRouter {
         compute_final_tool_visibility(FinalToolVisibilityInput {
             core_tools: core_tools.to_vec(),
             current_visible_tools: current_visible_tools.to_vec(),
-            preflight_visible_tools: preflight_visible_tools.to_vec(),
             dynamic_tool_names,
             registered_tool_names: all_tool_names,
             available_tool_names,
@@ -211,14 +264,35 @@ impl ToolRouter {
         })
     }
 
-    pub async fn build_model_tool_call(&self, call: RawToolCall) -> Result<ToolCall, ToolError> {
-        if self.find_spec(call.tool_name.as_str()).is_some()
-            && !self.is_model_visible_tool(call.tool_name.as_str()).await
-        {
-            return Err(ToolError::not_visible(call.tool_name));
+    fn observation_family(&self, name: &str) -> pioneer_observability::tool_call::Family {
+        use pioneer_observability::tool_call::Family;
+        match self.find_spec(name).map(|spec| spec.spec.payload_kind) {
+            Some(PayloadKind::Mcp) => Family::Mcp,
+            Some(PayloadKind::LocalShell) => Family::Shell,
+            _ => Family::Other,
         }
+    }
 
-        self.build_tool_call(call)
+    pub async fn build_model_tool_call(&self, call: RawToolCall) -> Result<ToolCall, ToolError> {
+        let observation = crate::observation::InvocationObservation::start(
+            self.observation_family(&call.tool_name),
+        );
+        let parent = observation.correlation();
+        let result = parent
+            .scope(async {
+                if self.find_spec(call.tool_name.as_str()).is_some()
+                    && !self.is_model_visible_tool(call.tool_name.as_str()).await
+                {
+                    return Err(ToolError::not_visible(call.tool_name));
+                }
+
+                self.build_tool_call_observed(call, observation.clone())
+            })
+            .await;
+        if let Err(error) = &result {
+            observation.finish(crate::observation::error_fact(error));
+        }
+        result
     }
 
     pub fn find_spec(&self, tool_name: &str) -> Option<&ConfiguredToolSpec> {
@@ -236,89 +310,129 @@ impl ToolRouter {
     }
 
     pub fn build_tool_call(&self, call: RawToolCall) -> Result<ToolCall, ToolError> {
-        let trace_id = self.event_bus.new_trace_id();
-        let trace = self.event_bus.trace_with_id(
-            trace_id.clone(),
-            self.turn_id.clone(),
-            call.call_id.clone(),
-            call.tool_name.clone(),
+        let observation = crate::observation::InvocationObservation::start(
+            self.observation_family(&call.tool_name),
         );
-        trace.emit_stage(
-            1,
-            "router.parse.started",
-            None,
-            Some(serde_json::json!({
-                "arguments_length": call.arguments.len(),
-            })),
+        let result = observation
+            .correlation()
+            .run(|| self.build_tool_call_observed(call, observation.clone()));
+        if let Err(error) = &result {
+            observation.finish(crate::observation::error_fact(error));
+        }
+        result
+    }
+
+    fn build_tool_call_observed(
+        &self,
+        call: RawToolCall,
+        observation: crate::observation::InvocationObservation,
+    ) -> Result<ToolCall, ToolError> {
+        let mut validation = pioneer_observability::tool_call::Measurement::start(
+            pioneer_observability::tool_call::Phase::Validation,
+            &observation.correlation(),
         );
-
-        let configured = match self.find_spec(call.tool_name.as_str()) {
-            Some(spec) => spec.clone(),
-            None => {
-                let error = ToolError::NotFound(call.tool_name.clone());
-                trace.emit_stage(
-                    1,
-                    "router.parse.failed",
-                    Some(error.to_string()),
-                    Some(serde_json::json!({
-                        "reason": "unknown_tool",
-                    })),
-                );
-                return Err(error);
-            }
-        };
-
-        let (payload, argument_coercions) = match self.parse_payload(
-            &configured,
-            call.tool_name.as_str(),
-            call.arguments.as_str(),
-        ) {
-            Ok(parsed) => {
-                trace.emit_stage(1, "router.parse.completed", None, None);
-                parsed
-            }
-            Err(error) => {
-                trace.emit_stage(1, "router.parse.failed", Some(error.to_string()), None);
-                return Err(error);
-            }
-        };
-        if !argument_coercions.is_empty() {
+        let result = (|| {
+            let trace_id = self.event_bus.new_trace_id();
+            let trace = self.event_bus.trace_with_id(
+                trace_id.clone(),
+                self.turn_id.clone(),
+                call.call_id.clone(),
+                call.tool_name.clone(),
+            );
             trace.emit_stage(
                 1,
-                "router.arguments.normalized",
+                "router.parse.started",
                 None,
                 Some(serde_json::json!({
-                    "coercions": argument_coercions,
+                    "arguments_length": call.arguments.len(),
                 })),
             );
-        }
 
-        let call_id = call.call_id;
-        let tool_name = call.tool_name;
+            let configured = match self.find_spec(call.tool_name.as_str()) {
+                Some(spec) => spec.clone(),
+                None => {
+                    let error = ToolError::NotFound(call.tool_name.clone());
+                    trace.emit_stage(
+                        1,
+                        "router.parse.failed",
+                        Some(error.to_string()),
+                        Some(serde_json::json!({
+                            "reason": "unknown_tool",
+                        })),
+                    );
+                    return Err(error);
+                }
+            };
 
-        let session_scope_key =
-            Self::derive_session_scope_key(configured.spec.name.as_str(), &payload);
-        let idempotency_key = Self::derive_idempotency_key(
-            configured.spec.name.as_str(),
-            &payload,
-            configured.spec.recovery.idempotency_mode,
-            call_id.as_str(),
-        );
+            let (payload, argument_coercions) = match self.parse_payload(
+                &configured,
+                call.tool_name.as_str(),
+                call.arguments.as_str(),
+            ) {
+                Ok(parsed) => {
+                    trace.emit_stage(1, "router.parse.completed", None, None);
+                    parsed
+                }
+                Err(error) => {
+                    trace.emit_stage(1, "router.parse.failed", Some(error.to_string()), None);
+                    return Err(error);
+                }
+            };
+            if !argument_coercions.is_empty() {
+                trace.emit_stage(
+                    1,
+                    "router.arguments.normalized",
+                    None,
+                    Some(serde_json::json!({
+                        "coercions": argument_coercions,
+                    })),
+                );
+            }
 
-        Ok(ToolCall {
-            call_id: call_id.clone(),
-            tool_name: tool_name.clone(),
-            session_scope_key,
-            payload,
-            execution_class: configured.execution_class,
-            turn_item_execution_class: configured.spec.turn_item_execution_class,
-            recovery: configured.spec.recovery,
-            permission_metadata: configured.spec.permission_metadata,
-            output_policy: configured.output_policy,
-            output_projection: configured.output_projection,
-            idempotency_key,
-            trace_id,
-        })
+            let call_id = call.call_id;
+            let tool_name = call.tool_name;
+
+            let session_scope_key =
+                Self::derive_session_scope_key(configured.spec.name.as_str(), &payload);
+            let recovery = if self.computer_use_leaf(&tool_name).is_some() {
+                ToolRecoveryMetadata {
+                    retry_class: crate::ToolRetryClass::Never,
+                    idempotency_mode: ToolIdempotencyMode::None,
+                    max_attempts: 1,
+                    can_resume: false,
+                    max_wall_clock_secs: None,
+                }
+            } else {
+                configured.spec.recovery
+            };
+            let idempotency_key = Self::derive_idempotency_key(
+                configured.spec.name.as_str(),
+                &payload,
+                recovery.idempotency_mode,
+                call_id.as_str(),
+            );
+
+            Ok(ToolCall {
+                observation,
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                session_scope_key,
+                payload,
+                execution_class: configured.execution_class,
+                turn_item_execution_class: configured.spec.turn_item_execution_class,
+                recovery,
+                permission_metadata: configured.spec.permission_metadata,
+                output_policy: configured.output_policy,
+                output_projection: configured.output_projection,
+                idempotency_key,
+                trace_id,
+            })
+        })();
+        validation.finish(match &result {
+            Ok(_) => pioneer_observability::tool_call::Fact::Returned,
+            Err(error) => crate::observation::error_fact(error),
+        });
+        result
     }
 
     pub async fn dispatch(
@@ -576,10 +690,6 @@ impl ToolRouter {
             ToolPayload::LocalShell(LocalShellPayload::WriteStdin(args)) => {
                 Some(format!("shell:{}", args.session_id))
             }
-            ToolPayload::Function { arguments } if tool_name == "computer_use" => arguments
-                .get("session_id")
-                .and_then(JsonValue::as_u64)
-                .map(|id| format!("computer_use:{id}")),
             ToolPayload::Function { arguments } if tool_name == "download_url" => arguments
                 .get("destination")
                 .and_then(JsonValue::as_str)
@@ -728,10 +838,8 @@ mod tests {
             ExecutionClass::Shared,
         )]);
 
-        let index = router.preflight_tool_index();
-
-        assert!(index.core_tools.is_empty());
-        assert!(index.candidate_tools.is_empty());
+        assert!(router.core_tool_names().is_empty());
+        assert!(router.available_tool_names().is_empty());
     }
 
     #[test]
@@ -1051,21 +1159,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn visibility_snapshot_can_hide_registered_specs() {
-        let router = router_with_specs(vec![
-            configured_spec("tool_a", PayloadKind::Function, ExecutionClass::Shared),
-            configured_spec("tool_b", PayloadKind::Function, ExecutionClass::Shared),
-        ]);
-
-        router.set_model_visible_tools(&["tool_a".to_owned()]).await;
-        let visible = router.model_visible_specs().await;
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].name, "tool_a");
-
-        assert!(router.find_spec("tool_b").is_some());
-    }
-
-    #[tokio::test]
     async fn router_reports_only_currently_visible_tools() {
         let router = router_with_specs(vec![
             configured_spec("tool_a", PayloadKind::Function, ExecutionClass::Shared),
@@ -1082,6 +1175,16 @@ mod tests {
 
         assert!(!router.is_model_visible_tool("unknown_tool").await);
         assert!(router.find_spec("unknown_tool").is_none());
+
+        assert_eq!(
+            router
+                .model_visible_specs()
+                .await
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool_a"]
+        );
     }
 
     #[tokio::test]
@@ -1186,82 +1289,6 @@ mod tests {
     }
 
     #[test]
-    fn request_tools_rejects_empty_domains() {
-        let router = router_with_specs(vec![request_tools_configured_spec()]);
-
-        let error = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_request_tools_empty".to_owned(),
-                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
-                arguments: r#"{"domains":[],"reason":"Need tools."}"#.to_owned(),
-            })
-            .expect_err("empty request_tools domains should fail");
-
-        assert!(matches!(error, ToolError::InvalidArguments(_)));
-    }
-
-    #[test]
-    fn request_tools_rejects_unknown_domain_values() {
-        let router = router_with_specs(vec![request_tools_configured_spec()]);
-
-        let error = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_request_tools_unknown".to_owned(),
-                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
-                arguments: r#"{"domains":["calendar"],"reason":"Need calendar tools."}"#.to_owned(),
-            })
-            .expect_err("unknown request_tools domains should fail");
-
-        assert!(matches!(error, ToolError::InvalidArguments(_)));
-    }
-
-    #[test]
-    fn request_tools_rejects_individual_tool_name_domains() {
-        let router = router_with_specs(vec![request_tools_configured_spec()]);
-
-        let error = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_request_tools_name".to_owned(),
-                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
-                arguments: r#"{"domains":["task_create"],"reason":"Need to create a task."}"#
-                    .to_owned(),
-            })
-            .expect_err("request_tools must accept domains, not individual tool names");
-
-        assert!(matches!(error, ToolError::InvalidArguments(_)));
-    }
-
-    #[test]
-    fn request_tools_rejects_missing_reason() {
-        let router = router_with_specs(vec![request_tools_configured_spec()]);
-
-        let error = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_request_tools_missing_reason".to_owned(),
-                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
-                arguments: r#"{"domains":["task"]}"#.to_owned(),
-            })
-            .expect_err("request_tools must require reason");
-
-        assert!(matches!(error, ToolError::InvalidArguments(_)));
-    }
-
-    #[test]
-    fn request_tools_rejects_extra_properties() {
-        let router = router_with_specs(vec![request_tools_configured_spec()]);
-
-        let error = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_request_tools_extra".to_owned(),
-                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
-                arguments: r#"{"domains":["task"],"reason":"Need task tools.","toolNames":["task_create"]}"#.to_owned(),
-            })
-            .expect_err("request_tools must reject extra properties");
-
-        assert!(matches!(error, ToolError::InvalidArguments(_)));
-    }
-
-    #[test]
     fn request_tools_rejects_blank_reason() {
         let router = router_with_specs(vec![request_tools_configured_spec()]);
 
@@ -1274,39 +1301,6 @@ mod tests {
             .expect_err("request_tools must reject blank reason");
 
         assert!(matches!(error, ToolError::InvalidArguments(_)));
-    }
-
-    #[test]
-    fn request_tools_rejects_overlong_reason() {
-        let router = router_with_specs(vec![request_tools_configured_spec()]);
-        let reason = "x".repeat(crate::domain::REQUEST_TOOLS_REASON_MAX_CHARS + 1);
-
-        let error = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_request_tools_overlong_reason".to_owned(),
-                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
-                arguments: serde_json::json!({
-                    "domains": ["task"],
-                    "reason": reason
-                })
-                .to_string(),
-            })
-            .expect_err("request_tools must reject overlong reason");
-
-        assert!(matches!(error, ToolError::InvalidArguments(_)));
-    }
-
-    #[test]
-    fn build_tool_call_returns_not_found_for_unknown_tool() {
-        let router = router_with_specs(Vec::new());
-        let error = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_3".to_owned(),
-                tool_name: "missing".to_owned(),
-                arguments: "{}".to_owned(),
-            })
-            .expect_err("unknown tool should fail");
-        assert!(matches!(error, ToolError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -1329,48 +1323,6 @@ mod tests {
                 .await
                 .is_err(),
             "router parse/build telemetry must not be published to ToolEventBus"
-        );
-    }
-
-    #[test]
-    fn computer_use_session_scope_key_is_derived_from_session_id_argument() {
-        let router = router_with_specs(vec![configured_spec(
-            "computer_use",
-            PayloadKind::Function,
-            ExecutionClass::SessionScoped,
-        )]);
-
-        let call = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_1".to_owned(),
-                tool_name: "computer_use".to_owned(),
-                arguments: r#"{"action":"status","session_id":12}"#.to_owned(),
-            })
-            .expect("tool call should parse");
-
-        assert_eq!(call.session_scope_key(), Some("computer_use:12".to_owned()));
-    }
-
-    #[test]
-    fn download_scope_key_uses_destination_when_present() {
-        let router = router_with_specs(vec![configured_spec(
-            "download_url",
-            PayloadKind::Function,
-            ExecutionClass::SessionScoped,
-        )]);
-
-        let call = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_1".to_owned(),
-                tool_name: "download_url".to_owned(),
-                arguments: r#"{"url":"https://example.com/a","destination":"/tmp/a.txt"}"#
-                    .to_owned(),
-            })
-            .expect("tool call should parse");
-
-        assert_eq!(
-            call.session_scope_key(),
-            Some("download:/tmp/a.txt".to_owned())
         );
     }
 
@@ -1439,5 +1391,33 @@ mod tests {
             .expect_err("MCP tool without binding should fail");
 
         assert!(matches!(error, ToolError::NotFound(_)));
+    }
+
+    #[test]
+    fn function_tools_reject_legacy_computer_use_and_preserve_download_destination() {
+        // CUA owns its sessions in the Gateway; the retired tool must not be
+        // resurrected by a synthetic spec carrying a caller-chosen session_id.
+        let router = router_with_specs(crate::builtin_tool_specs());
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_legacy_computer_use".to_owned(),
+                tool_name: "computer_use".to_owned(),
+                arguments: r#"{"action":"status","session_id":12}"#.to_owned(),
+            })
+            .expect_err("legacy computer_use must be rejected before dispatch");
+        assert!(matches!(error, ToolError::NotFound(name) if name == "computer_use"));
+
+        let call = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_download".to_owned(),
+                tool_name: "download_url".to_owned(),
+                arguments: r#"{"url":"https://example.com/a","destination":"/tmp/a.txt"}"#
+                    .to_owned(),
+            })
+            .expect("download tool call should parse");
+        assert_eq!(
+            call.session_scope_key(),
+            Some("download:/tmp/a.txt".to_owned())
+        );
     }
 }

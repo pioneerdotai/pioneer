@@ -50,6 +50,7 @@ pub struct ThreadCapabilityPublication {
 
 #[derive(Clone)]
 struct CapabilityRequest {
+    work: pioneer_observability::work::WorkCarrier,
     thread_id: String,
     workspace_id: String,
     principal_id: PrincipalId,
@@ -63,6 +64,7 @@ pub(crate) struct ThreadCapabilityController {
     publications: HashMap<String, Arc<ThreadCapabilityPublication>>,
     subscriptions: HashMap<String, usize>,
     sender: Option<mpsc::SyncSender<CapabilityRequest>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<JoinHandle<()>>,
 }
 impl ThreadCapabilityController {
@@ -193,6 +195,12 @@ impl ClientCore {
         }
         let generation = owner.next_generation();
         let request = CapabilityRequest {
+            work: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             thread_id: thread_id.clone(),
             workspace_id: workspace_id.clone(),
             principal_id,
@@ -210,11 +218,14 @@ impl ClientCore {
                 snapshot: None,
             },
         );
-        if owner
-            .sender
-            .as_ref()
-            .is_none_or(|sender| sender.try_send(request.clone()).is_err())
-        {
+        if owner.sender.as_ref().is_none_or(|sender| {
+            pioneer_observability::queues::observe_try_send(
+                owner.observer.as_ref(),
+                pioneer_observability::queues::QueueBytes::Unsupported,
+                || sender.try_send(request.clone()),
+            )
+            .is_err()
+        }) {
             drop(owner);
             return self.complete_thread_capability(
                 &request,
@@ -337,11 +348,29 @@ impl ClientCore {
 
     pub(crate) fn start_thread_capability_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<CapabilityRequest>(64);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(64),
+            "unsupported: controller request payload/shared references are not serialized",
+        );
+        let worker_queue = queue_observer.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-thread-capabilities".into())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
+                    worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+                    let mut processing = worker_queue.processing();
+                    let work = request.work.clone().received(
+                        pioneer_observability::work::Boundary::StdThread,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _work_scope = work.enter();
+                    let mut active_work = pioneer_observability::live::WorkGuard::start(
+                        pioneer_observability::work::current(),
+                        false,
+                    );
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
@@ -389,10 +418,17 @@ impl ClientCore {
                         );
                         Ok(snapshot)
                     });
+                    let outcome = if result.is_ok() {
+                        pioneer_observability::work::Outcome::Completed
+                    } else {
+                        pioneer_observability::work::Outcome::Failed
+                    };
                     core.complete_thread_capability(
                         &request,
                         result.map_err(|error| format!("{error:#}")),
                     );
+                    processing.processed();
+                    active_work.finish(outcome);
                 }
             })
             .expect("thread capability worker could not start");
@@ -400,6 +436,7 @@ impl ClientCore {
             .thread_capabilities
             .lock()
             .expect("thread capability owner poisoned");
+        owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);
     }

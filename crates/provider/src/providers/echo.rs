@@ -52,6 +52,7 @@ impl crate::traits::Provider for EchoProvider {
         let tool_calls = Vec::new();
         let termination = crate::ProviderTermination::Complete;
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage: None,
             reasoning_content,
@@ -112,6 +113,8 @@ mod tests {
             .get_or_create("echo")
             .expect("test provider should resolve with an authority fingerprint");
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "test".into(),
             messages: vec![
                 ChatMessage::system("system prompt"),
@@ -137,6 +140,8 @@ mod tests {
             .get_or_create("echo")
             .expect("test provider should resolve with an authority fingerprint");
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "test".into(),
             messages: vec![ChatMessage::user("streaming test")],
             temperature: None,

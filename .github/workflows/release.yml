@@ -1,0 +1,555 @@
+name: Release
+run-name: Release (${{ github.ref_name }})
+
+on:
+  push:
+    tags: ["*"]
+
+permissions:
+  contents: write
+  actions: read
+
+# A second release run for the same tag must not mutate the draft concurrently.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: keep-release-hidden-until-all-assets-are-ready
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          prerelease_flag=""
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft ${prerelease_flag}
+          else
+            if ! gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" --draft ${prerelease_flag}; then
+              gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                --draft ${prerelease_flag}
+            fi
+          fi
+
+          [[ "$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq '.isDraft')" == true ]] || {
+            echo 'release preparation did not leave the current tag in draft' >&2
+            exit 1
+          }
+
+  preflight:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: validate-release-declaration-and-existing-signing-parameters
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+          MACOS_DMG_SIGN_IDENTITY: ${{ secrets.MACOS_DMG_SIGN_IDENTITY }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+          APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+          APPLE_NOTARIZATION_KEY_BASE64: ${{ secrets.APPLE_NOTARIZATION_KEY_BASE64 }}
+          WINDOWS_SIGNING_REQUIRED: "false"
+          WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
+          WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+          WINDOWS_SIGNING_SUBJECT_NAME: ${{ secrets.WINDOWS_SIGNING_SUBJECT_NAME }}
+        run: python scripts/packaging/release-preflight.py --signing
+
+  generate-model-catalog:
+    name: generate-model-catalog
+    needs: preflight
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-model-catalog-v1
+
+      - name: generate-and-validate-model-catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-model-catalog
+          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
+            release-model-catalog/catalog.json
+
+      - name: upload-model-catalog
+        uses: actions/upload-artifact@v6
+        with:
+          name: pioneer-release-model-catalog-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: release-model-catalog/catalog.json
+          if-no-files-found: error
+
+  platforms:
+    name: release-${{ matrix.target }}
+    needs: [preflight, generate-model-catalog]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: pioneer-gateway-linux-x86_64.gz
+            cu_asset: pioneer-gateway-linux-x86_64-computer-use-package.zip
+            asset_name: pioneer-linux-x86_64.AppImage
+            update_asset_name: pioneer-linux-x86_64.AppImage
+            appimagetool_arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: pioneer-gateway-linux-aarch64.gz
+            cu_asset: pioneer-gateway-linux-aarch64-computer-use-package.zip
+            asset_name: pioneer-linux-aarch64.AppImage
+            update_asset_name: pioneer-linux-aarch64.AppImage
+            appimagetool_arch: aarch64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: pioneer-gateway-macos-x86_64.zip
+            cu_asset: pioneer-gateway-macos-x86_64-computer-use-package.zip
+            asset_name: Pioneer-x86_64.dmg
+            update_asset_name: Pioneer-x86_64.app.zip
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset: pioneer-gateway-macos-aarch64.gz
+            cu_asset: pioneer-gateway-macos-aarch64-computer-use-package.zip
+            asset_name: Pioneer-aarch64.dmg
+            update_asset_name: Pioneer-aarch64.app.zip
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: pioneer-gateway-windows-x86_64.zip
+            cu_asset: pioneer-gateway-windows-x86_64-computer-use-package.zip
+            asset_name: Pioneer-x86_64.msi
+            update_asset_name: Pioneer-x86_64.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset: pioneer-gateway-windows-aarch64.zip
+            cu_asset: pioneer-gateway-windows-aarch64-computer-use-package.zip
+            asset_name: Pioneer-aarch64.msi
+            update_asset_name: Pioneer-aarch64.exe
+    uses: ./.github/workflows/release-platform.yml
+    with:
+      platform: ${{ toJSON(matrix) }}
+    secrets: inherit
+
+  publish-release:
+    name: publish-release
+    runs-on: ubuntu-latest
+    needs: platforms
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: select-complete-release-artifact-set
+        id: select
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const targets = ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
+                             'x86_64-apple-darwin', 'aarch64-apple-darwin',
+                             'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc'];
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts,
+              {owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId, per_page: 100});
+            const roles = targets.flatMap(target => [`gateway-assets-${target}-default`,
+              `gateway-assets-${target}-computer-use`, `desktop-assets-${target}`]);
+            const ids = roles.map(role => {
+              const prefix = `${role}-run-${context.runId}-attempt-`;
+              const candidates = artifacts.filter(row => row.name.startsWith(prefix)).map(row => {
+                const attempt = row.name.slice(prefix.length);
+                if (!/^[1-9][0-9]*$/.test(attempt)) throw new Error(`Malformed release input: ${row.name}`);
+                return {...row, attempt: Number(attempt)};
+              }).filter(row => row.attempt <= Number(process.env.GITHUB_RUN_ATTEMPT));
+              candidates.sort((a,b) => b.attempt - a.attempt);
+              if (!candidates.length || candidates[0].expired ||
+                  candidates.filter(row => row.attempt === candidates[0].attempt).length !== 1) {
+                throw new Error(`Missing, expired or ambiguous release input: ${role}`);
+              }
+              return String(candidates[0].id);
+            });
+            core.setOutput('ids', ids.join(','));
+      - name: download-exact-release-assets
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ steps.select.outputs.ids }}
+          path: dist
+          merge-multiple: true
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: pioneer-release-model-catalog
+          path: release-model-catalog
+      - name: verify-complete-asset-provenance
+        shell: bash
+        run: |
+          python3 <<'PYPROVENANCE'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tomllib
+
+          dist = Path('dist')
+          catalog_hash = hashlib.sha256(Path('release-model-catalog/catalog.json').read_bytes()).hexdigest()
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          platforms = {
+              'x86_64-unknown-linux-gnu': ('linux-x86_64', 'gz', ['pioneer-linux-x86_64.AppImage']),
+              'aarch64-unknown-linux-gnu': ('linux-aarch64', 'gz', ['pioneer-linux-aarch64.AppImage']),
+              'x86_64-apple-darwin': ('macos-x86_64', 'zip', ['Pioneer-x86_64.dmg', 'Pioneer-x86_64.app.zip']),
+              'aarch64-apple-darwin': ('macos-aarch64', 'gz', ['Pioneer-aarch64.dmg', 'Pioneer-aarch64.app.zip']),
+              'x86_64-pc-windows-msvc': ('windows-x86_64', 'zip', ['Pioneer-x86_64.msi', 'Pioneer-x86_64.exe']),
+              'aarch64-pc-windows-msvc': ('windows-aarch64', 'zip', ['Pioneer-aarch64.msi', 'Pioneer-aarch64.exe']),
+          }
+          expected = {}
+          for target, (platform, extension, desktop) in platforms.items():
+              expected[f'pioneer-gateway-{platform}.{extension}'] = (target, 'default')
+              expected[f'pioneer-gateway-{platform}-computer-use-package.zip'] = (target, 'computer-use')
+              expected.update({name: (target, 'desktop') for name in desktop})
+          expected_files = set(expected) | {name + '.provenance.json' for name in expected}
+          if {path.name for path in dist.iterdir()} != expected_files:
+              raise ValueError('Release must contain precisely all 12 Gateway and 10 Desktop assets and their private provenance')
+          receipts = {}
+          for name, (target, variant) in expected.items():
+              path = dist / name
+              receipt = json.loads((dist / (name + '.provenance.json')).read_text())
+              source = receipt['source']
+              required = dict(schema_version=1, run_id=os.environ['GITHUB_RUN_ID'], commit=os.environ['GITHUB_SHA'],
+                              target=target, variant=variant, version=version, profile='release', catalog_sha256=catalog_hash)
+              if receipt.get('schema_version') != 1 or receipt.get('asset') != name or any(source.get(k) != v for k, v in required.items()):
+                  raise ValueError(f'Asset provenance differs from this release: {name}')
+              attempt = str(source.get('run_attempt', ''))
+              if not attempt.isdecimal() or not 1 <= int(attempt) <= int(os.environ['GITHUB_RUN_ATTEMPT']):
+                  raise ValueError(f'Invalid producer attempt: {name}')
+              if hashlib.sha256(path.read_bytes()).hexdigest() != receipt['sha256']:
+                  raise ValueError(f'Asset checksum mismatch: {name}')
+              receipts[name] = receipt
+              if variant == 'computer-use':
+                  subprocess.run(['python3', 'scripts/packaging/cua-driver.py', 'validate', '--target', target,
+                                  '--archive', str(path)], check=True)
+          for name, receipt in receipts.items():
+              if expected[name][1] == 'desktop':
+                  gateway = receipt.get('gateway_asset')
+                  if (gateway not in receipts or expected[gateway] != (expected[name][0], 'computer-use')
+                          or receipt.get('gateway_sha256') != receipts[gateway]['sha256']):
+                      raise ValueError(f'Desktop does not embed the released Gateway package: {name}')
+          for name in expected:
+              (dist / (name + '.provenance.json')).unlink()
+          PYPROVENANCE
+
+      - name: assemble-release-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist
+          cd dist
+          rm -f SHA256SUMS
+          shopt -s nullglob
+          files=(pioneer-gateway-*.gz pioneer-gateway-*.zip)
+          if [[ ${#files[@]} -ne 12 ]]; then
+            echo "expected all 12 Gateway assets before publication, found ${#files[@]}"
+            exit 1
+          fi
+          for platform in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 windows-x86_64 windows-aarch64; do
+            extension=zip
+            case "$platform" in linux-*|macos-aarch64) extension=gz ;; esac
+            test -f "pioneer-gateway-${platform}.${extension}"
+            test -f "pioneer-gateway-${platform}-computer-use-package.zip"
+          done
+          for file in "${files[@]}"; do
+            sha="$(sha256sum "$file" | awk '{print $1}')"
+            printf 'sha256:%s %s\n' "$sha" "$file" >> SHA256SUMS
+          done
+          sort -o SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
+
+      - name: assemble-desktop-update-metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          dist = Path("dist")
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag[1:] if tag.startswith(("v", "V")) else tag
+          channel = "stable"
+          if "-canary" in tag:
+              channel = "canary"
+          elif "-beta" in tag:
+              channel = "beta"
+          elif "-" in tag:
+              channel = "prerelease"
+
+          expected_assets = [
+              ("macos", "aarch64", "macos_app_zip", "Pioneer-aarch64.app.zip"),
+              ("macos", "x86_64", "macos_app_zip", "Pioneer-x86_64.app.zip"),
+              ("linux", "x86_64", "appimage", "pioneer-linux-x86_64.AppImage"),
+              ("linux", "aarch64", "appimage", "pioneer-linux-aarch64.AppImage"),
+              ("windows", "x86_64", "wix_bundle_exe", "Pioneer-x86_64.exe"),
+              ("windows", "aarch64", "wix_bundle_exe", "Pioneer-aarch64.exe"),
+          ]
+
+          assets = []
+          checksum_lines = []
+          for os_name, arch, kind, file_name in expected_assets:
+              path = dist / file_name
+              if not path.is_file():
+                  raise SystemExit(f"missing expected desktop update asset: {path}")
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              size_bytes = path.stat().st_size
+              assets.append(
+                  {
+                      "os": os_name,
+                      "arch": arch,
+                      "kind": kind,
+                      "name": file_name,
+                      "sha256": digest,
+                      "size_bytes": size_bytes,
+                  }
+              )
+              checksum_lines.append(f"sha256:{digest} {file_name}")
+
+          manifest = {
+              "schema_version": 1,
+              "product": "pioneer-desktop",
+              "version": version,
+              "tag": tag,
+              "channel": channel,
+              "published_at": datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+              "assets": assets,
+          }
+
+          manifest_path = dist / "desktop-update-manifest.json"
+          manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+          manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+          checksum_lines.append(f"sha256:{manifest_digest} desktop-update-manifest.json")
+          (dist / "DESKTOP_SHA256SUMS").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: validate-desktop-update-metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          jq -e '
+            .schema_version == 1
+            and .product == "pioneer-desktop"
+            and (.version | type == "string" and length > 0)
+            and (.tag | type == "string" and length > 0)
+            and (.channel | type == "string" and length > 0)
+            and (.published_at | type == "string" and length > 0)
+            and (.assets | type == "array")
+          ' dist/desktop-update-manifest.json >/dev/null
+
+          python3 <<'PY'
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          dist = Path("dist")
+          manifest_path = dist / "desktop-update-manifest.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          expected = {
+              ("macos", "aarch64"): ("macos_app_zip", "Pioneer-aarch64.app.zip"),
+              ("macos", "x86_64"): ("macos_app_zip", "Pioneer-x86_64.app.zip"),
+              ("linux", "x86_64"): ("appimage", "pioneer-linux-x86_64.AppImage"),
+              ("linux", "aarch64"): ("appimage", "pioneer-linux-aarch64.AppImage"),
+              ("windows", "x86_64"): ("wix_bundle_exe", "Pioneer-x86_64.exe"),
+              ("windows", "aarch64"): ("wix_bundle_exe", "Pioneer-aarch64.exe"),
+          }
+
+          seen = {}
+          rows = []
+          for index, asset in enumerate(manifest["assets"]):
+              for field in ("os", "arch", "kind", "name", "sha256", "size_bytes"):
+                  if field not in asset:
+                      raise SystemExit(f"manifest asset #{index} missing field: {field}")
+
+              key = (asset["os"], asset["arch"])
+              if key not in expected:
+                  raise SystemExit(f"unexpected desktop update asset platform: {key[0]}/{key[1]}")
+              if key in seen:
+                  raise SystemExit(f"duplicate desktop update asset platform: {key[0]}/{key[1]}")
+
+              expected_kind, expected_name = expected[key]
+              if asset["kind"] != expected_kind:
+                  raise SystemExit(f"{key[0]}/{key[1]} has kind {asset['kind']}, expected {expected_kind}")
+              if asset["name"] != expected_name:
+                  raise SystemExit(f"{key[0]}/{key[1]} has name {asset['name']}, expected {expected_name}")
+              if not re.fullmatch(r"[0-9a-f]{64}", asset["sha256"]):
+                  raise SystemExit(f"{asset['name']} has invalid sha256 format")
+
+              asset_path = dist / asset["name"]
+              if not asset_path.is_file():
+                  raise SystemExit(f"manifest asset file is missing: {asset_path}")
+              actual_sha256 = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+              if actual_sha256 != asset["sha256"]:
+                  raise SystemExit(f"{asset['name']} sha256 mismatch: {actual_sha256} != {asset['sha256']}")
+              actual_size = asset_path.stat().st_size
+              if actual_size != asset["size_bytes"]:
+                  raise SystemExit(f"{asset['name']} size mismatch: {actual_size} != {asset['size_bytes']}")
+
+              seen[key] = asset
+              rows.append((asset["os"], asset["arch"], asset["kind"], asset["name"], actual_size, actual_sha256[:12]))
+
+          missing = sorted(set(expected) - set(seen))
+          if missing:
+              missing_text = ", ".join(f"{os_name}/{arch}" for os_name, arch in missing)
+              raise SystemExit(f"missing expected desktop update asset platforms: {missing_text}")
+
+          expected_checksums = {
+              asset["name"]: asset["sha256"]
+              for asset in manifest["assets"]
+          }
+          expected_checksums["desktop-update-manifest.json"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+          checksum_path = dist / "DESKTOP_SHA256SUMS"
+          actual_checksums = {}
+          for line_number, raw_line in enumerate(checksum_path.read_text(encoding="utf-8").splitlines(), start=1):
+              if not raw_line:
+                  continue
+              try:
+                  digest_part, file_name = raw_line.split(" ", 1)
+              except ValueError:
+                  raise SystemExit(f"DESKTOP_SHA256SUMS line {line_number} is malformed")
+              if not digest_part.startswith("sha256:"):
+                  raise SystemExit(f"DESKTOP_SHA256SUMS line {line_number} does not start with sha256:")
+              digest = digest_part.removeprefix("sha256:")
+              if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                  raise SystemExit(f"DESKTOP_SHA256SUMS line {line_number} has invalid sha256")
+              if file_name in actual_checksums:
+                  raise SystemExit(f"DESKTOP_SHA256SUMS has duplicate entry: {file_name}")
+              actual_checksums[file_name] = digest
+
+          if actual_checksums != expected_checksums:
+              raise SystemExit("DESKTOP_SHA256SUMS does not match desktop update manifest assets")
+
+          print("Desktop update release assets:")
+          print(f"{'os':<8} {'arch':<8} {'kind':<16} {'name':<32} {'bytes':>12} {'sha256':<12}")
+          for row in rows:
+              print(f"{row[0]:<8} {row[1]:<8} {row[2]:<16} {row[3]:<32} {row[4]:>12} {row[5]:<12}")
+          PY
+
+      - name: publish-github-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for arch in x86_64 aarch64; do
+            test -f "dist/Pioneer-${arch}.dmg"
+            test -f "dist/Pioneer-${arch}.msi"
+          done
+          files=(
+            dist/pioneer-gateway-*.gz
+            dist/pioneer-gateway-*.zip
+            dist/SHA256SUMS
+            dist/Pioneer-*.app.zip
+            dist/Pioneer-*.dmg
+            dist/Pioneer-*.exe
+            dist/Pioneer-*.msi
+            dist/pioneer-linux-*.AppImage
+            dist/desktop-update-manifest.json
+            dist/DESKTOP_SHA256SUMS
+          )
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "no release assets found in dist/"
+            exit 1
+          fi
+
+          prerelease_flag=""
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          # prepare-release hides the current tag before any builds start.
+          # Keep it hidden throughout asset upload and verification.
+          [[ "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" == true ]] || {
+            echo 'the prepared release must remain draft until all assets are ready' >&2; exit 1;
+          }
+
+          gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
+          gh release view "${GITHUB_REF_NAME}" --json assets > release-remote-inventory.json
+          python3 <<'PYREMOTE'
+          import hashlib
+          import json
+          from pathlib import Path
+          remote = json.loads(Path('release-remote-inventory.json').read_text())['assets']
+          expected = {path.name: path.stat().st_size for path in Path('dist').iterdir()}
+          if len(remote) != len(expected) or {row['name']: row['size'] for row in remote} != expected:
+              raise ValueError('Draft uploaded inventory/size does not match the complete validated release')
+          for row in remote:
+              if row.get('state') != 'uploaded':
+                  raise ValueError('Draft contains an incomplete remote upload')
+              digest = row.get('digest')
+              if digest and digest != 'sha256:' + hashlib.sha256((Path('dist') / row['name']).read_bytes()).hexdigest():
+                  raise ValueError('Remote release asset digest differs from validated bytes')
+          PYREMOTE
+
+          # This is the only publication point: both products are already uploaded.
+          if [[ -n "${prerelease_flag}" ]]; then
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease
+          else
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease=false --latest
+          fi
+
+  # Dispatch once the exact inputs exist; publication does not wait for symbols.
+  queue-debug-symbols:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    name: queue-independent-debug-symbols
+    needs: platforms
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'build-debug-symbols.yml',
+              ref: context.ref.replace(/^refs\/(heads|tags)\//, ''),
+              inputs: {source_run_id: String(context.runId)},
+            });

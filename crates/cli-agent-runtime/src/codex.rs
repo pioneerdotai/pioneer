@@ -112,16 +112,25 @@ where
 pub struct CodexJsonlRpcClient {
     command_tx: mpsc::Sender<CodexJsonlRpcCommand>,
     next_request_id: Arc<AtomicI64>,
-    notification_rx: Arc<StdMutex<Option<mpsc::Receiver<CodexJsonlRpcNotificationEvent>>>>,
+    notification_rx: Arc<
+        StdMutex<
+            Option<
+                mpsc::Receiver<
+                    pioneer_observability::work::WorkItem<CodexJsonlRpcNotificationEvent>,
+                >,
+            >,
+        >,
+    >,
     server_request_rx: Arc<StdMutex<Option<mpsc::Receiver<CodexJsonlRpcServerRequest>>>>,
     diagnostic_rx: Arc<StdMutex<Option<mpsc::Receiver<CodexJsonlRpcClientDiagnostic>>>>,
 }
 
 /// Owns only this transport's reader, writer/dispatcher and ordered ingress.
 /// A service attempt joins these after terminating its own App Server process.
-/// Dropping the owner aborts every task even when client clones remain alive.
+/// Dropping the owner aborts async workers even when client clones remain alive.
 pub struct CodexJsonlRpcOwner {
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    join_failure: Option<String>,
 }
 impl CodexJsonlRpcOwner {
     pub async fn shutdown(mut self) {
@@ -129,13 +138,31 @@ impl CodexJsonlRpcOwner {
     }
 
     pub async fn abort_and_join(&mut self) {
+        // Preserve the service/probe API's best-effort contract. Runtime stop
+        // callers use the result-returning operation below.
+        let _ = self.abort_and_join_result().await;
+    }
+
+    /// Stop and join this exact transport, including ordered event ingress.
+    /// Keep handles across cancellation and a consumed panic across retries;
+    /// neither an abort request nor an empty task vector is successful proof.
+    pub async fn abort_and_join_result(&mut self) -> anyhow::Result<()> {
         for task in &self.tasks {
             task.abort();
         }
         while let Some(task) = self.tasks.last_mut() {
-            let _ = task.await;
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+                && self.join_failure.is_none()
+            {
+                self.join_failure = Some("Codex transport task failed while stopping".to_owned());
+            }
             self.tasks.pop();
         }
+        if let Some(failure) = &self.join_failure {
+            return Err(anyhow::anyhow!("{failure}"));
+        }
+        Ok(())
     }
 
     fn detach(mut self) {
@@ -164,9 +191,8 @@ impl CodexJsonlRpcClient {
             DEFAULT_INCOMING_QUEUE_CAPACITY,
             DEFAULT_COMMAND_QUEUE_CAPACITY,
             DEFAULT_SERVER_REQUEST_TIMEOUT,
-            // Service responses are bounded in memory. Disabling the larger
-            // disk recovery path also prevents detached spawn_blocking spool
-            // decoders from surviving cancellation of this attempt's owner.
+            // Service responses retain their bounded in-memory contract.
+            // Persistent Gateway constructors retain their larger spool budget.
             crate::NativeEventBudget {
                 max_frame_bytes: CODEX_MAX_MATERIALIZED_FRAME_BYTES,
                 max_recovery_frame_bytes: CODEX_MAX_MATERIALIZED_FRAME_BYTES,
@@ -223,6 +249,32 @@ impl CodexJsonlRpcClient {
         W: AsyncWrite + Send + Unpin + 'static,
     {
         Self::new_with_server_request_policy(
+            reader,
+            writer,
+            notification_capacity,
+            server_request_capacity,
+            diagnostic_capacity,
+            DEFAULT_SERVER_REQUEST_TIMEOUT,
+            native_event_budget,
+        )
+    }
+
+    /// The persistent Gateway session owns the same workers as a service
+    /// attempt while retaining its configured channel capacities/event budget.
+    /// The legacy constructor above intentionally remains detached.
+    pub fn new_owned_with_channel_capacity_and_budget<R, W>(
+        reader: R,
+        writer: W,
+        notification_capacity: usize,
+        server_request_capacity: usize,
+        diagnostic_capacity: usize,
+        native_event_budget: crate::NativeEventBudget,
+    ) -> (Self, CodexJsonlRpcOwner)
+    where
+        R: AsyncBufRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::new_owned_with_server_request_policy(
             reader,
             writer,
             notification_capacity,
@@ -321,6 +373,7 @@ impl CodexJsonlRpcClient {
             client,
             CodexJsonlRpcOwner {
                 tasks: vec![reader_worker, rpc_worker, ingress_worker],
+                join_failure: None,
             },
         )
     }
@@ -433,7 +486,8 @@ impl CodexJsonlRpcClient {
 
     pub fn take_notification_receiver(
         &self,
-    ) -> Option<mpsc::Receiver<CodexJsonlRpcNotificationEvent>> {
+    ) -> Option<mpsc::Receiver<pioneer_observability::work::WorkItem<CodexJsonlRpcNotificationEvent>>>
+    {
         self.notification_rx
             .lock()
             .expect("notification receiver mutex should not be poisoned")
@@ -4963,7 +5017,9 @@ async fn wait_for_codex_login_completion(
     stderr_ring: crate::process::StderrRing,
     shutdown_grace: Duration,
     login_id: Option<String>,
-    mut notifications: Option<mpsc::Receiver<CodexJsonlRpcNotificationEvent>>,
+    mut notifications: Option<
+        mpsc::Receiver<pioneer_observability::work::WorkItem<CodexJsonlRpcNotificationEvent>>,
+    >,
 ) {
     if let Some(notifications) = notifications.as_mut() {
         let wait = async {
@@ -5390,8 +5446,7 @@ const CODEX_NOTIFICATION_MAX_PENDING_PROGRESS_BYTES: usize = 64 * 1024;
 fn codex_notification_is_progress(method: &str) -> bool {
     matches!(
         method,
-        "thread/tokenUsage/updated"
-            | "account/rateLimits/updated"
+        "account/rateLimits/updated"
             | "turn/plan/updated"
             | "turn/diff/updated"
             | "item/agentMessage/delta"
@@ -5467,8 +5522,7 @@ fn merge_codex_progress_notification(
 fn codex_notification_progress_is_snapshot(method: &str) -> bool {
     matches!(
         method,
-        "thread/tokenUsage/updated"
-            | "account/rateLimits/updated"
+        "account/rateLimits/updated"
             | "turn/plan/updated"
             | "turn/diff/updated"
             | "item/reasoning/summaryPartAdded"
@@ -5526,7 +5580,7 @@ async fn run_codex_jsonl_rpc_reader<R>(
                 }
             }
             Ok(Some(crate::native_event::SpooledNativeFrame::Oversized { file, total_bytes })) => {
-                let decoded = tokio::task::spawn_blocking(move || {
+                let decoded = pioneer_observability::work::spawn_blocking(move || {
                     decode_oversized_codex_frame(file, total_bytes)
                 })
                 .await;
@@ -7991,7 +8045,7 @@ async fn resolve_oversized_codex_response(
     if kind == OversizedCodexResponseKind::Success {
         match pending_request.oversized_success_recovery {
             Some(OversizedSuccessRecovery::ThreadOpenSnapshot { method }) => {
-                let recovered = tokio::task::spawn_blocking(move || {
+                let recovered = pioneer_observability::work::spawn_blocking(move || {
                     extract_thread_open_snapshot_from_spooled_response(file, method)
                 })
                 .await
@@ -8008,7 +8062,7 @@ async fn resolve_oversized_codex_response(
                 native_thread_id,
                 native_turn_id,
             }) => {
-                let recovered = tokio::task::spawn_blocking(move || {
+                let recovered = pioneer_observability::work::spawn_blocking(move || {
                     extract_thread_turn_snapshot_from_spooled_response(
                         file,
                         native_thread_id.as_str(),
@@ -8031,7 +8085,7 @@ async fn resolve_oversized_codex_response(
     if total_bytes > CODEX_MAX_MATERIALIZED_FRAME_BYTES {
         if kind == OversizedCodexResponseKind::Error {
             let expected_id = id.clone();
-            let recovered = tokio::task::spawn_blocking(move || {
+            let recovered = pioneer_observability::work::spawn_blocking(move || {
                 extract_oversized_codex_error_response(file, &expected_id)
             })
             .await
@@ -8063,7 +8117,7 @@ async fn resolve_oversized_codex_response(
         return;
     }
 
-    let decoded = tokio::task::spawn_blocking(move || {
+    let decoded = pioneer_observability::work::spawn_blocking(move || {
         file.seek(SeekFrom::Start(0)).map_err(|error| {
             JsonlRpcDecodeError::new(
                 JsonlRpcDecodeErrorKind::InvalidMessage,
@@ -8411,6 +8465,125 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, split};
+
+    #[tokio::test]
+    async fn persistent_owned_transport_retains_capacities_and_closes_pending_rpc() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let (reader, writer) = split(client_io);
+        let (client, mut owner) = CodexJsonlRpcClient::new_owned_with_channel_capacity_and_budget(
+            BufReader::new(reader),
+            writer,
+            7,
+            11,
+            13,
+            codex_native_event_budget(),
+        );
+        let mut notifications = client.take_notification_receiver().unwrap();
+        let mut requests = client.take_server_request_receiver().unwrap();
+        let mut diagnostics = client.take_diagnostic_receiver().unwrap();
+        assert_eq!(notifications.max_capacity(), 7);
+        assert_eq!(requests.max_capacity(), 11);
+        assert_eq!(diagnostics.max_capacity(), 13);
+        let pending = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request_value("pending", None, Duration::from_secs(60))
+                    .await
+            }
+        });
+        let mut server = BufReader::new(server_io);
+        server.read_line(&mut String::new()).await.unwrap();
+        owner.abort_and_join_result().await.unwrap();
+        assert!(pending.await.unwrap().is_err());
+        assert!(notifications.recv().await.is_none());
+        assert!(requests.recv().await.is_none());
+        assert!(diagnostics.recv().await.is_none());
+        assert!(owner.tasks.is_empty());
+        owner.abort_and_join_result().await.unwrap();
+        assert_eq!(server.read_line(&mut String::new()).await.unwrap(), 0);
+        assert!(
+            client
+                .request_value("late", None, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_join_cancellation_retains_pending_handle_and_consumed_panic() {
+        // A running blocking worker cannot be aborted: it represents delayed
+        // native cleanup, without starting a provider/process/fixture.
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let delayed = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        ready.await.unwrap();
+        let panicked = tokio::spawn(async {
+            panic!("transport worker panic");
+        });
+        while !panicked.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut owner = CodexJsonlRpcOwner {
+            tasks: vec![delayed, panicked],
+            join_failure: None,
+        };
+        {
+            let mut stop = Box::pin(owner.abort_and_join_result());
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(stop.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            // Cancelling this waiter must not detach delayed native cleanup.
+        }
+        assert_eq!(owner.tasks.len(), 1);
+        assert!(owner.join_failure.is_some());
+        release.send(()).unwrap();
+        assert!(owner.abort_and_join_result().await.is_err());
+        assert!(
+            owner.tasks.is_empty(),
+            "all other workers still drain after a panic"
+        );
+        assert!(
+            owner.abort_and_join_result().await.is_err(),
+            "consumed panic stays failed"
+        );
+        owner.abort_and_join().await; // legacy best effort does not erase it
+        assert!(owner.abort_and_join_result().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn old_transport_close_does_not_stop_replacement_transport() {
+        let (old_io, _old_server) = tokio::io::duplex(1024);
+        let (reader, writer) = split(old_io);
+        let (_old, mut old_owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+        let (new_io, new_server) = tokio::io::duplex(1024);
+        let (reader, writer) = split(new_io);
+        let (replacement, mut replacement_owner) =
+            CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+        old_owner.abort_and_join_result().await.unwrap();
+        let pending = tokio::spawn(async move {
+            replacement
+                .request_value("replacement", None, Duration::from_secs(1))
+                .await
+        });
+        let mut server = BufReader::new(new_server);
+        let mut line = String::new();
+        server.read_line(&mut line).await.unwrap();
+        let request: JsonValue = serde_json::from_str(&line).unwrap();
+        let response = json!({"id": request["id"], "result": {"alive": true}});
+        server
+            .get_mut()
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(pending.await.unwrap().unwrap(), json!({"alive": true}));
+        replacement_owner.abort_and_join_result().await.unwrap();
+    }
 
     #[tokio::test]
     async fn owned_codex_transport_joins_all_tasks_between_attempts() {
@@ -9125,6 +9298,46 @@ while read line; do :; done
     }
 
     #[tokio::test]
+    async fn notification_ingress_preserves_usage_reset_and_repeated_values() {
+        let (client, mut server_reader, mut server_writer) = client_pair_with_capacities(1, 1, 4);
+        let mut notifications = client.take_notification_receiver().unwrap();
+        // Keep the output capacity at one while several updates for the same
+        // turn enter the real RPC reader/dispatcher/ordered ingress.
+        for input in [80, 100, 0, 20, 100] {
+            let line = json!({"method":"thread/tokenUsage/updated","params":{
+                "threadId":"thread", "turnId":"turn",
+                "tokenUsage":{"total":{"inputTokens":input}}
+            }})
+            .to_string()
+                + "\n";
+            server_writer.write_all(line.as_bytes()).await.unwrap();
+        }
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                    .await
+            })
+        };
+        let rpc = read_server_line(&mut server_reader).await;
+        let response = json!({"id":rpc["id"],"result":{}}).to_string() + "\n";
+        server_writer.write_all(response.as_bytes()).await.unwrap();
+        request.await.unwrap().unwrap();
+        for expected in [80, 100, 0, 20, 100] {
+            let notification = tokio::time::timeout(Duration::from_secs(2), notifications.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(notification.method, "thread/tokenUsage/updated");
+            assert_eq!(
+                notification.params.as_ref().unwrap()["tokenUsage"]["total"]["inputTokens"],
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn notification_ingress_survives_delta_storm_and_retains_terminal_events() {
         let (client, mut server_reader, mut server_writer) = client_pair_with_capacities(1, 1, 4);
         let mut notifications = client
@@ -9334,33 +9547,6 @@ while read line; do :; done
     }
 
     #[tokio::test]
-    async fn command_approval_accept_writes_codex_decision_payload() {
-        assert_command_approval_decision_response(
-            CodexCommandApprovalDecision::Accept,
-            json!("accept"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn command_approval_accept_for_session_writes_codex_decision_payload() {
-        assert_command_approval_decision_response(
-            CodexCommandApprovalDecision::AcceptForSession,
-            json!("acceptForSession"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn command_approval_decline_writes_codex_decision_payload() {
-        assert_command_approval_decision_response(
-            CodexCommandApprovalDecision::Decline,
-            json!("decline"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
     async fn command_approval_cancel_writes_decision_and_can_interrupt_turn() {
         let (rpc, mut server_reader, mut server_writer) = client_pair();
         let mut server_requests = rpc
@@ -9495,33 +9681,6 @@ while read line; do :; done
         assert_eq!(decoded.native_item_id.as_deref(), Some("codex-item-1"));
         assert_eq!(decoded.started_at_ms, Some(1234));
         assert_eq!(decoded.raw["futureField"], json!(true));
-    }
-
-    #[tokio::test]
-    async fn file_change_approval_accept_writes_codex_decision_payload() {
-        assert_file_change_approval_decision_response(
-            CodexFileChangeApprovalDecision::Accept,
-            json!("accept"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn file_change_approval_decline_writes_codex_decision_payload() {
-        assert_file_change_approval_decision_response(
-            CodexFileChangeApprovalDecision::Decline,
-            json!("decline"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn file_change_approval_cancel_writes_codex_decision_payload() {
-        assert_file_change_approval_decision_response(
-            CodexFileChangeApprovalDecision::Cancel,
-            json!("cancel"),
-        )
-        .await;
     }
 
     async fn assert_file_change_approval_decision_response(
@@ -11482,7 +11641,7 @@ while read line; do :; done
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "item/completed");
         assert_eq!(
-            notification.params.expect("notification params")["item"]["aggregatedOutput"],
+            notification.value.params.expect("notification params")["item"]["aggregatedOutput"],
             json!(output)
         );
 
@@ -11539,7 +11698,7 @@ while read line; do :; done
             .expect("oversized notification should arrive")
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "item/completed");
-        let params = notification.params.expect("notification params");
+        let params = notification.value.params.expect("notification params");
         assert_eq!(params["threadId"], json!("thread-control"));
         assert_eq!(params["turnId"], json!("turn-control"));
         assert_eq!(params["item"]["id"], json!("item-control"));
@@ -11600,7 +11759,7 @@ while read line; do :; done
             .expect("file-change notification should arrive")
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "item/completed");
-        let params = notification.params.expect("notification params");
+        let params = notification.value.params.expect("notification params");
         assert_eq!(params["threadId"], json!("thread-control"));
         assert_eq!(params["turnId"], json!("turn-control"));
         let item = &params["item"];
@@ -11665,7 +11824,7 @@ while read line; do :; done
             .expect("oversized diff notification should arrive")
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "turn/diff/updated");
-        let params = notification.params.expect("diff params");
+        let params = notification.value.params.expect("diff params");
         assert_eq!(params["threadId"], json!("thread-control"));
         assert_eq!(params["turnId"], json!("turn-control"));
         assert_eq!(params["revision"], json!(7));
@@ -11893,7 +12052,7 @@ while read line; do :; done
             .expect("oversized terminal notification should arrive")
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "turn/completed");
-        let params = notification.params.expect("terminal params");
+        let params = notification.value.params.expect("terminal params");
         assert_eq!(params["threadId"], json!("thread-terminal"));
         assert_eq!(params["turn"]["id"], json!("turn-terminal"));
         assert_eq!(params["turn"]["status"], json!("completed"));
@@ -12002,96 +12161,6 @@ while read line; do :; done
                 .expect("subsequent request must survive"),
             json!({"ok": 3})
         );
-    }
-
-    #[tokio::test]
-    async fn frame_beyond_spool_budget_requests_session_recovery() {
-        let budget = crate::NativeEventBudget {
-            max_frame_bytes: 128,
-            max_recovery_frame_bytes: 256,
-            ..crate::NativeEventBudget::default()
-        };
-        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
-        let mut diagnostics = client
-            .take_diagnostic_receiver()
-            .expect("diagnostic receiver");
-        let pending_client = client.clone();
-        let pending = tokio::spawn(async move {
-            pending_client
-                .request_value("account/read", Some(json!({})), Duration::from_secs(2))
-                .await
-        });
-        let _request = read_server_line(&mut server_reader).await;
-        server_writer
-            .write_all(
-                format!(
-                    "{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"{}\"}}}}\n",
-                    "x".repeat(512)
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("write frame beyond finite spool budget");
-
-        let diagnostic = tokio::time::timeout(Duration::from_secs(2), diagnostics.recv())
-            .await
-            .expect("session recovery diagnostic should arrive")
-            .expect("diagnostic channel should deliver recovery request");
-        assert_eq!(
-            diagnostic.kind,
-            CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
-        );
-        assert!(
-            diagnostic
-                .message
-                .contains("recovery frame exceeds 256 bytes")
-        );
-        assert!(matches!(
-            pending.await.expect("pending task should join"),
-            Err(CodexJsonlRpcClientError::TransportClosed { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn malformed_oversized_frame_requests_session_recovery() {
-        let budget = crate::NativeEventBudget {
-            max_frame_bytes: 128,
-            max_recovery_frame_bytes: 2 * 1024,
-            ..crate::NativeEventBudget::default()
-        };
-        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
-        let mut diagnostics = client
-            .take_diagnostic_receiver()
-            .expect("diagnostic receiver");
-        let pending_client = client.clone();
-        let pending = tokio::spawn(async move {
-            pending_client
-                .request_value("account/read", Some(json!({})), Duration::from_secs(2))
-                .await
-        });
-        let _request = read_server_line(&mut server_reader).await;
-        let malformed = format!(
-            "{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"thread\",\"text\":\"{}\"\n",
-            "x".repeat(512)
-        );
-        server_writer
-            .write_all(malformed.as_bytes())
-            .await
-            .expect("write malformed oversized frame");
-
-        let diagnostic = tokio::time::timeout(Duration::from_secs(2), diagnostics.recv())
-            .await
-            .expect("session recovery diagnostic should arrive")
-            .expect("diagnostic channel should deliver recovery request");
-        assert_eq!(
-            diagnostic.kind,
-            CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
-        );
-        assert!(diagnostic.message.contains("failed to stream oversized"));
-        assert!(matches!(
-            pending.await.expect("pending task should join"),
-            Err(CodexJsonlRpcClientError::TransportClosed { .. })
-        ));
     }
 
     fn codex_account_probe_config(root: &Path, executable: &Path) -> CodexAccountProbeConfig {
@@ -12864,5 +12933,98 @@ while read line; do :; done
         );
         let target = fs::read_link(link).expect("read symlink");
         assert_eq!(target, expected_target);
+    }
+
+    #[tokio::test]
+    async fn command_approval_decisions_write_exact_codex_payloads() {
+        for (decision, expected) in [
+            (CodexCommandApprovalDecision::Accept, json!("accept")),
+            (
+                CodexCommandApprovalDecision::AcceptForSession,
+                json!("acceptForSession"),
+            ),
+            (CodexCommandApprovalDecision::Decline, json!("decline")),
+        ] {
+            assert_command_approval_decision_response(decision, expected).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn file_change_approval_decisions_write_exact_codex_payloads() {
+        for (decision, expected) in [
+            (CodexFileChangeApprovalDecision::Accept, json!("accept")),
+            (CodexFileChangeApprovalDecision::Decline, json!("decline")),
+            (CodexFileChangeApprovalDecision::Cancel, json!("cancel")),
+        ] {
+            assert_file_change_approval_decision_response(decision, expected).await;
+        }
+    }
+
+    #[test]
+    fn unrecoverable_oversized_frames_request_recovery_and_close_pending_requests() {
+        for (max_recovery_frame_bytes, frame, write_message, expected_message) in [
+            (
+                256,
+                format!(
+                    "{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"{}\"}}}}\n",
+                    "x".repeat(512)
+                ),
+                "write frame beyond finite spool budget",
+                "recovery frame exceeds 256 bytes",
+            ),
+            (
+                2 * 1024,
+                format!(
+                    "{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"thread\",\"text\":\"{}\"\n",
+                    "x".repeat(512)
+                ),
+                "write malformed oversized frame",
+                "failed to stream oversized",
+            ),
+        ] {
+            let body = async {
+                let budget = crate::NativeEventBudget {
+                    max_frame_bytes: 128,
+                    max_recovery_frame_bytes,
+                    ..crate::NativeEventBudget::default()
+                };
+                let (client, mut server_reader, mut server_writer) =
+                    client_pair_with_budget(budget);
+                let mut diagnostics = client
+                    .take_diagnostic_receiver()
+                    .expect("diagnostic receiver");
+                let pending_client = client.clone();
+                let pending = tokio::spawn(async move {
+                    pending_client
+                        .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                        .await
+                });
+                let _request = read_server_line(&mut server_reader).await;
+                server_writer
+                    .write_all(frame.as_bytes())
+                    .await
+                    .expect(write_message);
+                let diagnostic = tokio::time::timeout(Duration::from_secs(2), diagnostics.recv())
+                    .await
+                    .expect("session recovery diagnostic should arrive")
+                    .expect("diagnostic channel should deliver recovery request");
+                assert_eq!(
+                    diagnostic.kind,
+                    CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
+                );
+                assert!(diagnostic.message.contains(expected_message));
+                assert!(matches!(
+                    pending.await.expect("pending task should join"),
+                    Err(CodexJsonlRpcClientError::TransportClosed { .. })
+                ));
+            };
+            let body = std::pin::pin!(body);
+            let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(body);
+        }
     }
 }

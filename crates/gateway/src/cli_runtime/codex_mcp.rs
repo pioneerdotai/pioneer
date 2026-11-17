@@ -692,48 +692,43 @@ mod tests {
 
     #[test]
     fn codex_schema_preflight_preserves_canonical_schema_opaquely() {
-        let schema = serde_json::json!({
-            "$schema": "https://example.test/custom-mcp-dialect",
-            "type": "object",
-            "properties": {
-                "value": {
-                    "oneOf": [{"type": "string"}, {"type": "integer"}],
-                    "nullable": true
+        for schema in [
+            serde_json::json!({
+                "$schema": "https://example.test/custom-mcp-dialect",
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "oneOf": [{"type": "string"}, {"type": "integer"}],
+                        "nullable": true
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "patternProperties": {"^x-": false},
+                        "unevaluatedProperties": true
+                    }
                 },
-                "metadata": {
-                    "type": "object",
-                    "patternProperties": {"^x-": false},
-                    "unevaluatedProperties": true
-                }
-            },
-            "x-provider-extension": {"arbitrary": [true, null]}
-        });
-        let projection = projection(schema.clone());
-        let original = projection.clone();
-        let preflight =
-            preflight_codex_mcp_schemas(&projection, "a".repeat(64)).expect("Codex preflight");
-        assert_eq!(projection, original);
-        assert_eq!(preflight.canonical_manifest_hash, projection.manifest_hash);
-        assert_ne!(preflight.provider_manifest_hash, projection.manifest_hash);
-        assert_eq!(preflight.tools.len(), 1);
-        assert_eq!(preflight.tools[0].transformed_schema, schema);
-        assert_eq!(
-            preflight.tools[0].canonical_schema_fingerprint,
-            preflight.tools[0].transformed_schema_fingerprint
-        );
-    }
-
-    #[test]
-    fn provider_schema_preflight_accepts_unknown_keywords_before_materialization() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {"value": {"oneOf": [{"type": "string"}]}},
-            "x-never-seen-before": {"nested": false}
-        });
-        let projection = projection(schema.clone());
-        let preflight = preflight_codex_mcp_schemas(&projection, "a".repeat(64))
-            .expect("opaque schema must reach provider");
-        assert_eq!(preflight.tools[0].transformed_schema, schema);
+                "x-provider-extension": {"arbitrary": [true, null]}
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"oneOf": [{"type": "string"}]}},
+                "x-never-seen-before": {"nested": false}
+            }),
+        ] {
+            let projection = projection(schema.clone());
+            let original = projection.clone();
+            let preflight =
+                preflight_codex_mcp_schemas(&projection, "a".repeat(64)).expect("Codex preflight");
+            assert_eq!(projection, original);
+            assert_eq!(preflight.canonical_manifest_hash, projection.manifest_hash);
+            assert_ne!(preflight.provider_manifest_hash, projection.manifest_hash);
+            assert_eq!(preflight.tools.len(), 1);
+            assert_eq!(preflight.tools[0].transformed_schema, schema);
+            assert_eq!(
+                preflight.tools[0].canonical_schema_fingerprint,
+                preflight.tools[0].transformed_schema_fingerprint
+            );
+        }
     }
 
     #[test]

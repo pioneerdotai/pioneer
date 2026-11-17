@@ -107,6 +107,9 @@ pub(crate) struct IdentityAuthorizationStore {
 }
 
 impl IdentityAuthorizationStore {
+    pub(crate) fn history_ticket_matches(&self, ticket: u64) -> bool {
+        self.identity_request == ticket
+    }
     pub(crate) fn authorization_epoch(&self) -> (u64, u64) {
         (self.connection_generation, self.policy_generation)
     }
@@ -473,6 +476,8 @@ impl ClientCore {
         auth.session.refresh_generation = metadata.refresh_generation;
         auth.session.refresh_expires_at_unix = metadata.refresh_expires_at_unix;
         self.apply_current_auth(&mut owner, &auth);
+        drop(owner); // Never acquire domain owners under the identity lock.
+        self.renew_workspace_push();
         Ok(())
     }
 
@@ -1175,6 +1180,7 @@ impl ClientCore {
         self.resume_provider_runtime_demand();
         self.resume_mcp_demand();
         self.resume_skills_demand();
+        self.resume_plugin_publications();
         self.resume_current_settings_demand();
     }
 
@@ -1707,6 +1713,9 @@ mod session_tests {
                 let core = ClientCore::new();
                 core.finish_current_auth(0, None, auth_me()).unwrap();
                 let thread = pioneer_protocol::Thread {
+                    context_window: None,
+                    service_mode: None,
+                    context_authority: None,
                     id: "thread".into(),
                     workspace_id: "workspace".into(),
                     name: None,

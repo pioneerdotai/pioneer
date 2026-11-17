@@ -10,6 +10,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub task_id: String,
+    pub webhook_secret_ref: Option<String>,
     pub kind: String,
     pub status: String,
     #[sea_orm(column_type = "Text")]

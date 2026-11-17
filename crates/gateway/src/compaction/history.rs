@@ -512,6 +512,188 @@ pub(crate) async fn final_response_aliases(
     .await
 }
 
+/// Explicit producer-owned copies use exact completed event revisions. None
+/// retains historical alias rules; Some([]) deliberately requires no UI item.
+pub(crate) async fn provider_round_aliases(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    represented: &SourceRef,
+    envelope: &CanonicalProviderRoundEnvelope,
+    reasoning_id: Option<&str>,
+) -> Result<FinalResponseAliasEvidence> {
+    let Some(copies) = envelope.ui_copies.as_deref() else {
+        return if envelope.calls.is_empty() {
+            final_response_aliases(
+                store,
+                workspace,
+                thread,
+                turn,
+                represented,
+                &envelope.round_id,
+                reasoning_id,
+            )
+            .await
+        } else {
+            Ok(FinalResponseAliasEvidence {
+                aliases: vec![],
+                ready: true,
+            })
+        };
+    };
+    ensure!(
+        represented.scope == format!("context:{turn}") && !represented.version.is_empty(),
+        "provider copy source authority mismatch"
+    );
+    if copies.is_empty() {
+        return Ok(FinalResponseAliasEvidence {
+            aliases: vec![],
+            ready: true,
+        });
+    }
+    let fence = store.compaction_history_read_fence().await?;
+    let mut after = 0;
+    let mut aliases = Vec::new();
+    let mut seen = BTreeSet::new();
+    loop {
+        let page = store
+            .compaction_source_metadata_page_at_fence(
+                workspace,
+                thread,
+                turn,
+                PagedSource::Event,
+                after,
+                fence.event_order,
+            )
+            .await?;
+        record_work(Work::Pages, 1);
+        let evidence = ui_copy_evidence_at_fence(
+            store,
+            workspace,
+            thread,
+            turn,
+            represented,
+            copies,
+            &page.entries,
+        )
+        .await?;
+        aliases.extend(evidence.0);
+        seen.extend(evidence.1);
+        if page.next_sequence <= after {
+            break;
+        }
+        after = page.next_sequence;
+    }
+    Ok(FinalResponseAliasEvidence {
+        aliases,
+        ready: seen.len() == copies.len(),
+    })
+}
+
+async fn ui_copy_evidence_at_fence(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    represented: &SourceRef,
+    copies: &[pioneer_provider::ProviderRoundUiCopy],
+    events: &[SourceRecord],
+) -> Result<(Vec<MessageSourceAlias>, BTreeSet<String>)> {
+    ensure!(
+        represented.scope == format!("context:{turn}") && !represented.version.is_empty(),
+        "provider copy source authority mismatch"
+    );
+    ensure!(copies.len() <= 130, "provider UI copy count limit");
+    let mut ids = BTreeSet::new();
+    ensure!(
+        copies.iter().all(|copy| !copy.turn_item_id.is_empty()
+            && copy.turn_item_id.len() <= 256
+            && copy.content_sha256.len() == 64
+            && copy.content_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            && ids.insert(copy.turn_item_id.as_str())),
+        "invalid provider UI copy relations"
+    );
+    let mut aliases = Vec::new();
+    let mut seen = BTreeSet::new();
+    for row in events {
+        if row.source_type != pioneer_protocol::constants::events::ITEM_COMPLETED
+            || row.reference.scope != format!("event:{turn}")
+            || row.reference.version.is_empty()
+        {
+            continue;
+        }
+        let Some(copy) = copies
+            .iter()
+            .find(|copy| row.item_id.as_deref() == Some(copy.turn_item_id.as_str()))
+        else {
+            continue;
+        };
+        let payload = reference_payload(store, workspace, thread, &row.reference).await?;
+        let event: Event = serde_json::from_str(&payload)?;
+        ensure!(
+            event.workspace_id() == workspace
+                && event.thread_id() == thread
+                && event.turn_id() == turn,
+            "provider UI copy scope mismatch"
+        );
+        let Event::ItemCompleted(completed) = &event else {
+            continue;
+        };
+        if !copy.matches(&completed.item) {
+            continue;
+        }
+        seen.insert(copy.turn_item_id.clone());
+        if !pioneer_crud::canonical_event_model_projection(&event).is_omitted() {
+            aliases.push(MessageSourceAlias {
+                represented_thread_id: thread.into(),
+                represented_source: runtime_source_ref(represented),
+                thread_id: thread.into(),
+                source: runtime_source_ref(&row.reference),
+            });
+        }
+    }
+    Ok((aliases, seen))
+}
+
+async fn provider_round_evidence_at_fence(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    represented: &SourceRef,
+    envelope: &CanonicalProviderRoundEnvelope,
+    reasoning_id: Option<&str>,
+    events: &[SourceRecord],
+) -> Result<FinalResponseAliasEvidence> {
+    if let Some(copies) = &envelope.ui_copies {
+        let (aliases, seen) =
+            ui_copy_evidence_at_fence(store, workspace, thread, turn, represented, copies, events)
+                .await?;
+        Ok(FinalResponseAliasEvidence {
+            aliases,
+            ready: seen.len() == copies.len(),
+        })
+    } else if envelope.calls.is_empty() {
+        final_response_evidence_at_fence(
+            store,
+            workspace,
+            thread,
+            turn,
+            represented,
+            &envelope.round_id,
+            reasoning_id,
+            events,
+        )
+        .await
+    } else {
+        Ok(FinalResponseAliasEvidence {
+            aliases: vec![],
+            ready: true,
+        })
+    }
+}
+
 /// Completion and model projection are separate facts. In particular, an empty
 /// completed Reasoning/AgentMessage is omitted, but still completes its exact UI
 /// identity. Read only matching completed revisions; never infer completion from
@@ -738,7 +920,9 @@ fn historical_user_attachment_part(
             MessageContentPart::video(historical_path_attachment(path.as_str(), "video/*"))
         }
         Attachment::Artifact { artifact } => historical_artifact_part(artifact),
-        Attachment::Skill { .. }
+        Attachment::App { .. }
+        | Attachment::Plugin { .. }
+        | Attachment::Skill { .. }
         | Attachment::SkillPack { .. }
         | Attachment::McpServer { .. }
         | Attachment::McpTool { .. } => return None,
@@ -893,6 +1077,10 @@ fn finish_round(
         unit,
         vec![round.assistant_source],
     ));
+    if let Some(origin) = assistant.provenance.as_mut() {
+        origin.source_aliases = round.response_aliases;
+        origin.complete &= round.response_copies_ready;
+    }
     let mut messages = vec![assistant];
     for (call, identity) in calls.iter().zip(&round.envelope.calls) {
         if let Some((source, message)) = round.results.get(&identity.turn_item_id) {
@@ -1096,6 +1284,402 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
     messages: &mut Vec<ChatMessage>,
     graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<()> {
+    task_input_copy_evidence_with_resolver(store, workspace, messages, graphs, false).await
+}
+
+/// Enrich the assembled boundary before checkpoint projection without removing
+/// copies: policy may later select a copy while excluding its representative.
+pub(super) async fn prepare_task_input_copy_evidence_with_resolver(
+    store: &CrudStore,
+    workspace: &str,
+    messages: &mut Vec<ChatMessage>,
+    graphs: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<()> {
+    task_input_copy_evidence_with_resolver(store, workspace, messages, graphs, true).await
+}
+
+// Classify only canonical prepared input, never arbitrary mixed provenance.
+// The context is a dependency; only input leaves participate in copy identity.
+async fn copy_input_sources(
+    store: &CrudStore,
+    workspace: &str,
+    message: &ChatMessage,
+) -> Result<Option<Vec<MessageSourceRef>>> {
+    let Some(origin) = &message.provenance else {
+        return Ok(None);
+    };
+    if message.role != Role::User || origin.sources.is_empty() {
+        return Ok(None);
+    }
+    if origin
+        .sources
+        .iter()
+        .all(|source| source.scope.starts_with("input:"))
+    {
+        return Ok(Some(origin.sources.clone()));
+    }
+    let contexts = origin
+        .sources
+        .iter()
+        .filter(|source| source.scope.starts_with("context:"))
+        .collect::<Vec<_>>();
+    let [context] = contexts.as_slice() else {
+        return Ok(None);
+    };
+    let turn = context
+        .scope
+        .strip_prefix("context:")
+        .expect("context scope");
+    let inputs = origin
+        .sources
+        .iter()
+        .filter(|source| source.scope == format!("input:{turn}"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !origin.complete
+        || origin.workspace_id != workspace
+        || inputs.is_empty()
+        || inputs.len() + 1 != origin.sources.len()
+        || message
+            .application_context
+            .as_ref()
+            .and_then(|m| m.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            != Some("turn_input")
+    {
+        return Ok(None);
+    }
+    let expected = store
+        .compaction_context_reference_for_item(
+            workspace,
+            &origin.thread_id,
+            turn,
+            "turn-input-projection",
+            "turn_input_projection_v1",
+        )
+        .await?;
+    let reference = SourceRef {
+        scope: context.scope.clone(),
+        id: context.id.clone(),
+        version: context.version.clone(),
+    };
+    let sources = origin
+        .sources
+        .iter()
+        .map(|s| SourceRef {
+            scope: s.scope.clone(),
+            id: s.id.clone(),
+            version: s.version.clone(),
+        })
+        .collect::<Vec<_>>();
+    if expected.as_ref() != Some(&reference) {
+        return Ok(None);
+    }
+    for page in sources.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
+        if !store
+            .compaction_references_current(workspace, &origin.thread_id, page)
+            .await?
+        {
+            return Ok(None);
+        }
+    }
+    let mut remaining = inputs
+        .iter()
+        .map(|s| SourceRef {
+            scope: s.scope.clone(),
+            id: s.id.clone(),
+            version: s.version.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    if remaining.len() != inputs.len() {
+        return Ok(None);
+    }
+    let mut after = 0;
+    loop {
+        let page = store
+            .compaction_source_metadata_page(
+                workspace,
+                &origin.thread_id,
+                turn,
+                PagedSource::Input,
+                after,
+            )
+            .await?;
+        if page.next_sequence <= after {
+            break;
+        }
+        after = page.next_sequence;
+        for row in page.entries {
+            if !remaining.remove(&row.reference) {
+                return Ok(None);
+            }
+        }
+    }
+    if !remaining.is_empty() {
+        return Ok(None);
+    }
+    let payload = reference_payload(store, workspace, &origin.thread_id, &reference).await?;
+    let view: pioneer_tools::ToolResultView = serde_json::from_str(&payload)?;
+    let pioneer_tools::ToolResultView::Json {
+        value,
+        truncated: false,
+    } = view
+    else {
+        return Ok(None);
+    };
+    // Provenance is wire-excluded; compare all durable model-facing bytes and
+    // application metadata while retaining the enriched provenance unchanged.
+    if serde_json::to_value(message)? != value {
+        return Ok(None);
+    }
+    Ok(Some(inputs))
+}
+
+/// A Composer launch's canonical UserMessage also carries capability chips.
+/// Once all of that launch's exact input leaves are represented by a saved
+/// prepared input, its UI copy must not introduce another model-facing input.
+/// Other UserMessage items and attachments absent from the saved input stay intact.
+async fn suppress_prepared_input_copy_events(
+    store: &CrudStore,
+    workspace: &str,
+    messages: &mut Vec<ChatMessage>,
+    ambiguous: &BTreeSet<(String, MessageSourceRef)>,
+) -> Result<()> {
+    let candidates = messages
+        .iter()
+        .filter_map(|message| {
+            let origin = message.provenance.as_ref()?;
+            let [source] = origin.sources.as_slice() else {
+                return None;
+            };
+            if message.role != Role::User
+                || !origin.complete
+                || origin.workspace_id != workspace
+                || origin.protected_input
+            {
+                return None;
+            }
+            let turn = source.scope.strip_prefix("event:")?;
+            Some((origin.thread_id.clone(), format!("input:{turn}")))
+        })
+        .collect::<BTreeSet<_>>();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let mut covered =
+        BTreeMap::<(String, String), Vec<(BTreeSet<SourceRef>, Vec<MessageContentPart>)>>::new();
+    for message in messages.iter() {
+        if message
+            .provenance
+            .as_ref()
+            .is_none_or(|origin| origin.source_aliases.is_empty())
+        {
+            continue;
+        }
+        let Some(inputs) = copy_input_sources(store, workspace, message).await? else {
+            continue;
+        };
+        let origin = message.provenance.as_ref().expect("classified input");
+        if inputs.len() == origin.sources.len() {
+            continue;
+        }
+        let mut aliases = BTreeMap::<(String, String), BTreeSet<SourceRef>>::new();
+        for alias in &origin.source_aliases {
+            if inputs.contains(&alias.represented_source)
+                && alias.represented_thread_id == origin.thread_id
+                && !ambiguous.contains(&(alias.thread_id.clone(), alias.source.clone()))
+                && !ambiguous.contains(&(
+                    alias.represented_thread_id.clone(),
+                    alias.represented_source.clone(),
+                ))
+                && alias.source.scope.starts_with("input:")
+            {
+                aliases
+                    .entry((alias.thread_id.clone(), alias.source.scope.clone()))
+                    .or_default()
+                    .insert(SourceRef {
+                        scope: alias.source.scope.clone(),
+                        id: alias.source.id.clone(),
+                        version: alias.source.version.clone(),
+                    });
+            }
+        }
+        for (key, sources) in aliases {
+            if candidates.contains(&key) {
+                covered
+                    .entry(key)
+                    .or_default()
+                    .push((sources, message.content_parts.clone()));
+            }
+        }
+    }
+    let mut complete = BTreeMap::new();
+    for ((thread, scope), claims) in covered {
+        let turn = scope.strip_prefix("input:").expect("input scope");
+        // A protected/current input is never suppressed through a UI event.
+        if messages.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin.thread_id == thread
+                    && origin.protected_input
+                    && origin.sources.iter().any(|source| source.scope == scope)
+            })
+        }) {
+            continue;
+        }
+        let mut sources = BTreeSet::new();
+        let mut after = 0;
+        loop {
+            let page = store
+                .compaction_source_metadata_page(
+                    workspace,
+                    &thread,
+                    turn,
+                    PagedSource::Input,
+                    after,
+                )
+                .await?;
+            if page.next_sequence <= after {
+                break;
+            }
+            after = page.next_sequence;
+            sources.extend(page.entries.into_iter().map(|row| row.reference));
+            if !claims.iter().any(|(claim, _)| sources.is_subset(claim)) {
+                break;
+            }
+        }
+        if !sources.is_empty() && claims.iter().any(|(claim, _)| sources.is_subset(claim)) {
+            complete.insert(
+                (thread, turn.to_owned()),
+                claims
+                    .into_iter()
+                    .filter(|(claim, _)| sources.is_subset(claim))
+                    .map(|(_, parts)| parts)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    let mut dropped = BTreeSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        let Some(origin) = &message.provenance else {
+            continue;
+        };
+        let [source] = origin.sources.as_slice() else {
+            continue;
+        };
+        let Some(turn) = source.scope.strip_prefix("event:") else {
+            continue;
+        };
+        if message.role != Role::User
+            || !origin.complete
+            || origin.workspace_id != workspace
+            || origin.protected_input
+            || !complete
+                .get(&(origin.thread_id.clone(), turn.to_owned()))
+                .is_some_and(|copies| {
+                    copies.iter().any(|parts| {
+                        message.content_parts.iter().all(|part| {
+                            parts.iter().any(|prepared| {
+                                if prepared == part {
+                                    return true;
+                                }
+                                // The UI stores an immutable artifact reference; the
+                                // exact saved input can already contain resolved bytes.
+                                let attachments = match (part, prepared) {
+                                    (
+                                        MessageContentPart::Image { image: original },
+                                        MessageContentPart::Image { image: saved },
+                                    )
+                                    | (
+                                        MessageContentPart::File { file: original },
+                                        MessageContentPart::File { file: saved },
+                                    ) => Some((original, saved)),
+                                    _ => None,
+                                };
+                                attachments.is_some_and(|(original, saved)| {
+                                    original.artifact.as_ref().is_some_and(|artifact| {
+                                        (artifact.workspace_id.is_empty()
+                                            || artifact.workspace_id == workspace)
+                                            && artifact.artifact_version_id.is_some()
+                                            && saved.artifact.as_ref().is_some_and(|accepted| {
+                                                accepted.workspace_id == workspace
+                                                    && accepted.artifact_id == artifact.artifact_id
+                                                    && accepted.artifact_version_id
+                                                        == artifact.artifact_version_id
+                                            })
+                                    })
+                                })
+                            })
+                        })
+                    })
+                })
+        {
+            continue;
+        }
+        let reference = SourceRef {
+            scope: source.scope.clone(),
+            id: source.id.clone(),
+            version: source.version.clone(),
+        };
+        let metadata = store
+            .compaction_historical_event_projections(
+                workspace,
+                &origin.thread_id,
+                std::slice::from_ref(&reference),
+            )
+            .await?;
+        if !metadata.iter().any(|row| {
+            row.projection_kind == "input_copy"
+                && row.item_id.as_deref() == Some(format!("user_{turn}").as_str())
+        }) || !store
+            .compaction_references_current(
+                workspace,
+                &origin.thread_id,
+                std::slice::from_ref(&reference),
+            )
+            .await?
+        {
+            continue;
+        }
+        let event: Event = serde_json::from_str(
+            &reference_payload(store, workspace, &origin.thread_id, &reference).await?,
+        )?;
+        if event.workspace_id() != workspace
+            || event.thread_id() != origin.thread_id
+            || event.turn_id() != turn
+        {
+            continue;
+        }
+        let Event::ItemCompleted(notification) = &event else {
+            continue;
+        };
+        if !matches!(
+            &notification.item,
+            pioneer_protocol::TurnItem::UserMessage { .. }
+        ) {
+            continue;
+        }
+        if let Some(projected) = event_message_suppressing_input_copy_media(event)?
+            && serde_json::to_value(projected)? == serde_json::to_value(message)?
+        {
+            dropped.insert(index);
+        }
+    }
+    let mut index = 0;
+    messages.retain(|_| {
+        let keep = !dropped.contains(&index);
+        index += 1;
+        keep
+    });
+    Ok(())
+}
+
+async fn task_input_copy_evidence_with_resolver(
+    store: &CrudStore,
+    workspace: &str,
+    messages: &mut Vec<ChatMessage>,
+    graphs: &mut super::coverage::CheckpointGraphResolver,
+    retain_copies: bool,
+) -> Result<()> {
     // A raw representative may already have been replaced by a published
     // summary. Its exact input-leaf proof is carried by the summary's frozen
     // provenance, not by the checkpoint source itself. Validate that leaf
@@ -1181,14 +1765,13 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
         let Some(origin) = &message.provenance else {
             continue;
         };
-        if origin
-            .sources
-            .iter()
-            .all(|source| source.scope.starts_with("input:"))
-        {
+        if origin.source_aliases.is_empty() {
+            continue;
+        }
+        if let Some(inputs) = copy_input_sources(store, workspace, message).await? {
             for alias in &origin.source_aliases {
                 if alias.represented_thread_id == origin.thread_id
-                    && origin.sources.contains(&alias.represented_source)
+                    && inputs.contains(&alias.represented_source)
                     && alias.source.scope.starts_with("input:")
                 {
                     if checkpoint_evidence
@@ -1208,7 +1791,7 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
     checkpoint_evidence
         .owners
         .retain(|copy, _| !checkpoint_evidence.ambiguous.contains(copy));
-    if !checkpoint_evidence.owners.is_empty() {
+    if !retain_copies && !checkpoint_evidence.owners.is_empty() {
         messages.retain(|message| {
             let Some(origin) = &message.provenance else {
                 return true;
@@ -1245,6 +1828,7 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
         message: usize,
         protected: bool,
         splittable: bool,
+        prepared: bool,
     }
 
     fn alias_key(alias: &MessageSourceAlias) -> (ExactInput, ExactInput) {
@@ -1276,15 +1860,11 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
         let Some(origin) = &message.provenance else {
             continue;
         };
-        if message.role != Role::User
-            || !origin
-                .sources
-                .iter()
-                .all(|source| source.scope.starts_with("input:"))
-        {
+        let Some(inputs) = copy_input_sources(store, workspace, message).await? else {
             continue;
-        }
-        for reference in &origin.sources {
+        };
+        let prepared = inputs.len() != origin.sources.len();
+        for reference in &inputs {
             let identity = ExactInput {
                 thread: origin.thread_id.clone(),
                 source: reference.clone(),
@@ -1297,6 +1877,7 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
                             message: message_index,
                             protected: origin.protected_input,
                             splittable: origin.sources.len() == 1,
+                            prepared,
                         },
                     )
                     .is_none(),
@@ -1307,7 +1888,7 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
             let (represented_source, alias_source) = alias_key(existing);
             ensure!(
                 represented_source.thread == origin.thread_id
-                    && origin.sources.contains(&represented_source.source),
+                    && inputs.contains(&represented_source.source),
                 "input alias does not identify a source represented by its message"
             );
             if represented_source != alias_source {
@@ -1356,15 +1937,25 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
         };
         originals_by_copy.entry(copy).or_default().insert(original);
     }
-    originals_by_copy.retain(|copy, _| {
+    originals_by_copy.retain(|copy, originals| {
         !checkpoint_evidence
             .ambiguous
             .contains(&(copy.thread.clone(), copy.source.clone()))
+            && originals.iter().all(|original| {
+                !checkpoint_evidence
+                    .ambiguous
+                    .contains(&(original.thread.clone(), original.source.clone()))
+            })
     });
     for (alias_source, claims) in &alias_claims {
         if checkpoint_evidence
             .ambiguous
             .contains(&(alias_source.thread.clone(), alias_source.source.clone()))
+            || claims.iter().any(|claim| {
+                checkpoint_evidence
+                    .ambiguous
+                    .contains(&(claim.thread.clone(), claim.source.clone()))
+            })
         {
             continue;
         }
@@ -1425,6 +2016,7 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
         .filter(|group| group.len() > 1)
         .collect::<Vec<_>>();
     let mut representative = BTreeMap::<ExactInput, ExactInput>::new();
+    let mut prepared_cover = BTreeMap::<ExactInput, ExactInput>::new();
     let mut replay_aliases = alias_claims
         .values()
         .filter(|claims| claims.len() == 1)
@@ -1447,7 +2039,13 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
         let keep = protected
             .first()
             .cloned()
+            .or_else(|| group.iter().find(|id| represented[*id].prepared).cloned())
             .unwrap_or_else(|| group[0].clone());
+        if represented[&keep].prepared {
+            for id in &group {
+                prepared_cover.insert(id.clone(), keep.clone());
+            }
+        }
         let eligible = group
             .into_iter()
             .filter(|id| id == &keep || represented[id].splittable)
@@ -1473,13 +2071,72 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
             }
         }
     }
+    // A raw composite is indivisible. Leaf groups only propose coverage; commit
+    // its removal and every reverse alias together after checking the whole
+    // message against one retained canonical prepared payload and one budget.
+    let mut composites = BTreeMap::<usize, Vec<ExactInput>>::new();
+    for (id, input) in &represented {
+        if !input.prepared && !input.splittable {
+            composites
+                .entry(input.message)
+                .or_default()
+                .push(id.clone());
+        }
+    }
+    for (message_index, inputs) in composites {
+        let origin = messages[message_index]
+            .provenance
+            .as_ref()
+            .expect("represented input");
+        if !origin.complete
+            || origin.workspace_id != workspace
+            || origin.protected_input
+            || inputs.len() != origin.sources.len()
+            || inputs.iter().any(|id| {
+                id.source.scope != inputs[0].source.scope
+                    || alias_claims.get(id).is_some_and(|claims| claims.len() != 1)
+            })
+        {
+            continue;
+        }
+        let Some(keepers) = inputs
+            .iter()
+            .map(|id| prepared_cover.get(id))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let target = represented[keepers[0]].message;
+        if keepers.iter().any(|keep| {
+            represented[*keep].message != target
+                || alias_claims
+                    .get(*keep)
+                    .is_some_and(|claims| claims.len() != 1)
+        }) {
+            continue;
+        }
+        let additional_aliases = inputs
+            .iter()
+            .filter(|id| alias_claims.get(*id).is_none_or(|claims| claims.len() != 1))
+            .count();
+        if additional_aliases > 0
+            && replay_aliases.saturating_add(additional_aliases)
+                > pioneer_compaction::REPLAY_ALIAS_LIMIT
+        {
+            continue;
+        }
+        replay_aliases += additional_aliases;
+        for (id, keep) in inputs.iter().zip(keepers) {
+            representative.insert(id.clone(), keep.clone());
+        }
+    }
     let mut aliases = BTreeMap::<ExactInput, BTreeSet<ExactInput>>::new();
     let mut dropped_messages = BTreeSet::new();
     for (id, keep) in &representative {
         if id != keep {
             dropped_messages.insert(represented[id].message);
             aliases.entry(keep.clone()).or_default().insert(id.clone());
-            if let Some(previous) = aliases_by_represented.get(id) {
+            if !retain_copies && let Some(previous) = aliases_by_represented.get(id) {
                 for previous in previous {
                     if alias_claims
                         .get(previous)
@@ -1496,34 +2153,31 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
     }
     let mut normalized = Vec::with_capacity(messages.len());
     for (message_index, message) in messages.iter().enumerate() {
-        if dropped_messages.contains(&message_index) {
+        if !retain_copies && dropped_messages.contains(&message_index) {
             continue;
         }
         let mut message = message.clone();
         if let Some(origin) = message.provenance.as_mut()
             && message.role == Role::User
-            && origin
-                .sources
-                .iter()
-                .all(|source| source.scope.starts_with("input:"))
         {
-            let represented_sources = origin
-                .sources
+            let represented_sources = represented
                 .iter()
-                .cloned()
-                .map(|source| ExactInput {
-                    thread: origin.thread_id.clone(),
-                    source,
-                })
+                .filter(|(_, input)| input.message == message_index)
+                .map(|(identity, _)| identity.clone())
                 .collect::<BTreeSet<_>>();
+            if represented_sources.is_empty() {
+                normalized.push(message);
+                continue;
+            }
             let mut normalized_aliases = BTreeSet::<(ExactInput, ExactInput)>::new();
             for existing in &origin.source_aliases {
                 let pair = alias_key(existing);
                 if represented_sources.contains(&pair.0)
                     && pair.0 != pair.1
-                    && alias_claims
-                        .get(&pair.1)
-                        .is_none_or(|claims| claims.len() == 1)
+                    && (retain_copies
+                        || alias_claims
+                            .get(&pair.1)
+                            .is_none_or(|claims| claims.len() == 1))
                 {
                     normalized_aliases.insert(pair);
                 }
@@ -1541,6 +2195,15 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
                 .collect();
         }
         normalized.push(message);
+    }
+    if !retain_copies {
+        suppress_prepared_input_copy_events(
+            store,
+            workspace,
+            &mut normalized,
+            &checkpoint_evidence.ambiguous,
+        )
+        .await?;
     }
     *messages = normalized;
     Ok(())
@@ -1992,6 +2655,7 @@ async fn load_line_history_inner(
                 fence,
             )
             .await?;
+            let has_input_projection = contexts.iter().any(|row| row.source_type == "turn_input_projection_v1");
             // Covered provider rows are removed before payload reads, but their
             // durable item relationship must still suppress the corresponding UI
             // event copy. This is metadata-only and does not make an unrelated
@@ -2061,6 +2725,7 @@ async fn load_line_history_inner(
                 .flat_map(|items| items.iter().copied())
                 .map(str::to_owned)
                 .collect::<BTreeSet<_>>();
+            let mut exact_ui_aliases = BTreeSet::new();
             aliases.extend(context_aliases);
             aliases.extend(
                 contexts
@@ -2119,6 +2784,37 @@ async fn load_line_history_inner(
                     take_source_payload_batch(store, workspace, thread, &mut contexts).await?
                 {
                     match row.source_type.as_str() {
+                        "system_snapshot_v1" => {},
+                        "turn_input_projection_v1" | "runtime_context_v1" => {
+                            if let Some(round) = pending.take() {
+                                finish_round(workspace, thread, &turn.id, round, captured_active, &mut ordered)?;
+                            }
+                            let view: pioneer_tools::ToolResultView = serde_json::from_str(&payload)?;
+                            let pioneer_tools::ToolResultView::Json { value, truncated: false } = view else {
+                                anyhow::bail!("runtime context projection is incomplete")
+                            };
+                            let mut message: ChatMessage = serde_json::from_value(value)?;
+                            ensure!(message.role == Role::User, "runtime context must be user-level");
+                            let input = row.source_type == "turn_input_projection_v1";
+                            let unit = if input { "turn-input-projection".to_owned() } else {
+                                row.item_id.clone().ok_or_else(|| anyhow::anyhow!("runtime context item missing"))?
+                            };
+                            message.provenance = Some(origin(workspace, thread, &turn.id, &unit, vec![row.reference]));
+                            if input {
+                                // Cover both the exact model projection and its clean input
+                                // sources so compaction cannot later resurrect the raw command.
+                                let input_sources = ordered.iter().filter(|(sequence, _)| *sequence == 0)
+                                    .flat_map(|(_, messages)| messages.iter())
+                                    .filter_map(|message| message.provenance.as_ref())
+                                    .flat_map(|origin| origin.sources.iter().cloned())
+                                    .collect::<Vec<_>>();
+                                message.provenance.as_mut().expect("projection origin assigned").sources.extend(input_sources);
+                                ordered.retain(|(sequence, _)| *sequence != 0);
+                                ordered.push((0, vec![message]));
+                            } else {
+                                ordered.push((row.sequence, vec![message]));
+                            }
+                        }
                         "assistant_round" => {
                             if let Some(round) = pending.take() {
                                 finish_round(
@@ -2138,28 +2834,12 @@ async fn load_line_history_inner(
                                 );
                                 // Native content owns the model history. Suppress its
                                 // exact reasoning/final UI copies, keeping stored events.
-                                aliases.insert(envelope.round_id.clone());
-                                if let Some(item) = row.item_id.as_ref() {
-                                    aliases.insert(item.clone());
+                                if envelope.ui_copies.is_none() {
+                                    aliases.insert(envelope.round_id.clone());
+                                    if let Some(item)=row.item_id.as_ref(){aliases.insert(item.clone());}
                                 }
-                                let evidence = if envelope.calls.is_empty() {
-                                    final_response_evidence_at_fence(
-                                        store,
-                                        workspace,
-                                        thread,
-                                        &turn.id,
-                                        &row.reference,
-                                        &envelope.round_id,
-                                        row.item_id.as_deref(),
-                                        &alias_events,
-                                    )
-                                    .await?
-                                } else {
-                                    FinalResponseAliasEvidence {
-                                        aliases: Vec::new(),
-                                        ready: true,
-                                    }
-                                };
+                                let evidence=provider_round_evidence_at_fence(store,workspace,thread,&turn.id,&row.reference,&envelope,row.item_id.as_deref(),&alias_events).await?;
+                                exact_ui_aliases.extend(evidence.aliases.iter().map(|alias| SourceRef{scope:alias.source.scope.clone(),id:alias.source.id.clone(),version:alias.source.version.clone()}));
                                 pending = Some(Round {
                                     sequence: starts
                                         .get(&envelope.round_id)
@@ -2268,10 +2948,11 @@ async fn load_line_history_inner(
                             last_attachment_copies.get(item) != Some(&row.sequence)
                         }));
                 let metadata_only = matches!(kind, "start" | "technical")
-                    || row.item_id.as_ref().is_some_and(|id| aliases.contains(id));
+                    || exact_ui_aliases.contains(&row.reference) || row.item_id.as_ref().is_some_and(|id| aliases.contains(id));
                 let superseded_input = matches!(kind, "input" | "input_revision" | "input_deleted")
-                    && (use_input_rows || Some(row.sequence) != latest_input);
-                !superseded_copy && !metadata_only && !superseded_input
+                    && (use_input_rows || has_input_projection || Some(row.sequence) != latest_input);
+                let projected_input_copy = has_input_projection && kind == "input_copy";
+                !superseded_copy && !metadata_only && !superseded_input && !projected_input_copy
             });
             loop {
                 let mut page = selected_events
@@ -2667,6 +3348,7 @@ mod tests {
         );
         message.provider_replay_state = Some(state.clone());
         let envelope = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "final-item".into(),
             termination: pioneer_provider::ProviderTermination::Complete,
@@ -2847,6 +3529,7 @@ mod tests {
     #[test]
     fn malformed_or_failed_round_cannot_become_completed_inherited_work() {
         let envelope = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "round".into(),
             termination: pioneer_provider::ProviderTermination::ToolCalls,
@@ -2904,6 +3587,7 @@ mod tests {
             ]}),
         ));
         let failed = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "failed".into(),
             termination: pioneer_provider::ProviderTermination::ProviderError,
@@ -2929,6 +3613,7 @@ mod tests {
         let round = Round {
             sequence: 1,
             envelope: CanonicalProviderRoundEnvelope {
+                ui_copies: None,
                 version: 1,
                 round_id: "interrupted".into(),
                 termination: pioneer_provider::ProviderTermination::ToolCalls,

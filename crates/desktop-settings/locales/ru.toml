@@ -161,14 +161,9 @@ description = "Не дает системе уходить в сон из-за �
 label = "Отправлять телеметрию"
 description = "Разрешить собирать диагностические данные и данные о производительности."
 
-[settings.general.preflight_model]
-label = "Модель preflight"
-description = "Выберите провайдера и модель для внутреннего планирования перед ходом. По умолчанию используется модель текущего треда."
-default = "По умолчанию"
-select_model = "Выбрать модель"
-dialog_title = "Выбор модели preflight"
-
 [settings.voice_input]
+transcribe_while_recording = "Распознавать во время записи"
+transcribe_while_recording_description = "Если выключено, распознавание начнётся после завершения записи"
 label = "Голосовой ввод"
 description = "Используйте локальную модель распознавания речи для голосовых сообщений."
 no_model_selected = "Модель не выбрана"
@@ -222,10 +217,6 @@ description = "Управляйте тем, как Pioneer использует 
 [settings.memory.enabled]
 label = "Память"
 description = "Разрешить Pioneer использовать сохранённые факты и проектные решения, когда это полезно."
-
-[settings.memory.active_recall]
-label = "Активное вспоминание"
-description = "Запускать дополнительное планирование чтения памяти для контекстных задач."
 
 [settings.memory.proactive_writes]
 label = "Проактивная запись"
@@ -364,6 +355,13 @@ reason_cancelled = "Запуск отменён."
 reason_unknown = "Операция не завершилась ожидаемым образом. Проверьте логи Gateway."
 
 [chat.composer.model]
+service_label = "Режим обслуживания"
+service_standard = "Стандартный"
+service_invalid = "Сохранённый режим недоступен. Выберите стандартный или другой режим."
+context_label = "Контекстное окно"
+context_auto = "Авто — до %{tokens} токенов"
+context_up_to = "До %{tokens} токенов"
+context_invalid = "Сохранённый вариант контекста недоступен. Выберите Авто или другое окно."
 select_label = "Выбрать модель"
 dialog_title = "Выбор модели"
 provider_label = "Провайдер"

@@ -23,7 +23,7 @@ pub async fn insert_candidate<C: ConnectionTrait>(
     candidate: NewAgentMemoryCandidate,
     resolved_scope: MemoryScopeResolution,
     now: DateTimeWithTimeZone,
-) -> Result<agent_memory_candidate::Model> {
+) -> Result<(agent_memory_candidate::Model, bool)> {
     let namespace = normalized_memory_namespace(candidate.namespace.as_deref())?;
     let key = normalized_optional_memory_key(candidate.key.clone())?;
 
@@ -32,7 +32,7 @@ pub async fn insert_candidate<C: ConnectionTrait>(
             find_any_candidate_by_dedupe(db, &resolved_scope, namespace.as_str(), dedupe_key)
                 .await?
         {
-            return Ok(existing);
+            return Ok((existing, false));
         }
     }
 
@@ -79,11 +79,12 @@ pub async fn insert_candidate<C: ConnectionTrait>(
     .await
     .with_context(|| format!("failed to insert memory candidate `{id}`"))?;
 
-    agent_memory_candidate::Entity::find_by_id(id)
+    let row = agent_memory_candidate::Entity::find_by_id(id)
         .one(db)
         .await
         .context("failed to reload inserted memory candidate")?
-        .context("inserted memory candidate missing")
+        .context("inserted memory candidate missing")?;
+    Ok((row, true))
 }
 
 pub async fn list_candidates<C: ConnectionTrait>(
@@ -244,28 +245,32 @@ pub async fn update_candidate_status<C: ConnectionTrait>(
         .context("failed to reload updated memory candidate")
 }
 
-pub async fn update_candidate_metadata<C: ConnectionTrait>(
+/// None means that the snapshot no longer matches (or the row was removed).
+/// Only metadata is mutated: lifecycle reason/status/provenance stay current.
+pub async fn update_candidate_metadata_if_unchanged<C: ConnectionTrait>(
     db: &C,
     candidate_id: &str,
-    reason: String,
+    expected_metadata_json: Option<String>,
     metadata_json: Option<String>,
-    now: DateTimeWithTimeZone,
 ) -> Result<Option<agent_memory_candidate::Model>> {
+    let expected = match expected_metadata_json {
+        Some(metadata) => agent_memory_candidate::Column::MetadataJson.eq(metadata),
+        None => agent_memory_candidate::Column::MetadataJson.is_null(),
+    };
     let affected = agent_memory_candidate::Entity::update_many()
-        .col_expr(agent_memory_candidate::Column::Reason, Expr::value(reason))
         .col_expr(
             agent_memory_candidate::Column::MetadataJson,
             Expr::value(metadata_json),
         )
         .filter(agent_memory_candidate::Column::Id.eq(candidate_id.to_owned()))
+        .filter(expected)
         .exec(db)
         .await
-        .with_context(|| format!("failed to update memory candidate `{candidate_id}` metadata"))?
+        .context("failed to conditionally update memory candidate metadata")?
         .rows_affected;
     if affected == 0 {
         return Ok(None);
     }
-    let _ = now;
     agent_memory_candidate::Entity::find_by_id(candidate_id.to_owned())
         .one(db)
         .await

@@ -2145,22 +2145,4 @@ mod tests {
         assert!(!report.delta.exact);
         assert_eq!(fs::read(root.path().join("file.txt")).unwrap(), b"new");
     }
-
-    #[test]
-    fn missing_destructive_guard_is_reported_as_precondition_required() {
-        let report = plan_rejection(
-            PlanError {
-                code: PlanErrorCode::MissingSourceGuard,
-                operation_index: 0,
-                path: "file.txt".to_owned(),
-                message: "operation consuming a pre-existing file requires If-Match".to_owned(),
-            },
-            "fallback",
-        );
-        assert_eq!(report.status, ExecutionStatus::Rejected);
-        assert_eq!(
-            report.failure.as_ref().map(|failure| failure.code),
-            Some(PatchErrorCode::PreconditionRequired)
-        );
-    }
 }

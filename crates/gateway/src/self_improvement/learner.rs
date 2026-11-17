@@ -1122,6 +1122,8 @@ impl<'a> LearnerReviewerClient<'a> {
         };
         let response = provider
             .chat(ChatRequest {
+                tool_declarations: None,
+                service_mode: None,
                 model: selection.model.clone(),
                 messages: vec![
                     ChatMessage::system(system_prompt),
@@ -1153,6 +1155,13 @@ impl<'a> LearnerReviewerClient<'a> {
             })
             .await
             .map_err(|error| ModelContractError::provider_transport(stage, &error))?;
+        pioneer_provider::ProviderMessageCollector::validate_response(&response).map_err(|_| {
+            ModelContractError::new(
+                stage,
+                ModelContractErrorKind::IncompleteResponse,
+                "invalid_model_messages",
+            )
+        })?;
         let usage = ModelCallUsage::from(response.usage);
         let reason = match response.termination {
             ProviderTermination::Complete if response.tool_calls.is_empty() => None,
@@ -1566,6 +1575,7 @@ mod tests {
                 bail!("scripted response exhausted");
             };
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text,
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
@@ -2791,62 +2801,6 @@ mod tests {
             chunk_analysis_data(&history, Some(&digest)).expect("prior digest data");
         assert!(repeated_chunk_data.contains(injected_digest));
         assert!(!CHUNK_ANALYSIS_SYSTEM_PROMPT.contains(injected_digest));
-    }
-
-    #[tokio::test]
-    async fn reviewer_inherits_default_model_without_override() {
-        let provider = Arc::new(ScriptedProvider::new([
-            analysis_json("verified first step succeeded"),
-            synthesis_json("Follow the verified sequence."),
-            r#"{"candidateKey":"candidate-253a437c86cee481cdd8b8142451b4c481e03da9d5ad3c78cb915177a2e25ad3","decision":"accept","reasonCodes":[]}"#
-                .to_owned(),
-        ]));
-        let registry = ProviderRegistry::with_provider("scripted", provider.clone());
-        let mut default_model = model("scripted", "one-model");
-        default_model.reasoning_effort = Some("high".to_owned());
-        let client = LearnerReviewerClient::new(&registry, "workspace-one", &default_model, None);
-        let history = history(
-            [
-                HistoryEvidenceRole::NewAnchor,
-                HistoryEvidenceRole::NewAnchor,
-            ],
-            "The verified first step succeeded.",
-        );
-        let digest = client
-            .analyze_chunk(&history, None)
-            .await
-            .expect("analysis")
-            .value;
-        let frozen_range = frozen_range();
-        let candidate = client
-            .synthesize_validated_candidate(
-                &digest,
-                &frozen_range,
-                std::slice::from_ref(&history),
-                &[],
-                &[],
-                1024 * 1024,
-            )
-            .await
-            .expect("synthesis")
-            .value
-            .expect("candidate");
-        client
-            .review_skill_candidate(candidate, 1024 * 1024)
-            .await
-            .expect("review");
-        assert!(
-            provider
-                .requests()
-                .iter()
-                .all(|request| request.model == "one-model"
-                    && request.temperature.is_none()
-                    && request.max_tokens.is_none()
-                    && request.reasoning
-                        == Some(ReasoningConfig::effort(
-                            pioneer_protocol::ReasoningEffort::High
-                        )))
-        );
     }
 
     #[tokio::test]

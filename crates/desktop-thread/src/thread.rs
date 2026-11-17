@@ -148,7 +148,7 @@ impl ThreadView {
     }
     pub fn new(config: ThreadViewConfig, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let mount = NEXT_MOUNT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mount| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |mount| {
                 mount.checked_add(3)
             })
             .expect("thread mount identity exhausted");
@@ -326,10 +326,15 @@ impl ThreadView {
     }
 }
 impl Render for ThreadView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout = self.layout.read(cx);
         let open = layout.is_open();
         let width = layout.width();
+        let bottom_app = layout.bottom_app();
+        let bottom_visible = bottom_app.is_some();
+        let app_height = layout.app_height();
+        let max_height = (window.viewport_size().height * 0.65).max(px(180.));
+        let bottom_layout = self.layout.downgrade();
         let layout = self.layout.downgrade();
         let body = v_flex()
             .size_full()
@@ -345,9 +350,34 @@ impl Render for ThreadView {
                     .child(div().flex_1().min_h_0().child(self.screen.clone()))
                     .child(self.composer.clone()),
             );
+        let body = gpui_kit::component::resizable::v_resizable("thread-app-bottom")
+            .on_resize(move |state, _, cx| {
+                if let Some(height) = state
+                    .read(cx)
+                    .sizes()
+                    .get(1)
+                    .copied()
+                    .filter(|_| bottom_visible)
+                {
+                    let _ = bottom_layout.update(cx, |layout, cx| layout.resize_app(height, cx));
+                }
+            })
+            .child(resizable_panel().child(body))
+            .child(
+                resizable_panel()
+                    .visible(bottom_visible)
+                    .size(app_height.min(max_height))
+                    .fixed()
+                    .size_range(px(180.)..max_height)
+                    .child(
+                        bottom_app
+                            .map(|view| view.into_any_element())
+                            .unwrap_or_else(|| div().into_any_element()),
+                    ),
+            );
         let split = h_resizable("thread-artifacts-layout")
             .on_resize(move |state, _, cx| {
-                if let Some(width) = state.read(cx).sizes().get(1).copied() {
+                if let Some(width) = state.read(cx).sizes().get(1).copied().filter(|_| open) {
                     let _ = layout.update(cx, |layout, cx| layout.resize(width, cx));
                 }
             })
@@ -360,6 +390,7 @@ impl Render for ThreadView {
                 resizable_panel()
                     .visible(open)
                     .size(width)
+                    .fixed()
                     .size_range(px(320.)..px(640.))
                     .child(self.panels.clone()),
             );
@@ -1047,6 +1078,46 @@ mod tests {
             (0, 0),
             "controlled composer text notified the root or timeline"
         );
+        // Send feedback is a Composer-only publication too, but it must redraw
+        // the mounted surface even though the edit target and text stay equal.
+        client.composer_intent(
+            pioneer_client::composer::store::ComposerIntent::BeginOperation {
+                thread_id: "a".into(),
+                draft_id: input.draft_id(),
+                operation: pioneer_client::composer::store::ComposerOperationKind::Send,
+            },
+        );
+        let identity = client
+            .composer_snapshot("a")
+            .unwrap()
+            .preparing_send()
+            .unwrap()
+            .identity()
+            .clone();
+        deliver();
+        cx.run_until_parked();
+        assert!(
+            notifications.get().1 > 0,
+            "captured Send did not notify the timeline binding"
+        );
+        let before_cancel = notifications.get().1;
+        client.complete_composer_operation(
+            identity,
+            pioneer_client::composer::store::ComposerOperationCompletion::Cancelled,
+        );
+        deliver();
+        cx.run_until_parked();
+        assert!(
+            notifications.get().1 > before_cancel,
+            "retired Send did not notify the timeline binding"
+        );
+        assert!(
+            client
+                .composer_snapshot("a")
+                .unwrap()
+                .preparing_send()
+                .is_none()
+        );
         drop(observers);
         cx.update(|window, cx| {
             let layout = ThreadPanelLayoutStore::for_window(window, cx);
@@ -1114,5 +1185,53 @@ mod tests {
 impl ThreadView {
     pub(crate) fn timeline_for_test(&self) -> Entity<crate::screen::TimelineView> {
         self.screen.clone()
+    }
+}
+
+impl ThreadView {
+    /// Mount App content in the existing window-owned sidebar without changing
+    /// thread identity or replacing artifacts/member panel ownership.
+    pub fn set_window_app_panel(window: &Window, app: Option<AnyView>, cx: &mut App) {
+        let layout = ThreadPanelLayoutStore::for_window(window, cx);
+        layout.update(cx, |layout, cx| layout.set_app(app, cx));
+    }
+    pub fn set_window_app_bottom(
+        window: &Window,
+        app: Option<AnyView>,
+        height: Pixels,
+        cx: &mut App,
+    ) {
+        ThreadPanelLayoutStore::for_window(window, cx)
+            .update(cx, |layout, cx| layout.set_bottom_app(app, height, cx));
+    }
+    pub fn resize_window_app_bottom(window: &Window, height: Pixels, cx: &mut App) {
+        ThreadPanelLayoutStore::for_window(window, cx)
+            .update(cx, |layout, cx| layout.resize_app(height, cx));
+    }
+    pub fn window_app_panel_visible(window: &Window, cx: &mut App) -> bool {
+        ThreadPanelLayoutStore::for_window(window, cx)
+            .read(cx)
+            .is_visible(crate::panel_layout::ThreadPanelKind::App)
+    }
+    pub fn observe_window_app_panel<T: 'static>(
+        window: &mut Window,
+        cx: &mut Context<T>,
+        mut changed: impl FnMut(&mut T, bool, Pixels, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        let layout = ThreadPanelLayoutStore::for_window(window, cx);
+        cx.observe_in(&layout, window, move |owner, layout, window, cx| {
+            let visible = layout
+                .read(cx)
+                .is_visible(crate::panel_layout::ThreadPanelKind::App);
+            let height = layout.read(cx).app_height();
+            changed(owner, visible, height, window, cx);
+        })
+    }
+    pub fn window_app_panel_width(window: &Window, cx: &App) -> Pixels {
+        ThreadPanelLayoutStore::existing_width(window, cx)
+    }
+    pub fn resize_window_app_panel(window: &Window, width: Pixels, cx: &mut App) {
+        ThreadPanelLayoutStore::for_window(window, cx)
+            .update(cx, |layout, cx| layout.resize(width, cx));
     }
 }

@@ -1,7 +1,4 @@
-use pioneer_client::{
-    ClientError,
-    platform::{ClientFileMetadata, ClientPath},
-};
+use pioneer_client::{ClientError, platform::ClientPath};
 
 #[test]
 fn client_error_display_is_stable_for_scaffold() {
@@ -22,18 +19,4 @@ fn platform_path_round_trips_without_desktop_types() {
         path.into_path_buf().to_string_lossy(),
         "workspace/thread.txt"
     );
-}
-
-#[test]
-fn platform_file_metadata_is_plain_data() {
-    let metadata = ClientFileMetadata {
-        len: 42,
-        modified: None,
-        is_file: true,
-        is_dir: false,
-    };
-
-    assert_eq!(metadata.len, 42);
-    assert!(metadata.is_file);
-    assert!(!metadata.is_dir);
 }

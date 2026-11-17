@@ -221,6 +221,7 @@
 "timeline.system.capability_kind_skill" = "स्किल"
 "timeline.system.checkpoint_label" = "चेकपॉइंट"
 "timeline.system.code" = "कोड:"
+"timeline.system.codex_request_retried" = "Codex ने अस्थायी विफलता के बाद अनुरोध दोबारा भेजने की सूचना दी।"
 "timeline.system.continued_label" = "जारी"
 "timeline.system.detail_agent_rounds" = "एजेंट राउंड"
 "timeline.system.detail_checkpoint" = "चेकपॉइंट"
@@ -333,6 +334,40 @@
 "timeline.web_search.results_count" = "%{count} परिणाम"
 "timeline.web_search.running" = "वेब पर खोज रहा है"
 "timeline.work_group.completed" = "काम किया"
+
+"chat.composer.add_menu.plugins" = "प्लगइन जोड़ें"
+"plugins.empty" = "कोई प्लगइन इंस्टॉल नहीं है"
+"plugins.error" = "प्लगइन लोड नहीं हो सके। फिर से कोशिश करें।"
+"plugins.loading" = "प्लगइन लोड हो रहे हैं…"
+"plugins.search" = "प्लगइन खोजें"
+"plugins.select" = "प्लगइन चुनें"
+"plugins.unavailable" = "अनुपलब्ध"
+"chat.composer.preparing_send" = "संदेश तैयार हो रहा है"
+"plugins.retry" = "फिर कोशिश करें"
+"plugins.stale" = "चुना गया संस्करण अब नवीनतम नहीं है"
+
+"chat.composer.model.context_label" = "संदर्भ विंडो"
+"chat.composer.model.context_auto" = "ऑटो — %{tokens} टोकन तक"
+"chat.composer.model.context_up_to" = "%{tokens} टोकन तक"
+"chat.composer.model.context_invalid" = "सहेजा गया विकल्प उपलब्ध नहीं है। ऑटो या दूसरी विंडो चुनें।"
+
+"chat.composer.model.service_label" = "सेवा स्तर"
+
+"chat.composer.model.service_standard" = "मानक"
+
+"chat.composer.model.service_invalid" = "सहेजा गया सेवा स्तर उपलब्ध नहीं है। मानक या दूसरा मोड चुनें।"
+
+"chat.composer.add_menu.apps" = "ऐप जोड़ें"
+"apps.empty" = "कोई ऐप इंस्टॉल नहीं है"
+"apps.error" = "ऐप लोड नहीं हो सके। फिर से कोशिश करें।"
+"apps.loading" = "ऐप लोड हो रहे हैं…"
+"apps.search" = "ऐप खोजें"
+"apps.select" = "ऐप चुनें"
+"apps.unavailable" = "अनुपलब्ध"
+"apps.retry" = "फिर कोशिश करें"
+"apps.stale" = "चुना गया संस्करण अब नवीनतम नहीं है"
+
+"apps.view" = "App view"
 
 [chat.acp]
 prepare = "सत्र तैयार करें"

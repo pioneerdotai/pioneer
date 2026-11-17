@@ -1,6 +1,7 @@
 //! Prepare completed native or completed history for later Pioneer continuations.
 //! Every actual native model call independently budgets its complete request.
 use super::*;
+use anyhow::Context as _;
 use pioneer_agent::compaction::{history::NativeHistoryLayout, request::NativeRequestProjection};
 use pioneer_compaction::{
     CompactionMode, CompactionSettings, CoverageDomain, ModelBudget, ModelSelection, Transport,
@@ -160,6 +161,7 @@ pub(crate) async fn prepare_completed_history(
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut diagnostic,
     )
     .await?;
@@ -190,17 +192,33 @@ pub(crate) async fn prepare_completed_history_owned(
     suspending: Arc<std::sync::atomic::AtomicBool>,
     accepted_projection: Option<super::frozen::PreparedHistory>,
     cli_cwd: Option<&str>,
+    root_check_revision: Option<i64>,
     diagnostic: &mut HistoryCheckDiagnostic,
 ) -> Result<HistoryCheckOutcome> {
+    let (mut current, mut settings, mut cli_override) =
+        (current.clone(), settings.clone(), cli_override.cloned());
+    super::isolate_cli_summary_service_modes(&mut current, &mut settings, &mut cli_override);
+    let (current, settings, cli_override) = (&current, &settings, cli_override.as_ref());
     // The owner chooses the database class: foreground transfer is part of
     // turn startup; the completed-turn worker passes a maintenance handle.
     let store = scoped_store.clone();
-    let clock: Arc<dyn CompactionClock> = Arc::new(SystemCompactionClock::default());
+    let clock: Arc<dyn CompactionClock> = if root_check_revision.is_some() {
+        processor.compaction_clock.clone()
+    } else {
+        Arc::new(SystemCompactionClock::default())
+    };
     let deadline = clock
         .now_ms()
         .saturating_add(pioneer_compaction::OPERATION_MILLIS)
         .min(original_deadline.unwrap_or(u64::MAX));
     diagnostic.stage = "executor".into();
+    let _conversation_lease = if priority == super::ContextWorkPriority::Foreground {
+        processor
+            .acquire_composer_history_priority(&store, workspace, thread, turn, &cancellation)
+            .await?
+    } else {
+        None
+    };
     let Some(lease) = processor
         .compaction_coordinator
         .acquire(workspace, thread, priority, &cancellation)
@@ -210,6 +228,27 @@ pub(crate) async fn prepare_completed_history_owned(
         return Ok(HistoryCheckOutcome::WaitingExecutor);
     };
     let cancellation = lease.cancellation();
+    if let Some(revision) = root_check_revision {
+        let admission = async {
+            if !store
+                .compaction_history_check_revision_is_current(turn, revision)
+                .await?
+            {
+                return Ok(Some(HistoryCheckOutcome::Cancelled));
+            }
+            processor
+                .root_history_check_admission(workspace, thread, turn, clock.now_ms())
+                .await
+        };
+        let outcome = tokio::select! { biased;
+            _ = cancellation.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
+            _ = clock.sleep_until(deadline) => return Err(HistoryCheckDeadline.into()),
+            result = admission => result?,
+        };
+        if let Some(outcome) = outcome {
+            return Ok(outcome);
+        }
+    }
     diagnostic.stage = "catalog".into();
     if current.transport != Transport::Acp && pioneer_provider::catalog::model_catalog().is_err() {
         diagnostic.code = "catalog_unavailable".into();
@@ -233,8 +272,14 @@ pub(crate) async fn prepare_completed_history_owned(
         diagnostic.code = "history_preparation_incomplete".into();
         return Ok(HistoryCheckOutcome::Preparing);
     }
+    let mut authorization_revision = None;
     let prepare = async {
-        if accepted_projection.is_none() {
+        authorization_revision = if root_check_revision.is_some() {
+            Some(processor.initialize_authorization_generation().await?)
+        } else {
+            None
+        };
+        if accepted_projection.is_none() && root_check_revision.is_none() {
             ensure!(
                 store
                     .compaction_turn_is_completed(workspace, thread, turn)
@@ -319,26 +364,114 @@ pub(crate) async fn prepare_completed_history_owned(
                 .name()
                 .to_owned(),
         };
-        let budget = if current.transport == Transport::Acp {
-            // ACP model ids are opaque. This is a local wire/history bound,
-            // never a claim about an agent model's hidden context window.
+        let catalog_model = if current.transport == Transport::OpenCode {
+            current
+                .model
+                .split_once('/')
+                .map(|(_, model)| model)
+                .unwrap_or(&current.model)
+        } else {
+            &current.model
+        };
+        let limits = if current.transport == Transport::Acp {
+            None
+        } else if current.transport == Transport::Api {
+            Some(
+                processor
+                    .provider_registry()
+                    .get_or_create_for_workspace(workspace, &current.instance)?
+                    .model_limits(catalog_model)
+                    .await?,
+            )
+        } else {
+            Some(pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model))
+        };
+        let saved = if current.transport == Transport::Api {
+            let mut record = store.get_turn_execution_security_snapshot(turn).await?;
+            if record.as_ref().is_some_and(|record| {
+                record
+                    .snapshot
+                    .native_context
+                    .as_ref()
+                    .is_none_or(|budget| budget.service_mode.is_none())
+            }) {
+                let provider = processor
+                    .provider_registry()
+                    .get_or_create_for_workspace(workspace, &current.instance)?;
+                // Legacy launches had no user-authorized expansion. Pin Auto once,
+                // before building any runner identity or reusing a fits proof.
+                let budget = if let Some(budget) = record
+                    .as_ref()
+                    .and_then(|record| record.snapshot.native_context.clone())
+                {
+                    budget
+                } else {
+                    super::native_budget::capture(
+                        provider.as_ref(),
+                        &current.instance,
+                        catalog_model,
+                        None,
+                    )
+                    .await?
+                };
+                let summary = if record
+                    .as_ref()
+                    .is_some_and(|record| record.snapshot.native_context.is_some())
+                {
+                    record
+                        .as_ref()
+                        .and_then(|record| record.snapshot.native_summary.clone())
+                } else {
+                    super::native_budget::capture_summary_legacy(processor, workspace, &budget)
+                        .await?
+                };
+                let (budget, summary) =
+                    super::native_budget::legacy_modes(processor, workspace, budget, summary)
+                        .await?;
+                store
+                    .pin_turn_native_context(workspace, turn, &budget, summary.as_ref())
+                    .await?;
+                record = store.get_turn_execution_security_snapshot(turn).await?;
+                anyhow::ensure!(
+                    record
+                        .as_ref()
+                        .is_some_and(|record| record.snapshot.native_context.is_some()),
+                    "Native execution context could not be pinned"
+                );
+            }
+            record.map(|record| record.snapshot)
+        } else {
+            None
+        };
+        let saved_context = saved
+            .as_ref()
+            .and_then(|saved| saved.native_context.as_ref());
+        let saved_summary = saved
+            .as_ref()
+            .and_then(|saved| saved.native_summary.as_ref());
+        let budget = if current.transport == Transport::Api {
+            let provider = processor
+                .provider_registry()
+                .get_or_create_for_workspace(workspace, &current.instance)?;
+            super::native_budget::effective(
+                provider.as_ref(),
+                &current.instance,
+                catalog_model,
+                saved_context,
+                current.context_window,
+            )
+            .await?
+        } else if current.transport == Transport::Acp {
+            // A local retained-history/wire bound, not the agent's hidden model window.
             ModelBudget::new(
                 Some((crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES / 8) as u64),
                 None,
                 None,
             )
         } else {
-            let catalog_model = if current.transport == Transport::OpenCode {
-                current
-                    .model
-                    .split_once('/')
-                    .map(|(_, model)| model)
-                    .unwrap_or(&current.model)
-            } else {
-                &current.model
-            };
-            let limits =
-                pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model);
+            let limits = limits
+                .as_ref()
+                .context("native CLI catalog limits are unavailable")?;
             ModelBudget::new(
                 Some(limits.context_window),
                 limits.max_input,
@@ -368,6 +501,12 @@ pub(crate) async fn prepare_completed_history_owned(
             None
         };
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: if current.transport == Transport::Api {
+                saved_context.and_then(|saved| saved.service_mode.clone())
+            } else {
+                None
+            },
             model: current.model.clone(),
             messages,
             temperature: None,
@@ -382,6 +521,7 @@ pub(crate) async fn prepare_completed_history_owned(
             pioneer_provider::history::project_request_for_provider(&catalog, request)?
         } else {
             ChatRequest {
+                tool_declarations: None,
                 messages: request
                     .messages
                     .iter()
@@ -480,15 +620,54 @@ pub(crate) async fn prepare_completed_history_owned(
             diagnostic.code = "history_fits".into();
             return Ok(None);
         }
-        let selection =
-            effective_selection(current, settings.selection.as_ref(), cli_override).clone();
+        let selection = saved_summary
+            .as_ref()
+            .map(|saved| super::native_budget::summary_selection(saved, current.effort.clone()))
+            .unwrap_or_else(|| {
+                effective_selection(current, settings.selection.as_ref(), cli_override).clone()
+            });
+        let native_summary_settings =
+            (current.transport == Transport::Api).then(|| CompactionSettings {
+                selection: Some(selection.clone()),
+            });
         diagnostic.stage = "summary_configuration".into();
+        if let Some(revision) = authorization_revision {
+            if processor.initialize_authorization_generation().await? != revision {
+                return Ok(Some(Err(HistoryCheckOutcome::Preparing)));
+            }
+        }
+        if let Some(revision) = root_check_revision {
+            if !store
+                .compaction_history_check_revision_is_current(turn, revision)
+                .await?
+            {
+                return Ok(Some(Err(HistoryCheckOutcome::Cancelled)));
+            }
+            if let Some(outcome) = processor
+                .root_history_check_admission(workspace, thread, turn, clock.now_ms())
+                .await?
+            {
+                return Ok(Some(Err(outcome)));
+            }
+        }
         let summarizer = super::service::make_summarizer(
             processor.provider_registry().as_ref(),
             &store,
             Some(processor),
             workspace,
+            thread,
             selection,
+            current.transport == Transport::Api,
+            saved_summary
+                .as_ref()
+                .map(|saved| &saved.budget)
+                .or_else(|| {
+                    if settings.selection.is_none() {
+                        saved_context
+                    } else {
+                        None
+                    }
+                }),
         )
         .await?;
         diagnostic.stage = "planning".into();
@@ -507,10 +686,10 @@ pub(crate) async fn prepare_completed_history_owned(
             .estimated_input_tokens
             .saturating_sub(message_total)
             .saturating_add(fixed_input_tokens);
-        let available = budget
-            .context
-            .saturating_sub(full.output_reserve)
-            .saturating_sub(fixed);
+        // The replacement summary shares the estimated-input allowance with
+        // fixed framing. Raw context room omits padding and input-only limits.
+        let available =
+            estimated_input_capacity(&budget, full.output_reserve, false).saturating_sub(fixed);
         let available = if current.transport == Transport::Codex {
             codex_history_budget.as_ref().map_or(available, |transfer| {
                 transfer.available_input_tokens(&budget, full.output_reserve, fixed)
@@ -599,15 +778,26 @@ pub(crate) async fn prepare_completed_history_owned(
             &full.request.messages,
         ))?));
         let manifest = super::admission::history_manifest(&full.request.messages, &layout, &plan)?;
+        let native_projection =
+            NativeRequestProjection::new(full.request, indexes, media, budget.clone(), false)?;
+        // Retained CLI history/media and their indices are immutable for this
+        // operation. Prepare the empty-summary frame once; correction candidates
+        // scan only their new summary, not all retained history or local images.
+        let cli_input = if let Some(runtime) = cli {
+            let base = native_projection.evaluate("")?;
+            let (tokens, _, _) = crate::cli_runtime::context::completed_cli_history_budget(
+                &base.request.messages,
+                workspace,
+                cwd.as_deref(),
+                runtime,
+            )?;
+            Some((tokens, base.output_reserve))
+        } else {
+            None
+        };
         let projection = BackgroundHistoryTarget {
-            projection: NativeRequestProjection::new(
-                full.request,
-                indexes,
-                media,
-                budget.clone(),
-                false,
-            )?,
-            cli: cli.map(|runtime| (workspace.to_owned(), cwd, runtime)),
+            projection: native_projection,
+            cli_input,
             budget,
             fixed_input_tokens,
         };
@@ -616,7 +806,7 @@ pub(crate) async fn prepare_completed_history_owned(
             &store,
             workspace,
             thread,
-            settings,
+            native_summary_settings.as_ref().unwrap_or(settings),
             current,
             cli_override,
             summarizer.as_ref(),
@@ -638,15 +828,19 @@ pub(crate) async fn prepare_completed_history_owned(
             clock.now_ms(),
         )
         .await?;
-        Ok::<_, anyhow::Error>(Some((snapshot, summarizer, projection)))
+        Ok::<_, anyhow::Error>(Some(Ok((snapshot, summarizer, projection))))
     };
     let operation = tokio::select! { biased;
         _ = cancellation.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
         _ = clock.sleep_until(deadline) => return Err(HistoryCheckDeadline.into()),
         result = prepare => result?,
     };
-    let Some((snapshot, summarizer, projection)) = operation else {
+    let Some(operation) = operation else {
         return Ok(HistoryCheckOutcome::Fits);
+    };
+    let (snapshot, summarizer, projection) = match operation {
+        Ok(operation) => operation,
+        Err(outcome) => return Ok(outcome),
     };
     diagnostic.stage = "summarization".into();
     diagnostic.operation = Some(snapshot.id.clone());
@@ -662,9 +856,44 @@ pub(crate) async fn prepare_completed_history_owned(
         clock.clone(),
     )
     .with_execution_turn(turn.into());
+    if let Some(revision) = root_check_revision {
+        // Admission may span several bounded metadata quanta. Recheck at the
+        // service boundary, with the same cancellation and operation deadline.
+        let admission = async {
+            let authority_changed = if let Some(revision) = authorization_revision {
+                processor.initialize_authorization_generation().await? != revision
+            } else {
+                false
+            };
+            if authority_changed
+                || !runner
+                    .store
+                    .compaction_history_check_revision_is_current(turn, revision)
+                    .await?
+            {
+                Ok(Some(HistoryCheckOutcome::Cancelled))
+            } else {
+                processor
+                    .root_history_check_admission(workspace, thread, turn, clock.now_ms())
+                    .await
+            }
+        };
+        let (outcome, reason) = tokio::select! { biased;
+            _ = cancellation.cancelled() => (Some(HistoryCheckOutcome::Cancelled), FailureKind::Cancelled),
+            _ = clock.sleep_until(operation_deadline) => (Some(HistoryCheckOutcome::Failed), FailureKind::Deadline),
+            result = admission => (result?, FailureKind::Cancelled),
+        };
+        if let Some(outcome) = outcome {
+            runner.reconcile(reason).await?;
+            return Ok(outcome);
+        }
+    }
     let exit = tokio::select! { biased;
         _ = clock.sleep_until(operation_deadline) => CompactionExit::Reconcile(FailureKind::Deadline),
-        result = runner.run(cancellation) => result?,
+        result = pioneer_provider::usage::scope_causal_parent(
+            pioneer_provider::usage::current_causal_parent().unwrap_or_else(||format!("turn:{turn}")),
+            runner.run(cancellation),
+        ) => result?,
     };
     if suspending.load(std::sync::atomic::Ordering::Acquire)
         && matches!(exit, CompactionExit::Reconcile(FailureKind::Cancelled))
@@ -687,6 +916,7 @@ pub(crate) async fn prepare_completed_history_owned(
             diagnostic.code = match reason {
                 FailureKind::Transient => "provider_retries_exhausted",
                 FailureKind::Permanent => "compaction_permanent_failure",
+                FailureKind::InputOverflow => "input_overflow",
                 FailureKind::InvalidCompletion => "invalid_completion",
                 FailureKind::InsufficientEffect => "insufficient_effect",
                 FailureKind::Deadline => "operation_deadline",
@@ -734,27 +964,25 @@ fn apply_cli_budget(
 
 struct BackgroundHistoryTarget {
     projection: NativeRequestProjection,
-    cli: Option<(
-        String,
-        Option<String>,
-        pioneer_protocol::CLIAgentRuntimeKind,
-    )>,
+    cli_input: Option<(u64, u64)>,
     budget: ModelBudget,
     fixed_input_tokens: u64,
 }
 #[async_trait::async_trait]
 impl CompactionTarget for BackgroundHistoryTarget {
     async fn fits(&self, summary: &str) -> Result<bool> {
-        let mut evaluated = self.projection.evaluate(summary)?;
-        if let Some((workspace, cwd, runtime)) = &self.cli {
-            apply_cli_budget(
-                &mut evaluated,
-                workspace,
-                cwd.as_deref(),
-                *runtime,
-                &self.budget,
-            )?;
+        if let Some((base, output_reserve)) = self.cli_input {
+            // Summary appears in portable-message JSON inside a CLI text JSON
+            // field. Exclude its two escaped quotes: the base already has them.
+            let added = super::summary_component_units(&summary)?.saturating_sub(4);
+            let input = super::PortionSizing::new(base).with(added);
+            return Ok(self.budget.fits(
+                input.saturating_add(self.fixed_input_tokens),
+                output_reserve,
+                false,
+            ));
         }
+        let evaluated = self.projection.evaluate(summary)?;
         Ok(self.budget.fits(
             evaluated
                 .estimated_input_tokens

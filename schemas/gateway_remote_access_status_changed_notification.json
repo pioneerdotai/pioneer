@@ -58,6 +58,13 @@
             "null"
           ]
         },
+        "public_base_url": {
+          "description": "Present only for the currently authenticated relay connection.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "state": {
           "$ref": "#/$defs/GatewayRemoteAccessState",
           "default": "disabled"

@@ -91,7 +91,7 @@ impl ArtifactBlobStore for LocalArtifactBlobStore {
         // One bounded FS operation owns its lock even if its caller or runtime
         // is cancelled. No queued rename may outlive coordination. HTML staging
         // registered an orphan row before starting this operation.
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             use std::io::{Read, Write};
             let _guard = guard;
             let tmp = store.tmp_path(&workspace)?;
@@ -190,7 +190,7 @@ impl ArtifactBlobStore for LocalArtifactBlobStore {
         guard: crate::ArtifactBlobMutationGuard,
     ) -> ArtifactResult<()> {
         let path = self.blob_path(workspace, key)?;
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             let _guard = guard;
             match std::fs::remove_file(path) {
                 Ok(()) => Ok(()),

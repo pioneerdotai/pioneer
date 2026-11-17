@@ -15,9 +15,17 @@ pub mod file_tools;
 mod generation;
 pub mod history;
 mod http;
+pub mod messages;
+pub mod prompt_cache;
+mod service_mode;
+pub use messages::{
+    ProviderMessage, ProviderMessageBoundary, ProviderMessageCollector, ProviderMessageId,
+    ProviderMessageMetadata, ProviderRoundUiCopy, ProviderRoundUiCopyKind,
+};
 pub mod providers;
-pub mod reasoning_registry;
 pub mod registry;
+pub mod selection;
+pub mod tool_declarations;
 pub mod tools;
 pub mod traits;
 pub mod types;
@@ -57,8 +65,9 @@ pub use types::{
     InputContentType, InputTypeSupport, MessageAttachment, MessageContentPart, MessageProvenance,
     MessageSourceAlias, MessageSourceIdentity, MessageSourceRef, ModelInputItem,
     ProviderCallIdentity, ProviderCapabilities, ProviderFailureClassification,
-    ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities, ProviderReplayState,
-    ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream, ProviderStreamDiagnostics,
-    ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ReasoningEffort,
-    Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities, ProviderMessageDelivery,
+    ProviderReplayState, ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream,
+    ProviderStreamDiagnostics, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall,
+    ProviderUsageProfile, ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage,
+    ToolChoice, ToolDefinition,
 };

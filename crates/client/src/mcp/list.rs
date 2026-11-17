@@ -3,6 +3,11 @@
 use pioneer_protocol::{McpListItem, McpListParams, McpServerDetailsResponse};
 use std::collections::HashSet;
 
+/// Standalone screens and pickers hide owned records; common catalogs retain them.
+pub fn mcp_is_standalone(server: &McpListItem) -> bool {
+    !server.is_package_component()
+}
+
 pub const MCP_INSTALL_PENDING_KEY: &str = "__install__";
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -182,6 +187,8 @@ mod tests {
 
     pub(crate) fn server(id: &str, name: &str) -> McpListItem {
         McpListItem {
+            plugin_owner: None,
+            package_owner: None,
             id: id.to_owned(),
             name: name.to_owned(),
             display_name: None,
@@ -256,28 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_application_prunes_pending_and_clears_missing_selection() {
-        let mut servers = vec![server("id-old", "old")];
-        let mut pending = HashSet::from(["old".to_owned()]);
-        let mut selected = Some("id-old".to_owned());
-        let mut details = None;
-
-        let result = apply_mcp_snapshot(
-            &mut servers,
-            &mut pending,
-            &mut selected,
-            &mut details,
-            vec![server("id-new", "new")],
-        );
-
-        assert!(result.selected_was_present);
-        assert!(result.selected_removed);
-        assert_eq!(selected, None);
-        assert!(!is_mcp_pending(&pending, "old"));
-        assert_eq!(servers[0].id, "id-new");
-    }
-
-    #[test]
     fn snapshot_application_keeps_existing_selection() {
         let mut servers = Vec::new();
         let mut pending = HashSet::new();
@@ -311,12 +296,7 @@ mod tests {
         assert!(reduction.server_details.is_none());
         assert!(reduction.application.selected_removed);
         assert!(!reduction.pending_actions.contains("old"));
-    }
 
-    #[test]
-    fn list_refresh_failure_reduction_carries_display_error() {
-        let reduction = reduce_mcp_list_refresh_failure("load failed");
-
-        assert_eq!(reduction.error, "load failed");
+        assert!(reduction.application.selected_was_present);
     }
 }

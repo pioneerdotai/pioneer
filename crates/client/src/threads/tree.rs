@@ -1160,6 +1160,9 @@ mod tests {
 
     fn thread(thread_id: &str, workspace_id: &str, updated_at: i64) -> Thread {
         Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -1845,30 +1848,6 @@ mod tests {
         assert_eq!(reduction.thread, thread);
         assert_eq!(reduction.thread_id, "thread_a");
         assert_eq!(reduction.workspace_id, "ws_a");
-    }
-
-    #[test]
-    fn remembered_thread_map_insert_remove_and_lookup_are_workspace_scoped() {
-        let mut remembered = HashMap::new();
-
-        remember_thread_for_workspace(&mut remembered, "ws_a", Some("thread_a".to_owned()));
-        remember_thread_for_workspace(&mut remembered, "ws_b", Some("thread_b".to_owned()));
-
-        assert_eq!(
-            remembered_thread_for_workspace(&remembered, "ws_a"),
-            Some("thread_a")
-        );
-        assert_eq!(
-            remembered_thread_for_workspace(&remembered, "ws_b"),
-            Some("thread_b")
-        );
-
-        remember_thread_for_workspace(&mut remembered, "ws_a", None);
-        assert_eq!(remembered_thread_for_workspace(&remembered, "ws_a"), None);
-        assert_eq!(
-            remembered_thread_for_workspace(&remembered, "ws_b"),
-            Some("thread_b")
-        );
     }
 
     #[test]

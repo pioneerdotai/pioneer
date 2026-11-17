@@ -32,6 +32,8 @@ base64.workspace = true
 tracing.workspace = true
 pioneer-config.workspace = true
 pioneer-client.workspace = true
+pioneer-desktop-packages.workspace = true
+pioneer-desktop-apps.workspace = true
 pioneer-desktop-foundation.workspace = true
 pioneer-keystore.workspace = true
 pioneer-observability.workspace = true
@@ -53,6 +55,10 @@ image.workspace = true
 cpal.workspace = true
 webbrowser.workspace = true
 url.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -70,11 +76,14 @@ pioneer-client = { workspace = true, features = ["test-support"] }
 # Syntax-aware ownership and Render checks use the already locked parser.
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 gpui-kit = { workspace = true, features = ["test-support"] }
-hex.workspace = true
-tempfile.workspace = true
 tokio-tungstenite.workspace = true
 
 [package.metadata.i18n]
 available-locales = ["en", "ru", "zh", "hi", "es", "de", "fr", "jp"]
 default-locale = "en"
 load-path = "locales"
+
+[build-dependencies]
+sha2.workspace = true
+hex.workspace = true
+serde_json.workspace = true

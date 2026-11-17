@@ -10,7 +10,13 @@ pub(crate) use super::compaction_task_output as task_output;
 
 /// Context rows retained by cleanup and admitted to newly built model history.
 /// Exact source lookup for existing frozen histories remains independent of this rule.
-pub const MODEL_HISTORY_CONTEXT_SOURCES: [&str; 2] = ["assistant_round", "tool_result_v2"];
+pub const MODEL_HISTORY_CONTEXT_SOURCES: [&str; 5] = [
+    "assistant_round",
+    "tool_result_v2",
+    "turn_input_projection_v1",
+    "runtime_context_v1",
+    "system_snapshot_v1",
+];
 
 pub fn model_history_context_source(source: &str) -> bool {
     MODEL_HISTORY_CONTEXT_SOURCES.contains(&source)
@@ -40,6 +46,7 @@ use pioneer_entity::{
     compaction_source_revision, task_run_conversation_snapshot, thread, turn, turn_event,
     turn_input, turn_item, turn_llm_context,
 };
+use pioneer_observability::portable_payload as observe;
 pub use runner::{ManifestEntry, RunnerPlanRecord};
 #[cfg(any(test, feature = "test-support"))]
 pub use runner::{
@@ -1318,7 +1325,7 @@ pub(crate) async fn compaction_model_context_sources_current<C: ConnectionTrait>
             JOIN thread context_thread ON context_thread.id=context_turn.thread_id
             WHERE revision.present=1 AND context_thread.workspace_id=?2
               AND context_turn.thread_id=?3
-              AND context_source.source IN (?4,?5)
+              AND context_source.source IN (?4,?5,?6,?7,?8)
               AND 'context:'||revision.turn_id=json_extract(wanted.value,'$.scope')
               AND revision.source_id=json_extract(wanted.value,'$.id')
               AND 'revision:'||revision.revision=json_extract(wanted.value,'$.version')
@@ -1329,6 +1336,9 @@ pub(crate) async fn compaction_model_context_sources_current<C: ConnectionTrait>
             thread.into(),
             MODEL_HISTORY_CONTEXT_SOURCES[0].into(),
             MODEL_HISTORY_CONTEXT_SOURCES[1].into(),
+            MODEL_HISTORY_CONTEXT_SOURCES[2].into(),
+            MODEL_HISTORY_CONTEXT_SOURCES[3].into(),
+            MODEL_HISTORY_CONTEXT_SOURCES[4].into(),
         ],
     ))
     .one(db)
@@ -1539,7 +1549,7 @@ pub(crate) async fn compaction_finish<C: ConnectionTrait>(
     id: &str,
     status: &str,
     outcome: &str,
-) -> Result<()> {
+) -> Result<bool> {
     ensure!(
         ["failed", "cancelled", "stale"].contains(&status),
         "invalid terminal transition"
@@ -1548,7 +1558,7 @@ pub(crate) async fn compaction_finish<C: ConnectionTrait>(
         outcome.len() <= 128,
         "outcome must be a bounded classification"
     );
-    compaction_operation::Entity::update_many()
+    let changed = compaction_operation::Entity::update_many()
         .col_expr(
             compaction_operation::Column::Status,
             Expr::Value(status.into()),
@@ -1564,7 +1574,7 @@ pub(crate) async fn compaction_finish<C: ConnectionTrait>(
         )
         .exec(db)
         .await?;
-    Ok(())
+    Ok(changed.rows_affected > 0)
 }
 
 /// Saves complete intermediate results without publishing a working pointer.
@@ -3075,6 +3085,35 @@ pub(crate) async fn compaction_tool_result_id<C: ConnectionTrait>(
     Ok(rows.into_iter().next())
 }
 
+/// Resolve ownership using canonical columns. Never deserialize full provider
+/// output/storage merely to authorize a result. Only observer parameters can
+/// introduce additional protected source references; other arguments are ignored.
+pub(crate) async fn tool_result_access_source(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    item: &str,
+) -> Result<Option<serde_json::Value>> {
+    let row = store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT ti.item_type AS item_type, json_extract(ti.payload,'$.toolName') AS tool_name, \
+         CASE WHEN json_extract(ti.payload,'$.toolName') IN ('threads_list','threads_history_read','threads_children_list','threads_tools_result_read') \
+         THEN json_extract(ti.payload,'$.arguments') ELSE NULL END AS arguments \
+         FROM turn_item ti JOIN turn t ON t.id=ti.turn_id JOIN thread th ON th.id=t.thread_id \
+         WHERE th.workspace_id=? AND t.thread_id=? AND t.id=? AND ti.item_id=? AND t.message_deleted_at IS NULL \
+         AND ti.item_type IN ('command_execution','file_change','web_search','web_fetch','download','dynamic_tool_call')",
+        vec![workspace.into(), thread.into(), turn.into(), item.into()])).await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let arguments: Option<String> = row.try_get("", "arguments")?;
+    Ok(Some(
+        serde_json::json!({"itemType":row.try_get::<String>("", "item_type")?,
+        "toolName":row.try_get::<Option<String>>("", "tool_name")?,
+        "arguments":arguments.map(|arguments| serde_json::from_str::<serde_json::Value>(&arguments)).transpose()?}),
+    ))
+}
+
 /// Prefer an already retained full shell source. Other tools use their canonical result.
 /// Both lookups and fragments retain the same workspace/thread/turn scope.
 pub(crate) async fn compaction_tool_result_fragment(
@@ -3172,101 +3211,133 @@ pub(crate) async fn compaction_reference_fragment(
     character_offset: u64,
 ) -> Result<Option<CanonicalFragment>> {
     if reference.scope.starts_with("task-basis:") {
-        let offset = i64::try_from(character_offset)?
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("source offset overflow"))?;
-        let row = task_run_conversation_snapshot::Entity::find()
-            .select_only()
-            .join(
-                JoinType::InnerJoin,
-                compaction_live_sources::join(
-                    task_run_conversation_snapshot::Entity,
-                    task_run_conversation_snapshot::Column::RunId,
-                    compaction_live_sources::Column::SourceId,
-                )
-                .on_condition(|_, _| {
-                    sea_orm::Condition::all().add(
-                        Expr::col((
-                            compaction_live_sources::Column::Table,
-                            compaction_live_sources::Column::SourceScope,
-                        ))
-                        .eq(Expr::val("task-basis:").binary(
-                            BinOper::Custom("||"),
-                            Expr::col((
-                                task_run_conversation_snapshot::Entity,
-                                task_run_conversation_snapshot::Column::RunId,
-                            )),
-                        )),
+        return observe::scope_result(
+            observe::Family::TaskHistory,
+            observe::Mode::Range,
+            async {
+                use pioneer_entity::compaction_task_basis_revision as basis_revision;
+                use sea_orm::QueryTrait;
+                use task_run_conversation_snapshot::Column as Col;
+                if reference.scope != format!("task-basis:{}", reference.id) {
+                    return Ok(None);
+                }
+                // Reproduce the Task branch's relational live-source fences directly.
+                // Joining the legacy live-source view here would evaluate ltrim(TEXT)
+                // and materialize the entire history before the native byte read.
+                let query = task_run_conversation_snapshot::Entity::find()
+                    .select_only()
+                    .join(
+                        JoinType::InnerJoin,
+                        task_run_conversation_snapshot::Entity::belongs_to(thread::Entity)
+                            .from(Col::ConversationThreadId)
+                            .to(thread::Column::Id)
+                            .into(),
                     )
-                }),
-            )
-            .expr_as(
-                Expr::expr(Func::cust(Alias::new("substr")).args([
-                    Expr::col((
-                        task_run_conversation_snapshot::Entity,
-                        task_run_conversation_snapshot::Column::HistoryJson,
-                    )),
-                    Expr::Value(offset.into()),
-                    Expr::val(16384_i64),
-                ])),
-                "fragment",
-            )
-            .expr_as(
-                Expr::expr(Func::cust(Alias::new("length")).args([Expr::col((
-                    task_run_conversation_snapshot::Entity,
-                    task_run_conversation_snapshot::Column::HistoryJson,
-                ))])),
-                "characters",
-            )
-            .filter(
-                Expr::col((
-                    compaction_live_sources::Column::Table,
-                    compaction_live_sources::Column::WorkspaceId,
-                ))
-                .eq(Expr::Value(workspace.into()))
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::ThreadId,
-                    ))
-                    .eq(Expr::Value(thread.into())),
+                    .join(
+                        JoinType::LeftJoin,
+                        task_run_conversation_snapshot::Entity::belongs_to(basis_revision::Entity)
+                            .from(Col::RunId)
+                            .to(basis_revision::Column::RunId)
+                            .into(),
+                    )
+                    .filter(Col::RunId.eq(&reference.id))
+                    .filter(Col::WorkspaceId.eq(workspace))
+                    .filter(Col::ConversationThreadId.eq(thread))
+                    .filter(
+                        Expr::col((thread::Entity, thread::Column::WorkspaceId)).eq(Expr::col((
+                            task_run_conversation_snapshot::Entity,
+                            Col::WorkspaceId,
+                        ))),
+                    )
+                    .filter(
+                        Expr::cust(
+                            "'task-basis-revision:'||COALESCE(compaction_task_basis_revision.revision,1)",
+                        )
+                        .eq(&reference.version),
+                    );
+                let length = "CASE WHEN task_run_conversation_snapshot.history_json_payload_id IS NULL THEN octet_length(task_run_conversation_snapshot.history_json) ELSE (SELECT p.original_bytes FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id) END";
+                let source_read = observe::stage(observe::Stage::SourceRead);
+                let row = query.clone()
+                    .expr_as(Expr::cust(length), "history_bytes")
+                    .column(Col::HistoryJsonPayloadId).column(Col::PortableIdentity).column(Col::PortableRevision)
+                    // Only a completed compressed value has a tiny base projection.
+                    // The legacy branch never evaluates OP_Column on history_json.
+                    .expr_as(Expr::cust("CASE WHEN (SELECT p.raw FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id)=0 THEN task_run_conversation_snapshot.history_json ELSE NULL END"), "projection")
+                    .limit(1).into_tuple::<(i64, Option<String>, String, i64, Option<String>)>()
+                    .one(&store.connection).await?;
+                drop(source_read);
+                let Some((size, payload_id, identity, revision, projection)) = row else {
+                    observe::outcome(observe::Outcome::Stale);
+                    return Ok(None);
+                };
+                if let Some(id) = &payload_id {
+                    let meta = super::portable_payload::header(
+                        &store.connection,
+                        id,
+                        super::portable_payload::Family::TaskHistory,
+                    )
+                    .await?;
+                    ensure!(
+                        meta.original_bytes == size,
+                        "Task basis byte length changed"
+                    );
+                    if meta.raw == 0 {
+                        let projection =
+                            projection.ok_or_else(|| anyhow::anyhow!("Task basis projection missing"))?;
+                        if !projection.trim_start_matches(' ').starts_with('[') {
+                            return Ok(None);
+                        }
+                        let characters = u64::try_from(meta.original_chars)?;
+                        ensure!(character_offset <= characters, "source offset is past end");
+                        let bytes = super::portable_payload::read_range(
+                            &store.connection,
+                            &meta,
+                            i64::try_from(character_offset)?,
+                            16384,
+                            true,
+                        )
+                        .await?;
+                        let _verify = observe::stage(observe::Stage::VerifyAssemble);
+                        let text = String::from_utf8(bytes)?;
+                        let end = character_offset + text.chars().count() as u64;
+                        return Ok(Some(CanonicalFragment {
+                            reference: reference.clone(),
+                            text,
+                            next_character: (end < characters).then_some(end),
+                        }));
+                    }
+                }
+                let guard = query
+                    .expr(Expr::cust("task_run_conversation_snapshot.rowid"))
+                    .filter(Col::PortableIdentity.eq(&identity))
+                    .filter(Col::PortableRevision.eq(revision))
+                    .filter(Expr::cust(length).eq(size))
+                    .filter(match &payload_id {
+                        Some(id) => Col::HistoryJsonPayloadId.eq(id),
+                        None => Col::HistoryJsonPayloadId.is_null(),
+                    })
+                    .limit(1)
+                    .build(DbBackend::Sqlite);
+                let result = super::portable_payload_legacy_text::fragment(
+                    store,
+                    guard,
+                    super::portable_payload_legacy_text::Key {
+                        run: reference.id.clone(),
+                        identity,
+                        revision,
+                    },
+                    u64::try_from(size)?,
+                    character_offset,
                 )
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceScope,
-                    ))
-                    .eq(Expr::Value(reference.scope.clone().into())),
-                )
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceId,
-                    ))
-                    .eq(Expr::Value(reference.id.clone().into())),
-                )
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceVersion,
-                    ))
-                    .eq(Expr::Value(reference.version.clone().into())),
-                ),
-            )
-            .into_tuple::<(String, i64)>()
-            .one(&store.connection)
-            .await?;
-        let Some((text, characters)) = row else {
-            return Ok(None);
-        };
-        let characters = u64::try_from(characters)?;
-        ensure!(character_offset <= characters, "source offset is past end");
-        let end = character_offset.saturating_add(text.chars().count() as u64);
-        return Ok(Some(CanonicalFragment {
-            reference: reference.clone(),
-            text,
-            next_character: (end < characters).then_some(end),
-        }));
+                .await?;
+                Ok(result.map(|(text, next_character)| CanonicalFragment {
+                    reference: reference.clone(),
+                    text,
+                    next_character,
+                }))
+            },
+        )
+        .await;
     }
     if reference.scope.starts_with("checkpoint:") {
         let offset = i64::try_from(character_offset)?
@@ -3390,7 +3461,7 @@ pub(crate) async fn compaction_reference_payload(
     reference: &SourceRef,
 ) -> Result<Option<String>> {
     if reference.scope.starts_with("task-basis:") {
-        return Ok(task_run_conversation_snapshot::Entity::find()
+        let captured = task_run_conversation_snapshot::Entity::find()
             .select_only()
             .join(
                 JoinType::InnerJoin,
@@ -3436,9 +3507,25 @@ pub(crate) async fn compaction_reference_payload(
                 ))
                 .eq(&reference.version),
             )
-            .into_tuple::<String>()
+            .column(task_run_conversation_snapshot::Column::HistoryJsonPayloadId)
+            .into_tuple::<(String, Option<String>)>()
             .one(&store.connection)
-            .await?);
+            .await?;
+        // Plain/raw remains one linear TEXT read. Compressed rows select only
+        // the tiny shape projection and reference; hydrate reads bounded byte
+        // blocks sequentially, never a growing Unicode substr prefix.
+        return match captured {
+            Some((plain, id)) => Ok(Some(
+                super::portable_payload::hydrate(
+                    &store.connection,
+                    super::portable_payload::Family::TaskHistory,
+                    id.as_deref(),
+                    plain,
+                )
+                .await?,
+            )),
+            None => Ok(None),
+        };
     }
     if reference.scope.starts_with("checkpoint:") {
         let row = SourceFragmentRow::find_by_statement(
@@ -3739,7 +3826,13 @@ pub(crate) async fn compaction_context_reference_for_item<C: ConnectionTrait>(
     source: &str,
 ) -> Result<Option<SourceRef>> {
     ensure!(
-        ["assistant_round", "tool_result_v2"].contains(&source),
+        [
+            "assistant_round",
+            "tool_result_v2",
+            "turn_input_projection_v1",
+            "runtime_context_v1",
+        ]
+        .contains(&source),
         "unsupported canonical runtime locator"
     );
     let row = turn_llm_context::Entity::find()

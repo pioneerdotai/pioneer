@@ -2,9 +2,37 @@
 
 pub(crate) mod poll;
 
+/// Shared management controller mailbox capacity (existing MCP policy).
+pub(crate) const CONTROLLER_QUEUE_CAPACITY: usize = 32;
+
 use serde::{Deserialize, Serialize};
 
 use crate::core::ClientGeneration;
+
+/// A catalog consumer's lifetime. The domain owner supplies its release action;
+/// all catalog surfaces use the same exactly-once release on drop.
+pub struct CatalogDemand {
+    identity: u64,
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+impl CatalogDemand {
+    pub(crate) fn new(identity: u64, release: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            identity,
+            release: Some(Box::new(release)),
+        }
+    }
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity
+    }
+}
+impl Drop for CatalogDemand {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

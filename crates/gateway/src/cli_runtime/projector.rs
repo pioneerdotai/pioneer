@@ -25,6 +25,8 @@ pub(crate) struct CLIRuntimeProjectorContext {
     pub thread_id: String,
     pub turn_id: String,
     pub recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+    /// Set only for Codex after current durable attempt ownership is validated.
+    pub codex_retry_attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -73,11 +75,17 @@ impl CLIRuntimeProjectedEvents {
     }
 }
 
+pub(crate) fn is_supplemental_statistics(event: &AgentDurableEvent) -> bool {
+    matches!(event, AgentDurableEvent::ItemCompleted { notification }
+        if matches!(&notification.item, TurnItem::SystemEvent { code: Some(code), .. }
+            if matches!(code.as_str(), "provider_usage" | "cli_native_turn_timing")))
+}
+
 pub(crate) fn project_cli_runtime_event(
     context: &CLIRuntimeProjectorContext,
     event: &RuntimeEvent,
 ) -> CLIRuntimeProjectedEvents {
-    match event {
+    let mut projected = match event {
         RuntimeEvent::TurnCompleted(_) => {
             CLIRuntimeProjectedEvents::durable(AgentDurableEvent::TurnCompleted {
                 thread_id: context.thread_id.clone(),
@@ -99,9 +107,31 @@ pub(crate) fn project_cli_runtime_event(
                 turn_id: context.turn_id.clone(),
                 reason: interrupted.reason.clone(),
                 recovery: context.recovery.clone(),
+                cancellation_owner: None,
             })
         }
-        RuntimeEvent::TurnRetrying(_) => CLIRuntimeProjectedEvents::ignored("turn_retrying"),
+        RuntimeEvent::TurnRetrying(_) => {
+            let Some(attempt_id) = context.codex_retry_attempt_id.as_deref() else {
+                return CLIRuntimeProjectedEvents::ignored("turn_retrying");
+            };
+            // One immutable historical fact per native attempt. Neither retry
+            // diagnostics nor recovery confirmation may change this payload.
+            CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ItemCompleted {
+                notification: ItemCompletedNotification {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn_id: context.turn_id.clone(),
+                    item: TurnItem::SystemEvent {
+                        id: pioneer_crud::codex_retry_notice_item_id(&context.turn_id, attempt_id),
+                        level: SystemEventLevel::Warning,
+                        message: "Codex reported a request retry after a temporary failure."
+                            .to_owned(),
+                        code: Some("codex_request_retried".to_owned()),
+                        details: None,
+                    },
+                },
+            })
+        }
         RuntimeEvent::Error(error) => project_runtime_error(context, error),
         RuntimeEvent::ReviewModeChanged(review) => project_review_mode_changed(context, review),
         RuntimeEvent::ItemStarted(started) => project_item_started(context, started),
@@ -124,7 +154,76 @@ pub(crate) fn project_cli_runtime_event(
         | RuntimeEvent::AppListUpdated(_) => {
             CLIRuntimeProjectedEvents::ignored(event_kind_name(event).to_owned())
         }
+    };
+    if let Some(timing) = project_cli_runtime_timing(context, event) {
+        projected.durable.insert(0, timing);
     }
+    projected
+}
+
+/// Project only observed native timing, without a Pioneer lifecycle transition.
+pub(crate) fn project_cli_runtime_timing(
+    context: &CLIRuntimeProjectorContext,
+    event: &RuntimeEvent,
+) -> Option<AgentDurableEvent> {
+    let (thread, turn, native) = match event {
+        RuntimeEvent::TurnStarted(e) => (
+            e.native_thread_id.as_deref(),
+            Some(e.native_turn_id.as_str()),
+            e.native.as_ref(),
+        ),
+        RuntimeEvent::TurnCompleted(e) => (
+            e.native_thread_id.as_deref(),
+            Some(e.native_turn_id.as_str()),
+            e.native.as_ref(),
+        ),
+        RuntimeEvent::TurnFailed(e) => (
+            e.native_thread_id.as_deref(),
+            e.native_turn_id.as_deref(),
+            e.native.as_ref(),
+        ),
+        RuntimeEvent::TurnInterrupted(e) => (
+            e.native_thread_id.as_deref(),
+            Some(e.native_turn_id.as_str()),
+            e.native.as_ref(),
+        ),
+        _ => return None,
+    };
+    let turn = turn?;
+    let native =
+        native.filter(|n| matches!(n.method.as_str(), "turn/started" | "turn/completed"))?;
+    let timing = pioneer_cli_agent_runtime::usage::counters(
+        &native.payload_redacted.as_ref().unwrap_or(&JsonValue::Null)["turn"],
+        &["startedAt", "completedAt", "durationMs"],
+    );
+    if !timing.as_object().is_some_and(|m| !m.is_empty()) {
+        return None;
+    }
+    // This is a deterministic encoding of existing native identity, not a new
+    // execution ID. Payload/timestamps do not define replay identity.
+    use sha2::{Digest, Sha256};
+    let identity = json!([context.turn_id, thread, turn, native.method]).to_string();
+    let id = format!(
+        "cli_native_timing_{}",
+        hex::encode(Sha256::digest(identity.as_bytes()))
+    );
+    Some(AgentDurableEvent::ItemCompleted {
+        notification: ItemCompletedNotification {
+            workspace_id: context.workspace_id.clone(),
+            thread_id: context.thread_id.clone(),
+            turn_id: context.turn_id.clone(),
+            item: TurnItem::SystemEvent {
+                id,
+                level: SystemEventLevel::Info,
+                message: "CLI native turn timing".into(),
+                code: Some("cli_native_turn_timing".into()),
+                details: Some(json!({"runtime":"codex", "scope":"turn",
+                    "observation_kind":"cli_native_turn_timing",
+                    "native_thread_id":thread,"native_turn_id":turn,"native_method":native.method,
+                    "native_timing":timing,"timestamp_unit":"unix_seconds","duration_unit":"milliseconds"})),
+            },
+        },
+    })
 }
 
 fn project_runtime_error(
@@ -303,6 +402,55 @@ fn project_item_completed(
     context: &CLIRuntimeProjectorContext,
     completed: &RuntimeItemCompleted,
 ) -> CLIRuntimeProjectedEvents {
+    // Native completion describes the caller's lifecycle, not the execution
+    // outcome committed by the managed MCP invoker.
+    if is_mcp_tool_kind(&completed.item_kind)
+        && pioneer_crud::is_managed_cli_mcp_item(&completed_turn_item(completed))
+    {
+        // Preserve the existing Task observation contract using its existing
+        // semantic marker. This receipt supplements execution; it never emits
+        // a second completion for the MCP call or changes its outcome.
+        let metadata = completed.metadata.as_ref().expect("managed MCP metadata");
+        if metadata["serverInstallationId"] == "pioneer-task-tools-v1"
+            && metadata["canonicalCallableName"] == metadata["rawToolName"]
+            && terminal_tool_status(Some(metadata)) == ToolCallStatus::Completed
+            && let Some(tool) = metadata["canonicalCallableName"].as_str()
+            && let Some(payload) = metadata
+                .get("taskResult")
+                .cloned()
+                .or_else(|| crate::task_tools::delivered_task_payload(&metadata["result"]))
+        {
+            let outcomes =
+                pioneer_agent::observed_terminal_task_outcomes_from_payload(tool, &payload);
+            if !outcomes.is_empty() {
+                return CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: context.workspace_id.clone(),
+                        thread_id: context.thread_id.clone(),
+                        turn_id: context.turn_id.clone(),
+                        item: TurnItem::SystemEvent {
+                            id: pioneer_crud::canonical_agent_id(
+                                'I',
+                                &format!(
+                                    "cli-mcp-observed:{}:{:?}:{}:{}:{}",
+                                    context.turn_id,
+                                    completed.native_thread_id,
+                                    completed.native_turn_id,
+                                    completed.native_item_id,
+                                    metadata["sessionGeneration"],
+                                ),
+                            ),
+                            level: SystemEventLevel::Info,
+                            message: "Native CLI completed a task-result response.".to_owned(),
+                            code: Some("task.terminal.observed".to_owned()),
+                            details: Some(json!({"outcomes": outcomes})),
+                        },
+                    },
+                });
+            }
+        }
+        return CLIRuntimeProjectedEvents::ignored("managed MCP caller completion");
+    }
     if is_user_message_kind(completed.item_kind.as_str()) {
         return CLIRuntimeProjectedEvents::ignored("native userMessage echo");
     }
@@ -342,6 +490,145 @@ fn project_item_completed(
             item,
         },
     })
+}
+
+pub(crate) fn confirmed_mcp_call_completed(
+    invocation: &crate::turn_mcp::invoker::TurnMcpInvocation,
+    binding: &pioneer_crud::TurnMcpBindingRecord,
+    manifest_hash: &str,
+    result: &Result<
+        crate::turn_mcp::result::CanonicalMcpToolResult,
+        crate::turn_mcp::invoker::TurnMcpInvocationError,
+    >,
+    rejected_before_execution: bool,
+) -> ItemCompletedNotification {
+    use crate::turn_mcp::invoker::TurnMcpInvocationErrorCode;
+    use pioneer_protocol::{ToolErrorClass, ToolOutcome, ToolOutcomeStatus};
+    use sha2::{Digest, Sha256};
+    let native = invocation
+        .native_call
+        .as_ref()
+        .expect("managed MCP native identity");
+    let correlation = serde_json::to_vec(&json!({
+        "runtimeId": invocation.runtime_id,
+        "nativeThreadId": native.native_thread_id,
+        "nativeTurnId": native.native_turn_id,
+        "providerCallId": native.native_item_id,
+    }))
+    .expect("MCP identity is serializable");
+    let mut metadata = json!({
+        "canonicalCallableName": invocation.canonical_callable_name,
+        "serverInstallationId": binding.server_installation_id,
+        "serverName": binding.server_name,
+        "rawToolName": binding.raw_tool_name,
+        "arguments": invocation.arguments,
+        "providerCallId": native.native_item_id,
+        "sessionGeneration": invocation.session_generation,
+        "manifestHash": manifest_hash,
+        "canonicalSchemaFingerprint": binding.canonical_schema_fingerprint,
+        "providerSchemaFingerprint": binding.provider_schema_fingerprint,
+        "selectionReason": binding.selection_reason,
+        "capabilityId": binding.capability_id,
+        "invocationCorrelationId": hex::encode(Sha256::digest(correlation)),
+        "responseDelivery": "unconfirmed",
+    });
+    if rejected_before_execution {
+        metadata["executionAdmission"] = json!("rejected");
+    }
+    let (success, error_class, incomplete, reason) = match result {
+        Ok(result) => {
+            metadata["result"] = json!({"content": result.content,
+                "structuredContent": result.structured_content,
+                "isError": result.is_error, "_meta": result.meta});
+            metadata["durationMs"] = json!(result.duration_ms);
+            let unknown = result
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta["pioneer"]["outcome"] == "unknown");
+            (
+                !result.is_error && !unknown,
+                if unknown {
+                    Some(ToolErrorClass::Unknown)
+                } else {
+                    result.is_error.then_some(ToolErrorClass::ExecutionFailed)
+                },
+                unknown,
+                unknown.then(|| "mcp_execution_outcome_unknown".to_owned()),
+            )
+        }
+        Err(error) => {
+            metadata["error"] = json!({"code": error.reason_code()});
+            let class = match error.code {
+                TurnMcpInvocationErrorCode::Cancelled => ToolErrorClass::Cancelled,
+                TurnMcpInvocationErrorCode::TimedOut => ToolErrorClass::Timeout,
+                TurnMcpInvocationErrorCode::ExecutionFailed => ToolErrorClass::ExecutionFailed,
+                TurnMcpInvocationErrorCode::InvalidRequest => ToolErrorClass::InvalidArguments,
+                TurnMcpInvocationErrorCode::PermissionDenied => ToolErrorClass::PermissionDenied,
+                TurnMcpInvocationErrorCode::ToolUnbound => ToolErrorClass::ToolNotVisible,
+                _ => ToolErrorClass::Unknown,
+            };
+            let reason = if error.code == TurnMcpInvocationErrorCode::Cancelled {
+                error.message.clone()
+            } else {
+                error.reason_code().to_owned()
+            };
+            (false, Some(class), !rejected_before_execution, Some(reason))
+        }
+    };
+    let unconfirmed_success = !rejected_before_execution
+        && matches!(
+            error_class,
+            Some(ToolErrorClass::Unknown | ToolErrorClass::Cancelled | ToolErrorClass::Timeout)
+        );
+    metadata["success"] = json!(if unconfirmed_success {
+        None
+    } else {
+        Some(success)
+    });
+    metadata["status"] = json!(match error_class {
+        Some(ToolErrorClass::Unknown) if !rejected_before_execution => "unconfirmed",
+        Some(ToolErrorClass::Cancelled) => "cancelled",
+        Some(ToolErrorClass::Timeout) => "timed_out",
+        _ if success => "completed",
+        _ => "failed",
+    });
+    let mut item = mcp_tool_item(
+        &native.native_item_id,
+        Some(&metadata),
+        if success {
+            ToolCallStatus::Completed
+        } else {
+            ToolCallStatus::Failed
+        },
+    );
+    if let TurnItem::DynamicToolCall {
+        outcome,
+        success: item_success,
+        ..
+    } = &mut item
+    {
+        if unconfirmed_success {
+            *item_success = None;
+        }
+        *outcome = Some(ToolOutcome {
+            status: if success {
+                ToolOutcomeStatus::Ok
+            } else {
+                ToolOutcomeStatus::FatalError
+            },
+            error_class,
+            should_retry: false,
+            retry_hint: None,
+            incomplete,
+            incomplete_reason: reason,
+        });
+    }
+    ItemCompletedNotification {
+        workspace_id: invocation.workspace_id.clone(),
+        thread_id: invocation.thread_id.clone(),
+        turn_id: invocation.turn_id.clone(),
+        item,
+    }
 }
 
 fn project_item_updated(
@@ -601,6 +888,45 @@ fn started_turn_item(
 fn completed_turn_item(completed: &RuntimeItemCompleted) -> TurnItem {
     if let Some(item) = &completed.item {
         return item.clone();
+    }
+    if completed.item_kind == "tokenUsage" {
+        let mut usage = completed.metadata.clone().unwrap_or_else(|| json!({}));
+        if let Some(usage) = usage.as_object_mut() {
+            usage.insert("native_thread_id".into(), json!(completed.native_thread_id));
+            usage.insert("native_turn_id".into(), json!(completed.native_turn_id));
+        }
+        // Codex values can recur after a reset. Only the persisted local
+        // receipt identifies replay; matching content is not replay evidence.
+        let id = if usage["runtime"] == "codex" {
+            let receipt = usage["observation_id"].as_str().map(str::to_owned);
+            usage["replay_identity"] = json!(if receipt.is_some() {
+                "local_journal_receipt"
+            } else {
+                "unknown"
+            });
+            usage["baseline"] = json!("unknown");
+            usage["native_replay_identity"] = json!("unavailable");
+            format!(
+                "cli_usage:{}",
+                receipt.unwrap_or_else(|| pioneer_protocol::generate_id(24))
+            )
+        } else {
+            use sha2::{Digest, Sha256};
+            let digest = hex::encode(Sha256::digest(usage.to_string().as_bytes()));
+            format!("{}:{digest}", completed.native_item_id)
+        };
+        return TurnItem::SystemEvent {
+            id,
+            level: SystemEventLevel::Info,
+            message: "CLI usage observation".into(),
+            code: Some("provider_usage".into()),
+            details: Some(json!({
+                "schema_version": 1,
+                "complete": false,
+                "usage": usage,
+                "observation_kind": "cli_native_statistics",
+            })),
+        };
     }
     if is_agent_message_kind(completed.item_kind.as_str()) {
         return TurnItem::AgentMessage {
@@ -985,6 +1311,19 @@ fn mcp_tool_item(item_id: &str, metadata: Option<&JsonValue>, status: ToolCallSt
         .and_then(JsonValue::as_str)
     {
         lines.push(error.to_owned());
+    }
+    // Preserve the semantic public task result before ToolMetadata redacts raw
+    // MCP content/text. Lifecycle/identity are validated separately by the gate.
+    // Claude already normalizes before its earlier typed metadata conversion.
+    if matches!(
+        tool_name.as_str(),
+        "task_wait" | "task_get" | "task_cancel" | "task_finish" | "task_accept"
+    ) && metadata_json["serverInstallationId"] == "pioneer-task-tools-v1"
+        && metadata_json["rawToolName"].as_str() == Some(tool_name.as_str())
+        && metadata_json.get("taskResult").is_none()
+        && let Some(payload) = crate::task_tools::delivered_task_payload(&metadata_json["result"])
+    {
+        metadata_json["taskResult"] = payload;
     }
     let summary = tool_summary(
         format!("MCP: {server_name} / {raw_tool_name}"),
@@ -1512,8 +1851,7 @@ mod tests {
     use pioneer_cli_agent_runtime::codex::CodexJsonlRpcNotificationEvent;
     use pioneer_cli_agent_runtime::event::{
         RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemCompleted,
-        RuntimeItemDelta, RuntimeItemDeltaKind, RuntimeItemStarted, RuntimeRawEvent,
-        RuntimeTurnCompleted, map_codex_notification_event,
+        RuntimeItemStarted, RuntimeRawEvent, map_codex_notification_event,
     };
     use pioneer_protocol::{
         AgentDurableEvent, AgentMessagePhase, AgentProgressEvent, ItemDeltaStream,
@@ -1528,6 +1866,7 @@ mod tests {
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             recovery: None,
+            codex_retry_attempt_id: Some("attempt_1".to_owned()),
         }
     }
 
@@ -1547,71 +1886,86 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_projector_projects_turn_completed() {
-        let projected = project_cli_runtime_event(
-            &context(),
-            &RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
-                native_thread_id: Some("native_thread_1".to_owned()),
-                native_turn_id: "native_turn_1".to_owned(),
-                status: "completed".to_owned(),
-                native: None,
-            }),
-        );
-
-        assert!(projected.progress.is_empty());
-        assert!(projected.ignored.is_empty());
-        assert_eq!(
-            projected.durable,
-            vec![AgentDurableEvent::TurnCompleted {
-                thread_id: "thread_1".to_owned(),
-                turn_id: "turn_1".to_owned(),
-                recovery: None,
-            }]
-        );
+    fn native_timing_identity_preserves_segments_and_idempotent_replay() {
+        let project = |turn: &str| {
+            project_codex_notification(
+                "turn/started",
+                json!({
+                    "threadId":"native-thread", "turn":{"id":turn,"startedAt":10}
+                }),
+            )
+            .durable
+        };
+        let first = project("segment-one");
+        assert_eq!(first, project("segment-one"));
+        let second = project("segment-two");
+        assert_ne!(first, second);
+        for (events, turn) in [(first, "segment-one"), (second, "segment-two")] {
+            assert_eq!(events.len(), 1);
+            let AgentDurableEvent::ItemCompleted { notification } = &events[0] else {
+                panic!("timing only")
+            };
+            let TurnItem::SystemEvent {
+                details: Some(details),
+                ..
+            } = &notification.item
+            else {
+                panic!("timing")
+            };
+            assert_eq!(details["native_turn_id"], turn);
+            assert_eq!(details["native_thread_id"], "native-thread");
+            assert_eq!(details["native_timing"]["startedAt"], 10);
+        }
     }
 
     #[test]
-    fn cli_runtime_projector_projects_agent_message_delta() {
-        let projected = project_cli_runtime_event(
-            &context(),
-            &RuntimeEvent::ItemDelta(RuntimeItemDelta {
-                native_thread_id: Some("native_thread_1".to_owned()),
-                native_turn_id: "native_turn_1".to_owned(),
-                native_item_id: "item_1".to_owned(),
-                item_kind: "agentMessage".to_owned(),
-                delta_kind: RuntimeItemDeltaKind::AgentMessage,
-                delta: "hello".to_owned(),
-                metadata: None,
-                native: None,
-            }),
-        );
-
-        assert!(projected.durable.is_empty());
-        assert!(projected.ignored.is_empty());
-        assert_eq!(projected.progress.len(), 1);
-        let AgentProgressEvent::ItemDelta { notification } = &projected.progress[0] else {
-            panic!("expected item delta");
+    fn codex_usage_projection_deduplicates_receipts_not_counter_content() {
+        use pioneer_cli_agent_runtime::codex::CodexJsonlRpcNotificationEvent;
+        use pioneer_cli_agent_runtime::event::{
+            RuntimeEventMappingOptions, map_codex_notification_event,
         };
-        assert_eq!(notification.workspace_id, "workspace_1");
-        assert_eq!(notification.thread_id, "thread_1");
-        assert_eq!(notification.turn_id, "turn_1");
-        assert_eq!(notification.item_id, "item_1");
-        assert_eq!(notification.delta, "hello");
-        assert_eq!(notification.stream, Some(ItemDeltaStream::AgentMessage));
-        assert_eq!(
-            notification
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("nativeItemId")),
-            Some(&json!("item_1"))
-        );
-        assert_eq!(
-            notification
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("runtimeDeltaKind")),
-            Some(&json!("agent_message"))
-        );
+        let project = |receipt: &str| {
+            let mut event = map_codex_notification_event(
+                &CodexJsonlRpcNotificationEvent {
+                    method: "thread/tokenUsage/updated".into(),
+                    params: Some(json!({"threadId":"thread", "turnId":"turn",
+                    "tokenUsage":{"total":{"inputTokens":100,"cachedInputTokens":80},
+                    "secret":"SECRET"}})),
+                    raw: json!({}),
+                },
+                RuntimeEventMappingOptions::default(),
+            );
+            let RuntimeEvent::ItemCompleted(item) = &mut event else {
+                panic!("usage")
+            };
+            item.metadata.as_mut().unwrap()["observation_id"] = json!(receipt);
+            project_cli_runtime_event(&context(), &event)
+                .durable
+                .remove(0)
+        };
+        let first = project("saved-receipt-one");
+        let replay = project("saved-receipt-one");
+        let repeated_counters = project("saved-receipt-two");
+        let item = |event: AgentDurableEvent| {
+            let AgentDurableEvent::ItemCompleted { notification } = event else {
+                panic!("item")
+            };
+            notification.item
+        };
+        let first = item(first);
+        assert_eq!(first, item(replay));
+        assert_ne!(first, item(repeated_counters));
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert!(!encoded.contains("SECRET"));
+        let TurnItem::SystemEvent {
+            details: Some(details),
+            ..
+        } = first
+        else {
+            panic!("usage")
+        };
+        assert_eq!(details["usage"]["baseline"], "unknown");
+        assert_eq!(details["usage"]["native_replay_identity"], "unavailable");
     }
 
     #[test]
@@ -1874,6 +2228,12 @@ mod tests {
             }),
         );
 
+        assert!(turn_completed.progress.is_empty());
+        assert!(turn_completed.ignored.is_empty());
+        assert!(delta_one.durable.is_empty());
+        assert!(delta_one.ignored.is_empty());
+        assert_eq!(delta_one.progress.len(), 1);
+
         let AgentDurableEvent::ItemStarted { notification } = &started.durable[0] else {
             panic!("expected item started");
         };
@@ -1887,8 +2247,25 @@ mod tests {
         let AgentProgressEvent::ItemDelta { notification } = &delta_one.progress[0] else {
             panic!("expected first item delta");
         };
+        assert_eq!(notification.workspace_id, "workspace_1");
+        assert_eq!(notification.thread_id, "thread_1");
+        assert_eq!(notification.turn_id, "turn_1");
         assert_eq!(notification.item_id, "native_item_message");
         assert_eq!(notification.delta, "Hel");
+        assert_eq!(
+            notification
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("nativeItemId")),
+            Some(&json!("native_item_message"))
+        );
+        assert_eq!(
+            notification
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("runtimeDeltaKind")),
+            Some(&json!("agent_message"))
+        );
         assert_eq!(notification.stream, Some(ItemDeltaStream::AgentMessage));
         assert_eq!(
             notification
@@ -2612,6 +2989,9 @@ mod tests {
         let context = context();
         let timestamp = 1_700_030_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: context.workspace_id.clone(),
             id: context.thread_id.clone(),
             name: None,
@@ -2632,6 +3012,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: context.turn_id.clone(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -2646,6 +3027,19 @@ mod tests {
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
+        {
+            use sea_orm::EntityTrait;
+            pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+                id: sea_orm::Set(thread.workspace_id.clone()),
+                name: sea_orm::Set("Observation fixture".to_owned()),
+                is_active: sea_orm::Set(true),
+                is_current: sea_orm::Set(true),
+                ..Default::default()
+            })
+            .exec(&store.database_connection())
+            .await
+            .expect("observation workspace should exist");
+        }
         store
             .upsert_thread_model(&thread, PersistedActorRef::System)
             .await
@@ -2911,7 +3305,48 @@ mod tests {
     }
 
     #[test]
-    fn codex_mcp_timeline_uses_one_enriched_native_item_for_start_terminal_and_replay() {
+    fn task_result_normalization_precedes_raw_metadata_redaction() {
+        let payload = json!({"taskId":"accepted_task","runId":"run","candidateId":"candidate","status":"completed","taskTerminal":true,"finalAnswerAllowed":true});
+        let blocks = json!([{"type":"text","text":payload.to_string()}]);
+        // Codex's content-only MCP envelope and OpenCode V2's content array.
+        for result in [json!({"content":blocks}), blocks.clone()] {
+            let item = super::mcp_tool_item(
+                "native-task",
+                Some(&json!({
+                    "canonicalCallableName":"task_accept", "rawToolName":"task_accept",
+                    "serverInstallationId":"pioneer-task-tools-v1", "serverName":"pioneer_tasks",
+                    "status":"completed", "success":true, "result":result,
+                    "message":"preview contains no IDs",
+                })),
+                pioneer_protocol::ToolCallStatus::Completed,
+            );
+            let TurnItem::DynamicToolCall {
+                storage: ToolStoragePayload::Metadata { metadata },
+                ..
+            } = item
+            else {
+                panic!("metadata");
+            };
+            let metadata = metadata.to_json();
+            assert_eq!(
+                pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                    "task_accept",
+                    &metadata["taskResult"]
+                ),
+                std::collections::BTreeSet::from([
+                    pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
+                        task_id: "accepted_task".into(),
+                        run_id: "run".into(),
+                        candidate_id: "candidate".into()
+                    }
+                ])
+            );
+            assert_ne!(metadata["result"], result, "raw content remains redacted");
+        }
+    }
+
+    #[test]
+    fn codex_mcp_timeline_keeps_native_start_identity_and_defers_execution_outcome_to_invoker() {
         let metadata = json!({
             "server": "pioneer",
             "tool": "mcp__server__tool",
@@ -2966,7 +3401,7 @@ mod tests {
         let completed = project_cli_runtime_event(&context(), &completed_event);
         assert_eq!(started, replayed, "replay must upsert the same identity");
         assert_eq!(started.durable.len(), 1);
-        assert_eq!(completed.durable.len(), 1);
+        assert!(completed.durable.is_empty());
 
         let AgentDurableEvent::ItemStarted { notification } = &started.durable[0] else {
             panic!("expected MCP item start");
@@ -2992,29 +3427,6 @@ mod tests {
         };
         assert_eq!(summary.title, "MCP: Real Server / real_tool");
         assert_eq!(*success, None);
-
-        let AgentDurableEvent::ItemCompleted { notification } = &completed.durable[0] else {
-            panic!("expected MCP item terminal");
-        };
-        let TurnItem::DynamicToolCall {
-            id,
-            tool_name,
-            status,
-            success,
-            display,
-            ..
-        } = &notification.item
-        else {
-            panic!("expected terminal canonical MCP tool item");
-        };
-        assert_eq!(id, "native_mcp_1");
-        assert_eq!(tool_name, "mcp__server__tool");
-        assert_eq!(*status, pioneer_protocol::ToolCallStatus::Failed);
-        assert_eq!(*success, Some(false));
-        let ToolDisplayPayload::Summary(summary) = display else {
-            panic!("expected terminal MCP summary");
-        };
-        assert_eq!(summary.lines, vec!["upstream failed".to_owned()]);
     }
 
     #[test]
@@ -3247,23 +3659,74 @@ mod tests {
     }
 
     #[test]
-    fn codex_retrying_turn_does_not_project_terminal_or_timeline_events() {
-        let retrying = project_codex_notification(
-            "error",
-            json!({
-                "threadId": "native_thread_1",
-                "turnId": "native_turn_1",
-                "error": {
-                    "message": "Reconnecting... 2/5",
-                    "code": "stream_disconnected"
-                },
-                "willRetry": true
-            }),
+    fn codex_retrying_turn_projects_one_immutable_historical_warning() {
+        let retry = |message: &str| {
+            project_codex_notification(
+                "error",
+                json!({
+                    "threadId": "native_thread_1",
+                    "turnId": "native_turn_1",
+                    "error": {"message": message, "code": message},
+                    "willRetry": true
+                }),
+            )
+        };
+        let first = retry("Reconnecting... 2/5");
+        assert!(first.progress.is_empty());
+        assert!(first.snapshot.is_empty());
+        assert!(first.ignored.is_empty());
+        let [AgentDurableEvent::ItemCompleted { notification }] = first.durable.as_slice() else {
+            panic!("retry must emit only a completed historical item");
+        };
+        assert!(matches!(&notification.item, TurnItem::SystemEvent {
+            level: SystemEventLevel::Warning, code: Some(code), details: None, ..
+        } if code == "codex_request_retried"));
+        let payload = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone());
+        for message in [
+            "Reconnecting... 3/5",
+            "different temporary failure",
+            "Reconnecting... 2/5",
+        ] {
+            let projected = retry(message);
+            assert_eq!(projected.durable, first.durable);
+            let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+                unreachable!();
+            };
+            let replay =
+                pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone());
+            assert_eq!(
+                replay.idempotency_key().unwrap(),
+                payload.idempotency_key().unwrap()
+            );
+        }
+        assert!(
+            pioneer_observability::turn_startup::notification_output(
+                "item/completed",
+                &serde_json::to_value(notification).unwrap()
+            )
+            .is_none()
         );
 
-        assert!(retrying.progress.is_empty());
-        assert!(retrying.durable.is_empty());
-        assert_eq!(retrying.ignored, vec!["turn_retrying"]);
+        let event =
+            RuntimeEvent::TurnRetrying(pioneer_cli_agent_runtime::event::RuntimeTurnRetrying {
+                native_thread_id: Some("native_thread_1".into()),
+                native_turn_id: Some("native_turn_1".into()),
+                message: "temporary failure".into(),
+                code: None,
+                native: None,
+            });
+        let mut next_attempt = context();
+        next_attempt.codex_retry_attempt_id = Some("attempt_2".into());
+        let next = project_cli_runtime_event(&next_attempt, &event);
+        let [AgentDurableEvent::ItemCompleted { notification: next }] = next.durable.as_slice()
+        else {
+            panic!("next attempt must own its own notice");
+        };
+        assert_ne!(next.item.item_id(), notification.item.item_id());
+        next_attempt.codex_retry_attempt_id = None;
+        let unowned = project_cli_runtime_event(&next_attempt, &event);
+        assert!(unowned.durable.is_empty());
+        assert!(unowned.progress.is_empty());
     }
 
     #[test]
@@ -3285,6 +3748,7 @@ mod tests {
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
                 reason: "interrupted".to_owned(),
+                cancellation_owner: None,
                 recovery: None
             }]
         );

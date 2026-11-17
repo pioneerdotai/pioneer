@@ -104,6 +104,29 @@ impl ClientCore {
         Ok(response)
     }
     pub fn execute_workspace_intent(&self, intent: WorkspaceIntent) -> anyhow::Result<()> {
+        let opening = match &intent {
+            WorkspaceIntent::SelectThread { thread_id, .. } => Some(self.begin_opening(
+                Some(thread_id),
+                pioneer_observability::opening::Fact::Workspace,
+            )),
+            _ => None,
+        };
+        let execute = || self.execute_workspace_intent_observed(intent, opening.clone());
+        let result = if let Some(handle) = &opening {
+            handle.correlation().run(execute)
+        } else {
+            execute()
+        };
+        if let (Some(handle), Err(error)) = (opening, &result) {
+            handle.finish(crate::threads::opening::failure(error));
+        }
+        result
+    }
+    fn execute_workspace_intent_observed(
+        &self,
+        intent: WorkspaceIntent,
+        opening: Option<crate::threads::opening::Handle>,
+    ) -> anyhow::Result<()> {
         if let WorkspaceIntent::CreateWorkspace { name } = intent {
             if let super::commands::WorkspaceCreateResult::Created { reduction } =
                 self.create_and_select_workspace(name)?
@@ -187,7 +210,7 @@ impl ClientCore {
             }
             WorkspaceIntent::SelectThread { thread_id, .. } => {
                 ensure_thread(&thread_id, false)?;
-                self.open_workspace_thread(workspace, Some(thread_id), None);
+                self.open_workspace_thread_observed(workspace, Some(thread_id), None, opening);
                 return Ok(());
             }
             WorkspaceIntent::RenameThread {

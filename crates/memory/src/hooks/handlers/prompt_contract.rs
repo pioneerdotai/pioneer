@@ -64,31 +64,14 @@ impl HookHandler for MemoryPromptContractHook {
         let Some(prompt_policy) = policy.recall_prompt_policy() else {
             return Ok(HookHandlerResponse::default());
         };
-        let recall_context = memory_recall_context_from_prompt_context_set(
-            &request.prompt_context_set,
-            prompt_policy,
-        );
         let mut response = HookHandlerResponse::default();
-        let contributions = memory_prompt_section_contributions_from_context(
-            available_tool_names,
-            prompt_policy,
-            recall_context.clone(),
-            recall_context.truncated,
-        );
-        if !contributions.is_empty() {
-            response.diagnostics.push(memory_safe_info_diagnostic(
-                "memory.prompt_rendered",
-                format!(
-                    "memory prompt contract rendered: source={} reason={} recalled_contexts={}",
-                    policy.source.as_str(),
-                    policy.reason_code.as_str(),
-                    recall_context.count
-                ),
-            ));
-            response
-                .diagnostics
-                .push(memory_prompt_recall_dedup_diagnostic(&recall_context));
-            response.contributions.extend(contributions);
+        if let Some(contribution) =
+            memory_recall_prompt_section_contribution_from_input(MemoryRecallPromptInput {
+                available_tool_names,
+                policy: prompt_policy,
+            })
+        {
+            response.contributions.push(contribution);
         } else if no_available_memory_tools {
             response.diagnostics.push(memory_safe_info_diagnostic(
                 "memory.prompt_omitted",

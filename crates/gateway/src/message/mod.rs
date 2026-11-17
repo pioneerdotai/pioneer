@@ -2,6 +2,7 @@ mod access_invalidation;
 pub(crate) mod agent_action_tools;
 mod agent_route_handlers;
 mod agent_runtime;
+mod apps;
 mod artifact_finalization_diagnostics;
 mod artifact_registration;
 mod artifact_tools;
@@ -12,7 +13,9 @@ mod cli_post_turn;
 #[path = "../cli_runtime/handlers.rs"]
 mod cli_runtime;
 mod compaction_background;
+mod control_work;
 mod dispatch;
+mod execution_observability;
 pub(crate) mod html_tools;
 mod invitation_handlers;
 mod invitation_lifecycle;
@@ -24,14 +27,19 @@ mod message_mutations;
 mod message_turn;
 mod native_health;
 mod notifications;
+mod package_delivery;
+pub(crate) mod packages;
 mod patch_history_handlers;
 mod permission_handlers;
+mod projection_work;
 mod provider_handlers;
 mod provider_readiness;
 mod reconciliation_diagnostics;
+mod scoped_push;
 pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
+pub(crate) use task_agent_executor::task_cache_routing_context;
 mod task_artifacts;
 mod task_completion_inbox;
 mod task_delivery;
@@ -39,12 +47,19 @@ mod task_handlers;
 mod tasks;
 #[cfg(test)]
 mod tests;
+mod webhook_endpoint;
 #[cfg(test)]
 pub(crate) use tests::{test_summary_config, test_tool_loop_config};
 mod thread_agents_doc_handlers;
 mod thread_file_handlers;
 mod thread_handlers;
-mod thread_tool_results;
+mod thread_history_read;
+mod thread_launch_pages;
+mod thread_read_cursor;
+pub(crate) mod thread_read_tools;
+mod thread_result_sources;
+pub(crate) mod thread_search_tools;
+pub(crate) mod thread_tool_results;
 mod timeline_cursor;
 mod timeline_handlers;
 mod timeline_notifications;
@@ -149,10 +164,6 @@ use crate::thread_episodic::{
     ThreadEpisodicIndexExecutor, ThreadEpisodicIngestor, ThreadEpisodicRecallService,
     ThreadEpisodicRuntimeConfig,
 };
-use crate::thread_episodic_hooks::{
-    ThreadContextRecallHookConfig, ThreadEpisodicMemoryRecallProvider,
-    thread_context_recall_hook_package,
-};
 use anyhow::Context as AnyhowContext;
 use futures_util::FutureExt;
 use pioneer_agent::MemoryLoopConfig;
@@ -164,9 +175,9 @@ use pioneer_artifacts::{
 };
 use pioneer_config::{
     GatewayArtifactsConfig, GatewayCliAgentRuntimeCommandHeartbeatConfig,
-    GatewayCommandExecutionTimeoutConfig, GatewayContextCompactionTimeoutConfig,
-    GatewayHookRecoveryConfig, GatewayProviderStreamItemTimeoutConfig,
-    GatewayThreadEpisodicVectorSearchConfig,
+    GatewayCommandExecutionTimeoutConfig, GatewayContextCompactionConfig,
+    GatewayContextCompactionTimeoutConfig, GatewayHookRecoveryConfig,
+    GatewayProviderStreamItemTimeoutConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
 use pioneer_crud::{
     CliRuntimePendingRequestRecord,
@@ -176,9 +187,7 @@ use pioneer_crud::{
     TurnFinalizationReconciliationSummary,
 };
 use pioneer_hooks::{HookRecoveryOptions, HookRuntime};
-use pioneer_memory::{
-    MemvidThreadEpisodicBackend, ThreadEpisodicMemvidBackend, thread_episodic_storage_uri_from_path,
-};
+use pioneer_memory::{SqliteThreadEpisodicBackend, ThreadEpisodicSearchBackend};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ArtifactBindingDirection, ArtifactBindingKind,
     ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactKind, ArtifactRole,
@@ -221,8 +230,8 @@ use pioneer_protocol::{
     RuntimeStatus, RuntimeSummary, SkillsUploadAbortParams, SkillsUploadFinishParams,
     SkillsUploadStartParams, SystemEventLevel, TaskAcceptParams, TaskAgendaParams,
     TaskCancelParams, TaskCreateParams, TaskDeliveriesParams, TaskDelivery, TaskDeliveryAttempt,
-    TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
-    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
+    TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskFinishParams, TaskGetParams,
+    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocArchiveResponse, ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
@@ -276,7 +285,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
-use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::GatewayAuthService;
@@ -305,14 +314,14 @@ use crate::workspace::{WorkspaceError, WorkspaceManager};
 static TEST_EPISODIC_STORAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
-fn isolated_test_thread_episodic_storage_root(runtime_home: &std::path::Path) -> PathBuf {
+fn isolated_test_thread_episodic_lock_root(runtime_home: &std::path::Path) -> PathBuf {
     let sequence = TEST_EPISODIC_STORAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     runtime_home.join("memory").join(format!(
-        "capsules-{}-{now_nanos}-{sequence}",
+        "locks-{}-{now_nanos}-{sequence}",
         std::process::id()
     ))
 }
@@ -363,7 +372,7 @@ where
     Box::pin(future)
 }
 
-struct AbortOnDropMessageTask<T> {
+pub(crate) struct AbortOnDropMessageTask<T> {
     handle: Option<JoinHandle<T>>,
 }
 
@@ -374,7 +383,7 @@ impl<T> AbortOnDropMessageTask<T> {
         }
     }
 
-    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+    pub(crate) async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
         let result = self
             .handle
             .as_mut()
@@ -382,6 +391,13 @@ impl<T> AbortOnDropMessageTask<T> {
             .await;
         self.handle = None;
         result
+    }
+
+    pub(crate) async fn abort_and_join(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+            let _ = self.join().await;
+        }
     }
 }
 
@@ -397,6 +413,14 @@ impl<T> Drop for AbortOnDropMessageTask<T> {
 
 // Heavy CRUD/projection calls otherwise inherit a deeply nested message-handler poll stack.
 pub(crate) async fn message_fresh_task<F, T>(future: F) -> Result<T, tokio::task::JoinError>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    spawn_message_task(future).join().await
+}
+
+fn spawn_message_task<F, T>(future: F) -> AbortOnDropMessageTask<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -424,9 +448,13 @@ where
             .with_subscriber(dispatch)
             .bind_hub(sentry::Hub::current())
     };
+    let future = pioneer_observability::work::inherit(
+        pioneer_observability::work::Boundary::MessageFreshTask,
+        pioneer_observability::work::WorkKind::Message,
+        pioneer_observability::work::ExecutorRole::Gateway,
+        future,
+    );
     AbortOnDropMessageTask::new(tokio::spawn(future))
-        .join()
-        .await
 }
 
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
@@ -435,15 +463,9 @@ const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
 const PROGRESS_DELTA_HEARTBEAT_INTERVAL_SECONDS: i64 = 5;
 const PROGRESS_ITEM_TYPE_MISS_RETRY_SECONDS: i64 = 1;
 const PROGRESS_ITEM_TYPE_MISS_CACHE_CAPACITY: usize = 1_024;
-const CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS: i64 = 30;
-const AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
-const AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS: i64 = 60 * 60;
 const AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE: u64 = 256;
 const NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
-const NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
-const NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS: i64 = 60 * 60;
 const NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE: u64 = 256;
-const NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS: i64 = 10 * 60;
 const NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS: i64 = 60;
 const NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE: u64 = 64;
 
@@ -452,6 +474,7 @@ pub(crate) struct MessageProcessorResilienceConfig {
     pub command_execution_timeout: GatewayCommandExecutionTimeoutConfig,
     pub provider_stream_item_timeout: GatewayProviderStreamItemTimeoutConfig,
     pub context_compaction_timeout: GatewayContextCompactionTimeoutConfig,
+    pub context_compaction: GatewayContextCompactionConfig,
     pub cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig,
 }
 
@@ -461,6 +484,7 @@ impl Default for MessageProcessorResilienceConfig {
             command_execution_timeout: GatewayCommandExecutionTimeoutConfig::default(),
             provider_stream_item_timeout: GatewayProviderStreamItemTimeoutConfig::default(),
             context_compaction_timeout: GatewayContextCompactionTimeoutConfig::default(),
+            context_compaction: GatewayContextCompactionConfig::default(),
             cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig::default(),
         }
     }
@@ -534,19 +558,39 @@ async fn sleep_after_transient_storage_poll_failure(transient_storage_poll_faile
     true
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+const TITLE_JOB_MAX_RECOVERIES: u8 = 2;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThreadTitleRecovery {
+    text: Arc<str>,
+    remaining: u8,
+}
+impl From<&str> for ThreadTitleRecovery {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.into(),
+            remaining: TITLE_JOB_MAX_RECOVERIES,
+        }
+    }
+}
+impl std::ops::Deref for ThreadTitleRecovery {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ThreadTitleJobState {
     Pending,
     Running,
     Succeeded,
     FailedRetriable,
     FailedNonRetriable,
-}
-
-impl ThreadTitleJobState {
-    const fn is_active(self) -> bool {
-        matches!(self, Self::Pending | Self::Running | Self::FailedRetriable)
-    }
+    // Retain the original user text only while waiting for recovery. This is
+    // not name provenance or a queue of completion triggers.
+    DeferredUntilSuccessfulTurn(ThreadTitleRecovery),
+    AwaitingSuccessfulTurn(ThreadTitleRecovery),
 }
 
 #[derive(Clone)]
@@ -562,27 +606,36 @@ pub struct MessageProcessor {
     agent_manager: Arc<AgentManager>,
     provider_registry: Arc<ProviderRegistry>,
     session_manager: Arc<SessionManager>,
+    push_scopes: Arc<scoped_push::PushScopes>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     observation_governor: Arc<crate::authorization::ObservationAdmissionGovernor>,
     turn_execution_owner_id: Arc<str>,
-    artifact_stream_invalidation:
-        Arc<StdRwLock<Option<Weak<dyn ArtifactStreamInvalidation>>>>,
+    foreground_starts: Arc<turn_handlers::foreground_start::ForegroundStartOwners>,
+    pending_delivery_order: Arc<crate::thread::replay::PendingDeliveryOrder>,
+    #[cfg(test)]
+    execution_auth_fault: Arc<std::sync::Mutex<Option<notifications::ExecutionAuthFault>>>,
+    artifact_stream_invalidation: Arc<StdRwLock<Option<Weak<dyn ArtifactStreamInvalidation>>>>,
     view_grant_service: Arc<StdRwLock<Option<Weak<crate::view_grants::ViewGrantService>>>>,
     auth_service: Option<Arc<GatewayAuthService>>,
     epic5_rate_limits: Arc<crate::epic5_observability::Epic5RateLimits>,
     cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
     remote_access_supervisor: Option<Arc<pioneer_tunnel::RemoteAccessSupervisor>>,
-    thread_episodic_vector_refill_status_tx: crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender,
+    thread_episodic_vector_refill_status_tx:
+        crate::database::startup::thread_episodic_refill::ThreadEpisodicWorkspaceRefillStatusSender,
     thread_episodic_workspace_refill_supervisor:
         Arc<crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor>,
     workspace_manager: Arc<WorkspaceManager>,
     pub(crate) crud_store: Arc<CrudStore>,
     gateway_secrets: Arc<GatewaySecrets>,
     invitation_gateway_base_url: Arc<pioneer_protocol::GatewayBaseUrl>,
+    gateway_listen_addr: Arc<std::sync::RwLock<Option<std::net::SocketAddr>>>,
     summary_config: Arc<summary::SummaryConfig>,
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
-    completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
+    task_child_point_cursor: Arc<Mutex<tasks::ChildDiscoveryPass<(i64, String)>>>,
+    task_child_scope_cursor: Arc<Mutex<tasks::ChildDiscoveryPass<(i64, String, String)>>>,
+    completed_history_checks:
+        Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
     compaction_lifecycle_not_before: Arc<StdRwLock<Option<tokio::time::Instant>>>,
     #[cfg(test)]
     completed_history_preparation_barrier:
@@ -590,6 +643,8 @@ pub struct MessageProcessor {
     #[cfg(test)]
     turn_execution_heartbeat_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    #[cfg(test)]
+    recovery_due_wait_barrier: Arc<compaction_background::CompletedHistoryPreparationBarrier>,
     #[cfg(test)]
     task_history_preparation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
     #[cfg(test)]
@@ -604,6 +659,8 @@ pub struct MessageProcessor {
     task_cli_readiness_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
     #[cfg(test)]
     task_output_capture_failures: Arc<std::sync::Mutex<HashMap<String, anyhow::Error>>>,
+    pub(crate) context_compaction_config: GatewayContextCompactionConfig,
+    pub(crate) compaction_clock: Arc<dyn crate::compaction::CompactionClock>,
     pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
     cli_history_shutdown: tokio_util::sync::CancellationToken,
     #[cfg(test)]
@@ -619,15 +676,23 @@ pub struct MessageProcessor {
     #[cfg(test)]
     claude_boundary_write_failures: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
-    native_cancellation_finish_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    native_cancellation_finish_barrier:
+        Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     #[cfg(test)]
     native_cancellation_materialization_failure: Arc<Mutex<Option<sea_orm::DbErr>>>,
     #[cfg(test)]
-    native_cancellation_materialization_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
-    workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
+    native_cancellation_materialization_barrier:
+        Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    workspace_compaction_settings: Arc<
+        StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>,
+    >,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
     agent_message_buffers: Arc<Mutex<HashMap<String, AgentMarkdownBuffer>>>,
+    #[cfg(test)]
+    markdown_delta_parse_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    progress_item_type_lookup_count: Arc<AtomicU64>,
     progress_items: Arc<Mutex<ProgressItemRegistry>>,
     agent_action_bindings:
         Arc<Mutex<HashMap<String, agent_action_tools::AgentActionRuntimeBinding>>>,
@@ -641,8 +706,14 @@ pub struct MessageProcessor {
     cli_runtime_proxy_cache: Arc<Mutex<HashMap<(String, String), Option<String>>>>,
     provider_readiness: Arc<provider_readiness::ProviderReadinessSupervisor>,
     cli_runtime_pending_turn_activity_sequence: Arc<AtomicU64>,
-    cli_runtime_event_hubs:
-        Arc<Mutex<HashMap<crate::cli_runtime::session_instance::CliSessionInstanceId, Arc<ExecutionEventHub>>>>,
+    cli_runtime_event_hubs: Arc<
+        Mutex<
+            HashMap<
+                crate::cli_runtime::session_instance::CliSessionInstanceId,
+                Arc<ExecutionEventHub>,
+            >,
+        >,
+    >,
     cli_runtime_turn_binding_cache:
         Arc<Mutex<HashMap<CLIRuntimeNativeTurnKey, pioneer_crud::CliRuntimeTurnBindingRecord>>>,
     cli_runtime_session_turn_mutexes: Arc<
@@ -653,8 +724,17 @@ pub struct MessageProcessor {
             >,
         >,
     >,
-    cli_runtime_session_turn_leases:
-        Arc<Mutex<HashMap<String, tokio::sync::OwnedMutexGuard<()>>>>,
+    cli_runtime_session_turn_leases: Arc<
+        Mutex<
+            HashMap<
+                String,
+                (
+                    tokio::sync::OwnedMutexGuard<()>,
+                    crate::cli_runtime::manager::CLIAgentRuntimeSessionHandle,
+                ),
+            >,
+        >,
+    >,
     cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
     artifact_output_dirs: Arc<Mutex<HashMap<String, pioneer_artifacts::ArtifactOutputDir>>>,
@@ -662,16 +742,18 @@ pub struct MessageProcessor {
     native_permission_pending_requests:
         Arc<Mutex<HashMap<String, PendingNativePermissionApprovalRequest>>>,
     native_permission_approval_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    artifact_finalization_retry_turns: Arc<Mutex<HashSet<String>>>,
+    artifact_finalization_retry_turns:
+        Arc<Mutex<HashMap<String, Option<artifact_tools::ArtifactClosing>>>>,
     title_job_runtime: Arc<Mutex<HashMap<String, ThreadTitleJobState>>>,
     thread_title_publication_mutexes: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     #[cfg(test)]
-    thread_title_publication_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    thread_title_publication_barrier:
+        Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     #[cfg(test)]
     thread_title_publication_attempted: Arc<tokio::sync::Notify>,
     timeout_supervisor: Arc<TimeoutSupervisor>,
     recovery_coordinator: Arc<RecoveryCoordinator>,
-    native_turn_event_delivery_kick_running: Arc<AtomicBool>,
+    native_turn_event_delivery_workers: Arc<agent_runtime::NativeTurnEventDeliveryWorkers>,
     native_terminal_effect_kick_running: Arc<AtomicBool>,
     native_terminal_effect_kick_pending: Arc<AtomicBool>,
     native_lifecycle_readiness: Arc<native_health::NativeLifecycleReadinessState>,
@@ -687,6 +769,9 @@ pub struct MessageProcessor {
     mcp_snapshot_version: Arc<AtomicU64>,
     mcp_service: Arc<McpService>,
     skills_write_lock: Arc<tokio::sync::Mutex<()>>,
+    plugin_mutation_locks: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    app_runtime: Arc<apps::runtime::AppRuntime>,
+    host_api: Arc<crate::host_api::HostApi>,
     cli_runtime_skill_destination_locks: CliRuntimeSkillDestinationLocks,
     #[cfg(test)]
     cli_runtime_skill_preflight_test_events: Arc<Mutex<Vec<String>>>,
@@ -702,7 +787,7 @@ pub struct MessageProcessor {
     hook_recovery_config: Arc<RwLock<GatewayHookRecoveryConfig>>,
     keepawake: Arc<GatewayKeepAwake>,
     artifact_runtime_home: PathBuf,
-    thread_episodic_storage_root: PathBuf,
+    thread_episodic_lock_root: PathBuf,
     pub(crate) artifact_service: Arc<ArtifactService>,
     artifact_uploads: Arc<artifacts::upload::ArtifactUploadSessionManager>,
     thread_episodic_ingestor: Arc<RwLock<Arc<dyn ThreadEpisodicIngestor>>>,
@@ -711,11 +796,13 @@ pub struct MessageProcessor {
         Arc<ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver>,
     thread_episodic_recall_service: Arc<ThreadEpisodicRecallService>,
     voice_input_supervisor: Option<Arc<VoiceInputSupervisor>>,
-    self_improvement_supervisor: Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
+    self_improvement_supervisor:
+        Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
     gateway_settings_update_lock: Arc<Mutex<()>>,
     pub(crate) voice_finalizations: crate::voice::finalization::VoiceFinalizations,
     #[cfg(test)]
-    pub(crate) voice_test_transcriber: Option<crate::voice::transcription::TestVoiceSpeechTranscriber>,
+    pub(crate) voice_test_transcriber:
+        Option<crate::voice::transcription::TestVoiceSpeechTranscriber>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
 }
@@ -728,13 +815,15 @@ struct AgentListenerTask {
 
 #[derive(Default)]
 struct AgentMarkdownBuffer {
+    turn_id: String,
     text: String,
     stats: Arc<AgentMarkdownBufferStats>,
 }
 
 impl AgentMarkdownBuffer {
-    fn new(text: String) -> Self {
+    fn new(turn_id: String, text: String) -> Self {
         Self {
+            turn_id,
             text,
             stats: Arc::new(AgentMarkdownBufferStats::default()),
         }
@@ -941,7 +1030,6 @@ impl AgentMarkdownBufferStats {
 #[derive(Clone)]
 struct MemoryBridgeProviders {
     memory_provider: Arc<crate::memory_tools::GatewayMemoryProvider>,
-    memory_policy_provider: Arc<crate::memory_policy::GatewayMemoryTurnPolicyProvider>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1013,6 +1101,7 @@ struct PendingNativePermissionApprovalRequest {
 
 #[derive(Default)]
 struct TaskEventFanoutSummary {
+    #[cfg(test)]
     selected: usize,
     event_inputs: usize,
     emitted: usize,
@@ -1021,6 +1110,9 @@ struct TaskEventFanoutSummary {
 }
 
 impl MessageProcessor {
+    pub(crate) fn computer_use_config(&self) -> pioneer_tools::ComputerUseToolsConfig {
+        self.tool_loop_config.computer_use.clone()
+    }
     #[cfg(test)]
     pub fn new_with_memory_runtime(
         thread_manager: Arc<ThreadManager>,
@@ -1035,8 +1127,7 @@ impl MessageProcessor {
         runtime_home: PathBuf,
         artifacts_config: GatewayArtifactsConfig,
     ) -> Self {
-        let thread_episodic_storage_root =
-            isolated_test_thread_episodic_storage_root(&runtime_home);
+        let thread_episodic_lock_root = isolated_test_thread_episodic_lock_root(&runtime_home);
         Self::new_with_memory_runtime_and_task_config(
             thread_manager,
             provider_registry,
@@ -1048,7 +1139,7 @@ impl MessageProcessor {
             tool_loop_config,
             memory_runtime,
             runtime_home,
-            thread_episodic_storage_root,
+            thread_episodic_lock_root,
             artifacts_config,
             TaskRuntimeConfig::default(),
             ThreadEpisodicRuntimeConfig::default(),
@@ -1067,7 +1158,7 @@ impl MessageProcessor {
         tool_loop_config: ToolLoopConfig,
         memory_runtime: Arc<GatewayMemoryRuntime>,
         runtime_home: PathBuf,
-        thread_episodic_storage_root: PathBuf,
+        thread_episodic_lock_root: PathBuf,
         artifacts_config: GatewayArtifactsConfig,
         task_runtime_config: TaskRuntimeConfig,
         thread_episodic_runtime_config: ThreadEpisodicRuntimeConfig,
@@ -1117,6 +1208,7 @@ impl MessageProcessor {
                 resilience_config.context_compaction_timeout,
             ),
         ));
+        let plugin_mutation_locks = Arc::new(Mutex::new(HashMap::new()));
         let recovery_coordinator = Arc::new(
             RecoveryCoordinator::new(
                 crud_store.clone(),
@@ -1127,6 +1219,7 @@ impl MessageProcessor {
                 ),
                 normalized_tool_loop_config.clone(),
             )
+            .with_plugin_launch_locks(plugin_mutation_locks.clone())
             .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
             .with_execution_leases(execution_leases.clone())
             .with_turn_execution_owner_id(turn_execution_owner_id.clone()),
@@ -1149,8 +1242,8 @@ impl MessageProcessor {
         let artifact_uploads = Arc::new(artifacts::upload::ArtifactUploadSessionManager::new(
             runtime_home.join("artifacts").join("upload_sessions"),
         ));
-        let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
-            Arc::new(MemvidThreadEpisodicBackend::new());
+        let thread_episodic_backend: Arc<dyn ThreadEpisodicSearchBackend> =
+            Arc::new(SqliteThreadEpisodicBackend::new(crud_store.clone()));
         let thread_episodic_embedding_provider_resolver = Arc::new(
             ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
                 provider_registry.clone(),
@@ -1167,16 +1260,13 @@ impl MessageProcessor {
                 Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                     Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                         maintenance_crud_store.clone(),
-                        thread_episodic_storage_uri_from_path(
-                            thread_episodic_storage_root.as_path(),
-                        ),
                     )),
                     thread_episodic_embedding_provider_resolver.clone(),
                     maintenance_crud_store,
                 )),
             )
             .with_projection_runtime(
-                thread_episodic_storage_root.clone(),
+                thread_episodic_lock_root.clone(),
                 thread_episodic_embedding_provider_resolver.clone(),
                 thread_episodic_workspace_refill_supervisor.clone(),
             ),
@@ -1207,10 +1297,15 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            push_scopes: Arc::new(scoped_push::PushScopes::default()),
             authorization_invalidation_hub,
             execution_leases,
             observation_governor,
             turn_execution_owner_id,
+            foreground_starts: Arc::new(Default::default()),
+            pending_delivery_order: Arc::default(),
+            #[cfg(test)]
+            execution_auth_fault: Arc::default(),
             artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
@@ -1222,16 +1317,21 @@ impl MessageProcessor {
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
+            gateway_listen_addr: Arc::new(std::sync::RwLock::new(None)),
             invitation_gateway_base_url: Arc::new(
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            task_child_point_cursor: Arc::new(Mutex::new(Default::default())),
+            task_child_scope_cursor: Arc::new(Mutex::new(Default::default())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             turn_execution_heartbeat_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            recovery_due_wait_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -1246,6 +1346,8 @@ impl MessageProcessor {
             task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            context_compaction_config: resilience_config.context_compaction,
+            compaction_clock: Arc::new(crate::compaction::SystemCompactionClock::default()),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
@@ -1276,6 +1378,9 @@ impl MessageProcessor {
                     || summary_config.summary_model_provider.is_some()
                 {
                     Some(pioneer_compaction::ModelSelection {
+                        service_mode: None,
+                        context_authority: None,
+                        context_window: None,
                         transport: pioneer_compaction::Transport::Api,
                         instance: summary_config
                             .summary_model_provider
@@ -1292,6 +1397,10 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            markdown_delta_parse_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            progress_item_type_lookup_count: Arc::new(AtomicU64::new(0)),
             progress_items: Arc::new(Mutex::new(ProgressItemRegistry::default())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -1314,7 +1423,7 @@ impl MessageProcessor {
             turn_final_assistant_texts: Arc::new(Mutex::new(HashMap::new())),
             native_permission_pending_requests: Arc::new(Mutex::new(HashMap::new())),
             native_permission_approval_worker: Arc::new(Mutex::new(None)),
-            artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
+            artifact_finalization_retry_turns: Arc::new(Mutex::new(HashMap::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             thread_title_publication_mutexes: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -1323,7 +1432,7 @@ impl MessageProcessor {
             thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
-            native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
+            native_turn_event_delivery_workers: Arc::new(Default::default()),
             native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
             native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
             native_lifecycle_readiness: Arc::new(
@@ -1343,6 +1452,9 @@ impl MessageProcessor {
             mcp_snapshot_version,
             mcp_service,
             skills_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            plugin_mutation_locks,
+            app_runtime: Arc::new(apps::runtime::AppRuntime::default()),
+            host_api: Arc::new(crate::host_api::HostApi::default()),
             cli_runtime_skill_destination_locks: new_cli_runtime_skill_destination_locks(),
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
@@ -1358,7 +1470,7 @@ impl MessageProcessor {
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
             keepawake: Arc::new(GatewayKeepAwake::default()),
             artifact_runtime_home: runtime_home,
-            thread_episodic_storage_root,
+            thread_episodic_lock_root,
             artifact_service,
             artifact_uploads,
             thread_episodic_ingestor: Arc::new(RwLock::new(Arc::new(
@@ -1383,6 +1495,10 @@ impl MessageProcessor {
 
     pub async fn set_hook_recovery_config(&self, config: GatewayHookRecoveryConfig) {
         *self.hook_recovery_config.write().await = config;
+        self.crud_store
+            .database_connection()
+            .work_signal("hooks")
+            .notify();
     }
 
     pub(crate) fn with_remote_access_supervisor(
@@ -1423,15 +1539,28 @@ impl MessageProcessor {
                     break;
                 }
 
-                let status = status_rx.borrow().clone();
+                let Some(processor) = processor.upgrade() else {
+                    break;
+                };
+                let status = match processor
+                    .persist_current_remote_access_public_base_url()
+                    .await
+                {
+                    Ok(status) => status,
+                    Err(_) => {
+                        tracing::warn!("failed to persist current relay public address");
+                        processor
+                            .remote_access_supervisor
+                            .as_ref()
+                            .expect("remote access supervisor")
+                            .status_snapshot()
+                    }
+                };
                 if status == previous {
                     continue;
                 }
                 previous = status.clone();
 
-                let Some(processor) = processor.upgrade() else {
-                    break;
-                };
                 processor
                     .send_gateway_management_notification(
                         events::GATEWAY_REMOTE_ACCESS_STATUS_CHANGED,
@@ -1492,6 +1621,21 @@ impl MessageProcessor {
                 let Some(processor) = processor.upgrade() else {
                     break;
                 };
+                // Serialize with settings saves so an older engine event cannot
+                // overwrite a newly persisted session mode on another client.
+                let _settings_guard = processor.gateway_settings_update_lock.lock().await;
+                settings = processor
+                    .voice_input_supervisor
+                    .as_ref()
+                    .map(|supervisor| supervisor.settings_snapshot())
+                    .unwrap_or_default();
+                if processor
+                    .apply_persisted_voice_input_mode(&mut settings)
+                    .is_err()
+                {
+                    warn!("failed to read Voice Input mode for status publication");
+                    continue;
+                }
                 processor
                     .send_gateway_management_notification(
                         events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
@@ -1506,9 +1650,32 @@ impl MessageProcessor {
         });
     }
 
+    fn apply_persisted_voice_input_mode(
+        &self,
+        settings: &mut pioneer_protocol::GatewayVoiceInputSettings,
+    ) -> anyhow::Result<()> {
+        #[cfg(not(test))]
+        let config = pioneer_config::AppConfig::load()?;
+        #[cfg(test)]
+        let config = crate::isolated_test_app_config()?;
+        let file_name = crate::settings::normalize_settings_file_name(
+            config.gateway.settings_file_name.as_str(),
+        )?;
+        let persisted = crate::settings::load_or_create_gateway_settings(
+            &self.artifact_runtime_home.join(&file_name),
+            config.gateway.settings_version,
+            &file_name,
+        )?;
+        settings.transcribe_while_recording = persisted
+            .effective_voice_input_config(&config.gateway.voice)
+            .transcribe_while_recording;
+        Ok(())
+    }
+
     pub(crate) fn thread_episodic_vector_refill_status_sender(
         &self,
-    ) -> crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender{
+    ) -> crate::database::startup::thread_episodic_refill::ThreadEpisodicWorkspaceRefillStatusSender
+    {
         self.thread_episodic_vector_refill_status_tx.clone()
     }
 
@@ -1610,7 +1777,7 @@ impl MessageProcessor {
     }
 
     pub async fn shutdown_cli_runtime_manager(&self) {
-        self.cli_history_shutdown.cancel();
+        self.cancel_cli_history_work().await;
         let Some(manager) = self.cli_runtime_manager.as_ref() else {
             return;
         };
@@ -1836,6 +2003,10 @@ impl MessageProcessor {
                 Ok(builder) => {
                     let runtime = builder.build();
                     *self.hook_runtime.write().await = Some(runtime.clone());
+                    self.crud_store
+                        .database_connection()
+                        .work_signal("hooks")
+                        .notify();
                     self.agent_manager.set_hook_runtime(Some(runtime)).await;
                 }
                 Err(error) => {
@@ -1852,6 +2023,10 @@ impl MessageProcessor {
             Ok(builder) => {
                 let runtime = builder.build();
                 *self.hook_runtime.write().await = Some(runtime.clone());
+                self.crud_store
+                    .database_connection()
+                    .work_signal("hooks")
+                    .notify();
                 self.agent_manager.set_hook_runtime(Some(runtime)).await;
             }
             Err(error) => {
@@ -1880,6 +2055,12 @@ impl MessageProcessor {
     }
 
     pub async fn bind_agent_tool_bridges(self: &Arc<Self>) {
+        self.tool_loop_config
+            .computer_use
+            .image_admission
+            .set(Arc::new(artifact_tools::GatewayCuaImageSink(
+                Arc::downgrade(self),
+            )));
         self.bind_permission_approval_bridge().await;
         self.bind_task_bridge().await;
         self.bind_artifact_tool_bridge().await;
@@ -1891,6 +2072,10 @@ impl MessageProcessor {
                 crate::compaction::GatewayNativeContextController::new(Arc::downgrade(self)),
             )))
             .await;
+        self.crud_store
+            .database_connection()
+            .work_signal("compaction")
+            .notify();
     }
 
     /// Resolve the database-backed launch catalog on an isolated Tokio task.
@@ -2017,10 +2202,6 @@ impl MessageProcessor {
         let memory_provider = Arc::new(crate::memory_tools::GatewayMemoryProvider::new(
             Arc::downgrade(self),
         ));
-        let memory_policy_provider =
-            Arc::new(crate::memory_policy::GatewayMemoryTurnPolicyProvider::new(
-                self.provider_registry.clone(),
-            ));
         self.agent_manager
             .set_memory_provider(Some(memory_provider.clone()))
             .await;
@@ -2030,14 +2211,8 @@ impl MessageProcessor {
         self.agent_manager
             .set_memory_post_turn_extractor_provider(Some(memory_provider.clone()))
             .await;
-        self.agent_manager
-            .set_memory_turn_policy_provider(Some(memory_policy_provider.clone()))
-            .await;
 
-        let bridge = MemoryBridgeProviders {
-            memory_provider,
-            memory_policy_provider,
-        };
+        let bridge = MemoryBridgeProviders { memory_provider };
         *self.memory_bridge_providers.write().await = Some(bridge.clone());
         self.install_memory_hook_runtime(bridge).await;
     }
@@ -2049,37 +2224,19 @@ impl MessageProcessor {
                 bridge.memory_provider.clone(),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
-                Some(bridge.memory_policy_provider),
-                Some(Arc::new(ThreadEpisodicMemoryRecallProvider::new(
-                    self.thread_episodic_recall_service.clone(),
-                    self.crud_store.clone(),
-                ))),
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
             ))
-            .and_then(|builder| {
-                let thread_config = self
-                    .thread_episodic_runtime_config
-                    .read()
-                    .map(|config| config.clone())
-                    .unwrap_or_default();
-                builder.install(thread_context_recall_hook_package(
-                    self.thread_episodic_recall_service.clone(),
-                    Some(self.crud_store.clone()),
-                    self.memory_loop_config(),
-                    ThreadContextRecallHookConfig {
-                        enabled: thread_config.enabled && thread_config.recall_enabled,
-                        max_prompt_chars: thread_config.hook_max_prompt_chars,
-                        max_candidates: thread_config.hook_max_candidates,
-                    },
-                ))
-            })
             .and_then(|builder| {
                 builder.install(agents_doc_prompt_hook_package(self.crud_store.clone()))
             }) {
             Ok(builder) => {
                 let runtime = builder.build();
                 *self.hook_runtime.write().await = Some(runtime.clone());
+                self.crud_store
+                    .database_connection()
+                    .work_signal("hooks")
+                    .notify();
                 self.agent_manager.set_hook_runtime(Some(runtime)).await;
             }
             Err(error) => {
@@ -2183,6 +2340,26 @@ impl MessageProcessor {
         // a barrier: no in-flight progress can reinsert state behind it.
         self.execution_leases.finish(turn_id).await;
         self.progress_items.lock().await.forget_turn(turn_id);
+        let removed = {
+            let mut buffers = self.agent_message_buffers.lock().await;
+            let mut removed = Vec::new();
+            buffers.retain(|_, buffer| {
+                if buffer.turn_id == turn_id {
+                    removed.push(std::mem::take(buffer));
+                    false
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+        for buffer in removed {
+            Self::record_agent_markdown_buffer(
+                &buffer,
+                buffer.text.len(),
+                pioneer_observability::GatewayMarkdownMessageOutcome::Abandoned,
+            );
+        }
     }
 
     pub(crate) async fn validate_task_execution_admission_seed(
@@ -2300,6 +2477,10 @@ impl MessageProcessor {
             .workspace_compaction_settings
             .write()
             .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))? = prepared;
+        self.crud_store
+            .database_connection()
+            .work_signal("compaction")
+            .notify();
         Ok(())
     }
 
@@ -2370,16 +2551,18 @@ impl MessageProcessor {
             };
             let store = this.crud_store.with_maintenance_reads_and_critical_writes();
             let owner = this.turn_execution_owner_id.clone();
+            let notification = store.turn_execution_heartbeat_notification(owner.as_ref());
             #[cfg(test)]
             let barrier = this.turn_execution_heartbeat_barrier.clone();
             // Keep only the DB scope and owner identity during I/O, retry and
             // sleep. The heartbeat must not keep MessageProcessor alive.
             drop(this);
             let cycle = AssertUnwindSafe(async {
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::ExecutionOwnerHeartbeat,
                     retry_transient_storage_access(|| {
-                        store.heartbeat_turn_executions_owned_by(
+                        store.supervise_turn_execution_heartbeat(
                             owner.as_ref(),
                             TURN_EXECUTION_OWNER_LEASE_SECONDS,
                         )
@@ -2387,11 +2570,15 @@ impl MessageProcessor {
                 )
                 .await
                 {
-                    record_resilience_worker_error(
-                        "Turn execution owner heartbeat",
-                        &error,
-                        ResilienceWorkerFailureImpact::CriticalPoll,
-                    );
+                    Ok(parked) => parked,
+                    Err(error) => {
+                        record_resilience_worker_error(
+                            "Turn execution owner heartbeat",
+                            &error,
+                            ResilienceWorkerFailureImpact::CriticalPoll,
+                        );
+                        false
+                    }
                 }
             })
             .catch_unwind()
@@ -2408,7 +2595,104 @@ impl MessageProcessor {
                 .await;
             // Retries are bounded by the existing storage policy; subsequent
             // polls remain serial and use the existing short service interval.
-            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            // Drop the scoped DB handle before waiting; neither branch retains
+            // MessageProcessor. notify_one retains a permit across the final
+            // empty check and waiter registration (including admission races).
+            drop(store);
+            if matches!(cycle, Ok(true)) {
+                notification.notified().await;
+            } else {
+                tokio::select! {
+                    _ = notification.notified() => {},
+                    _ = sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)) => {},
+                }
+            }
+        }
+    }
+
+    async fn run_recovery_due_worker(processor: Weak<Self>) {
+        let Some(owner) = processor.upgrade() else {
+            return;
+        };
+        let database = owner.crud_store.database_connection().maintenance();
+        let mut work = database.work_signal("recovery.due").subscribe();
+        drop(owner);
+        loop {
+            let Some(original) = processor.upgrade() else {
+                break;
+            };
+            let this = original.for_background_reconciliation();
+            drop(original);
+            #[cfg(test)]
+            let wait_barrier = this.recovery_due_wait_barrier.clone();
+            let mut transient_storage_poll_failed = false;
+            let mut failed = false;
+            let mut deadline = None;
+            let cycle = AssertUnwindSafe(async {
+                if let Err(error) = work.begin_pass(&database).await {
+                    error!(error = %error, "failed to settle recovery invalidation");
+                    failed = true;
+                    return;
+                }
+                let now = now_timestamp_secs();
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::RecoveryJobs,
+                    retry_transient_storage_access(|| {
+                        this.recovery_coordinator.run_due_jobs(now, 64)
+                    }),
+                )
+                .await
+                {
+                    Ok(events) => {
+                        for event in events {
+                            this.handle_recovery_event(event, now).await;
+                        }
+                    }
+                    Err(error) => {
+                        failed = true;
+                        record_resilience_worker_poll_error(
+                            "recovery due jobs",
+                            &error,
+                            &mut transient_storage_poll_failed,
+                        );
+                    }
+                }
+                if !failed {
+                    match this.crud_store.next_recovery_job_due_at().await {
+                        Ok(next) => deadline = next,
+                        Err(error) => {
+                            failed = true;
+                            error!(error = %error, "recovery deadline discovery failed");
+                        }
+                    }
+                }
+            })
+            .catch_unwind()
+            .await;
+            if cycle.is_err() {
+                error!("contained panic in recovery due worker");
+            }
+            // The subscription was acknowledged before discovery. Concurrent
+            // commits remain visible; no processor or DB capacity is held here.
+            drop(this);
+            #[cfg(test)]
+            wait_barrier
+                .wait_if_armed(
+                    "__recovery_due_before_wait__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                continue;
+            }
+            if failed || cycle.is_err() {
+                sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            } else {
+                // A due timestamp also preserves bounded page continuation.
+                tokio::task::yield_now().await;
+                work.wait(deadline).await;
+            }
         }
     }
 
@@ -2416,21 +2700,61 @@ impl MessageProcessor {
         let mut finalization_reporting = reconciliation_diagnostics::Reporter::new(
             reconciliation_diagnostics::Operation::NativeFinalization,
         );
+        let Some(owner) = processor.upgrade() else {
+            return;
+        };
+        let database = owner.crud_store.database_connection().maintenance();
+        let mut changes = database.work_signal("projection").subscribe();
+        drop(owner);
+        let mut work = projection_work::ProjectionWork::default();
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
             };
             let this = this.for_background_reconciliation();
+            let mut failed = false;
+            let mut replay_deadline = None;
             let cycle = AssertUnwindSafe(async {
+                if work.is_complete() {
+                    match changes.begin_keyed_pass(&database).await {
+                        Ok(keys) => work.begin(keys, now_timestamp_secs()),
+                        Err(error) => {
+                            error!(error = %error, "projection invalidation failed");
+                            failed = true;
+                            return;
+                        }
+                    }
+                }
+                let Some(scope) = work.current() else {
+                    // Delivery ACK/claim changes still wake the existing delivery
+                    // owners, without re-running projection/finalization discovery.
+                    this.kick_native_turn_event_deliveries();
+                    return;
+                };
                 let now = now_timestamp_secs();
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ProjectionRecovery,
-                    retry_transient_storage_access(|| {
-                        this.crud_store.replay_due_turn_event_projections(now, 64)
-                    }),
-                )
-                .await
-                {
+                let cutoff = work.cutoff;
+                let replay = if scope.replay {
+                    crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ProjectionRecovery,
+                        pioneer_observability::DatabaseOperationSite::ProjectionReplay,
+                        retry_transient_storage_access(|| {
+                            this.crud_store.replay_turn_event_projection_frontier(
+                                now,
+                                64,
+                                scope.turns.as_deref(),
+                                cutoff,
+                            )
+                        }),
+                    )
+                    .await
+                } else {
+                    Ok(pioneer_crud::TurnProjectionReplaySummary::default())
+                };
+                match &replay {
+                    Ok(summary) => replay_deadline = summary.next_eligible_at_unix,
+                    Err(_) => failed = true,
+                }
+                match replay {
                     Ok(summary) if summary.quarantined > 0 || summary.missing_events > 0 => warn!(
                         claimed = summary.claimed,
                         projected = summary.projected,
@@ -2451,16 +2775,34 @@ impl MessageProcessor {
                     ),
                 }
 
-                let result = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::FinalizationRecovery,
-                    retry_transient_storage_access(|| {
-                        this.reconcile_prepared_native_turn_finalizations(now, 64)
-                    }),
-                )
-                .await;
-                finalization_reporting.observe(&result, Instant::now());
+                let result = if scope.finalization {
+                    crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::FinalizationRecovery,
+                        pioneer_observability::DatabaseOperationSite::PreparedFinalizationReconcile,
+                        retry_transient_storage_access(|| {
+                            this.reconcile_prepared_native_turn_finalizations_scoped(
+                                now,
+                                64,
+                                scope.turns.as_deref(),
+                            )
+                        }),
+                    )
+                    .await
+                } else {
+                    Ok(pioneer_crud::TurnFinalizationReconciliationSummary {
+                        pass_complete: true,
+                        ..Default::default()
+                    })
+                };
+                finalization_reporting.observe_finalizations(&result, Instant::now());
                 match result {
                     Ok(summary) => {
+                        failed |= summary.pass_failed || !summary.failures.is_empty();
+                        // A full page is continuation, not EOF. Keep the same
+                        // invalidation frontier until both domain passes finish.
+                        if !failed {
+                            work.advance(replay_deadline, summary.pass_complete);
+                        }
                         let committed = summary.committed_count();
                         if committed > 0 {
                             info!(
@@ -2482,29 +2824,35 @@ impl MessageProcessor {
                             );
                         }
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        failed = true;
+                    }
                 }
 
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::EventDelivery,
-                    retry_transient_storage_access(|| {
-                        this.process_due_native_turn_event_deliveries(now, 64)
-                    }),
-                )
-                .await
-                {
-                    error!(
-                        error = %format!("{error:#}"),
-                        "native turn-event optional delivery worker failed"
-                    );
-                }
+                #[cfg(test)]
+                this.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__event_delivery_recovery_before_kick__",
+                        &this.cli_history_shutdown,
+                    )
+                    .await;
+                // Recovery shares the same consumer owners as commit
+                // kicks; a slow episodic effect cannot hold the next LIVE batch.
+                this.kick_native_turn_event_deliveries();
             })
             .catch_unwind()
             .await;
             if cycle.is_err() {
                 error!("contained panic in projection/delivery resilience worker");
             }
-            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            drop(this);
+            if failed || cycle.is_err() {
+                work.retry();
+                sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            } else {
+                work.wait(&mut changes).await;
+            }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -2512,15 +2860,29 @@ impl MessageProcessor {
         let mut occurrence_reporting = reconciliation_diagnostics::Reporter::new(
             reconciliation_diagnostics::Operation::TaskRunOccurrence,
         );
+        let Some(owner) = processor.upgrade() else {
+            return;
+        };
+        let database = owner.crud_store.database_connection().maintenance();
+        let mut changes = database.work_signal("tasks.lifecycle").subscribe();
+        drop(owner);
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
             };
             let this = this.for_background_reconciliation();
+            let mut failed = false;
+            let mut deadline = None;
             let cycle = AssertUnwindSafe(async {
+                if let Err(error) = changes.begin_pass(&database).await {
+                    error!(error = %error, "task lifecycle invalidation failed");
+                    failed = true;
+                    return;
+                }
                 let now = now_timestamp_secs();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    pioneer_observability::DatabaseOperationSite::TaskChildReconcile,
                     this.reconcile_terminal_task_child_turns_with_retry(64),
                 )
                 .await
@@ -2530,18 +2892,36 @@ impl MessageProcessor {
                         "reconciled terminal child Turns with their TaskRun aggregates"
                     ),
                     Ok(_) => {}
-                    Err(error) => tasks::report_task_child_reconciliation_error(error),
+                    Err(error) => {
+                        failed = true;
+                        tasks::report_task_child_reconciliation_error(error);
+                    }
                 }
 
                 let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    pioneer_observability::DatabaseOperationSite::TaskOccurrenceReconcile,
                     this.reconcile_terminal_task_run_occurrence_turns(64),
                 )
                 .await;
                 occurrence_reporting.observe_occurrences(&result, Instant::now());
+                if result.is_err() {
+                    failed = true;
+                }
                 if let Ok(summary) = result
                     && summary.selected > 0
                 {
+                    if summary.unresolved > 0
+                        || summary.claim_errors > 0
+                        || summary.claim_deferral_errors > 0
+                        || summary.claim_commit_unknown > 0
+                        || summary.repair_errors > 0
+                        || summary.storage_errors > 0
+                        || summary.notification_errors > 0
+                        || summary.queue_state_errors > 0
+                    {
+                        failed = true;
+                    }
                     info!(
                         selected = summary.selected,
                         claimed = summary.claimed,
@@ -2566,11 +2946,20 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    pioneer_observability::DatabaseOperationSite::TaskDelivery,
                     this.process_due_task_deliveries(now, 64),
                 )
                 .await
                 {
+                    failed = true;
                     error!(error = %format!("{error:#}"), "task delivery worker failed");
+                }
+                match this.crud_store.next_task_lifecycle_deadline(now).await {
+                    Ok(next) => deadline = next,
+                    Err(error) => {
+                        failed = true;
+                        error!(error = %error, "task lifecycle deadline failed");
+                    }
                 }
             })
             .catch_unwind()
@@ -2578,7 +2967,13 @@ impl MessageProcessor {
             if cycle.is_err() {
                 error!("contained panic in task lifecycle resilience worker");
             }
-            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            drop(this);
+            if failed || cycle.is_err() {
+                sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            } else {
+                changes.wait(deadline).await;
+            }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -2698,16 +3093,32 @@ impl MessageProcessor {
             }
         }
 
+        // Startup reconciliation is a bounded Maintenance DB action, not
+        // an automatic installer replay. Unfinished parents remain closed.
+        background.crud_store.interrupt_unfinished_plugins().await?;
+        self.start_app_runtimes().await;
+
         let task_runtime_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceTaskRuntimeStart);
-        if let Err(error) = self.task_runtime.start().await {
-            drop(task_runtime_stage);
-            error!(error = %format!("{error:#}"), "failed to start task runtime");
-            trace.finish_failure();
-            return Err(error).context("failed to start task runtime");
-        } else {
-            task_runtime_stage.succeed();
-        }
+        let partial_startup = match self.task_runtime.start().await {
+            Ok(()) => {
+                task_runtime_stage.succeed();
+                None
+            }
+            Err(error) => {
+                drop(task_runtime_stage);
+                error!(error = %format!("{error:#}"), "failed to start task runtime");
+                if error
+                    .downcast_ref::<pioneer_tasks::PartialTaskStartup>()
+                    .is_some()
+                {
+                    Some(error)
+                } else {
+                    trace.finish_failure();
+                    return Err(error).context("failed to start task runtime");
+                }
+            }
+        };
 
         let task_events_stage = trace
             .stage(pioneer_observability::GatewayOperationStage::ResilienceTaskEventListenerStart);
@@ -2719,7 +3130,13 @@ impl MessageProcessor {
         self.start_hook_recovery_worker().await;
         hook_recovery_stage.succeed();
 
-        trace.finish_success();
+        if partial_startup.is_some() {
+            // Keep explicit failure diagnostics/trace, but do not trap Gateway
+            // initialization in a retry loop on classified row-local poison.
+            trace.finish_failure();
+        } else {
+            trace.finish_success();
+        }
         Ok(())
     }
 
@@ -2813,22 +3230,46 @@ impl MessageProcessor {
                 }
             }
 
+            let Some(owner) = processor.upgrade() else {
+                return;
+            };
+            let database = owner.crud_store.database_connection().maintenance();
+            let mut control_changes = database.work_signal("gateway.control").subscribe();
+            let mut cli_changes = database.work_signal("gateway.cli").subscribe();
+            let mut native_retry_changes = database.work_signal("control.native_retry").subscribe();
+            drop(owner);
             let _isolated_workers = IsolatedWorkerGuard(vec![
                 tokio::spawn(Self::run_turn_execution_owner_heartbeat_worker(
                     processor.clone(),
                 )),
+                tokio::spawn(Self::run_recovery_due_worker(processor.clone())),
                 tokio::spawn(Self::run_projection_delivery_resilience_worker(
                     processor.clone(),
                 )),
                 tokio::spawn(Self::run_task_lifecycle_resilience_worker(
                     processor.clone(),
                 )),
+                tokio::spawn(Self::run_compaction_background_worker(processor.clone())),
             ]);
+            use control_work::{ControlWork, Family};
+            let mut work = ControlWork::default();
             let mut cli_runtime_stale_turn_scan = cli_runtime::CliRuntimeStaleTurnScan::default();
-            let mut next_skill_upload_cleanup = 0;
-            let mut next_agent_action_ledger_compaction = 0;
-            let mut next_native_terminal_effect_purge = 0;
-            let mut next_native_terminal_effect_recovery = 0;
+            let mut command_rehydration_after: Option<String> = None;
+            let mut command_rehydration_upper: Option<String> = None;
+            let mut command_rehydration_failed = false;
+            let mut command_rehydration_pending = true;
+            let mut command_rehydration_retry = None::<i64>;
+            let mut next_native_terminal_effect_recovery = Some(0);
+            let mut begin_round = true;
+            let mut round_failed = false;
+            let mut round_cutoff = now_timestamp_secs();
+            let mut supervision_complete = false;
+            let mut supervision_failed = false;
+            let mut cli_stale_complete = false;
+            let mut timeout_complete = false;
+            let mut timeout_after: Option<pioneer_crud::TimeoutCandidateCursor> = None;
+            let mut ledger_after: Option<pioneer_crud::AgentLedgerCursor> = None;
+            let mut ledger_complete = false;
             loop {
                 let Some(this) = processor.upgrade() else {
                     break;
@@ -2836,58 +3277,236 @@ impl MessageProcessor {
                 let this = this.for_background_reconciliation();
                 let maintenance = this.with_database_class(SqliteWriteClass::Maintenance);
                 let now = now_timestamp_secs();
+                // Poll release obligations even while other families have more
+                // portions; a busy outbox must not starve terminal cleanup.
+                work.drain_cli_transition_retries();
                 let mut transient_storage_poll_failed = false;
-                #[cfg(test)]
-                this.completed_history_preparation_barrier
-                    .wait_if_armed(
-                        "__resilience_before_history_poll__",
-                        &tokio_util::sync::CancellationToken::new(),
-                    )
+                let mut more = false;
+                let mut finished = std::collections::BTreeSet::new();
+                if begin_round {
+                    // ACK before each finite pass. A commit behind a live
+                    // cursor remains on its subscription for the next pass.
+                    let hints = async {
+                        this.absorb_control_hints(
+                            &mut work,
+                            control_changes.begin_keyed_pass(&database).await?,
+                        )
+                        .await?;
+                        this.absorb_control_hints(
+                            &mut work,
+                            cli_changes.begin_keyed_pass(&database).await?,
+                        )
+                        .await?;
+                        Ok::<_, anyhow::Error>(())
+                    }
                     .await;
-                if maintenance.poll_completed_history_checks().await.is_err() {
-                    warn!("failed to poll completed history checks");
+                    if let Err(error) = hints {
+                        warn!(error = %error, "control hint settlement failed");
+                        work.full();
+                        drop(maintenance);
+                        drop(this);
+                        sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    work.due(now);
+                    round_cutoff = now;
+                    supervision_failed = false;
+                    if work.ready(Family::Cli) {
+                        cli_runtime_stale_turn_scan =
+                            cli_runtime::CliRuntimeStaleTurnScan::default();
+                    }
+                    supervision_complete = !work.ready(Family::Supervision);
+                    cli_stale_complete = !work.ready(Family::Cli);
+                    timeout_complete = !work.ready(Family::Timeouts);
+                    timeout_after = None;
+                    ledger_complete = !work.ready(Family::Ledger);
+                    ledger_after = None;
+                    if work.rebuild_commands {
+                        command_rehydration_pending = true;
+                        command_rehydration_retry = None;
+                        command_rehydration_after = None;
+                        command_rehydration_upper = None;
+                        command_rehydration_failed = false;
+                        work.rebuild_commands = false;
+                    }
+                    if native_retry_changes.changed().now_or_never().is_some() {
+                        next_native_terminal_effect_recovery = Some(0);
+                    }
+                    if next_native_terminal_effect_recovery.is_some_and(|at| now >= at)
+                        && native_retry_changes.begin_pass(&database).await.is_err()
+                    {
+                        next_native_terminal_effect_recovery = Some(now.saturating_add(2));
+                    }
                 }
-                if now >= next_skill_upload_cleanup {
+                if work.ready(Family::Skills) {
+                    if let Err(error) =
+                        crate::database::attribution::scope_database_workload_result(
+                            pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                            pioneer_observability::DatabaseOperationSite::StaleSkillUploadCleanup,
+                            maintenance.cleanup_stale_skill_uploads_for_control(now),
+                        )
+                        .await
+                    {
+                        warn!(error = %error, "skill upload cleanup failed");
+                        round_failed = true;
+                        work.retry(Family::Skills, now.saturating_add(2));
+                    } else {
+                        finished.insert(Family::Skills);
+                    }
+                }
+                if work.ready(Family::Buffers) {
+                    this.prune_cli_control_buffers(now).await;
+                    finished.insert(Family::Buffers);
+                }
+
+                if command_rehydration_pending
+                    && command_rehydration_retry.is_none_or(|at| now >= at)
+                {
+                    if command_rehydration_upper.is_none() {
+                        match this
+                            .crud_store
+                            .running_turn_item_attempt_upper_id_by_type(
+                                TurnItemType::CommandExecution,
+                            )
+                            .await
+                        {
+                            Ok(upper) => {
+                                command_rehydration_upper = Some(upper.unwrap_or_default())
+                            }
+                            Err(error) => {
+                                warn!(error = %error, "CLI command frontier discovery failed");
+                                command_rehydration_failed = true;
+                                command_rehydration_retry = Some(now.saturating_add(2));
+                                round_failed = true;
+                            }
+                        }
+                    }
+                    if let Some(upper) = command_rehydration_upper.as_deref() {
+                        match this
+                            .rehydrate_cli_runtime_command_items_bounded(
+                                None,
+                                command_rehydration_after.as_deref(),
+                                upper,
+                                1_024,
+                            )
+                            .await
+                        {
+                            Ok((_, next, failed)) => {
+                                command_rehydration_failed |= failed;
+                                command_rehydration_after = next;
+                                more |= command_rehydration_after.is_some();
+                                if command_rehydration_after.is_none() {
+                                    command_rehydration_pending = command_rehydration_failed;
+                                    command_rehydration_retry =
+                                        command_rehydration_failed.then(|| now.saturating_add(2));
+                                    command_rehydration_failed = false;
+                                }
+                            }
+                            Err(error) => {
+                                round_failed = true;
+                                warn!(error = %error, "CLI command rehydration discovery failed");
+                                command_rehydration_retry = Some(now.saturating_add(2));
+                            }
+                        }
+                    }
+                }
+
+                let turn_ids = work.take_turn_ids(16);
+                let mut point_timeouts_changed = false;
+                for turn_id in turn_ids {
+                    let mut pass = work.turns.remove(&turn_id).expect("selected control Turn");
+                    let commands_requested = pass.commands;
+                    let result = this.process_control_turn(&turn_id, &mut pass, now).await;
+                    match result {
+                        Ok((done, cli_deadline)) => {
+                            match cli_deadline {
+                                Some(control_work::CliTurnReadiness::Ready(next)) => {
+                                    work.cli_turn(turn_id.clone(), next);
+                                }
+                                Some(control_work::CliTurnReadiness::Waiting(transition)) => {
+                                    work.defer_cli_transition(turn_id.clone(), transition, now);
+                                }
+                                None => {}
+                            }
+                            point_timeouts_changed = true;
+                            if commands_requested {
+                                work.wake(pioneer_crud::GatewayControlWake::Commands);
+                            }
+                            if !done {
+                                work.turns.insert(turn_id, pass);
+                                more = true;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "addressed control reconciliation failed");
+                            pass.cli_done = false;
+                            work.retry_turn(turn_id, pass, now.saturating_add(2));
+                        }
+                    }
+                }
+                more |= !work.turns.is_empty();
+                if point_timeouts_changed && !work.ready(Family::Timeouts) {
+                    match maintenance
+                        .crud_store
+                        .next_gateway_control_deadline_for(
+                            &pioneer_crud::GatewayControlWake::Timeouts,
+                            round_cutoff,
+                        )
+                        .await
+                    {
+                        Ok(next) => work.finish(Family::Timeouts, next),
+                        Err(error) => {
+                            warn!(error = %error, "addressed timeout head failed");
+                            work.wake(pioneer_crud::GatewayControlWake::Timeouts);
+                            round_failed = true;
+                        }
+                    }
+                }
+                if work.ready(Family::Commands) || command_rehydration_pending {
+                    // Confirm live native command activity before timeout polling.
+                    // A command whose lease is near its boundary must get the
+                    // authoritative liveness check before any destructive claim.
                     crate::database::attribution::scope_database_workload(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                        maintenance.cleanup_stale_skill_uploads(now),
+                        pioneer_observability::DatabaseOperationSite::CliCommandHeartbeat,
+                        this.heartbeat_due_cli_runtime_command_items(now),
                     )
                     .await;
-                    next_skill_upload_cleanup = now.saturating_add(60);
+
+                    if !command_rehydration_pending {
+                        finished.insert(Family::Commands);
+                    }
                 }
-
-                // Confirm live native command activity before timeout polling.
-                // A command whose lease is near its boundary must get the
-                // authoritative liveness check before any destructive claim.
-                crate::database::attribution::scope_database_workload(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    this.heartbeat_due_cli_runtime_command_items(now),
-                )
-                .await;
-
-                let agent_resource_policy =
-                    crate::authorization::AgentWorkResourcePolicy::default();
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    retry_transient_storage_access(|| {
-                        this.crud_store.promote_queued_agent_executions(
-                            pioneer_crud::utc_now(),
-                            64,
-                            i64::try_from(agent_resource_policy.idle_timeout_secs)
-                                .unwrap_or(i64::MAX),
-                            i64::try_from(agent_resource_policy.hard_timeout_secs)
-                                .unwrap_or(i64::MAX),
-                        )
-                    }),
-                )
-                .await
-                {
-                    Ok(promoted) => {
-                        let database = this.crud_store.database_connection();
-                        for execution in &promoted {
-                            if let Err(error) =
+                if work.ready(Family::Resources) {
+                    let agent_resource_policy =
+                        crate::authorization::AgentWorkResourcePolicy::default();
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::QueuedExecutionPromotion,
+                        retry_transient_storage_access(|| {
+                            this.crud_store.promote_queued_agent_executions(
+                                pioneer_crud::utc_now(),
+                                64,
+                                i64::try_from(agent_resource_policy.idle_timeout_secs)
+                                    .unwrap_or(i64::MAX),
+                                i64::try_from(agent_resource_policy.hard_timeout_secs)
+                                    .unwrap_or(i64::MAX),
+                            )
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(promoted) => {
+                            more |= promoted.len() >= 64;
+                            if promoted.len() < 64 {
+                                finished.insert(Family::Resources);
+                            }
+                            let database = this.crud_store.database_connection();
+                            for execution in &promoted {
+                                if let Err(error) =
                                 crate::database::attribution::scope_database_workload_result(
                                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                    pioneer_observability::DatabaseOperationSite::AgentOutboxWake,
                                     pioneer_crud::wake_agent_action_outbox_for_execution(
                                         &database,
                                         execution.execution_id.as_str(),
@@ -2896,51 +3515,55 @@ impl MessageProcessor {
                                 )
                                 .await
                             {
+                                round_failed = true;
+                            work.retry(Family::Resources, now.saturating_add(2));
                                 record_resilience_worker_poll_error(
                                     "agent domain promoted agent outbox wake",
                                     &error,
                                     &mut transient_storage_poll_failed,
                                 );
                             }
-                        }
-                        let roots = promoted
-                            .into_iter()
-                            .map(|execution| execution.root_execution_id)
-                            .collect::<std::collections::BTreeSet<_>>();
-                        for root_execution_id in roots {
-                            crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                            }
+                            let roots = promoted
+                                .into_iter()
+                                .map(|execution| execution.root_execution_id)
+                                .collect::<std::collections::BTreeSet<_>>();
+                            for root_execution_id in roots {
+                                crate::database::attribution::scope_database_workload(
+                                pioneer_observability::DatabaseWorkload::ExecutionSupervision, pioneer_observability::DatabaseOperationSite::AgentGraphNotification,
                                 this.notify_agent_work_graph_state_changed(
                                     root_execution_id.as_str(),
                                 ),
                             )
                             .await;
+                            }
+                        }
+                        Err(error) => {
+                            round_failed = true;
+                            work.retry(Family::Resources, now.saturating_add(2));
+                            record_resilience_worker_poll_error(
+                                "agent domain durable agent queue",
+                                &error,
+                                &mut transient_storage_poll_failed,
+                            );
                         }
                     }
-                    Err(error) => {
-                        record_resilience_worker_poll_error(
-                            "agent domain durable agent queue",
-                            &error,
-                            &mut transient_storage_poll_failed,
-                        );
-                    }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                if now >= next_agent_action_ledger_compaction {
-                    next_agent_action_ledger_compaction =
-                        now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS);
+                if !ledger_complete && work.ready(Family::Ledger) {
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::TerminalExecutionCompaction,
                         retry_transient_storage_access(|| {
                             let database = maintenance.crud_store.database_connection();
+                            let after = ledger_after.clone();
                             async move {
-                                pioneer_crud::compact_terminal_agent_action_ledger(
+                                pioneer_crud::compact_terminal_agent_action_ledger_page(
                                     &database,
-                                    pioneer_crud::utc_now(),
+                                    chrono::DateTime::from_timestamp(round_cutoff, 0)
+                                        .unwrap_or_default()
+                                        .fixed_offset(),
                                     AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE,
+                                    after.as_ref(),
                                 )
                                 .await
                             }
@@ -2948,7 +3571,13 @@ impl MessageProcessor {
                     )
                     .await
                     {
-                        Ok(summary) => {
+                        Ok((summary, next)) => {
+                            ledger_after = next;
+                            ledger_complete = ledger_after.is_none();
+                            if ledger_complete {
+                                finished.insert(Family::Ledger);
+                            }
+                            more |= !ledger_complete;
                             if summary.compacted_rows > 0 {
                                 info!(
                                     compacted_rows = summary.compacted_rows,
@@ -2956,13 +3585,10 @@ impl MessageProcessor {
                                     "compacted terminal agent domain action ledger payloads"
                                 );
                             }
-                            if summary.candidate_rows >= AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE {
-                                next_agent_action_ledger_compaction = now;
-                            }
                         }
                         Err(error) => {
-                            next_agent_action_ledger_compaction =
-                                now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS);
+                            round_failed = true;
+                            work.retry(Family::Ledger, now.saturating_add(2));
                             record_resilience_worker_poll_error(
                                 "agent domain action ledger compaction",
                                 &error,
@@ -2971,15 +3597,15 @@ impl MessageProcessor {
                         }
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
 
-                if now >= next_native_terminal_effect_recovery {
+                // Exhausted native-effect retries retain their own source and
+                // row deadline; they do not run on unrelated control wakes.
+                if next_native_terminal_effect_recovery.is_some_and(|at| now >= at) {
                     next_native_terminal_effect_recovery =
-                        now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS);
+                        Some(now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS));
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::NativeTerminalEffectRequeue,
                         retry_transient_storage_access(|| {
                             maintenance
                                 .crud_store
@@ -2999,12 +3625,31 @@ impl MessageProcessor {
                                 );
                             }
                             if requeued >= NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE {
-                                next_native_terminal_effect_recovery = now;
+                                next_native_terminal_effect_recovery = Some(now);
+                                more = true;
+                            } else {
+                                match maintenance
+                                    .crud_store
+                                    .next_native_terminal_effect_recovery_deadline(now)
+                                    .await
+                                {
+                                    Ok(next) => next_native_terminal_effect_recovery = next,
+                                    Err(error) => {
+                                        round_failed = true;
+                                        record_resilience_worker_error(
+                                            "native terminal-effect recovery deadline",
+                                            &error,
+                                            ResilienceWorkerFailureImpact::Maintenance,
+                                        );
+                                    }
+                                }
                             }
                         }
                         Err(error) => {
-                            next_native_terminal_effect_recovery =
-                                now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS);
+                            round_failed = true;
+                            next_native_terminal_effect_recovery = Some(
+                                now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS),
+                            );
                             record_resilience_worker_error(
                                 "native terminal-effect retryable recovery",
                                 &error,
@@ -3013,15 +3658,11 @@ impl MessageProcessor {
                         }
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
 
-                if now >= next_native_terminal_effect_purge {
-                    next_native_terminal_effect_purge =
-                        now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS);
+                if work.ready(Family::NativeRetention) {
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::NativeTerminalEffectPurge,
                         retry_transient_storage_access(|| {
                             maintenance
                                 .crud_store
@@ -3037,13 +3678,16 @@ impl MessageProcessor {
                             if purged > 0 {
                                 info!(purged, "purged retained native terminal effects");
                             }
+                            if purged < NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE {
+                                finished.insert(Family::NativeRetention);
+                            }
                             if purged >= NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE {
-                                next_native_terminal_effect_purge = now;
+                                more = true;
                             }
                         }
                         Err(error) => {
-                            next_native_terminal_effect_purge =
-                                now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS);
+                            round_failed = true;
+                            work.retry(Family::NativeRetention, now.saturating_add(2));
                             // Retention is maintenance, not recovery authority.
                             // Its failure must not defer terminalization,
                             // timeout supervision, or either durable outbox.
@@ -3055,163 +3699,363 @@ impl MessageProcessor {
                         }
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
 
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    // One input quantum. Report errors/back off only after all
-                    // independent known-committed rows have had their dispatch.
-                    agent_action_tools::process_due_agent_action_outbox(&this, 64),
-                )
-                .await
-                {
-                    Ok(batch) => {
-                        if !batch.errors.is_empty() {
-                            tracing::warn!(
-                                delivered = batch.delivered,
-                                candidate_failures = batch.errors.len(),
-                                "agent action outbox quantum made partial progress"
-                            );
-                            transient_storage_poll_failed = true;
-                            for error in batch.errors {
-                                record_resilience_worker_poll_error(
-                                    "agent domain agent action outbox",
-                                    &error,
-                                    &mut transient_storage_poll_failed,
+                if work.ready(Family::Actions) {
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::AgentActionOutbox,
+                        // One input quantum. Report errors/back off only after all
+                        // independent known-committed rows have had their dispatch.
+                        agent_action_tools::process_due_agent_action_outbox(&this, 64),
+                    )
+                    .await
+                    {
+                        Ok(batch) => {
+                            more |= batch.has_more;
+                            if !batch.has_more && batch.errors.is_empty() {
+                                finished.insert(Family::Actions);
+                            }
+                            if !batch.errors.is_empty() {
+                                tracing::warn!(
+                                    delivered = batch.delivered,
+                                    candidate_failures = batch.errors.len(),
+                                    "agent action outbox quantum made partial progress"
                                 );
+                                transient_storage_poll_failed = true;
+                                for error in batch.errors {
+                                    record_resilience_worker_poll_error(
+                                        "agent domain agent action outbox",
+                                        &error,
+                                        &mut transient_storage_poll_failed,
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(error) => {
-                        transient_storage_poll_failed = true;
-                        record_resilience_worker_poll_error(
-                            "agent domain agent action outbox",
-                            &error,
-                            &mut transient_storage_poll_failed,
-                        );
+                        Err(error) => {
+                            round_failed = true;
+                            work.retry(Family::Actions, now.saturating_add(2));
+                            transient_storage_poll_failed = true;
+                            record_resilience_worker_poll_error(
+                                "agent domain agent action outbox",
+                                &error,
+                                &mut transient_storage_poll_failed,
+                            );
+                        }
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
                 // Hook/cleanup handlers have their own bounded deadlines and
                 // must never block lease heartbeats, timeout recovery, or the
                 // rest of this global resilience control loop.
-                this.kick_native_terminal_effects();
+                if work.ready(Family::NativeRetention) || work.ready(Family::Terminalization) {
+                    this.kick_native_terminal_effects();
+                }
 
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    retry_transient_storage_access(|| {
-                        this.poll_timeouts_respecting_human_wait(now, 64)
-                    }),
-                )
-                .await
+                if command_rehydration_after.is_none()
+                    && !timeout_complete
+                    && work.ready(Family::Timeouts)
+                    && work.turns.values().all(|pass| !pass.commands)
                 {
-                    Ok(candidates) => {
-                        for candidate in candidates {
-                            crate::database::attribution::scope_database_workload(
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::ExecutionTimeoutPoll,
+                        retry_transient_storage_access(|| {
+                            this.poll_timeout_candidate_page(
+                                round_cutoff,
+                                64,
+                                timeout_after.as_ref(),
+                            )
+                        }),
+                    )
+                    .await
+                    {
+                        Ok((candidates, next)) => {
+                            timeout_after = next;
+                            timeout_complete = timeout_after.is_none();
+                            if timeout_complete {
+                                finished.insert(Family::Timeouts);
+                            }
+                            more |= !timeout_complete;
+                            for candidate in candidates {
+                                crate::database::attribution::scope_database_workload(
                                 pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                pioneer_observability::DatabaseOperationSite::ExecutionTimeoutApply,
                                 this.handle_timeout_candidate(candidate, now),
                             )
                             .await;
+                            }
+                        }
+                        Err(error) => {
+                            round_failed = true;
+                            work.retry(Family::Timeouts, now.saturating_add(2));
+                            record_resilience_worker_poll_error(
+                                "timeout supervisor",
+                                &error,
+                                &mut transient_storage_poll_failed,
+                            );
                         }
                     }
-                    Err(error) => {
-                        record_resilience_worker_poll_error(
-                            "timeout supervisor",
-                            &error,
-                            &mut transient_storage_poll_failed,
-                        );
-                    }
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
                 }
 
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::RecoveryTerminalizationAudit,
-                    retry_transient_storage_access(|| {
-                        this.crud_store
-                            .enqueue_missing_recovery_terminalizations(64, now)
-                    }),
-                )
-                .await
-                {
-                    record_resilience_worker_poll_error(
-                        "recovery terminalization auditor",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
+                #[cfg(test)]
+                this.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__control_after_timeout_phase__",
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
 
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::RecoveryTerminalizationApply,
-                    retry_transient_storage_access(|| {
-                        this.process_due_recovery_terminalizations(now, 64)
-                    }),
-                )
-                .await
-                {
-                    record_resilience_worker_poll_error(
-                        "recovery terminalization outbox",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                match crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    retry_transient_storage_access(|| {
-                        this.recovery_coordinator.run_ready_jobs(now, 64)
-                    }),
-                )
-                .await
-                {
-                    Ok(events) => {
-                        for event in events {
-                            crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                                this.handle_recovery_event(event, now),
-                            )
-                            .await;
+                if work.ready(Family::Terminalization) {
+                    let mut terminal_more = false;
+                    let mut terminal_failed = false;
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::RecoveryTerminalizationAudit,
+                        pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationAudit,
+                        retry_transient_storage_access(|| {
+                            this.crud_store
+                                .enqueue_missing_recovery_terminalizations(64, now)
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(count) => {
+                            more |= count >= 64;
+                            terminal_more |= count >= 64;
+                        }
+                        Err(error) => {
+                            round_failed = true;
+                            terminal_failed = true;
+                            record_resilience_worker_poll_error(
+                                "recovery terminalization auditor",
+                                &error,
+                                &mut transient_storage_poll_failed,
+                            );
                         }
                     }
-                    Err(error) => {
-                        record_resilience_worker_poll_error(
-                            "recovery coordinator",
-                            &error,
-                            &mut transient_storage_poll_failed,
-                        );
+
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::RecoveryTerminalizationApply,
+                        pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationApply,
+                        retry_transient_storage_access(|| {
+                            this.process_due_recovery_terminalizations(now, 64)
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(count) => {
+                            more |= count >= 64;
+                            terminal_more |= count >= 64;
+                        }
+                        Err(error) => {
+                            round_failed = true;
+                            terminal_failed = true;
+                            record_resilience_worker_poll_error(
+                                "recovery terminalization outbox",
+                                &error,
+                                &mut transient_storage_poll_failed,
+                            );
+                        }
+                    }
+
+                    if !terminal_more && !terminal_failed {
+                        finished.insert(Family::Terminalization);
+                    } else if terminal_failed {
+                        work.retry(Family::Terminalization, now.saturating_add(2));
                     }
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                if !supervision_complete && work.ready(Family::Supervision) {
+                    let supervision = crate::database::attribution::scope_database_workload(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::RecoveryJobs,
+                        this.recovery_coordinator
+                            .run_supervision_quantum(round_cutoff, 64),
+                    )
+                    .await;
+                    supervision_complete = !supervision.has_more;
+                    supervision_failed |= !supervision.errors.is_empty();
+                    if supervision_complete && !supervision_failed {
+                        finished.insert(Family::Supervision);
+                    }
+                    more |= supervision.has_more;
+                    round_failed |= !supervision.errors.is_empty();
+                    // Keep the current finite pass and its unacknowledged
+                    // invalidations through row failures. Only retry from the
+                    // head after later pages have had their turn.
+                    if supervision_complete && supervision_failed {
+                        work.retry(Family::Supervision, now.saturating_add(2));
+                    }
+                    for error in supervision.errors {
+                        warn!(error, "recovery supervision phase failed");
+                    }
+                    for event in supervision.events {
+                        crate::database::attribution::scope_database_workload(
+                            pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                            pioneer_observability::DatabaseOperationSite::RecoveryEventApply,
+                            this.handle_recovery_event(event, now),
+                        )
+                        .await;
+                    }
+                }
+                if !cli_stale_complete && work.ready(Family::Cli) {
+                    let stale = crate::database::attribution::scope_database_workload(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::StaleCliTurnFailure,
+                        this.fail_stale_cli_runtime_turns(
+                            now_timestamp_millis(),
+                            &mut cli_runtime_stale_turn_scan,
+                        ),
+                    )
+                    .await;
+                    for (turn_id, transition) in stale.deferred_transitions {
+                        work.defer_cli_transition(turn_id, transition, now);
+                    }
+                    cli_stale_complete = !stale.has_more && !stale.failed;
+                    if cli_stale_complete {
+                        finished.insert(Family::Cli);
+                    }
+                    more |= stale.has_more;
+                    round_failed |= stale.failed;
+                    if stale.failed {
+                        work.retry(Family::Cli, now.saturating_add(2));
+                    }
+                }
+                for family in finished {
+                    if !work.ready(family) {
+                        // A later operation in the same phase may have parked
+                        // an error retry. Do not replace it with a success head.
+                        continue;
+                    }
+                    let head = async {
+                        if family == Family::Cli {
+                            let (per_turn, next, overflow) =
+                                this.capture_cli_background_deadlines(now).await?;
+                            work.cli_snapshot(per_turn, next, overflow);
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        let mut next = match family {
+                            Family::Commands => {
+                                this.cli_runtime_command_heartbeats.next_deadline().await
+                            }
+                            Family::Buffers => this.next_cli_buffer_deadline(now).await,
+                            _ => {
+                                maintenance
+                                    .crud_store
+                                    .next_gateway_control_deadline_for(&family.wake(), round_cutoff)
+                                    .await?
+                            }
+                        };
+                        if family == Family::Skills {
+                            next = next
+                                .into_iter()
+                                .chain(
+                                    maintenance
+                                        .next_skill_cleanup_deadline(round_cutoff)
+                                        .await?,
+                                )
+                                .min();
+                        }
+                        if family == Family::Supervision {
+                            next = next
+                                .into_iter()
+                                .chain(
+                                    this.recovery_coordinator
+                                        .next_supervision_deadline(round_cutoff)
+                                        .await?,
+                                )
+                                .min();
+                        }
+                        work.finish(family, next);
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(error) = head {
+                        warn!(error = %error, "control family head failed");
+                        round_failed = true;
+                        work.retry(family, now.saturating_add(2));
+                    }
+                }
+                if command_rehydration_pending
+                    && command_rehydration_retry.is_some_and(|at| at > now)
+                {
+                    let next = command_rehydration_retry
+                        .into_iter()
+                        .chain(this.cli_runtime_command_heartbeats.next_deadline().await)
+                        .min();
+                    work.finish(Family::Commands, next);
+                }
+                more |= work.has_work();
+                round_failed |= transient_storage_poll_failed;
+                if more {
+                    let retry_delay = round_failed;
+                    // Queue drains can remain runnable forever. They must not
+                    // pin the cutoff or keep completed discovery phases idle.
+                    // Finish the finite sweep before acknowledging changes so
+                    // a mutation behind any live cursor is rediscovered from
+                    // the head on the next round, even with a busy outbox.
+                    begin_round = (ledger_complete || !work.ready(Family::Ledger))
+                        && (timeout_complete || !work.ready(Family::Timeouts))
+                        && (supervision_complete || !work.ready(Family::Supervision))
+                        && (cli_stale_complete || !work.ready(Family::Cli))
+                        && work.turns.is_empty()
+                        && (command_rehydration_after.is_none()
+                            || command_rehydration_retry.is_some());
+                    if begin_round {
+                        round_failed = false;
+                    }
+                    drop(maintenance);
+                    drop(this);
+                    if retry_delay {
+                        sleep(Duration::from_secs(2)).await;
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
                     continue;
                 }
 
-                crate::database::attribution::scope_database_workload(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    this.fail_stale_cli_runtime_turns(
-                        now_timestamp_millis(),
-                        &mut cli_runtime_stale_turn_scan,
-                    ),
-                )
-                .await;
-
-                sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+                let mut deadline = next_native_terminal_effect_recovery
+                    .into_iter()
+                    .chain(work.deadline())
+                    .min();
+                deadline = deadline.into_iter().chain(command_rehydration_retry).min();
+                if round_failed {
+                    // A failed mutation can itself leave a retained UNKNOWN
+                    // signal. Back off without consuming it; selecting that
+                    // signal here would bypass the error delay indefinitely.
+                    drop(maintenance);
+                    drop(this);
+                    sleep(Duration::from_secs(2)).await;
+                    begin_round = true;
+                    round_failed = false;
+                    continue;
+                }
+                #[cfg(test)]
+                this.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__control_before_wait__",
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
+                drop(maintenance);
+                drop(this);
+                // Keep all cursors and subscriptions unacknowledged across
+                // portions. A retained mutation starts a fresh complete sweep.
+                tokio::select! {
+                    _ = control_changes.wait(deadline) => {},
+                    _ = cli_changes.changed() => {},
+                    _ = work.wait_cli_transition_retry() => {},
+                    _ = native_retry_changes.changed() => {
+                        next_native_terminal_effect_recovery = Some(0);
+                    },
+                }
+                begin_round = true;
+                round_failed = false;
             }
         };
+        let shutdown = self.cli_history_shutdown.clone();
         let handle = tokio::spawn(async move {
             tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => {},
+                _ = shutdown.cancelled() => {},
                 _ = worker => {},
             }
         });
@@ -3221,7 +4065,19 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn shutdown_resilience_workers(&self) {
-        self.cli_history_shutdown.cancel();
+        self.session_manager.stop_thread_replays().await;
+        self.foreground_starts.shutdown().await;
+        self.cancel_cli_history_work().await;
+        {
+            let workers = &self.native_turn_event_delivery_workers;
+            let _admission = workers
+                .admission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            workers.shutdown.cancel();
+            workers.tasks.close();
+        }
+        self.native_turn_event_delivery_workers.tasks.wait().await;
         for worker in [
             &self.resilience_worker,
             &self.task_event_listener_worker,
@@ -3236,6 +4092,143 @@ impl MessageProcessor {
         self.task_runtime.shutdown().await;
     }
 
+    async fn cancel_cli_history_work(&self) {
+        {
+            // The same admission lock protects the shutdown check and spawn
+            // in the compaction owner. Once cancelled, no new job can enter.
+            let _admission = self.completed_history_checks.lock().await;
+            self.cli_history_shutdown.cancel();
+        }
+    }
+
+    async fn absorb_control_hints(
+        &self,
+        work: &mut control_work::ControlWork,
+        keys: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        use pioneer_crud::GatewayControlWake as Wake;
+        let Some(keys) = keys else {
+            work.full();
+            return Ok(());
+        };
+        for key in keys {
+            match Wake::from_key(&key) {
+                Some(Wake::Thread(runtime, thread)) => {
+                    let bindings = self
+                        .crud_store
+                        .list_cli_runtime_turn_binding_controls(
+                            pioneer_crud::CliRuntimeTurnBindingListFilter {
+                                runtime_id: Some(runtime),
+                                continuation_thread_id: Some(thread),
+                                statuses: vec!["starting".into(), "running".into()],
+                                limit: Some(257),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    if bindings.len() > 256 {
+                        work.wake(Wake::Cli);
+                    } else {
+                        for binding in bindings {
+                            work.turn(binding.turn_id, true);
+                        }
+                    }
+                }
+                Some(Wake::Request(id)) => {
+                    if let Some(request) =
+                        self.crud_store.get_cli_runtime_pending_request(&id).await?
+                        && let Some(turn_id) = request.turn_id
+                    {
+                        work.turn(turn_id, false);
+                    }
+                }
+                Some(Wake::Attempt(id)) => {
+                    if let Some(attempt) = self.crud_store.get_cli_runtime_turn_attempt(&id).await?
+                    {
+                        work.turn(attempt.turn_id, true);
+                    }
+                }
+                Some(Wake::Native(runtime, native)) => {
+                    if let Some(owner) = self
+                        .crud_store
+                        .resolve_cli_runtime_native_turn_control_owner(&runtime, &native)
+                        .await?
+                    {
+                        work.turn(owner.binding.turn_id, true);
+                    }
+                }
+                Some(wake) => work.wake(wake),
+                None => work.full(),
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_control_turn(
+        &self,
+        turn_id: &str,
+        pass: &mut control_work::TurnPass,
+        now: i64,
+    ) -> anyhow::Result<(bool, Option<control_work::CliTurnReadiness>)> {
+        if pass.commands {
+            if pass.command_upper.is_none() {
+                pass.command_upper = Some(
+                    self.crud_store
+                        .running_turn_item_attempt_upper_id_by_type(TurnItemType::CommandExecution)
+                        .await?
+                        .unwrap_or_default(),
+                );
+            }
+            let (_, next, failed) = self
+                .rehydrate_cli_runtime_command_items_for_turn(
+                    turn_id,
+                    None,
+                    pass.command_after.as_deref(),
+                    pass.command_upper.as_deref().unwrap_or_default(),
+                    64,
+                )
+                .await?;
+            pass.command_failed |= failed;
+            pass.command_after = next;
+            pass.commands = pass.command_after.is_some();
+            if !pass.commands && pass.command_failed {
+                // Restore later owners before retrying a failed row. Timeout
+                // polling stays gated until all command owners are restored.
+                pass.commands = true;
+                pass.command_failed = false;
+                pass.command_upper = None;
+                anyhow::bail!("CLI command owner reconciliation failed");
+            }
+        }
+        if pass.commands {
+            return Ok((false, None));
+        }
+        self.heartbeat_due_cli_runtime_command_items(now).await;
+        let cli_deadline = if !pass.cli_done {
+            let next = self
+                .refresh_cli_control_turn(turn_id, now, pass.check_state)
+                .await?;
+            pass.cli_done = true;
+            Some(next)
+        } else {
+            None
+        };
+        if !pass.timeout_done {
+            let (candidates, next) = self
+                .poll_timeout_candidate_page_for_turn(turn_id, now, 64, pass.timeout_after.as_ref())
+                .await?;
+            for candidate in candidates {
+                self.handle_timeout_candidate(candidate, now).await;
+            }
+            pass.timeout_after = next;
+            pass.timeout_done = pass.timeout_after.is_none();
+        }
+        Ok((
+            pass.cli_done && pass.timeout_done && !pass.commands,
+            cli_deadline,
+        ))
+    }
+
     async fn update_cli_runtime_command_item_registry(
         &self,
         instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
@@ -3245,6 +4238,15 @@ impl MessageProcessor {
         self.cli_runtime_command_heartbeats
             .update_from_runtime_event(instance, turn_binding, event, now_timestamp_secs())
             .await;
+        if matches!(event, RuntimeEvent::ItemStarted(started) if crate::cli_runtime::command_heartbeat::is_command_execution_kind(&started.item_kind))
+            || matches!(event, RuntimeEvent::ItemCompleted(completed) if crate::cli_runtime::command_heartbeat::is_command_execution_kind(&completed.item_kind))
+            || event.turn_terminal_kind().is_some()
+        {
+            self.crud_store
+                .database_connection()
+                .work_signal("gateway.control")
+                .notify_keys(&[pioneer_crud::GatewayControlWake::Commands.key()]);
+        }
     }
 
     async fn detach_cli_runtime_command_observer(
@@ -3254,37 +4256,96 @@ impl MessageProcessor {
         self.cli_runtime_command_heartbeats
             .detach_observer(instance)
             .await;
+        self.crud_store
+            .database_connection()
+            .work_signal("gateway.control")
+            .notify_keys(&[pioneer_crud::GatewayControlWake::Commands.key()]);
     }
 
     async fn rehydrate_cli_runtime_command_items(
         &self,
         observer: Option<&crate::cli_runtime::session_instance::CliSessionInstanceId>,
+        after_id: Option<&str>,
         limit: u64,
-    ) -> usize {
-        let attempts = match self
+    ) -> anyhow::Result<(usize, Option<String>, bool)> {
+        let upper = self
             .crud_store
-            .list_running_turn_item_attempts_by_type(TurnItemType::CommandExecution, limit)
+            .running_turn_item_attempt_upper_id_by_type(TurnItemType::CommandExecution)
+            .await?
+            .unwrap_or_default();
+        self.rehydrate_cli_runtime_command_items_bounded(observer, after_id, &upper, limit)
             .await
-        {
-            Ok(attempts) => attempts,
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "failed to load durable CLI runtime command supervision candidates"
-                );
-                return 0;
-            }
+    }
+
+    async fn rehydrate_cli_runtime_command_items_bounded(
+        &self,
+        observer: Option<&crate::cli_runtime::session_instance::CliSessionInstanceId>,
+        after_id: Option<&str>,
+        upper_id: &str,
+        limit: u64,
+    ) -> anyhow::Result<(usize, Option<String>, bool)> {
+        self.rehydrate_cli_runtime_command_items_scoped(None, observer, after_id, upper_id, limit)
+            .await
+    }
+
+    async fn rehydrate_cli_runtime_command_items_for_turn(
+        &self,
+        turn_id: &str,
+        observer: Option<&crate::cli_runtime::session_instance::CliSessionInstanceId>,
+        after_id: Option<&str>,
+        upper_id: &str,
+        limit: u64,
+    ) -> anyhow::Result<(usize, Option<String>, bool)> {
+        self.rehydrate_cli_runtime_command_items_scoped(
+            Some(turn_id),
+            observer,
+            after_id,
+            upper_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn rehydrate_cli_runtime_command_items_scoped(
+        &self,
+        turn_id: Option<&str>,
+        observer: Option<&crate::cli_runtime::session_instance::CliSessionInstanceId>,
+        after_id: Option<&str>,
+        upper_id: &str,
+        limit: u64,
+    ) -> anyhow::Result<(usize, Option<String>, bool)> {
+        let (attempts, next) = if let Some(turn_id) = turn_id {
+            self.crud_store
+                .list_running_turn_item_attempt_page_by_type_bounded_for_turn(
+                    turn_id,
+                    TurnItemType::CommandExecution,
+                    after_id,
+                    upper_id,
+                    limit,
+                )
+                .await?
+        } else {
+            self.crud_store
+                .list_running_turn_item_attempt_page_by_type_bounded(
+                    TurnItemType::CommandExecution,
+                    after_id,
+                    upper_id,
+                    limit,
+                )
+                .await?
         };
+        let mut failed = false;
         let mut restored = 0usize;
         for attempt in attempts {
             let binding = match self
                 .crud_store
-                .get_cli_runtime_turn_binding(attempt.turn_id.as_str())
+                .get_cli_runtime_turn_binding_control(attempt.turn_id.as_str())
                 .await
             {
                 Ok(Some(binding)) => binding,
                 Ok(None) => continue,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = attempt.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3316,6 +4377,7 @@ impl MessageProcessor {
                 Ok(Some(owner_attempt)) if owner_attempt.status.is_active() => owner_attempt,
                 Ok(_) => continue,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = binding.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3337,6 +4399,7 @@ impl MessageProcessor {
             {
                 Ok(segment) => segment,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = binding.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3355,7 +4418,7 @@ impl MessageProcessor {
             };
             let owner = match self
                 .crud_store
-                .resolve_cli_runtime_native_turn_owner(
+                .resolve_cli_runtime_native_turn_control_owner(
                     binding.runtime_id.as_str(),
                     native_turn_id.as_str(),
                 )
@@ -3364,6 +4427,7 @@ impl MessageProcessor {
                 Ok(Some(owner)) => owner,
                 Ok(None) => continue,
                 Err(error) => {
+                    failed = true;
                     warn!(
                         turn_id = binding.turn_id.as_str(),
                         item_id = attempt.item_id.as_str(),
@@ -3412,17 +4476,10 @@ impl MessageProcessor {
                 .await;
             restored = restored.saturating_add(1);
         }
-        restored
+        Ok((restored, next, failed))
     }
 
     async fn heartbeat_due_cli_runtime_command_items(&self, now_unix: i64) -> usize {
-        if self
-            .cli_runtime_command_heartbeats
-            .should_rehydrate(now_unix, CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS)
-            .await
-        {
-            self.rehydrate_cli_runtime_command_items(None, 1_024).await;
-        }
         let due = self
             .cli_runtime_command_heartbeats
             .due_items(now_unix)
@@ -3432,7 +4489,7 @@ impl MessageProcessor {
             let key = item.key.clone();
             let owner = match self
                 .crud_store
-                .resolve_cli_runtime_native_turn_owner(
+                .resolve_cli_runtime_native_turn_control_owner(
                     key.runtime_id.as_str(),
                     item.native_turn_id(),
                 )
@@ -3603,6 +4660,8 @@ impl MessageProcessor {
         }
 
         let processor = Arc::downgrade(self);
+        let database = self.crud_store.database_connection().maintenance();
+        let mut changes = database.work_signal("hooks").subscribe();
         let handle = tokio::spawn(async move {
             let mut first_pass = true;
             loop {
@@ -3611,27 +4670,65 @@ impl MessageProcessor {
                 };
                 let this = this.for_background_reconciliation();
                 let config = this.hook_recovery_config.read().await.clone();
-                if config.enabled && (!first_pass || config.startup_scan) {
-                    crate::database::attribution::scope_database_workload(
-                        pioneer_observability::DatabaseWorkload::HookRecovery,
-                        this.run_hook_recovery_pass(config.clone()),
-                    )
-                    .await;
+                let result: anyhow::Result<Option<i64>> = async {
+                    changes.begin_pass(&database).await?;
+                    if !config.enabled {
+                        return Ok(None);
+                    }
+                    if !this
+                        .hook_runtime
+                        .read()
+                        .await
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.has_run_store())
+                    {
+                        return Ok(None);
+                    }
+                    if !first_pass || config.startup_scan {
+                        crate::database::attribution::scope_database_workload_result(
+                            pioneer_observability::DatabaseWorkload::HookRecovery,
+                            pioneer_observability::DatabaseOperationSite::HookRecovery,
+                            this.run_hook_recovery_pass(config.clone()),
+                        )
+                        .await?;
+                    }
+                    let deadline = this
+                        .crud_store
+                        .next_hook_recovery_deadline(config.stale_running_after_ms)
+                        .await?;
+                    Ok(deadline)
                 }
+                .await;
                 first_pass = false;
-                sleep(Duration::from_millis(config.poll_interval_ms.max(250))).await;
+                drop(this);
+                match result {
+                    Ok(Some(at)) if at <= now_timestamp_secs() => {
+                        // A persisted due head can include a swallowed per-run
+                        // store error. Back off before accepting its own wake.
+                        sleep(Duration::from_millis(config.poll_interval_ms.max(250))).await;
+                    }
+                    Ok(deadline) => changes.wait(deadline).await,
+                    Err(error) => {
+                        error!(error = %error, "hook recovery pass failed");
+                        sleep(Duration::from_millis(config.poll_interval_ms.max(250))).await;
+                    }
+                }
+                tokio::task::yield_now().await;
             }
         });
 
         *guard = Some(handle);
     }
 
-    async fn run_hook_recovery_pass(&self, config: GatewayHookRecoveryConfig) {
+    async fn run_hook_recovery_pass(
+        &self,
+        config: GatewayHookRecoveryConfig,
+    ) -> anyhow::Result<()> {
         let Some(runtime) = self.hook_runtime.read().await.clone() else {
-            return;
+            return Ok(());
         };
         if !runtime.has_run_store() {
-            return;
+            return Ok(());
         }
         let runtime = GatewayHookRuntimeBuilder::from_runtime(self.crud_store.clone(), &runtime)
             .with_crud_run_store()
@@ -3665,9 +4762,10 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
-                error!(error = %format!("{error:#}"), "hook recovery pass failed");
+                return Err(anyhow::anyhow!("{error:#}"));
             }
         }
+        Ok(())
     }
 
     async fn start_task_event_listener(self: &Arc<Self>) {
@@ -3676,56 +4774,37 @@ impl MessageProcessor {
             return;
         }
         let processor = Arc::downgrade(self);
-        let mut subscription = self
-            .task_runtime
-            .event_bus()
-            .subscribe(pioneer_tasks::TaskEventFilter::default());
+        let database = self.crud_store.database_connection().maintenance();
+        let mut changes = database.work_signal("tasks.fanout").subscribe();
         *guard = Some(tokio::spawn(async move {
-            let mut bus_open = true;
-            let mut periodic = interval(Duration::from_secs(5));
-            periodic.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
-                // The bus is only a wake. This owned dispatcher is the sole
-                // emitter, so even slow Tasks cannot acquire competing lanes.
-                tokio::select! {
-                    delivery=subscription.recv(),if bus_open=>match delivery {
-                        pioneer_tasks::TaskEventWakeDelivery::Wake(_)=>{},
-                        pioneer_tasks::TaskEventWakeDelivery::Lagged(count)=>warn!(missed_wakes=count,"task fanout wake bus lagged"),
-                        pioneer_tasks::TaskEventWakeDelivery::Closed=>bus_open=false,
-                    },
-                    _=periodic.tick()=>{},
-                }
                 let Some(this) = processor.upgrade() else {
                     break;
                 };
-                let result = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::TaskEventFanout,
-                    this.for_background_reconciliation()
-                        .task_event_fanout_quantum(),
-                )
+                let this = this.for_background_reconciliation();
+                let result: anyhow::Result<Option<i64>> = async {
+                    changes.begin_pass(&database).await?;
+                    let summary = crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::TaskEventFanout,
+                        pioneer_observability::DatabaseOperationSite::TaskEventFanout,
+                        this.task_event_fanout_quantum(),
+                    )
+                    .await?;
+                    anyhow::ensure!(summary.errors == 0, "task fanout quantum incomplete");
+                    // Remaining tickets (including a full last page) retain a
+                    // due timestamp; reaching the quantum budget is not EOF.
+                    this.crud_store.next_task_event_fanout_deadline().await
+                }
                 .await;
+                drop(this);
                 match result {
-                    Ok(summary) => {
-                        debug!(selected=summary.selected,event_inputs=summary.event_inputs,emitted=summary.emitted,errors=summary.errors,pending=?summary.pending,"task fanout quantum completed");
-                        if summary.errors > 0 {
-                            // Storage/claim failures cannot spin via a hot bus.
-                            // Sleep owns no DB resources; cancellation aborts it.
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                        }
-                    }
+                    Ok(deadline) => changes.wait(deadline).await,
                     Err(error) => {
-                        warn!(
-                            failure_class =
-                                if reconciliation_diagnostics::is_storage_failure(&error) {
-                                    "storage"
-                                } else {
-                                    "candidate"
-                                },
-                            "task fanout discovery failed"
-                        );
+                        warn!(error = %error, "task fanout discovery failed");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
+                tokio::task::yield_now().await;
             }
         }));
     }
@@ -3748,6 +4827,7 @@ impl MessageProcessor {
             .due_task_event_fanout(clock(), TASK_EVENT_FANOUT_TASK_BUDGET)
             .await?;
         let mut summary = TaskEventFanoutSummary {
+            #[cfg(test)]
             selected: candidates.len(),
             ..Default::default()
         };
@@ -3929,9 +5009,12 @@ impl MessageProcessor {
         self.skills_write_lock.clone().lock_owned().await
     }
 
-    pub(crate) async fn install_one_cli_runtime_skill(
+    pub(crate) async fn install_one_cli_runtime_skill<
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    >(
         &self,
         plan: &crate::cli_runtime::skills::CliRuntimeSkillInstallPlan,
+        before_replace: F,
     ) -> anyhow::Result<crate::cli_runtime::skills::CliRuntimeSkillInstallResult> {
         let candidates = self
             .external_runtime_receipt_conversion_candidates()
@@ -3941,6 +5024,7 @@ impl MessageProcessor {
             &self.skills_write_lock,
             candidates.as_slice(),
             plan,
+            before_replace,
         )
         .await
     }
@@ -4040,74 +5124,6 @@ fn first_user_text(input: &[pioneer_protocol::UserInput]) -> Option<String> {
         }
         _ => None,
     })
-}
-
-#[cfg(test)]
-fn user_message_payload_from_input(
-    input: &[pioneer_protocol::UserInput],
-) -> Option<(String, Vec<pioneer_protocol::UserMessageAttachment>)> {
-    let mut text_parts = Vec::new();
-    let mut attachments = Vec::new();
-
-    for value in input {
-        match value {
-            pioneer_protocol::UserInput::Text { text, .. } => {
-                let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                if !normalized.is_empty() {
-                    text_parts.push(normalized);
-                }
-            }
-            pioneer_protocol::UserInput::Image { url } => {
-                attachments
-                    .push(pioneer_protocol::UserMessageAttachment::Image { url: url.clone() });
-            }
-            pioneer_protocol::UserInput::LocalImage { path } => {
-                attachments.push(pioneer_protocol::UserMessageAttachment::LocalImage {
-                    path: path.clone(),
-                });
-            }
-            pioneer_protocol::UserInput::File { url } => {
-                attachments
-                    .push(pioneer_protocol::UserMessageAttachment::File { url: url.clone() });
-            }
-            pioneer_protocol::UserInput::LocalFile { path } => {
-                attachments.push(pioneer_protocol::UserMessageAttachment::LocalFile {
-                    path: path.clone(),
-                });
-            }
-            pioneer_protocol::UserInput::Audio { url } => {
-                attachments
-                    .push(pioneer_protocol::UserMessageAttachment::Audio { url: url.clone() });
-            }
-            pioneer_protocol::UserInput::LocalAudio { path } => {
-                attachments.push(pioneer_protocol::UserMessageAttachment::LocalAudio {
-                    path: path.clone(),
-                });
-            }
-            pioneer_protocol::UserInput::Video { url } => {
-                attachments
-                    .push(pioneer_protocol::UserMessageAttachment::Video { url: url.clone() });
-            }
-            pioneer_protocol::UserInput::LocalVideo { path } => {
-                attachments.push(pioneer_protocol::UserMessageAttachment::LocalVideo {
-                    path: path.clone(),
-                });
-            }
-            pioneer_protocol::UserInput::Mention { name, .. } => {
-                text_parts.push(format!("mention: {name}"));
-            }
-            pioneer_protocol::UserInput::Artifact { artifact_id, .. } => {
-                text_parts.push(format!("artifact: {artifact_id}"));
-            }
-        }
-    }
-
-    let text = text_parts.join("\n");
-    if text.is_empty() && attachments.is_empty() {
-        None
-    } else {
-        Some((text, attachments))
-    }
 }
 
 impl MessageProcessor {
@@ -4725,7 +5741,6 @@ impl MessageProcessor {
         ));
         let normalized_tool_loop_config = ToolLoopConfig {
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-            preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: pioneer_tools::WebToolsConfig {
                 default_timeout_ms: web.default_timeout_ms,
                 hard_max_timeout_ms: web.hard_max_timeout_ms,
@@ -4746,7 +5761,6 @@ impl MessageProcessor {
             },
             computer_use: pioneer_tools::ComputerUseToolsConfig {
                 runtime_home_dir: std::env::temp_dir().join("pioneer-message-tests"),
-                artifacts_subdir: "tools/computer_use".to_owned(),
                 ..pioneer_tools::ComputerUseToolsConfig::default()
             },
             skills: pioneer_agent::SkillsLoopConfig {
@@ -4796,18 +5810,13 @@ impl MessageProcessor {
                     allow_function_proxy_tools: true,
                 },
             },
-            memory: pioneer_memory::hooks::MemoryLoopConfig {
-                active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
-                    mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
-                    ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
-                },
-                ..pioneer_memory::hooks::MemoryLoopConfig::default()
-            },
+            memory: pioneer_memory::hooks::MemoryLoopConfig::default(),
             budget: pioneer_tools::ToolLoopBudgetConfig::default(),
             execution_windows: pioneer_tools::ExecutionWindowsConfig::default(),
             retry: pioneer_tools::ToolRetryBudgetConfig::default(),
         }
         .normalized();
+        let plugin_mutation_locks = Arc::new(Mutex::new(HashMap::new()));
         let recovery_coordinator = Arc::new(
             RecoveryCoordinator::new(
                 crud_store.clone(),
@@ -4816,16 +5825,17 @@ impl MessageProcessor {
                 RecoveryPolicyRegistry::default(),
                 normalized_tool_loop_config.clone(),
             )
+            .with_plugin_launch_locks(plugin_mutation_locks.clone())
             .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
             .with_execution_leases(execution_leases.clone())
             .with_turn_execution_owner_id(turn_execution_owner_id.clone()),
         );
         let memory_loop_config =
             Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
-        let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
-            Arc::new(MemvidThreadEpisodicBackend::new());
-        let thread_episodic_storage_root =
-            isolated_test_thread_episodic_storage_root(&artifact_runtime_home);
+        let thread_episodic_backend: Arc<dyn ThreadEpisodicSearchBackend> =
+            Arc::new(SqliteThreadEpisodicBackend::new(crud_store.clone()));
+        let thread_episodic_lock_root =
+            isolated_test_thread_episodic_lock_root(&artifact_runtime_home);
         let thread_episodic_embedding_provider_resolver = Arc::new(
             ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
                 provider_registry.clone(),
@@ -4842,16 +5852,13 @@ impl MessageProcessor {
                 Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                     Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
                         maintenance_crud_store.clone(),
-                        thread_episodic_storage_uri_from_path(
-                            thread_episodic_storage_root.as_path(),
-                        ),
                     )),
                     thread_episodic_embedding_provider_resolver.clone(),
                     maintenance_crud_store,
                 )),
             )
             .with_projection_runtime(
-                thread_episodic_storage_root.clone(),
+                thread_episodic_lock_root.clone(),
                 thread_episodic_embedding_provider_resolver.clone(),
                 thread_episodic_workspace_refill_supervisor.clone(),
             ),
@@ -4872,10 +5879,15 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            push_scopes: Arc::new(scoped_push::PushScopes::default()),
             authorization_invalidation_hub,
             execution_leases,
             observation_governor,
             turn_execution_owner_id,
+            foreground_starts: Arc::new(Default::default()),
+            pending_delivery_order: Arc::default(),
+            #[cfg(test)]
+            execution_auth_fault: Arc::default(),
             artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
@@ -4887,16 +5899,21 @@ impl MessageProcessor {
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
+            gateway_listen_addr: Arc::new(std::sync::RwLock::new(None)),
             invitation_gateway_base_url: Arc::new(
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            task_child_point_cursor: Arc::new(Mutex::new(Default::default())),
+            task_child_scope_cursor: Arc::new(Mutex::new(Default::default())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             turn_execution_heartbeat_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            recovery_due_wait_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -4911,6 +5928,8 @@ impl MessageProcessor {
             task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            context_compaction_config: GatewayContextCompactionConfig::default(),
+            compaction_clock: Arc::new(crate::compaction::SystemCompactionClock::default()),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
@@ -4948,6 +5967,10 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            markdown_delta_parse_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            progress_item_type_lookup_count: Arc::new(AtomicU64::new(0)),
             progress_items: Arc::new(Mutex::new(ProgressItemRegistry::default())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -4974,7 +5997,7 @@ impl MessageProcessor {
             turn_final_assistant_texts: Arc::new(Mutex::new(HashMap::new())),
             native_permission_pending_requests: Arc::new(Mutex::new(HashMap::new())),
             native_permission_approval_worker: Arc::new(Mutex::new(None)),
-            artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
+            artifact_finalization_retry_turns: Arc::new(Mutex::new(HashMap::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             thread_title_publication_mutexes: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -4983,7 +6006,7 @@ impl MessageProcessor {
             thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
-            native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
+            native_turn_event_delivery_workers: Arc::new(Default::default()),
             native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
             native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
             native_lifecycle_readiness: Arc::new(
@@ -5003,6 +6026,9 @@ impl MessageProcessor {
             mcp_snapshot_version,
             mcp_service,
             skills_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            plugin_mutation_locks,
+            app_runtime: Arc::new(apps::runtime::AppRuntime::default()),
+            host_api: Arc::new(crate::host_api::HostApi::default()),
             cli_runtime_skill_destination_locks: new_cli_runtime_skill_destination_locks(),
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
@@ -5018,7 +6044,7 @@ impl MessageProcessor {
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
             keepawake: Arc::new(GatewayKeepAwake::default()),
             artifact_runtime_home,
-            thread_episodic_storage_root,
+            thread_episodic_lock_root,
             artifact_service,
             artifact_uploads,
             thread_episodic_ingestor: Arc::new(RwLock::new(Arc::new(

@@ -835,23 +835,6 @@ mod tests {
     }
 
     #[test]
-    fn no_retry_for_success() {
-        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
-        let decision = controller.decide(&[ToolRetryObservation::from_tool_outcome(
-            "item_read_file",
-            "command_execution",
-            1,
-            "read_file",
-            "{}",
-            true,
-            ToolOutcome::ok(),
-        )]);
-
-        assert!(matches!(decision, ToolRetryDecision::None { ref drafts } if drafts.is_empty()));
-        assert!(controller.state_snapshot().active_episode.is_none());
-    }
-
-    #[test]
     fn retry_for_recoverable_result_consumes_budget_once() {
         let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
         let decision = controller.decide(&[observation(
@@ -946,35 +929,6 @@ mod tests {
             panic!("expected retry prompt");
         };
         assert_eq!(entries[0].retry_hint, "recovery view hint");
-    }
-
-    #[test]
-    fn no_retry_for_fatal_result() {
-        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
-        let decision = controller.decide(&[observation(
-            "exec_command",
-            "{}",
-            ToolOutcome::fatal(
-                ToolErrorClass::Internal,
-                Some("internal failure".to_owned()),
-            ),
-        )]);
-
-        assert!(matches!(decision, ToolRetryDecision::None { ref drafts } if drafts.is_empty()));
-        assert!(controller.state_snapshot().active_episode.is_none());
-    }
-
-    #[test]
-    fn permission_denied_never_enters_the_global_retry_episode() {
-        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
-        let decision = controller.decide(&[observation(
-            "read_file",
-            r#"{"path":"/restricted"}"#,
-            recoverable(ToolErrorClass::PermissionDenied),
-        )]);
-
-        assert!(matches!(decision, ToolRetryDecision::None { ref drafts } if drafts.is_empty()));
-        assert!(controller.state_snapshot().active_episode.is_none());
     }
 
     #[test]
@@ -1183,88 +1137,6 @@ mod tests {
     }
 
     #[test]
-    fn retry_episode_resets_after_success() {
-        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig {
-            max_recoverable_retry_rounds_per_episode: 1,
-            max_same_tool_error_retries_per_episode: 1,
-            max_retries_per_tool_name_per_episode: 1,
-        });
-
-        let first = controller.decide(&[observation(
-            "web_fetch",
-            r#"{"url":"https://example.com"}"#,
-            recoverable(ToolErrorClass::ExecutionFailed),
-        )]);
-        assert!(matches!(first, ToolRetryDecision::Retry { .. }));
-        assert_eq!(active_episode(&controller).total_retry_rounds, 1);
-
-        let success = controller.decide(&[ToolRetryObservation::from_tool_outcome(
-            "item_web_fetch_success",
-            "web_fetch",
-            1,
-            "web_fetch",
-            r#"{"url":"https://example.com"}"#,
-            true,
-            ToolOutcome::ok(),
-        )]);
-        assert!(matches!(
-            success,
-            ToolRetryDecision::None {
-                drafts: ref succeeded
-            } if matches!(succeeded.as_slice(), [ToolRetryEventDraft::Resolved { entries, .. }] if entries.len() == 1 && entries[0].resolution == ToolRetryResolution::Succeeded)
-        ));
-        assert!(controller.state_snapshot().active_episode.is_none());
-
-        let next_failure = controller.decide(&[observation(
-            "web_fetch",
-            r#"{"url":"https://example.com"}"#,
-            recoverable(ToolErrorClass::ExecutionFailed),
-        )]);
-        assert!(matches!(next_failure, ToolRetryDecision::Retry { .. }));
-        assert_eq!(active_episode(&controller).total_retry_rounds, 1);
-    }
-
-    #[test]
-    fn retry_episode_resets_after_non_retryable_resolution() {
-        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig {
-            max_recoverable_retry_rounds_per_episode: 1,
-            max_same_tool_error_retries_per_episode: 1,
-            max_retries_per_tool_name_per_episode: 1,
-        });
-
-        let first = controller.decide(&[observation(
-            "web_fetch",
-            r#"{"url":"https://example.com"}"#,
-            recoverable(ToolErrorClass::ExecutionFailed),
-        )]);
-        assert!(matches!(first, ToolRetryDecision::Retry { .. }));
-
-        let fatal = controller.decide(&[observation(
-            "web_fetch",
-            r#"{"url":"https://example.com"}"#,
-            ToolOutcome::fatal(
-                ToolErrorClass::PermissionDenied,
-                Some("blocked by policy".to_owned()),
-            ),
-        )]);
-        assert!(matches!(
-            fatal,
-            ToolRetryDecision::None {
-                drafts: ref succeeded
-            } if matches!(succeeded.as_slice(), [ToolRetryEventDraft::Resolved { entries, .. }] if entries.len() == 1 && entries[0].resolution == ToolRetryResolution::NonRetryable)
-        ));
-        assert!(controller.state_snapshot().active_episode.is_none());
-
-        let next_failure = controller.decide(&[observation(
-            "web_fetch",
-            r#"{"url":"https://example.com"}"#,
-            recoverable(ToolErrorClass::ExecutionFailed),
-        )]);
-        assert!(matches!(next_failure, ToolRetryDecision::Retry { .. }));
-        assert_eq!(active_episode(&controller).total_retry_rounds, 1);
-    }
-
-    #[test]
     fn long_turn_same_tool_episode_resets_after_late_success() {
         let mut controller = ToolRetryController::with_class_budgets(
             ToolRetryBudgetConfig {
@@ -1350,5 +1222,114 @@ mod tests {
         assert_eq!(fresh_episode.total_retry_rounds, 1);
         assert_eq!(fresh_episode.by_tool_name.get("web_fetch"), Some(&1));
         assert_eq!(fresh_episode.by_failure_signature.len(), 1);
+    }
+
+    #[test]
+    fn non_retryable_observations_do_not_open_an_episode() {
+        let cases = [
+            (
+                "success",
+                ToolRetryObservation::from_tool_outcome(
+                    "item_read_file",
+                    "command_execution",
+                    1,
+                    "read_file",
+                    "{}",
+                    true,
+                    ToolOutcome::ok(),
+                ),
+            ),
+            (
+                "fatal",
+                observation(
+                    "exec_command",
+                    "{}",
+                    ToolOutcome::fatal(
+                        ToolErrorClass::Internal,
+                        Some("internal failure".to_owned()),
+                    ),
+                ),
+            ),
+            (
+                "permission denied",
+                observation(
+                    "read_file",
+                    r#"{"path":"/restricted"}"#,
+                    recoverable(ToolErrorClass::PermissionDenied),
+                ),
+            ),
+        ];
+        for (case, observation) in cases {
+            let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
+            let decision = controller.decide(&[observation]);
+            assert!(
+                matches!(decision, ToolRetryDecision::None { ref drafts } if drafts.is_empty()),
+                "{case}"
+            );
+            assert!(
+                controller.state_snapshot().active_episode.is_none(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_retry_episodes_restart_with_a_fresh_budget() {
+        for (resolution, expected_resolution) in [
+            (
+                ToolRetryObservation::from_tool_outcome(
+                    "item_web_fetch_success",
+                    "web_fetch",
+                    1,
+                    "web_fetch",
+                    r#"{"url":"https://example.com"}"#,
+                    true,
+                    ToolOutcome::ok(),
+                ),
+                ToolRetryResolution::Succeeded,
+            ),
+            (
+                observation(
+                    "web_fetch",
+                    r#"{"url":"https://example.com"}"#,
+                    ToolOutcome::fatal(
+                        ToolErrorClass::PermissionDenied,
+                        Some("blocked by policy".to_owned()),
+                    ),
+                ),
+                ToolRetryResolution::NonRetryable,
+            ),
+        ] {
+            let mut controller = ToolRetryController::new(ToolRetryBudgetConfig {
+                max_recoverable_retry_rounds_per_episode: 1,
+                max_same_tool_error_retries_per_episode: 1,
+                max_retries_per_tool_name_per_episode: 1,
+            });
+            let first = controller.decide(&[observation(
+                "web_fetch",
+                r#"{"url":"https://example.com"}"#,
+                recoverable(ToolErrorClass::ExecutionFailed),
+            )]);
+            assert!(matches!(first, ToolRetryDecision::Retry { .. }));
+            assert_eq!(active_episode(&controller).total_retry_rounds, 1);
+            let resolved = controller.decide(&[resolution]);
+            assert!(
+                matches!(
+                    resolved,
+                    ToolRetryDecision::None {
+                        drafts: ref succeeded
+                    } if matches!(succeeded.as_slice(), [ToolRetryEventDraft::Resolved { entries, .. }] if entries.len() == 1 && entries[0].resolution == expected_resolution)
+                ),
+                "{expected_resolution:?}"
+            );
+            assert!(controller.state_snapshot().active_episode.is_none());
+            let next_failure = controller.decide(&[observation(
+                "web_fetch",
+                r#"{"url":"https://example.com"}"#,
+                recoverable(ToolErrorClass::ExecutionFailed),
+            )]);
+            assert!(matches!(next_failure, ToolRetryDecision::Retry { .. }));
+            assert_eq!(active_episode(&controller).total_retry_rounds, 1);
+        }
     }
 }

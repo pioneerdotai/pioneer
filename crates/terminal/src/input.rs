@@ -263,170 +263,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_enter_key() {
-        let keystroke = Keystroke::parse("enter").unwrap();
-        let bytes = keystroke_to_bytes(&keystroke, TermMode::empty());
-        assert_eq!(bytes, Some(b"\r".to_vec()));
-    }
-
-    #[test]
-    fn test_escape_key() {
-        let keystroke = Keystroke::parse("escape").unwrap();
-        let bytes = keystroke_to_bytes(&keystroke, TermMode::empty());
-        assert_eq!(bytes, Some(b"\x1b".to_vec()));
-    }
-
-    #[test]
-    fn test_backspace_key() {
-        let keystroke = Keystroke::parse("backspace").unwrap();
-        let bytes = keystroke_to_bytes(&keystroke, TermMode::empty());
-        assert_eq!(bytes, Some(b"\x7f".to_vec()));
-    }
-
-    #[test]
-    fn test_tab_key() {
-        let keystroke = Keystroke::parse("tab").unwrap();
-        let bytes = keystroke_to_bytes(&keystroke, TermMode::empty());
-        assert_eq!(bytes, Some(b"\t".to_vec()));
-    }
-
-    #[test]
-    fn test_shift_tab() {
-        let keystroke = Keystroke::parse("shift-tab").unwrap();
-        let bytes = keystroke_to_bytes(&keystroke, TermMode::empty());
-        assert_eq!(bytes, Some(b"\x1b[Z".to_vec()));
-    }
-
-    #[test]
-    fn test_arrow_keys_normal_mode() {
-        let mode = TermMode::empty();
-
-        let up = Keystroke::parse("up").unwrap();
-        assert_eq!(keystroke_to_bytes(&up, mode), Some(b"\x1b[A".to_vec()));
-
-        let down = Keystroke::parse("down").unwrap();
-        assert_eq!(keystroke_to_bytes(&down, mode), Some(b"\x1b[B".to_vec()));
-
-        let right = Keystroke::parse("right").unwrap();
-        assert_eq!(keystroke_to_bytes(&right, mode), Some(b"\x1b[C".to_vec()));
-
-        let left = Keystroke::parse("left").unwrap();
-        assert_eq!(keystroke_to_bytes(&left, mode), Some(b"\x1b[D".to_vec()));
-    }
-
-    #[test]
-    fn test_arrow_keys_app_cursor_mode() {
-        let mode = TermMode::APP_CURSOR;
-
-        let up = Keystroke::parse("up").unwrap();
-        assert_eq!(keystroke_to_bytes(&up, mode), Some(b"\x1bOA".to_vec()));
-
-        let down = Keystroke::parse("down").unwrap();
-        assert_eq!(keystroke_to_bytes(&down, mode), Some(b"\x1bOB".to_vec()));
-
-        let right = Keystroke::parse("right").unwrap();
-        assert_eq!(keystroke_to_bytes(&right, mode), Some(b"\x1bOC".to_vec()));
-
-        let left = Keystroke::parse("left").unwrap();
-        assert_eq!(keystroke_to_bytes(&left, mode), Some(b"\x1bOD".to_vec()));
-    }
-
-    #[test]
-    fn test_navigation_keys() {
-        let mode = TermMode::empty();
-
-        let home = Keystroke::parse("home").unwrap();
-        assert_eq!(keystroke_to_bytes(&home, mode), Some(b"\x1b[H".to_vec()));
-
-        let end = Keystroke::parse("end").unwrap();
-        assert_eq!(keystroke_to_bytes(&end, mode), Some(b"\x1b[F".to_vec()));
-
-        let pageup = Keystroke::parse("pageup").unwrap();
-        assert_eq!(keystroke_to_bytes(&pageup, mode), Some(b"\x1b[5~".to_vec()));
-
-        let pagedown = Keystroke::parse("pagedown").unwrap();
-        assert_eq!(
-            keystroke_to_bytes(&pagedown, mode),
-            Some(b"\x1b[6~".to_vec())
-        );
-
-        let insert = Keystroke::parse("insert").unwrap();
-        assert_eq!(keystroke_to_bytes(&insert, mode), Some(b"\x1b[2~".to_vec()));
-
-        let delete = Keystroke::parse("delete").unwrap();
-        assert_eq!(keystroke_to_bytes(&delete, mode), Some(b"\x1b[3~".to_vec()));
-    }
-
-    #[test]
-    fn test_function_keys() {
-        let mode = TermMode::empty();
-
-        let f1 = Keystroke::parse("f1").unwrap();
-        assert_eq!(keystroke_to_bytes(&f1, mode), Some(b"\x1bOP".to_vec()));
-
-        let f2 = Keystroke::parse("f2").unwrap();
-        assert_eq!(keystroke_to_bytes(&f2, mode), Some(b"\x1bOQ".to_vec()));
-
-        let f5 = Keystroke::parse("f5").unwrap();
-        assert_eq!(keystroke_to_bytes(&f5, mode), Some(b"\x1b[15~".to_vec()));
-
-        let f12 = Keystroke::parse("f12").unwrap();
-        assert_eq!(keystroke_to_bytes(&f12, mode), Some(b"\x1b[24~".to_vec()));
-    }
-
-    #[test]
-    fn test_ctrl_combinations() {
-        let mode = TermMode::empty();
-
-        // Ctrl+A = 0x01
-        let ctrl_a = Keystroke::parse("ctrl-a").unwrap();
-        assert_eq!(keystroke_to_bytes(&ctrl_a, mode), Some(vec![0x01]));
-
-        // Ctrl+C = 0x03
-        let ctrl_c = Keystroke::parse("ctrl-c").unwrap();
-        assert_eq!(keystroke_to_bytes(&ctrl_c, mode), Some(vec![0x03]));
-
-        // Ctrl+Z = 0x1a
-        let ctrl_z = Keystroke::parse("ctrl-z").unwrap();
-        assert_eq!(keystroke_to_bytes(&ctrl_z, mode), Some(vec![0x1a]));
-
-        // Ctrl+Space = 0x00
-        let ctrl_space = Keystroke::parse("ctrl-space").unwrap();
-        assert_eq!(keystroke_to_bytes(&ctrl_space, mode), Some(vec![0x00]));
-    }
-
-    #[test]
-    fn test_alt_combinations() {
-        let mode = TermMode::empty();
-
-        // Alt+a sends ESC followed by 'a'
-        let alt_a = Keystroke::parse("alt-a").unwrap();
-        assert_eq!(keystroke_to_bytes(&alt_a, mode), Some(b"\x1ba".to_vec()));
-
-        // Alt+x sends ESC followed by 'x'
-        let alt_x = Keystroke::parse("alt-x").unwrap();
-        assert_eq!(keystroke_to_bytes(&alt_x, mode), Some(b"\x1bx".to_vec()));
-    }
-
-    #[test]
-    fn test_regular_characters() {
-        let mode = TermMode::empty();
-
-        let a = Keystroke::parse("a").unwrap();
-        assert_eq!(keystroke_to_bytes(&a, mode), Some(b"a".to_vec()));
-
-        let z = Keystroke::parse("z").unwrap();
-        assert_eq!(keystroke_to_bytes(&z, mode), Some(b"z".to_vec()));
-
-        let zero = Keystroke::parse("0").unwrap();
-        assert_eq!(keystroke_to_bytes(&zero, mode), Some(b"0".to_vec()));
-    }
-
-    #[test]
-    fn test_space_key() {
-        let mode = TermMode::empty();
-
-        let space = Keystroke::parse("space").unwrap();
-        assert_eq!(keystroke_to_bytes(&space, mode), Some(b" ".to_vec()));
+    fn keyboard_input_preserves_literal_terminal_bytes() {
+        for (key, mode, expected) in [
+            // Basic control keys.
+            ("enter", TermMode::empty(), b"\r".to_vec()),
+            ("escape", TermMode::empty(), b"\x1b".to_vec()),
+            ("backspace", TermMode::empty(), b"\x7f".to_vec()),
+            ("tab", TermMode::empty(), b"\t".to_vec()),
+            ("shift-tab", TermMode::empty(), b"\x1b[Z".to_vec()),
+            ("space", TermMode::empty(), b" ".to_vec()),
+            // Normal and application cursor modes both remain explicit.
+            ("up", TermMode::empty(), b"\x1b[A".to_vec()),
+            ("down", TermMode::empty(), b"\x1b[B".to_vec()),
+            ("right", TermMode::empty(), b"\x1b[C".to_vec()),
+            ("left", TermMode::empty(), b"\x1b[D".to_vec()),
+            ("up", TermMode::APP_CURSOR, b"\x1bOA".to_vec()),
+            ("down", TermMode::APP_CURSOR, b"\x1bOB".to_vec()),
+            ("right", TermMode::APP_CURSOR, b"\x1bOC".to_vec()),
+            ("left", TermMode::APP_CURSOR, b"\x1bOD".to_vec()),
+            // Navigation and function keys.
+            ("home", TermMode::empty(), b"\x1b[H".to_vec()),
+            ("end", TermMode::empty(), b"\x1b[F".to_vec()),
+            ("pageup", TermMode::empty(), b"\x1b[5~".to_vec()),
+            ("pagedown", TermMode::empty(), b"\x1b[6~".to_vec()),
+            ("insert", TermMode::empty(), b"\x1b[2~".to_vec()),
+            ("delete", TermMode::empty(), b"\x1b[3~".to_vec()),
+            ("f1", TermMode::empty(), b"\x1bOP".to_vec()),
+            ("f2", TermMode::empty(), b"\x1bOQ".to_vec()),
+            ("f5", TermMode::empty(), b"\x1b[15~".to_vec()),
+            ("f12", TermMode::empty(), b"\x1b[24~".to_vec()),
+            // Original independent numeric control-byte literals.
+            ("ctrl-a", TermMode::empty(), vec![0x01]),
+            ("ctrl-c", TermMode::empty(), vec![0x03]),
+            ("ctrl-z", TermMode::empty(), vec![0x1a]),
+            ("ctrl-space", TermMode::empty(), vec![0x00]),
+            // Alt and plain ASCII inputs.
+            ("alt-a", TermMode::empty(), b"\x1ba".to_vec()),
+            ("alt-x", TermMode::empty(), b"\x1bx".to_vec()),
+            ("a", TermMode::empty(), b"a".to_vec()),
+            ("z", TermMode::empty(), b"z".to_vec()),
+            ("0", TermMode::empty(), b"0".to_vec()),
+        ] {
+            let keystroke = Keystroke::parse(key).unwrap();
+            assert_eq!(
+                keystroke_to_bytes(&keystroke, mode),
+                Some(expected),
+                "{key} {mode:?}"
+            );
+        }
     }
 }

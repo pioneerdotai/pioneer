@@ -16,10 +16,9 @@ pub(crate) struct PreparedSourceSave {
 }
 
 impl CrudStore {
-    /// Gateway must own this workspace across cleanup/reset/execution, outside
-    /// DB capacity, so a capsule writer cannot outlive destructive replacement.
-    /// Caller must finish artifact cleanup before entering this reset. The first
-    /// source batch records that cleanup together with job replacement progress.
+    /// Gateway owns this workspace across preparation/reset/execution, outside
+    /// DB capacity. Reset fences every old job identity, clears its projection
+    /// and preserves source progress in the existing bounded maintenance pass.
     pub async fn reset_thread_episodic_projection(
         &self,
         workspace_id: &str,
@@ -28,6 +27,7 @@ impl CrudStore {
         use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
         let checkpoint_key = crate::thread_episodic_projection_reset_key(workspace_id)?;
         let mut total_replaced = 0_u64;
+        let mut duplicates_drained = false;
         loop {
             let checkpoint = crate::find_projection_meta(&self.connection, &checkpoint_key)
                 .await?
@@ -40,6 +40,49 @@ impl CrudStore {
                 checkpoint.status == crate::PROJECTION_META_STATUS_PENDING,
                 "episodic reset checkpoint is not pending"
             );
+            if !duplicates_drained {
+                let source = thread_episodic::find_duplicate_projection_source(
+                    &self.connection,
+                    workspace_id,
+                )
+                .await?;
+                if let Some(source) = source {
+                    // Ownership prevents a new runtime from creating duplicate jobs;
+                    // the writer transaction revalidates the durable reset identity
+                    // before retiring any old callbacks. Cancellation rolls back or
+                    // leaves an idempotently smaller set, without advancing sources.
+                    let pruned = self
+                        .run_serialized_write(|| async {
+                            let transaction = self.connection.begin().await?;
+                            let current =
+                                crate::find_projection_meta(&transaction, &checkpoint_key)
+                                    .await?
+                                    .context("episodic reset checkpoint disappeared")?;
+                            ensure!(
+                                current.status == checkpoint.status
+                                    && current.projection_version == checkpoint.projection_version
+                                    && current.projection_config_hash
+                                        == checkpoint.projection_config_hash
+                                    && current.projection_config_json
+                                        == checkpoint.projection_config_json,
+                                "episodic reset identity changed before duplicate cleanup"
+                            );
+                            let pruned = thread_episodic::prune_duplicate_projection_jobs(
+                                &transaction,
+                                workspace_id,
+                                &source,
+                            )
+                            .await?;
+                            transaction.commit().await?;
+                            Ok(pruned)
+                        })
+                        .await?;
+                    total_replaced = total_replaced.saturating_add(pruned);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                duplicates_drained = true;
+            }
             let mut progress: crate::ThreadEpisodicProjectionResetProgress = serde_json::from_str(
                 checkpoint
                     .projection_config_json
@@ -52,10 +95,10 @@ impl CrudStore {
                 progress.after_source.as_ref(),
             )
             .await?;
-            if sources.is_empty() && progress.files_cleaned {
+            if sources.is_empty() && progress.reset_started {
                 return Ok(total_replaced);
             }
-            progress.files_cleaned = true;
+            progress.reset_started = true;
             if let Some(last) = sources.last() {
                 progress.after_source = Some([
                     last.thread_id.clone(),
@@ -111,6 +154,7 @@ impl CrudStore {
                 })
                 .await?;
             total_replaced = total_replaced.saturating_add(replaced);
+            tokio::task::yield_now().await;
         }
     }
 

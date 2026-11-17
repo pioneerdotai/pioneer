@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspaceExecutionObservabilityParams",
+  "description": "Workspace-owned work only. Thread data requires its separate ThreadRead proof.",
+  "type": "object",
+  "properties": {
+    "after": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "operationId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parentOperationId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "through": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "view": {
+      "$ref": "#/$defs/ExecutionObservationView"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspaceId",
+    "view"
+  ],
+  "$defs": {
+    "ExecutionObservationView": {
+      "type": "string",
+      "enum": [
+        "summary",
+        "timeline",
+        "contexts",
+        "attempt",
+        "export"
+      ]
+    }
+  }
+}

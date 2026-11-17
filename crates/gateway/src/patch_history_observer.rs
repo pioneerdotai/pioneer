@@ -894,6 +894,12 @@ where
     F: FnOnce(SqliteDatabase) -> Fut + Send + 'static,
     Fut: Future<Output = Result<T>> + Send + 'static,
 {
+    let work = pioneer_observability::work::WorkCarrier::child(
+        pioneer_observability::work::Boundary::StdThread,
+        pioneer_observability::work::WorkKind::Database,
+        pioneer_observability::work::Trigger::Lifecycle,
+        pioneer_observability::work::ExecutorRole::StdThread,
+    );
     let join = std::thread::Builder::new()
         .name("apply-patch-history".to_owned())
         .spawn(move || {
@@ -901,11 +907,18 @@ where
                 .enable_all()
                 .build()
                 .context("build synchronous patch history runtime")?;
-            runtime.block_on(async move {
-                tokio::time::timeout(PATCH_HISTORY_SYNC_TIMEOUT, operation(db))
-                    .await
-                    .context("synchronous patch history operation timed out")?
-            })
+            let _runtime_observer = pioneer_observability::runtime::register(
+                runtime.handle(),
+                pioneer_observability::runtime::RuntimeRole::GatewayPatch,
+            );
+            _runtime_observer.block_on(
+                &runtime,
+                work.scope_result(async move {
+                    tokio::time::timeout(PATCH_HISTORY_SYNC_TIMEOUT, operation(db))
+                        .await
+                        .context("synchronous patch history operation timed out")?
+                }),
+            )
         })
         .context("spawn synchronous patch history worker")?;
     join.join()

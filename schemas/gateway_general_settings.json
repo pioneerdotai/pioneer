@@ -20,46 +20,12 @@
         "proxy_configured": false
       }
     },
-    "preflight_model": {
-      "$ref": "#/$defs/GatewayMemoryModelSelection",
-      "default": {
-        "source": "thread"
-      }
-    },
     "telemetry_enabled": {
       "type": "boolean",
       "default": true
     }
   },
   "$defs": {
-    "GatewayMemoryModelSelection": {
-      "type": "object",
-      "properties": {
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "model_provider": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "source": {
-          "$ref": "#/$defs/GatewayMemoryModelSelectionSource",
-          "default": "thread"
-        }
-      }
-    },
-    "GatewayMemoryModelSelectionSource": {
-      "type": "string",
-      "enum": [
-        "thread",
-        "custom"
-      ]
-    },
     "GatewayModelCatalogSettings": {
       "type": "object",
       "properties": {
@@ -99,6 +65,20 @@
         {
           "type": "object",
           "properties": {
+            "context_authority": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context_window": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
             "instance": {
               "type": "string"
             },
@@ -109,6 +89,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "service_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NativeServiceModeSelection"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "source": {
@@ -136,6 +126,23 @@
         "codex",
         "claude",
         "opencode"
+      ]
+    },
+    "NativeServiceModeSelection": {
+      "description": "Explicit choice uses the existing endpoint/credential/model authority proof.\nAbsence means Standard; Inherit belongs to the enclosing model selection.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "authority"
       ]
     }
   }

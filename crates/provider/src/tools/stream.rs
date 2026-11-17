@@ -74,6 +74,13 @@ pub(crate) struct SseEvent {
 }
 
 impl IncrementalSseDecoder {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.lines
+            .pending
+            .len()
+            .saturating_add(self.data.iter().map(String::len).sum::<usize>())
+            .saturating_add(self.event.as_ref().map_or(0, String::len))
+    }
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>> {
         let mut events = Vec::new();
         for line in self.lines.push(bytes)? {

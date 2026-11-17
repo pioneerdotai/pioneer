@@ -58,6 +58,9 @@
         "claude"
       ]
     },
+    "GatewayBaseUrl": {
+      "type": "string"
+    },
     "GatewayCliRuntimeInstanceSettings": {
       "type": "object",
       "properties": {
@@ -143,12 +146,6 @@
             "proxy_configured": false
           }
         },
-        "preflight_model": {
-          "$ref": "#/$defs/GatewayMemoryModelSelection",
-          "default": {
-            "source": "thread"
-          }
-        },
         "telemetry_enabled": {
           "type": "boolean",
           "default": true
@@ -186,16 +183,10 @@
     "GatewayMemorySettings": {
       "type": "object",
       "properties": {
-        "active_recall_enabled": {
-          "type": "boolean"
-        },
         "background_extraction_enabled": {
           "type": "boolean"
         },
         "debug_trace_enabled": {
-          "type": "boolean"
-        },
-        "deterministic_recall_enabled": {
           "type": "boolean"
         },
         "enabled": {
@@ -219,8 +210,6 @@
       },
       "required": [
         "enabled",
-        "deterministic_recall_enabled",
-        "active_recall_enabled",
         "tools_enabled",
         "proactive_writes_enabled",
         "background_extraction_enabled",
@@ -267,6 +256,20 @@
         {
           "type": "object",
           "properties": {
+            "context_authority": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context_window": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
             "instance": {
               "type": "string"
             },
@@ -285,6 +288,29 @@
             },
             "transport": {
               "$ref": "#/$defs/ModelSelectionTransport"
+            },
+            "service_mode": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "authority": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "authority"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "additionalProperties": false,
@@ -377,6 +403,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "public_base_url": {
+          "description": "Present only for the currently authenticated relay connection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayBaseUrl"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "state": {
@@ -559,9 +596,6 @@
               "catalog_available": false,
               "proxy_configured": false
             },
-            "preflight_model": {
-              "source": "thread"
-            },
             "telemetry_enabled": true
           }
         },
@@ -609,10 +643,8 @@
             "max_candidate_work": 128,
             "max_hit_chars": 1200,
             "max_prompt_chars": 12000,
-            "max_segments": 16,
             "min_relevancy": 0.25,
             "min_results": 1,
-            "near_capacity_percent": 85.0,
             "recall_enabled": true,
             "retry_base_delay_secs": 30,
             "retry_max_delay_secs": 900,
@@ -637,7 +669,8 @@
             "runtime": {
               "effective_enabled": false,
               "phase": "disabled"
-            }
+            },
+            "transcribe_while_recording": true
           }
         }
       },
@@ -688,11 +721,6 @@
           "format": "uint32",
           "minimum": 0
         },
-        "max_segments": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
         "min_relevancy": {
           "type": "number",
           "format": "float"
@@ -701,10 +729,6 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
-        },
-        "near_capacity_percent": {
-          "type": "number",
-          "format": "double"
         },
         "recall_enabled": {
           "type": "boolean"
@@ -746,15 +770,13 @@
         "max_hit_chars",
         "default_max_candidates",
         "max_candidate_work",
-        "max_segments",
         "min_relevancy",
         "min_results",
         "snippet_chars",
         "index_batch_limit",
         "retry_base_delay_secs",
         "retry_max_delay_secs",
-        "max_attempts",
-        "near_capacity_percent"
+        "max_attempts"
       ]
     },
     "GatewayThreadEpisodicVectorLocalModelStatus": {
@@ -773,6 +795,7 @@
       "enum": [
         "openai",
         "openrouter",
+        "vercel-ai-gateway",
         "local"
       ]
     },
@@ -967,6 +990,10 @@
             "effective_enabled": false,
             "phase": "disabled"
           }
+        },
+        "transcribe_while_recording": {
+          "type": "boolean",
+          "default": true
         }
       }
     },

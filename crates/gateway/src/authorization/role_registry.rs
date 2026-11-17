@@ -32,6 +32,7 @@ pub(crate) struct AgentRoleDefinition {
 
 const THREAD_AGENT_ACTIONS: &[ResourceAction] = &[
     ResourceAction::ThreadRead,
+    ResourceAction::ThreadObserveWorkspace,
     ResourceAction::ThreadCreatePrivate,
     ResourceAction::ThreadCreateWorkspace,
     ResourceAction::MessageCreate,
@@ -78,6 +79,7 @@ const THREAD_AGENT_ROLE: AgentRoleDefinition = AgentRoleDefinition {
 
 const AGENT_OBSERVER_ACTIONS: &[ResourceAction] = &[
     ResourceAction::ThreadRead,
+    ResourceAction::ThreadObserveWorkspace,
     ResourceAction::AgentExecutionObserve,
     ResourceAction::AgentRequestObserve,
     ResourceAction::ChildObserve,
@@ -536,6 +538,7 @@ const MEMBER_ACTIONS: &[ResourceAction] = &[
     ResourceAction::ThreadCreatePrivate,
     ResourceAction::ThreadCreateWorkspace,
     ResourceAction::ThreadRead,
+    ResourceAction::ThreadObserveWorkspace,
     ResourceAction::MessageCreate,
     ResourceAction::MessageEditOwn,
     ResourceAction::MessageDeleteOwn,
@@ -1242,24 +1245,6 @@ mod tests {
         assert!(!definition.actions.allows(ResourceAction::AgentTurnStart));
         assert!(!definition.actions.allows(ResourceAction::ProviderUse));
         assert!(!definition.actions.allows(ResourceAction::CliRuntimeUse));
-    }
-
-    #[test]
-    fn synthetic_executor_keeps_artifact_create_and_bind_as_independent_actions() {
-        let role = RoleKey::new("synthetic_executor").expect("valid role");
-        let definition = RoleDefinitionRegistry::new()
-            .resolve_user_role(&role)
-            .expect("executor role is registered");
-        assert!(
-            definition
-                .actions
-                .allows(ResourceAction::ArtifactCreateThread)
-        );
-        assert!(
-            !definition
-                .actions
-                .allows(ResourceAction::ArtifactBindThread)
-        );
     }
 
     #[test]

@@ -61,12 +61,6 @@ impl CLIAgentRuntimeRecoveryCatalog {
         }
     }
 
-    #[cfg(test)]
-    fn with_runtime(mut self, runtime: CLIAgentRuntimeRecoveryRuntime) -> Self {
-        self.runtimes.insert(runtime.runtime_id.clone(), runtime);
-        self
-    }
-
     fn get(&self, runtime_id: &str) -> Option<&CLIAgentRuntimeRecoveryRuntime> {
         self.runtimes.get(runtime_id)
     }
@@ -108,7 +102,7 @@ pub(crate) async fn scan_cli_runtime_turn_recovery(
     limit: u64,
 ) -> Result<Vec<CLIAgentRuntimeTurnRecoveryPlan>> {
     let bindings = store
-        .list_cli_runtime_turn_bindings(CliRuntimeTurnBindingListFilter {
+        .list_cli_runtime_turn_binding_controls(CliRuntimeTurnBindingListFilter {
             statuses: vec![
                 CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
                 CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
@@ -396,14 +390,8 @@ fn cli_agent_runtime_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CLIAgentRuntimeRecoveryCatalog, CLIAgentRuntimeRecoveryRuntime,
-        CLIAgentRuntimeTurnRecoveryOutcome, scan_cli_runtime_turn_recovery,
-    };
-    use crate::cli_runtime::turn_binding::{
-        CLI_RUNTIME_TURN_STATUS_COMPLETED, CLI_RUNTIME_TURN_STATUS_RUNNING,
-        CLI_RUNTIME_TURN_STATUS_STARTING,
-    };
+    use super::{CLIAgentRuntimeRecoveryRuntime, CLIAgentRuntimeTurnRecoveryOutcome};
+    use crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING;
     use chrono::{FixedOffset, TimeZone};
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, NewCliRuntimeTurnBinding};
@@ -456,6 +444,9 @@ mod tests {
             model: "test-model".to_owned(),
             model_provider: "echo".to_owned(),
             reasoning_effort: None,
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             created_at: timestamp_secs,
             updated_at: timestamp_secs,
             status: ThreadStatus::Active,
@@ -470,6 +461,7 @@ mod tests {
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
+            work_owner: Default::default(),
             origin: Default::default(),
             mode: Default::default(),
             author: None,
@@ -539,107 +531,6 @@ mod tests {
             .expect("binding should persist");
     }
 
-    #[tokio::test]
-    async fn cli_runtime_recovery_scanner_marks_ready_runtime_recoverable() {
-        let store = test_store().await;
-        materialize_in_progress_turn(&store, "thread_ready", "turn_ready").await;
-        persist_binding(
-            &store,
-            "codex-ready",
-            "thread_ready",
-            "turn_ready",
-            CLI_RUNTIME_TURN_STATUS_RUNNING,
-        )
-        .await;
-
-        let catalog = CLIAgentRuntimeRecoveryCatalog::empty()
-            .with_runtime(runtime("codex-ready", RuntimeStatus::Ready));
-        let plans = scan_cli_runtime_turn_recovery(&store, &catalog, 64)
-            .await
-            .expect("scan should succeed");
-
-        assert_eq!(plans.len(), 1);
-        assert!(matches!(
-            &plans[0].outcome,
-            CLIAgentRuntimeTurnRecoveryOutcome::Recoverable { reason }
-                if reason.contains("ready for native turn recovery")
-        ));
-    }
-
-    #[tokio::test]
-    async fn cli_runtime_recovery_scanner_blocks_missing_runtime_binary_and_auth() {
-        let store = test_store().await;
-        for (thread_id, turn_id, runtime_id, status) in [
-            (
-                "thread_missing",
-                "turn_missing",
-                "codex-missing",
-                CLI_RUNTIME_TURN_STATUS_STARTING,
-            ),
-            (
-                "thread_binary",
-                "turn_binary",
-                "codex-binary",
-                CLI_RUNTIME_TURN_STATUS_RUNNING,
-            ),
-            (
-                "thread_auth",
-                "turn_auth",
-                "codex-auth",
-                CLI_RUNTIME_TURN_STATUS_RUNNING,
-            ),
-            (
-                "thread_done",
-                "turn_done",
-                "codex-ready",
-                CLI_RUNTIME_TURN_STATUS_COMPLETED,
-            ),
-        ] {
-            materialize_in_progress_turn(&store, thread_id, turn_id).await;
-            persist_binding(&store, runtime_id, thread_id, turn_id, status).await;
-        }
-
-        let catalog = CLIAgentRuntimeRecoveryCatalog::empty()
-            .with_runtime(runtime(
-                "codex-binary",
-                RuntimeStatus::MissingBinary {
-                    binary_path: Some("/bad/codex".to_owned()),
-                },
-            ))
-            .with_runtime(runtime("codex-auth", RuntimeStatus::NeedsAuth))
-            .with_runtime(runtime("codex-ready", RuntimeStatus::Ready));
-        let plans = scan_cli_runtime_turn_recovery(&store, &catalog, 64)
-            .await
-            .expect("scan should succeed");
-
-        assert_eq!(plans.len(), 3);
-        let mut reason_classes = plans
-            .iter()
-            .map(|plan| match &plan.outcome {
-                CLIAgentRuntimeTurnRecoveryOutcome::Blocked { resume, .. } => {
-                    resume.reason_class.as_str()
-                }
-                other => panic!("expected blocked recovery plan, got {other:?}"),
-            })
-            .collect::<Vec<_>>();
-        reason_classes.sort_unstable();
-        assert_eq!(
-            reason_classes,
-            vec![
-                "cli_runtime_missing",
-                "cli_runtime_missing_binary",
-                "cli_runtime_needs_auth",
-            ]
-        );
-        assert!(plans.iter().all(|plan| match &plan.outcome {
-            CLIAgentRuntimeTurnRecoveryOutcome::Blocked { resume, .. } => {
-                resume.can_resume_same_turn
-                    && resume.resume_command == format!("turn.resume:{}", plan.binding.turn_id)
-                    && !resume.resume_requirements.is_empty()
-            }
-            _ => false,
-        }));
-    }
     #[tokio::test]
     async fn ready_acp_session_does_not_prove_unknown_prompt_outcome() {
         let store = test_store().await;

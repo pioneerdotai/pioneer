@@ -5,7 +5,6 @@
   "enum": [
     "provider_metadata",
     "cli_metadata",
-    "static_registry",
     "config_override",
     "unknown"
   ]

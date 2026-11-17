@@ -1,0 +1,46 @@
+{
+  "sourceRevision": "b739d6720a0714cf9fd7b0fa5cfbefb169ea234b",
+  "status": "candidate-not-qualified-in-microsandbox",
+  "runtimes": {
+    "node": {
+      "runtime": "node",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "digest": "sha256:edd295a96b9bcdd8bf6a4f8ade7b45bbc24eb7d2bb8e2991a7d024c51d971fdc",
+      "tag": "ghcr.io/pioneerdotai/runtime-node:sha-b739d6720a0714cf9fd7b0fa5cfbefb169ea234b-run-43411306752-1",
+      "image": "ghcr.io/pioneerdotai/runtime-node@sha256:edd295a96b9bcdd8bf6a4f8ade7b45bbc24eb7d2bb8e2991a7d024c51d971fdc"
+    },
+    "python": {
+      "runtime": "python",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "digest": "sha256:9c5fb069d56b20227560bae27df633ad074b5f2b08ca2b7a095d0001ad135219",
+      "tag": "ghcr.io/pioneerdotai/runtime-python:sha-b739d6720a0714cf9fd7b0fa5cfbefb169ea234b-run-43411306752-1",
+      "image": "ghcr.io/pioneerdotai/runtime-python@sha256:9c5fb069d56b20227560bae27df633ad074b5f2b08ca2b7a095d0001ad135219"
+    },
+    "native": {
+      "runtime": "native",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "digest": "sha256:966a57238273aa349c66afab1c0b6d499219716a21d8353cef3f15899d7aa466",
+      "tag": "ghcr.io/pioneerdotai/runtime-native:sha-b739d6720a0714cf9fd7b0fa5cfbefb169ea234b-run-43411306752-1",
+      "image": "ghcr.io/pioneerdotai/runtime-native@sha256:966a57238273aa349c66afab1c0b6d499219716a21d8353cef3f15899d7aa466"
+    },
+    "wasm": {
+      "runtime": "wasm",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "digest": "sha256:ae113f9c46a3f1826007f97bf3566c5d8d8f3fb8627f55dc4ac05c39484d560d",
+      "tag": "ghcr.io/pioneerdotai/runtime-wasm:sha-b739d6720a0714cf9fd7b0fa5cfbefb169ea234b-run-43411306752-1",
+      "image": "ghcr.io/pioneerdotai/runtime-wasm@sha256:ae113f9c46a3f1826007f97bf3566c5d8d8f3fb8627f55dc4ac05c39484d560d"
+    }
+  }
+}

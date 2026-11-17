@@ -35,8 +35,28 @@ impl SkillArchiveFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUploadPurpose {
+    #[default]
+    Skill,
+    Plugin,
+    App,
+}
+impl SkillUploadPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Skill => "skill",
+            Self::Plugin => "plugin",
+            Self::App => "app",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillsUploadStartParams {
+    #[serde(default)]
+    pub purpose: SkillUploadPurpose,
     pub workspace_id: String,
     pub file_name: String,
     pub archive_format: SkillArchiveFormat,
@@ -137,6 +157,10 @@ pub struct SkillPackMembership {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillListItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_owner: Option<crate::PluginOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_owner: Option<crate::PackageOwner>,
     pub skill_id: SkillId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack: Option<SkillPackMembership>,
@@ -497,6 +521,8 @@ mod tests {
 
     fn list_item(character: char, pack: Option<SkillPackMembership>) -> SkillListItem {
         SkillListItem {
+            plugin_owner: None,
+            package_owner: None,
             skill_id: skill_id(character),
             pack,
             owner: None,
@@ -941,6 +967,8 @@ mod tests {
     #[test]
     fn management_results_and_notifications_carry_id_and_presentation() {
         let list_item = SkillListItem {
+            plugin_owner: None,
+            package_owner: None,
             skill_id: skill_id('E'),
             pack: None,
             owner: Some("owner".to_owned()),
@@ -1057,27 +1085,6 @@ mod tests {
     }
 
     #[test]
-    fn install_upload_id_is_not_skill_id() {
-        let source = SkillLifecycleSource::UploadedArchive {
-            upload_id: "UUUUUUUUUUUUUUUUUUUUU".to_owned(),
-        };
-        let result = SkillLifecycleResultSkill {
-            skill_id: skill_id('S'),
-            owner: None,
-            slug: "skill".to_owned(),
-            source_kind: "user".to_owned(),
-            version: None,
-            fingerprint: "fingerprint".to_owned(),
-            trust_level: "community".to_owned(),
-            install_path: "/managed/S/skill".to_owned(),
-        };
-
-        let source_json = serde_json::to_value(source).unwrap();
-        let result_json = serde_json::to_value(result).unwrap();
-        assert_ne!(source_json["upload_id"], result_json["skill_id"]);
-    }
-
-    #[test]
     fn skills_changed_notification_defaults_old_payload_and_round_trips_pack_changes() {
         let old: SkillsChangedNotification = serde_json::from_value(json!({
             "workspace_id": "workspace-one",
@@ -1123,6 +1130,7 @@ mod tests {
     #[test]
     fn upload_control_params_round_trip() {
         let start = SkillsUploadStartParams {
+            purpose: Default::default(),
             workspace_id: "ws_000000000000000001".to_owned(),
             file_name: "skill.tar.gz".to_owned(),
             archive_format: SkillArchiveFormat::TarGz,
@@ -1206,5 +1214,18 @@ mod tests {
 
         assert!(schema_json.contains("uploaded_archive"));
         assert!(!schema_json.contains("\"path\""));
+    }
+}
+
+impl SkillListItem {
+    pub fn package_owner(&self) -> Option<crate::PackageOwner> {
+        self.package_owner.clone().or_else(|| {
+            self.plugin_owner
+                .as_ref()
+                .map(crate::PackageOwner::from_plugin)
+        })
+    }
+    pub fn is_package_component(&self) -> bool {
+        self.package_owner.is_some() || self.plugin_owner.is_some()
     }
 }

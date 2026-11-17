@@ -70,11 +70,26 @@ impl Projection {
                         native_thread_id: Some(native_thread_id.to_owned()),
                         native_turn_id: native_turn_id.to_owned(),
                         native_item_id: notification.item.item_id().to_owned(),
-                        item_kind: "acp".to_owned(),
+                        item_kind: if matches!(&notification.item, TurnItem::AgentMessage { .. }) {
+                            "agentMessage"
+                        } else {
+                            "acp"
+                        }
+                        .to_owned(),
                         text: None,
                         summary: Vec::new(),
                         content: Vec::new(),
-                        phase: RuntimeAgentMessagePhase::Commentary,
+                        phase: if matches!(
+                            &notification.item,
+                            TurnItem::AgentMessage {
+                                phase: AgentMessagePhase::FinalAnswer,
+                                ..
+                            }
+                        ) {
+                            RuntimeAgentMessagePhase::FinalAnswer
+                        } else {
+                            RuntimeAgentMessagePhase::Commentary
+                        },
                         metadata: None,
                         native_item_redacted: None,
                         native: None,
@@ -1166,17 +1181,29 @@ mod tests {
     fn prompt_completion_does_not_first_complete_the_final_segment_as_commentary() {
         let mut reducer = reducer();
         reducer.update(notification(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Final response"}}))).unwrap();
-        let (projection, candidate) = reducer
+        let (mut projection, candidate) = reducer
             .finish(&schema::PromptResponse::new(schema::StopReason::EndTurn))
             .unwrap();
         assert!(projection.durable.is_empty());
+        let candidate = candidate.unwrap();
         assert!(matches!(
-            candidate.unwrap().item,
+            &candidate.item,
             TurnItem::AgentMessage {
                 phase: AgentMessagePhase::FinalAnswer,
                 ..
             }
         ));
+        projection.durable.push(AgentDurableEvent::ItemCompleted {
+            notification: candidate,
+        });
+        assert!(
+            matches!(&projection.runtime_events("session", "prompt").unwrap()[0],
+                crate::event::RuntimeEvent::ItemCompleted(item)
+                    if item.item_kind == "agentMessage"
+                        && item.phase == crate::event::RuntimeAgentMessagePhase::FinalAnswer
+            ),
+            "the runtime boundary must retain finality for the Gateway's attached-work gate"
+        );
     }
 
     #[test]

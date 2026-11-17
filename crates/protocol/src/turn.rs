@@ -319,6 +319,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct TurnStartParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_mode: Option<crate::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_authority: Option<String>,
+    /// User-owned model choice; absent means Auto, not inheritance of a wider override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// Explicit, bounded cross-capsule delegations requested for this root
     /// Agent execution. These are authorization inputs, never prompt content.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -418,6 +425,11 @@ pub struct TurnAgentAuthorityCapSnapshot {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct TurnExecutionSecuritySnapshot {
+    /// Financial context authorization for this exact Native/API execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_context: Option<crate::NativeContextBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_summary: Option<crate::NativeSummaryContext>,
     pub schema_version: u32,
     pub version: u32,
     pub source: TurnSecuritySnapshotSource,
@@ -448,6 +460,8 @@ impl TurnExecutionSecuritySnapshot {
         let process = TurnProcessPolicySnapshot::unrestricted();
         let approval = TurnApprovalScopePolicySnapshot::full_access();
         Self {
+            native_context: None,
+            native_summary: None,
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
             source: TurnSecuritySnapshotSource::ComposerSelection,
@@ -490,6 +504,8 @@ impl TurnExecutionSecuritySnapshot {
         let process = TurnProcessPolicySnapshot::restricted();
         let approval = TurnApprovalScopePolicySnapshot::supervised();
         Self {
+            native_context: None,
+            native_summary: None,
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
             source: TurnSecuritySnapshotSource::ComposerSelection,
@@ -540,6 +556,8 @@ impl TurnExecutionSecuritySnapshot {
         let process = TurnProcessPolicySnapshot::restricted();
         let approval = TurnApprovalScopePolicySnapshot::auto_accept_edits();
         Self {
+            native_context: None,
+            native_summary: None,
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
             source: TurnSecuritySnapshotSource::ComposerSelection,
@@ -1542,6 +1560,7 @@ pub struct TurnCapability {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 struct TurnCapabilityWire {
     id: String,
     kind: TurnCapabilityKind,
@@ -1557,6 +1576,24 @@ impl<'de> Deserialize<'de> for TurnCapability {
         let wire = TurnCapabilityWire::deserialize(deserializer)?;
         let expected = match &wire.kind {
             TurnCapabilityKind::Skill { skill_id, .. } => Some(skill_capability_key(skill_id)),
+            TurnCapabilityKind::App {
+                app_id,
+                expected_revision,
+            } => {
+                if app_id.len() != 21 || *expected_revision < 1 {
+                    return Err(serde::de::Error::custom("invalid App selection"));
+                }
+                Some(app_capability_key(app_id))
+            }
+            TurnCapabilityKind::Plugin {
+                plugin_id,
+                expected_revision,
+            } => {
+                if plugin_id.len() != 21 || *expected_revision < 1 {
+                    return Err(serde::de::Error::custom("invalid plugin selection"));
+                }
+                Some(plugin_capability_key(plugin_id))
+            }
             TurnCapabilityKind::SkillPack { pack_id } => Some(skill_pack_capability_key(pack_id)),
             TurnCapabilityKind::McpServer { name, scope_kind } => {
                 Some(mcp_server_capability_key(*scope_kind, name))
@@ -1592,6 +1629,37 @@ pub fn skill_capability_key(skill_id: &SkillId) -> String {
 }
 
 /// Builds the canonical internal key for a selected skill pack capability.
+pub fn app_capability_key(app_id: &str) -> String {
+    format!("app:{app_id}")
+}
+/// Server/client presentation helper; it never expands components or grants authority.
+pub fn package_capability(kind: crate::PackageKind, id: &str, revision: i64) -> TurnCapability {
+    let (key, capability) = match kind {
+        crate::PackageKind::Plugin => (
+            plugin_capability_key(id),
+            TurnCapabilityKind::Plugin {
+                plugin_id: id.into(),
+                expected_revision: revision,
+            },
+        ),
+        crate::PackageKind::App => (
+            app_capability_key(id),
+            TurnCapabilityKind::App {
+                app_id: id.into(),
+                expected_revision: revision,
+            },
+        ),
+    };
+    TurnCapability {
+        id: key,
+        kind: capability,
+        label: None,
+    }
+}
+pub fn plugin_capability_key(plugin_id: &str) -> String {
+    format!("plugin:{plugin_id}")
+}
+
 pub fn skill_pack_capability_key(pack_id: &SkillPackId) -> String {
     format!("skill_pack:{pack_id}")
 }
@@ -1614,8 +1682,20 @@ pub fn mcp_tool_capability_key(
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum TurnCapabilityKind {
+    App {
+        #[serde(rename = "appId")]
+        app_id: String,
+        #[serde(rename = "expectedRevision")]
+        expected_revision: i64,
+    },
+    Plugin {
+        #[serde(rename = "pluginId")]
+        plugin_id: String,
+        #[serde(rename = "expectedRevision")]
+        expected_revision: i64,
+    },
     Skill {
         #[serde(rename = "skillId")]
         skill_id: SkillId,
@@ -2272,8 +2352,41 @@ pub struct TurnItemEvent {
     pub payload: TurnItemEventPayload,
 }
 
+/// Canonical work ownership, persisted at admission independently of authorship.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnWorkOwner {
+    #[default]
+    Turn,
+    DetachedTask,
+}
+
+impl TurnWorkOwner {
+    const fn is_turn(&self) -> bool {
+        matches!(self, Self::Turn)
+    }
+
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::DetachedTask => "detached_task",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "turn" => Ok(Self::Turn),
+            "detached_task" => Ok(Self::DetachedTask),
+            _ => Err("invalid Turn work owner"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
+    /// Immutable owner of the admitted work; absent historical wire values own their turn.
+    #[serde(default, skip_serializing_if = "TurnWorkOwner::is_turn")]
+    pub work_owner: TurnWorkOwner,
     pub id: String,
     pub status: TurnStatus,
     #[serde(default)]
@@ -2453,8 +2566,8 @@ pub enum PromptManifestHookTruncation {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptManifestHookPhase {
+    #[serde(alias = "turn_post_preflight_prompt_context")]
     TurnPrePromptContext,
-    TurnPostPreflightPromptContext,
     TurnPrePromptCompile,
     RuntimeTurnPreContext,
 }
@@ -4462,6 +4575,34 @@ pub struct ToolRecoveryView {
     pub continuation: Option<JsonValue>,
 }
 
+pub const CUA_TOOL_NAMES: &[&str] = &[
+    "cua_click",
+    "cua_clipboard_read",
+    "cua_clipboard_write",
+    "cua_drag",
+    "cua_get_cursor_position",
+    "cua_get_desktop_state",
+    "cua_get_screen_size",
+    "cua_get_window_state",
+    "cua_hotkey",
+    "cua_invoke_menu",
+    "cua_list_apps",
+    "cua_list_windows",
+    "cua_press_key",
+    "cua_scroll",
+    "cua_set_window_frame",
+    "cua_type_text",
+    "cua_verify_state",
+    "cua_get_browser_state",
+    "cua_browser_prepare",
+    "cua_browser_navigate",
+    "cua_browser_click",
+    "cua_browser_type",
+    "cua_browser_select",
+    "cua_browser_dialog",
+    "cua_browser_set_input_files",
+];
+
 impl ToolOutputPolicySnapshot {
     pub fn for_tool_name(tool_name: &str) -> Self {
         match tool_name {
@@ -4469,7 +4610,7 @@ impl ToolOutputPolicySnapshot {
             "web_fetch" => web_fetch_output_policy_snapshot(),
             "web_search" => web_search_output_policy_snapshot(),
             "download_url" | "download" => download_output_policy_snapshot(),
-            "computer_use" => computer_use_output_policy_snapshot(),
+            name if CUA_TOOL_NAMES.contains(&name) => computer_use_output_policy_snapshot(),
             "html_preview" | "html_render" => html_output_policy_snapshot(),
             "artifact_prepare" | "artifact_register" | "read_file" | "read_skill" | "list_dir"
             | "grep_files" | "apply_patch" | "tool_search" | "tool_suggest" => {
@@ -4485,7 +4626,7 @@ impl ToolOutputPolicySnapshot {
             "web_fetch" => web_fetch_output_policy_snapshot(),
             "web_search" => web_search_output_policy_snapshot(),
             "download_url" | "download" => download_output_policy_snapshot(),
-            "computer_use" => computer_use_output_policy_snapshot(),
+            name if CUA_TOOL_NAMES.contains(&name) => computer_use_output_policy_snapshot(),
             "html_preview" | "html_render" => html_output_policy_snapshot(),
             "artifact_prepare" | "artifact_register" | "read_file" | "list_dir" | "grep_files"
             | "apply_patch" | "tool_search" | "tool_suggest" => {
@@ -4496,7 +4637,7 @@ impl ToolOutputPolicySnapshot {
     }
 }
 
-const DEFAULT_LLM_MAX_BYTES: usize = 2 * 1024 * 1024;
+pub const TOOL_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_SUMMARY_CHARS: usize = 2_000;
 const DEFAULT_SHELL_CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_SHELL_TOTAL_BYTES: usize = 4 * 1024 * 1024;
@@ -4504,7 +4645,7 @@ const DEFAULT_DIAGNOSTIC_CHARS: usize = 4_000;
 
 fn retained_llm_policy() -> LlmRetentionPolicy {
     LlmRetentionPolicy::UntilTurnTerminal {
-        max_bytes: DEFAULT_LLM_MAX_BYTES,
+        max_bytes: TOOL_RESPONSE_MAX_BYTES,
     }
 }
 
@@ -4521,7 +4662,7 @@ fn evidence_recovery_policy(diagnostic_excerpt: DiagnosticExcerptPolicy) -> Reco
 fn shell_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Full {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Full {
@@ -4543,7 +4684,7 @@ fn shell_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn model_only_metadata_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Full {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4558,7 +4699,7 @@ fn model_only_metadata_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn web_fetch_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Full {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4573,7 +4714,7 @@ fn web_fetch_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn web_search_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4590,7 +4731,7 @@ fn web_search_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn download_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4605,7 +4746,7 @@ fn download_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn computer_use_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4620,7 +4761,7 @@ fn computer_use_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn external_runtime_tool_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4633,14 +4774,14 @@ fn external_runtime_tool_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 }
 
 fn html_output_policy_snapshot() -> ToolOutputPolicySnapshot {
-    // Three bounded diagnostic sets plus exact screenshot references. Actual PNG
+    // Six bounded diagnostic sets plus exact screenshot references. Actual PNG
     // bytes travel as media parts, never in timeline/storage JSON.
     let mut policy = dynamic_unknown_output_policy_snapshot();
     policy.llm = LlmOutputPolicy::Structured {
-        max_bytes: 96 * 1024,
+        max_bytes: 192 * 1024,
     };
     policy.llm_retention = LlmRetentionPolicy::UntilTurnTerminal {
-        max_bytes: 96 * 1024,
+        max_bytes: 192 * 1024,
     };
     policy
 }
@@ -4648,7 +4789,7 @@ fn html_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn dynamic_unknown_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::MetadataOnly,
@@ -4707,6 +4848,8 @@ pub enum ProviderFailureStage {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFailureDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_response: Option<crate::ProviderErrorResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_reason: Option<crate::ProviderErrorReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<crate::ProviderRequestId>,
@@ -4754,9 +4897,40 @@ pub enum SystemEventLevel {
     Error,
 }
 
+/// Content-free source boundaries, bounded per invocation. All mono_ns values
+/// belong to the enclosing observation's process_run_id.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolPhaseBoundary {
+    pub phase: String,
+    pub attempt_id: u32,
+    pub ts_unix_ms: i64,
+    pub mono_ns: u64,
+    pub local_sequence: u64,
+}
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolOutputMeasurements {
+    pub captured_text_bytes: u64,
+    /// Prepared handler representation; persistence is a separate acknowledged fact.
+    pub prepared_source_bytes: u64,
+    pub model_projection_text_bytes: u64,
+    pub basis: String,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolObservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_boundaries: Vec<ToolPhaseBoundary>,
+    #[serde(default, skip_serializing_if = "no_omitted_tool_phases")]
+    pub omitted_phase_boundaries: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_sizes: Option<ToolOutputMeasurements>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_run_id: Option<String>,
     pub trace_id: String,
     pub turn_id: String,
     pub tool_call_id: String,
@@ -4765,6 +4939,10 @@ pub struct ToolObservation {
     pub ts_unix_ms: i64,
     pub mono_ns: u64,
     pub event_seq: u64,
+}
+
+fn no_omitted_tool_phases(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -4976,6 +5154,12 @@ pub enum UserMessageAttachment {
     Skill {
         capability: TurnSkillCapabilitySummary,
     },
+    Plugin {
+        capability: TurnPluginCapabilitySummary,
+    },
+    App {
+        capability: TurnAppCapabilitySummary,
+    },
     SkillPack {
         capability: TurnSkillPackCapabilitySummary,
     },
@@ -4985,6 +5169,27 @@ pub enum UserMessageAttachment {
     McpTool {
         capability: TurnMcpToolCapabilitySummary,
     },
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPluginCapabilitySummary {
+    pub plugin_id: String,
+    pub expected_revision: i64,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::PluginIcon>,
+}
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnAppCapabilitySummary {
+    pub app_id: String,
+    pub expected_revision: i64,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::PluginIcon>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dark_icon: Option<crate::PluginIcon>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -5743,6 +5948,21 @@ pub struct ContextCompressedNotification {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_prompt_manifest_phase_reads_and_serializes_as_current_context() {
+        let phase: super::PromptManifestHookPhase =
+            serde_json::from_str("\"turn_post_preflight_prompt_context\"")
+                .expect("historical manifests remain readable");
+        assert_eq!(phase, super::PromptManifestHookPhase::TurnPrePromptContext);
+        assert_eq!(
+            serde_json::to_string(&phase).unwrap(),
+            "\"turn_pre_prompt_context\""
+        );
+        assert!(
+            serde_json::from_str::<super::PromptManifestHookPhase>("\"unknown_phase\"").is_err()
+        );
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -5922,18 +6142,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_turn_permission_profile_defaults_to_full_access() {
-        let snapshot = resolve_turn_permission_profile(None);
-
-        assert_eq!(snapshot.mode, TurnPermissionMode::FullAccess);
-        assert_eq!(snapshot.source, TurnPermissionProfileSource::Defaulted);
-        assert_eq!(
-            snapshot.effective_policy,
-            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
-        );
-    }
-
-    #[test]
     fn resolve_turn_permission_profile_uses_composer_source_for_selection() {
         let selection = TurnPermissionProfileSelection {
             mode: TurnPermissionMode::AutoAcceptEdits,
@@ -5965,32 +6173,6 @@ mod tests {
             snapshot.effective_policy,
             ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
         );
-    }
-
-    #[test]
-    fn default_turn_permission_profile_snapshot_is_full_access_defaulted() {
-        let snapshot = crate::default_turn_permission_profile_snapshot();
-
-        assert_eq!(snapshot.mode, TurnPermissionMode::FullAccess);
-        assert_eq!(snapshot.source, TurnPermissionProfileSource::Defaulted);
-        assert_eq!(
-            snapshot.effective_policy,
-            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
-        );
-    }
-
-    #[test]
-    fn permission_profile_compilation_is_deterministic() {
-        let first = crate::compile_turn_permission_profile(
-            TurnPermissionMode::FullAccess,
-            TurnPermissionProfileSource::System,
-        );
-        let second = crate::compile_turn_permission_profile(
-            TurnPermissionMode::FullAccess,
-            TurnPermissionProfileSource::System,
-        );
-
-        assert_eq!(first, second);
     }
 
     #[test]
@@ -6136,70 +6318,6 @@ mod tests {
     }
 
     #[test]
-    fn restricted_permission_policy_tables_do_not_deny_by_default() {
-        for mode in [
-            TurnPermissionMode::AutoAcceptEdits,
-            TurnPermissionMode::Supervised,
-        ] {
-            let policy = crate::permission_policy_for_mode(mode);
-            let fields = [
-                policy.default_behavior,
-                policy.file_read,
-                policy.file_write,
-                policy.shell_command,
-                policy.network,
-                policy.mcp_read,
-                policy.mcp_write_or_unknown,
-                policy.dynamic_skill_tool,
-                policy.computer_use,
-                policy.task_subagent,
-                policy.memory_write,
-                policy.agent_action,
-            ];
-
-            assert!(
-                fields
-                    .into_iter()
-                    .all(|behavior| behavior != PermissionBehavior::Deny)
-            );
-            assert_eq!(policy.default_behavior, PermissionBehavior::Ask);
-        }
-    }
-
-    #[test]
-    fn security_snapshot_unrestricted_full_access_round_trips_with_explicit_sandbox() {
-        let snapshot =
-            TurnExecutionSecuritySnapshot::unrestricted_full_access("/workspace/project", 1_700);
-
-        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
-
-        assert_eq!(encoded["schema_version"], 1);
-        assert_eq!(encoded["version"], 1);
-        assert_eq!(encoded["permission_profile"]["mode"], "full_access");
-        assert_eq!(encoded["sandbox"]["mode"], "unrestricted");
-        assert_eq!(encoded["sandbox"]["filesystem"]["kind"], "unrestricted");
-        assert_eq!(encoded["sandbox"]["network"]["mode"], "enabled");
-        assert_eq!(encoded["network"]["mode"], "enabled");
-        assert_eq!(encoded["sandbox"]["backend_requirement"], "optional");
-        assert_eq!(encoded["process"]["shell"]["enabled"], true);
-        assert_eq!(encoded["enforcement"], json!({ "status": "active" }));
-        assert_eq!(
-            encoded["authority_cap"]["resource_binding_id"],
-            "unrestricted"
-        );
-        assert!(encoded.get("sandbox").is_some());
-
-        let decoded: TurnExecutionSecuritySnapshot =
-            serde_json::from_value(encoded).expect("snapshot should deserialize");
-        assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.sandbox.mode, TurnSandboxMode::Unrestricted);
-        assert_eq!(
-            decoded.sandbox.filesystem.kind,
-            TurnFilesystemSandboxKind::Unrestricted
-        );
-    }
-
-    #[test]
     fn execution_security_snapshot_rejects_a_missing_authority_cap() {
         let snapshot =
             TurnExecutionSecuritySnapshot::unrestricted_full_access("/workspace/project", 1_700);
@@ -6210,89 +6328,6 @@ mod tests {
             .remove("authority_cap");
 
         assert!(serde_json::from_value::<TurnExecutionSecuritySnapshot>(encoded).is_err());
-    }
-
-    #[test]
-    fn security_snapshot_read_only_round_trips_with_restricted_roots() {
-        let profile = TurnPermissionProfileSnapshot::from_mode(
-            TurnPermissionMode::Supervised,
-            TurnPermissionProfileSource::Composer,
-        );
-        let snapshot = TurnExecutionSecuritySnapshot::read_only(
-            profile,
-            "/workspace/project",
-            vec![TurnFilesystemSandboxEntry::workspace_root(
-                TurnFilesystemAccess::Read,
-                "/workspace/project",
-            )],
-            1_701,
-        );
-
-        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
-
-        assert_eq!(encoded["permission_profile"]["mode"], "supervised");
-        assert_eq!(encoded["sandbox"]["mode"], "read_only");
-        assert_eq!(encoded["sandbox"]["filesystem"]["kind"], "restricted");
-        assert_eq!(
-            encoded["sandbox"]["filesystem"]["entries"][0]["path"],
-            json!({ "kind": "workspace_root" })
-        );
-        assert_eq!(
-            encoded["sandbox"]["filesystem"]["entries"][0]["access"],
-            "read"
-        );
-        assert_eq!(encoded["network"]["mode"], "disabled");
-        assert_eq!(
-            encoded["authority_cap"]["filesystem"]["kind"],
-            "unrestricted"
-        );
-        assert_eq!(encoded["authority_cap"]["network"]["mode"], "enabled");
-        assert_eq!(encoded["sandbox"]["backend_requirement"], "required");
-        assert_eq!(encoded["sandbox"]["backend_preference"], json!(["nono"]));
-
-        let decoded: TurnExecutionSecuritySnapshot =
-            serde_json::from_value(encoded).expect("snapshot should deserialize");
-        assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.sandbox.mode, TurnSandboxMode::ReadOnly);
-    }
-
-    #[test]
-    fn security_snapshot_workspace_write_round_trips_with_write_roots() {
-        let profile = TurnPermissionProfileSnapshot::from_mode(
-            TurnPermissionMode::AutoAcceptEdits,
-            TurnPermissionProfileSource::Composer,
-        );
-        let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
-            profile,
-            "/workspace/project",
-            vec![TurnFilesystemSandboxEntry::workspace_root(
-                TurnFilesystemAccess::Write,
-                "/workspace/project",
-            )],
-            1_702,
-        );
-
-        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
-
-        assert_eq!(encoded["permission_profile"]["mode"], "auto_accept_edits");
-        assert_eq!(encoded["sandbox"]["mode"], "workspace_write");
-        assert_eq!(
-            encoded["sandbox"]["filesystem"]["entries"][0]["access"],
-            "write"
-        );
-        assert_eq!(encoded["approval"]["allow_for_turn"], true);
-        assert_eq!(encoded["approval"]["request_permissions"], true);
-        assert_eq!(
-            encoded["authority_cap"]["filesystem"]["kind"],
-            "unrestricted"
-        );
-        assert_eq!(encoded["authority_cap"]["network"]["mode"], "enabled");
-        assert_eq!(encoded["backend"]["sandbox_backend"], "nono");
-
-        let decoded: TurnExecutionSecuritySnapshot =
-            serde_json::from_value(encoded).expect("snapshot should deserialize");
-        assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.sandbox.mode, TurnSandboxMode::WorkspaceWrite);
     }
 
     #[test]
@@ -6810,35 +6845,6 @@ mod tests {
     }
 
     #[test]
-    fn turn_start_params_round_trips_api_provider_execution_backend() {
-        let params: TurnStartParams = serde_json::from_value(json!({
-            "thread_id": "thr_123",
-            "turn_id": "turn_123",
-            "execution_backend": {
-                "type": "apiProvider",
-                "provider": "openai"
-            }
-        }))
-        .expect("params should decode");
-
-        assert_eq!(
-            params.execution_backend,
-            Some(AgentExecutionBackend::ApiProvider {
-                provider: "openai".to_owned()
-            })
-        );
-
-        let encoded = serde_json::to_value(params).expect("params should encode");
-        assert_eq!(
-            encoded["execution_backend"],
-            json!({
-                "type": "apiProvider",
-                "provider": "openai"
-            })
-        );
-    }
-
-    #[test]
     fn turn_start_params_round_trips_reasoning_selection() {
         let params: TurnStartParams = serde_json::from_value(json!({
             "thread_id": "thr_123",
@@ -6987,28 +6993,11 @@ mod tests {
     }
 
     #[test]
-    fn turn_start_params_round_trips_future_acp_execution_backend() {
-        let params: TurnStartParams = serde_json::from_value(json!({
-            "thread_id": "thr_123",
-            "turn_id": "turn_123",
-            "execution_backend": {
-                "type": "acpAgentRuntime",
-                "runtime_id": "acp_local"
-            }
-        }))
-        .expect("params should decode");
-
-        assert_eq!(
-            params.execution_backend,
-            Some(AgentExecutionBackend::ACPAgentRuntime {
-                runtime_id: "acp_local".to_owned()
-            })
-        );
-    }
-
-    #[test]
     fn turn_start_params_encode_user_input_tagged_enum() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thr_123".to_owned(),
             turn_id: "turn_123".to_owned(),
@@ -7076,6 +7065,9 @@ mod tests {
     #[test]
     fn turn_start_params_encode_extended_attachment_input_variants() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thr_123".to_owned(),
             turn_id: "turn_123".to_owned(),
@@ -8965,5 +8957,173 @@ mod tests {
                 observation: None,
             },
         ]
+    }
+
+    #[test]
+    fn security_snapshot_modes_round_trip_explicit_contracts() {
+        let cases = [
+            {
+                let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                    "/workspace/project",
+                    1_700,
+                );
+                (
+                    "Unrestricted",
+                    snapshot,
+                    TurnSandboxMode::Unrestricted,
+                    TurnFilesystemSandboxKind::Unrestricted,
+                    vec![
+                        ("/schema_version", json!(1)),
+                        ("/version", json!(1)),
+                        ("/permission_profile/mode", json!("full_access")),
+                        ("/sandbox/mode", json!("unrestricted")),
+                        ("/sandbox/filesystem/kind", json!("unrestricted")),
+                        ("/sandbox/network/mode", json!("enabled")),
+                        ("/network/mode", json!("enabled")),
+                        ("/sandbox/backend_requirement", json!("optional")),
+                        ("/process/shell/enabled", json!(true)),
+                        ("/enforcement", json!({ "status": "active" })),
+                        ("/authority_cap/resource_binding_id", json!("unrestricted")),
+                    ],
+                )
+            },
+            {
+                let profile = TurnPermissionProfileSnapshot::from_mode(
+                    TurnPermissionMode::Supervised,
+                    TurnPermissionProfileSource::Composer,
+                );
+                let snapshot = TurnExecutionSecuritySnapshot::read_only(
+                    profile,
+                    "/workspace/project",
+                    vec![TurnFilesystemSandboxEntry::workspace_root(
+                        TurnFilesystemAccess::Read,
+                        "/workspace/project",
+                    )],
+                    1_701,
+                );
+                (
+                    "ReadOnly",
+                    snapshot,
+                    TurnSandboxMode::ReadOnly,
+                    TurnFilesystemSandboxKind::Restricted,
+                    vec![
+                        ("/permission_profile/mode", json!("supervised")),
+                        ("/sandbox/mode", json!("read_only")),
+                        ("/sandbox/filesystem/kind", json!("restricted")),
+                        (
+                            "/sandbox/filesystem/entries/0/path",
+                            json!({ "kind": "workspace_root" }),
+                        ),
+                        ("/sandbox/filesystem/entries/0/access", json!("read")),
+                        ("/network/mode", json!("disabled")),
+                        ("/authority_cap/filesystem/kind", json!("unrestricted")),
+                        ("/authority_cap/network/mode", json!("enabled")),
+                        ("/sandbox/backend_requirement", json!("required")),
+                        ("/sandbox/backend_preference", json!(["nono"])),
+                    ],
+                )
+            },
+            {
+                let profile = TurnPermissionProfileSnapshot::from_mode(
+                    TurnPermissionMode::AutoAcceptEdits,
+                    TurnPermissionProfileSource::Composer,
+                );
+                let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+                    profile,
+                    "/workspace/project",
+                    vec![TurnFilesystemSandboxEntry::workspace_root(
+                        TurnFilesystemAccess::Write,
+                        "/workspace/project",
+                    )],
+                    1_702,
+                );
+                (
+                    "WorkspaceWrite",
+                    snapshot,
+                    TurnSandboxMode::WorkspaceWrite,
+                    TurnFilesystemSandboxKind::Restricted,
+                    vec![
+                        ("/permission_profile/mode", json!("auto_accept_edits")),
+                        ("/sandbox/mode", json!("workspace_write")),
+                        ("/sandbox/filesystem/entries/0/access", json!("write")),
+                        ("/approval/allow_for_turn", json!(true)),
+                        ("/approval/request_permissions", json!(true)),
+                        ("/authority_cap/filesystem/kind", json!("unrestricted")),
+                        ("/authority_cap/network/mode", json!("enabled")),
+                        ("/backend/sandbox_backend", json!("nono")),
+                    ],
+                )
+            },
+        ];
+        for (name, snapshot, expected_mode, expected_filesystem, wire_fields) in cases {
+            let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
+            for (path, expected) in wire_fields {
+                assert_eq!(encoded.pointer(path), Some(&expected), "{name}: {path}");
+            }
+            assert!(encoded.get("sandbox").is_some(), "{name}: explicit sandbox");
+            let decoded: TurnExecutionSecuritySnapshot =
+                serde_json::from_value(encoded).expect("snapshot should deserialize");
+            assert_eq!(decoded, snapshot, "{name}");
+            assert_eq!(decoded.sandbox.mode, expected_mode, "{name}");
+            assert_eq!(
+                decoded.sandbox.filesystem.kind, expected_filesystem,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_start_params_provider_and_acp_backends_round_trip() {
+        let cases = [
+            (
+                "apiProvider",
+                json!({"type":"apiProvider","provider":"openai"}),
+                AgentExecutionBackend::ApiProvider {
+                    provider: "openai".to_owned(),
+                },
+            ),
+            (
+                "acpAgentRuntime",
+                json!({"type":"acpAgentRuntime","runtime_id":"acp_local"}),
+                AgentExecutionBackend::ACPAgentRuntime {
+                    runtime_id: "acp_local".to_owned(),
+                },
+            ),
+        ];
+        for (name, wire_backend, expected_backend) in cases {
+            let params: TurnStartParams = serde_json::from_value(json!({
+                "thread_id":"thr_123", "turn_id":"turn_123", "execution_backend":wire_backend.clone()
+            })).expect("params should decode");
+            assert_eq!(params.execution_backend, Some(expected_backend), "{name}");
+            let encoded = serde_json::to_value(params).expect("params should encode");
+            assert_eq!(encoded["execution_backend"], wire_backend, "{name}");
+        }
+    }
+
+    #[test]
+    fn permission_profile_default_entry_points_are_full_access_defaulted() {
+        let cases: [(&str, fn() -> TurnPermissionProfileSnapshot); 2] = [
+            ("resolve omitted selection", || {
+                resolve_turn_permission_profile(None)
+            }),
+            (
+                "default helper",
+                crate::default_turn_permission_profile_snapshot,
+            ),
+        ];
+        for (name, make_snapshot) in cases {
+            let snapshot = make_snapshot();
+            assert_eq!(snapshot.mode, TurnPermissionMode::FullAccess, "{name}");
+            assert_eq!(
+                snapshot.source,
+                TurnPermissionProfileSource::Defaulted,
+                "{name}"
+            );
+            assert_eq!(
+                snapshot.effective_policy,
+                ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow),
+                "{name}"
+            );
+        }
     }
 }

@@ -75,15 +75,21 @@ fn palette(cx: &App) -> serde_json::Value {
     };
     serde_json::json!({"appearance":if theme.mode.is_dark(){"dark"}else{"light"},
         "background":css(theme.background),"foreground":css(theme.foreground),
-        "muted":css(theme.muted_foreground),"border":css(theme.border),"accent":css(theme.primary)})
+        "muted":css(theme.muted_foreground),"border":css(theme.border),"accent":css(theme.primary),"accent-foreground":css(theme.primary_foreground)})
 }
 fn script(instance: u64, palette: &serde_json::Value) -> String {
     format!(
-        r#"(()=>{{if(window.top!==window)return;const instance={instance};let scheduled=false,last='',wheelY=0;const measure=()=>{{scheduled=false;const b=document.body;if(!b)return;const r=b.getBoundingClientRect();let bottom=Math.max(1,r.bottom+scrollY,r.top+scrollY+b.scrollHeight);for(const e of b.children)bottom=Math.max(bottom,e.getBoundingClientRect().bottom+scrollY);const payload=JSON.stringify({{instance,width:innerWidth,height:Math.ceil(bottom),wheelY}});if(payload!==last){{last=payload;window.ipc.postMessage(payload)}}}};const schedule=()=>{{if(!scheduled){{scheduled=true;requestAnimationFrame(measure)}}}};const apply=p=>{{const r=document.documentElement;if(!r)return;r.style.colorScheme=p.appearance;for(const k of ['background','foreground','muted','border','accent'])r.style.setProperty('--pioneer-'+k,p[k]);schedule()}};window.addEventListener('pioneer-theme',e=>apply(e.detail));window.addEventListener('resize',schedule);window.addEventListener('pioneer-measure',()=>{{last='';schedule()}});window.addEventListener('load',schedule);window.addEventListener('wheel',e=>{{if(e.ctrlKey||e.defaultPrevented||!Number.isFinite(e.deltaY)||e.deltaY===0)return;for(const node of e.composedPath()){{if(!(node instanceof Element)||node===document.body||node===document.documentElement)continue;const style=getComputedStyle(node);if(/^(auto|scroll|overlay)$/.test(style.overflowY)&&node.scrollHeight>node.clientHeight+1&&((e.deltaY>0&&node.scrollTop+node.clientHeight<node.scrollHeight-1)||(e.deltaY<0&&node.scrollTop>0)))return;}}const delta=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?innerHeight:1);if(!Number.isFinite(delta))return;e.preventDefault();wheelY+=Math.max(-10000,Math.min(10000,delta));schedule()}},{{passive:false}});document.addEventListener('DOMContentLoaded',()=>{{const resize=new ResizeObserver(schedule);resize.observe(document.body);resize.observe(document.documentElement);new MutationObserver(schedule).observe(document.documentElement,{{subtree:true,childList:true,attributes:true,characterData:true}});document.fonts.ready.then(schedule);document.fonts.addEventListener('loadingdone',schedule);apply({palette});measure()}});apply({palette});}})();"#
+        r#"(()=>{{if(window.top!==window)return;const instance={instance};let scheduled=false,last='',wheelY=0;const measure=()=>{{scheduled=false;const b=document.body;if(!b)return;const r=b.getBoundingClientRect();let bottom=Math.max(1,r.bottom+scrollY,r.top+scrollY+b.scrollHeight);for(const e of b.children)bottom=Math.max(bottom,e.getBoundingClientRect().bottom+scrollY);const payload=JSON.stringify({{instance,width:innerWidth,height:Math.ceil(bottom),wheelY}});if(payload!==last){{last=payload;window.ipc.postMessage(payload)}}}};const schedule=()=>{{if(!scheduled){{scheduled=true;requestAnimationFrame(measure)}}}};const apply=p=>{{const r=document.documentElement;if(!r)return;r.style.colorScheme=p.appearance;for(const k of ['background','foreground','muted','border','accent','accent-foreground'])r.style.setProperty('--pioneer-'+k,p[k]);schedule()}};window.addEventListener('pioneer-theme',e=>apply(e.detail));window.addEventListener('resize',schedule);window.addEventListener('pioneer-measure',()=>{{last='';schedule()}});window.addEventListener('load',schedule);window.addEventListener('wheel',e=>{{if(e.ctrlKey||e.defaultPrevented||!Number.isFinite(e.deltaY)||e.deltaY===0)return;for(const node of e.composedPath()){{if(!(node instanceof Element)||node===document.body||node===document.documentElement)continue;const style=getComputedStyle(node);if(/^(auto|scroll|overlay)$/.test(style.overflowY)&&node.scrollHeight>node.clientHeight+1&&((e.deltaY>0&&node.scrollTop+node.clientHeight<node.scrollHeight-1)||(e.deltaY<0&&node.scrollTop>0)))return;}}const delta=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?innerHeight:1);if(!Number.isFinite(delta))return;e.preventDefault();wheelY+=Math.max(-10000,Math.min(10000,delta));schedule()}},{{passive:false}});document.addEventListener('DOMContentLoaded',()=>{{const resize=new ResizeObserver(schedule);resize.observe(document.body);resize.observe(document.documentElement);new MutationObserver(schedule).observe(document.documentElement,{{subtree:true,childList:true,attributes:true,characterData:true}});document.fonts.ready.then(schedule);document.fonts.addEventListener('loadingdone',schedule);apply({palette});measure()}});apply({palette});}})();"#
     )
 }
 
 pub(super) struct HtmlView {
+    update: Option<(
+        pioneer_observability::updates::RenderBatch,
+        pioneer_observability::updates::RenderTarget,
+    )>,
+    update_visible: bool,
+    update_layout: bool,
     publication: HtmlPublication,
     response_thread: String,
     client: Arc<ClientCore>,
@@ -117,6 +123,40 @@ impl Drop for HtmlView {
     }
 }
 impl HtmlView {
+    pub(super) fn bind_update(
+        &mut self,
+        batch: pioneer_observability::updates::RenderBatch,
+        mut target: pioneer_observability::updates::RenderTarget,
+    ) {
+        target.part = pioneer_observability::updates::html_part(
+            &self.publication.artifact.artifact_id,
+            self.publication.artifact.version_id.as_deref(),
+        );
+        self.update = target.part.is_some().then_some((batch, target));
+    }
+    fn observe_layout(&self) {
+        let Some((batch, target)) = &self.update else {
+            return;
+        };
+        if !batch.is_pending() {
+            return;
+        }
+        if self.update_visible
+            && self.update_layout
+            && self.visible
+            && self.permitted
+            && self.source.is_some()
+            && !self.failed
+            && self.instance != 0
+            && self.auth_generation == self.client.authorization_connection_generation()
+        {
+            batch.observe(
+                target,
+                pioneer_observability::updates::RendererBoundary::HtmlVisibleLayout,
+            );
+        }
+    }
+
     pub(super) fn new(
         publication: HtmlPublication,
         response_thread: String,
@@ -129,6 +169,9 @@ impl HtmlView {
     ) -> Self {
         let auth_generation = client.authorization_connection_generation();
         Self {
+            update: None,
+            update_visible: false,
+            update_layout: false,
             publication,
             response_thread,
             client,
@@ -284,6 +327,8 @@ impl HtmlView {
         }
         self.messages = None;
         self.instance = 0;
+        self.update_layout = false;
+        self.update_visible = false;
         if let Some(identity) = self.action.take() {
             self.client.cancel_artifact_action(&identity);
         }
@@ -293,6 +338,9 @@ impl HtmlView {
         if !self.can_load || self.source.is_some() || self.download.is_some() || self.failed {
             return;
         }
+        let mut source = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::HtmlSource,
+        );
         let publication = self.publication.clone();
         if self
             .client
@@ -373,8 +421,14 @@ impl HtmlView {
                     };
                     client.complete_artifact_presentation(&identity, error);
                     match result {
-                        Ok(html) => view.source = Some(html.into()),
-                        Err(_) => view.failed = true,
+                        Ok(html) => {
+                            source.finish(pioneer_observability::updates::Fact::Accepted);
+                            view.source = Some(html.into());
+                        }
+                        Err(_) => {
+                            source.finish(pioneer_observability::updates::Fact::Rejected);
+                            view.failed = true;
+                        }
                     }
                 } else {
                     view.failed = true;
@@ -414,6 +468,7 @@ impl HtmlView {
             self.load(window, cx);
             return;
         };
+        self.update_layout = false;
         self.instance = INSTANCE.fetch_add(1, Ordering::Relaxed);
         let instance = self.instance;
         let (sender, mut receiver) = watch::channel(None::<String>);
@@ -466,6 +521,10 @@ impl HtmlView {
                                 if let Some(height) =
                                     layout(&raw, instance, f64::from(view.bounds.size.width))
                                 {
+                                    view.update_layout = true;
+                                    if window.is_visible() {
+                                        view.observe_layout();
+                                    }
                                     if let Ok(message) = serde_json::from_str::<Layout>(&raw) {
                                         let delta = message.wheel_y - last_wheel_y;
                                         last_wheel_y = message.wheel_y;
@@ -552,6 +611,17 @@ impl HtmlView {
             }
             return;
         };
+        self.update_visible = window.is_visible()
+            && document_intersects_viewport(
+                Bounds::new(bounds.origin, size(bounds.size.width, self.height)),
+                viewport,
+            );
+        if width_changed {
+            self.update_layout = false;
+        }
+        if self.update_visible {
+            self.observe_layout();
+        }
         self.row_offset = Some(bounds.origin - row_origin);
         if !self.retain_nearby(bounds, viewport, cx) {
             return;
@@ -594,6 +664,16 @@ impl HtmlView {
 }
 impl Render for HtmlView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some((batch, target)) = &self.update {
+            if self.failed {
+                batch.end(target, pioneer_observability::updates::RenderEnd::Failed);
+            } else if !self.permitted {
+                batch.end(
+                    target,
+                    pioneer_observability::updates::RenderEnd::Unconfirmed,
+                );
+            }
+        }
         let content =
             if !self.permitted || self.publication.artifact.status != ArtifactStatus::Ready {
                 div()
@@ -691,7 +771,7 @@ mod tests {
             test_support::{ThreadPorts, binding_router, install_thread_timeline},
             thread::{ThreadView, ThreadViewConfig},
         };
-        use gpui_kit::{component::Root, prelude::*, *};
+        use gpui_kit::{component::Root, *};
         use pioneer_client::{core::ClientCore, timeline::semantic::TopLevelPageMergeMode};
         use std::sync::Arc;
         cx.update(gpui_kit::init);
@@ -777,6 +857,57 @@ mod tests {
                         );
                     });
                 }
+                // The real retained HTML owner must have matching layout,
+                // visibility and current authorization before emitting evidence.
+                html.update(cx, |html, _| {
+                    use pioneer_observability::updates::{
+                        RenderBatch, RenderTarget, RendererBoundary, UpdateContext, html_part,
+                    };
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    let _lock = crate::test_support::UPDATE_OBSERVATION_LOCK.lock().unwrap();
+                    let old = pioneer_observability::telemetry_enabled();
+                    pioneer_observability::set_telemetry_enabled(true);
+                    let target = RenderTarget {
+                        thread: html.response_thread.clone(),
+                        generation: 1,
+                        row: html.key.id.as_str().to_owned(),
+                        revision: html.key.content_revision,
+                        boundary: RendererBoundary::HtmlVisibleLayout,
+                        part: html_part(
+                            &html.publication.artifact.artifact_id,
+                            html.publication.artifact.version_id.as_deref(),
+                        ),
+                    };
+                    let batch = RenderBatch::new(UpdateContext::source(None), [target.clone()]);
+                    let callbacks = Arc::new(AtomicUsize::new(0));
+                    let observed = callbacks.clone();
+                    batch.require_validity(move || {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        true
+                    });
+                    html.bind_update(batch, target);
+                    let permitted = html.permitted;
+                    html.permitted = true;
+                    html.update_layout = false;
+                    html.update_visible = true;
+                    html.observe_layout();
+                    assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+                    html.update_layout = true;
+                    html.auth_generation = html.auth_generation.wrapping_add(1);
+                    html.observe_layout();
+                    assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+                    html.auth_generation = html.client.authorization_connection_generation();
+                    html.update_visible = false;
+                    html.observe_layout();
+                    assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+                    html.update_visible = true;
+                    html.observe_layout();
+                    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+                    html.permitted = permitted;
+                    html.update_layout = false;
+                    html.update_visible = false;
+                    pioneer_observability::set_telemetry_enabled(old);
+                });
                 let identity = html.read(cx).publication.clone();
                 let key = html.read(cx).key.clone();
                 html.update(cx, |html, cx| {

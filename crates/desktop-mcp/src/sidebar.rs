@@ -76,6 +76,11 @@ impl CatalogSidebar {
     }
 
     pub(crate) fn render_mcp_details_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let embedded = self
+            .owner
+            .upgrade()
+            .is_some_and(|owner| owner.read(cx).is_plugin_component());
+
         let desktop_entity = self.owner.clone();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
         let can_manage_capabilities = self
@@ -107,51 +112,53 @@ impl CatalogSidebar {
                     .pt_4()
                     .px_2()
                     .gap_1()
-                    .child(
-                        Button::new("mcp-details-sidebar-back")
-                            .ghost()
-                            .justify_start()
-                            .px_2()
-                            .child({
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .justify_start()
-                                    .gap_2()
-                                    .child({
-                                        let icon_bg = cx.theme().foreground.opacity(0.075);
-                                        let icon_bg_hover = cx.theme().foreground.opacity(0.1);
-                                        div()
-                                            .id("mcp-details-sidebar-back-icon")
-                                            .size_6()
-                                            .rounded_full()
-                                            .bg(icon_bg)
-                                            .group_hover(
-                                                "mcp-details-sidebar-back-btn",
-                                                move |style| style.bg(icon_bg_hover),
-                                            )
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(
-                                                Icon::new(IconName::ChevronLeft)
-                                                    .size_5()
-                                                    .ml_neg_px()
-                                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY),
-                                            )
-                                    })
-                                    .child(sidebar_label(t!("mcp.sidebar.back").to_string()))
-                            })
-                            .on_click({
-                                let desktop_entity = desktop_entity.clone();
-                                move |_, _, cx| {
-                                    let _ = desktop_entity.update(cx, |view, cx| {
-                                        view.close_mcp_details_screen(cx);
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    )
+                    .when(!embedded, |column| {
+                        column.child(
+                            Button::new("mcp-details-sidebar-back")
+                                .ghost()
+                                .justify_start()
+                                .px_2()
+                                .child({
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_start()
+                                        .gap_2()
+                                        .child({
+                                            let icon_bg = cx.theme().foreground.opacity(0.075);
+                                            let icon_bg_hover = cx.theme().foreground.opacity(0.1);
+                                            div()
+                                                .id("mcp-details-sidebar-back-icon")
+                                                .size_6()
+                                                .rounded_full()
+                                                .bg(icon_bg)
+                                                .group_hover(
+                                                    "mcp-details-sidebar-back-btn",
+                                                    move |style| style.bg(icon_bg_hover),
+                                                )
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    Icon::new(IconName::ChevronLeft)
+                                                        .size_5()
+                                                        .ml_neg_px()
+                                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                                )
+                                        })
+                                        .child(sidebar_label(t!("mcp.sidebar.back").to_string()))
+                                })
+                                .on_click({
+                                    let desktop_entity = desktop_entity.clone();
+                                    move |_, _, cx| {
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.close_mcp_details_screen(cx);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                    })
                     .when_some(oauth_actions, |this, actions| this.child(actions))
                     .when(can_manage_capabilities, |this| {
                         this.child(
@@ -263,36 +270,15 @@ impl CatalogSidebar {
     }
 }
 
-fn sidebar_icon(icon: IconName, cx: &mut Context<CatalogSidebar>) -> AnyElement {
-    let icon_bg = cx.theme().foreground.opacity(0.075);
-    div()
-        .size_6()
-        .rounded_full()
-        .bg(icon_bg)
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(Icon::new(icon).size_4().opacity(SIDEBAR_MENU_ITEM_OPACITY))
-        .into_any_element()
+fn sidebar_icon(icon: impl Into<Icon>, cx: &App) -> AnyElement {
+    pioneer_desktop_foundation::catalog_sidebar_icon(icon, true, cx).into_any_element()
 }
 
 pub(crate) fn sidebar_menu_icon(icon: impl Into<Icon>) -> AnyElement {
-    div()
-        .size_6()
-        .rounded_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(Icon::new(icon).size_4().opacity(SIDEBAR_MENU_ITEM_OPACITY))
-        .into_any_element()
+    pioneer_desktop_foundation::catalog_sidebar_menu_icon(icon).into_any_element()
 }
-
 pub(crate) fn sidebar_label(label: String) -> AnyElement {
-    div()
-        .line_height(relative(1.))
-        .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-        .child(label)
-        .into_any_element()
+    pioneer_desktop_foundation::catalog_sidebar_label(label).into_any_element()
 }
 
 use crate::catalog::CatalogInput;

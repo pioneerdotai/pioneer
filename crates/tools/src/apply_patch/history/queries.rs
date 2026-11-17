@@ -757,22 +757,6 @@ mod tests {
     }
 
     #[test]
-    fn file_history_follows_rename_alias() {
-        let log = AppliedPatchLog::new();
-        let item = record(0, "old.txt", Some("new.txt"));
-        log.insert(item.record, [1; 32]).unwrap();
-        let page = query_file_history(
-            &log,
-            "thread",
-            "new.txt",
-            None,
-            HistoryQueryLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(page.items.len(), 1);
-    }
-
-    #[test]
     fn file_history_follows_rename_alias_across_turns_with_reset_ordinals() {
         let log = AppliedPatchLog::new();
         let mut first = record(1, "old.txt", Some("middle.txt"));

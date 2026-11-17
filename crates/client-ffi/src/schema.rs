@@ -43,6 +43,14 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             pioneer_client::cli_runtime::acp::AcpSessionResponse
         ),
         schema_doc!(
+            "plugin_shell_request.json",
+            crate::package_shell::PluginShellRequest
+        ),
+        schema_doc!(
+            "plugin_shell_response.json",
+            crate::package_shell::PluginShellResponse
+        ),
+        schema_doc!(
             "client_scope_lease_request_dto.json",
             crate::client_binding::ClientScopeLeaseRequestDto
         ),

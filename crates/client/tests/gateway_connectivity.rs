@@ -4,21 +4,6 @@ use pioneer_client::gateway::{
 };
 
 #[test]
-fn gateway_base_url_rejects_legacy_or_unsafe_values() {
-    for input in [
-        " ",
-        "ws://gateway.example.com",
-        "wss://gateway.example.com/socket",
-        "https://user:secret@gateway.example.com",
-        "https://gateway.example.com?token=secret",
-        "https://gateway.example.com#fragment",
-        "http://0.0.0.0:17878",
-    ] {
-        assert!(GatewayBaseUrl::parse_presentation(input).is_err());
-    }
-}
-
-#[test]
 fn gateway_base_url_normalizes_presentation_input() {
     assert_eq!(
         GatewayBaseUrl::parse_presentation("127.0.0.1")

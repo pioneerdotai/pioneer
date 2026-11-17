@@ -4,6 +4,7 @@ use super::*;
 use crate::patch_history_observer::{SqlitePatchObserver, reserve_patch_history_capacity};
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, StreamExt};
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_observability::{
     GatewayMarkdownMessageMetric, GatewayMarkdownMessageOutcome, GatewayMarkdownOutcome,
     GatewayMarkdownStage, GatewayMarkdownStageMetric, GatewayMarkdownStreamKind,
@@ -21,6 +22,83 @@ use std::time::Instant;
 const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
 const TITLE_JOB_BASE_BACKOFF_MS: u64 = 200;
 const TITLE_JOB_MAX_JITTER_MS: u64 = 250;
+
+// Two bits per consumer: kicks publish pending before trying to own running.
+// SeqCst gives the release/recheck handshake one order across both bits.
+#[derive(Default)]
+pub(super) struct NativeTurnEventDeliveryWake {
+    pub(super) running: AtomicBool,
+    pending: AtomicBool,
+    deadline_wake: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) claim_barrier: super::compaction_background::CompletedHistoryPreparationBarrier,
+    #[cfg(test)]
+    pub(super) handoff_barrier: super::compaction_background::CompletedHistoryPreparationBarrier,
+}
+
+#[derive(Default)]
+pub(super) struct NativeTurnEventDeliveryWorkers {
+    pub(super) live: Arc<NativeTurnEventDeliveryWake>,
+    pub(super) episodic: Arc<NativeTurnEventDeliveryWake>,
+    pub(super) tasks: tokio_util::task::TaskTracker,
+    pub(super) shutdown: tokio_util::sync::CancellationToken,
+    // Admission and close are synchronous; shutdown cannot miss a late spawn.
+    pub(super) admission: std::sync::Mutex<()>,
+}
+
+struct NativeTurnEventDeliveryGuard {
+    wake: Arc<NativeTurnEventDeliveryWake>,
+    owned: bool,
+    recovery: pioneer_sqlite::WorkSignal,
+}
+
+impl NativeTurnEventDeliveryGuard {
+    fn acquire(
+        wake: Arc<NativeTurnEventDeliveryWake>,
+        recovery: pioneer_sqlite::WorkSignal,
+    ) -> Option<Self> {
+        wake.running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(Self {
+            wake,
+            owned: true,
+            recovery,
+        })
+    }
+
+    fn release(&mut self) {
+        // Disarm before publishing availability: Drop must never reset a
+        // replacement owner's running bit, including after a failed reacquire.
+        self.owned = false;
+        self.wake.running.store(false, Ordering::SeqCst);
+    }
+
+    fn reacquire_if_pending(&mut self) -> bool {
+        // A replacement may already be running. Do not consume its wake.
+        if !self.wake.pending.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.owned = self
+            .wake
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        self.owned
+    }
+}
+
+impl Drop for NativeTurnEventDeliveryGuard {
+    fn drop(&mut self) {
+        if self.owned {
+            // Panic/cancellation retains a wake for recovery. Durable claims
+            // remain leased; neither cancellation nor this bit ACKs an effect.
+            self.wake.pending.store(true, Ordering::SeqCst);
+            self.release();
+            self.recovery.notify();
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct NativeTerminalEffectDispatchOutcome {
@@ -332,6 +410,7 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnCapabilitiesResolved { thread_id, .. }
         | AgentDurableEvent::SkillAuditEvents { thread_id, .. }
         | AgentDurableEvent::TurnLlmContextAppended { thread_id, .. }
+        | AgentDurableEvent::ProviderUsageSnapshot { thread_id, .. }
         | AgentDurableEvent::TurnProviderHistoryAppended { thread_id, .. }
         | AgentDurableEvent::ProviderFailureDetected { thread_id, .. }
         | AgentDurableEvent::RecoveryAttemptSucceeded { thread_id, .. }
@@ -392,6 +471,7 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnCapabilitiesResolved { turn_id, .. }
         | AgentDurableEvent::SkillAuditEvents { turn_id, .. }
         | AgentDurableEvent::TurnLlmContextAppended { turn_id, .. }
+        | AgentDurableEvent::ProviderUsageSnapshot { turn_id, .. }
         | AgentDurableEvent::TurnProviderHistoryAppended { turn_id, .. }
         | AgentDurableEvent::ProviderFailureDetected { turn_id, .. }
         | AgentDurableEvent::RecoveryAttemptSucceeded { turn_id, .. }
@@ -495,7 +575,7 @@ fn terminal_durable_event_status(event: &AgentDurableEvent) -> Option<TurnStatus
 
 // Same SeaORM -> SQLx driver chain used by the existing memory write mapper.
 // SQLite extended codes preserve the primary BUSY/LOCKED code in the low byte.
-fn native_preparation_has_typed_sqlite_lock(error: &anyhow::Error) -> bool {
+pub(super) fn native_preparation_has_typed_sqlite_lock(error: &anyhow::Error) -> bool {
     use sea_orm::{DbErr, RuntimeErr, SqlxError};
     let Some(db_error) = error.downcast_ref::<DbErr>() else {
         return false;
@@ -535,6 +615,21 @@ impl std::fmt::Display for NativeTurnControlTransitionPending {
 impl std::error::Error for NativeTurnControlTransitionPending {}
 
 fn classify_native_preparation_error(error: anyhow::Error) -> DurableCommitRejection {
+    if error
+        .downcast_ref::<pioneer_crud::UnactivatedTurnPhaseChanged>()
+        .is_some()
+    {
+        return DurableCommitRejection::permanent(
+            "execution_generation_changed",
+            "Stop source ownership or generation changed",
+        );
+    }
+    if pioneer_crud::turn_event_was_appended_before_error(&error) {
+        return DurableCommitRejection::retryable(
+            "native_terminal_projection_pending",
+            "accepted Stop is waiting for canonical projection",
+        );
+    }
     if error
         .downcast_ref::<NativeTurnControlTransitionPending>()
         .is_some()
@@ -902,7 +997,9 @@ impl MessageProcessor {
                         let terminal_enqueue_age =
                             durable_receiver.pending_enqueue_age().unwrap_or_default();
                         let projection_started = Instant::now();
-                        let (commit_result, listener_failed) = match AssertUnwindSafe(async {
+                        let work=durable_receiver.pending_work();
+                        let closing_correlation = durable_receiver.pending_closing_correlation();
+                        let (commit_result, listener_failed) = match AssertUnwindSafe(work.scope_result(closing_correlation.scope(async {
                             if let Some(weak) = &this {
                                 let Some(this) = weak.upgrade() else {
                                     return Err(DurableCommitRejection::permanent(
@@ -911,17 +1008,17 @@ impl MessageProcessor {
                                     ));
                                 };
                                 let this = this.with_database_class(SqliteWriteClass::Critical);
-                                this.commit_durable_agent_event(event).await
+                                this.commit_leased_durable_agent_event(event, actor_generation).await
                             } else {
                                 #[cfg(test)]
-                                { test_this.as_ref().expect("test listener owner").commit_durable_agent_event(event).await }
+                                { test_this.as_ref().expect("test listener owner").commit_leased_durable_agent_event(event, actor_generation).await }
                                 #[cfg(not(test))]
                                 { Err(DurableCommitRejection::permanent(
                                     "processor_stopped",
                                     "gateway message processor is no longer available",
                                 )) }
                             }
-                        })
+                        })))
                         .catch_unwind()
                         .await
                         {
@@ -978,7 +1075,8 @@ impl MessageProcessor {
                     }, if live_receiver.is_some() => {
                         match live {
                             Some(Ok(event)) => {
-                                if AssertUnwindSafe(async {
+                                let work=live_receiver.as_ref().map(|receiver|receiver.pending_work()).unwrap_or_default();
+                                if AssertUnwindSafe(work.scope(async {
                                     if let Some(weak) = &this {
                                         let Some(this) = weak.upgrade() else { return; };
                                         let this = this.with_database_class(SqliteWriteClass::Critical);
@@ -987,7 +1085,7 @@ impl MessageProcessor {
                                         #[cfg(test)]
                                         { test_this.as_ref().expect("test listener owner").handle_progress_agent_event(event).await; }
                                     }
-                                })
+                                }))
                                     .catch_unwind()
                                     .await
                                     .is_err()
@@ -1041,24 +1139,62 @@ impl MessageProcessor {
         Ok(())
     }
 
+    fn item_type_allows_markdown(item_type: Option<TurnItemType>) -> bool {
+        matches!(
+            item_type,
+            Some(TurnItemType::AgentMessage | TurnItemType::Reasoning | TurnItemType::UserMessage)
+        )
+    }
+
     pub(super) fn enrich_turn_item_events_markdown(events: &mut [TurnItemEvent]) {
-        let mut buffers: HashMap<String, String> = HashMap::new();
+        let mut buffers: HashMap<(String, String, String), String> = HashMap::new();
 
         for event in events {
             match &mut event.payload {
-                TurnItemEventPayload::ItemStarted { item, .. } => {
-                    let (item_id, text) = Self::normalize_item_markdown(item);
-                    buffers.insert(item_id, text);
+                TurnItemEventPayload::ItemStarted {
+                    thread_id,
+                    turn_id,
+                    item,
+                    ..
+                }
+                | TurnItemEventPayload::ItemUpdated {
+                    thread_id,
+                    turn_id,
+                    item,
+                    ..
+                } => {
+                    let key = (
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        item.item_id().to_owned(),
+                    );
+                    if Self::item_type_allows_markdown(Some(item.item_type())) {
+                        let (_, text) = Self::normalize_item_markdown(item);
+                        buffers.insert(key, text);
+                    } else {
+                        buffers.remove(&key);
+                    }
                 }
                 TurnItemEventPayload::ItemDelta {
+                    thread_id,
+                    turn_id,
                     item_id,
                     delta,
+                    payload,
                     markdown,
                     markdown_version,
                     ..
                 } => {
+                    if Self::is_provider_message_preview(payload.as_ref()) {
+                        continue;
+                    }
+                    // A delta cannot establish its own type or full prefix.
+                    // Wait for an allowed lifecycle snapshot in this event set.
+                    let key = (thread_id.clone(), turn_id.clone(), item_id.clone());
+                    let Some(text) = buffers.get_mut(&key) else {
+                        continue;
+                    };
                     let full_text = {
-                        let text = buffers.entry(item_id.clone()).or_default();
                         text.push_str(delta.as_str());
                         text.clone()
                     };
@@ -1070,25 +1206,21 @@ impl MessageProcessor {
                         *markdown_version = Some(MARKDOWN_AST_VERSION);
                     }
                 }
-                TurnItemEventPayload::ItemCompleted { item, .. }
-                | TurnItemEventPayload::ItemUpdated { item, .. } => {
-                    let (item_id, _) = Self::normalize_item_markdown(item);
-                    buffers.remove(item_id.as_str());
+                TurnItemEventPayload::ItemCompleted {
+                    thread_id,
+                    turn_id,
+                    item,
+                    ..
+                } => {
+                    Self::normalize_item_markdown(item);
+                    buffers.remove(&(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        item.item_id().to_owned(),
+                    ));
                 }
                 _ => {}
             }
-        }
-    }
-
-    pub(super) fn tool_item_output(item: &TurnItem) -> Option<String> {
-        match item {
-            TurnItem::CommandExecution { display, .. } => tool_display_text(display),
-            TurnItem::FileChange { display, .. }
-            | TurnItem::WebSearch { display, .. }
-            | TurnItem::WebFetch { display, .. }
-            | TurnItem::Download { display, .. }
-            | TurnItem::DynamicToolCall { display, .. } => tool_display_text(display),
-            _ => None,
         }
     }
 
@@ -1187,6 +1319,9 @@ impl MessageProcessor {
     }
 
     pub(super) fn normalize_item_markdown(item: &mut TurnItem) -> (String, String) {
+        if !Self::item_type_allows_markdown(Some(item.item_type())) {
+            return (item.item_id().to_owned(), String::new());
+        }
         match item {
             TurnItem::AgentMessage {
                 id,
@@ -1219,11 +1354,7 @@ impl MessageProcessor {
                 };
                 (id.clone(), text)
             }
-            _ => {
-                let id = item.item_id().to_owned();
-                let text = Self::tool_item_output(item).unwrap_or_default();
-                (id, text)
-            }
+            _ => (item.item_id().to_owned(), String::new()),
         }
     }
 
@@ -1389,22 +1520,146 @@ impl MessageProcessor {
         .await
     }
 
+    async fn initial_stop_handoff_is_current(
+        &self,
+        preparation: &pioneer_protocol::NativeTerminalEffectPreparation,
+    ) -> Result<bool, DurableCommitRejection> {
+        let Some(proof) = self
+            .agent_manager
+            .initial_cancellation_handoff(preparation)
+            .await
+        else {
+            return Ok(false);
+        };
+        if proof.2 != self.turn_execution_owner_id.as_ref() {
+            return Ok(false);
+        }
+        let current = self
+            .crud_store
+            .get_turn_execution(&preparation.turn_id)
+            .await
+            .map_err(|error| {
+                if super::agent_action_tools::agent_start_has_storage_failure(&error) {
+                    DurableCommitRejection::retryable(
+                        "storage_temporarily_unavailable",
+                        "initial Stop source proof could not access storage",
+                    )
+                } else {
+                    classify_native_preparation_error(error)
+                }
+            })?;
+        Ok(current.is_some_and(|owner| {
+            owner.owner_id == proof.2
+                && owner.owner_generation == proof.3
+                && owner.thread_id == preparation.thread_id
+                && owner.workspace_id == preparation.workspace_id
+                && (owner.status.is_active()
+                    || owner.status == pioneer_crud::TurnExecutionStatus::Interrupted)
+        }) && self
+            .agent_manager
+            .initial_cancellation_handoff(preparation)
+            .await
+            .as_ref()
+            == Some(&proof))
+    }
+
     async fn prepare_native_turn_control(
         &self,
         preparation: pioneer_protocol::NativeTerminalEffectPreparation,
         initial_turn: bool,
+        foreground: Option<Arc<super::turn_handlers::foreground_start::StartObligation>>,
     ) -> Result<(), DurableCommitRejection> {
         if initial_turn {
-            return self
-                .crud_store
-                .persist_native_cancellation_context(
-                    preparation,
-                    self.turn_execution_owner_id.as_ref(),
-                    now_timestamp_secs(),
-                    true,
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__native_initial_control_before_registration__",
+                    &tokio_util::sync::CancellationToken::new(),
                 )
-                .await
-                .map_err(classify_native_preparation_error);
+                .await;
+            let result = if let Some(entry) = foreground.as_ref() {
+                let expected = entry
+                    .execution
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let generation = *entry
+                    .actor_generation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let source = self.agent_manager.initial_start_receipt(&preparation).await;
+                match (expected, generation, source) {
+                    (Some(expected), Some(generation), Some(source))
+                        if source.actor_generation == generation =>
+                    {
+                        self.crud_store
+                            .confirm_foreground_start_cancellation_context(
+                                preparation.clone(),
+                                &expected,
+                                now_timestamp_secs(),
+                            )
+                            .await
+                    }
+                    _ => Err(anyhow::anyhow!(
+                        "foreground activation actor retired or cancelled"
+                    )),
+                }
+            } else {
+                self.crud_store
+                    .persist_native_cancellation_context(
+                        preparation.clone(),
+                        self.turn_execution_owner_id.as_ref(),
+                        now_timestamp_secs(),
+                        true,
+                    )
+                    .await
+            };
+            let result = match result {
+                Err(error) => {
+                    // A handed-off initial Stop still owns this registration
+                    // publication. Typed storage unavailability cannot become a
+                    // permanent refusal before its terminal completion receipt.
+                    if super::agent_action_tools::agent_start_has_storage_failure(&error)
+                        && self.initial_stop_handoff_is_current(&preparation).await?
+                    {
+                        #[cfg(test)]
+                        self.completed_history_preparation_barrier
+                            .wait_if_armed(
+                                "__initial_stop_registration_failed__",
+                                &tokio_util::sync::CancellationToken::new(),
+                            )
+                            .await;
+                        Err(DurableCommitRejection::retryable(
+                            "storage_temporarily_unavailable",
+                            "initial native Stop could not register its immutable context",
+                        ))
+                    } else {
+                        Err(classify_native_preparation_error(error))
+                    }
+                }
+                Ok(()) => Ok(()),
+            };
+            #[cfg(test)]
+            if result.is_ok() {
+                self.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__native_initial_control_after_registration__",
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
+            }
+            if let Some(entry) = foreground {
+                // Retryable storage failures retain the obligation; a definitive
+                // outcome wakes only this startup, never optional publication.
+                if result.is_ok() {
+                    entry.activation_result(Ok(()));
+                } else if let Err(error) = &result {
+                    if !error.is_retryable() {
+                        entry.activation_result(Err(format!("{error:?}")));
+                    }
+                }
+            }
+            return result;
         }
         // Capture the actor's exact delivery source before any await which can
         // retire it. A late delivery from another run must not fail its successor.
@@ -1476,15 +1731,20 @@ impl MessageProcessor {
                 self.defer_native_turn_control_transition(&preparation)
                     .await?;
             }
-            self.send_notification_to_thread_subscribers(
-                &preparation.thread_id,
-                events::THREAD_UPDATED,
-                &ThreadUpdatedNotification {
-                    thread,
-                    placement: None,
-                },
-            )
-            .await;
+            if !self
+                .foreground_starts
+                .pending(&preparation.thread_id, &preparation.turn_id)
+            {
+                self.send_notification_to_thread_subscribers(
+                    &preparation.thread_id,
+                    events::THREAD_UPDATED,
+                    &ThreadUpdatedNotification {
+                        thread,
+                        placement: None,
+                    },
+                )
+                .await;
+            }
             #[cfg(test)]
             self.completed_history_preparation_barrier
                 .wait_if_armed(
@@ -1537,40 +1797,18 @@ impl MessageProcessor {
             // An accepted terminal event fences execution even before projection,
             // but only the projected durable Turn confirms a snapshot for fanout.
             // Conflicting provisional state is left to rollback and existing delivery.
-            let durable = self
-                .crud_store
-                .get_turn(&preparation.thread_id, &preparation.turn_id)
-                .await
-                .map_err(|_| {
-                    DurableCommitRejection::retryable(
-                        "native_recovery_outcome_unavailable",
-                        "native recovery outcome could not be checked",
-                    )
-                })?;
-            if let Some((workspace, terminal)) = durable.as_ref()
-                && workspace == &preparation.workspace_id
-                && terminal.id == preparation.turn_id
-                && terminal.status != TurnStatus::InProgress
-                && matches!(
-                    self.thread_manager
-                        .commit_terminal_turn(&preparation.thread_id, terminal)
-                        .await,
-                    Ok(true)
+            self.synchronize_projected_native_terminal_turn(
+                &preparation.workspace_id,
+                &preparation.thread_id,
+                &preparation.turn_id,
+            )
+            .await
+            .map_err(|_| {
+                DurableCommitRejection::retryable(
+                    "native_recovery_outcome_unavailable",
+                    "native recovery outcome could not be synchronized",
                 )
-                && let Some(thread) = self.thread_manager.thread_get(&preparation.thread_id).await
-                && thread.workspace_id == preparation.workspace_id
-                && thread.turns.iter().any(|turn| turn == terminal)
-            {
-                self.send_notification_to_thread_subscribers(
-                    &preparation.thread_id,
-                    events::THREAD_UPDATED,
-                    &ThreadUpdatedNotification {
-                        thread,
-                        placement: None,
-                    },
-                )
-                .await;
-            }
+            })?;
             let failure_message = format!("native Turn control restoration failed: {error:#}");
             let rejection = classify_native_preparation_error(error);
             if !rejection.is_retryable()
@@ -1664,11 +1902,95 @@ impl MessageProcessor {
         Err(NativeTurnControlTransitionPending.into())
     }
 
+    // Statistics are supplemental only when the CLI producer marker and native
+    // identity agree with this Turn's persisted CLI binding. A code alone must
+    // never exempt API usage or arbitrary SystemEvents from failure handling.
+    async fn is_bound_cli_statistics(&self, notification: &ItemCompletedNotification) -> bool {
+        let TurnItem::SystemEvent {
+            code: Some(code),
+            details: Some(details),
+            ..
+        } = &notification.item
+        else {
+            return false;
+        };
+        let identity = match code.as_str() {
+            "provider_usage"
+                if details["schema_version"] == 1
+                    && details["observation_kind"] == "cli_native_statistics" =>
+            {
+                &details["usage"]
+            }
+            "cli_native_turn_timing" if details["observation_kind"] == "cli_native_turn_timing" => {
+                details
+            }
+            _ => return false,
+        };
+        let (Some(runtime), Some(native_thread), Some(native_turn)) = (
+            identity["runtime"].as_str(),
+            identity["native_thread_id"].as_str(),
+            identity["native_turn_id"].as_str(),
+        ) else {
+            return false;
+        };
+        if !matches!(runtime, "codex" | "claude" | "opencode") || native_turn.is_empty() {
+            return false;
+        }
+        match self
+            .crud_store
+            .get_cli_runtime_turn_binding_control(&notification.turn_id)
+            .await
+        {
+            Ok(Some(binding)) => {
+                binding.workspace_id == notification.workspace_id
+                    && binding.thread_id == notification.thread_id
+                    && binding.runtime_kind == runtime
+                    && binding.native_thread_id == native_thread
+            }
+            Ok(None) => false,
+            Err(error) => {
+                warn!(error = %error, "failed to validate supplemental CLI statistics binding");
+                false
+            }
+        }
+    }
+
     pub(super) fn handle_durable_agent_event<'a>(
         &'a self,
         event: AgentDurableEvent,
     ) -> MessageFuture<'a, bool> {
         message_future(async move { self.commit_durable_agent_event(event).await.is_ok() })
+    }
+
+    async fn commit_leased_durable_agent_event(
+        &self,
+        event: AgentDurableEvent,
+        actor_generation: u64,
+    ) -> Result<(), DurableCommitRejection> {
+        let initial = match &event {
+            AgentDurableEvent::NativeCancellationContextPrepared {
+                preparation,
+                initial_turn: true,
+            } => Some(preparation.clone()),
+            _ => None,
+        };
+        // Construct before the first await: the canonical owner captures any
+        // foreground obligation, including across retirement while guards wait.
+        let commit = self.commit_durable_agent_event(event);
+        if let Some(preparation) = initial {
+            if self
+                .agent_manager
+                .initial_start_receipt(&preparation)
+                .await
+                .is_none_or(|receipt| receipt.actor_generation != actor_generation)
+            {
+                return Err(DurableCommitRejection::permanent(
+                    "stale_initial_actor",
+                    "initial registration actor was retired",
+                ));
+            }
+        }
+        commit.await
     }
 
     pub(crate) fn commit_durable_agent_event<'a>(
@@ -1684,6 +2006,18 @@ impl MessageProcessor {
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
         mut turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> MessageFuture<'a, Result<(), DurableCommitRejection>> {
+        let closing_correlation = (event.is_terminal()
+            || matches!(&event, AgentDurableEvent::TurnFinalizationPrepared { .. }))
+        .then(pioneer_observability::scenario::Correlation::capture);
+        let foreground_activation = match &event {
+            AgentDurableEvent::NativeCancellationContextPrepared {
+                preparation,
+                initial_turn: true,
+            } => self
+                .foreground_starts
+                .entry(&preparation.thread_id, &preparation.turn_id),
+            _ => None,
+        };
         let terminal_delivery = cli_blocked_guard
             .as_ref()
             .filter(|guard| guard.terminal_delivery_id.is_some())
@@ -1783,7 +2117,7 @@ impl MessageProcessor {
                 {
                     let binding = self
                         .crud_store
-                        .get_cli_runtime_turn_binding(turn_id)
+                        .get_cli_runtime_turn_binding_control(turn_id)
                         .await
                         .map_err(|_| {
                             DurableCommitRejection::retryable(
@@ -1794,7 +2128,7 @@ impl MessageProcessor {
                     if let Some(binding) = binding {
                         let expected = self
                             .crud_store
-                            .cli_runtime_turn_terminal_guard(&binding)
+                            .cli_runtime_turn_terminal_control_guard(&binding)
                             .await
                             .map_err(|_| {
                                 DurableCommitRejection::retryable(
@@ -1822,7 +2156,7 @@ impl MessageProcessor {
                         if expected.is_none()
                             || self
                                 .crud_store
-                                .cli_runtime_turn_terminal_guard(&binding)
+                                .cli_runtime_turn_terminal_control_guard(&binding)
                                 .await
                                 .map_err(|_| {
                                     DurableCommitRejection::retryable(
@@ -1839,26 +2173,91 @@ impl MessageProcessor {
                         }
                     }
                 }
-                let already_committed = if let Some(turn_id) = durable_event_turn_id(&event) {
+                let initial_stop = matches!(
+                    &event,
+                    AgentDurableEvent::TurnInterrupted {
+                        cancellation_owner: Some(_),
+                        ..
+                    }
+                );
+                // A captured control cancellation proves authority at its
+                // generation-bound writer, even after the work graph is fenced.
+                // Numeric late evidence refines an already prepared attempt;
+                // its source/physical identity is revalidated in the writer.
+                // It neither activates nor mutates execution lifecycle state.
+                let financial_refinement =
+                    matches!(&event, AgentDurableEvent::ProviderUsageSnapshot { .. });
+                let already_committed = if initial_stop || financial_refinement {
+                    false
+                } else if let Some(turn_id) = durable_event_turn_id(&event) {
                     match self.guard_execution_commit(turn_id).await {
                         Ok(_) => false,
                         Err(error) => {
-                            if !event.is_terminal()
+                            // A failed handoff lookup cannot replace an already
+                            // established semantic denial with a storage retry.
+                            let handoff_relevant =
+                                super::agent_action_tools::agent_start_has_storage_failure(&error)
+                                    || error.downcast_ref::<crate::authorization::ExecutionTurnNotInProgress>()
+                                        .is_some_and(|e| e.status() == TurnStatus::Interrupted);
+                            let handed_off = if handoff_relevant
+                                && let AgentDurableEvent::NativeCancellationContextPrepared {
+                                    preparation,
+                                    initial_turn: true,
+                                } = &event
+                            {
+                                self.initial_stop_handoff_is_current(preparation).await?
+                            } else {
+                                false
+                            };
+                            if handed_off
+                                && super::agent_action_tools::agent_start_has_storage_failure(
+                                    &error,
+                                )
+                            {
+                                #[cfg(test)]
+                                self.completed_history_preparation_barrier
+                                    .wait_if_armed(
+                                        "__initial_stop_registration_guard_failed__",
+                                        &tokio_util::sync::CancellationToken::new(),
+                                    )
+                                    .await;
+                                return Err(DurableCommitRejection::retryable(
+                                    "storage_temporarily_unavailable",
+                                    "initial Stop registration guard could not access storage",
+                                ));
+                            }
+                            let accepted_interruption = if !event.is_terminal()
                                 && error.downcast_ref::<crate::authorization::ExecutionTurnNotInProgress>()
                                     .is_some_and(|e| e.status() == TurnStatus::Interrupted)
-                                && confirm_owned_cancellation_lookup(self.crud_store.native_cancellation_was_accepted_owned(
+                            {
+                                self.crud_store.native_cancellation_was_accepted_owned(
                                     turn_id, self.turn_execution_owner_id.as_ref()
-                                ).await)? {
-                                return Err(DurableCommitRejection::superseded_by_durable_interruption());
-                            }
-                            match classify_durable_commit_guard_error(&event, &error) {
-                                // A targeted CLI source must still reach writer validation
-                                // when replaying a terminal canonical event.
-                                Ok(already_committed) => {
-                                    already_committed && cli_blocked_guard.is_none()
+                                ).await.map_err(|lookup| {
+                                    if handed_off && super::agent_action_tools::agent_start_has_storage_failure(&lookup) {
+                                        DurableCommitRejection::retryable("storage_temporarily_unavailable",
+                                            "initial Stop acceptance proof could not access storage")
+                                    } else { classify_native_preparation_error(lookup) }
+                                })?
+                            } else { false };
+                            if accepted_interruption && handed_off {
+                                // Registration replay after our cancellation append must
+                                // preserve the control publisher through cleanup and sync.
+                                true
+                            } else {
+                                if accepted_interruption {
+                                    return Err(
+                                        DurableCommitRejection::superseded_by_durable_interruption(
+                                        ),
+                                    );
                                 }
-                                Err(rejection) => {
-                                    pioneer_observability::record_native_lifecycle_event(
+                                match classify_durable_commit_guard_error(&event, &error) {
+                                    // A targeted CLI source must still reach writer validation
+                                    // when replaying a terminal canonical event.
+                                    Ok(already_committed) => {
+                                        already_committed && cli_blocked_guard.is_none()
+                                    }
+                                    Err(rejection) => {
+                                        pioneer_observability::record_native_lifecycle_event(
                                     pioneer_observability::NativeLifecycleEventMetric {
                                         stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
                                         outcome: pioneer_observability::NativeLifecycleOutcome::Rejected,
@@ -1866,13 +2265,14 @@ impl MessageProcessor {
                                         elapsed: None,
                                     },
                                 );
-                                    warn!(
-                                        rejection_code = rejection.code(),
-                                        retryable = rejection.is_retryable(),
-                                        error = %format!("{error:#}"),
-                                        "durable agent event failed its execution commit guard"
-                                    );
-                                    return Err(rejection);
+                                        warn!(
+                                            rejection_code = rejection.code(),
+                                            retryable = rejection.is_retryable(),
+                                            error = %format!("{error:#}"),
+                                            "durable agent event failed its execution commit guard"
+                                        );
+                                        return Err(rejection);
+                                    }
                                 }
                             }
                         }
@@ -1887,8 +2287,24 @@ impl MessageProcessor {
                         turn_id,
                         reason,
                         recovery,
+                        cancellation_owner,
                     } => {
-                        if already_committed {
+                        if let Some((owner_id, generation)) = cancellation_owner {
+                            Some(self.commit_initial_native_cancellation(
+                                thread_id, turn_id, reason, owner_id, *generation,
+                            ).await.map_err(|error| {
+                                if pioneer_crud::turn_event_was_appended_before_error(&error) {
+                                    DurableCommitRejection::retryable("native_terminal_projection_pending",
+                                        "accepted initial Stop is waiting for canonical projection")
+                                } else if super::agent_action_tools::agent_start_has_storage_failure(&error) {
+                                    DurableCommitRejection::retryable("storage_temporarily_unavailable",
+                                        "initial native Stop could not persist its terminal outcome")
+                                } else if error.downcast_ref::<pioneer_crud::UnactivatedTurnPhaseChanged>().is_some() {
+                                    DurableCommitRejection::permanent("execution_generation_changed",
+                                        "initial native Stop source ownership changed")
+                                } else { classify_native_preparation_error(error) }
+                            }))
+                        } else if already_committed {
                             Some(Ok(()))
                         } else {
                             let user_reason = self
@@ -1923,10 +2339,16 @@ impl MessageProcessor {
                     AgentDurableEvent::NativeCancellationContextPrepared {
                         preparation,
                         initial_turn,
-                    } => Some(
-                        self.prepare_native_turn_control(preparation.clone(), *initial_turn)
-                            .await,
-                    ),
+                    } => Some(if already_committed {
+                        Ok(())
+                    } else {
+                        self.prepare_native_turn_control(
+                            preparation.clone(),
+                            *initial_turn,
+                            foreground_activation.clone(),
+                        )
+                        .await
+                    }),
                     AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => Some(
                         match self
                             .crud_store
@@ -2060,7 +2482,12 @@ impl MessageProcessor {
         message_future(pioneer_observability::turn_startup::scope_stage(
             startup_key,
             pioneer_observability::turn_startup::Stage::Projection,
-            future,
+            async move {
+                match closing_correlation {
+                    Some(correlation) => correlation.scope(future).await,
+                    None => future.await,
+                }
+            },
         ))
     }
 
@@ -2154,6 +2581,19 @@ impl MessageProcessor {
                     "gateway could not persist the turn skill projection",
                 ));
             }
+            let resolved_skills = bindings
+                .iter()
+                .map(|b| b.skill_id.clone())
+                .collect::<Vec<_>>();
+            self.crud_store
+                .ready_plugin_selection(&turn_id, &resolved_skills)
+                .await
+                .map_err(|_| {
+                    DurableCommitRejection::retryable(
+                        "plugin_selection_unavailable",
+                        "plugin selection could not become ready",
+                    )
+                })?;
             pioneer_observability::record_native_lifecycle_event(
                 pioneer_observability::NativeLifecycleEventMetric {
                     stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
@@ -2801,12 +3241,17 @@ impl MessageProcessor {
 
                 // Source/job is already committed atomically; wake only advances execution.
                 self.spawn_thread_episodic_index_run();
-                self.send_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    events::ITEM_UPDATED,
-                    &notification,
-                )
-                .await;
+                if !self
+                    .foreground_starts
+                    .pending(&notification.thread_id, &notification.turn_id)
+                {
+                    self.send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::ITEM_UPDATED,
+                        &notification,
+                    )
+                    .await;
+                }
                 self.notify_semantic_timeline_item_changed(
                     notification.workspace_id.as_str(),
                     notification.thread_id.as_str(),
@@ -2863,122 +3308,334 @@ impl MessageProcessor {
         Ok(())
     }
 
-    pub(super) async fn process_due_native_turn_event_deliveries(
+    async fn process_due_native_turn_event_deliveries_for_consumer(
         &self,
+        consumer: &'static str,
         now_unix: i64,
         limit: u64,
-    ) -> Result<u64> {
-        let mut processed = 0_u64;
-        for consumer in [
-            pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
-            pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
-        ] {
-            let deliveries = self
-                .crud_store
-                .claim_due_turn_event_deliveries(consumer, now_unix, limit)
-                .await?;
-            let mut by_turn = std::collections::BTreeMap::<
-                String,
-                Vec<pioneer_crud::ClaimedTurnEventDeliveryRecord>,
-            >::new();
-            for delivery in deliveries {
-                by_turn
-                    .entry(delivery.event.turn_id.clone())
-                    .or_default()
-                    .push(delivery);
-            }
-            processed = processed.saturating_add(
-                by_turn
-                    .values()
-                    .map(|deliveries| deliveries.len() as u64)
-                    .sum::<u64>(),
-            );
-            futures_util::stream::iter(by_turn.into_values())
-                .for_each_concurrent(Some(16), |deliveries| async move {
-                    for delivery in deliveries {
-                        self.process_claimed_native_turn_event_delivery(delivery)
-                            .await;
-                    }
-                })
-                .await;
+    ) -> Result<(u64, Option<i64>)> {
+        let batch = self
+            .crud_store
+            .claim_due_turn_event_deliveries_with_deadline(consumer, now_unix, limit)
+            .await?;
+        let processed = batch.deliveries.len() as u64;
+        if processed == 1 {
+            self.process_claimed_native_turn_event_delivery(
+                batch.deliveries.into_iter().next().expect("one delivery"),
+            )
+            .await?;
+            return Ok((processed, batch.next_eligible_at_unix));
         }
-        Ok(processed)
+
+        let mut by_turn = std::collections::BTreeMap::<
+            String,
+            Vec<pioneer_crud::ClaimedTurnEventDeliveryRecord>,
+        >::new();
+        for delivery in batch.deliveries {
+            by_turn
+                .entry(delivery.event.turn_id.clone())
+                .or_default()
+                .push(delivery);
+        }
+        // Claim discovery admits only causal heads, so each turn has one
+        // outstanding delivery. Keep per-turn sequencing explicit if that
+        // representation changes; other turns remain independent.
+        let deliveries = futures_util::stream::iter(by_turn.into_values())
+            .map(|deliveries| async move {
+                let mut outcomes = Vec::with_capacity(deliveries.len());
+                for delivery in deliveries {
+                    outcomes.push(
+                        self.prepare_native_turn_event_delivery_settlement(delivery)
+                            .await,
+                    );
+                }
+                outcomes
+            })
+            .buffer_unordered(16)
+            .ready_chunks(64);
+        let storage_failed = AtomicBool::new(false);
+        deliveries
+            .for_each_concurrent(Some(16), |ready| {
+                let storage_failed = &storage_failed;
+                async move {
+                    let ready = ready.into_iter().flatten().collect::<Vec<_>>();
+                    // ready_chunks never waits to fill a batch. Settlement futures
+                    // are polled alongside delivery, so waiting for the writer
+                    // cannot suspend the other turns' notification futures.
+                    if self
+                        .crud_store
+                        .settle_turn_event_deliveries(&ready)
+                        .await
+                        .is_err()
+                    {
+                        // Isolate a poison row. Exact tokens also fence a replay
+                        // following an unknown but actually committed batch write.
+                        for outcome in ready {
+                            if self
+                                .crud_store
+                                .settle_turn_event_deliveries(&[outcome])
+                                .await
+                                .is_err()
+                            {
+                                storage_failed.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        anyhow::ensure!(
+            !storage_failed.load(Ordering::Relaxed),
+            "turn-event delivery acknowledgement/deferral storage failed"
+        );
+        Ok((processed, batch.next_eligible_at_unix))
     }
 
-    /// Wake the optional outbox after the canonical transaction commits.
-    ///
-    /// The durable commit ACK never waits for websocket, artifact, or episodic
-    /// side effects. At the same time, delivery cannot depend solely on the
-    /// process-wide resilience worker: restored/test-owned processors and a
-    /// freshly admitted turn may not have reached that worker yet. Each kick
-    /// drains a bounded number of batches; the durable retry schedule remains
-    /// authoritative for failures and the periodic worker remains the restart
-    /// safety net.
+    /// Wake both existing consumers after commit, or from periodic recovery.
+    /// Each consumer owns a separate bounded drain; neither waits for the other.
     pub(super) fn kick_native_turn_event_deliveries(&self) {
-        if self
-            .native_turn_event_delivery_kick_running
-            .swap(true, Ordering::AcqRel)
-        {
+        self.kick_native_turn_event_delivery_consumer(
+            pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
+            self.native_turn_event_delivery_workers.live.clone(),
+        );
+        self.kick_native_turn_event_delivery_consumer(
+            pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
+            self.native_turn_event_delivery_workers.episodic.clone(),
+        );
+    }
+
+    fn kick_native_turn_event_delivery_consumer(
+        &self,
+        consumer: &'static str,
+        wake: Arc<NativeTurnEventDeliveryWake>,
+    ) {
+        let workers = &self.native_turn_event_delivery_workers;
+        let _admission = workers
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if workers.tasks.is_closed() || workers.shutdown.is_cancelled() {
             return;
         }
+        wake.pending.store(true, Ordering::SeqCst);
+        wake.deadline_wake.notify_one();
+        let Some(guard) = NativeTurnEventDeliveryGuard::acquire(
+            wake.clone(),
+            self.crud_store
+                .database_connection()
+                .work_signal("projection"),
+        ) else {
+            return;
+        };
         let this = self.scoped_for_background_reconciliation();
-        tokio::spawn(async move {
-            struct KickGuard(Arc<AtomicBool>);
-
-            impl Drop for KickGuard {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
-                }
+        let shutdown = workers.shutdown.clone();
+        // Construct the guard before spawning: even an unpolled cancelled task
+        // must release ownership. The processor lifecycle tracks and cancels it.
+        let future = async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {}
+                _ = this.drain_native_turn_event_delivery_consumer(consumer, wake, guard) => {}
             }
+        };
+        #[cfg(test)]
+        let future = {
+            use sentry::SentryFutureExt;
+            use tracing::instrument::WithSubscriber;
+            let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+            future
+                .with_subscriber(dispatch)
+                .bind_hub(sentry::Hub::current())
+        };
+        workers.tasks.spawn(future);
+    }
 
-            let _guard = KickGuard(this.native_turn_event_delivery_kick_running.clone());
+    async fn drain_native_turn_event_delivery_consumer(
+        &self,
+        consumer: &'static str,
+        wake: Arc<NativeTurnEventDeliveryWake>,
+        mut guard: NativeTurnEventDeliveryGuard,
+    ) {
+        #[cfg(test)]
+        let shutdown = &self.native_turn_event_delivery_workers.shutdown;
+        loop {
+            wake.pending.store(false, Ordering::SeqCst);
+            // Consume the initial kick's permit before discovering timers.
+            // A concurrent kick still publishes pending before its Notify.
+            let _ = wake.deadline_wake.notified().now_or_never();
+            let mut exhausted = true;
             for _ in 0..128 {
-                match this
-                    .process_due_native_turn_event_deliveries(now_timestamp_secs(), 64)
-                    .await
-                {
-                    Ok(0) => break,
+                let result = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::EventDelivery,
+                    pioneer_observability::DatabaseOperationSite::NativeEventDelivery,
+                    super::retry_transient_storage_access(|| {
+                        self.process_due_native_turn_event_deliveries_for_consumer(
+                            consumer,
+                            now_timestamp_secs(),
+                            64,
+                        )
+                    }),
+                )
+                .await;
+                match result {
+                    Ok((0, next_eligible_at_unix)) => {
+                        exhausted = false;
+                        #[cfg(test)]
+                        wake.claim_barrier.wait_if_armed("empty", shutdown).await;
+                        // Timed retry/lease is itself an unblocker: no new
+                        // domain commit is required. Keep the coalesced owner
+                        // only while a future eligible timer exists. A retained
+                        // Notify permit plus pending covers kick-before-sleep.
+                        if let Some(deadline) = next_eligible_at_unix {
+                            #[cfg(test)]
+                            wake.claim_barrier.wait_if_armed("timer", shutdown).await;
+                            if !wake.pending.load(Ordering::SeqCst) {
+                                tokio::select! {
+                                    _ = wake.deadline_wake.notified() => {}
+                                    _ = pioneer_sqlite::wait_for_unix_deadline(deadline) => {}
+                                }
+                            }
+                            wake.pending.store(true, Ordering::SeqCst);
+                        }
+                        break;
+                    }
                     Ok(_) => tokio::task::yield_now().await,
                     Err(error) => {
-                        warn!(
-                            error = %format!("{error:#}"),
-                            "post-commit native turn-event delivery kick failed"
-                        );
+                        exhausted = false;
+                        error!(consumer, error = %format!("{error:#}"), "native turn-event optional delivery worker failed");
+                        #[cfg(test)]
+                        wake.claim_barrier
+                            .wait_if_armed("storage_failed", shutdown)
+                            .await;
+                        // Claim/ACK/deferral errors cannot turn coalesced
+                        // wakes into a hot loop. No DB capacity is held.
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        // Retain the durable retry obligation when the owner is
+                        // released below; no periodic external kick is needed.
+                        wake.pending.store(true, Ordering::SeqCst);
                         break;
                     }
                 }
             }
-        });
+            if exhausted {
+                // A nonempty last batch may have unblocked another
+                // causal head. Hand that runnable possibility to the
+                // next quantum, rather than waiting for periodic recovery.
+                wake.pending.store(true, Ordering::SeqCst);
+                #[cfg(test)]
+                wake.claim_barrier.wait_if_armed("quantum", shutdown).await;
+            }
+            guard.release();
+            #[cfg(test)]
+            wake.handoff_barrier
+                .wait_if_armed("released", shutdown)
+                .await;
+            if !guard.reacquire_if_pending() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Wake durable terminal work without lending handler latency to the
     /// process-wide resilience loop. One bounded claim wave runs at a time;
-    /// terminal commits and the periodic worker provide subsequent kicks.
+    /// terminal commits provide invalidation; this owner retains due clocks.
     pub(super) fn kick_native_terminal_effects(&self) {
+        #[cfg(not(test))]
+        self.spawn_native_terminal_effect_kick();
+        #[cfg(test)]
+        self.spawn_native_terminal_effect_kick(None);
+    }
+
+    // Regression fixtures fix only this owner's discovery clock. Production
+    // has no clock override and still reads UTC separately for each wave.
+    pub(super) fn spawn_native_terminal_effect_kick(
+        &self,
+        #[cfg(test)] discovery_clock: Option<Box<dyn Fn() -> i64 + Send>>,
+    ) {
+        let workers = &self.native_turn_event_delivery_workers;
+        let _admission = workers
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if workers.tasks.is_closed() || workers.shutdown.is_cancelled() {
+            return;
+        }
+        let database = self.crud_store.database_connection().maintenance();
+        let signal = database.work_signal("native.effects");
+        let mut changes = signal.subscribe();
         // Retain a wakeup that arrives while the bounded worker is already
         // running. Without this bit, a terminal commit racing an earlier
-        // preparation kick can leave a newly eligible effect asleep until the
-        // periodic recovery sweep.
+        // preparation kick must still invalidate that owner's next discovery.
         self.native_terminal_effect_kick_pending
             .store(true, Ordering::Release);
         if self
             .native_terminal_effect_kick_running
             .swap(true, Ordering::AcqRel)
         {
+            drop(_admission);
+            signal.notify();
             return;
         }
         let this = self.scoped_for_background_reconciliation();
-        tokio::spawn(async move {
+        let shutdown = workers.shutdown.clone();
+        struct OwnerGuard {
+            running: Arc<AtomicBool>,
+            control: pioneer_sqlite::WorkSignal,
+            shutdown: tokio_util::sync::CancellationToken,
+            complete: bool,
+        }
+        impl Drop for OwnerGuard {
+            fn drop(&mut self) {
+                if !self.complete {
+                    self.running.store(false, Ordering::Release);
+                    if !self.shutdown.is_cancelled() {
+                        self.control.notify_keys(&[
+                            pioneer_crud::GatewayControlWake::NativeRetention.key(),
+                        ]);
+                    }
+                }
+            }
+        }
+        let owner = OwnerGuard {
+            running: this.native_terminal_effect_kick_running.clone(),
+            control: database.work_signal("gateway.control"),
+            shutdown: shutdown.clone(),
+            complete: false,
+        };
+        let worker_signal = signal.clone();
+        let worker = async move {
+            let mut owner = owner;
             loop {
                 this.native_terminal_effect_kick_pending
                     .store(false, Ordering::Release);
+                if changes.begin_pass(&database).await.is_err() {
+                    warn!(
+                        dispatched_count = 0_u64,
+                        "native terminal-effect source settlement failed; retry deferred"
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                let discovery_now = now_timestamp_secs();
+                #[cfg(test)]
+                let discovery_now = discovery_clock
+                    .as_ref()
+                    .map_or(discovery_now, |clock| clock());
+                let change = worker_signal.changing();
                 let (dispatched_count, storage_failed) = match this
-                    .process_due_native_terminal_effects(now_timestamp_secs(), 8)
+                    .process_due_native_terminal_effects(discovery_now, 8)
                     .await
                 {
                     Ok(outcome) => (outcome.count, outcome.storage_failed),
                     Err(_error) => (0, true),
                 };
+                if !storage_failed {
+                    change.completed(false);
+                } else {
+                    drop(change);
+                }
                 if storage_failed {
                     warn!(
                         dispatched_count,
@@ -2987,31 +3644,70 @@ impl MessageProcessor {
                     // A failed durable deferral/claim must not spin on coalesced
                     // kicks. The quantum has released all database capacity.
                     tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Retry settlement after one backoff. A failed discovery
+                    // cannot supply a valid deadline head; querying it here
+                    // could add a second backoff before the same retry.
+                    continue;
                 }
 
+                // The raw due head covers quota continuation even if no row
+                // dispatched (gate probes, exhausted rows or a stale claim).
+                // Future retry, lease and acceptance clocks need no client.
+                let deadline = match this
+                    .crud_store
+                    .next_native_terminal_effect_execution_deadline()
+                    .await
+                {
+                    Ok(deadline) => deadline,
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
                 if this
                     .native_terminal_effect_kick_pending
                     .load(Ordering::Acquire)
                 {
+                    tokio::task::yield_now().await;
                     continue;
                 }
-
-                this.native_terminal_effect_kick_running
-                    .store(false, Ordering::Release);
-                // Close the release/reacquire race: a caller that published a
-                // wake immediately before `running` became false observed the
-                // old true value and did not spawn a replacement worker.
-                if !this
+                if deadline.is_some() {
+                    #[cfg(test)]
+                    this.completed_history_preparation_barrier
+                        .wait_if_armed("__terminal_effect_before_timer__", &owner.shutdown)
+                        .await;
+                    changes.wait(deadline).await;
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                // Admission also guards release, so the old owner cannot
+                // clear the running flag of a newly admitted replacement.
+                let _admission = this
+                    .native_turn_event_delivery_workers
+                    .admission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if this
                     .native_terminal_effect_kick_pending
                     .swap(false, Ordering::AcqRel)
-                    || this
-                        .native_terminal_effect_kick_running
-                        .swap(true, Ordering::AcqRel)
                 {
-                    break;
+                    continue;
                 }
+                owner.complete = true;
+                this.native_terminal_effect_kick_running
+                    .store(false, Ordering::Release);
+                break;
+            }
+        };
+        workers.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {},
+                _ = worker => {},
             }
         });
+        drop(_admission);
+        signal.notify();
     }
 
     async fn persist_native_patch_history(
@@ -3384,6 +4080,351 @@ impl MessageProcessor {
         .await
     }
 
+    // Completion of a generation-bound initial Stop belongs to the actor's
+    // existing durable publication, not to the lifetime of the HTTP request.
+    // Registration alone is never an interruption receipt.
+    async fn commit_initial_native_cancellation(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        reason: &str,
+        owner_id: &str,
+        generation: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            owner_id == self.turn_execution_owner_id.as_ref(),
+            pioneer_crud::UnactivatedTurnPhaseChanged
+        );
+        let owner = self
+            .crud_store
+            .get_turn_execution(turn_id)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        anyhow::ensure!(
+            owner.owner_id == owner_id
+                && owner.owner_generation == generation
+                && owner.thread_id == thread_id,
+            pioneer_crud::UnactivatedTurnPhaseChanged
+        );
+        let context = self
+            .crud_store
+            .native_cancellation_context(turn_id)
+            .await?
+            .ok_or(pioneer_crud::NativeCancellationContextUnavailable)?;
+        let (workspace_id, mut turn) = self
+            .crud_store
+            .get_turn(thread_id, turn_id)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        anyhow::ensure!(
+            workspace_id == owner.workspace_id
+                && matches!(
+                    turn.status,
+                    TurnStatus::InProgress | TurnStatus::Interrupted
+                ),
+            pioneer_crud::UnactivatedTurnPhaseChanged
+        );
+        turn.status = TurnStatus::Interrupted;
+        turn.error = Some(reason.to_owned());
+        let preparation = pioneer_agent::post_turn::prepare_native_cancellation(
+            context.preparation.clone(),
+            reason,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let actor = self
+            .user_turn_cancel_intents
+            .lock()
+            .await
+            .get(&(thread_id.to_owned(), turn_id.to_owned()))
+            .and_then(|intent| intent.actor_id.clone());
+        let acceptance = self
+            .crud_store
+            .materialize_native_cancellation_owned_at_generation(
+                pioneer_crud::CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn,
+                }),
+                now_timestamp_secs(),
+                context,
+                preparation,
+                owner_id,
+                actor,
+                generation,
+            )
+            .await;
+        #[cfg(test)]
+        if acceptance.is_err() {
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__initial_stop_terminal_commit_failed__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+        }
+        acceptance?;
+        let completion = self.finish_turn_cancellation(&owner).await;
+        #[cfg(test)]
+        if completion.is_err() {
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__initial_stop_terminal_completion_pending__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+        }
+        completion
+    }
+
+    async fn finish_turn_cancellation(
+        &self,
+        owner: &pioneer_crud::TurnExecutionRecord,
+    ) -> Result<()> {
+        let thread_id = owner.thread_id.as_str();
+        let turn_id = owner.turn_id.as_str();
+        let workspace_id = owner.workspace_id.as_str();
+        let current = self
+            .crud_store
+            .get_turn_execution(turn_id)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        anyhow::ensure!(
+            current.owner_id == owner.owner_id
+                && current.owner_generation == owner.owner_generation
+                && current.thread_id == owner.thread_id
+                && current.workspace_id == owner.workspace_id,
+            pioneer_crud::UnactivatedTurnPhaseChanged
+        );
+        let projected = self
+            .crud_store
+            .get_turn(thread_id, turn_id)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        if projected.1.status == TurnStatus::InProgress {
+            return Err(NativeTurnControlTransitionPending.into());
+        }
+
+        anyhow::ensure!(
+            projected.0 == owner.workspace_id && projected.1.status == TurnStatus::Interrupted,
+            pioneer_crud::UnactivatedTurnPhaseChanged
+        );
+        if let Some(response) =
+            pioneer_crud::load_agent_turn_response(&self.crud_store.database_connection(), turn_id)
+                .await?
+        {
+            let execution = pioneer_crud::load_agent_execution(
+                &self.crud_store.database_connection(),
+                &response.execution_id,
+            )
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+            // Tasks retain their own aggregate cleanup protocol. Direct Threads
+            // and ordinary roots finish their exact resources before completion.
+            if execution.parent_task_id.is_none() {
+                anyhow::ensure!(
+                    self.crud_store
+                        .finalize_terminal_agent_turn_owned(
+                            owner,
+                            &response.execution_id,
+                            pioneer_crud::utc_now(),
+                        )
+                        .await?,
+                    pioneer_crud::UnactivatedTurnPhaseChanged
+                );
+            }
+        }
+
+        if !self
+            .synchronize_projected_native_terminal_turn(workspace_id, thread_id, turn_id)
+            .await?
+        {
+            return Err(NativeTurnControlTransitionPending.into());
+        }
+        let current = self
+            .crud_store
+            .get_turn_execution(turn_id)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        anyhow::ensure!(
+            current.owner_id == owner.owner_id
+                && current.owner_generation == owner.owner_generation
+                && current.thread_id == owner.thread_id
+                && current.workspace_id == owner.workspace_id,
+            pioneer_crud::UnactivatedTurnPhaseChanged
+        );
+        Ok(())
+    }
+
+    async fn cancel_cli_after_initial_phase(
+        &self,
+        expected: &pioneer_crud::TurnExecutionRecord,
+        notification: TurnFailedNotification,
+        actor: Option<String>,
+        timestamp: i64,
+    ) -> Result<()> {
+        let selected = self
+            .crud_store
+            .get_cli_runtime_turn_binding_control(&expected.turn_id)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        let selected_attempt = self
+            .crud_store
+            .latest_cli_runtime_turn_attempt(&expected.turn_id)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        let transition = Arc::new(
+            self.cli_runtime_turn_resume_transition(&expected.turn_id)
+                .await?
+                .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?,
+        );
+        // Re-read under the selected session gate. Neither a new binding nor
+        // another durable owner/generation inherits this early Stop's proof.
+        let binding = self
+            .crud_store
+            .get_cli_runtime_turn_binding_control(&expected.turn_id)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        anyhow::ensure!(
+            binding.turn_id == selected.turn_id
+                && binding.thread_id == selected.thread_id
+                && binding.workspace_id == selected.workspace_id
+                && binding.runtime_id == selected.runtime_id
+                && binding.runtime_kind == selected.runtime_kind
+                && binding.continuation_thread_id == selected.continuation_thread_id
+                && binding.native_thread_id == selected.native_thread_id,
+            pioneer_crud::UnactivatedTurnPhaseChanged
+        );
+        let source = self
+            .crud_store
+            .cli_runtime_turn_terminal_control_guard(&binding)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        anyhow::ensure!(
+            source.execution_owner.as_ref()
+                == Some(&(expected.owner_id.clone(), expected.owner_generation))
+                && binding.workspace_id == expected.workspace_id
+                && binding.thread_id == expected.thread_id
+                && source
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.id == selected_attempt.id),
+            pioneer_crud::UnactivatedTurnPhaseChanged
+        );
+        let reason = notification
+            .turn
+            .error
+            .clone()
+            .unwrap_or_else(|| "turn interrupted".into());
+        if source.turn_status == TurnStatus::InProgress {
+            anyhow::ensure!(
+                source
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.status.is_active()),
+                pioneer_crud::UnactivatedTurnPhaseChanged
+            );
+            self.crud_store
+                .materialize_cli_runtime_cancellation_owned_as(
+                    notification,
+                    expected,
+                    &source,
+                    actor,
+                    timestamp,
+                )
+                .await?;
+        } else {
+            // Activation may have observed this same public cancellation intent
+            // while retaining the gate. Confirm its terminal; never append again.
+            anyhow::ensure!(
+                source.turn_status == TurnStatus::Interrupted,
+                pioneer_crud::UnactivatedTurnPhaseChanged
+            );
+        }
+        // Cleanup is the existing CLI binding/attempt lifecycle. Completion
+        // still requires projection and the exact terminal resource release.
+        self.finish_turn_cancellation(expected)
+            .await
+            .context(NativeTurnControlTransitionPending)?;
+        anyhow::ensure!(
+            self.cleanup_cli_runtime_terminal_turn_status_with_transition(
+                &binding,
+                TurnStatus::Interrupted,
+                &reason,
+                Some(&transition)
+            )
+            .await,
+            NativeTurnControlTransitionPending
+        );
+        Ok(())
+    }
+
+    // A single Stop may cross initial actor admission while its early writer
+    // waits. Re-observe the exact durable owner, then use the existing control
+    // command only for the proved initial registration phase. None means the
+    // actor confirmed canonical completion, never merely a missing context.
+    async fn cancellation_context_after_initial_phase(
+        &self,
+        expected: &pioneer_crud::TurnExecutionRecord,
+        reason: &str,
+    ) -> Result<Option<pioneer_crud::NativeCancellationContext>> {
+        let revalidate = |current: &pioneer_crud::TurnExecutionRecord| -> Result<()> {
+            anyhow::ensure!(
+                current.owner_id == expected.owner_id
+                    && current.owner_generation == expected.owner_generation
+                    && current.thread_id == expected.thread_id
+                    && current.workspace_id == expected.workspace_id,
+                pioneer_crud::UnactivatedTurnPhaseChanged
+            );
+            Ok(())
+        };
+        let current = self
+            .crud_store
+            .get_turn_execution(&expected.turn_id)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        revalidate(&current)?;
+        if let Some(context) = self
+            .crud_store
+            .native_cancellation_context(&expected.turn_id)
+            .await?
+        {
+            return Ok(Some(context));
+        }
+        if let Some((actor_generation, run_id)) = self
+            .agent_manager
+            .turn_owner_waiting_for_cancellation_context(&expected.thread_id, &expected.turn_id)
+            .await
+        {
+            let canonical_accepted = self
+                .agent_manager
+                .cancel_turn_for_generation(
+                    &expected.thread_id,
+                    &expected.turn_id,
+                    reason,
+                    actor_generation,
+                    run_id,
+                    (expected.owner_id.clone(), expected.owner_generation),
+                )
+                .await?;
+            if canonical_accepted {
+                // The receipt proves the fenced canonical write and cleanup.
+                // Fallible reads after it cannot revoke that accepted outcome.
+                return Ok(None);
+            }
+        }
+        let current = self
+            .crud_store
+            .get_turn_execution(&expected.turn_id)
+            .await?
+            .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+        revalidate(&current)?;
+        self.crud_store
+            .native_cancellation_context(&expected.turn_id)
+            .await?
+            .map(Some)
+            .ok_or_else(|| pioneer_crud::NativeCancellationContextUnavailable.into())
+    }
+
     async fn materialize_native_agent_turn_event_with_cli_blocked_guard(
         &self,
         event: pioneer_crud::CanonicalTurnEventPayload,
@@ -3403,6 +4444,16 @@ impl MessageProcessor {
         } else {
             None
         };
+        let interruption = matches!(&event,
+            pioneer_crud::CanonicalTurnEventPayload::TurnFailed(n)
+                if n.turn.status == TurnStatus::Interrupted);
+        let interruption_target = interruption.then(|| {
+            (
+                event.workspace_id().to_owned(),
+                event.thread_id().to_owned(),
+                event.turn_id().to_owned(),
+            )
+        });
         let guarded_cli_blocked_commit = cli_blocked_guard.is_some();
         let activates_terminal_effects = matches!(
             &event,
@@ -3410,6 +4461,132 @@ impl MessageProcessor {
                 | pioneer_crud::CanonicalTurnEventPayload::TurnFailed(_)
                 | pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(_)
         );
+        let mut preactivation_cancellation = None;
+        let mut cancellation_generation = None;
+        let mut interruption_owner = None;
+        let cancellation = if let pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification) =
+            &event
+            && notification.turn.status == TurnStatus::Interrupted
+        {
+            let mut context = self
+                .crud_store
+                .native_cancellation_context(&notification.turn.id)
+                .await?;
+            let execution = self
+                .crud_store
+                .get_turn_execution(&notification.turn.id)
+                .await?;
+            interruption_owner = execution.clone();
+            if context.is_none() {
+                let actor_generation = self
+                    .agent_manager
+                    .turn_owner_generation(&notification.thread_id, &notification.turn.id)
+                    .await;
+                let registration_pending = self
+                    .agent_manager
+                    .turn_owner_waiting_for_cancellation_context(
+                        &notification.thread_id,
+                        &notification.turn.id,
+                    )
+                    .await;
+                let cli_attempt = self
+                    .crud_store
+                    .latest_cli_runtime_turn_attempt(&notification.turn.id)
+                    .await?;
+                if actor_generation.is_some()
+                    && registration_pending.map(|(generation, _)| generation) != actor_generation
+                {
+                    // Registration may have completed after the first read.
+                    // A completed phase still requires the actual context.
+                    context = self
+                        .crud_store
+                        .native_cancellation_context(&notification.turn.id)
+                        .await?;
+                }
+                if let Some(expected) = execution.as_ref().filter(|e| {
+                    e.owner_id == self.turn_execution_owner_id.as_ref()
+                        && (actor_generation.is_none()
+                            || registration_pending.map(|(generation, _)| generation)
+                                == actor_generation)
+                        && e.thread_id == notification.thread_id
+                        && e.workspace_id == notification.workspace_id
+                        && (e.started_at.is_none()
+                            || e.status == pioneer_crud::TurnExecutionStatus::Starting
+                            || (actor_generation.is_some()
+                                && registration_pending.map(|(generation, _)| generation)
+                                    == actor_generation
+                                && matches!(
+                                    e.executor_kind,
+                                    pioneer_crud::TurnExecutorKind::NativeAgent
+                                        | pioneer_crud::TurnExecutorKind::ApiProvider
+                                )))
+                        && matches!(
+                            e.status,
+                            pioneer_crud::TurnExecutionStatus::Starting
+                                | pioneer_crud::TurnExecutionStatus::Queued
+                                | pioneer_crud::TurnExecutionStatus::Running
+                                | pioneer_crud::TurnExecutionStatus::Interrupted
+                        )
+                }) && cli_attempt.is_none()
+                    && context.is_none()
+                {
+                    if actor_generation.is_some() {
+                        context = self
+                            .cancellation_context_after_initial_phase(
+                                expected,
+                                notification
+                                    .turn
+                                    .error
+                                    .as_deref()
+                                    .unwrap_or("turn interrupted"),
+                            )
+                            .await?;
+                        if context.is_none() {
+                            return Ok(());
+                        }
+                    } else {
+                        preactivation_cancellation = Some(expected.clone());
+                    }
+                }
+                if context.is_none()
+                    && preactivation_cancellation.is_none()
+                    && (execution.as_ref().is_some_and(|e| {
+                        matches!(
+                            e.executor_kind,
+                            pioneer_crud::TurnExecutorKind::NativeAgent
+                                | pioneer_crud::TurnExecutorKind::ApiProvider
+                        )
+                    }) || actor_generation.is_some()
+                        || (execution
+                            .as_ref()
+                            .is_none_or(|e| !e.executor_kind.is_cli_runtime())
+                            && self
+                                .crud_store
+                                .get_turn_runtime_snapshot(&notification.turn.id)
+                                .await?
+                                .is_some()))
+                {
+                    return Err(pioneer_crud::NativeCancellationContextUnavailable.into());
+                }
+            }
+            if let Some(context) = context {
+                cancellation_generation = execution.as_ref().map(|e| e.owner_generation);
+                let preparation = pioneer_agent::post_turn::prepare_native_cancellation(
+                    context.preparation.clone(),
+                    notification
+                        .turn
+                        .error
+                        .as_deref()
+                        .unwrap_or("turn interrupted"),
+                )
+                .map_err(anyhow::Error::msg)?;
+                Some((context, preparation))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         #[cfg(test)]
         if matches!(&event, pioneer_crud::CanonicalTurnEventPayload::TurnFailed(n)
             if n.turn.status == TurnStatus::Interrupted)
@@ -3433,70 +4610,10 @@ impl MessageProcessor {
                 return Err(error.into());
             }
         }
-        let cancellation = if let pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification) =
-            &event
-            && notification.turn.status == TurnStatus::Interrupted
-        {
-            match self
-                .crud_store
-                .native_cancellation_context(&notification.turn.id)
-                .await?
-            {
-                Some(context) => {
-                    let preparation = pioneer_agent::post_turn::prepare_native_cancellation(
-                        context.preparation.clone(),
-                        notification
-                            .turn
-                            .error
-                            .as_deref()
-                            .unwrap_or("turn interrupted"),
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                    Some((context, preparation))
-                }
-                None => {
-                    let execution = self
-                        .crud_store
-                        .get_turn_execution(&notification.turn.id)
-                        .await?;
-                    if execution.as_ref().is_some_and(|e| {
-                        matches!(
-                            e.executor_kind,
-                            pioneer_crud::TurnExecutorKind::NativeAgent
-                                | pioneer_crud::TurnExecutorKind::ApiProvider
-                        )
-                    }) || self
-                        .agent_manager
-                        .turn_owner_generation(&notification.thread_id, &notification.turn.id)
-                        .await
-                        .is_some()
-                        // CLI and ACP turns also freeze task inheritance in a runtime
-                        // snapshot. Their cancellation uses the CLI lifecycle,
-                        // without a native controller's terminal-effect plan.
-                        // Keep the snapshot fallback fail-closed unless durable
-                        // execution ownership positively identifies a CLI turn.
-                        || (execution.as_ref().is_none_or(|e| {
-                            !matches!(
-                                e.executor_kind,
-                                pioneer_crud::TurnExecutorKind::CliRuntime
-                                    | pioneer_crud::TurnExecutorKind::AcpRuntime
-                            )
-                        }) && self
-                            .crud_store
-                            .get_turn_runtime_snapshot(&notification.turn.id)
-                            .await?
-                            .is_some())
-                    {
-                        return Err(pioneer_crud::NativeCancellationContextUnavailable.into());
-                    }
-                    None
-                }
-            }
-        } else {
-            None
-        };
         let crud_store = Arc::clone(&self.crud_store);
         let turn_execution_owner_id = Arc::clone(&self.turn_execution_owner_id);
+        let early_cancellation = preactivation_cancellation.is_some();
+        let phase_processor = preactivation_cancellation.as_ref().map(|_| self.clone());
         // Projection is one durable transaction, but it is reached from several
         // already-deep orchestration paths (including terminal recovery).  Keep
         // it in an awaited, abort-on-drop task so SeaORM does not inherit the
@@ -3505,6 +4622,7 @@ impl MessageProcessor {
         let result = match message_fresh_task(
             crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::TurnEventCommit,
+                pioneer_observability::DatabaseOperationSite::TurnEventCommit,
                 async move {
                     if let Some(guard) = cli_blocked_guard {
                         let pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(notification) =
@@ -3527,7 +4645,137 @@ impl MessageProcessor {
                         );
                         return Ok(());
                     }
+                    if let Some(expected) = preactivation_cancellation {
+                        let early = crud_store
+                            .materialize_unactivated_turn_cancellation_owned_as(
+                                event.clone(),
+                                event_timestamp_secs,
+                                expected.clone(),
+                                turn_execution_owner_id.as_ref(),
+                                cancellation_actor.clone(),
+                            )
+                            .await;
+                        match early {
+                            Err(error)
+                                if error
+                                    .downcast_ref::<pioneer_crud::UnactivatedTurnPhaseChanged>()
+                                    .is_some() =>
+                            {
+                                // One bounded phase transition, never a retry of
+                                // arbitrary storage/authorization failures. The
+                                // writer also fences the normal path generation.
+                                let current = crud_store
+                                    .get_turn_execution(&expected.turn_id)
+                                    .await?
+                                    .ok_or(pioneer_crud::UnactivatedTurnPhaseChanged)?;
+                                anyhow::ensure!(
+                                    current.owner_id == expected.owner_id
+                                        && current.owner_generation == expected.owner_generation
+                                        && current.thread_id == expected.thread_id
+                                        && current.workspace_id == expected.workspace_id,
+                                    pioneer_crud::UnactivatedTurnPhaseChanged
+                                );
+                                let pioneer_crud::CanonicalTurnEventPayload::TurnFailed(
+                                    notification,
+                                ) = &event
+                                else {
+                                    anyhow::bail!("early cancellation lost its interruption event");
+                                };
+                                if current.executor_kind.is_cli_runtime()
+                                    && crud_store
+                                        .latest_cli_runtime_turn_attempt(&expected.turn_id)
+                                        .await?
+                                        .is_some()
+                                {
+                                    #[cfg(test)]
+                                    phase_processor
+                                        .as_ref()
+                                        .expect("early cancellation owns its phase caller")
+                                        .completed_history_preparation_barrier
+                                        .wait_if_armed(
+                                            "__early_stop_cli_after_phase_change__",
+                                            &tokio_util::sync::CancellationToken::new(),
+                                        )
+                                        .await;
+                                    return phase_processor
+                                        .as_ref()
+                                        .expect("early cancellation owns its phase caller")
+                                        .cancel_cli_after_initial_phase(
+                                            &expected,
+                                            notification.clone(),
+                                            cancellation_actor,
+                                            event_timestamp_secs,
+                                        )
+                                        .await;
+                                }
+                                let context = phase_processor
+                                    .as_ref()
+                                    .expect("early cancellation owns its phase caller")
+                                    .cancellation_context_after_initial_phase(
+                                        &expected,
+                                        notification
+                                            .turn
+                                            .error
+                                            .as_deref()
+                                            .unwrap_or("turn interrupted"),
+                                    )
+                                    .await?;
+                                let Some(context) = context else {
+                                    return Ok(());
+                                };
+                                let preparation =
+                                    pioneer_agent::post_turn::prepare_native_cancellation(
+                                        context.preparation.clone(),
+                                        notification
+                                            .turn
+                                            .error
+                                            .as_deref()
+                                            .unwrap_or("turn interrupted"),
+                                    )
+                                    .map_err(anyhow::Error::msg)?;
+                                crud_store
+                                    .materialize_native_cancellation_owned_at_generation(
+                                        event,
+                                        event_timestamp_secs,
+                                        context,
+                                        preparation,
+                                        turn_execution_owner_id.as_ref(),
+                                        cancellation_actor,
+                                        expected.owner_generation,
+                                    )
+                                    .await?;
+                                return phase_processor
+                                    .as_ref()
+                                    .expect("early cancellation owns its phase caller")
+                                    .finish_turn_cancellation(&expected)
+                                    .await
+                                    .context(NativeTurnControlTransitionPending);
+                            }
+                            result => {
+                                result?;
+                                return phase_processor
+                                    .as_ref()
+                                    .expect("early cancellation owns its phase caller")
+                                    .finish_turn_cancellation(&expected)
+                                    .await
+                                    .context(NativeTurnControlTransitionPending);
+                            }
+                        }
+                    }
                     if let Some((context, preparation)) = cancellation {
+                        if let Some(generation) = cancellation_generation {
+                            return crud_store
+                                .materialize_native_cancellation_owned_at_generation(
+                                    event,
+                                    event_timestamp_secs,
+                                    context,
+                                    preparation,
+                                    turn_execution_owner_id.as_ref(),
+                                    cancellation_actor,
+                                    generation,
+                                )
+                                .await;
+                        }
                         return crud_store
                             .materialize_native_cancellation_owned_as(
                                 event,
@@ -3560,6 +4808,32 @@ impl MessageProcessor {
         };
         match result {
             Ok(()) => {
+                if interruption {
+                    self.kick_native_turn_event_deliveries();
+                    self.kick_native_terminal_effects();
+                }
+                async {
+                    if !early_cancellation
+                        && let Some((workspace, thread, turn)) = interruption_target.as_ref()
+                    {
+                        if let Some(owner) = interruption_owner.as_ref() {
+                            self.finish_turn_cancellation(owner).await?;
+                            return Ok(());
+                        }
+                        let projected = self.crud_store.get_turn(thread, turn).await?;
+                        if !projected.as_ref().is_some_and(|(scope, saved)| {
+                            scope == workspace && saved.status == TurnStatus::Interrupted
+                        }) || !self
+                            .synchronize_projected_native_terminal_turn(workspace, thread, turn)
+                            .await?
+                        {
+                            return Err(NativeTurnControlTransitionPending.into());
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await
+                .context(NativeTurnControlTransitionPending)?;
                 #[cfg(test)]
                 if guarded_cli_blocked_commit {
                     self.completed_history_preparation_barrier
@@ -3571,16 +4845,19 @@ impl MessageProcessor {
                 }
                 #[cfg(not(test))]
                 let _ = guarded_cli_blocked_commit;
-                self.kick_native_turn_event_deliveries();
-                if activates_terminal_effects {
-                    self.kick_native_terminal_effects();
+                if !interruption {
+                    self.kick_native_turn_event_deliveries();
+                    if activates_terminal_effects {
+                        self.kick_native_terminal_effects();
+                    }
                 }
                 Ok(())
             }
             Err(error) if pioneer_crud::turn_event_was_appended_before_error(&error) => {
                 // The canonical event is the authoritative commit. A read-model
                 // predecessor backlog is recoverable projection work and must
-                // neither reject the producer ACK nor start a second execution.
+                // not restart execution. Cancellation completion still waits for
+                // projection; other events retain their producer ACK semantics.
                 self.kick_native_turn_event_deliveries();
                 if activates_terminal_effects {
                     self.kick_native_terminal_effects();
@@ -3589,7 +4866,17 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "native event committed while its ordered projection remains pending"
                 );
-                Ok(())
+                if interruption { Err(error) } else { Ok(()) }
+            }
+            Err(error)
+                if interruption
+                    && error
+                        .downcast_ref::<NativeTurnControlTransitionPending>()
+                        .is_some() =>
+            {
+                self.kick_native_turn_event_deliveries();
+                self.kick_native_terminal_effects();
+                Err(error)
             }
             Err(error) => Err(error),
         }
@@ -3598,54 +4885,48 @@ impl MessageProcessor {
     pub(super) async fn process_claimed_native_turn_event_delivery(
         &self,
         delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
-    ) {
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.deliver_native_turn_event(&delivery),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("optional turn-event delivery timed out"))
-        .and_then(|result| result);
-        let completed_at = now_timestamp_secs();
-        match result {
-            Ok(()) => {
-                if let Err(error) = self
-                    .crud_store
-                    .complete_turn_event_delivery(
-                        delivery.id.as_str(),
-                        delivery.claim_token.as_str(),
-                        completed_at,
-                    )
-                    .await
-                {
-                    warn!(
-                        delivery_id = delivery.id,
-                        consumer = delivery.consumer,
-                        error = %format!("{error:#}"),
-                        "failed to acknowledge optional turn-event delivery"
-                    );
-                }
+    ) -> Result<()> {
+        let settlement = self
+            .prepare_native_turn_event_delivery_settlement(delivery)
+            .await;
+        self.crud_store
+            .settle_turn_event_deliveries(&[settlement])
+            .await?;
+        Ok(())
+    }
+
+    async fn prepare_native_turn_event_delivery_settlement(
+        &self,
+        delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
+    ) -> pioneer_crud::TurnEventDeliverySettlement {
+        use pioneer_crud::{TurnEventDeliveryOutcome as Outcome, TurnEventDeliverySettlement};
+        let outcome = if delivery.consumer == pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER
+            && self.foreground_starts.pending(
+                delivery.event.payload.thread_id(),
+                delivery.event.payload.turn_id(),
+            ) {
+            Outcome::ForegroundDeferred
+        } else {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.deliver_native_turn_event(&delivery),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("optional turn-event delivery timed out"))
+            .and_then(|result| result)
+            {
+                Ok(()) => Outcome::Delivered,
+                Err(error) => Outcome::Failed {
+                    attempt_count: delivery.attempt_count,
+                    error: format!("{error:#}"),
+                },
             }
-            Err(error) => {
-                if let Err(mark_error) = self
-                    .crud_store
-                    .fail_turn_event_delivery(
-                        delivery.id.as_str(),
-                        delivery.claim_token.as_str(),
-                        delivery.attempt_count,
-                        format!("{error:#}"),
-                        completed_at,
-                    )
-                    .await
-                {
-                    warn!(
-                        delivery_id = delivery.id,
-                        consumer = delivery.consumer,
-                        error = %format!("{mark_error:#}"),
-                        "failed to record optional turn-event delivery failure"
-                    );
-                }
-            }
+        };
+        TurnEventDeliverySettlement {
+            id: delivery.id,
+            claim_token: delivery.claim_token,
+            at_unix: now_timestamp_secs(),
+            outcome,
         }
     }
 
@@ -3684,12 +4965,17 @@ impl MessageProcessor {
     /// A conflicting provisional terminal remains untouched: live delivery must
     /// retain its existing outbox obligation until the local transition resolves.
     /// Returns false while the authoritative terminal projection is unavailable.
-    async fn synchronize_projected_native_terminal_turn(
+    pub(super) async fn synchronize_projected_native_terminal_turn(
         &self,
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
     ) -> Result<bool> {
+        let expected_owner = self
+            .crud_store
+            .get_turn_execution(turn_id)
+            .await?
+            .map(|owner| (owner.owner_id, owner.owner_generation));
         let Some((workspace, terminal)) = self.crud_store.get_turn(thread_id, turn_id).await?
         else {
             return Ok(false);
@@ -3703,30 +4989,43 @@ impl MessageProcessor {
             // Acceptance alone fences execution, but cannot confirm memory state.
             return Ok(false);
         }
-        let Some((workspace, current)) = self.thread_manager.turn_get(thread_id, turn_id).await
-        else {
-            return Ok(true);
-        };
-        anyhow::ensure!(
-            workspace == workspace_id,
-            "loaded terminal Turn workspace changed"
-        );
-        if current == terminal {
-            return Ok(true);
-        }
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__agent_terminal_before_memory_sync__",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
         if !self
             .thread_manager
-            .commit_terminal_turn(thread_id, &terminal)
+            .commit_terminal_turn_if_current(workspace_id, thread_id, &terminal, async {
+                let projection = self.crud_store.get_turn(thread_id, turn_id).await?;
+                let owner = self
+                    .crud_store
+                    .get_turn_execution(turn_id)
+                    .await?
+                    .map(|owner| (owner.owner_id, owner.owner_generation));
+                Ok(owner == expected_owner
+                    && projection.as_ref().is_some_and(|(workspace, turn)| {
+                        workspace == workspace_id && turn == &terminal
+                    }))
+            })
             .await?
         {
-            return Ok(true);
+            return Ok(false);
         }
         if let Some(thread) = self.thread_manager.thread_get(thread_id).await {
-            anyhow::ensure!(
-                thread.workspace_id == workspace_id
-                    && thread.turns.iter().any(|turn| turn == &terminal),
-                "projected terminal Turn changed before delivery"
-            );
+            let targets = thread
+                .turns
+                .iter()
+                .filter(|turn| turn.id == terminal.id)
+                .collect::<Vec<_>>();
+            if thread.workspace_id != workspace_id
+                || targets.len() > 1
+                || targets.iter().any(|turn| *turn != &terminal)
+            {
+                return Ok(false); // resume won after synchronization
+            }
             self.send_notification_to_thread_subscribers(
                 thread_id,
                 events::THREAD_UPDATED,
@@ -3744,6 +5043,14 @@ impl MessageProcessor {
         &self,
         payload: &pioneer_crud::CanonicalTurnEventPayload,
     ) -> Result<()> {
+        // A pending foreground publisher never occupies a delivery slot while
+        // waiting. Existing claimed-delivery failure/retry owns the event body.
+        if self
+            .foreground_starts
+            .pending(payload.thread_id(), payload.turn_id())
+        {
+            bail!("foreground start publication is pending");
+        }
         use pioneer_crud::CanonicalTurnEventPayload as Event;
 
         let terminal = match payload {
@@ -3813,6 +5120,27 @@ impl MessageProcessor {
                     Some("completed"),
                 )
                 .await;
+                if matches!(&notification.item, TurnItem::SystemEvent {
+                    level: SystemEventLevel::Warning, code: Some(code), ..
+                } if code == "codex_request_retried")
+                    && let Some(target) = self
+                        .crud_store
+                        .codex_retry_notice_target(&notification.thread_id, &notification.turn_id)
+                        .await?
+                {
+                    // Invalidate the existing parent Task card, never publish a
+                    // child payload as a parent event or create a canonical copy.
+                    self.notify_semantic_timeline_blocks_changed(
+                        &target.workspace_id,
+                        &target.thread_id,
+                        vec![pioneer_crud::detached_task_run_block_id(
+                            &target.turn_id,
+                            &target.task.id,
+                        )],
+                        Vec::new(),
+                    )
+                    .await;
+                }
             }
             Event::ItemUpdated(notification) => {
                 let mut presented = notification.clone();
@@ -4262,11 +5590,17 @@ impl MessageProcessor {
                         return false;
                     }
                 };
-                let delivery_key = turn_llm_context_delivery_key(&[
-                    "tool_result",
-                    item_id.as_str(),
-                    attempt_id.as_deref().unwrap_or(""),
-                ]);
+                // A control-only receipt and the final canonical result belong
+                // to the same item, but are distinct acknowledged deliveries.
+                let delivery_key = if source == "shell_control_v1" {
+                    turn_llm_context_delivery_key(&["shell_control_v1", item_id.as_str()])
+                } else {
+                    turn_llm_context_delivery_key(&[
+                        "tool_result",
+                        item_id.as_str(),
+                        attempt_id.as_deref().unwrap_or(""),
+                    ])
+                };
                 let entry = pioneer_crud::NewTurnLlmContextEntry {
                     turn_id: turn_id.clone(),
                     item_id: Some(item_id),
@@ -4351,6 +5685,26 @@ impl MessageProcessor {
                     return false;
                 }
                 true
+            }),
+            AgentDurableEvent::ProviderUsageSnapshot {
+                workspace_id,
+                thread_id,
+                turn_id,
+                item_id,
+                revision,
+                usage,
+            } => message_future(async move {
+                self.crud_store
+                    .record_native_provider_usage(
+                        &workspace_id,
+                        &thread_id,
+                        &turn_id,
+                        &item_id,
+                        revision,
+                        usage,
+                    )
+                    .await
+                    .is_ok()
             }),
             AgentDurableEvent::ToolOutputRecorded { id, notification } => {
                 message_future(async move {
@@ -4466,6 +5820,19 @@ impl MessageProcessor {
                 ))
                 .await
                 {
+                    if self.is_bound_cli_statistics(&notification).await {
+                        warn!(thread_id, turn_id, error = %error,
+                            "failed to persist supplemental CLI statistics; native execution remains owned by CLI");
+                        return false;
+                    }
+                    if matches!(&notification.item, TurnItem::SystemEvent {
+                        level: SystemEventLevel::Warning, code: Some(code), ..
+                    } if code == "codex_request_retried")
+                    {
+                        warn!(thread_id, turn_id, error = %error,
+                            "failed to persist Codex retry notice; native execution remains owned by CLI");
+                        return false;
+                    }
                     self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
@@ -4491,18 +5858,24 @@ impl MessageProcessor {
                 generation,
                 task_finalization_revision,
             } => message_future(async move {
+                let artifact = self.artifact_finalization_ref(&notification.turn_id).await;
+                let mut closing = Closing::start_linked(
+                    Phase::NativePreparation,
+                    &Closing::capture(),
+                    artifact.as_slice(),
+                );
                 let mut notification = notification;
                 self.enrich_item_completed_markdown(&mut notification).await;
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
-                if let Err(error) = self
-                    .crud_store
-                    .prepare_turn_finalization(
+                if let Err(error) = closing
+                    .correlation()
+                    .scope(self.crud_store.prepare_turn_finalization(
                         &notification,
                         generation,
                         task_finalization_revision.as_deref(),
                         now_timestamp_secs(),
-                    )
+                    ))
                     .await
                 {
                     self.report_legacy_turn_failure(
@@ -4513,6 +5886,7 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
+                closing.finish(Fact::Confirmed);
                 self.progress_items
                     .lock()
                     .await
@@ -4880,11 +6254,16 @@ impl MessageProcessor {
             AgentDurableEvent::NativeCancellationContextPrepared {
                 preparation,
                 initial_turn,
-            } => message_future(async move {
-                self.prepare_native_turn_control(preparation, initial_turn)
-                    .await
-                    .is_ok()
-            }),
+            } => {
+                let foreground = self
+                    .foreground_starts
+                    .entry(&preparation.thread_id, &preparation.turn_id);
+                message_future(async move {
+                    self.prepare_native_turn_control(preparation, initial_turn, foreground)
+                        .await
+                        .is_ok()
+                })
+            }
             AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
                 message_future(async move {
                     let thread_id = preparation.thread_id.clone();
@@ -5064,6 +6443,7 @@ impl MessageProcessor {
                 turn_id,
                 reason,
                 recovery,
+                ..
             } => message_future(async move {
                 if let Err(error) = self
                     .finalize_native_patch_projection(thread_id.as_str(), turn_id.as_str())
@@ -5100,7 +6480,12 @@ impl MessageProcessor {
         &self,
         notification: &pioneer_protocol::ItemCompletedNotification,
     ) {
-        if let TurnItem::AgentMessage { text, .. } = &notification.item {
+        if let TurnItem::AgentMessage {
+            text,
+            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+            ..
+        } = &notification.item
+        {
             self.turn_final_assistant_texts
                 .lock()
                 .await
@@ -5123,6 +6508,9 @@ impl MessageProcessor {
                 return Ok(None);
             }
         }
+        #[cfg(test)]
+        self.progress_item_type_lookup_count
+            .fetch_add(1, Ordering::Relaxed);
         let item_type = self.crud_store.get_turn_item_type(turn_id, item_id).await?;
         let mut progress_items = self.progress_items.lock().await;
         if !self.execution_progress_is_current_cached(turn_id).await? {
@@ -5165,6 +6553,7 @@ impl MessageProcessor {
     pub(super) async fn handle_progress_agent_event(&self, event: AgentProgressEvent) {
         crate::database::attribution::scope_database_workload(
             pioneer_observability::DatabaseWorkload::AgentProgress,
+            pioneer_observability::DatabaseOperationSite::AgentProgress,
             pioneer_observability::turn_startup::scope_stage(
                 Some(match &event {
                     AgentProgressEvent::ItemDelta { notification } => notification.turn_id.clone(),
@@ -5192,16 +6581,7 @@ impl MessageProcessor {
         match event {
             AgentProgressEvent::ItemDelta { notification } => {
                 let mut notification = notification;
-                self.enrich_item_delta_markdown(&mut notification).await;
                 let event_timestamp = now_timestamp_secs();
-                let delta_method = Self::item_delta_event_method(notification.stream);
-                self.send_progress_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    delta_method,
-                    &notification,
-                )
-                .await;
-
                 let item_type = match self
                     .progress_item_type(
                         notification.turn_id.as_str(),
@@ -5223,6 +6603,21 @@ impl MessageProcessor {
                         None
                     }
                 };
+
+                self.enrich_item_delta_markdown(&mut notification, item_type)
+                    .await;
+                let delta_method = Self::item_delta_event_method(notification.stream);
+                if !self
+                    .foreground_starts
+                    .pending(&notification.thread_id, &notification.turn_id)
+                {
+                    self.send_progress_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        delta_method,
+                        &notification,
+                    )
+                    .await;
+                }
 
                 if matches!(item_type, Some(TurnItemType::Reasoning)) {
                     self.forward_child_reasoning_delta_to_parent_turn(&notification)
@@ -5311,22 +6706,24 @@ impl MessageProcessor {
                 delta,
                 payload,
             } => {
-                self.send_progress_notification_to_thread_subscribers(
-                    &thread_id,
-                    Self::item_delta_event_method(Some(stream)),
-                    &pioneer_protocol::ItemDeltaNotification {
-                        workspace_id,
-                        thread_id: thread_id.clone(),
-                        turn_id,
-                        item_id,
-                        stream: Some(stream),
-                        delta,
-                        payload,
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                )
-                .await;
+                if !self.foreground_starts.pending(&thread_id, &turn_id) {
+                    self.send_progress_notification_to_thread_subscribers(
+                        &thread_id,
+                        Self::item_delta_event_method(Some(stream)),
+                        &pioneer_protocol::ItemDeltaNotification {
+                            workspace_id,
+                            thread_id: thread_id.clone(),
+                            turn_id,
+                            item_id,
+                            stream: Some(stream),
+                            delta,
+                            payload,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    )
+                    .await;
+                }
             }
             AgentProgressEvent::TaskProgress { .. } => {}
         }
@@ -6087,15 +7484,65 @@ impl MessageProcessor {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn poll_timeouts_respecting_human_wait(
         &self,
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<TimeoutCandidate>> {
-        let candidates = self
-            .timeout_supervisor
-            .list_timeout_candidates(now_unix, limit)
-            .await?;
+        self.poll_timeout_candidate_page(now_unix, limit, None)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    /// Control-loop continuation follows raw candidates, including human waits
+    /// and unavailable runtime observations that emit no timeout event.
+    pub(super) async fn poll_timeout_candidate_page(
+        &self,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&pioneer_crud::TimeoutCandidateCursor>,
+    ) -> Result<(
+        Vec<TimeoutCandidate>,
+        Option<pioneer_crud::TimeoutCandidateCursor>,
+    )> {
+        self.poll_timeout_candidate_page_scoped(None, now_unix, limit, after)
+            .await
+    }
+
+    pub(super) async fn poll_timeout_candidate_page_for_turn(
+        &self,
+        turn_id: &str,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&pioneer_crud::TimeoutCandidateCursor>,
+    ) -> Result<(
+        Vec<TimeoutCandidate>,
+        Option<pioneer_crud::TimeoutCandidateCursor>,
+    )> {
+        self.poll_timeout_candidate_page_scoped(Some(turn_id), now_unix, limit, after)
+            .await
+    }
+
+    async fn poll_timeout_candidate_page_scoped(
+        &self,
+        turn_id: Option<&str>,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&pioneer_crud::TimeoutCandidateCursor>,
+    ) -> Result<(
+        Vec<TimeoutCandidate>,
+        Option<pioneer_crud::TimeoutCandidateCursor>,
+    )> {
+        let (candidates, next) = if let Some(turn_id) = turn_id {
+            self.crud_store
+                .list_timeout_candidate_page_for_turn(turn_id, now_unix, limit, after)
+                .await?
+        } else {
+            self.timeout_supervisor
+                .list_timeout_candidate_page(now_unix, limit, after)
+                .await?
+        };
         let now_unix_ms = now_unix.saturating_mul(1_000);
         let mut timed_out = Vec::new();
         let mut human_waits = HashMap::<String, bool>::new();
@@ -6213,7 +7660,7 @@ impl MessageProcessor {
                 timed_out.push(candidate);
             }
         }
-        Ok(timed_out)
+        Ok((timed_out, next))
     }
 
     async fn renew_active_native_runtime_turn_deadlines(
@@ -6373,17 +7820,21 @@ impl MessageProcessor {
                     item: failed_item,
                 };
                 match self
-                    .crud_store
-                    .materialize_item_completed(completed.clone(), event_timestamp)
+                    .materialize_independent_item_lifecycle(
+                        pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(completed.clone()),
+                        event_timestamp,
+                    )
                     .await
                 {
-                    Ok(()) => {
-                        self.send_notification_to_thread_subscribers(
-                            thread_id.as_str(),
-                            events::ITEM_COMPLETED,
-                            &completed,
-                        )
-                        .await;
+                    Ok(live) => {
+                        if !live {
+                            self.send_notification_to_thread_subscribers(
+                                thread_id.as_str(),
+                                events::ITEM_COMPLETED,
+                                &completed,
+                            )
+                            .await;
+                        }
                         self.notify_semantic_timeline_item_changed(
                             completed.workspace_id.as_str(),
                             completed.thread_id.as_str(),
@@ -6535,12 +7986,22 @@ impl MessageProcessor {
             };
             match applied {
                 Ok(pioneer_crud::RecoveryTerminalizationApplyOutcome::Applied(applied)) => {
-                    if let Some(turn) = applied.newly_terminal_turn.as_ref() {
-                        if let Err(error) = self
-                            .thread_manager
-                            .commit_terminal_turn(applied.thread_id.as_str(), turn)
+                    if applied.newly_terminal_turn.is_some() {
+                        let synchronized = async {
+                            let (workspace, _) = self
+                                .crud_store
+                                .get_turn(&applied.thread_id, &record.turn_id)
+                                .await?
+                                .context("recovery terminal Turn is missing")?;
+                            self.synchronize_projected_native_terminal_turn(
+                                &workspace,
+                                &applied.thread_id,
+                                &record.turn_id,
+                            )
                             .await
-                        {
+                        }
+                        .await;
+                        if let Err(error) = synchronized {
                             warn!(
                                 recovery_job_id = record.recovery_job_id,
                                 turn_id = record.turn_id,
@@ -6918,18 +8379,45 @@ impl MessageProcessor {
     /// in-memory Turn from the authoritative transaction. Bootstrap performs
     /// the same database repair before threads are loaded; this path covers a
     /// listener/agent task loss while the Gateway process keeps running.
+    #[cfg(test)]
     pub(super) async fn reconcile_prepared_native_turn_finalizations(
         &self,
         now_unix: i64,
         limit: u64,
     ) -> Result<TurnFinalizationReconciliationSummary> {
-        let summary = self
-            .crud_store
-            .reconcile_prepared_turn_finalizations(limit, now_unix)
-            .await?;
+        self.reconcile_prepared_native_turn_finalizations_scoped(now_unix, limit, None)
+            .await
+    }
+
+    pub(super) async fn reconcile_prepared_native_turn_finalizations_scoped(
+        &self,
+        now_unix: i64,
+        limit: u64,
+        turns: Option<&[String]>,
+    ) -> Result<TurnFinalizationReconciliationSummary> {
+        let mut summary = match turns {
+            Some(turns) => {
+                self.crud_store
+                    .reconcile_prepared_turn_finalizations_for_turns(turns, now_unix)
+                    .await?
+            }
+            None => {
+                self.crud_store
+                    .reconcile_prepared_turn_finalizations(limit, now_unix)
+                    .await?
+            }
+        };
         for committed in &summary.committed {
+            if !committed.already_committed {
+                self.recover_completed_turn_title(
+                    committed.turn_completed.thread_id.clone(),
+                    &committed.turn_completed.turn,
+                )
+                .await;
+            }
             let turn_id = committed.turn_completed.turn.id.as_str();
-            self.thread_manager
+            if let Err(error) = self
+                .thread_manager
                 .commit_terminal_turn(
                     committed.turn_completed.thread_id.as_str(),
                     &committed.turn_completed.turn,
@@ -6937,7 +8425,10 @@ impl MessageProcessor {
                 .await
                 .with_context(|| {
                     format!("failed to synchronize reconciled native Turn `{turn_id}` in memory")
-                })?;
+                })
+            {
+                summary.failures.push(Arc::new(error));
+            }
         }
         Ok(summary)
     }
@@ -7404,7 +8895,7 @@ impl MessageProcessor {
             .await;
         let result = self
             .crud_store
-            .cli_runtime_turn_terminal_guard(binding)
+            .cli_runtime_turn_terminal_control_guard(binding)
             .await;
         let diagnostic = match result {
             Ok(Some(snapshot)) => return Some(snapshot),
@@ -7885,7 +9376,7 @@ impl MessageProcessor {
 
         let is_cli_runtime_turn = self
             .crud_store
-            .get_cli_runtime_turn_binding(turn_id)
+            .get_cli_runtime_turn_binding_control(turn_id)
             .await?
             .is_some();
         if !is_cli_runtime_turn {
@@ -7960,32 +9451,87 @@ impl MessageProcessor {
             .await
     }
 
+    /// Task service/recovery own these mutations independently of provider
+    /// execution. Choosing LIVE changes only optional delivery, not authority.
+    /// Once a completion/timeout joined LIVE, its durable receipt keeps later
+    /// updates behind the same canonical sequence even after Pending releases.
+    pub(super) async fn materialize_independent_item_lifecycle(
+        &self,
+        event: pioneer_crud::CanonicalTurnEventPayload,
+        timestamp: i64,
+    ) -> Result<bool> {
+        use pioneer_crud::CanonicalTurnEventPayload as Event;
+        let item_id = match &event {
+            Event::ItemCompleted(n) => n.item.item_id(),
+            Event::ItemUpdated(n) => n.item.item_id(),
+            Event::ItemTimeoutDetected(n) => n.item_id.as_str(),
+            _ => bail!("independent item lifecycle requires completion, update or timeout"),
+        };
+        let live = self
+            .foreground_starts
+            .pending(event.thread_id(), event.turn_id())
+            || self
+                .crud_store
+                .independent_item_uses_live_delivery(event.thread_id(), event.turn_id(), item_id)
+                .await?;
+        if live {
+            // The unowned CRUD API preserves task/recovery authority after
+            // parent Stop/replacement. Provider-owned append remains fenced.
+            self.crud_store
+                .materialize_native_agent_turn_event(event, timestamp, None)
+                .await?;
+            self.kick_native_turn_event_deliveries();
+        } else {
+            match event {
+                Event::ItemCompleted(n) => {
+                    self.crud_store
+                        .materialize_item_completed(n, timestamp)
+                        .await?
+                }
+                Event::ItemUpdated(n) => {
+                    self.crud_store
+                        .materialize_item_updated(n, timestamp)
+                        .await?
+                }
+                Event::ItemTimeoutDetected(n) => {
+                    self.crud_store
+                        .materialize_item_timeout_detected(n, timestamp)
+                        .await?
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(live)
+    }
+
     async fn persist_and_send_item_timeout_detected(
         &self,
         notification: pioneer_protocol::ItemTimeoutDetectedNotification,
         event_timestamp: i64,
     ) {
-        if let Err(error) = self
-            .crud_store
-            .materialize_item_timeout_detected(notification.clone(), event_timestamp)
+        let live = match self
+            .materialize_independent_item_lifecycle(
+                pioneer_crud::CanonicalTurnEventPayload::ItemTimeoutDetected(notification.clone()),
+                event_timestamp,
+            )
             .await
         {
-            warn!(
-                thread_id = notification.thread_id.as_str(),
-                turn_id = notification.turn_id.as_str(),
-                item_id = notification.item_id.as_str(),
-                error = %format!("{error:#}"),
-                "failed to persist item timeout recovery timeline event; skipping live notification"
-            );
-            return;
+            Ok(live) => live,
+            Err(error) => {
+                warn!(thread_id = notification.thread_id, turn_id = notification.turn_id,
+                    item_id = notification.item_id, error = %format!("{error:#}"),
+                    "failed to persist item timeout recovery timeline event; skipping live notification");
+                return;
+            }
+        };
+        if !live {
+            self.send_notification_to_thread_subscribers(
+                notification.thread_id.as_str(),
+                events::ITEM_TIMEOUT_DETECTED,
+                &notification,
+            )
+            .await;
         }
-
-        self.send_notification_to_thread_subscribers(
-            notification.thread_id.as_str(),
-            events::ITEM_TIMEOUT_DETECTED,
-            &notification,
-        )
-        .await;
         self.notify_semantic_timeline_work_item_id_changed(
             notification.workspace_id.as_str(),
             notification.thread_id.as_str(),
@@ -8186,7 +9732,7 @@ impl MessageProcessor {
         }
     }
 
-    fn record_agent_markdown_buffer(
+    pub(super) fn record_agent_markdown_buffer(
         buffer: &AgentMarkdownBuffer,
         final_source_bytes: usize,
         outcome: GatewayMarkdownMessageOutcome,
@@ -8206,13 +9752,21 @@ impl MessageProcessor {
         &self,
         notification: &mut pioneer_protocol::ItemStartedNotification,
     ) {
-        let (item_id, text) = Self::normalize_item_markdown(&mut notification.item);
+        let item_id = notification.item.item_id().to_owned();
         let key = Self::item_markdown_buffer_key(notification.thread_id.as_str(), item_id.as_str());
-        let replaced = self
-            .agent_message_buffers
-            .lock()
-            .await
-            .insert(key, AgentMarkdownBuffer::new(text));
+        let buffer = if Self::item_type_allows_markdown(Some(notification.item.item_type())) {
+            let (_, text) = Self::normalize_item_markdown(&mut notification.item);
+            Some(AgentMarkdownBuffer::new(notification.turn_id.clone(), text))
+        } else {
+            None
+        };
+        let replaced = {
+            let mut buffers = self.agent_message_buffers.lock().await;
+            match buffer {
+                Some(buffer) => buffers.insert(key, buffer),
+                None => buffers.remove(&key),
+            }
+        };
         if let Some(replaced) = replaced {
             Self::record_agent_markdown_buffer(
                 &replaced,
@@ -8222,21 +9776,63 @@ impl MessageProcessor {
         }
     }
 
+    fn is_provider_message_preview(payload: Option<&serde_json::Value>) -> bool {
+        payload.and_then(|value| value["runtimeDeltaKind"].as_str())
+            == Some("provider_message_preview")
+    }
+
     pub(super) async fn enrich_item_delta_markdown(
         &self,
         notification: &mut pioneer_protocol::ItemDeltaNotification,
+        item_type: Option<TurnItemType>,
     ) {
+        if Self::is_provider_message_preview(notification.payload.as_ref()) {
+            // Runtime drafts never enter canonical markdown buffers. A late
+            // preview must not append to a resolved commentary's buffer, and
+            // a final-only preview has no ItemCompleted to reclaim that buffer.
+            return;
+        }
         let stream = Self::markdown_stream_kind(notification.stream);
         let key = Self::item_markdown_buffer_key(
             notification.thread_id.as_str(),
             notification.item_id.as_str(),
         );
+        if !Self::item_type_allows_markdown(item_type) {
+            // If classification is lost, this fragment is absent from the
+            // canonical prefix. Do not later publish an AST with that gap.
+            let removed = {
+                let mut buffers = self.agent_message_buffers.lock().await;
+                if buffers
+                    .get(&key)
+                    .is_some_and(|buffer| buffer.turn_id == notification.turn_id)
+                {
+                    buffers.remove(&key)
+                } else {
+                    None
+                }
+            };
+            if let Some(buffer) = removed {
+                Self::record_agent_markdown_buffer(
+                    &buffer,
+                    buffer.text.len(),
+                    GatewayMarkdownMessageOutcome::Abandoned,
+                );
+            }
+            return;
+        }
         let lock_started = Instant::now();
         let (full_text, stats, lock_elapsed, update_elapsed) = {
             let mut buffers = self.agent_message_buffers.lock().await;
             let lock_elapsed = lock_started.elapsed();
             let update_started = Instant::now();
-            let buffer = buffers.entry(key).or_default();
+            // Type resolution alone cannot recover an earlier streaming prefix.
+            // Only a lifecycle snapshot may seed a canonical Markdown buffer.
+            let Some(buffer) = buffers.get_mut(&key) else {
+                return;
+            };
+            if buffer.turn_id != notification.turn_id {
+                return;
+            }
             buffer.text.push_str(notification.delta.as_str());
             let full_text = buffer.text.clone();
             let stats = buffer.stats.clone();
@@ -8263,6 +9859,9 @@ impl MessageProcessor {
             block_count: None,
         });
 
+        #[cfg(test)]
+        self.markdown_delta_parse_count
+            .fetch_add(1, Ordering::Relaxed);
         let parsed = markdown::parse_streaming_markdown_document(full_text.as_str(), stream);
         stats.record_parse_duration(parsed.elapsed);
         notification.markdown = Some(parsed.document);
@@ -8275,7 +9874,17 @@ impl MessageProcessor {
     ) {
         let (item_id, final_text) = Self::normalize_item_markdown(&mut notification.item);
         let key = Self::item_markdown_buffer_key(notification.thread_id.as_str(), item_id.as_str());
-        let buffer = self.agent_message_buffers.lock().await.remove(key.as_str());
+        let buffer = {
+            let mut buffers = self.agent_message_buffers.lock().await;
+            if buffers
+                .get(&key)
+                .is_some_and(|buffer| buffer.turn_id == notification.turn_id)
+            {
+                buffers.remove(&key)
+            } else {
+                None
+            }
+        };
         if let Some(buffer) = buffer {
             Self::record_agent_markdown_buffer(
                 &buffer,
@@ -8305,6 +9914,12 @@ impl MessageProcessor {
         parent_delta.thread_id = target.parent_thread_id;
         parent_delta.turn_id = target.parent_turn_id;
 
+        if self
+            .foreground_starts
+            .pending(&parent_delta.thread_id, &parent_delta.turn_id)
+        {
+            return;
+        }
         let delta_method = Self::item_delta_event_method(parent_delta.stream);
         self.send_progress_notification_to_thread_subscribers(
             parent_delta.thread_id.as_str(),
@@ -8336,6 +9951,25 @@ impl MessageProcessor {
         self.thread_manager
             .rollback_turn_finish(rollback_context)
             .await;
+        // A competing cancellation or terminal write can commit while this
+        // candidate is being rejected. Reuse the committed Turn so rolling
+        // back the candidate cannot revive foreground ownership in memory.
+        match self.crud_store.get_turn(thread_id, turn_id).await {
+            Ok(Some((_, terminal))) if terminal.status != TurnStatus::InProgress => {
+                match self
+                    .thread_manager
+                    .commit_terminal_turn(thread_id, &terminal)
+                    .await
+                {
+                    Ok(_) => return false,
+                    Err(error) => warn!(thread_id, turn_id, error = %error,
+                        "failed to synchronize competing terminal Turn after rollback"),
+                }
+            }
+            Err(error) => warn!(thread_id, turn_id, error = %error,
+                "failed to read competing terminal Turn after rollback"),
+            _ => {}
+        }
         true
     }
 
@@ -8345,6 +9979,23 @@ impl MessageProcessor {
         turn_id: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        self.complete_turn_with_title_recovery(thread_id, turn_id, recovery, true)
+            .await
+    }
+
+    pub(super) async fn complete_turn_with_title_recovery(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        recover_title: bool,
+    ) -> bool {
+        let artifact = self.artifact_finalization_ref(&turn_id).await;
+        let mut closing = Closing::start_linked(
+            Phase::TerminalTransition,
+            &Closing::capture(),
+            artifact.as_slice(),
+        );
         let terminal_actor_generation = self
             .agent_manager
             .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
@@ -8382,9 +10033,15 @@ impl MessageProcessor {
                     self.finalize_agent_execution_for_turn(&current_turn, "completed")
                         .await;
                 }
+                closing.finish(if committed {
+                    Fact::Duplicate
+                } else {
+                    Fact::Unconfirmed
+                });
                 return committed;
             }
             if current_turn.status != TurnStatus::InProgress {
+                closing.finish(Fact::Superseded);
                 self.retire_execution_progress_state(turn_id.as_str()).await;
                 return false;
             }
@@ -8416,6 +10073,7 @@ impl MessageProcessor {
             .artifact_finalization_blocks_completion(thread_id.as_str(), turn_id.as_str())
             .await
         {
+            closing.finish(Fact::Rejected);
             return false;
         }
 
@@ -8448,14 +10106,20 @@ impl MessageProcessor {
         };
 
         let event_timestamp = now_timestamp_secs();
-        if let Err(error) = self
-            .materialize_native_agent_turn_event(
+        let persisted = closing
+            .correlation()
+            .scope(self.materialize_native_agent_turn_event(
                 pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(turn_completed.clone()),
                 event_timestamp,
                 None,
-            )
-            .await
-        {
+            ))
+            .await;
+        let fact = if persisted.is_ok() {
+            Fact::Confirmed
+        } else {
+            Fact::Unconfirmed
+        };
+        if let Err(error) = persisted {
             let rolled_back = self
                 .rollback_terminal_turn_finish_if_event_not_appended(
                     finish_outcome.rollback_context,
@@ -8474,6 +10138,11 @@ impl MessageProcessor {
                 .await;
                 return false;
             }
+        }
+        closing.finish(fact);
+        if recover_title {
+            self.recover_completed_turn_title(thread_id.clone(), &turn_completed.turn)
+                .await;
         }
         self.finalize_agent_execution_for_turn(&turn_completed.turn, "completed")
             .await;
@@ -8499,17 +10168,20 @@ impl MessageProcessor {
         // projection does not inherit the complete native-event listener stack.
         // Abort-on-drop is safe here: an interrupted reconciliation remains
         // discoverable by the durable terminal-child reconciler.
+        self.observe_cli_terminal_phase(&turn_id, "reconcile_task_result")
+            .await;
         let task_reconciliation = {
             let executor = Arc::clone(&self.task_agent_executor);
             let reconciliation_thread_id = thread_id.clone();
             let reconciliation_turn_id = turn_id.clone();
+            let correlation = closing.correlation();
             message_fresh_task(async move {
-                executor
-                    .reconcile_child_turn_completed(
+                correlation
+                    .scope(executor.reconcile_child_turn_completed(
                         reconciliation_thread_id.as_str(),
                         reconciliation_turn_id.as_str(),
                         TaskChildReconciliationOrigin::Live,
-                    )
+                    ))
                     .await
             })
             .await
@@ -8548,6 +10220,8 @@ impl MessageProcessor {
         // the immutable provider/result input.  Keep both durable records
         // until the live/startup reconciler completes the task transition.
         if task_reconciliation_succeeded {
+            self.observe_cli_terminal_phase(&turn_id, "delete_task_context")
+                .await;
             if let Err(error) = self
                 .crud_store
                 .delete_turn_llm_context_for_turn(turn_id.as_str())
@@ -8560,6 +10234,8 @@ impl MessageProcessor {
                     "failed to delete turn_llm_context rows after turn completion"
                 );
             }
+            self.observe_cli_terminal_phase(&turn_id, "delete_runtime_snapshot")
+                .await;
             self.delete_turn_runtime_snapshot_for_closed_turn(
                 thread_id.as_str(),
                 turn_id.as_str(),
@@ -8567,9 +10243,13 @@ impl MessageProcessor {
             )
             .await;
         }
+        self.observe_cli_terminal_phase(&turn_id, "clear_artifact_state")
+            .await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
 
+        self.observe_cli_terminal_phase(&turn_id, "reconcile_terminal_recovery")
+            .await;
         match self
             .recovery_coordinator
             .complete_active_recovery_for_turn(turn_id.as_str(), recovery.as_ref(), event_timestamp)
@@ -8590,6 +10270,26 @@ impl MessageProcessor {
             }
         }
 
+        // Recovery job settlement follows the first cleanup attempt. Retry the
+        // existing cleanup boundary now, so an aborted receipt needs no timer.
+        if task_reconciliation_succeeded {
+            let cleanup_store = self.crud_store.with_maintenance_access();
+            if let Err(_error) = cleanup_store
+                .release_settled_shell_controls(turn_id.as_str())
+                .await
+            {
+                warn!("failed to release settled shell controls");
+            }
+            if let Err(_error) = cleanup_store
+                .cleanup_terminal_task_child_capsule(thread_id.as_str(), turn_id.as_str())
+                .await
+            {
+                warn!("terminal child control cleanup remains pending");
+            }
+        }
+
+        self.observe_cli_terminal_phase(&turn_id, "retire_terminal_actor")
+            .await;
         if task_reconciliation_succeeded
             && self
                 .thread_manager
@@ -8614,7 +10314,16 @@ impl MessageProcessor {
         turn: &pioneer_protocol::Turn,
         terminal_status: &str,
     ) {
+        // The committed turn terminal boundary revokes computer-use authority
+        // even if a cancelled provider/proxy future still retains tool handles.
+        self.mcp_service
+            .cancel_turn_mcp_invocations(turn.id.as_str());
         self.retire_execution_progress_state(turn.id.as_str()).await;
+        // Admission completes the handoff, never the AgentExecution that
+        // authored it. The Task owns the responding execution and resources.
+        if turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask {
+            return;
+        }
         let database = self.crud_store.database_connection();
         let responding_execution_id =
             match pioneer_crud::load_agent_turn_response(&database, turn.id.as_str()).await {
@@ -8688,6 +10397,39 @@ impl MessageProcessor {
         turn: &pioneer_protocol::Turn,
         reason: &str,
     ) -> anyhow::Result<bool> {
+        self.cancel_root_agent_work_graph(thread_id, turn, reason, None)
+            .await
+    }
+
+    /// Internal lifecycle prerequisite, with one deadline for graph fencing,
+    /// admission and every native root/descendant cleanup. No public RPC.
+    pub(super) async fn cancel_root_agent_work_graph_for_turn_and_wait(
+        &self,
+        thread_id: &str,
+        turn: &pioneer_protocol::Turn,
+        reason: &str,
+        request_deadline: tokio::time::Instant,
+    ) -> anyhow::Result<bool> {
+        tokio::time::timeout_at(
+            request_deadline,
+            self.cancel_root_agent_work_graph(thread_id, turn, reason, Some(request_deadline)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("native graph stop deadline expired; cleanup unconfirmed"))?
+    }
+
+    async fn cancel_root_agent_work_graph(
+        &self,
+        thread_id: &str,
+        turn: &pioneer_protocol::Turn,
+        reason: &str,
+        completion_deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<bool> {
+        // A detached admission records provenance, not a responding execution.
+        // Its Task owns cancellation through the ordinary Task lifecycle.
+        if turn.work_owner == pioneer_protocol::TurnWorkOwner::DetachedTask {
+            return Ok(false);
+        }
         let database = self.crud_store.database_connection();
         let responding_execution_id =
             pioneer_crud::load_agent_turn_response(&database, turn.id.as_str())
@@ -8708,11 +10450,19 @@ impl MessageProcessor {
         let Some(execution) =
             pioneer_crud::load_agent_execution(&database, execution_id.as_str()).await?
         else {
+            if let Some(deadline) = completion_deadline {
+                self.stop_graph_turn_without_root(thread_id, turn, reason, deadline)
+                    .await?;
+            }
             return Ok(false);
         };
         if execution.id != execution.work_graph_root_execution_id
             || execution.parent_execution_id.is_some()
         {
+            if let Some(deadline) = completion_deadline {
+                self.stop_graph_turn_without_root(thread_id, turn, reason, deadline)
+                    .await?;
+            }
             return Ok(false);
         }
 
@@ -8725,17 +10475,125 @@ impl MessageProcessor {
             .await
             .get(&(thread_id.to_owned(), turn.id.clone()))
             .and_then(|intent| intent.actor_id.clone());
-        let targets = self
-            .crud_store
-            .cancel_agent_work_graph_as(
-                execution.id.as_str(),
-                reason,
-                pioneer_crud::utc_now(),
-                actor_id
-                    .as_deref()
-                    .map(|actor| (actor, thread_id, turn.id.as_str())),
-            )
-            .await?;
+        let targets = if completion_deadline.is_some() {
+            self.crud_store
+                .cancel_agent_work_graph_and_collect_owners(
+                    execution.id.as_str(),
+                    reason,
+                    pioneer_crud::utc_now(),
+                )
+                .await?
+        } else {
+            self.crud_store
+                .cancel_agent_work_graph_as(
+                    execution.id.as_str(),
+                    reason,
+                    pioneer_crud::utc_now(),
+                    actor_id
+                        .as_deref()
+                        .map(|actor| (actor, thread_id, turn.id.as_str())),
+                )
+                .await?
+        };
+
+        let mut cli_turns = std::collections::BTreeSet::new();
+        let mut cli_owners = Vec::new();
+        let mut cli_keys = std::collections::HashSet::new();
+        if completion_deadline.is_some() {
+            let mut turns = targets
+                .iter()
+                .filter_map(|target| {
+                    Some((
+                        target.thread_id.clone()?,
+                        target.turn_id.clone()?,
+                        target.turn_pending,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            turns.push((
+                thread_id.to_owned(),
+                turn.id.clone(),
+                turn.status == pioneer_protocol::TurnStatus::InProgress,
+            ));
+            for (thread, turn_id, pending) in turns {
+                if let Some(binding) = self
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await?
+                {
+                    anyhow::ensure!(
+                        binding.thread_id == thread
+                            && binding.workspace_id == execution.workspace_id,
+                        "CLI graph binding scope changed"
+                    );
+                    cli_turns.insert((thread, turn_id.clone()));
+                    let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                        binding.workspace_id,
+                        binding.runtime_id,
+                        binding.continuation_thread_id,
+                    )?;
+                    cli_keys.insert(key.clone());
+                    let manager = self
+                        .cli_runtime_manager
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("CLI graph owner inventory unavailable"))?;
+                    let owners = manager
+                        .stop_inventory(&execution.workspace_id)
+                        .into_iter()
+                        .filter(|owner| owner.instance().key() == &key && owner.owns_turn(&turn_id))
+                        .collect::<Vec<_>>();
+                    anyhow::ensure!(
+                        !pending || !owners.is_empty(),
+                        "pending CLI graph owner is unknown"
+                    );
+                    for owner in owners {
+                        if !cli_owners.iter().any(
+                            |known: &crate::cli_runtime::manager::CliSessionStopOwner| {
+                                known.instance() == owner.instance()
+                            },
+                        ) {
+                            cli_owners.push(owner);
+                        }
+                    }
+                }
+            }
+        }
+        let api_targets = targets
+            .iter()
+            .filter(|target| !target.has_cli_binding)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (native_owners, native_threads, captured_runs) = if completion_deadline.is_some() {
+            let mut threads = targets
+                .iter()
+                .filter_map(|target| target.turn_id.as_ref().and(target.thread_id.clone()))
+                .collect::<std::collections::BTreeSet<_>>();
+            threads.insert(thread_id.to_owned());
+            // Capture before Task/native cancellation, after the durable admission
+            // fence. Snapshot also covers predecessor and retirement ownership;
+            // historical terminal rows alone are never cleanup proof.
+            let threads = threads.into_iter().collect::<Vec<_>>();
+            let owners = self
+                .agent_manager
+                .capture_native_stop_owners(&threads)
+                .await?;
+            // Include proven historical runs omitted from cancellation selection.
+            let captured_runs = owners
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            let owners = select_native_graph_owners(
+                &api_targets,
+                owners,
+                thread_id,
+                turn.id.as_str(),
+                matches!(turn.status, pioneer_protocol::TurnStatus::InProgress)
+                    && !cli_turns.contains(&(thread_id.to_owned(), turn.id.clone())),
+            )?;
+            (owners, threads, captured_runs)
+        } else {
+            (Vec::new(), Vec::new(), std::collections::HashSet::new())
+        };
 
         let mut task_ids = targets
             .iter()
@@ -8778,6 +10636,9 @@ impl MessageProcessor {
                 )
                 .await
             {
+                if completion_deadline.is_some() {
+                    return Err(error.context("descendant Task cleanup failed"));
+                }
                 warn!(
                     root_execution_id = execution.id,
                     task_id,
@@ -8788,6 +10649,32 @@ impl MessageProcessor {
             }
         }
 
+        if let Some(deadline) = completion_deadline {
+            if let Some(manager) = &self.cli_runtime_manager {
+                for owner in &cli_owners {
+                    manager.stop_and_wait(owner, deadline).await?;
+                }
+            }
+            // Every captured run is awaited; execution IDs cannot overwrite
+            // multiple revisions, recovery runs or outstanding predecessors.
+            for owner in &native_owners {
+                self.mcp_service
+                    .cancel_turn_mcp_invocations(owner.turn_id());
+                self.await_native_graph_owner(owner, reason, deadline)
+                    .await?;
+            }
+        }
+
+        let mut selected_turns = native_owners
+            .iter()
+            .map(|owner| (owner.thread_id(), owner.turn_id()))
+            .collect::<std::collections::BTreeSet<_>>();
+        selected_turns.extend(
+            cli_turns
+                .iter()
+                .map(|(thread, turn)| (thread.as_str(), turn.as_str())),
+        );
+        let mut direct_failure = None;
         for target in targets {
             if target.execution_id == execution.id {
                 continue;
@@ -8795,30 +10682,197 @@ impl MessageProcessor {
             let (Some(thread_id), Some(turn_id)) =
                 (target.thread_id.as_deref(), target.turn_id.as_deref())
             else {
+                if completion_deadline.is_some() && target.turn_id.is_some() {
+                    anyhow::bail!("descendant native runtime owner is unknown");
+                }
                 continue;
             };
             self.mcp_service.cancel_turn_mcp_invocations(turn_id);
-            let stopped_cli = self
-                .cancel_task_cli_runtime_turn(thread_id, turn_id, reason)
-                .await
-                .unwrap_or(false);
-            if !stopped_cli {
-                let _ = self
-                    .agent_manager
-                    .cancel_turn(thread_id, turn_id, reason)
-                    .await;
+            if completion_deadline.is_some() {
+                if !selected_turns.contains(&(thread_id, turn_id)) {
+                    // The snapshot's full native lifetime invariant proves no
+                    // outstanding owner; do not mutate historical completed Turns.
+                    continue;
+                }
+            } else {
+                let stopped_cli = match self
+                    .cancel_task_cli_runtime_turn(thread_id, turn_id, reason)
+                    .await
+                {
+                    Ok(stopped) => stopped,
+                    Err(error) if target.parent_task_id.is_none() => {
+                        direct_failure.get_or_insert(error);
+                        continue;
+                    }
+                    Err(_) => false, // genuine Tasks retain their own cleanup owner
+                };
+                if !stopped_cli {
+                    if target.parent_task_id.is_none() {
+                        if let Err(error) = self
+                            .commit_turn_interrupted_with_recovery_disposition(
+                                thread_id.to_owned(),
+                                turn_id.to_owned(),
+                                reason.to_owned(),
+                                None,
+                                true,
+                            )
+                            .await
+                        {
+                            // Preserve completion failure, but keep process control
+                            // and siblings downstream of the committed graph fence.
+                            direct_failure.get_or_insert_with(|| anyhow::Error::msg(error.clone()));
+                            if !error.is_retryable() {
+                                // A semantic refusal grants no control over a
+                                // replacement owner/generation or conflicting result.
+                                continue;
+                            }
+                        }
+                    }
+                    let _ = self
+                        .agent_manager
+                        .cancel_turn(thread_id, turn_id, reason)
+                        .await;
+                }
             }
             self.unregister_agent_action_binding(turn_id).await;
-            if target.parent_task_id.is_none() {
-                self.mark_turn_interrupted(
-                    thread_id.to_owned(),
-                    turn_id.to_owned(),
-                    reason.to_owned(),
-                )
-                .await;
+        }
+        if let Some(error) = direct_failure {
+            return Err(error);
+        }
+
+        if completion_deadline.is_some() {
+            // Completion of captured tasks can unblock a previously accepted
+            // recovery/continuation. Revalidate actor admission/publication at
+            // the success boundary; do not cancel a replacement by old run ID.
+            let remaining = self
+                .agent_manager
+                .capture_native_stop_owners(&native_threads)
+                .await?;
+            validate_native_graph_stop_snapshot(&captured_runs, &remaining)?;
+            if let Some(manager) = &self.cli_runtime_manager {
+                anyhow::ensure!(
+                    !manager
+                        .stop_inventory(&execution.workspace_id)
+                        .iter()
+                        .any(|owner| cli_keys.contains(owner.instance().key())),
+                    "CLI graph publication changed during stop; retry required"
+                );
             }
         }
         Ok(true)
+    }
+
+    async fn stop_graph_turn_without_root(
+        &self,
+        thread: &str,
+        turn: &pioneer_protocol::Turn,
+        reason: &str,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        if let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding(&turn.id)
+            .await?
+        {
+            anyhow::ensure!(
+                binding.thread_id == thread,
+                "CLI fallback binding scope changed"
+            );
+            let manager = self
+                .cli_runtime_manager
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("CLI stop inventory unavailable"))?;
+            let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                binding.workspace_id.clone(),
+                binding.runtime_id,
+                binding.continuation_thread_id,
+            )?;
+            let owners = manager
+                .stop_inventory(&binding.workspace_id)
+                .into_iter()
+                .filter(|owner| owner.instance().key() == &key && owner.owns_turn(&turn.id))
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                turn.status != pioneer_protocol::TurnStatus::InProgress || !owners.is_empty(),
+                "pending CLI fallback owner unknown"
+            );
+            for owner in &owners {
+                manager.stop_and_wait(owner, deadline).await?;
+            }
+            anyhow::ensure!(
+                !manager
+                    .stop_inventory(&binding.workspace_id)
+                    .iter()
+                    .any(|owner| owner.instance().key() == &key),
+                "CLI fallback publication changed during stop"
+            );
+            return Ok(());
+        }
+        tokio::time::timeout_at(deadline, async {
+            let threads = [thread.to_owned()];
+            // Inventory rejects accepted/unpublished starts and unresolved
+            // recovery. Terminal DB state or a missing owner is never proof.
+            let captured = self
+                .agent_manager
+                .capture_native_stop_owners(&threads)
+                .await?
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            let exact = self
+                .agent_manager
+                .capture_turn_stop_owner(thread, &turn.id)
+                .await?;
+            anyhow::ensure!(
+                captured.contains(&exact),
+                "native fallback owner changed before stop"
+            );
+            // Its normal completion path drains its captured predecessors;
+            // do that before examining the rest of the unordered inventory.
+            if !exact.is_quiescent() {
+                self.await_native_graph_owner(&exact, reason, deadline)
+                    .await?;
+            }
+            for owner in &captured {
+                if owner == &exact {
+                    continue;
+                }
+                if owner.turn_id() != turn.id {
+                    anyhow::ensure!(
+                        owner.is_quiescent(),
+                        "outstanding native fallback predecessor or replacement"
+                    );
+                    continue;
+                }
+                // A logical Turn can stay pending after its native run drained.
+                // This new stop needs actual quiescence, not that run's failure.
+                if !owner.is_quiescent() {
+                    self.await_native_graph_owner(owner, reason, deadline)
+                        .await?;
+                }
+            }
+            let remaining = self
+                .agent_manager
+                .capture_native_stop_owners(&threads)
+                .await?;
+            validate_native_graph_stop_snapshot(&captured, &remaining)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("native fallback stop deadline expired; cleanup unconfirmed")
+        })?
+    }
+
+    pub(super) async fn await_native_graph_owner(
+        &self,
+        owner: &pioneer_agent::NativeTurnStopOwner,
+        reason: &str,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        self.agent_manager
+            .cancel_captured_turn_and_wait(owner, reason, deadline)
+            .await
+            .map_err(|error| anyhow::anyhow!("descendant native cleanup failed: {error}"))
     }
 
     /// Native provider success with a final response is acknowledged only after
@@ -8832,6 +10886,12 @@ impl MessageProcessor {
         turn_id: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        let artifact = self.artifact_finalization_ref(&turn_id).await;
+        let mut closing = Closing::start_linked(
+            Phase::NativeFinalization,
+            &Closing::capture(),
+            artifact.as_slice(),
+        );
         if let Some(recovery) = recovery.as_ref() {
             match self
                 .recovery_coordinator
@@ -8865,7 +10925,13 @@ impl MessageProcessor {
             .await
         {
             Ok(true) => {}
-            Ok(false) => return self.complete_turn(thread_id, turn_id, recovery).await,
+            Ok(false) => {
+                closing.finish(Fact::Returned);
+                return closing
+                    .correlation()
+                    .scope(self.complete_turn(thread_id, turn_id, recovery))
+                    .await;
+            }
             Err(error) => {
                 warn!(
                     thread_id,
@@ -8877,13 +10943,17 @@ impl MessageProcessor {
             }
         }
 
-        let committed = match self
-            .crud_store
-            .commit_prepared_turn_finalization(turn_id.as_str(), now_timestamp_secs())
+        let committed = match closing
+            .correlation()
+            .scope(
+                self.crud_store
+                    .commit_prepared_turn_finalization(turn_id.as_str(), now_timestamp_secs()),
+            )
             .await
         {
             Ok(TurnFinalizationCommitOutcome::Committed(committed)) => committed,
             Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor) => {
+                closing.finish(Fact::Pending);
                 debug!(
                     thread_id,
                     turn_id, "native Turn finalization is waiting for an earlier projection"
@@ -8891,6 +10961,7 @@ impl MessageProcessor {
                 return false;
             }
             Ok(TurnFinalizationCommitOutcome::SupersededByTerminalStatus(status)) => {
+                closing.finish(Fact::Superseded);
                 debug!(
                     thread_id,
                     turn_id,
@@ -8918,6 +10989,15 @@ impl MessageProcessor {
             );
             return false;
         }
+        closing.finish(if committed.already_committed {
+            Fact::Duplicate
+        } else {
+            Fact::Confirmed
+        });
+        if !committed.already_committed {
+            self.recover_completed_turn_title(thread_id.clone(), &committed.turn_completed.turn)
+                .await;
+        }
         self.record_final_assistant_text_for_item(&committed.final_item)
             .await;
         self.kick_native_turn_event_deliveries();
@@ -8925,17 +11005,21 @@ impl MessageProcessor {
         // Reuse terminal cleanup/recovery/task reconciliation. Its canonical
         // TurnCompleted write is now an exact idempotent replay of the already
         // committed terminal half of the finalization transaction.
-        self.complete_turn(thread_id, turn_id, recovery).await
+        closing
+            .correlation()
+            .scope(self.complete_turn_with_title_recovery(thread_id, turn_id, recovery, false))
+            .await
     }
 
-    pub(super) async fn mark_turn_blocked(
+    // CLI launch has many terminal error branches. Keep their large recovery
+    // futures on the heap even when the successful path never polls them.
+    pub(super) fn mark_turn_blocked(
         &self,
         thread_id: String,
         turn_id: String,
         reason: String,
-    ) -> bool {
-        self.mark_turn_blocked_with_transition(thread_id, turn_id, reason, None)
-            .await
+    ) -> MessageFuture<'_, bool> {
+        message_future(self.mark_turn_blocked_with_transition(thread_id, turn_id, reason, None))
     }
 
     pub(super) async fn mark_turn_blocked_with_transition(
@@ -8984,11 +11068,15 @@ impl MessageProcessor {
             // Cancellation wins over Blocked, but still cannot bypass a CLI
             // transition already performing terminal effects or admission.
             let _acquired = if transition.is_none() {
-                match self.crud_store.get_cli_runtime_turn_binding(&turn_id).await {
+                match self
+                    .crud_store
+                    .get_cli_runtime_turn_binding_control(&turn_id)
+                    .await
+                {
                     Ok(Some(binding)) => {
                         let expected = self
                             .crud_store
-                            .cli_runtime_turn_terminal_guard(&binding)
+                            .cli_runtime_turn_terminal_control_guard(&binding)
                             .await
                             .ok()
                             .flatten();
@@ -9003,7 +11091,7 @@ impl MessageProcessor {
                         if expected.is_none()
                             || self
                                 .crud_store
-                                .cli_runtime_turn_terminal_guard(&binding)
+                                .cli_runtime_turn_terminal_control_guard(&binding)
                                 .await
                                 .ok()
                                 .flatten()
@@ -9169,11 +11257,15 @@ impl MessageProcessor {
         let turn_transition = if turn_transition.is_some() {
             turn_transition
         } else {
-            match self.crud_store.get_cli_runtime_turn_binding(&turn_id).await {
+            match self
+                .crud_store
+                .get_cli_runtime_turn_binding_control(&turn_id)
+                .await
+            {
                 Ok(Some(binding)) => {
                     let expected = match self
                         .crud_store
-                        .cli_runtime_turn_terminal_guard(&binding)
+                        .cli_runtime_turn_terminal_control_guard(&binding)
                         .await
                     {
                         Ok(Some(expected)) => expected,
@@ -9185,7 +11277,7 @@ impl MessageProcessor {
                     };
                     if self
                         .crud_store
-                        .cli_runtime_turn_terminal_guard(&binding)
+                        .cli_runtime_turn_terminal_control_guard(&binding)
                         .await
                         .ok()
                         .flatten()
@@ -9398,17 +11490,35 @@ impl MessageProcessor {
             return false;
         }
 
-        let task_reconciliation_succeeded = match self
-            .task_agent_executor
-            .reconcile_child_turn_blocked_with_start_failure(
-                thread_id.as_str(),
-                turn_id.as_str(),
-                turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
-                TaskChildReconciliationOrigin::Live,
-                start_failure,
-            )
+        // Like Completed reconciliation, this durable Task transition needs a
+        // fresh poll stack below CLI preparation and terminal Turn cleanup.
+        // Await the owned task; cancellation leaves durable reconciliation pending.
+        let task_reconciliation = {
+            let executor = Arc::clone(&self.task_agent_executor);
+            let reconciliation_thread_id = thread_id.clone();
+            let reconciliation_turn_id = turn_id.clone();
+            let reason = turn_blocked
+                .turn
+                .error
+                .clone()
+                .unwrap_or_else(|| "turn blocked".to_owned());
+            let start_failure = start_failure.cloned();
+            message_fresh_task(async move {
+                executor
+                    .reconcile_child_turn_blocked_with_start_failure(
+                        reconciliation_thread_id.as_str(),
+                        reconciliation_turn_id.as_str(),
+                        reason.as_str(),
+                        TaskChildReconciliationOrigin::Live,
+                        start_failure.as_ref(),
+                    )
+                    .await
+            })
             .await
-        {
+            .context("blocked child task reconciliation task did not finish")
+            .and_then(|result| result)
+        };
+        let task_reconciliation_succeeded = match task_reconciliation {
             Ok(reconciled) => reconciled,
             Err(error) => {
                 warn!(
@@ -9600,17 +11710,35 @@ impl MessageProcessor {
             return false;
         }
 
-        let task_reconciliation_succeeded = match self
-            .task_agent_executor
-            .reconcile_child_turn_blocked_with_start_failure(
-                thread_id.as_str(),
-                turn_id.as_str(),
-                turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
-                TaskChildReconciliationOrigin::Live,
-                start_failure,
-            )
+        // Like Completed reconciliation, this durable Task transition needs a
+        // fresh poll stack below CLI preparation and terminal Turn cleanup.
+        // Await the owned task; cancellation leaves durable reconciliation pending.
+        let task_reconciliation = {
+            let executor = Arc::clone(&self.task_agent_executor);
+            let reconciliation_thread_id = thread_id.clone();
+            let reconciliation_turn_id = turn_id.clone();
+            let reason = turn_blocked
+                .turn
+                .error
+                .clone()
+                .unwrap_or_else(|| "turn blocked".to_owned());
+            let start_failure = start_failure.cloned();
+            message_fresh_task(async move {
+                executor
+                    .reconcile_child_turn_blocked_with_start_failure(
+                        reconciliation_thread_id.as_str(),
+                        reconciliation_turn_id.as_str(),
+                        reason.as_str(),
+                        TaskChildReconciliationOrigin::Live,
+                        start_failure.as_ref(),
+                    )
+                    .await
+            })
             .await
-        {
+            .context("blocked child task reconciliation task did not finish")
+            .and_then(|result| result)
+        };
+        let task_reconciliation_succeeded = match task_reconciliation {
             Ok(reconciled) => reconciled,
             Err(error) => {
                 warn!(
@@ -9647,12 +11775,15 @@ impl MessageProcessor {
             return false;
         }
 
-        self.send_notification_to_thread_subscribers(
-            thread_id.as_str(),
-            events::TURN_BLOCKED,
-            &turn_blocked,
-        )
-        .await;
+        // The canonical blocked event already owns retry through LIVE.
+        if !self.foreground_starts.pending(&thread_id, &turn_id) {
+            self.send_notification_to_thread_subscribers(
+                thread_id.as_str(),
+                events::TURN_BLOCKED,
+                &turn_blocked,
+            )
+            .await;
+        }
         self.notify_semantic_timeline_turn_state_changed(
             turn_blocked.workspace_id.as_str(),
             turn_blocked.thread_id.as_str(),
@@ -9669,7 +11800,11 @@ impl MessageProcessor {
         reason: Option<&str>,
         transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> bool {
-        match self.crud_store.get_cli_runtime_turn_binding(turn_id).await {
+        match self
+            .crud_store
+            .get_cli_runtime_turn_binding_control(turn_id)
+            .await
+        {
             Ok(Some(binding)) => {
                 if binding.thread_id != thread_id
                     || !self
@@ -9768,6 +11903,43 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn projected_terminal_cancel_outcome(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        expected_owner: Option<&pioneer_crud::TurnExecutionRecord>,
+    ) -> Result<Option<(String, pioneer_protocol::Turn)>> {
+        let owner = self.crud_store.get_turn_execution(turn_id).await?;
+        anyhow::ensure!(
+            owner
+                .as_ref()
+                .map(|owner| (&owner.owner_id, owner.owner_generation))
+                == expected_owner.map(|owner| (&owner.owner_id, owner.owner_generation)),
+            pioneer_crud::UnactivatedTurnPhaseChanged
+        );
+        let Some((workspace, turn)) = self.crud_store.get_turn(thread_id, turn_id).await? else {
+            return Ok(None);
+        };
+        if matches!(
+            turn.status,
+            TurnStatus::InProgress | TurnStatus::Interrupted
+        ) || !self
+            .synchronize_projected_native_terminal_turn(&workspace, thread_id, turn_id)
+            .await?
+        {
+            return Ok(None);
+        }
+        let current_owner = self.crud_store.get_turn_execution(turn_id).await?;
+        anyhow::ensure!(
+            current_owner
+                .as_ref()
+                .map(|owner| (&owner.owner_id, owner.owner_generation))
+                == expected_owner.map(|owner| (&owner.owner_id, owner.owner_generation)),
+            pioneer_crud::UnactivatedTurnPhaseChanged
+        );
+        Ok(Some((workspace, turn)))
+    }
+
     pub(super) async fn mark_turn_interrupted(
         &self,
         thread_id: String,
@@ -9859,79 +12031,87 @@ impl MessageProcessor {
             .agent_manager
             .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
             .await;
-        if let Some(accepted) = self
+        let accepted = self
             .crud_store
             .native_cancellation_accepted_notification_owned(
                 &turn_id,
                 self.turn_execution_owner_id.as_ref(),
             )
             .await
-            .map_err(classify_native_preparation_error)?
-        {
-            self.thread_manager
-                .commit_terminal_turn(&thread_id, &accepted.turn)
-                .await
-                .map_err(|_| {
-                    DurableCommitRejection::permanent(
-                        "terminal_result_conflict",
-                        "local interruption conflicts with accepted canonical result",
-                    )
-                })?;
-        }
-        if let Some((workspace_id, current_turn)) = self
-            .thread_manager
-            .turn_get(thread_id.as_str(), turn_id.as_str())
-            .await
-        {
-            if current_turn.status == TurnStatus::Interrupted {
-                self.retire_execution_progress_state(turn_id.as_str()).await;
-                let notification = TurnFailedNotification {
-                    workspace_id,
+            .map_err(classify_native_preparation_error)?;
+        let loaded = self.thread_manager.turn_get(&thread_id, &turn_id).await;
+        // Projection may enrich memory with a persisted prompt manifest. Replay
+        // the immutable accepted payload, whose full-payload idempotency key
+        // must not be reconstructed from that enriched runtime snapshot.
+        if let Some(notification) = accepted.or_else(|| {
+            loaded
+                .as_ref()
+                .filter(|(_, turn)| turn.status == TurnStatus::Interrupted)
+                .map(|(workspace, turn)| TurnFailedNotification {
+                    workspace_id: workspace.clone(),
                     thread_id: thread_id.clone(),
-                    turn: current_turn,
-                };
-                if let Err(error) = self
-                    .materialize_native_agent_turn_event(
-                        pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification),
-                        now_timestamp_secs(),
-                        None,
+                    turn: turn.clone(),
+                })
+        }) {
+            self.retire_execution_progress_state(turn_id.as_str()).await;
+            if let Err(error) = self
+                .materialize_native_agent_turn_event(
+                    pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification),
+                    now_timestamp_secs(),
+                    None,
+                )
+                .await
+            {
+                if error
+                    .downcast_ref::<pioneer_crud::UnactivatedTurnPhaseChanged>()
+                    .is_none()
+                    && (pioneer_crud::turn_event_was_appended_before_error(&error)
+                        || error
+                            .downcast_ref::<NativeTurnControlTransitionPending>()
+                            .is_some())
+                {
+                    self.observe_accepted_native_cancellation(
+                        &thread_id,
+                        &turn_id,
+                        terminal_actor_generation,
+                    )
+                    .await;
+                }
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to confirm idempotent interrupted Turn commit"
+                );
+                return Err(classify_native_preparation_error(error));
+            }
+            self.observe_accepted_native_cancellation(
+                &thread_id,
+                &turn_id,
+                terminal_actor_generation,
+            )
+            .await;
+            if task_cancellation
+                && let Err(error) = self
+                    .task_agent_executor
+                    .reconcile_child_turn_cancelled(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        reason.as_str(),
+                        TaskChildReconciliationOrigin::Live,
                     )
                     .await
-                {
-                    warn!(
-                        thread_id,
-                        turn_id,
-                        error = %format!("{error:#}"),
-                        "failed to confirm idempotent interrupted Turn commit"
-                    );
-                    return Err(classify_native_preparation_error(error));
-                }
-                self.observe_accepted_native_cancellation(
-                    &thread_id,
-                    &turn_id,
-                    terminal_actor_generation,
-                )
-                .await;
-                if task_cancellation
-                    && let Err(error) = self
-                        .task_agent_executor
-                        .reconcile_child_turn_cancelled(
-                            thread_id.as_str(),
-                            turn_id.as_str(),
-                            reason.as_str(),
-                            TaskChildReconciliationOrigin::Live,
-                        )
-                        .await
-                {
-                    warn!(
-                        thread_id,
-                        turn_id,
-                        error = %format!("{error:#}"),
-                        "failed to reconcile already-interrupted child task turn as cancelled"
-                    );
-                }
-                return Ok(());
+            {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to reconcile already-interrupted child task turn as cancelled"
+                );
             }
+            return Ok(());
+        }
+        if let Some((_, current_turn)) = loaded {
             if current_turn.status != TurnStatus::InProgress {
                 self.retire_execution_progress_state(turn_id.as_str()).await;
                 return Err(DurableCommitRejection::permanent(
@@ -9995,15 +12175,22 @@ impl MessageProcessor {
                     .await
                     && current_turn.status == TurnStatus::Interrupted
                 {
+                    let notification = self
+                        .crud_store
+                        .native_cancellation_accepted_notification_owned(
+                            &turn_id,
+                            self.turn_execution_owner_id.as_ref(),
+                        )
+                        .await
+                        .map_err(classify_native_preparation_error)?
+                        .unwrap_or(TurnFailedNotification {
+                            workspace_id,
+                            thread_id: thread_id.clone(),
+                            turn: current_turn,
+                        });
                     match self
                         .materialize_native_agent_turn_event(
-                            pioneer_crud::CanonicalTurnEventPayload::TurnFailed(
-                                TurnFailedNotification {
-                                    workspace_id,
-                                    thread_id: thread_id.clone(),
-                                    turn: current_turn,
-                                },
-                            ),
+                            pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification),
                             now_timestamp_secs(),
                             None,
                         )
@@ -10019,7 +12206,24 @@ impl MessageProcessor {
                             self.retire_execution_progress_state(turn_id.as_str()).await;
                             return Ok(());
                         }
-                        Err(error) => return Err(classify_native_preparation_error(error)),
+                        Err(error) => {
+                            if error
+                                .downcast_ref::<pioneer_crud::UnactivatedTurnPhaseChanged>()
+                                .is_none()
+                                && (pioneer_crud::turn_event_was_appended_before_error(&error)
+                                    || error
+                                        .downcast_ref::<NativeTurnControlTransitionPending>()
+                                        .is_some())
+                            {
+                                self.observe_accepted_native_cancellation(
+                                    &thread_id,
+                                    &turn_id,
+                                    terminal_actor_generation,
+                                )
+                                .await;
+                            }
+                            return Err(classify_native_preparation_error(error));
+                        }
                     }
                 }
                 warn!(
@@ -10050,6 +12254,29 @@ impl MessageProcessor {
             )
             .await
         {
+            if error
+                .downcast_ref::<pioneer_crud::UnactivatedTurnPhaseChanged>()
+                .is_none()
+                && (pioneer_crud::turn_event_was_appended_before_error(&error)
+                    || error
+                        .downcast_ref::<NativeTurnControlTransitionPending>()
+                        .is_some())
+            {
+                self.observe_accepted_native_cancellation(
+                    &thread_id,
+                    &turn_id,
+                    terminal_actor_generation,
+                )
+                .await;
+            }
+            if error
+                .downcast_ref::<NativeTurnControlTransitionPending>()
+                .is_some()
+            {
+                // Materialization accepted this cancellation; its completion
+                // validation is pending. Do not undo that accepted terminal.
+                return Err(classify_native_preparation_error(error));
+            }
             let rolled_back = self
                 .rollback_terminal_turn_finish_if_event_not_appended(
                     finish_outcome.rollback_context,
@@ -10087,6 +12314,7 @@ impl MessageProcessor {
                 }
                 return Err(classify_native_preparation_error(error));
             }
+            return Err(classify_native_preparation_error(error));
         }
         self.observe_accepted_native_cancellation(&thread_id, &turn_id, terminal_actor_generation)
             .await;
@@ -10203,6 +12431,24 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to mark active recovery jobs interrupted"
                 );
+            }
+        }
+
+        // Recovery job settlement follows the first cleanup attempt. Retry the
+        // existing cleanup boundary now, so an aborted receipt needs no timer.
+        if task_reconciliation_succeeded {
+            let cleanup_store = self.crud_store.with_maintenance_access();
+            if let Err(_error) = cleanup_store
+                .release_settled_shell_controls(turn_id.as_str())
+                .await
+            {
+                warn!("failed to release settled shell controls");
+            }
+            if let Err(_error) = cleanup_store
+                .cleanup_terminal_task_child_capsule(thread_id.as_str(), turn_id.as_str())
+                .await
+            {
+                warn!("terminal child control cleanup remains pending");
             }
         }
 
@@ -10444,6 +12690,24 @@ impl MessageProcessor {
             }
         }
 
+        // Recovery job settlement follows the first cleanup attempt. Retry the
+        // existing cleanup boundary now, so an aborted receipt needs no timer.
+        if task_reconciliation_succeeded {
+            let cleanup_store = self.crud_store.with_maintenance_access();
+            if let Err(_error) = cleanup_store
+                .release_settled_shell_controls(turn_id.as_str())
+                .await
+            {
+                warn!("failed to release settled shell controls");
+            }
+            if let Err(_error) = cleanup_store
+                .cleanup_terminal_task_child_capsule(thread_id.as_str(), turn_id.as_str())
+                .await
+            {
+                warn!("terminal child control cleanup remains pending");
+            }
+        }
+
         if task_reconciliation_succeeded
             && self
                 .thread_manager
@@ -10504,6 +12768,63 @@ impl MessageProcessor {
             .context("failed to materialize artifact-aware user message payload")?;
         let (text, mut attachments) = payload.unwrap_or_default();
         attachments.extend_from_slice(capability_attachments);
+        // Freeze the authored image reference with the user message. Only the Gateway's
+        // matching installed revision may supply it; client image references are ignored.
+        for attachment in &mut attachments {
+            if let pioneer_protocol::UserMessageAttachment::App { capability } = attachment {
+                capability.icon = None;
+                capability.dark_icon = None;
+                if let Ok(Some(parent)) = self
+                    .crud_store
+                    .find_package_installation(&capability.app_id)
+                    .await
+                {
+                    if parent.kind == pioneer_protocol::PackageKind::App
+                        && parent.workspace_id == workspace_id
+                        && parent.revision == capability.expected_revision
+                        && parent.state == "installed"
+                        && parent.pending_json.is_none()
+                    {
+                        let item = self.package_presentation_item(&parent).await?;
+                        capability.dark_icon = item
+                            .app
+                            .as_ref()
+                            .and_then(|a| a.composer_icon.as_ref())
+                            .map(|i| i.dark.clone());
+                        capability.icon = item.composer_icon;
+                    }
+                }
+            }
+            if let pioneer_protocol::UserMessageAttachment::Plugin { capability } = attachment {
+                capability.icon = None;
+                if let Ok(Some(parent)) = self
+                    .crud_store
+                    .find_package_installation(&capability.plugin_id)
+                    .await
+                {
+                    if parent.workspace_id == workspace_id
+                        && parent.revision == capability.expected_revision
+                        && parent.state == "installed"
+                        && parent.pending_json.is_none()
+                    {
+                        capability.icon = parent
+                            .composer_icon_path
+                            .as_ref()
+                            .zip(parent.composer_icon_revision.as_ref())
+                            .or_else(|| {
+                                parent.logo_path.as_ref().zip(parent.logo_revision.as_ref())
+                            })
+                            .map(|(_, revision)| {
+                                pioneer_protocol::ImageReference::plugin_icon(
+                                    &parent.workspace_id,
+                                    &parent.id,
+                                    revision.clone(),
+                                )
+                            });
+                    }
+                }
+            }
+        }
 
         if text.is_empty() && attachments.is_empty() {
             return Ok(());
@@ -10568,18 +12889,62 @@ impl MessageProcessor {
     ) {
         let processor = self.clone();
         tokio::spawn(async move {
-            if !processor.try_acquire_title_job(thread_id.as_str()).await {
-                debug!(
-                    thread_id = thread_id.as_str(),
-                    "thread title job is already active; trigger coalesced"
+            if processor.try_acquire_title_job(&thread_id).await {
+                processor.spawn_owned_thread_title_task(
+                    thread_id,
+                    current_turn_first_user_text,
+                    None,
                 );
+            }
+        });
+    }
+
+    pub(super) async fn recover_thread_title(&self, thread_id: String) {
+        // Consume the ticket at the completion boundary. An active job drops
+        // the trigger; only the original full input survives a deferred attempt.
+        let user_text = {
+            let mut runtime = self.title_job_runtime.lock().await;
+            let Some(ThreadTitleJobState::AwaitingSuccessfulTurn(text)) = runtime.get(&thread_id)
+            else {
+                return;
+            };
+            let text = text.clone();
+            if text.remaining == 0 {
                 return;
             }
+            runtime.insert(thread_id.clone(), ThreadTitleJobState::Pending);
+            text
+        };
+        self.spawn_owned_thread_title_task(thread_id, None, Some(user_text));
+    }
 
+    async fn recover_completed_turn_title(&self, thread_id: String, turn: &pioneer_protocol::Turn) {
+        if turn.status == TurnStatus::Completed
+            && turn.origin == pioneer_protocol::TurnOrigin::User
+            && turn.turn_kind == pioneer_protocol::TurnKind::Conversation
+        {
+            self.recover_thread_title(thread_id).await;
+        }
+    }
+
+    fn spawn_owned_thread_title_task(
+        &self,
+        thread_id: String,
+        current_turn_first_user_text: Option<String>,
+        recovery_source: Option<ThreadTitleRecovery>,
+    ) {
+        let processor = self.clone();
+        tokio::spawn(async move {
             if let Err(error) = processor
                 .run_initial_thread_title_task(
                     thread_id.as_str(),
                     current_turn_first_user_text.as_deref(),
+                    recovery_source.as_deref(),
+                    recovery_source
+                        .as_ref()
+                        .map_or(TITLE_JOB_MAX_RECOVERIES, |source| {
+                            source.remaining.saturating_sub(1)
+                        }),
                 )
                 .await
             {
@@ -10591,7 +12956,13 @@ impl MessageProcessor {
                 processor
                     .record_title_job_state(
                         thread_id.as_str(),
-                        ThreadTitleJobState::FailedNonRetriable,
+                        recovery_source.map_or(ThreadTitleJobState::FailedNonRetriable, |source| {
+                            if source.remaining > 0 {
+                                ThreadTitleJobState::DeferredUntilSuccessfulTurn(source)
+                            } else {
+                                ThreadTitleJobState::FailedNonRetriable
+                            }
+                        }),
                         TITLE_JOB_MAX_ATTEMPTS,
                     )
                     .await;
@@ -10603,9 +12974,7 @@ impl MessageProcessor {
 
     async fn try_acquire_title_job(&self, thread_id: &str) -> bool {
         let mut runtime = self.title_job_runtime.lock().await;
-        if let Some(state) = runtime.get(thread_id).copied()
-            && state.is_active()
-        {
+        if runtime.contains_key(thread_id) {
             return false;
         }
         runtime.insert(thread_id.to_owned(), ThreadTitleJobState::Pending);
@@ -10613,7 +12982,15 @@ impl MessageProcessor {
     }
 
     async fn release_title_job(&self, thread_id: &str) {
-        self.title_job_runtime.lock().await.remove(thread_id);
+        let mut runtime = self.title_job_runtime.lock().await;
+        if let Some(ThreadTitleJobState::DeferredUntilSuccessfulTurn(text)) =
+            runtime.remove(thread_id)
+        {
+            runtime.insert(
+                thread_id.to_owned(),
+                ThreadTitleJobState::AwaitingSuccessfulTurn(text),
+            );
+        }
     }
 
     async fn record_title_job_state(
@@ -10649,6 +13026,8 @@ impl MessageProcessor {
         &self,
         thread_id: &str,
         current_turn_first_user_text: Option<&str>,
+        recovery_source: Option<&str>,
+        remaining_recoveries: u8,
     ) -> Result<()> {
         self.record_title_job_state(thread_id, ThreadTitleJobState::Pending, 0)
             .await;
@@ -10665,26 +13044,33 @@ impl MessageProcessor {
             pioneer_protocol::ThreadOriginKind::User
                 | pioneer_protocol::ThreadOriginKind::Collaborative
                 | pioneer_protocol::ThreadOriginKind::DirectMessage
-        ) || background
-            .get_task_thread_lineage(thread_id)
-            .await?
-            .is_some()
+        ) || thread.sidebar_visibility == pioneer_protocol::ThreadSidebarVisibility::Hidden
+            || background
+                .get_task_thread_lineage(thread_id)
+                .await?
+                .is_some()
         {
             self.record_title_job_state(thread_id, ThreadTitleJobState::Succeeded, 0)
                 .await;
             return Ok(());
         }
 
-        let user_text = match background.get_first_thread_user_text(thread_id).await {
-            Ok(Some(text)) => Some(text),
-            Ok(None) => current_turn_first_user_text.map(str::to_owned),
-            Err(error) => {
-                warn!(
-                    thread_id,
-                    error = %format!("{error:#}"),
-                    "failed to resolve first thread user text for title generation"
-                );
-                current_turn_first_user_text.map(str::to_owned)
+        let user_text = if let Some(source) = recovery_source {
+            // The history may start with attachments, or have changed since
+            // the deadline. Reuse the exact trusted text from that title job.
+            Some(source.to_owned())
+        } else {
+            match background.get_first_thread_user_text(thread_id).await {
+                Ok(Some(text)) => Some(text),
+                Ok(None) => current_turn_first_user_text.map(str::to_owned),
+                Err(error) => {
+                    warn!(
+                        thread_id,
+                        error = %format!("{error:#}"),
+                        "failed to resolve first thread user text for title generation"
+                    );
+                    current_turn_first_user_text.map(str::to_owned)
+                }
             }
         };
 
@@ -10743,6 +13129,36 @@ impl MessageProcessor {
                     return Ok(());
                 }
                 Err(error) => {
+                    let recoverable = if let Some(failure) =
+                        error.downcast_ref::<pioneer_cli_agent_runtime::service::ServiceFailure>()
+                    {
+                        matches!(
+                            failure.class,
+                            pioneer_protocol::ProviderFailureClass::NetworkTransient
+                                | pioneer_protocol::ProviderFailureClass::RateLimit
+                                | pioneer_protocol::ProviderFailureClass::Provider5xx
+                        )
+                    } else {
+                        error.is::<pioneer_cli_agent_runtime::service::CodexServiceDeadline>()
+                            || error
+                                .is::<pioneer_cli_agent_runtime::service::ClaudeServiceDeadline>()
+                            || error
+                                .is::<pioneer_cli_agent_runtime::service::ServiceProcessFailure>()
+                    };
+                    if recoverable {
+                        // Retry only after another successful user turn, with
+                        // a finite recovery budget and the original trusted input.
+                        let state = if remaining_recoveries > 0 {
+                            ThreadTitleJobState::DeferredUntilSuccessfulTurn(ThreadTitleRecovery {
+                                text: user_text.as_str().into(),
+                                remaining: remaining_recoveries,
+                            })
+                        } else {
+                            ThreadTitleJobState::FailedNonRetriable
+                        };
+                        self.record_title_job_state(thread_id, state, attempt).await;
+                        return Ok(());
+                    }
                     if attempt >= TITLE_JOB_MAX_ATTEMPTS {
                         warn!(
                             thread_id,
@@ -10888,12 +13304,14 @@ impl MessageProcessor {
             placement: None,
         };
 
-        self.send_notification_to_thread_subscribers(
-            thread_id,
-            events::THREAD_UPDATED,
-            &notification,
-        )
-        .await;
+        if !self.foreground_starts.pending_thread(thread_id) {
+            self.send_notification_to_thread_subscribers(
+                thread_id,
+                events::THREAD_UPDATED,
+                &notification,
+            )
+            .await;
+        }
         self.notify_thread_tree_changed(notification.thread.workspace_id)
             .await;
     }
@@ -10949,6 +13367,8 @@ fn user_message_attachments_from_capabilities_with_lookup<'a>(
                         },
                     }
                 }
+                pioneer_protocol::TurnCapabilityKind::App { app_id, expected_revision } => pioneer_protocol::UserMessageAttachment::App { capability: pioneer_protocol::TurnAppCapabilitySummary { app_id:app_id.clone(), expected_revision:*expected_revision, label:capability.label.clone().ok_or_else(|| anyhow::anyhow!("App presentation missing"))?, icon:None,dark_icon:None } },
+                pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id, expected_revision } => pioneer_protocol::UserMessageAttachment::Plugin { capability: pioneer_protocol::TurnPluginCapabilitySummary { plugin_id: plugin_id.clone(), expected_revision: *expected_revision, label: capability.label.clone().ok_or_else(|| anyhow::anyhow!("plugin presentation missing"))?, icon: None } },
                 pioneer_protocol::TurnCapabilityKind::SkillPack { pack_id } => {
                     let name = pack_names.get(pack_id).ok_or_else(|| {
                         anyhow::anyhow!(
@@ -11279,6 +13699,76 @@ mod user_message_attachment_tests {
                 if capability.pack_id == pack_id && capability.label == "Authoritative Pack"
         ));
     }
+}
+
+/// Match bounded durable one-to-many bindings to captured actual native runs.
+/// A missing pending binding is an admission/ownership gap, not a terminal-state
+/// cleanup claim. Historical bindings can disappear only through the manager's
+/// proven-quiescent release/actor-join invariant used by its snapshot.
+pub(super) fn select_native_graph_owners(
+    targets: &[pioneer_crud::AgentWorkGraphCancellationTarget],
+    owners: Vec<pioneer_agent::NativeTurnStopOwner>,
+    root_thread: &str,
+    root_turn: &str,
+    root_pending: bool,
+) -> anyhow::Result<Vec<pioneer_agent::NativeTurnStopOwner>> {
+    if targets.iter().any(|target| target.has_cli_binding) {
+        anyhow::bail!("graph stop contains an unsupported CLI runtime binding");
+    }
+    let mut bindings = std::collections::BTreeSet::new();
+    for target in targets {
+        match (&target.thread_id, &target.turn_id) {
+            (Some(thread), Some(turn)) => {
+                bindings.insert((thread.as_str(), turn.as_str()));
+            }
+            (None, Some(_)) => anyhow::bail!("graph response thread owner is unknown"),
+            (_, None) => {} // Serialized fence closes queued/unadmitted work.
+        }
+    }
+    let known_turns = owners
+        .iter()
+        .map(|owner| (owner.thread_id(), owner.turn_id()))
+        .collect::<std::collections::BTreeSet<_>>();
+    for owner in &owners {
+        if !owner.is_quiescent()
+            && !bindings.contains(&(owner.thread_id(), owner.turn_id()))
+            && (owner.thread_id(), owner.turn_id()) != (root_thread, root_turn)
+        {
+            anyhow::bail!("outstanding native run has no exact graph response binding");
+        }
+    }
+    for target in targets.iter().filter(|target| target.turn_pending) {
+        if let (Some(thread), Some(turn)) = (&target.thread_id, &target.turn_id) {
+            if !known_turns.contains(&(thread.as_str(), turn.as_str())) {
+                anyhow::bail!("pending graph response native owner is unknown");
+            }
+        }
+    }
+    if root_pending && !known_turns.contains(&(root_thread, root_turn)) {
+        anyhow::bail!("pending root native owner is unknown");
+    }
+    // Pending rows require a known native owner above, but may lag its completed
+    // cleanup. A new stop awaits outstanding runs; the complete initial snapshot
+    // still owns final identity validation, including already quiescent runs.
+    Ok(owners
+        .into_iter()
+        .filter(|owner| !owner.is_quiescent())
+        .collect())
+}
+
+/// The success boundary permits only proven-quiescent identities already in
+/// the initial snapshot, including history omitted from cancellation selection.
+pub(super) fn validate_native_graph_stop_snapshot(
+    captured: &std::collections::HashSet<pioneer_agent::NativeTurnStopOwner>,
+    remaining: &[pioneer_agent::NativeTurnStopOwner],
+) -> anyhow::Result<()> {
+    if remaining
+        .iter()
+        .any(|owner| !owner.is_quiescent() || !captured.contains(owner))
+    {
+        anyhow::bail!("native graph publication changed during stop; retry required");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

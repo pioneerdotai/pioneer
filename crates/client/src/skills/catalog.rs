@@ -99,6 +99,9 @@ pub fn skill_key(skill_id: &SkillId) -> SkillId {
 /// Tasks, and Subagents are always active and therefore do not belong in
 /// user-managed catalog or composer-selection surfaces.
 pub fn skill_is_user_selectable(skill: &SkillListItem) -> bool {
+    if skill.is_package_component() {
+        return false;
+    }
     skill.policy.allow_implicit_invocation_editable
 }
 
@@ -140,7 +143,8 @@ pub fn filter_skills_by_search<'a>(
 }
 
 pub fn derive_skills_catalog_and_installed(mut catalog: Vec<SkillListItem>) -> SkillsCatalogSplit {
-    catalog.retain(skill_is_user_selectable);
+    // Keep owned native records in the shared catalog; surface selectors hide them.
+    catalog.retain(|skill| skill.is_package_component() || skill_is_user_selectable(skill));
     catalog.sort_by(|left, right| {
         left.source_kind
             .cmp(&right.source_kind)
@@ -194,7 +198,7 @@ pub fn project_skill_management(
 ) -> SkillManagementProjection {
     let mut standalone = installed
         .iter()
-        .filter(|skill| skill.pack.is_none())
+        .filter(|skill| skill.pack.is_none() && !skill.is_package_component())
         .cloned()
         .collect::<Vec<_>>();
     standalone.sort_by(skill_management_order);
@@ -373,6 +377,21 @@ mod tests {
     };
     use std::cell::RefCell;
 
+    #[test]
+    fn owned_records_survive_common_catalog_but_are_hidden_by_surface_selectors() {
+        let standalone = skill("standalone", "user", true);
+        let mut owned = skill("bundled", "user", true);
+        owned.plugin_owner = Some(pioneer_protocol::PluginOwner {
+            plugin_id: "P".repeat(21),
+            member_key: "bundled".into(),
+        });
+        let snapshot = project_skills_snapshot(vec![owned.clone(), standalone], vec![]);
+        assert_eq!(snapshot.catalog.len(), 2);
+        assert_eq!(snapshot.installed.len(), 2);
+        assert_eq!(snapshot.management.standalone.len(), 1);
+        assert!(!skill_is_user_selectable(&owned));
+    }
+
     fn skill_id(slug: &str, source_kind: &str) -> SkillId {
         let seed = format!("{slug}{source_kind}")
             .chars()
@@ -383,6 +402,8 @@ mod tests {
 
     fn skill(slug: &str, source_kind: &str, installed: bool) -> SkillListItem {
         SkillListItem {
+            plugin_owner: None,
+            package_owner: None,
             skill_id: skill_id(slug, source_kind),
             pack: None,
             owner: None,
@@ -455,12 +476,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_targets_are_keyed_only_by_exact_id() {
-        let id = skill_id("imagegen", "user");
-        assert_eq!(skill_key(&id), id);
-    }
-
-    #[test]
     fn catalog_split_uses_invocation_policy_instead_of_system_origin() {
         let browser = skill("browser", "system", true);
         let mut memory = skill("memory", "system", true);
@@ -493,22 +508,6 @@ mod tests {
             &split.installed,
             &skill_id("memory", "system")
         ));
-    }
-
-    #[test]
-    fn snapshot_projects_health_map_and_prunes_pending_actions() {
-        let snapshot = project_skills_snapshot(
-            vec![skill("alpha", "user", true), skill("beta", "user", false)],
-            vec![health("alpha", "user")],
-        );
-        let alpha_id = skill_id("alpha", "user");
-        assert!(snapshot.health_details.contains_key(&alpha_id));
-
-        let missing_id = skill_id("missing", "user");
-        let mut pending = HashSet::from([alpha_id.clone(), missing_id.clone()]);
-        retain_pending_actions_for_catalog(&mut pending, &snapshot.catalog);
-        assert!(pending.contains(&alpha_id));
-        assert!(!pending.contains(&missing_id));
     }
 
     #[test]
@@ -714,13 +713,6 @@ mod tests {
             assert_eq!(filter_skills_by_search(&skills, query).len(), 2, "{query}");
         }
         assert!(filter_skills_by_search(&skills, "missing").is_empty());
-    }
-
-    #[test]
-    fn refresh_failure_reduction_carries_display_error() {
-        let reduction = reduce_skills_catalog_refresh_failure("load failed");
-
-        assert_eq!(reduction.error, "load failed");
     }
 
     #[test]

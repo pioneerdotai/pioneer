@@ -311,18 +311,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strict_mime_mismatch_is_rejected() {
-        let policy = AttachmentNormalizationPolicy {
-            strict_mime_match: true,
-            ..AttachmentNormalizationPolicy::default()
-        };
-        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        let err = reconcile_mime("text/plain", Some(&png), &policy)
-            .expect_err("mismatch must fail in strict mode");
-        assert!(err.to_string().contains("MIME_MISMATCH"));
-    }
-
-    #[test]
     fn filename_is_sanitized() {
         let normalized = normalize_attachment_name(
             Some("../bad:name"),

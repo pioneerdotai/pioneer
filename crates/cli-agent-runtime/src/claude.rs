@@ -211,26 +211,11 @@ pub fn claude_executable_cache_identity(
 pub fn attest_claude_executable_identity(
     cache_identity: ClaudeExecutableCacheIdentity,
 ) -> anyhow::Result<ClaudeExecutableAttestation> {
-    let metadata = fs::metadata(cache_identity.realpath.as_path()).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to re-inspect Claude executable `{}`: {error}",
-            cache_identity.realpath.display()
-        )
-    })?;
-    let modified = metadata
-        .modified()
-        .map_err(|error| anyhow::anyhow!("failed to re-read Claude executable mtime: {error}"))?
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| anyhow::anyhow!("Claude executable modification time predates Unix epoch"))?;
-    let modified_unix_nanos = modified.as_nanos().min(u64::MAX as u128) as u64;
-    if !metadata.is_file()
-        || metadata.len() != cache_identity.size
-        || modified_unix_nanos != cache_identity.modified_unix_nanos
-    {
-        anyhow::bail!("Claude executable changed while it was being attested");
-    }
-    let binary_sha256 =
-        crate::codex_attestation::sha256_file_contents(cache_identity.realpath.as_path())?;
+    let binary_sha256 = crate::executable_digest::executable_sha256(
+        cache_identity.realpath.as_path(),
+        cache_identity.size,
+        cache_identity.modified_unix_nanos,
+    )?;
     let platform = env::consts::OS.to_owned();
     let architecture = env::consts::ARCH.to_owned();
     let local_executable_fingerprint = crate::codex_attestation::sha256_json(&serde_json::json!({
@@ -1637,6 +1622,11 @@ async fn run_initialize_probe(
             message: format!("failed to spawn Claude CLI initialize probe: {error}"),
             stderr: Vec::new(),
         })?;
+    let mut observation = pioneer_observability::resources::ChildRegistration::register(
+        child.id(),
+        pioneer_observability::resources::ChildRole::CliAgent,
+        None,
+    );
     if let Some(mut stdin) = child.stdin.take() {
         let initialize_line = serde_json::json!({
             "type": "control_request",
@@ -1672,6 +1662,7 @@ async fn run_initialize_probe(
             });
         }
     };
+    observation.exited(output.status.success());
     let stderr = stderr_lines(
         config
             .env

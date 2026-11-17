@@ -6,6 +6,8 @@ use pioneer_client::{
 };
 fn runtime(core: Arc<ClientCore>) -> ClientFfiRuntime {
     ClientFfiRuntime {
+        native_oauth: Arc::new(package_shell::NativeOAuthShell::new(&core)),
+        plugin_uploads: Default::default(),
         core,
         config: Default::default(),
         client_subscriptions: Default::default(),
@@ -13,6 +15,7 @@ fn runtime(core: Arc<ClientCore>) -> ClientFfiRuntime {
 
         diagnostics: Default::default(),
         avatar_cache: Default::default(),
+        voice_capture: Default::default(),
     }
 }
 #[test]

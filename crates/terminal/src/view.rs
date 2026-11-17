@@ -780,12 +780,7 @@ impl TerminalView {
     /// Handle scroll events.
     ///
     /// Currently a placeholder for future scrollback support.
-    fn on_scroll(
-        &mut self,
-        _event: &ScrollWheelEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
+    fn on_scroll(&mut self, _event: &ScrollEvent, _window: &mut Window, _cx: &mut Context<Self>) {
         // TODO: Implement scrollback
         // - Scroll the terminal display up/down
         // - Send scroll reports if alternate screen is not active
@@ -929,7 +924,7 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .on_scroll(cx.listener(Self::on_scroll))
             .child(
                 canvas(
                     move |bounds, _window, _cx| bounds,

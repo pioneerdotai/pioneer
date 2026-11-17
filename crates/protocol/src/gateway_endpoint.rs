@@ -109,6 +109,7 @@ pub enum GatewayBaseUrlError {
     InvalidBasePath,
     InvalidUrl,
     InvalidStoragePath,
+    InvalidWebhookPath,
 }
 
 impl GatewayBaseUrl {
@@ -181,6 +182,26 @@ impl GatewayBaseUrl {
             return Err(GatewayBaseUrlError::InvalidStoragePath);
         }
         Ok(target)
+    }
+
+    /// Append a capability path without discarding the configured public prefix.
+    pub fn task_webhook_url(
+        &self,
+        trigger_id: &str,
+        secret: &str,
+    ) -> Result<Url, GatewayBaseUrlError> {
+        if [trigger_id, secret].into_iter().any(|segment| {
+            segment.is_empty()
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        }) {
+            return Err(GatewayBaseUrlError::InvalidWebhookPath);
+        }
+        Url::parse(self.as_str())
+            .expect("GatewayBaseUrl invariant")
+            .join(&format!("webhooks/tasks/{trigger_id}/{secret}"))
+            .map_err(|_| GatewayBaseUrlError::InvalidWebhookPath)
     }
 
     pub fn socket_address_input(&self) -> String {
@@ -360,6 +381,7 @@ impl fmt::Display for GatewayBaseUrlError {
             Self::InvalidBasePath => "Gateway base URL contains an invalid base path",
             Self::InvalidUrl => "Gateway base URL is invalid",
             Self::InvalidStoragePath => "Gateway storage path is invalid",
+            Self::InvalidWebhookPath => "Gateway webhook path is invalid",
         })
     }
 }
@@ -451,6 +473,34 @@ mod tests {
         ] {
             let error = GatewayBaseUrl::parse_presentation(input).unwrap_err();
             assert!(!format!("{error:?} {error}").contains("secret"));
+        }
+    }
+
+    #[test]
+    fn task_webhook_urls_preserve_public_prefix_port_and_ipv6_authority() {
+        for (input, expected) in [
+            (
+                "https://relay.example/pioneer",
+                "https://relay.example/pioneer/webhooks/tasks/id_21/secret-42",
+            ),
+            (
+                "http://[fd00::42]:1234/prefix",
+                "http://[fd00::42]:1234/prefix/webhooks/tasks/id_21/secret-42",
+            ),
+        ] {
+            let base = GatewayBaseUrl::parse_presentation(input).unwrap();
+            assert_eq!(
+                base.task_webhook_url("id_21", "secret-42")
+                    .unwrap()
+                    .as_str(),
+                expected
+            );
+            for invalid in ["", "..", "a/b", "a?secret", "%2f"] {
+                assert_eq!(
+                    base.task_webhook_url("id_21", invalid),
+                    Err(GatewayBaseUrlError::InvalidWebhookPath)
+                );
+            }
         }
     }
 

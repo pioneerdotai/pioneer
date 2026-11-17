@@ -45,11 +45,13 @@ pub struct AgentTaskActionSelection {
 #[serde(rename_all = "snake_case")]
 pub enum AgentTaskControl {
     Cancel,
+    Finish,
     Resume,
     Detach,
     Pause,
     Update,
     Reschedule,
+    RunNow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

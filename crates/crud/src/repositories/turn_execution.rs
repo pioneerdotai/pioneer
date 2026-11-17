@@ -15,6 +15,17 @@ pub enum TurnExecutorKind {
 }
 
 impl TurnExecutorKind {
+    pub const fn is_cli_runtime(self) -> bool {
+        matches!(self, Self::CliRuntime | Self::AcpRuntime)
+    }
+
+    pub fn matches_cli_runtime_kind(self, runtime_kind: &str) -> bool {
+        matches!(
+            (self, runtime_kind),
+            (Self::CliRuntime, "codex" | "claude" | "opencode") | (Self::AcpRuntime, "acp")
+        )
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NativeAgent => "native_agent",
@@ -188,6 +199,30 @@ pub async fn find<C: ConnectionTrait>(
         .transpose()
 }
 
+/// Bounded bootstrap of the owner registry, never an every-heartbeat preflight.
+pub async fn list_owned_active<C: ConnectionTrait>(
+    db: &C,
+    owner_id: &str,
+    limit: u64,
+) -> Result<Vec<TurnExecutionRecord>> {
+    turn_execution::Entity::find()
+        .filter(turn_execution::Column::OwnerId.eq(owner_id.to_owned()))
+        .filter(turn_execution::Column::Status.is_in([
+            "queued",
+            "starting",
+            "running",
+            "recovering",
+        ]))
+        .order_by_asc(turn_execution::Column::TurnId)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to bootstrap execution heartbeat ownership")?
+        .into_iter()
+        .map(record_from_model)
+        .collect()
+}
+
 pub async fn heartbeat_owner<C: ConnectionTrait>(
     db: &C,
     owner_id: &str,
@@ -248,6 +283,60 @@ pub async fn mark_running_owned<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to mark owned Turn execution running")?;
+    Ok(result.rows_affected == 1)
+}
+
+/// Running transition for an exact captured startup ownership receipt.
+pub async fn mark_running_current<C: ConnectionTrait>(
+    db: &C,
+    expected: &TurnExecutionRecord,
+    started_at: DateTimeWithTimeZone,
+    lease_until: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let generation = i64::try_from(expected.owner_generation)?;
+    let result = turn_execution::Entity::update_many()
+        .filter(turn_execution::Column::TurnId.eq(&expected.turn_id))
+        .filter(turn_execution::Column::ThreadId.eq(&expected.thread_id))
+        .filter(turn_execution::Column::WorkspaceId.eq(&expected.workspace_id))
+        .filter(turn_execution::Column::OwnerId.eq(&expected.owner_id))
+        .filter(turn_execution::Column::OwnerGeneration.eq(generation))
+        .filter(turn_execution::Column::LeaseUntil.gt(started_at))
+        .filter(turn_execution::Column::Status.is_in(["starting", "running"]))
+        .col_expr(turn_execution::Column::Status, Expr::value("running"))
+        .col_expr(
+            turn_execution::Column::StartedAt,
+            Expr::value(Some(started_at)),
+        )
+        .col_expr(turn_execution::Column::HeartbeatAt, Expr::value(started_at))
+        .col_expr(turn_execution::Column::LeaseUntil, Expr::value(lease_until))
+        .col_expr(turn_execution::Column::UpdatedAt, Expr::value(started_at))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn claim_unactivated<C: ConnectionTrait>(
+    db: &C,
+    expected: &TurnExecutionRecord,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let generation = i64::try_from(expected.owner_generation)?;
+    let result = turn_execution::Entity::update_many()
+        .filter(turn_execution::Column::TurnId.eq(&expected.turn_id))
+        .filter(turn_execution::Column::ThreadId.eq(&expected.thread_id))
+        .filter(turn_execution::Column::WorkspaceId.eq(&expected.workspace_id))
+        .filter(turn_execution::Column::OwnerId.eq(&expected.owner_id))
+        .filter(turn_execution::Column::OwnerGeneration.eq(generation))
+        .filter(turn_execution::Column::LeaseUntil.gt(now))
+        .filter(turn_execution::Column::Status.is_in(["queued", "starting"]))
+        .filter(turn_execution::Column::StartedAt.is_null())
+        // Claim initial dispatch once while runtime registration is still pending.
+        // Running requires a registered runtime; started_at fences a second claim.
+        .col_expr(turn_execution::Column::Status, Expr::value("starting"))
+        .col_expr(turn_execution::Column::StartedAt, Expr::value(Some(now)))
+        .col_expr(turn_execution::Column::UpdatedAt, Expr::value(now))
+        .exec(db)
+        .await?;
     Ok(result.rows_affected == 1)
 }
 
@@ -496,7 +585,7 @@ fn ensure_same_immutable(
     Ok(())
 }
 
-fn record_from_model(model: turn_execution::Model) -> Result<TurnExecutionRecord> {
+pub(crate) fn record_from_model(model: turn_execution::Model) -> Result<TurnExecutionRecord> {
     Ok(TurnExecutionRecord {
         turn_id: model.turn_id,
         thread_id: model.thread_id,

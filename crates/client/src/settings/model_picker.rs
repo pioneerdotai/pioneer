@@ -21,7 +21,19 @@ pub struct SettingsModelPickerPublication {
     pub owner_generation: u64,
     pub workspace_id: String,
     pub selector: ProviderModelSelectorState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_rows: Vec<presentation::ContextWindowRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_rows: Vec<presentation::ServiceModeRow>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_reasoning_only: bool,
     pub selected_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_authority: Option<String>,
     pub closed: bool,
 }
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -43,6 +55,16 @@ pub enum SettingsModelPickerIntent {
         picker_id: String,
         expected_owner: u64,
         model: String,
+    },
+    SelectServiceMode {
+        picker_id: String,
+        expected_owner: u64,
+        id: String,
+    },
+    SelectContextWindow {
+        picker_id: String,
+        expected_owner: u64,
+        window: Option<u64>,
     },
     SelectReasoningEffort {
         picker_id: String,
@@ -68,6 +90,8 @@ impl SettingsModelPickerIntent {
             Self::Open { picker_id, .. }
             | Self::SelectProvider { picker_id, .. }
             | Self::SelectModel { picker_id, .. }
+            | Self::SelectServiceMode { picker_id, .. }
+            | Self::SelectContextWindow { picker_id, .. }
             | Self::SelectReasoningEffort { picker_id, .. }
             | Self::RetryProviders { picker_id, .. }
             | Self::RetryModels { picker_id, .. }
@@ -79,6 +103,8 @@ impl SettingsModelPickerIntent {
             Self::Open { .. } => None,
             Self::SelectProvider { expected_owner, .. }
             | Self::SelectModel { expected_owner, .. }
+            | Self::SelectServiceMode { expected_owner, .. }
+            | Self::SelectContextWindow { expected_owner, .. }
             | Self::SelectReasoningEffort { expected_owner, .. }
             | Self::RetryProviders { expected_owner, .. }
             | Self::RetryModels { expected_owner, .. }
@@ -104,6 +130,7 @@ struct Work {
     generation: u64,
     key: ProviderCollectionKey,
     models: bool,
+    refresh: bool,
 }
 #[derive(Default)]
 pub(crate) struct SettingsModelPickerController {
@@ -175,6 +202,9 @@ impl ClientCore {
             provider,
             model,
             selected_reasoning_effort: value.selected_reasoning_effort.clone(),
+            selected_context_window: value.selected_context_window.clone(),
+            selected_service_mode: value.selected_service_mode.clone(),
+            selected_context_authority: value.selected_context_authority.clone(),
         })
     }
     pub fn settings_model_picker_intent(
@@ -249,18 +279,27 @@ impl ClientCore {
                 *mode,
             );
             selector.mark_providers_loading();
-            let runtime = *mode == ProviderModelSelectorMode::Chat;
+            let runtime = matches!(
+                *mode,
+                ProviderModelSelectorMode::Chat | ProviderModelSelectorMode::AuxiliaryChat
+            );
             if runtime {
                 observe = Some(workspace_id.clone());
                 selector.sync_cli_runtime_snapshot(runtimes);
             }
             let selected = selector.preload_selected_provider_models();
             let value = SettingsModelPickerPublication {
+                context_rows: vec![],
+                service_rows: vec![],
+                default_reasoning_only: false,
                 picker_id: id.clone(),
                 owner_generation: store.generation,
                 workspace_id: workspace_id.clone(),
                 selector,
                 selected_reasoning_effort: selection.selected_reasoning_effort.clone(),
+                selected_context_window: selection.selected_context_window.clone(),
+                selected_service_mode: selection.selected_service_mode.clone(),
+                selected_context_authority: selection.selected_context_authority.clone(),
                 closed: false,
             };
             let session = Session {
@@ -280,6 +319,7 @@ impl ClientCore {
                 generation: 1,
                 key: ProviderCollectionKey::catalog(workspace_id.clone()),
                 models: false,
+                refresh: true,
             });
             if let Some(provider) = selected {
                 work.push(model_work(&session, provider));
@@ -315,6 +355,9 @@ impl ClientCore {
                     }
                     let provider = next.selector.select_provider(provider);
                     next.selected_reasoning_effort = None;
+                    next.selected_context_window = None;
+                    next.selected_service_mode = None;
+                    next.selected_context_authority = None;
                     session.model_generation += 1;
                     session.model_pending = true;
                     work.push(model_work(session, provider));
@@ -326,9 +369,57 @@ impl ClientCore {
                     if next.selector.selected_model() != Some(model.as_str()) {
                         next.selector.set_selected_model(model);
                         next.selected_reasoning_effort = None;
+                        next.selected_context_window = None;
+                        next.selected_service_mode = None;
+                        next.selected_context_authority = None;
                     }
                 }
+                SettingsModelPickerIntent::SelectServiceMode { id, .. } => {
+                    let Some(model) =
+                        next.selector.models().iter().find(|model| {
+                            Some(model.id.as_str()) == next.selector.selected_model()
+                        })
+                    else {
+                        return self.reject_intent();
+                    };
+                    if !next
+                        .selector
+                        .service_rows(next.selected_service_mode.as_ref())
+                        .iter()
+                        .any(|row| row.id == id && row.available)
+                    {
+                        return self.reject_intent();
+                    }
+                    let Some(choice) = presentation::service_mode_choice(model, &id) else {
+                        return self.reject_intent();
+                    };
+                    next.selected_service_mode = choice;
+                }
+                SettingsModelPickerIntent::SelectContextWindow { window, .. } => {
+                    let rows = next.selector.context_rows(
+                        next.selected_context_window,
+                        next.selected_context_authority.as_deref(),
+                    );
+                    if rows.is_empty() || !rows.iter().any(|row| row.window == window) {
+                        return self.reject_intent();
+                    }
+                    next.selected_context_authority = window.and_then(|_| {
+                        next.selector
+                            .models()
+                            .iter()
+                            .find(|model| Some(model.id.as_str()) == next.selector.selected_model())
+                            .and_then(|model| model.context_authority.clone())
+                    });
+                    next.selected_context_window = window;
+                }
                 SettingsModelPickerIntent::SelectReasoningEffort { effort, .. } => {
+                    if effort.is_some()
+                        && next
+                            .selector
+                            .service_default_reasoning_only(next.selected_service_mode.as_ref())
+                    {
+                        return self.reject_intent();
+                    }
                     let rows = next
                         .selector
                         .models()
@@ -341,6 +432,16 @@ impl ClientCore {
                     if effort.is_some() && !rows.iter().any(|row| row.selected) {
                         return self.reject_intent();
                     }
+                    if next
+                        .selected_service_mode
+                        .as_ref()
+                        .is_some_and(|mode| mode.id == "pro")
+                        && effort
+                            .as_deref()
+                            .is_some_and(|effort| matches!(effort, "none" | "off"))
+                    {
+                        return self.reject_intent();
+                    }
                     next.selected_reasoning_effort = effort;
                 }
                 SettingsModelPickerIntent::RetryProviders { .. } => {
@@ -349,7 +450,18 @@ impl ClientCore {
                     }
                     next.selector.mark_providers_loading();
                     if session.runtime_demand {
+                        let changed = next.selector.selected_cli_catalog_changed(&runtimes);
                         next.selector.sync_cli_runtime_snapshot(runtimes);
+                        if changed {
+                            session.model_generation += 1;
+                            let provider = next.selector.preload_selected_provider_models();
+                            session.model_pending = provider.is_some();
+                            if let Some(provider) = provider {
+                                let mut models = model_work(session, provider);
+                                models.refresh = false;
+                                work.push(models);
+                            }
+                        }
                     }
                     session.provider_generation += 1;
                     session.provider_pending = true;
@@ -359,6 +471,7 @@ impl ClientCore {
                         generation: session.provider_generation,
                         key: ProviderCollectionKey::catalog(next.workspace_id.clone()),
                         models: false,
+                        refresh: true,
                     });
                 }
                 SettingsModelPickerIntent::RetryModels { .. } => {
@@ -375,6 +488,9 @@ impl ClientCore {
                     next.closed = true;
                     next.selector = ProviderModelSelectorState::new(None, None);
                     next.selected_reasoning_effort = None;
+                    next.selected_context_window = None;
+                    next.selected_service_mode = None;
+                    next.selected_context_authority = None;
                     if session.runtime_demand {
                         released = Some(next.workspace_id.clone());
                         session.runtime_demand = false;
@@ -382,6 +498,16 @@ impl ClientCore {
                 }
                 SettingsModelPickerIntent::Open { .. } => unreachable!(),
             }
+            next.service_rows = next
+                .selector
+                .service_rows(next.selected_service_mode.as_ref());
+            next.default_reasoning_only = next
+                .selector
+                .service_default_reasoning_only(next.selected_service_mode.as_ref());
+            next.context_rows = next.selector.context_rows(
+                next.selected_context_window,
+                next.selected_context_authority.as_deref(),
+            );
             session.value = Arc::new(next);
         }
         let value = store.sessions[&id].value.clone();
@@ -487,7 +613,13 @@ impl ClientCore {
                     && s.value.owner_generation == work.owner
                     && !s.value.closed
                     && if work.models {
-                        s.model_pending && s.model_generation == work.generation
+                        s.model_pending
+                            && s.model_generation == work.generation
+                            && self.cli_catalog_matches_runtime_publication(
+                                &s.value.workspace_id,
+                                s.value.selector.selected_provider(),
+                                s.value.selector.cli_runtimes(),
+                            )
                     } else {
                         s.provider_pending && s.provider_generation == work.generation
                     }
@@ -533,7 +665,13 @@ impl ClientCore {
             return;
         }
         if work.models {
-            if !session.model_pending {
+            if !session.model_pending
+                || !self.cli_catalog_matches_runtime_publication(
+                    &session.value.workspace_id,
+                    session.value.selector.selected_provider(),
+                    session.value.selector.cli_runtimes(),
+                )
+            {
                 return;
             }
             session.model_pending = false;
@@ -555,20 +693,21 @@ impl ClientCore {
                     }
                 }
             }
-            let valid = next
+            let invalid = next
                 .selector
                 .models()
                 .iter()
                 .find(|row| Some(row.id.as_str()) == next.selector.selected_model())
                 .is_some_and(|row| {
-                    presentation::reasoning_effort_rows_for_model(
-                        row,
-                        next.selected_reasoning_effort.as_deref(),
-                    )
-                    .iter()
-                    .any(|row| row.selected)
+                    next.selected_reasoning_effort.is_some()
+                        && !presentation::reasoning_effort_rows_for_model(
+                            row,
+                            next.selected_reasoning_effort.as_deref(),
+                        )
+                        .iter()
+                        .any(|row| row.selected)
                 });
-            if !valid {
+            if invalid {
                 next.selected_reasoning_effort = None;
             }
         } else {
@@ -581,6 +720,16 @@ impl ClientCore {
                 Err(error) => next.selector.apply_provider_list_error(error),
             }
         }
+        next.service_rows = next
+            .selector
+            .service_rows(next.selected_service_mode.as_ref());
+        next.default_reasoning_only = next
+            .selector
+            .service_default_reasoning_only(next.selected_service_mode.as_ref());
+        next.context_rows = next.selector.context_rows(
+            next.selected_context_window,
+            next.selected_context_authority.as_deref(),
+        );
         session.value = Arc::new(next);
         self.publish_settings_value(scope(&work.id), (*session.value).clone());
     }
@@ -657,18 +806,33 @@ impl ClientCore {
                         next.selector.selected_provider(),
                         next.selector.cli_runtimes(),
                     );
+                    let catalog_changed = next.selector.selected_cli_catalog_changed(&runtimes);
                     next.selector.sync_cli_runtime_snapshot(runtimes);
                     let ready = provider_ready_for_model_selector(
                         next.selector.selected_provider(),
                         next.selector.cli_runtimes(),
                     );
                     let mut work = None;
-                    if was_ready != ready {
+                    if was_ready != ready || catalog_changed {
                         session.model_generation += 1;
                         let provider = next.selector.preload_selected_provider_models();
                         session.model_pending = provider.is_some();
-                        work = provider.map(|provider| model_work(session, provider));
+                        work = provider.map(|provider| {
+                            let mut work = model_work(session, provider);
+                            work.refresh = false;
+                            work
+                        });
                     }
+                    next.service_rows = next
+                        .selector
+                        .service_rows(next.selected_service_mode.as_ref());
+                    next.default_reasoning_only = next
+                        .selector
+                        .service_default_reasoning_only(next.selected_service_mode.as_ref());
+                    next.context_rows = next.selector.context_rows(
+                        next.selected_context_window,
+                        next.selected_context_authority.as_deref(),
+                    );
                     session.value = Arc::new(next);
                     self.publish_settings_value(scope(&value.picker_id), (*session.value).clone());
                     let sender = store.sender.clone();
@@ -693,7 +857,8 @@ impl ClientCore {
         let mut changed = self.watch_publications();
         let task = std::thread::Builder::new().name("client-settings-model-picker".into()).spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("settings model picker runtime");
-            runtime.block_on(async {
+        let _runtime_observer=pioneer_observability::runtime::register(runtime.handle(),pioneer_observability::runtime::RuntimeRole::ClientHttp);
+            _runtime_observer.block_on(&runtime, async {
                 loop {
                     let work = tokio::select! {
                         result = changed.changed() => {
@@ -705,7 +870,7 @@ impl ClientCore {
                     };
                     let Some(core) = weak.upgrade() else { return; };
                     if !core.settings_model_picker_work_current(&work) { continue; }
-                    let read = core.read_provider_collection(work.key.clone(), true); drop(core);
+                    let read = core.read_provider_collection(work.key.clone(), work.refresh); drop(core);
                     let result = read.and_then(|read| read.wait_while(|| weak.upgrade().is_some_and(|core| core.settings_model_picker_work_current(&work)))).map_err(|error| pioneer_protocol::sanitize_runtime_diagnostic_line(&error.to_string()));
                     if let Some(core) = weak.upgrade() { core.complete_settings_model_picker(work, result); }
                 }
@@ -731,6 +896,7 @@ fn model_work(session: &Session, provider: String) -> Work {
         generation: session.model_generation,
         key: ProviderCollectionKey::models(session.value.workspace_id.clone(), provider, kind),
         models: true,
+        refresh: true,
     }
 }
 
@@ -753,6 +919,9 @@ mod tests {
                 provider: Some("openai".into()),
                 model: Some("baseline".into()),
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
             },
         });
         core.settings_model_picker("picker")
@@ -777,6 +946,70 @@ mod tests {
             )),
         );
     }
+    #[test]
+    fn filtered_response_preserves_saved_effort_but_found_metadata_and_user_changes_validate_it() {
+        for ids in [vec![], vec!["next"], vec!["baseline", "next"]] {
+            let (core, mut requests) = fixture();
+            core.settings_model_picker_intent(SettingsModelPickerIntent::Open {
+                picker_id: "picker".into(),
+                workspace_id: "workspace".into(),
+                mode: ProviderModelSelectorMode::Chat,
+                selection: ModelSelectorSelection {
+                    provider: Some("openai".into()),
+                    model: Some("baseline".into()),
+                    selected_reasoning_effort: Some("high".into()),
+                    selected_context_window: None,
+                    selected_service_mode: None,
+                    selected_context_authority: None,
+                },
+            });
+            let catalog = requests.try_recv().unwrap();
+            complete(&core, catalog);
+            let work = requests.try_recv().unwrap();
+            let rows = ids.iter().map(|id| serde_json::from_value(serde_json::json!({"id":id,"provider":"openai","limits":{},"capabilities":{}})).unwrap()).collect();
+            core.complete_settings_model_picker(
+                work.clone(),
+                Ok(ProviderCollectionPublication::for_test(
+                    work.key,
+                    vec![],
+                    rows,
+                )),
+            );
+            let picker = core.settings_model_picker("picker").unwrap();
+            assert_eq!(picker.selector.selected_provider(), Some("openai"));
+            assert_eq!(picker.selector.selected_model(), Some("baseline"));
+            assert_eq!(
+                picker.selected_reasoning_effort.as_deref(),
+                if ids.contains(&"baseline") {
+                    None
+                } else {
+                    Some("high")
+                }
+            );
+            if !ids.contains(&"baseline") {
+                assert!(
+                    picker
+                        .selector
+                        .models()
+                        .iter()
+                        .all(|row| row.id != "baseline")
+                );
+            }
+            if ids.contains(&"next") {
+                core.settings_model_picker_intent(SettingsModelPickerIntent::SelectModel {
+                    picker_id: "picker".into(),
+                    expected_owner: picker.owner_generation,
+                    model: "next".into(),
+                });
+                let selection = core
+                    .settings_model_picker_selection("picker", picker.owner_generation)
+                    .unwrap();
+                assert_eq!(selection.model.as_deref(), Some("next"));
+                assert!(selection.selected_reasoning_effort.is_none());
+            }
+        }
+    }
+
     #[test]
     fn model_picker_displays_the_failed_collection_cause() {
         let (core, mut requests) = fixture();
@@ -996,6 +1229,126 @@ mod tests {
         assert!(core.settings_model_picker("picker").unwrap().closed);
     }
     #[test]
+    fn settings_cli_catalog_arrival_and_replacement_refresh_without_accepting_late_work() {
+        use pioneer_protocol::*;
+        let (core, mut requests) = fixture();
+        core.settings_model_picker_intent(SettingsModelPickerIntent::Open {
+            picker_id: "picker".into(),
+            workspace_id: "workspace".into(),
+            mode: ProviderModelSelectorMode::Chat,
+            selection: ModelSelectorSelection {
+                provider: Some("cli_runtime:codex".into()),
+                model: Some("model".into()),
+                selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
+            },
+        });
+        let _providers = requests.try_recv().unwrap();
+        let mut runtime: RuntimeSummary = serde_json::from_value(serde_json::json!({
+            "runtime_id":"codex", "kind":"codex", "display_name":"Codex", "enabled":true,
+            "status":{"state":"initializing"}, "capabilities": pioneer_protocol::RuntimeCapabilities {
+                supports_threads: true,
+                supports_model_list: true,
+                ..Default::default()
+            }
+        })).unwrap();
+        let work = core.provider_runtime_request_for_test("workspace").unwrap();
+        core.complete_provider_runtime_for_test(
+            work,
+            Ok(CLIRuntimeListResponse {
+                revision: 1,
+                runtimes: vec![runtime.clone()],
+            }),
+        );
+        core.reconcile_settings_model_pickers();
+        let empty = requests.try_recv().unwrap();
+        core.complete_settings_model_picker(
+            empty.clone(),
+            Ok(ProviderCollectionPublication::for_test(
+                empty.key,
+                vec![],
+                vec![],
+            )),
+        );
+        let publish = |runtime: RuntimeSummary, revision| {
+            core.observe_provider_runtime_notification(
+                &GatewayNotification::CLIRuntimeStatusChanged(
+                    CLIRuntimeStatusChangedNotification {
+                        workspace_id: "workspace".into(),
+                        revision,
+                        runtime,
+                        removed: false,
+                    },
+                ),
+            );
+            core.reconcile_settings_model_pickers();
+        };
+        let result = |work: &Work, name: &str| {
+            ProviderCollectionPublication::for_test(work.key.clone(), vec![], vec![
+            serde_json::from_value(serde_json::json!({"id":"model","provider":"cli_runtime:codex","name":name,"limits":{},"capabilities":{}})).unwrap()
+        ])
+        };
+        runtime.models_refreshed_at_unix_ms = Some(10);
+        publish(runtime.clone(), 2);
+        let first = requests
+            .try_recv()
+            .expect("first catalog must refresh the open settings picker");
+        assert!(!first.refresh);
+        core.complete_settings_model_picker(first.clone(), Ok(result(&first, "Initial")));
+        assert_eq!(
+            core.settings_model_picker("picker")
+                .unwrap()
+                .selector
+                .models()[0]
+                .name
+                .as_deref(),
+            Some("Initial")
+        );
+        runtime.models_refreshed_at_unix_ms = Some(20);
+        publish(runtime.clone(), 3);
+        let stale = requests.try_recv().unwrap();
+        runtime.home_path = Some("/replacement-source".into());
+        runtime.models_refreshed_at_unix_ms = None;
+        publish(runtime.clone(), 4);
+        let current = requests.try_recv().unwrap();
+        assert_ne!(stale.generation, current.generation);
+        core.complete_settings_model_picker(stale.clone(), Ok(result(&stale, "Obsolete")));
+        assert!(
+            core.settings_model_picker("picker")
+                .unwrap()
+                .selector
+                .models()
+                .is_empty()
+        );
+        core.complete_settings_model_picker(current.clone(), Ok(result(&current, "Current")));
+        let selected = core
+            .settings_model_picker("picker")
+            .unwrap()
+            .selector
+            .selection_parts();
+        assert_eq!(
+            selected,
+            (Some("cli_runtime:codex".into()), Some("model".into()))
+        );
+        runtime.status = RuntimeStatus::Error {
+            message: "diagnostic only".into(),
+        };
+        publish(runtime, 5);
+        assert!(requests.try_recv().is_err());
+        assert_eq!(
+            core.settings_model_picker("picker")
+                .unwrap()
+                .selector
+                .models()[0]
+                .name
+                .as_deref(),
+            Some("Current")
+        );
+    }
+
+    #[test]
     fn runtime_becoming_ready_loads_selected_cli_models_once_and_unready_cancels_them() {
         let (core, mut requests) = fixture();
         core.settings_model_picker_intent(SettingsModelPickerIntent::Open {
@@ -1006,6 +1359,9 @@ mod tests {
                 provider: Some(crate::providers::list::cli_runtime_provider_key("codex")),
                 model: None,
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
             },
         });
         requests.try_recv().unwrap();

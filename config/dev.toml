@@ -1,0 +1,26 @@
+# The debug contour is versioned, so a fresh checkout needs no local.toml.
+# Loaded before repository-local, user and PIONEER_CONFIG overrides. The Gateway
+# bundle association is reasserted after local settings, before user/explicit ones.
+home_directory = ".pioneer.dev"
+
+[install]
+unix_root_directory_name = "pioneer-dev"
+macos_root_directory_name = "PioneerDev"
+windows_root_directory_name = "PioneerDev"
+managed_directory_name = "managed-dev"
+binary_name = "pioneer-dev"
+command_name = "pioneer-dev"
+macos_background_item_name = "Pioneer Gateway Dev"
+macos_associated_bundle_identifier = "ai.pioneer.gateway.dev"
+
+[gateway]
+service_name = "com.pioneer.gateway.dev"
+legacy_service_names = ["com.pioneer.gateway.local"]
+listen_addr = "0.0.0.0:18778"
+
+[gateway.remote_access]
+local_addr = "127.0.0.1:18778"
+service_name = "pioneer_gateway_dev"
+
+[desktop.mcp_oauth]
+callback_port = 37644

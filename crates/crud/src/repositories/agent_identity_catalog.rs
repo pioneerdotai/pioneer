@@ -21,7 +21,6 @@ const PIONEER_SYSTEM_KEY: &str = "pioneer";
 const PIONEER_NICKNAME: &str = "pioneer";
 const PIONEER_FINGERPRINT: &str = "seed:pioneer:v1";
 const CATALOG_PAGE_SIZE: u64 = 256;
-const MAX_RUNTIME_INSTANCES: usize = pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES;
 
 /// Provider-independent identity fields derived from one configured CLI runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,19 +219,15 @@ pub async fn sync_cli_runtime_identity_catalog<C: ConnectionTrait>(
                 )
                 .await?;
             }
+            let mut retired_after: Option<String> = None;
             loop {
                 let mut removed_query = agent_identity::Entity::find()
                     .filter(agent_identity::Column::WorkspaceId.eq(workspace.id.clone()))
                     .filter(agent_identity::Column::SourceKind.eq(SOURCE_CLI_RUNTIME_INSTANCE))
                     .filter(agent_identity::Column::Status.eq("active"));
-                if !configured_source_ids.is_empty() {
-                    removed_query = removed_query.filter(
-                        agent_identity::Column::SourceId.is_not_in(
-                            configured_source_ids
-                                .iter()
-                                .map(|source_id| (*source_id).to_owned()),
-                        ),
-                    );
+                if let Some(after) = &retired_after {
+                    removed_query =
+                        removed_query.filter(agent_identity::Column::Id.gt(after.clone()));
                 }
                 let removed_identities = removed_query
                     .order_by_asc(agent_identity::Column::Id)
@@ -240,10 +235,14 @@ pub async fn sync_cli_runtime_identity_catalog<C: ConnectionTrait>(
                     .all(db)
                     .await
                     .context("failed to inspect removed CLI runtime identities")?;
-                if removed_identities.is_empty() {
-                    break;
-                }
+                let done = removed_identities.len() < CATALOG_PAGE_SIZE as usize;
+                retired_after = removed_identities
+                    .last()
+                    .map(|identity| identity.id.clone());
                 for identity in removed_identities {
+                    if configured_source_ids.contains(identity.source_id.as_str()) {
+                        continue;
+                    }
                     let retired = agent_identity::Entity::update_many()
                         .col_expr(
                             agent_identity::Column::Status,
@@ -259,6 +258,7 @@ pub async fn sync_cli_runtime_identity_catalog<C: ConnectionTrait>(
                         )
                         .filter(agent_identity::Column::Id.eq(identity.id.clone()))
                         .filter(agent_identity::Column::Status.eq("active"))
+                        .filter(agent_identity::Column::SourceId.eq(identity.source_id.clone()))
                         .exec(db)
                         .await
                         .context("failed to retire removed CLI runtime identity")?;
@@ -283,6 +283,9 @@ pub async fn sync_cli_runtime_identity_catalog<C: ConnectionTrait>(
                         .exec(db)
                         .await
                         .context("failed to tombstone removed CLI runtime nickname")?;
+                }
+                if done {
+                    break;
                 }
             }
         }
@@ -433,9 +436,6 @@ async fn project_cli_runtime_identity<C: ConnectionTrait>(
 }
 
 fn validate_runtime_catalog(instances: &[CliRuntimeIdentitySeed]) -> Result<()> {
-    if instances.len() > MAX_RUNTIME_INSTANCES {
-        bail!("CLI runtime catalog exceeds the bounded identity limit");
-    }
     let mut ids = BTreeSet::new();
     let mut nicknames = BTreeMap::<String, String>::new();
     for instance in instances {
@@ -563,6 +563,43 @@ mod tests {
         super::sync_cli_runtime_identity_catalog(db, instances, chrono::Utc::now().fixed_offset())
             .await
             .expect("CLI settings projection must succeed");
+    }
+
+    #[tokio::test]
+    async fn large_identity_catalog_survives_sync_paging_and_bounded_retirement() {
+        let db = catalog_database().await;
+        let seeds = (0..260)
+            .map(|n| CliRuntimeIdentitySeed {
+                id: format!("runtime-{n:03}"),
+                kind: "codex".into(),
+                display_name: format!("Runtime {n}"),
+                nickname: format!("runtime-{n:03}"),
+                enabled: true,
+                source_revision_material: "configured".into(),
+            })
+            .collect::<Vec<_>>();
+        sync(&db, &seeds).await;
+        let mut after = None;
+        let mut ids = std::collections::BTreeSet::new();
+        loop {
+            let page = crate::list_active_agent_identities_page(&db, "workspace", after.as_deref())
+                .await
+                .unwrap();
+            let done = page.len() < 200;
+            after = page.last().map(|identity| identity.id.clone());
+            for identity in page {
+                assert!(ids.insert(identity.id));
+            }
+            if done {
+                break;
+            }
+        }
+        assert_eq!(ids.len(), 261); // CLI identities plus the reserved Pioneer.
+        sync(&db, &seeds[..129]).await;
+        let rows = crate::list_active_agent_identities_page(&db, "workspace", None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 130);
     }
 
     #[tokio::test]

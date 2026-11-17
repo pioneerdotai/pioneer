@@ -1,7 +1,5 @@
 mod admission;
 mod agent_action_service;
-#[cfg(test)]
-mod agent_authored_operations;
 mod agent_execution;
 mod agent_facts;
 mod agent_liveness;
@@ -11,8 +9,6 @@ mod agent_runtime_adapter;
 #[cfg(test)]
 mod catalog;
 mod domain;
-#[cfg(test)]
-mod epic5_contract;
 mod execution;
 mod governor;
 mod invalidation;

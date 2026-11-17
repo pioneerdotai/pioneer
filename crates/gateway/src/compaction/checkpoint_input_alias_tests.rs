@@ -381,6 +381,16 @@ async fn accepted_projection_preserves_competing_inputs_in_either_order() {
             messages.swap(0, 1);
         }
         let before = messages.clone();
+        // Composition now enriches copy evidence before candidate discovery.
+        // Competing saved claims must survive that non-destructive step.
+        history::prepare_task_input_copy_evidence_with_resolver(
+            &s.f.store,
+            "ws",
+            &mut messages,
+            &mut coverage::CheckpointGraphResolver::default(),
+        )
+        .await
+        .unwrap();
         checkpoint::project_accepted_checkpoints(
             &s.f.store,
             "ws",
@@ -2088,4 +2098,255 @@ async fn accepted_raw_history_sees_all_candidate_claims_before_projection() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn raw_saved_input_alias_is_reused_through_frozen_execution_handoff() {
+    let s = scenario().await;
+    let raw = vec![s.original.clone(), s.work.clone()];
+    let descriptor = frozen::capture(&s.f.store, "ws", "thread", &s.allowed, &raw)
+        .await
+        .unwrap();
+    let literal_json = serde_json::to_string(&descriptor).unwrap();
+    let references_before =
+        s.f.store
+            .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
+            .await
+            .unwrap();
+    let root =
+        s.f.store
+            .compaction_checkpoint_source("ws", "copy-thread", &s.checkpoint.id)
+            .await
+            .unwrap()
+            .unwrap();
+    let graph_before = coverage::CheckpointGraphResolver::default()
+        .resolve(&s.f.store, "ws", Some(&s.allowed), &root)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut materialized = raw.clone();
+    project(&s, &mut materialized).await.unwrap();
+    for _ in 0..2 {
+        let restored = frozen::restore_accepted_history_for_execution(
+            &s.f.store,
+            "ws",
+            Some("thread"),
+            "thread",
+            &s.allowed,
+            &literal_json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.messages, materialized);
+        assert_eq!(restored.messages.len(), 1);
+        let origin = restored.messages[0].provenance.as_ref().unwrap();
+        assert_eq!(origin.sources[0].id, s.checkpoint.id);
+        assert!(origin.inherited);
+        assert_eq!(origin.source_aliases[0].represented_source, s.copy);
+        assert_eq!(
+            origin.source_aliases[0].source,
+            s.original.provenance.as_ref().unwrap().sources[0]
+        );
+        assert_eq!(restored.direct_sources.len(), 1);
+        assert_eq!(restored.direct_sources[0].source, root);
+        let mut current = restored.messages;
+        current.push(s.tail.clone());
+        assert_eq!(
+            current[1], s.tail,
+            "current input is outside historical coverage"
+        );
+        assert_eq!(
+            frozen::restore(&s.f.store, "ws", &s.allowed, &descriptor)
+                .await
+                .unwrap(),
+            raw,
+            "literal replay must stay raw"
+        );
+    }
+    assert_eq!(
+        s.f.store
+            .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0,)
+            .await
+            .unwrap(),
+        references_before
+    );
+    let graph_after = coverage::CheckpointGraphResolver::default()
+        .resolve(&s.f.store, "ws", Some(&s.allowed), &root)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(graph_after.leaves, graph_before.leaves);
+    assert_eq!(serde_json::to_string(&descriptor).unwrap(), literal_json);
+    assert!(s.f.provider.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn frozen_raw_alias_projection_keeps_conflict_and_incomplete_boundary_contracts() {
+    for boundary in [
+        "conflicting-alias",
+        "copy-version",
+        "copy-scope",
+        "missing-work",
+        "protected-input",
+        "incomplete-unit",
+    ] {
+        let s = scenario().await;
+        let mut raw = vec![s.original.clone(), s.work.clone()];
+        match boundary {
+            "conflicting-alias" => raw[0]
+                .provenance
+                .as_mut()
+                .unwrap()
+                .ambiguous_input_aliases
+                .push(MessageSourceIdentity {
+                    thread_id: "copy-thread".into(),
+                    source: s.copy.clone(),
+                }),
+            "copy-version" => {
+                raw[0].provenance.as_mut().unwrap().source_aliases[0]
+                    .source
+                    .version = "input-revision:2".into()
+            }
+            "copy-scope" => {
+                raw[0].provenance.as_mut().unwrap().source_aliases[0]
+                    .source
+                    .scope = "input:another-turn".into()
+            }
+            "missing-work" => {
+                raw.pop();
+            }
+            "protected-input" => raw[0].provenance.as_mut().unwrap().protected_input = true,
+            "incomplete-unit" => raw[1].provenance.as_mut().unwrap().complete = false,
+            _ => unreachable!(),
+        }
+        let descriptor = frozen::capture(&s.f.store, "ws", "thread", &s.allowed, &raw)
+            .await
+            .unwrap();
+        let restored = frozen::restore_accepted_history_for_execution(
+            &s.f.store,
+            "ws",
+            Some("thread"),
+            "thread",
+            &s.allowed,
+            &serde_json::to_string(&descriptor).unwrap(),
+        )
+        .await;
+        if boundary == "incomplete-unit" {
+            assert!(
+                restored
+                    .err()
+                    .expect("incomplete unit must fail")
+                    .to_string()
+                    .contains("checkpoint cannot replace pending or protected input")
+            );
+        } else {
+            let messages = restored.unwrap().messages;
+            assert!(
+                !messages
+                    .iter()
+                    .any(
+                        |message| message.provenance.as_ref().is_some_and(|origin| origin
+                            .sources
+                            .iter()
+                            .any(|source| source.id == s.checkpoint.id))
+                    ),
+                "{boundary}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message
+                        .provenance
+                        .as_ref()
+                        .is_some_and(|origin| origin.sources
+                            == s.original.provenance.as_ref().unwrap().sources)),
+                "the unproven raw input must remain: {boundary}"
+            );
+        }
+        assert_eq!(
+            frozen::restore(&s.f.store, "ws", &s.allowed, &descriptor)
+                .await
+                .unwrap(),
+            raw
+        );
+    }
+}
+
+#[tokio::test]
+async fn frozen_alias_cannot_admit_late_checkpoint_with_an_additional_snapshot_source() {
+    let s = scenario().await;
+    let raw = vec![s.original.clone(), s.work.clone()];
+    let descriptor = frozen::capture(&s.f.store, "ws", "thread", &s.allowed, &raw)
+        .await
+        .unwrap();
+    let saved = serde_json::to_string(&descriptor).unwrap();
+    s.f.store.database_connection().execute_unprepared(
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('later-input','turn',1,'text','later unrelated input','{"type":"text","text":"later unrelated input"}',CURRENT_TIMESTAMP)"#,
+    ).await.unwrap();
+    history::prepare_history(&s.f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let later =
+        s.f.store
+            .compaction_source_page("ws", "thread", "turn", PagedSource::Input, 0)
+            .await
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|entry| entry.reference.id == "later-input")
+            .unwrap()
+            .reference;
+    let root =
+        s.f.store
+            .compaction_checkpoint_source("ws", "copy-thread", &s.checkpoint.id)
+            .await
+            .unwrap()
+            .unwrap();
+    let graph = coverage::CheckpointGraphResolver::default()
+        .resolve(&s.f.store, "ws", Some(&s.allowed), &root)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut sources = graph
+        .leaves
+        .iter()
+        .map(|leaf| (leaf.thread.clone(), leaf.source.clone()))
+        .collect::<Vec<_>>();
+    sources.push(("thread".into(), later));
+    let late = publish_projection_checkpoint(
+        &s.f,
+        "copy-thread",
+        "late-outside-snapshot",
+        &sources,
+        pioneer_compaction::CoverageDomain::WorkingContext,
+        None,
+    )
+    .await;
+    let restored = frozen::restore_accepted_history_for_execution(
+        &s.f.store,
+        "ws",
+        Some("thread"),
+        "thread",
+        &s.allowed,
+        &saved,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restored.messages, raw,
+        "exact alias only represents its saved input, not a later source"
+    );
+    assert!(
+        !restored
+            .direct_sources
+            .iter()
+            .any(|source| source.source.id == late.id)
+    );
+    assert_eq!(
+        frozen::restore(&s.f.store, "ws", &s.allowed, &descriptor)
+            .await
+            .unwrap(),
+        raw
+    );
+    assert_eq!(serde_json::to_string(&descriptor).unwrap(), saved);
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::authorization::ResourceAction;
+use pioneer_observability::closing::{Closing, Fact, Phase};
 
 struct TaskObservationAdmission {
     budget: pioneer_protocol::TaskResourceBudget,
@@ -80,6 +81,7 @@ impl MessageProcessor {
         principal: &crate::auth::AuthenticatedSessionPrincipal,
         preferred_root_thread_id: Option<&str>,
         task_id: &str,
+        source_actions: Option<&std::collections::BTreeSet<ResourceAction>>,
     ) -> anyhow::Result<Option<pioneer_tasks::TaskExecutionAdmissionSeed>> {
         let response = self
             .crud_store
@@ -95,6 +97,7 @@ impl MessageProcessor {
             principal,
             preferred_root_thread_id,
             &response,
+            source_actions,
         )
         .await
         .map(Some)
@@ -105,6 +108,7 @@ impl MessageProcessor {
         principal: &crate::auth::AuthenticatedSessionPrincipal,
         preferred_root_thread_id: Option<&str>,
         response: &pioneer_protocol::TaskGetResponse,
+        source_actions: Option<&std::collections::BTreeSet<ResourceAction>>,
     ) -> anyhow::Result<pioneer_tasks::TaskExecutionAdmissionSeed> {
         if response.task.executor_kind != pioneer_protocol::TaskExecutorKind::Agent {
             anyhow::bail!(
@@ -175,17 +179,12 @@ impl MessageProcessor {
         let launch = contract
             .launch
             .ok_or_else(|| anyhow::anyhow!("Agent Task launch is unavailable"))?;
-        if !launch.execution.selected_capabilities.is_empty() {
-            request.capabilities =
-                super::agent_action_tools::task_launch_selection_capabilities(&launch.execution)?;
-        }
         request.capabilities = self
-            .normalize_turn_skill_capabilities(
+            .normalize_task_launch_capabilities(
                 response.task.workspace_id.as_str(),
-                request.capabilities.as_slice(),
+                &launch.execution,
             )
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?
+            .await?
             .execution;
         if !matches!(
             request.execution_backend,
@@ -209,10 +208,15 @@ impl MessageProcessor {
             .rev()
             .find(|spec| spec.run_id.is_none())
             .and_then(|spec| spec.permission_cap.as_ref());
-        let context =
+        let mut context =
             crate::authorization::ExecutionAdmissionService::new(self.crud_store.as_ref().clone())
                 .admit_context(principal, revision, &request, requested_permission_cap)
                 .await?;
+        // Only a new legacy seed inherits this agent caller's ceiling. The
+        // persisted branch above must preserve its original immutable JSON.
+        if let Some(actions) = source_actions {
+            context.constrain_thread_creation_grants(actions);
+        }
         let seed = pioneer_tasks::TaskExecutionAdmissionSeed {
             workspace_id: context.workspace_id().to_owned(),
             root_thread_id: context.root_thread_id().to_owned(),
@@ -477,17 +481,17 @@ impl MessageProcessor {
         false
     }
 
-    /// Resolves operator disclosure against the exact Task. An action-level
+    /// Resolves projection permissions against the exact Task. An action-level
     /// grant is final only for an absolute role; a future scoped operator role
     /// must pass the same authoritative Task facts as every mutation/read.
-    async fn task_operator_projection_allowed(
+    async fn task_projection_action_allowed(
         &self,
         request_context: &RequestContext,
         task_id: Option<&str>,
         workspace_id: Option<&str>,
+        action: ResourceAction,
     ) -> bool {
         let service = crate::authorization::AuthorizationService::new();
-        let action = ResourceAction::TaskReadOperator;
         let gate = service.authorize_action(
             request_context.principal().kind,
             request_context.principal().role_key.as_ref(),
@@ -758,8 +762,8 @@ impl MessageProcessor {
                     )
                     .attachment
                 });
-            params.delivery_policy = Some(pioneer_tasks::default_delivery_policy(
-                trigger_kind,
+            params.delivery_policy = Some(pioneer_tasks::default_delivery_policy_for_trigger(
+                &params.trigger.spec,
                 attachment,
                 params.owner_kind,
                 params.owner_id.as_deref(),
@@ -861,7 +865,7 @@ impl MessageProcessor {
                     return;
                 }
             };
-            let (canonical_launch, resolved_launch) =
+            let (mut canonical_launch, resolved_launch) =
                 match super::agent_action_tools::resolve_workspace_task_launch(
                     self,
                     params.workspace_id.as_str(),
@@ -889,6 +893,29 @@ impl MessageProcessor {
                         return;
                     }
                 };
+            let normalized_launch = match self
+                .normalize_new_task_launch_capabilities(
+                    params.workspace_id.as_str(),
+                    &mut canonical_launch,
+                )
+                .await
+            {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        crate::public_error::agent_rpc_error(
+                            Some(request_id),
+                            INVALID_PARAMS_CODE,
+                            pioneer_protocol::PublicErrorCode::InvalidInput,
+                            pioneer_protocol::PublicErrorStage::Admission,
+                            format!("invalid Task capabilities: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
             params.launch = Some(canonical_launch);
             resolved_task_launch = resolved_launch;
             let mut execution_request =
@@ -916,6 +943,7 @@ impl MessageProcessor {
                         return;
                     }
                 };
+            execution_request.capabilities = normalized_launch.execution;
             if !matches!(
                 execution_request.execution_backend,
                 Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
@@ -1034,8 +1062,7 @@ impl MessageProcessor {
                         params.workspace_id.as_str(),
                         identity,
                         profile,
-                        root_thread.model_provider.as_str(),
-                        root_thread.model.as_str(),
+                        &admitted_context,
                         true,
                         child_skill_ids,
                         admitted_context
@@ -1130,6 +1157,25 @@ impl MessageProcessor {
             context.resolved_launch_identity = Some(identity);
             context.resolved_launch_profile = Some(profile);
         }
+        if let Err(error) = crate::compaction::native_budget::freeze_task_context(
+            self,
+            &params.workspace_id,
+            None,
+            &mut context,
+        )
+        .await
+        {
+            self.send_error(
+                connection_id,
+                task_public_error(
+                    Some(request_id),
+                    pioneer_protocol::PublicErrorStage::Preparation,
+                    format!("Native Task context: {error:#}"),
+                ),
+            )
+            .await;
+            return;
+        }
         context.agent_authorization_grant = task_agent_authorization_grant;
         context.execution_admission = task_execution_admission;
         if let Some(seed) = context.execution_admission.as_ref()
@@ -1150,10 +1196,58 @@ impl MessageProcessor {
             .await;
             return;
         }
+        if crate::task_tools::is_webhook_trigger(&params.trigger.spec) {
+            // Native RPC has no task-create mutation receipt. Keep this request's
+            // provisioning outside the Task transaction, with a dedicated ref.
+            let secret_ref = pioneer_protocol::generate_id(21);
+            if self
+                .gateway_secrets
+                .ensure_task_webhook_secret(&secret_ref)
+                .is_err()
+            {
+                self.send_error(
+                    connection_id,
+                    task_public_error(
+                        Some(request_id),
+                        pioneer_protocol::PublicErrorStage::Preparation,
+                        "task webhook provisioning unavailable",
+                    ),
+                )
+                .await;
+                return;
+            }
+            context.webhook_secret_ref = Some(secret_ref);
+        }
         match message_future(self.task_runtime.service().create_task(context, params)).await {
             Ok(response_payload) => {
-                self.send_task_response(connection_id, request_id, &response_payload)
-                    .await
+                let output = async {
+                    let mut output = serde_json::to_value(&response_payload)?;
+                    crate::task_tools::enrich_task_webhook_output(
+                        self,
+                        std::slice::from_ref(&response_payload.trigger),
+                        &mut output,
+                    )
+                    .await?;
+                    anyhow::Ok(output)
+                }
+                .await;
+                match output {
+                    Ok(output) => {
+                        self.send_task_response(connection_id, request_id, &output)
+                            .await
+                    }
+                    Err(_) => {
+                        self.send_error(
+                            connection_id,
+                            task_public_error(
+                                Some(request_id),
+                                pioneer_protocol::PublicErrorStage::Observation,
+                                "task webhook address unavailable",
+                            ),
+                        )
+                        .await
+                    }
+                }
             }
             Err(error) => {
                 self.send_error(
@@ -1209,14 +1303,95 @@ impl MessageProcessor {
         };
         let connection_id = request_context.connection_id();
         let operator_allowed = self
-            .task_operator_projection_allowed(request_context, Some(params.task_id.as_str()), None)
+            .task_projection_action_allowed(
+                request_context,
+                Some(params.task_id.as_str()),
+                None,
+                ResourceAction::TaskReadOperator,
+            )
             .await;
         match self.task_runtime.service().get_task(params).await {
             Ok(response_payload) => {
-                let projected =
+                let mut projected =
                     crate::task_projection::project_task_get(&response_payload, operator_allowed);
-                self.send_task_response(connection_id, request_id, &projected)
-                    .await
+                let review_allowed = self
+                    .task_projection_action_allowed(
+                        request_context,
+                        Some(&response_payload.task.id),
+                        None,
+                        ResourceAction::TaskReview,
+                    )
+                    .await;
+                let cancel_allowed = self
+                    .task_projection_action_allowed(
+                        request_context,
+                        Some(&response_payload.task.id),
+                        None,
+                        ResourceAction::TaskCancel,
+                    )
+                    .await;
+                for review in &mut projected.review_required {
+                    review.allowed_actions = if review_allowed {
+                        if let Some(candidate) = response_payload
+                            .result_candidates
+                            .iter()
+                            .find(|candidate| candidate.id == review.candidate.id)
+                        {
+                            self.task_runtime
+                                .service()
+                                .candidate_review_actions(
+                                    Self::task_mutation_context(request_context),
+                                    candidate,
+                                )
+                                .await
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    if cancel_allowed {
+                        review
+                            .allowed_actions
+                            .push(pioneer_protocol::TaskWaitReviewAction::TaskCancel);
+                    }
+                    if !review
+                        .allowed_actions
+                        .contains(&pioneer_protocol::TaskWaitReviewAction::TaskRevise)
+                        && review.revision_blocked_reason.is_none()
+                    {
+                        review.revision_blocked_reason =
+                            Some(pioneer_protocol::TaskWaitRevisionBlockedReason::ReviewNotAllowed);
+                    }
+                }
+                let output = async {
+                    let mut output = serde_json::to_value(&projected)?;
+                    crate::task_tools::enrich_task_webhook_output(
+                        self,
+                        &response_payload.triggers,
+                        &mut output,
+                    )
+                    .await?;
+                    anyhow::Ok(output)
+                }
+                .await;
+                match output {
+                    Ok(output) => {
+                        self.send_task_response(connection_id, request_id, &output)
+                            .await
+                    }
+                    Err(_) => {
+                        self.send_error(
+                            connection_id,
+                            task_public_error(
+                                Some(request_id),
+                                pioneer_protocol::PublicErrorStage::Observation,
+                                "task webhook address unavailable",
+                            ),
+                        )
+                        .await
+                    }
+                }
             }
             Err(error) => {
                 self.send_error(
@@ -1342,7 +1517,12 @@ impl MessageProcessor {
         };
         let connection_id = request_context.connection_id();
         let operator_allowed = self
-            .task_operator_projection_allowed(request_context, Some(params.task_id.as_str()), None)
+            .task_projection_action_allowed(
+                request_context,
+                Some(params.task_id.as_str()),
+                None,
+                ResourceAction::TaskReadOperator,
+            )
             .await;
         match self
             .task_runtime
@@ -1410,7 +1590,12 @@ impl MessageProcessor {
         };
         let connection_id = request_context.connection_id();
         let operator_allowed = self
-            .task_operator_projection_allowed(request_context, Some(params.task_id.as_str()), None)
+            .task_projection_action_allowed(
+                request_context,
+                Some(params.task_id.as_str()),
+                None,
+                ResourceAction::TaskReadOperator,
+            )
             .await;
         match self
             .task_runtime
@@ -1469,18 +1654,60 @@ impl MessageProcessor {
                 ),
             confirmed_activity: None,
         };
-        match self
+        let result = self
             .task_runtime
             .service()
-            .wait_tasks(wait_context, params)
-            .await
-        {
+            .wait_tasks(wait_context, params.clone())
+            .await;
+        match result {
             Ok(response_payload) => {
                 let projected = crate::task_projection::project_task_wait(&response_payload);
-                self.send_task_response(connection_id, request_id, &projected)
+                let encoded = match JsonRpcResponse::from_result(request_id.clone(), &projected)
+                    .and_then(|response| serde_json::to_string(&response))
+                {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            task_public_error(
+                                None,
+                                pioneer_protocol::PublicErrorStage::Delivery,
+                                format!("failed to encode task response: {error}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                // The initial proof only admits the wait. Re-resolve the same
+                // targets after waiting AND encoding, under current access/policy.
+                let Some(current) = self
+                    .reauthorize_task_wait(request_context, &request_id, &params)
                     .await
+                else {
+                    return;
+                };
+                // No queue await after the final connection/access gate. An
+                // overloaded or closed outbound retires the socket fail-closed.
+                if !matches!(
+                    self.session_manager
+                        .try_send_wait_response(connection_id, current.principal(), encoded)
+                        .await,
+                    Ok(true)
+                ) {
+                    self.session_manager
+                        .unregister_connection(connection_id)
+                        .await;
+                }
             }
             Err(error) => {
+                if self
+                    .reauthorize_task_wait(request_context, &request_id, &params)
+                    .await
+                    .is_none()
+                {
+                    return;
+                }
                 self.send_error(
                     connection_id,
                     task_public_error(
@@ -1494,6 +1721,70 @@ impl MessageProcessor {
         }
     }
 
+    async fn reauthorize_task_wait(
+        &self,
+        original: &RequestContext,
+        request_id: &RequestId,
+        params: &TaskWaitParams,
+    ) -> Option<crate::request_context::ConnectionContext> {
+        let current = self
+            .session_manager
+            .connection_context(original.connection_id())
+            .await
+            .ok()?;
+        let expected = original.principal();
+        let principal = current.principal();
+        // Connection IDs are monotonic; additionally retain the original auth
+        // identity. A same-socket access renewal is allowed, a new session isn't.
+        if principal.gateway_id != expected.gateway_id
+            || principal.principal_id != expected.principal_id
+            || principal.device_id != expected.device_id
+            || principal.session_id != expected.session_id
+        {
+            return None;
+        }
+        let termination = self
+            .session_manager
+            .connection_termination_receiver(original.connection_id())
+            .await
+            .ok()?;
+        let expired = crate::helpers::unix_timestamp_secs()
+            .map_or(true, |now| now >= principal.access_expires_at_unix);
+        let invalid_lease = if let Some(auth) = &self.auth_service {
+            auth.validate_session_lease(principal).await.is_err()
+        } else {
+            false
+        };
+        let terminated = termination.borrow().is_some();
+        if terminated || expired || invalid_lease {
+            self.send_error(
+                original.connection_id(),
+                crate::authorization::AuthorizationExternalError::NotFound
+                    .response(request_id.clone()),
+            )
+            .await;
+            return None;
+        }
+        let context = RequestContext::new(
+            &current,
+            Some(request_id.clone()),
+            crate::request_context::CanonicalMethod::rpc(methods::TASK_WAIT),
+        );
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: request_id.clone(),
+            method: methods::TASK_WAIT.to_owned(),
+            params: Some(serde_json::to_value(params).ok()?),
+        };
+        match self.authorize_normal_request(&context, &request).await {
+            Ok(_) => Some(current),
+            Err(error) => {
+                self.send_error(original.connection_id(), error).await;
+                None
+            }
+        }
+    }
+
     pub(super) async fn task_accept(
         &self,
         request_context: &RequestContext,
@@ -1501,6 +1792,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskAcceptParams,
     ) {
+        let mut closing = Closing::current(Phase::ReviewRequest);
         if !self
             .require_scoped_task_proof(
                 request_context,
@@ -1511,18 +1803,22 @@ impl MessageProcessor {
             )
             .await
         {
+            closing.finish(Fact::Rejected);
             return;
         }
         let connection_id = request_context.connection_id();
         let context = Self::task_mutation_context(request_context);
-        match message_future(
-            self.task_runtime
-                .service()
-                .accept_task_result_candidate(context, params),
-        )
-        .await
+        match closing
+            .correlation()
+            .scope(message_future(
+                self.task_runtime
+                    .service()
+                    .accept_task_result_candidate(context, params),
+            ))
+            .await
         {
             Ok(response_payload) => {
+                closing.finish(Fact::Returned); // RPC service result alone is not destination delivery
                 self.send_task_response(connection_id, request_id, &response_payload)
                     .await
             }
@@ -1632,6 +1928,51 @@ impl MessageProcessor {
                         Some(request_id),
                         pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to cancel task: {error:#}"),
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    pub(super) async fn task_finish(
+        &self,
+        request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
+        request_id: RequestId,
+        params: TaskFinishParams,
+    ) {
+        if !self
+            .require_scoped_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskScheduleManage,
+            )
+            .await
+        {
+            return;
+        }
+        let connection_id = request_context.connection_id();
+        match message_future(
+            self.task_runtime
+                .service()
+                .finish_task(Self::task_mutation_context(request_context), params),
+        )
+        .await
+        {
+            Ok(response_payload) => {
+                self.send_task_response(connection_id, request_id, &response_payload)
+                    .await
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    task_public_error(
+                        Some(request_id),
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        format!("failed to finish task: {error:#}"),
                     ),
                 )
                 .await;
@@ -1799,6 +2140,7 @@ impl MessageProcessor {
                 request_context.principal(),
                 authorized_task.and_then(|proof| proof.root_thread_id()),
                 params.task_id.as_str(),
+                None,
             )
             .await
         {
@@ -1938,10 +2280,11 @@ impl MessageProcessor {
         let operator_task_id = params.task_id.clone();
         let operator_workspace_id = params.workspace_id.clone();
         let operator_allowed = self
-            .task_operator_projection_allowed(
+            .task_projection_action_allowed(
                 request_context,
                 operator_task_id.as_deref(),
                 Some(operator_workspace_id.as_str()),
+                ResourceAction::TaskReadOperator,
             )
             .await;
         let access = match self
@@ -2061,11 +2404,13 @@ mod task_revision_failure_tests {
             for already_reported in [false, true] {
                 let ((response, public), events) =
                     crate::public_error::test_support::capture_events(|| {
-                        let public = crate::public_error::build_public_error(
+                        let mut public = crate::public_error::build_public_error(
                             code,
                             pioneer_protocol::PublicErrorStage::Admission,
                         );
+                        public.correlation_id = "revision-correlation".to_owned();
                         let failure = TaskStartFailure::new(TaskStartStage::CliAdmission, cause)
+                            .with_correlation_id("revision-correlation".to_owned())
                             .with_public_error(public.clone());
                         let failure = if already_reported {
                             failure.report()

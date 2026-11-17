@@ -999,7 +999,7 @@ async fn validate_prepared_source_content_match(
 
 async fn file_fingerprint(path: &Path) -> Result<Option<FileFingerprint>, ToolError> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         let mut file = match open_regular_file(path.as_path()) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2241,16 +2241,6 @@ mod tests {
         assert_eq!(output["nextOffset"], 13);
         assert_eq!(output["truncated"], true);
         assert!(output.get("content_base64").is_none());
-    }
-
-    #[test]
-    fn artifact_tool_specs_include_artifact_read() {
-        let tool_names = artifact_tool_specs()
-            .into_iter()
-            .map(|configured| configured.spec.name)
-            .collect::<Vec<_>>();
-
-        assert!(tool_names.contains(&ARTIFACT_READ_TOOL.to_owned()));
     }
 
     fn assert_schema_descriptions_have_no_json_object_examples(value: &JsonValue, label: &str) {

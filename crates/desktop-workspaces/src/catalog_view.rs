@@ -246,10 +246,8 @@ impl ThreadSidebarView {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
-        let workspace_unavailable =
-            self.client.current_auth().is_none() || self.client.gateway_refresh_in_flight();
         let selector_interaction = workspace_selector_interaction_state(
-            workspace_unavailable,
+            self.workspace_unavailable(),
             self.workspace_action_in_progress(),
             self.context_locked,
         );

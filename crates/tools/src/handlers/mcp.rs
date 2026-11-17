@@ -305,9 +305,9 @@ impl ToolHandler for McpToolHandler {
         trace.emit_stage(1, "mcp.call.prepare", None, Some(stage_metadata.clone()));
         trace.emit_stage(1, "mcp.call.started", None, Some(stage_metadata.clone()));
 
-        let output = match self
-            .executor
-            .call_mcp_tool(
+        let output = match crate::observation::measure(
+            pioneer_observability::tool_call::Phase::McpRequest,
+            self.executor.call_mcp_tool(
                 mcp_call_request(
                     &self.descriptor,
                     trace.turn_id(),
@@ -316,8 +316,9 @@ impl ToolHandler for McpToolHandler {
                 ),
                 trace.clone(),
                 invocation.cancellation.clone(),
-            )
-            .await
+            ),
+        )
+        .await
         {
             Ok(output) => {
                 trace.emit_stage(

@@ -324,8 +324,12 @@ mod tests {
     #[tokio::test]
     async fn request_tools_result_reports_computer_use_only_when_registered() {
         let visibility = visibility(&["request_tools"]);
-        let available_handler =
-            RequestToolsHandler::new(visibility.clone(), ["computer_use".to_owned()]);
+        let available_handler = RequestToolsHandler::new(
+            visibility.clone(),
+            crate::COMPUTER_USE_DOMAIN_TOOL_NAMES
+                .iter()
+                .map(|name| name.to_string()),
+        );
 
         let available = available_handler
             .resolve(&serde_json::json!({
@@ -337,7 +341,12 @@ mod tests {
 
         assert_eq!(
             available.added.get("computer_use"),
-            Some(&vec!["computer_use".to_owned()])
+            Some(
+                &crate::COMPUTER_USE_DOMAIN_TOOL_NAMES
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>()
+            )
         );
         assert!(available.already_visible.is_empty());
         assert!(available.blocked.is_empty());
@@ -359,7 +368,10 @@ mod tests {
         assert_eq!(unavailable.unknown_or_unavailable[0].domain, "computer_use");
         assert_eq!(
             unavailable.unknown_or_unavailable[0].tools,
-            vec!["computer_use".to_owned()]
+            crate::COMPUTER_USE_DOMAIN_TOOL_NAMES
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -368,6 +380,7 @@ mod tests {
         let catalog = [
             "request_tools",
             "threads_start_options",
+            "threads_identity_models_list",
             "threads_turn_start",
             "thread_create",
             "thread_message_send",
@@ -395,7 +408,10 @@ mod tests {
         assert!(!task_only.added.values().flatten().any(|name| {
             matches!(
                 name.as_str(),
-                "thread_create" | "thread_message_send" | "threads_turn_start"
+                "thread_create"
+                    | "thread_message_send"
+                    | "threads_turn_start"
+                    | "threads_identity_models_list"
             )
         }));
         assert!(!snapshot.contains_name("threads_start_options").await);
@@ -406,7 +422,9 @@ mod tests {
             }))
             .await
             .expect("both domains resolve");
-        assert_eq!(both.added["threads"].len(), 4);
+        assert_eq!(both.added["threads"].len(), 5);
+        assert!(both.added["threads"].contains(&"threads_identity_models_list".to_owned()));
+        assert!(!snapshot.contains_name("threads_identity_models_list").await);
         assert!(!both.added.contains_key("task"));
         assert_eq!(
             both.already_visible["task"],

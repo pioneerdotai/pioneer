@@ -54,6 +54,13 @@ remove = "Quitar mención"
 cancel = "Cancelar respuesta"
 
 [chat.composer.model]
+service_label = "Nivel de servicio"
+service_standard = "Estándar"
+service_invalid = "El nivel guardado no está disponible. Elige Estándar u otro modo."
+context_label = "Ventana de contexto"
+context_auto = "Auto — hasta %{tokens} tokens"
+context_up_to = "Hasta %{tokens} tokens"
+context_invalid = "La opción guardada no está disponible. Elige Auto u otra ventana."
 select_label = "Seleccionar modelo"
 dialog_title = "Seleccionar modelo"
 provider_label = "Proveedor"
@@ -440,6 +447,13 @@ hide = "Ocultar Pioneer"
 hide_others = "Ocultar otros"
 show_all = "Mostrar todo"
 quit = "Salir de Pioneer"
+
+[menu.edit]
+name = "Edición"
+cut = "Cortar"
+copy = "Copiar"
+paste = "Pegar"
+select_all = "Seleccionar todo"
 
 [menu.about]
 version = "Versión %{version}"
@@ -980,13 +994,6 @@ description = "Evita que el equipo entre en reposo por inactividad mientras el g
 label = "Enviar telemetría"
 description = "Permitir recopilar datos de diagnóstico y rendimiento."
 
-[settings.general.preflight_model]
-label = "Modelo de preflight"
-description = "Elige el proveedor y el modelo para la planificación interna previa al turno. Predeterminado usa el modelo del hilo actual."
-default = "Predeterminado"
-select_model = "Seleccionar modelo"
-dialog_title = "Seleccionar modelo de preflight"
-
 [settings.voice_input]
 label = "Entrada de voz"
 description = "Usa un modelo de transcripción local para los mensajes de voz."
@@ -1041,10 +1048,6 @@ description = "Controla cómo Pioneer usa la memoria duradera."
 [settings.memory.enabled]
 label = "Memoria"
 description = "Permitir que Pioneer use hechos guardados y decisiones del proyecto cuando sea útil."
-
-[settings.memory.active_recall]
-label = "Recuperación activa"
-description = "Ejecutar planificación adicional de recuperación de solo lectura para tareas con mucho contexto."
 
 [settings.memory.proactive_writes]
 label = "Escritura proactiva"
@@ -1762,3 +1765,9 @@ reason_unknown = "La operación no terminó como se esperaba. Consulta los regis
 [mcp.oauth]
 callback_received = "Respuesta aceptada. Vuelve a Pioneer para comprobar el resultado."
 callback_rejected = "Inicio de sesión rechazado. Vuelve a Pioneer para intentarlo de nuevo."
+
+[plugins]
+title = "Plugins"
+
+[apps]
+title = "Aplicaciones"

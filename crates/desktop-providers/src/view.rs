@@ -19,8 +19,8 @@ use pioneer_client::providers::diagnostics::{
     cli_runtime_mcp_readiness_reason_from_code,
 };
 use pioneer_client::providers::types::{
-    CLIAgentRuntimeKind, GatewayCliRuntimeInstanceSettings, RuntimeCapabilities,
-    RuntimeDiagnosticLevel, RuntimeStatus, RuntimeSummary,
+    GatewayCliRuntimeInstanceSettings, RuntimeCapabilities, RuntimeDiagnosticLevel, RuntimeStatus,
+    RuntimeSummary,
 };
 use pioneer_client::providers::{cli_runtime_settings as cli_provider_settings, selectors};
 use std::{cmp::Ordering, collections::HashSet};
@@ -243,7 +243,7 @@ impl ProviderCatalogView {
                                 )
                             })
                             .when(show_cli_providers, |this| {
-                                this.child(Self::render_cli_providers_section(
+                                this.child(self.render_cli_providers_section(
                                     cli_runtime_settings.as_deref(),
                                     cli_runtimes.as_slice(),
                                     cli_error,
@@ -386,6 +386,7 @@ impl ProviderCatalogView {
     }
 
     fn render_cli_providers_section(
+        &self,
         settings_instances: Option<&[GatewayCliRuntimeInstanceSettings]>,
         runtimes: &[RuntimeSummary],
         error: Option<String>,
@@ -463,7 +464,7 @@ impl ProviderCatalogView {
                             .iter()
                             .enumerate()
                             .map(|(index, runtime)| {
-                                Self::render_cli_runtime_card(
+                                self.render_cli_runtime_card(
                                     index,
                                     runtime,
                                     expanded_runtime_ids.contains(runtime.runtime_id.as_str()),
@@ -484,6 +485,7 @@ impl ProviderCatalogView {
     }
 
     fn render_cli_runtime_card(
+        &self,
         index: usize,
         runtime: &RuntimeSummary,
         expanded: bool,
@@ -686,7 +688,7 @@ impl ProviderCatalogView {
                                 h_flex()
                                     .min_w_0()
                                     .gap_1()
-                                    .child(Self::render_cli_runtime_logo(runtime, cx))
+                                    .child(self.render_cli_runtime_avatar(runtime, window, cx))
                                     .child(
                                         h_flex()
                                             .min_w_0()
@@ -920,6 +922,8 @@ impl ProviderCatalogView {
             ("ovhcloud", false) => "logos/providers/ovhcloud-light.svg",
             ("openai", true) => "logos/providers/openai-dark.svg",
             ("openai", false) => "logos/providers/openai-light.svg",
+            ("vercel-ai-gateway", true) => "logos/providers/vercel-dark.svg",
+            ("vercel-ai-gateway", false) => "logos/providers/vercel-light.svg",
             ("xai", true) => "logos/providers/xai-dark.svg",
             ("xai", false) => "logos/providers/xai-light.svg",
             ("yi", true) => "logos/providers/yi-dark.svg",
@@ -944,8 +948,32 @@ impl ProviderCatalogView {
             .into_any_element()
     }
 
-    fn render_cli_runtime_logo(runtime: &RuntimeSummary, cx: &mut Context<Self>) -> AnyElement {
-        let (provider_id, logo_path) = cli_runtime_provider_logo(runtime.kind);
+    fn render_cli_runtime_avatar(
+        &self,
+        runtime: &RuntimeSummary,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let revision = pioneer_client::avatars::cli_runtime_avatar_revision(
+            runtime.kind,
+            cx.theme().mode.is_dark(),
+        );
+        let path = self.cli_avatars.image_path(&self.client, revision);
+        let avatar = if let Some(path) = path {
+            pioneer_desktop_foundation::AvatarSurface::new(
+                avatar::Avatar::new()
+                    .with_size(window.rem_size() * 2.)
+                    .border_0(),
+            )
+            .source(path)
+            .into_any_element()
+        } else {
+            avatar::Avatar::new()
+                .name(runtime.display_name.clone())
+                .size_8()
+                .border_0()
+                .into_any_element()
+        };
 
         div()
             .relative()
@@ -954,12 +982,7 @@ impl ProviderCatalogView {
             .flex()
             .items_center()
             .justify_center()
-            .child(Self::render_provider_logo(
-                provider_id,
-                logo_path,
-                px(22.),
-                cx.theme().mode.is_dark(),
-            ))
+            .child(avatar)
             .child(
                 div()
                     .absolute()
@@ -975,16 +998,7 @@ impl ProviderCatalogView {
     }
 }
 
-fn cli_runtime_provider_logo(kind: CLIAgentRuntimeKind) -> (&'static str, &'static str) {
-    match kind {
-        CLIAgentRuntimeKind::Codex => ("openai", "logos/providers/openai.svg"),
-        CLIAgentRuntimeKind::Claude => ("claude", "logos/providers/claude.svg"),
-        CLIAgentRuntimeKind::Acp => ("acp", "icons/terminal.svg"),
-        CLIAgentRuntimeKind::OpenCode => ("opencode", "logos/providers/opencode.svg"),
-    }
-}
-
-fn cli_runtime_displayed_runtimes(
+pub(crate) fn cli_runtime_displayed_runtimes(
     settings_instances: Option<&[GatewayCliRuntimeInstanceSettings]>,
     live_runtimes: &[RuntimeSummary],
 ) -> Vec<RuntimeSummary> {

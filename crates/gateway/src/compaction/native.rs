@@ -11,7 +11,7 @@ use pioneer_agent::compaction::{
     request::NativeRequestProjection,
 };
 use pioneer_compaction::{
-    CompactionMode, CompactionSettings, CoverageDomain, ModelBudget, ModelSelection, Transport,
+    CompactionMode, CompactionSettings, CoverageDomain, ModelSelection, Transport,
     coverage_domain_for, effective_selection, plan_compaction,
 };
 use pioneer_provider::{ChatRequest, MessageProvenance, MessageSourceRef, ProviderRegistry};
@@ -316,7 +316,7 @@ async fn prepare_native_projection_with_prepared(
         Some(processor) => Some(tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native media preparation cancelled"),
             _ = clock.sleep_until(preparation_deadline) => anyhow::bail!("native media preparation deadline exceeded"),
-            guard = processor.artifact_service.html_preview_activity() => guard,
+            guard = processor.artifact_service.html_preview_activity_signaled() => guard,
         }),
         None => None,
     };
@@ -325,7 +325,6 @@ async fn prepare_native_projection_with_prepared(
     }
     // This deadline includes reader/writer queues and admission, not just LLM time.
     let prepared = async {
-        let catalog = pioneer_provider::catalog::model_catalog()?;
         let version = store
             .compaction_projection_version(workspace, thread)
             .await?;
@@ -484,10 +483,10 @@ async fn prepare_native_projection_with_prepared(
         if request.messages.iter().any(|message| {
             message.content_parts.iter().any(|part| match part {
                 pioneer_provider::MessageContentPart::File { file } => {
-                    matches!(&file.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
+                    file.artifact.is_some() || matches!(&file.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
                 }
                 pioneer_provider::MessageContentPart::Image { image } => {
-                    matches!(&image.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
+                    image.artifact.is_some() || matches!(&image.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
                 }
                 pioneer_provider::MessageContentPart::Text { .. }
                 | pioneer_provider::MessageContentPart::Audio { .. }
@@ -504,12 +503,29 @@ async fn prepare_native_projection_with_prepared(
         if matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_))) {
             observe_reused_projection(store, workspace, thread);
         }
-        let limits = catalog.limits(context.provider.name(), &request.model);
-        let budget = ModelBudget::new(
-            Some(limits.context_window),
-            limits.max_input,
-            limits.max_output,
-        );
+        request.service_mode = match context
+            .context_budget
+            .as_ref()
+            .and_then(|budget| budget.service_mode.clone())
+        {
+            Some(plan) => Some(plan),
+            None => Some(
+                pioneer_provider::catalog::service::capture_plan(
+                    context.provider.as_ref(),
+                    &request.model,
+                    None,
+                )
+                .await?,
+            ),
+        };
+        let budget = super::native_budget::effective(
+            context.provider.as_ref(),
+            &context.provider_instance,
+            &request.model,
+            context.context_budget.as_ref(),
+            None,
+        )
+        .await?;
         // Resolve and pin media under the selected provider authority before
         // evaluating either the full request or any compaction candidate.
         let materialized = context.provider.prepare_input_budget(request).await?;
@@ -536,12 +552,12 @@ async fn prepare_native_projection_with_prepared(
             basis.clone(),
         )?;
         let mut message_tokens = full.message_input_tokens.clone();
-        let mut input = receipt.calibrated_input(
+        let mut input = receipt.calibrated_estimate(
             full.estimated_input_tokens,
             &message_tokens,
             measured.as_ref(),
         )?;
-        if !budget.fits(input, full.output_reserve, recovery) {
+        if !budget.fits_estimate(input, full.output_reserve, recovery) {
             if let Some(reduced) = super::result_budget::shrink_results(
                 &store, workspace, &full, &media, &budget, recovery,
             )
@@ -558,7 +574,7 @@ async fn prepare_native_projection_with_prepared(
                 )?;
                 // Representation changed: exact-prefix validation decides
                 // whether any earlier provider measurement is still usable.
-                input = receipt.calibrated_input(
+                input = receipt.calibrated_estimate(
                     full.estimated_input_tokens,
                     &message_tokens,
                     measured.as_ref(),
@@ -566,7 +582,7 @@ async fn prepare_native_projection_with_prepared(
             }
         }
         let history_check = history_check_metadata(&full)?;
-        if !recovery && budget.fits(input, full.output_reserve, false) {
+        if !recovery && budget.fits_estimate(input, full.output_reserve, false) {
             return Ok::<_, anyhow::Error>((full.request, receipt, history_check, None));
         }
         let _startup_compaction = pioneer_observability::turn_startup::current_stage(
@@ -580,29 +596,67 @@ async fn prepare_native_projection_with_prepared(
             None => None,
         };
         let current = ModelSelection {
+            service_mode: context
+                .context_budget
+                .as_ref()
+                .and_then(|saved| saved.service_choice()),
+            context_authority: context.context_budget.as_ref().and_then(|saved| {
+                saved.authority.as_deref().map(|authority| {
+                    pioneer_provider::catalog::context_choice_authority(authority, &saved.model)
+                })
+            }),
+            context_window: context
+                .context_budget
+                .as_ref()
+                .map(|saved| saved.context_window),
             transport: Transport::Api,
             instance: context.provider_instance.clone(),
             model: full.request.model.clone(),
             effort,
         };
-        let selection = effective_selection(&current, settings.selection.as_ref(), None).clone();
-        let summarizer =
-            super::service::make_summarizer(providers, store, processor, workspace, selection)
-                .await?;
+        let selection = context
+            .summary_context
+            .as_ref()
+            .map(|saved| super::native_budget::summary_selection(saved, current.effort.clone()))
+            .unwrap_or_else(|| {
+                effective_selection(&current, settings.selection.as_ref(), None).clone()
+            });
+        // Admission and the service must consume the same durable choice.
+        let summary_settings = CompactionSettings {
+            selection: Some(selection.clone()),
+        };
+        let summarizer = super::service::make_summarizer(
+            providers,
+            store,
+            processor,
+            workspace,
+            thread,
+            selection,
+            true,
+            context
+                .summary_context
+                .as_ref()
+                .map(|saved| &saved.budget)
+                .or_else(|| {
+                    if settings.selection.is_none() {
+                        context.context_budget.as_ref()
+                    } else {
+                        None
+                    }
+                }),
+        )
+        .await?;
         let layout = NativeHistoryLayout::from_messages(
             workspace,
             thread,
             &full.request.messages,
             &message_tokens,
         )?;
-        let message_total = message_tokens
-            .iter()
-            .fold(0_u64, |sum, n| sum.saturating_add(*n));
-        let fixed = input.saturating_sub(message_total);
-        let available = budget
-            .context
-            .saturating_sub(full.output_reserve)
-            .saturating_sub(fixed);
+        // Compaction changes the measured prefix; its replacement candidates
+        // must use their local fixed framing, not reuse an old provider anchor.
+        let fixed = full.fixed_input_tokens;
+        let available =
+            estimated_input_capacity(&budget, full.output_reserve, recovery).saturating_sub(fixed);
         let goal = summarizer
             .model_budget()
             .summarizer_cap(u64::MAX)?
@@ -686,7 +740,7 @@ async fn prepare_native_projection_with_prepared(
             &store,
             workspace,
             thread,
-            settings,
+            &summary_settings,
             &current,
             None,
             summarizer.as_ref(),
@@ -931,6 +985,11 @@ impl pioneer_agent::compaction::controller::NativeContextController
             &context.turn_id,
             pioneer_observability::turn_startup::Stage::CompactionWait,
         );
+        let _conversation_lease = tokio::select! { biased;
+            _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
+            _ = clock.sleep_until(deadline) => anyhow::bail!("native context preparation deadline exceeded"),
+            result = processor.acquire_composer_history_priority(&history_store, &context.workspace_id, &context.thread_id, &context.turn_id, &context.cancellation) => result?,
+        };
         let lease = tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
             _ = clock.sleep_until(deadline) => anyhow::bail!("native context preparation deadline exceeded"),
@@ -947,6 +1006,74 @@ impl pioneer_agent::compaction::controller::NativeContextController
             result = refresh => result?,
         };
         let mut context = context.clone();
+        if context
+            .context_budget
+            .as_ref()
+            .is_none_or(|budget| budget.service_mode.is_none())
+        {
+            let saved = processor
+                .crud_store
+                .get_turn_execution_security_snapshot(&context.turn_id)
+                .await?;
+            if let Some(record) = saved {
+                if record
+                    .snapshot
+                    .native_context
+                    .as_ref()
+                    .is_none_or(|budget| budget.service_mode.is_none())
+                {
+                    let budget = if let Some(budget) = record.snapshot.native_context.clone() {
+                        budget
+                    } else {
+                        super::native_budget::capture(
+                            context.provider.as_ref(),
+                            &context.provider_instance,
+                            &request.model,
+                            None,
+                        )
+                        .await?
+                    };
+                    let summary = if record.snapshot.native_context.is_some() {
+                        record.snapshot.native_summary.clone()
+                    } else {
+                        super::native_budget::capture_summary_legacy(
+                            &processor,
+                            &context.workspace_id,
+                            &budget,
+                        )
+                        .await?
+                    };
+                    let (budget, summary) = super::native_budget::legacy_modes(
+                        &processor,
+                        &context.workspace_id,
+                        budget,
+                        summary,
+                    )
+                    .await?;
+                    processor
+                        .crud_store
+                        .pin_turn_native_context(
+                            &context.workspace_id,
+                            &context.turn_id,
+                            &budget,
+                            summary.as_ref(),
+                        )
+                        .await?;
+                }
+                let saved = processor
+                    .crud_store
+                    .get_turn_execution_security_snapshot(&context.turn_id)
+                    .await?
+                    .context("Native execution context snapshot disappeared")?
+                    .snapshot;
+                context.context_budget = saved.native_context;
+                context.summary_context = saved.native_summary;
+                ensure!(
+                    context.context_budget.is_some(),
+                    "Native execution context could not be pinned"
+                );
+            }
+        }
         context.recovery_deadline_ms = Some(deadline);
         context.cancellation = lease.cancellation();
         let settings = processor.compaction_settings_for_workspace(&context.workspace_id)?;
@@ -1013,6 +1140,8 @@ async fn refresh_native_history(
                             | "context"
                             | "item"
                             | "pending-input"
+                            | "pending-turn-input-projection"
+                            | "pending-runtime-context"
                             | "pending-assistant"
                             | "pending-tool"
                             | "pending-item"
@@ -1079,7 +1208,9 @@ async fn refresh_native_history(
                 "history unit crosses the current execution boundary"
             );
             if origin.sources.iter().any(|source| {
-                source.scope.starts_with("input:") || source.scope.starts_with("pending-input:")
+                source.scope.starts_with("input:")
+                    || source.scope.starts_with("pending-input:")
+                    || source.scope.starts_with("pending-turn-input-projection:")
             }) {
                 origin.protected_input = true;
             }
@@ -1122,12 +1253,15 @@ fn replace_completed_history(
 #[cfg(test)]
 mod completed_request_tests {
     use super::*;
+    use pioneer_compaction::ModelBudget;
     use pioneer_provider::ChatMessage;
 
     #[test]
     fn completed_history_keeps_system_instructions_in_full_request_budget() {
         let instructions = "Required runtime instruction. ".repeat(500);
         let mut request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "fixture".into(),
             messages: vec![
                 ChatMessage::system(instructions.clone()),

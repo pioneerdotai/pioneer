@@ -422,6 +422,158 @@ mod tests {
     }
 
     #[test]
+    fn native_threads_policy_requires_readable_hidden_skill_and_delivered_exact_reference() {
+        let root = temp_case("threads-policy");
+        let package_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/skills");
+        let catalog = load_catalog(&SkillCatalogLoadParams {
+            installations: vec![],
+            bundled: vec![pioneer_skills::BundledSkillCatalogEntry {
+                skill_id: pioneer_protocol::SkillId::new("Th7kE4qP9mNs2vX6aR8cZ").unwrap(),
+                owner: Some("pioneer".to_owned()),
+                slug: "threads".to_owned(),
+                source_root: package_root.clone(),
+                install_path: package_root.join("pioneer/threads"),
+            }],
+            max_file_bytes: 1024 * 1024,
+        })
+        .unwrap();
+        let resolution = resolve_turn_skills_with_explicit_refs(
+            &[],
+            &[],
+            &catalog,
+            &[],
+            &test_skills_config(&root),
+            &HashMap::new(),
+            &crate::AgentMcpAvailability::default(),
+        )
+        .unwrap();
+        assert_eq!(resolution.result.active.len(), 1);
+        let specifications = [
+            "read_skill",
+            "request_tools",
+            "threads_list",
+            "threads_start_options",
+        ]
+        .map(|name| {
+            pioneer_tools::ConfiguredToolSpec::new(
+                pioneer_tools::ToolSpec::new(
+                    name,
+                    "fixture",
+                    serde_json::json!({"type":"object"}),
+                    pioneer_tools::PayloadKind::Function,
+                ),
+                pioneer_tools::ExecutionClass::Shared,
+                pioneer_tools::dynamic_unknown_output_policy(),
+            )
+        });
+        let index = specifications
+            .iter()
+            .map(|spec| spec.spec.name.clone())
+            .collect::<Vec<_>>();
+        let visible = vec!["read_skill".to_owned(), "request_tools".to_owned()];
+        let permission = pioneer_protocol::default_turn_permission_profile_snapshot();
+        // No Threads operation has been opened. request_tools makes the hidden
+        // registered reader reachable, so the agent learns of Threads first.
+        assert!(super::super::native_threads_policy_available(
+            &resolution,
+            Some(&resolution.prompt),
+            &index,
+            &visible,
+            &permission
+        ));
+        for missing in [
+            "skill",
+            "reader",
+            "reference",
+            "read-index",
+            "request-tools",
+            "capability",
+            "denied",
+            "allow-empty",
+        ] {
+            let mut candidate = resolution.clone();
+            let mut prompt = resolution.prompt.clone();
+            let mut visible = visible.clone();
+            let mut index = index.clone();
+            let mut permission = permission.clone();
+            match missing {
+                "skill" => candidate.result.active.clear(),
+                "reader" => visible.retain(|name| name != "read_skill"),
+                "reference" => {
+                    prompt =
+                        prompt.replace("skill:Th7kE4qP9mNs2vX6aR8cZ", "skill:AAAAAAAAAAAAAAAAAAAAA")
+                }
+                "read-index" => candidate.runtime_plan.read_skill_index.clear(),
+                "request-tools" => visible.retain(|name| name != "request_tools"),
+                "capability" => index.retain(|name| name == "threads_start_options"),
+                "denied" => permission
+                    .effective_policy
+                    .denied_tools
+                    .push("threads_list".to_owned()),
+                "allow-empty" => permission.effective_policy.allowed_tools_restricted = true,
+                _ => unreachable!(),
+            }
+            assert!(
+                !super::super::native_threads_policy_available(
+                    &candidate,
+                    Some(&prompt),
+                    &index,
+                    &visible,
+                    &permission
+                ),
+                "{missing}"
+            );
+        }
+        for continuing in [false, true] {
+            let enabled = super::super::native_threads_policy_available(
+                &resolution,
+                Some(&resolution.prompt),
+                &index,
+                &visible,
+                &permission,
+            );
+            let plan = super::super::compile_agent_instruction_delivery_plan_with_prompt_root(
+                &root,
+                Some(resolution.prompt.clone()),
+                None,
+                &[],
+                &permission,
+                false,
+                enabled,
+                false,
+                true,
+                false,
+                continuing,
+                Some("root"),
+                "root",
+                "turn",
+            )
+            .unwrap();
+            assert!(
+                plan.bundle
+                    .sections
+                    .iter()
+                    .any(|section| section.id == pioneer_promt::PromptSectionId::ThreadsPolicy)
+            );
+            for policy in [
+                pioneer_promt::PromptSectionId::TasksPolicy,
+                pioneer_promt::PromptSectionId::SubagentsPolicy,
+            ] {
+                assert!(
+                    plan.bundle
+                        .sections
+                        .iter()
+                        .any(|section| section.id == policy)
+                );
+            }
+            let reference = "- pioneer/threads: `skill:Th7kE4qP9mNs2vX6aR8cZ`";
+            assert!(plan.turn_context.text.contains(reference));
+            assert!(!plan.provider_instructions.text.contains(reference));
+        }
+    }
+
+    #[test]
     fn skill_activates_when_dependency_exists_only_in_metadata() {
         let root = temp_case("metadata-pass");
         let skill_dir = root.join("tests").join("agent-browser");
@@ -512,6 +664,159 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    // Plugin leaves use this same native resolution/runtime-plan path.
+    // NOT_RUN / NOT_COMPILED: no provider, process or fixture is started.
+    #[test]
+    fn disabled_bundled_skill_is_absent_from_prompt_tools_and_read_index() {
+        let root = temp_case("plugin-disabled-sibling");
+        for slug in ["allowed", "disabled"] {
+            let dir = root.join("tests").join(slug);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {slug}\ndescription: {slug} bundled skill\n---\nBody for {slug}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let mut catalog = test_catalog(&root, "allowed");
+        catalog
+            .skills
+            .extend(test_catalog(&root, "disabled").skills);
+        for skill in &mut catalog.skills {
+            skill.host_explicit_only = true;
+            skill
+                .runtime
+                .runtime_tools
+                .push(pioneer_skills::SkillRuntimeToolDefinition {
+                    tool_slug: "lookup".into(),
+                    description: "lookup".into(),
+                    kind: pioneer_skills::SkillRuntimeToolKind::FunctionProxy,
+                    parameters: serde_json::json!({"type":"object"}),
+                    execution_class: Default::default(),
+                    config: serde_json::json!({"function":"lookup"}),
+                    output_policy: None,
+                });
+        }
+        let refs = [
+            explicit_skill_ref("allowed"),
+            explicit_skill_ref("disabled"),
+        ];
+        let mut policies = HashMap::from([(
+            SkillPolicyKey::new(test_skill_id("disabled")),
+            crate::WorkspaceSkillPolicy {
+                enabled: Some(false),
+                allow_implicit_invocation: Some(true),
+            },
+        )]);
+        let resolve = |policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>| {
+            resolve_turn_skills_with_explicit_refs(
+                &[],
+                &refs,
+                &catalog,
+                &[],
+                &test_skills_config(&root),
+                policies,
+                &crate::AgentMcpAvailability::default(),
+            )
+            .unwrap()
+        };
+        let result = resolve(&policies);
+        assert_eq!(result.result.active.len(), 1);
+        assert_eq!(result.result.active[0].skill_id, test_skill_id("allowed"));
+        assert!(
+            result
+                .prompt
+                .contains(&format!("skill:{}", test_skill_id("allowed")))
+        );
+        assert!(
+            !result
+                .prompt
+                .contains(&format!("skill:{}", test_skill_id("disabled")))
+        );
+        assert!(
+            result
+                .runtime_plan
+                .read_skill_index
+                .contains_key(&format!("skill:{}", test_skill_id("allowed")))
+        );
+        assert!(
+            !result
+                .runtime_plan
+                .read_skill_index
+                .contains_key(&format!("skill:{}", test_skill_id("disabled")))
+        );
+        assert!(
+            result
+                .runtime_plan
+                .tools
+                .iter()
+                .any(|t| t.skill_id == test_skill_id("allowed"))
+        );
+        assert!(
+            result
+                .runtime_plan
+                .tools
+                .iter()
+                .all(|t| t.skill_id != test_skill_id("disabled"))
+        );
+        assert_eq!(to_turn_skill_bindings(&result.result.active, &[]).len(), 1);
+        // Trust exclusions also come from the actual native resolver, even
+        // when an installed candidate is policy-enabled at Gateway expansion.
+        let mut untrusted_catalog = catalog.clone();
+        untrusted_catalog
+            .skills
+            .iter_mut()
+            .find(|s| s.identity.skill_id == test_skill_id("disabled"))
+            .unwrap()
+            .runtime
+            .trust_level = SkillTrustLevel::Untrusted;
+        let untrusted = resolve_turn_skills_with_explicit_refs(
+            &[],
+            &refs,
+            &untrusted_catalog,
+            &[],
+            &test_skills_config(&root),
+            &HashMap::new(),
+            &crate::AgentMcpAvailability::default(),
+        )
+        .unwrap();
+        assert_eq!(untrusted.result.active.len(), 1);
+        assert_eq!(
+            untrusted.result.active[0].skill_id,
+            test_skill_id("allowed")
+        );
+        assert!(
+            !untrusted
+                .runtime_plan
+                .read_skill_index
+                .contains_key(&format!("skill:{}", test_skill_id("disabled")))
+        );
+        assert!(
+            !untrusted
+                .prompt
+                .contains(&format!("skill:{}", test_skill_id("disabled")))
+        );
+        policies.insert(
+            SkillPolicyKey::new(test_skill_id("allowed")),
+            crate::WorkspaceSkillPolicy {
+                enabled: Some(false),
+                allow_implicit_invocation: Some(true),
+            },
+        );
+        let excluded = resolve(&policies);
+        assert!(excluded.result.active.is_empty());
+        assert!(excluded.runtime_plan.read_skill_index.is_empty());
+        assert!(excluded.runtime_plan.tools.is_empty());
+        assert!(
+            !excluded
+                .prompt
+                .contains(&format!("skill:{}", test_skill_id("allowed")))
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -737,3 +1042,7 @@ Use the ordinary weather procedure.
         assert_eq!(bindings[0].resolved_reason, "agent_catalog");
     }
 }
+
+#[cfg(test)]
+#[path = "package_inventory_tests.rs"]
+mod package_inventory_tests;

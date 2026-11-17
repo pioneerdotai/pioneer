@@ -12,6 +12,80 @@ use pioneer_observability::DesktopStartupOutcome;
 use std::sync::Arc;
 
 impl ComposerView {
+    pub(crate) fn observe_opening_inputs(&self) {
+        use pioneer_client::threads::opening::ComposerReadiness;
+        let Some(evidence) = self.client.opening_evidence(&self.thread_id) else {
+            return;
+        };
+        let Some(navigation) = self.thread_bindings.publication(&ClientScope::Navigation) else {
+            return;
+        };
+        if navigation.revisions().scoped().get() != evidence.navigation_revision {
+            return;
+        }
+        let (Some(input), Some(identity)) = (&self.composer_input, &self.identity_input) else {
+            return;
+        };
+        let Some(session) = self.thread_bindings.publication(&ClientScope::Session)
+            .and_then(|publication| publication.typed::<pioneer_client::gateway::session_controller::GatewaySessionPublication>())
+            .map(|publication| publication.payload()) else { return; };
+        if !Arc::ptr_eq(&session, &self.client.gateway_session()) {
+            return;
+        }
+        if self.composer_editor_draft != Some(input.draft_id()) {
+            return;
+        }
+        let state = if identity.current_auth.is_none() {
+            ComposerReadiness::AuthRequired
+        } else if !desktop_composer_transport_ready(self.connection_state) {
+            return;
+        } else if !self.composer_scoped_write_allowed() {
+            ComposerReadiness::ReadOnly
+        } else if input.domain().selected_mode != ThreadMode::Message
+            && !input.selected_permission_mode_allowed()
+        {
+            ComposerReadiness::SetupRequired
+        } else {
+            match self.startup_outcome() {
+                Some(DesktopStartupOutcome::Ready) => {
+                    if self.message_mutation_pending()
+                        || input
+                            .operation()
+                            .is_some_and(|operation| operation.pending())
+                        || self
+                            .active_thread_conversation()
+                            .is_some_and(|conversation| !conversation.can_submit_message())
+                    {
+                        ComposerReadiness::Busy
+                    } else if input
+                        .voice_readiness()
+                        .and_then(|voice| voice.response.as_ref())
+                        .is_some_and(|voice| {
+                            voice.status == pioneer_client::voice::VoiceStatus::Disabled
+                        })
+                    {
+                        ComposerReadiness::VoiceDisabled
+                    } else {
+                        ComposerReadiness::Ready
+                    }
+                }
+                Some(DesktopStartupOutcome::SetupRequired) => ComposerReadiness::SetupRequired,
+                Some(DesktopStartupOutcome::Degraded) => ComposerReadiness::Degraded,
+                _ => return,
+            }
+        };
+        evidence.ticket.correlation().run(|| {
+            self.client.observe_opening_native(
+                &self.thread_id,
+                &evidence.ticket,
+                input,
+                identity,
+                self.thread_capability_input.as_ref(),
+                &session,
+                state,
+            );
+        });
+    }
     pub(crate) fn startup_outcome(&self) -> Option<DesktopStartupOutcome> {
         // Core publication precedes asynchronous application in the native view.
         // Inspect only committed inputs, and never synchronize or request work here.

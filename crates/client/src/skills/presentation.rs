@@ -605,6 +605,8 @@ mod tests {
 
     fn skill(owner: Option<&str>, slug: &str) -> SkillListItem {
         SkillListItem {
+            plugin_owner: None,
+            package_owner: None,
             skill_id: test_id('A'),
             pack: None,
             owner: owner.map(str::to_owned),

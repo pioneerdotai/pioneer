@@ -40,6 +40,7 @@ fn packages(skills: &[pioneer_skills::ResolvedSkill]) -> Result<BTreeMap<String,
     let mut captured = BTreeMap::new();
     for skill in skills {
         let files = pioneer_skills::snapshot_skill_package(
+            std::path::Path::new(&skill.definition.identity.source_root),
             std::path::Path::new(&skill.definition.identity.skill_dir),
             256,
             256 * 1024,
@@ -310,6 +311,8 @@ impl pioneer_tools::McpToolExecutor for NestedMcpExecutor {
                     runtime_id: Some(self.instance.key().runtime_id.clone()),
                     session_generation: Some(self.instance.generation()),
                     provider_call_id: request.call_id,
+                    native_call: None,
+                    admission_deadline: None,
                     canonical_callable_name: request.callable_name,
                     arguments: request.arguments,
                     origin: TurnMcpInvocationOrigin::CliFacade,
@@ -433,6 +436,25 @@ impl pioneer_tools::PermissionApprovalBroker for SkillApprovalGuard {
             .map_err(|_| "Tool owner unavailable")?
             .upgrade()
             .ok_or("Tool owner unavailable")?;
+        let workspace = current
+            .workspace_id
+            .as_deref()
+            .ok_or("ACP skill workspace is unavailable")?;
+        for skill in &tooling.skills {
+            if !processor
+                .crud_store
+                .plugin_turn_child_available(
+                    &self.turn,
+                    "skill",
+                    skill.skill_id.as_str(),
+                    workspace,
+                )
+                .await
+                .map_err(|_| "skill ownership unavailable")?
+            {
+                return Err("plugin selection is unavailable for this turn".into());
+            }
+        }
         processor
             .revalidate_persisted_turn_skill_projection(&self.thread, &self.turn)
             .await

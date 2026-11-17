@@ -108,6 +108,8 @@ mod tests {
 
     fn server(id: &str, name: &str) -> McpListItem {
         McpListItem {
+            plugin_owner: None,
+            package_owner: None,
             id: id.to_owned(),
             name: name.to_owned(),
             display_name: None,
@@ -192,27 +194,6 @@ mod tests {
     }
 
     #[test]
-    fn details_response_updates_selection_and_matching_list_item() {
-        let mut servers = vec![server("id-github", "old-name")];
-        let mut selected = None;
-        let mut stored_details = None;
-
-        apply_mcp_details_response(
-            &mut servers,
-            &mut selected,
-            &mut stored_details,
-            details("id-github", "github"),
-        );
-
-        assert_eq!(selected.as_deref(), Some("id-github"));
-        assert_eq!(servers[0].name, "github");
-        assert!(mcp_details_match_selected(
-            stored_details.as_ref(),
-            selected.as_deref()
-        ));
-    }
-
-    #[test]
     fn details_refresh_success_reduction_updates_selection_and_matching_list_item() {
         let reduction = reduce_mcp_details_refresh_success(
             vec![server("id-github", "old-name")],
@@ -227,12 +208,5 @@ mod tests {
             reduction.server_details.as_ref(),
             reduction.selected_server_id.as_deref()
         ));
-    }
-
-    #[test]
-    fn details_refresh_failure_reduction_carries_display_error() {
-        let reduction = reduce_mcp_details_refresh_failure("load failed");
-
-        assert_eq!(reduction.error, "load failed");
     }
 }

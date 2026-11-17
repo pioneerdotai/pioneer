@@ -21,6 +21,17 @@
     },
     "kind": {
       "$ref": "#/$defs/ParsedUserAttachmentKind"
+    },
+    "plugin_icon": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ImageReference"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [
@@ -188,10 +199,27 @@
     "ParsedUserAttachmentKind": {
       "type": "string",
       "enum": [
+        "Plugin",
         "File",
         "Skill",
         "Mcp"
       ]
+    },
+    "ImageReference": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision"
+      ],
+      "description": "Immutable image reference. Gateway inventory exposes a native storage link, never image bytes."
     }
   }
 }

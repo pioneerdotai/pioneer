@@ -697,6 +697,7 @@ pub(super) fn registered_supplements(
                 // The native /models route below owns this gateway's identities
                 // and filters. models.dev must not refill rejected native rows.
                 | "openrouter"
+                | "vercel-ai-gateway"
                 | "local"
                 | "telnyx"
                 | "glm"
@@ -915,48 +916,107 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
         })
         .collect()
 }
+pub(super) fn vercel_model(m: &Value) -> Option<Candidate> {
+    let id = m["id"].as_str().filter(|id| !id.trim().is_empty())?;
+    let mut c = base(
+        "vercel-ai-gateway",
+        id,
+        "openai-responses",
+        "https://ai-gateway.vercel.sh/v1",
+        m,
+        (4096, 4096),
+    );
+    c.model["pricingSource"] =
+        json!({"url":SOURCE_URLS[2],"units":"USD_per_token","raw":m["pricing"]});
+    c.model["reasoning"] = json!(
+        has(&m["tags"], "reasoning")
+            || m["reasoning_options"]
+                .as_array()
+                .is_some_and(|v| !v.is_empty())
+    );
+    c.tool_calling = crate::catalog::tool_support_from_marker_list(&m["tags"], "tool-use");
+    c.model["toolCalling"] = c.tool_calling.map_or(Value::Null, |v| json!(v));
+    for (field, legacy) in [
+        ("input", "input_modalities"),
+        ("output", "output_modalities"),
+    ] {
+        let current = &m["modalities"][field];
+        let valid = |v: &Value| v.as_array().is_some_and(|v| v.iter().all(Value::is_string));
+        let (value, expression, kind) = if valid(current) {
+            (
+                current.clone(),
+                format!("vercel.modalities.{field}"),
+                "source",
+            )
+        } else if current.is_null() && valid(&m[legacy]) {
+            (
+                m[legacy].clone(),
+                format!("vercel.{legacy} (legacy schema)"),
+                "source",
+            )
+        } else if field == "input" && has(&m["tags"], "vision") {
+            (
+                json!(["image"]),
+                "vercel positive vision tag".into(),
+                "partial",
+            )
+        } else {
+            (json!([]), format!("vercel.{field} unknown"), "fallback")
+        };
+        c.model[field] = value;
+        c.model[format!("{field}Origin")] = json!({"kind":kind,"expression":expression});
+    }
+    (c.model["contextWindow"], c.context_origin) =
+        limit(&m["context_window"], 4096, "vercel.context_window");
+    (c.model["maxTokens"], c.output_origin) = limit(&m["max_tokens"], 4096, "vercel.max_tokens");
+    c.model["vercelLimitOrigins"] =
+        json!({"contextWindow":c.context_origin,"maxTokens":c.output_origin});
+    for (key, source) in [
+        ("input", "input"),
+        ("output", "output"),
+        ("cacheRead", "input_cache_read"),
+        ("cacheWrite", "input_cache_write"),
+    ] {
+        c.model["cost"][key] = per_token_rate(&m["pricing"][source]);
+    }
+    // Variable/tiered tariffs are retained as source evidence; the runtime's
+    // pricing estimator must not interpret the floor as an exact account bill.
+    if m["pricing"]["varies_by_provider"] == true
+        || m["pricing"].as_object().is_some_and(|pricing| {
+            pricing
+                .keys()
+                .any(|key| key == "tiers" || key.ends_with("_tiers"))
+        })
+    {
+        c.model["pricingSource"]["unknownRateContract"] =
+            json!({"reason":"variable_vercel_tariff"});
+    }
+    if let Some(temperature) = m["temperature"].as_bool() {
+        c.compat(json!({"supportsTemperature":temperature}));
+    }
+    Some(c)
+}
+
+pub(super) fn vercel_chat_eligible(m: &Value) -> bool {
+    let output = if m["modalities"]["output"].is_null() {
+        &m["output_modalities"]
+    } else {
+        &m["modalities"]["output"]
+    };
+    m["type"] == "language"
+        && has(output, "text")
+        && has(&m["tags"], "tool-use")
+        && !text(&m["id"]).ends_with("-batch")
+        && !has(&m["tags"], "realtime")
+}
+
 pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
     data["data"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|m| has(&m["tags"], "tool-use"))
-        .map(|m| {
-            let id = text(&m["id"]);
-            let mut c = base(
-                "vercel-ai-gateway",
-                id,
-                "anthropic-messages",
-                "https://ai-gateway.vercel.sh",
-                m,
-                (4096, 4096),
-            );
-            c.model["pricingSource"] =
-                json!({"url":SOURCE_URLS[2],"units":"USD_per_token","raw":m["pricing"]});
-            c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
-            c.tool_calling = Some(has(&m["tags"], "tool-use"));
-            c.model["input"] = m["input_modalities"].as_array().map(|v| json!(v))
-                .unwrap_or_else(|| if has(&m["tags"], "vision") {json!(["text", "image"])} else {json!([])});
-            c.model["inputOrigin"] = json!({"kind":if m["input_modalities"].is_array(){"source"}else if has(&m["tags"], "vision"){"partial"}else{"fallback"},"expression":"vercel.input_modalities or positive vision tag"});
-            c.model["sourceMetadata"] = json!({"tags":m["tags"],"input_modalities":m["input_modalities"]});
-            c.model["output"] = m["output_modalities"].clone();
-            (c.model["contextWindow"], c.context_origin) =
-                limit(&m["context_window"], 4096, "vercel.context_window");
-            (c.model["maxTokens"], c.output_origin) =
-                limit(&m["max_tokens"], 4096, "vercel.max_tokens");
-            for (key, source) in [
-                ("input", "input"),
-                ("output", "output"),
-                ("cacheRead", "input_cache_read"),
-                ("cacheWrite", "input_cache_write"),
-            ] {
-                c.model["cost"][key] = match &m["pricing"][source] {
-                    Value::Null => Value::Null,
-                    value => per_token_rate(value),
-                };
-            }
-            c
-        })
+        .filter(|m| vercel_chat_eligible(m))
+        .filter_map(vercel_model)
         .collect()
 }
 
@@ -1010,6 +1070,56 @@ pub(super) fn tool_capabilities(snapshot: &SourceSnapshot) -> super::super::Tool
                 .entry(provider.into())
                 .or_default()
                 .insert(id.into(), supported);
+        }
+    }
+    result
+}
+
+/// Keep operation tariffs from the same captured sources, separate from chat
+/// eligibility. Known adapter identities, never an embedding-looking name alone.
+pub(super) fn billing_models(
+    snapshot: &SourceSnapshot,
+) -> BTreeMap<String, BTreeMap<String, Value>> {
+    let mut result = BTreeMap::<String, BTreeMap<String, Value>>::new();
+    if let Some(source) = snapshot.source_body(SOURCE_URLS[0]) {
+        for (id, raw) in entries(source, "openai") {
+            if crate::providers::openai::embedding_model_definition(id).is_none() {
+                continue;
+            }
+            let mut candidate = base(
+                "openai",
+                id,
+                "openai-embeddings",
+                "https://api.openai.com/v1",
+                raw,
+                (0, 0),
+            );
+            candidate.model["pricingEvidenceVersion"] = json!(1);
+            candidate.model["pricingCapturedAt"] = json!(snapshot.captured_at);
+            candidate.model["pricingUnits"] = json!("USD_per_million_tokens");
+            result
+                .entry("openai".into())
+                .or_default()
+                .insert(id.clone(), candidate.model);
+        }
+    }
+    if let Some(source) = snapshot.source_body(SOURCE_URLS[2]) {
+        for raw in source["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|raw| vercel_embedding_eligible(raw))
+        {
+            if let Some(mut candidate) = vercel_model(raw) {
+                candidate.model["api"] = json!("openai-embeddings");
+                candidate.model["pricingEvidenceVersion"] = json!(1);
+                candidate.model["pricingCapturedAt"] = json!(snapshot.captured_at);
+                candidate.model["pricingUnits"] = json!("USD_per_million_tokens");
+                result
+                    .entry("vercel-ai-gateway".into())
+                    .or_default()
+                    .insert(candidate.id().into(), candidate.model);
+            }
         }
     }
     result

@@ -13,15 +13,21 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 const OUTBOUND_CONTROL_RESERVE: usize = 8;
 
 pub(crate) struct CliMcpBridgeFacadeHandle {
     context: Arc<CliMcpBridgeFacadeContext>,
+    shutdown: CancellationToken,
+    facade: Arc<CliMcpToolFacade>,
 }
 
 impl CliMcpBridgeFacadeHandle {
+    pub(crate) fn request_shutdown(&self) {
+        self.facade.request_shutdown();
+        self.shutdown.cancel();
+    }
     pub(crate) async fn set_activation(&self, activation: Option<CliMcpActivationGeneration>) {
         *self.context.activation.write().await = activation;
     }
@@ -80,7 +86,7 @@ pub(crate) struct CliMcpBridgeFacadeServer {
     outbound_sender: mpsc::Sender<Vec<u8>>,
     max_pending_bytes: usize,
     max_call_tasks: usize,
-    shutdown_drain: std::time::Duration,
+    shutdown: CancellationToken,
 }
 
 impl CliMcpBridgeFacadeServer {
@@ -91,6 +97,7 @@ impl CliMcpBridgeFacadeServer {
         projection_generation: CliMcpProjectionGeneration,
         projection: CliMcpFacadeProjection,
         limits: CliMcpFacadeLimits,
+        call_contract: super::facade::CliMcpCallContract,
     ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
         let channel_capacity = limits
             .max_ledger_entries
@@ -104,13 +111,17 @@ impl CliMcpBridgeFacadeServer {
                 outbound: outbound_sender.clone(),
             }),
             limits.clone(),
+            call_contract,
         )?;
         let context = Arc::new(CliMcpBridgeFacadeContext {
             bound_grant: transport.bound_grant().clone(),
             projection_generation,
             activation: RwLock::new(None),
         });
+        let shutdown = CancellationToken::new();
         let handle = CliMcpBridgeFacadeHandle {
+            shutdown: shutdown.clone(),
+            facade: facade.clone(),
             context: context.clone(),
         };
         let server = Self {
@@ -121,7 +132,7 @@ impl CliMcpBridgeFacadeServer {
             outbound_sender,
             max_pending_bytes: limits.max_frame_bytes,
             max_call_tasks: limits.max_ledger_entries,
-            shutdown_drain: limits.shutdown_drain_duration,
+            shutdown,
         };
         Ok((handle, server))
     }
@@ -130,21 +141,26 @@ impl CliMcpBridgeFacadeServer {
         let mut pending = Vec::new();
         let mut calls = JoinSet::new();
         let outcome = self.run_loop(&mut pending, &mut calls).await;
-        let facade_shutdown = self.facade.shutdown().await;
-        let calls_drained = timeout(self.shutdown_drain, async {
-            while calls.join_next().await.is_some() {}
-        })
-        .await
-        .is_ok();
-        if !calls_drained {
-            calls.abort_all();
-            while calls.join_next().await.is_some() {}
+        // Close outbound admission so cancelled calls cannot block on progress
+        // or result backpressure after the run loop exits.
+        self.outbound.close();
+        self.facade.shutdown().await;
+        let mut failed_call = false;
+        while let Some(joined) = calls.join_next().await {
+            failed_call |= joined.is_err();
         }
-        self.transport.terminate().await;
+        let facade_shutdown = self.facade.shutdown().await;
+        // Return the connection to its existing supervisor entry. Grant and
+        // artifact cleanup happens only after this actual server has joined.
+        self.transport.retire_connection().await?;
         pending.fill(0);
-        if !facade_shutdown.drained || !calls_drained {
+        if failed_call {
+            return Err(CliMcpBridgeServerError::CallTaskFailed);
+        }
+        if !facade_shutdown.drained {
             return Err(CliMcpBridgeServerError::ShutdownTimeout);
         }
+
         outcome
     }
 
@@ -156,6 +172,7 @@ impl CliMcpBridgeFacadeServer {
         loop {
             tokio::select! {
                 biased;
+                _ = self.shutdown.cancelled() => return Ok(()),
                 outbound = self.outbound.recv() => {
                     let Some(outbound) = outbound else {
                         return Err(CliMcpBridgeServerError::OutboundClosed);
@@ -201,6 +218,9 @@ impl CliMcpBridgeFacadeServer {
         }
         pending.extend_from_slice(payload);
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            if self.shutdown.is_cancelled() {
+                return Ok(());
+            }
             let mut line = pending.drain(..=newline).collect::<Vec<_>>();
             while line.last().is_some_and(u8::is_ascii_whitespace) {
                 line.pop();
@@ -328,6 +348,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex};
+    use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
     const SECRET_CANARY: &str = "pioneer-secret-canary-7c3278d3c7214b66965e";
@@ -336,6 +357,10 @@ mod tests {
         calls: AtomicUsize,
         wait_calls: AtomicUsize,
         gateway_only_secret: String,
+        after_cancel_entered: tokio::sync::Notify,
+        after_cancel_release: tokio::sync::Notify,
+        is_error: bool,
+        duration_ms: u64,
     }
 
     #[async_trait]
@@ -355,6 +380,15 @@ mod tests {
             if invocation.canonical_callable_name == "wait" {
                 self.wait_calls.fetch_add(1, Ordering::SeqCst);
                 cancellation.cancelled().await;
+                if invocation
+                    .arguments
+                    .get("delay_after_cancel")
+                    .and_then(JsonValue::as_bool)
+                    == Some(true)
+                {
+                    self.after_cancel_entered.notify_one();
+                    self.after_cancel_release.notified().await;
+                }
                 return Err(TurnMcpInvocationError::new(
                     TurnMcpInvocationErrorCode::Cancelled,
                     "cancelled by fake provider",
@@ -366,8 +400,8 @@ mod tests {
                     {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"}
                 ]),
                 structured_content: Some(json!({"echo": invocation.arguments})),
-                is_error: false,
-                duration_ms: 3,
+                is_error: self.is_error,
+                duration_ms: self.duration_ms,
                 meta: None,
             })
         }
@@ -447,181 +481,375 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_mcp_bridge_integration_full_helper_facade_path_and_secret_canary() {
-        #[cfg(unix)]
-        let temporary = tempfile::tempdir_in("/tmp").expect("temporary");
-        #[cfg(windows)]
-        let temporary = tempfile::tempdir().expect("temporary");
-        let artifact_root = temporary.path().join("bridge-sessions");
-        let supervisor =
-            super::super::supervisor::CliMcpBridgeSupervisor::new(artifact_root.clone());
-        let process_instance = instance(("workspace", "codex", "thread"), 1);
-        let scope = CliMcpGrantScope::new(
-            process_instance.clone(),
-            CliMcpManifestHash::new("a".repeat(64)).expect("manifest"),
-        );
-        let projection = projection();
-        let launch = supervisor
-            .prepare(scope, expiry(60_000))
-            .await
-            .expect("prepare");
-        let bootstrap_path = launch.bootstrap_path().to_path_buf();
-        let reservation = supervisor
-            .coordinator()
-            .stage_projection(launch.grant_ref(), projection.fingerprint().clone())
-            .await
-            .expect("projection reservation");
-        supervisor
-            .associate_provider_process(&process_instance, std::process::id(), None)
-            .await
-            .expect("provider process");
+    async fn transport_return_and_facade_join_precede_supervisor_cleanup() {
+        use super::super::supervisor::{CliMcpBridgeSessionState, CliMcpBridgeSupervisor};
 
-        let (provider_writer, helper_stdin) = duplex(1024 * 1024);
-        let (helper_stdout, provider_reader) = duplex(1024 * 1024);
-        let helper_bootstrap = bootstrap_path.clone();
-        let helper = tokio::spawn(async move {
-            run_hidden_helper_with_io(&helper_bootstrap, helper_stdin, helper_stdout).await
-        });
-        let attachment = supervisor
-            .await_attach(&process_instance, Duration::from_secs(2))
-            .await
-            .expect("attach");
-        assert!(
-            !bootstrap_path.exists(),
-            "bootstrap must be consumed before list"
-        );
-        let transport = supervisor
-            .take_transport(&process_instance)
-            .await
-            .expect("transport");
-        let invoker = Arc::new(FakeSharedInvoker {
-            calls: AtomicUsize::new(0),
-            wait_calls: AtomicUsize::new(0),
-            gateway_only_secret: SECRET_CANARY.to_owned(),
-        });
-        let (handle, server) = CliMcpBridgeFacadeServer::build(
-            transport,
-            supervisor.coordinator(),
-            invoker.clone(),
-            reservation.generation,
-            projection,
-            CliMcpFacadeLimits::default(),
-        )
-        .expect("server");
-        let server = tokio::spawn(server.run());
-        let mut provider = ProviderClient {
-            writer: provider_writer,
-            reader: BufReader::new(provider_reader),
-            captured: Vec::new(),
-        };
-
-        provider
-            .send(json!({
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "fake-provider", "version": "1"}
-                }
-            }))
-            .await;
-        let initialized = provider.response(&json!(1)).await;
-        assert_eq!(initialized["result"]["capabilities"], json!({"tools": {}}));
-        provider
-            .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
-            .await;
-        provider
-            .send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
-            .await;
-        let listed = provider.response(&json!(2)).await;
-        assert_eq!(listed["result"]["tools"][0]["name"], "echo");
-        assert_eq!(listed["result"]["tools"][1]["name"], "wait");
-
-        let turn = supervisor
-            .coordinator()
-            .reserve_turn(
-                &attachment.bound_grant.grant_ref(),
-                reservation.generation,
-                "thread",
-                "turn",
-            )
-            .await
-            .expect("turn reservation");
-        supervisor
-            .coordinator()
-            .activate_turn(
-                &attachment.bound_grant,
-                turn.activation_generation,
-                "native-thread",
-                "native-turn",
-            )
-            .await
-            .expect("activate");
-        handle
-            .set_activation(Some(turn.activation_generation))
-            .await;
-        provider
-            .send(json!({
-                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                "params": {
-                    "name": "echo", "arguments": {"value": 7},
-                    "_meta": {"progressToken": "progress-3"}
-                }
-            }))
-            .await;
-        let called = provider.response(&json!(3)).await;
-        assert_eq!(called["result"]["content"][0]["text"], "bridge-ok");
-        assert_eq!(called["result"]["content"][1]["type"], "image");
-        assert_eq!(
-            called["result"]["structuredContent"],
-            json!({"echo": {"value": 7}})
-        );
-
-        provider
-            .send(json!({
-                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                "params": {"name": "wait", "arguments": {}}
-            }))
-            .await;
-        wait_for_count(&invoker.wait_calls, 1).await;
-        provider
-            .send(json!({
-                "jsonrpc": "2.0", "method": "notifications/cancelled",
-                "params": {"requestId": 4, "reason": "fixture cancellation"}
-            }))
-            .await;
-        let cancelled = provider.response(&json!(4)).await;
-        assert_eq!(cancelled["error"]["data"]["kind"], "cancelled");
-
-        provider.writer.shutdown().await.expect("provider EOF");
-        helper.await.expect("helper join").expect("helper success");
-        server.await.expect("server join").expect("server success");
-        assert!(
+        for mode in ["drop", "invalid", "joined-owned"] {
+            #[cfg(unix)]
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            #[cfg(windows)]
+            let root = tempfile::tempdir().unwrap();
+            let supervisor = CliMcpBridgeSupervisor::new(root.path().join("sessions"));
+            let old = instance(("workspace", "codex", "thread"), 1);
+            let launch = supervisor
+                .prepare(
+                    CliMcpGrantScope::new(
+                        old.clone(),
+                        CliMcpManifestHash::new("a".repeat(64)).unwrap(),
+                    ),
+                    expiry(60_000),
+                )
+                .await
+                .unwrap();
+            let bootstrap_directory = launch.bootstrap_path().parent().unwrap().to_path_buf();
+            let projection = projection();
+            let reservation = supervisor
+                .coordinator()
+                .stage_projection(launch.grant_ref(), projection.fingerprint().clone())
+                .await
+                .unwrap();
+            supervisor
+                .associate_provider_process(&old, std::process::id(), None)
+                .await
+                .unwrap();
+            let (provider_writer, helper_stdin) = duplex(1024);
+            let bootstrap = launch.bootstrap_path().to_path_buf();
+            let helper = tokio::spawn(async move {
+                run_hidden_helper_with_io(&bootstrap, helper_stdin, tokio::io::sink()).await
+            });
+            let attachment = supervisor
+                .await_attach(&old, Duration::from_secs(2))
+                .await
+                .unwrap();
             supervisor
                 .coordinator()
                 .authorize_list(&attachment.bound_grant, reservation.generation)
                 .await
-                .is_err(),
-            "transport teardown must revoke the grant"
-        );
-        assert_directory_empty(&artifact_root);
+                .unwrap();
+            let transport = supervisor.take_transport(&old).await.unwrap();
 
-        let prohibited_surfaces = [
-            String::from_utf8_lossy(&provider.captured).into_owned(),
-            format!("{launch:?}"),
-            format!("{attachment:?}"),
-            "argv=__cli-mcp-stdio --bootstrap-file [REDACTED]".to_owned(),
-            "env={}".to_owned(),
-            "logs=[] stderr=[] timeline=[] db=[] generated_configs=[] diagnostics=[]".to_owned(),
-            read_tree(&artifact_root),
-        ];
-        for surface in prohibited_surfaces {
+            // A replacement has a different exact identity. Old Drop/cleanup
+            // must not retire or revoke its prepared grant/artifacts.
+            let replacement = instance(("workspace", "codex", "thread"), 2);
+            let next = supervisor
+                .prepare(
+                    CliMcpGrantScope::new(
+                        replacement.clone(),
+                        CliMcpManifestHash::new("b".repeat(64)).unwrap(),
+                    ),
+                    expiry(60_000),
+                )
+                .await
+                .unwrap();
+            assert!(supervisor.revoke_session_result(&old).await.is_err());
+            if mode == "drop" {
+                drop(transport);
+            } else {
+                let invoker = Arc::new(FakeSharedInvoker {
+                    calls: AtomicUsize::new(0),
+                    wait_calls: AtomicUsize::new(0),
+                    gateway_only_secret: SECRET_CANARY.to_owned(),
+                    after_cancel_entered: tokio::sync::Notify::new(),
+                    after_cancel_release: tokio::sync::Notify::new(),
+                    is_error: false,
+                    duration_ms: 3,
+                });
+                let mut limits = CliMcpFacadeLimits::default();
+                if mode != "joined-owned" {
+                    limits.max_active_calls = 0;
+                }
+                let build = CliMcpBridgeFacadeServer::build;
+                let result = build(
+                    transport,
+                    supervisor.coordinator(),
+                    invoker,
+                    reservation.generation,
+                    projection,
+                    limits,
+                    super::super::facade::CliMcpCallContract::Codex,
+                );
+                if mode == "joined-owned" {
+                    let (handle, server) = result.unwrap();
+                    assert!(supervisor.revoke_session_result(&old).await.is_err());
+                    handle.request_shutdown();
+                    let server = tokio::spawn(server.run());
+                    timeout(Duration::from_secs(2), server)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        supervisor.state(&old).await,
+                        Some(CliMcpBridgeSessionState::Attached)
+                    );
+                    assert!(bootstrap_directory.exists());
+                    assert!(supervisor.revoke_session_result(&old).await.unwrap());
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(CliMcpFacadeConfigurationError::Limits(_))
+                    ));
+                }
+            }
+            timeout(Duration::from_secs(2), async {
+                while supervisor.state(&old).await == Some(CliMcpBridgeSessionState::TransportOwned)
+                {
+                    tokio::task::yield_now().await;
+                }
+                supervisor.revoke_session_result(&old).await.unwrap();
+            })
+            .await
+            .expect("transport return must permit supervisor cleanup after join");
+            assert!(!bootstrap_directory.exists());
             assert!(
-                !surface.contains(SECRET_CANARY),
-                "Gateway-only secret leaked to prohibited surface"
+                supervisor
+                    .coordinator()
+                    .authorize_list(&attachment.bound_grant, reservation.generation)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                supervisor.state(&replacement).await,
+                Some(CliMcpBridgeSessionState::Prepared)
+            );
+            assert!(next.bootstrap_path().exists());
+            timeout(Duration::from_secs(2), helper)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            drop(provider_writer);
+            assert!(
+                supervisor
+                    .revoke_session_result(&replacement)
+                    .await
+                    .unwrap()
             );
         }
-        assert_eq!(invoker.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cli_mcp_bridge_integration_full_helper_facade_path_and_secret_canary() {
+        for (is_error, duration_ms) in [(false, 3_u64), (true, 12_u64)] {
+            #[cfg(unix)]
+            let temporary = tempfile::tempdir_in("/tmp").expect("temporary");
+            #[cfg(windows)]
+            let temporary = tempfile::tempdir().expect("temporary");
+            let artifact_root = temporary.path().join("bridge-sessions");
+            let supervisor =
+                super::super::supervisor::CliMcpBridgeSupervisor::new(artifact_root.clone());
+            let process_instance = instance(("workspace", "codex", "thread"), 1);
+            let scope = CliMcpGrantScope::new(
+                process_instance.clone(),
+                CliMcpManifestHash::new("a".repeat(64)).expect("manifest"),
+            );
+            let projection = projection();
+            let launch = supervisor
+                .prepare(scope, expiry(60_000))
+                .await
+                .expect("prepare");
+            let bootstrap_path = launch.bootstrap_path().to_path_buf();
+            let reservation = supervisor
+                .coordinator()
+                .stage_projection(launch.grant_ref(), projection.fingerprint().clone())
+                .await
+                .expect("projection reservation");
+            supervisor
+                .associate_provider_process(&process_instance, std::process::id(), None)
+                .await
+                .expect("provider process");
+
+            let (provider_writer, helper_stdin) = duplex(1024 * 1024);
+            let (helper_stdout, provider_reader) = duplex(1024 * 1024);
+            let helper_bootstrap = bootstrap_path.clone();
+            let helper = tokio::spawn(async move {
+                run_hidden_helper_with_io(&helper_bootstrap, helper_stdin, helper_stdout).await
+            });
+            let attachment = supervisor
+                .await_attach(&process_instance, Duration::from_secs(2))
+                .await
+                .expect("attach");
+            assert!(
+                !bootstrap_path.exists(),
+                "bootstrap must be consumed before list"
+            );
+            let transport = supervisor
+                .take_transport(&process_instance)
+                .await
+                .expect("transport");
+            let invoker = Arc::new(FakeSharedInvoker {
+                calls: AtomicUsize::new(0),
+                wait_calls: AtomicUsize::new(0),
+                gateway_only_secret: SECRET_CANARY.to_owned(),
+                is_error,
+                duration_ms,
+                after_cancel_entered: tokio::sync::Notify::new(),
+                after_cancel_release: tokio::sync::Notify::new(),
+            });
+            let (handle, server) = CliMcpBridgeFacadeServer::build(
+                transport,
+                supervisor.coordinator(),
+                invoker.clone(),
+                reservation.generation,
+                projection,
+                CliMcpFacadeLimits::default(),
+                super::super::facade::CliMcpCallContract::Codex,
+            )
+            .expect("server");
+            let mut server = tokio::spawn(server.run());
+            let mut provider = ProviderClient {
+                writer: provider_writer,
+                reader: BufReader::new(provider_reader),
+                captured: Vec::new(),
+            };
+
+            provider
+                .send(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "fake-provider", "version": "1"}
+                    }
+                }))
+                .await;
+            let initialized = provider.response(&json!(1)).await;
+            assert_eq!(initialized["result"]["capabilities"], json!({"tools": {}}));
+            provider
+                .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await;
+            provider
+                .send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+                .await;
+            let listed = provider.response(&json!(2)).await;
+            assert_eq!(listed["result"]["tools"][0]["name"], "echo");
+            assert_eq!(listed["result"]["tools"][1]["name"], "wait");
+
+            let turn = supervisor
+                .coordinator()
+                .reserve_turn(
+                    &attachment.bound_grant.grant_ref(),
+                    reservation.generation,
+                    "thread",
+                    "turn",
+                )
+                .await
+                .expect("turn reservation");
+            supervisor
+                .coordinator()
+                .activate_turn(
+                    &attachment.bound_grant,
+                    turn.activation_generation,
+                    "native-thread",
+                    "native-turn",
+                )
+                .await
+                .expect("activate");
+            handle
+                .set_activation(Some(turn.activation_generation))
+                .await;
+            provider
+                .send(json!({
+                    "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {
+                        "name": "echo", "arguments": {"value": 7},
+                        "_meta": {"progressToken": "progress-3", "callId": "echo-3", "threadId": "native-thread",
+                            "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}}
+                    }
+                }))
+                .await;
+            let called = provider.response(&json!(3)).await;
+            assert_eq!(called["result"]["content"][0]["text"], "bridge-ok");
+            assert_eq!(called["result"]["content"][1]["type"], "image");
+            assert_eq!(
+                called["result"]["structuredContent"],
+                json!({"echo": {"value": 7}})
+            );
+            assert_eq!(called["result"]["isError"], is_error);
+            assert_eq!(
+                called["result"]["_meta"]["pioneer"]["durationMs"],
+                duration_ms
+            );
+
+            provider
+                .send(json!({
+                    "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {"name": "wait", "arguments": {}, "_meta": {
+                        "callId": "wait-4", "threadId": "native-thread",
+                        "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}
+                    }}
+                }))
+                .await;
+            wait_for_count(&invoker.wait_calls, 1).await;
+            provider
+                .send(json!({
+                    "jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": {"requestId": 4, "reason": "fixture cancellation"}
+                }))
+                .await;
+            let cancelled = provider.response(&json!(4)).await;
+            assert_eq!(cancelled["error"]["data"]["kind"], "cancelled");
+
+            // Normal shutdown must retain the server and nested call even after
+            // cancellation has been observed by the invoker.
+            provider.send(json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+            "name": "wait", "arguments": {"delay_after_cancel": true}, "_meta": {
+                "callId": "wait-5", "threadId": "native-thread",
+                "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}
+            }
+        }})).await;
+            wait_for_count(&invoker.wait_calls, 2).await;
+            handle.request_shutdown();
+            invoker.after_cancel_entered.notified().await;
+            assert!(
+                timeout(Duration::from_millis(10), &mut server)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                supervisor
+                    .revoke_session_result(&process_instance)
+                    .await
+                    .is_err(),
+                "active transport cannot release cleanup resources"
+            );
+            invoker.after_cancel_release.notify_one();
+            server.await.expect("server join").expect("server success");
+            supervisor
+                .revoke_session_result(&process_instance)
+                .await
+                .expect("strict cleanup after server join");
+            provider.writer.shutdown().await.expect("provider EOF");
+            helper.await.expect("helper join").expect("helper success");
+
+            assert!(
+                supervisor
+                    .coordinator()
+                    .authorize_list(&attachment.bound_grant, reservation.generation)
+                    .await
+                    .is_err(),
+                "transport teardown must revoke the grant"
+            );
+            assert_directory_empty(&artifact_root);
+
+            let prohibited_surfaces = [
+                String::from_utf8_lossy(&provider.captured).into_owned(),
+                format!("{launch:?}"),
+                format!("{attachment:?}"),
+                "argv=__cli-mcp-stdio --bootstrap-file [REDACTED]".to_owned(),
+                "env={}".to_owned(),
+                "logs=[] stderr=[] timeline=[] db=[] generated_configs=[] diagnostics=[]"
+                    .to_owned(),
+                read_tree(&artifact_root),
+            ];
+            for surface in prohibited_surfaces {
+                assert!(
+                    !surface.contains(SECRET_CANARY),
+                    "Gateway-only secret leaked to prohibited surface"
+                );
+            }
+            assert_eq!(invoker.calls.load(Ordering::SeqCst), 3);
+        }
     }
 
     #[tokio::test]
@@ -730,13 +958,20 @@ mod tests {
             calls: AtomicUsize::new(0),
             wait_calls: AtomicUsize::new(0),
             gateway_only_secret: SECRET_CANARY.to_owned(),
+            after_cancel_entered: tokio::sync::Notify::new(),
+            after_cancel_release: tokio::sync::Notify::new(),
+            is_error: false,
+            duration_ms: 3,
         });
-        let facade = CliMcpToolFacade::new(
+        let facade = CliMcpToolFacade::try_new(
             coordinator.clone(),
             invoker.clone(),
             facade_projection,
             Arc::new(super::super::facade::CliMcpNoopProgressSink),
-        );
+            CliMcpFacadeLimits::default(),
+            super::super::facade::CliMcpCallContract::Codex,
+        )
+        .expect("facade");
         let context = CliMcpFacadeRequestContext {
             bound_grant: bound,
             projection_generation: projection_reservation.generation,

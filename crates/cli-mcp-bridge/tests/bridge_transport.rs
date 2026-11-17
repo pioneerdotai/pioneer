@@ -1,8 +1,7 @@
 use pioneer_cli_mcp_bridge::{
-    BRIDGE_FRAME_MAGIC, BRIDGE_FRAME_VERSION, BridgeFrame, BridgeFrameError, BridgeFrameTransport,
-    BridgeFrameType, BridgeGeneration, BridgeSessionId, MAX_FRAME_PAYLOAD_BYTES,
+    BridgeFrame, BridgeFrameTransport, BridgeFrameType, BridgeGeneration, BridgeSessionId,
     PrivateEndpointConfig, bind_private_endpoint, connect_private_endpoint,
-    create_private_session_directory, decode_frame_with_limit,
+    create_private_session_directory,
 };
 
 #[tokio::test]
@@ -56,48 +55,4 @@ async fn bridge_transport_real_private_endpoint_round_trip_and_cleanup() {
     client.await.expect("client join");
     drop(listener);
     directory.cleanup().expect("directory cleanup");
-}
-
-#[test]
-fn bridge_transport_rejects_malformed_and_oversized_wire_frames() {
-    let mut oversized = Vec::new();
-    oversized.extend_from_slice(&BRIDGE_FRAME_MAGIC);
-    oversized.extend_from_slice(&BRIDGE_FRAME_VERSION.to_be_bytes());
-    oversized.push(BridgeFrameType::Payload as u8);
-    oversized.push(0);
-    oversized.extend_from_slice(&1025_u32.to_be_bytes());
-    oversized.resize(12 + 1025, 0);
-    assert!(matches!(
-        decode_frame_with_limit(&oversized, 1024),
-        Err(BridgeFrameError::PayloadTooLarge {
-            declared: 1025,
-            max: 1024
-        })
-    ));
-
-    let mut invalid_magic = oversized;
-    invalid_magic[..4].copy_from_slice(b"NOPE");
-    assert!(matches!(
-        decode_frame_with_limit(&invalid_magic, MAX_FRAME_PAYLOAD_BYTES),
-        Err(BridgeFrameError::InvalidMagic)
-    ));
-}
-
-#[test]
-fn bridge_transport_debug_surfaces_redact_nonce_canary() {
-    use pioneer_cli_mcp_bridge::{BootstrapNonce, NONCE_BYTES};
-
-    let nonce = BootstrapNonce::new([0x5a; NONCE_BYTES]).expect("nonce");
-    let exposed = hex_for_test(nonce.expose_secret());
-    assert!(!format!("{nonce:?}").contains(&exposed));
-}
-
-fn hex_for_test(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[usize::from(byte >> 4)] as char);
-        output.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    output
 }

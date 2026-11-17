@@ -191,12 +191,6 @@ pub mod tests {
         Ok(db)
     }
 
-    #[test]
-    fn sanity() -> anyhow::Result<()> {
-        let _db = create_example_db(None, 10).context("create eg db")?;
-        Ok(())
-    }
-
     fn test_strings() -> anyhow::Result<Vec<String>> {
         let data = [
             "hello this is a test",

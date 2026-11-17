@@ -11,6 +11,8 @@ use std::borrow::Cow;
 #[include = "logos/**/*.svg"]
 struct PioneerAssets;
 
+gpui_kit::assets::icon_assets!(AppPanelAssets, [Maximize2, Minimize2, X]);
+
 /// Asset source that serves Pioneer's custom icons,
 /// falling back to GPUI Kit's bundled assets for built-in icons.
 pub struct PioneerAssetsSource;
@@ -25,6 +27,10 @@ impl AssetSource for PioneerAssetsSource {
             return Ok(Some(file.data));
         }
 
+        if let Some(data) = AppPanelAssets.load(path)? {
+            return Ok(Some(data));
+        }
+
         gpui_kit::assets::Assets.load(path)
     }
 
@@ -33,6 +39,8 @@ impl AssetSource for PioneerAssetsSource {
             .filter(|p| p.starts_with(path))
             .map(|p| p.into())
             .collect();
+
+        items.extend(AppPanelAssets.list(path)?);
 
         if let Ok(mut base_items) = gpui_kit::assets::Assets.list(path) {
             items.append(&mut base_items);
@@ -47,6 +55,7 @@ pub enum PioneerIconName {
     Bolt,
     FolderTree,
     Mcp,
+    Plugin,
     Users,
     Zap,
 }
@@ -57,6 +66,7 @@ impl IconNamed for PioneerIconName {
             Self::Bolt => "icons/bolt.svg",
             Self::FolderTree => "icons/folder-tree.svg",
             Self::Mcp => "icons/mcp.svg",
+            Self::Plugin => "icons/box.svg",
             Self::Users => "icons/users.svg",
             Self::Zap => "icons/zap.svg",
         }

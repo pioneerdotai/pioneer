@@ -1,6 +1,7 @@
 use crate::MemoryReadPolicy;
 use pioneer_crud::{
-    MemoryWorkspaceGuard, global_agent_memory_scope_key, workspace_agent_memory_scope_key,
+    MemoryWorkspaceGuard, global_agent_memory_scope_key, parse_workspace_user_scope_key,
+    workspace_agent_memory_scope_key,
 };
 use pioneer_protocol::{MemoryActor, MemoryScope, MemoryScopeKind};
 use std::collections::BTreeSet;
@@ -211,6 +212,22 @@ impl MemoryOperationContext {
     /// Scope-level denial only: never inspect a row or reveal whether it exists.
     /// Other readable scopes still undergo record-level authorization/filtering.
     pub fn scope_read_denial(&self, scope: &MemoryScope) -> Option<&'static str> {
+        if scope.kind == MemoryScopeKind::User
+            && let Some(workspace) = parse_workspace_user_scope_key(&scope.key)
+        {
+            return if self.workspace_id.as_deref() != Some(workspace.as_str()) {
+                Some("user_workspace_unavailable")
+            } else if self.source_access.requires_authoritative_provenance()
+                || matches!(
+                    self.mutation_boundary,
+                    MemoryMutationBoundary::ThreadCapsule { .. }
+                )
+            {
+                Some("personal_user_memory_unavailable")
+            } else {
+                None
+            };
+        }
         match scope.kind {
             MemoryScopeKind::User if self.workspace_id.is_some() && !self.allow_global_user => {
                 Some("global_user_memory_unavailable")
@@ -229,6 +246,11 @@ impl MemoryOperationContext {
         let mut unavailable = Vec::new();
         for scope in self.effective_scopes(&[]) {
             let name = match scope.kind {
+                MemoryScopeKind::User
+                    if !mutation && !self.allow_global_user && scope.key == "default" =>
+                {
+                    "user (global)"
+                }
                 MemoryScopeKind::User => "user",
                 MemoryScopeKind::Workspace => "workspace",
                 MemoryScopeKind::Thread => "thread",
@@ -241,9 +263,13 @@ impl MemoryOperationContext {
                 self.scope_read_denial(&scope).is_none()
             };
             if permits {
-                allowed.push(name);
+                if !allowed.contains(&name) {
+                    allowed.push(name);
+                }
             } else {
-                unavailable.push(name);
+                if !unavailable.contains(&name) {
+                    unavailable.push(name);
+                }
             }
         }
         if self.task_id.is_none() {
@@ -316,6 +342,10 @@ impl MemoryOperationContext {
         }];
 
         if let Some(workspace_id) = &self.workspace_id {
+            scopes.push(MemoryScope {
+                kind: MemoryScopeKind::User,
+                key: format!("workspace:{workspace_id}:user:default"),
+            });
             scopes.push(MemoryScope {
                 kind: MemoryScopeKind::Workspace,
                 key: workspace_id.clone(),
@@ -621,6 +651,50 @@ mod tests {
                     &scope(MemoryScopeKind::Task, "task-current"),
                     Some("thread-other")
                 )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_user_read_ceiling_is_independent_of_global_user_permission() {
+        let mut context = MemoryOperationContext {
+            workspace_id: Some("one".into()),
+            allow_global_user: false,
+            ..Default::default()
+        };
+        let own = MemoryScope {
+            kind: MemoryScopeKind::User,
+            key: "workspace:one:user:default".into(),
+        };
+        let foreign = MemoryScope {
+            kind: MemoryScopeKind::User,
+            key: "workspace:two:user:default".into(),
+        };
+        let global = MemoryScope {
+            kind: MemoryScopeKind::User,
+            key: "default".into(),
+        };
+        assert_eq!(context.scope_read_denial(&own), None);
+        assert_eq!(
+            context.scope_read_denial(&foreign),
+            Some("user_workspace_unavailable")
+        );
+        assert_eq!(
+            context.scope_read_denial(&global),
+            Some("global_user_memory_unavailable")
+        );
+        let contract = context.tool_scope_contract(false);
+        assert!(contract.contains("read scopes: user, workspace"));
+        assert!(contract.contains("Unavailable scopes: user (global)"));
+        context.mutation_boundary = MemoryMutationBoundary::thread_capsule("root", None);
+        assert_eq!(
+            context.scope_read_denial(&own),
+            Some("personal_user_memory_unavailable")
+        );
+        assert!(
+            context
+                .mutation_boundary
+                .validate_owned_scope(&own)
                 .is_err()
         );
     }

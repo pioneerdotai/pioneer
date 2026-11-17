@@ -534,6 +534,7 @@ mod tests {
         let core = ClientCore::new();
         let settings = pioneer_protocol::GatewayVoiceInputSettings {
             enabled: true,
+            transcribe_while_recording: false,
             ..Default::default()
         };
         let notification = pioneer_protocol::GatewayNotification::GatewayVoiceInputStatusChanged(
@@ -567,6 +568,7 @@ mod tests {
         let request = core.request_gateway_settings().unwrap();
         let voice = pioneer_protocol::GatewayVoiceInputSettings {
             enabled: true,
+            transcribe_while_recording: false,
             ..Default::default()
         };
         core.reduce_settings_notification(
@@ -1150,6 +1152,7 @@ mod tests {
             &pioneer_protocol::GatewayNotification::GatewayRemoteAccessStatusChanged(
                 pioneer_protocol::GatewayRemoteAccessStatusChangedNotification {
                     status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot {
+                        public_base_url: None,
                         state: pioneer_protocol::GatewayRemoteAccessState::Connected,
                         error_kind: None,
                         message: None,

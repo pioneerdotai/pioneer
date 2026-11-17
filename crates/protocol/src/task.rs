@@ -443,6 +443,9 @@ pub struct TaskAgentReviewPolicy {
     pub mode: TaskAgentReviewMode,
     pub max_revision_rounds: u32,
     pub require_explicit_acceptance: bool,
+    /// Mandatory-review marker: never resolve this policy through the legacy review timeout. Legacy records default to false.
+    #[serde(default)]
+    pub disable_timeout_acceptance: bool,
     #[serde(default)]
     pub reviewers: Vec<TaskResultReviewerSpec>,
     pub resolution_strategy: TaskResultReviewResolutionStrategy,
@@ -454,6 +457,7 @@ impl TaskAgentReviewPolicy {
             mode: TaskAgentReviewMode::ParentAgent,
             max_revision_rounds,
             require_explicit_acceptance: true,
+            disable_timeout_acceptance: false,
             reviewers: Vec::new(),
             resolution_strategy: TaskResultReviewResolutionStrategy::ParentFinal,
         }
@@ -801,12 +805,26 @@ impl TaskComposerWork {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskMetadata {
+    /// Server-owned durable decision to stop future runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_request: Option<TaskFinishRequest>,
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<TaskValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer_work: Option<TaskComposerWork>,
+}
+
+/// A user-directed final soft stop; this is not evidence that the goal succeeded.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFinishRequest {
+    pub requested_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Earliest admitted run whose real outcome contributes to the final state.
+    pub first_run_number: i64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -906,9 +924,18 @@ pub struct Task {
     pub completed_at: Option<i64>,
 }
 
+impl Task {
+    pub fn finish_request(&self) -> Option<&TaskFinishRequest> {
+        self.metadata.as_ref()?.finish_request.as_ref()
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskTrigger {
+    /// Opaque keystore reference; the bearer secret is never persisted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_ref: Option<String>,
     pub id: String,
     pub task_id: String,
     pub status: TaskTriggerStatus,
@@ -1108,8 +1135,33 @@ pub struct TaskAgentResultContract {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunInputEncoding {
+    Utf8,
+    Base64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunTriggerInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    pub encoding: TaskRunInputEncoding,
+    pub body: String,
+}
+
+impl std::fmt::Debug for TaskRunTriggerInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TaskRunTriggerInput([redacted])")
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskRun {
+    /// External data accepted for this occurrence, preserved across retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_input: Option<TaskRunTriggerInput>,
     pub id: String,
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1934,6 +1986,29 @@ impl TaskEventPayload {
                 task.id, task.revision
             )),
             Self::TaskUpdated { .. } | Self::TaskPaused { .. } | Self::TaskResumed { .. } => None,
+            // Explicit replacements are distinct assignments even with identical
+            // timestamps. One-shot consumption is protected by the writer's
+            // trigger snapshot CAS, not a historical cursor event key.
+            Self::TaskRescheduled {
+                reason: TaskRescheduleReason::UserRequested,
+                ..
+            } => None,
+            Self::TaskRescheduled {
+                trigger,
+                reason: TaskRescheduleReason::TriggerFired | TaskRescheduleReason::MissedFireSkipped,
+                ..
+            } if matches!(
+                trigger.spec,
+                TaskTriggerSpec::Immediate | TaskTriggerSpec::ScheduledAt { .. }
+            ) =>
+            {
+                None
+            }
+            // Terminal refreshes are deduplicated by their run's terminal batch.
+            Self::TaskRescheduled {
+                reason: TaskRescheduleReason::RunTerminalStatusRefresh,
+                ..
+            } => None,
             Self::TaskRescheduled {
                 trigger,
                 reason,
@@ -2159,9 +2234,21 @@ pub struct TaskCreateParams {
     pub metadata: Option<TaskMetadata>,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWebhookScope {
+    Public,
+    Lan,
+    Loopback,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskCreateResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_scope: Option<TaskWebhookScope>,
     pub task: Task,
     pub trigger: TaskTrigger,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2353,6 +2440,22 @@ pub struct TaskCancelParams {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct TaskFinishParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFinishResponse {
+    pub task: Task,
+    /// True only when the task was already terminal before this call.
+    pub already_finished: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskCancelResponse {
     pub task: Task,
     #[serde(default)]
@@ -2381,6 +2484,19 @@ pub struct TaskRescheduleResponse {
     pub trigger: TaskTrigger,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunNowParams {
+    pub task_id: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunNowResponse {
+    pub task_id: String,
+    pub run_id: String,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPauseParams {
@@ -2390,9 +2506,19 @@ pub struct TaskPauseParams {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPauseScheduleOutcome {
+    Paused,
+    NoFutureFirings,
+    NotApplied,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPauseResponse {
     pub task: Task,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_outcome: Option<TaskPauseScheduleOutcome>,
     #[serde(default)]
     pub triggers: Vec<TaskTrigger>,
 }
@@ -2539,6 +2665,7 @@ pub enum TaskWaitReviewAction {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskWaitRevisionBlockedReason {
+    ReviewNotAllowed,
     MaxRevisionRoundsReached,
     CandidateNotRevisable,
 }
@@ -2743,6 +2870,8 @@ pub struct PublicTask {
     pub title: String,
     pub goal: String,
     pub priority: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_request: Option<TaskFinishRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<PublicTaskResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2967,6 +3096,13 @@ pub struct TaskOperatorDetails {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicTaskGetResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_scope: Option<TaskWebhookScope>,
+    /// Current review candidates only; full immutable content uses task_result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_required: Vec<PublicTaskWaitReviewItem>,
     pub task: PublicTask,
     #[serde(default)]
     pub triggers: Vec<PublicTaskTrigger>,
@@ -3461,6 +3597,9 @@ pub struct TaskCompletionInboxEntry {
     pub thread_title: String,
     pub status: TaskRunStatus,
     pub completed_at: i64,
+    /// Exact server keyset ordering key. Empty only for legacy servers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub completed_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3693,6 +3832,9 @@ mod tests {
     #[test]
     fn composer_work_round_trips_exact_launch_and_rebinds_only_execution_ids() {
         let launch = crate::TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thr_parent".to_owned(),
             turn_id: "turn_planned".to_owned(),
@@ -3734,6 +3876,7 @@ mod tests {
         let metadata = super::TaskMetadata {
             labels: vec!["composer".to_owned()],
             data: None,
+            finish_request: None,
             composer_work: Some(super::TaskComposerWork::v1(launch.clone())),
         };
 

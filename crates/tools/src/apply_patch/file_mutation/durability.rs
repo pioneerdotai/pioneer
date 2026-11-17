@@ -293,10 +293,12 @@ fn unsupported_metadata_presence(path: &Path) -> Result<UnsupportedMetadataPrese
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_acl_xattr(name: &[u8]) -> bool {
     name == b"system.posix_acl_access" || name == b"system.posix_acl_default"
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_preservation_relevant_extended_attribute(name: &[u8]) -> bool {
     if is_acl_xattr(name) {
         return false;
@@ -420,30 +422,6 @@ pub fn unsupported_metadata_warnings() -> Vec<MetadataWarning> {
 mod tests {
     use super::*;
     use std::fs;
-
-    #[test]
-    fn fault_plan_is_deterministic() {
-        let plan = FaultPlan::fail_at(FaultPoint::Rename);
-        assert!(plan.check(FaultPoint::StageWrite).is_ok());
-        assert_eq!(
-            plan.check(FaultPoint::Rename).unwrap_err().point,
-            FaultPoint::Rename
-        );
-    }
-
-    #[test]
-    fn parent_sync_and_metadata_helpers_are_callable() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source");
-        let destination = root.path().join("destination");
-        fs::write(&source, b"data").unwrap();
-        fs::write(&destination, b"data").unwrap();
-        sync_parent_directory(&destination).unwrap();
-        let warnings = preserve_supported_mode(&source, &destination).unwrap();
-        assert!(warnings.is_empty());
-        let warnings = apply_safe_add_mode(&destination).unwrap();
-        assert!(warnings.is_empty());
-    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

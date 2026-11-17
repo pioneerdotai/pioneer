@@ -786,19 +786,12 @@ impl MessageProcessor {
             received_bytes: updated.received_bytes,
             next_offset: updated.received_bytes,
         };
-        let notification = match JsonRpcNotification::from_params(
+        self.send_notification_to_connections(
             events::ARTIFACT_UPLOAD_CHUNK_ACK,
             &ack,
-        ) {
-            Ok(notification) => notification,
-            Err(error) => {
-                error!(connection_id, error = %error, "failed to encode artifact upload chunk ack");
-                return;
-            }
-        };
-        if let Err(error) = self.send_json(connection_id, &notification).await {
-            warn!(connection_id, error = %format!("{error:#}"), "failed to send artifact upload chunk ack");
-        }
+            vec![connection_id],
+        )
+        .await;
     }
 
     pub(in crate::message) async fn validate_artifact_workspace(
@@ -1211,36 +1204,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_upload_session_start_and_valid_chunk_updates_offset() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let manager = ArtifactUploadSessionManager::new(temp.path().join("uploads"));
-        let chunk = b"hello";
-        let session = manager
-            .start(
-                7,
-                start_params("ws_a", sha256_bytes(chunk), chunk.len() as u64),
-                10,
-            )
-            .await
-            .expect("start upload");
-        let header = ArtifactUploadChunkHeader {
-            workspace_id: "ws_a".to_owned(),
-            upload_id: session.upload_id.clone(),
-            offset: 0,
-            len: chunk.len() as u64,
-            chunk_sha256: Some(sha256_bytes(chunk)),
-        };
-
-        let updated = manager
-            .append_chunk(7, &header, chunk, 11)
-            .await
-            .expect("append chunk");
-
-        assert_eq!(updated.received_bytes, chunk.len() as u64);
-        assert!(updated.temp_path.exists());
-    }
-
-    #[tokio::test]
     async fn artifact_upload_zero_byte_session_finishes_without_chunks() {
         let temp = tempfile::tempdir().expect("temp dir");
         let manager = ArtifactUploadSessionManager::new(temp.path().join("uploads"));
@@ -1409,10 +1372,12 @@ mod tests {
             len: chunk.len() as u64,
             chunk_sha256: Some(sha256_bytes(chunk)),
         };
-        manager
+        let updated = manager
             .append_chunk(7, &header, chunk, 11)
             .await
             .expect("append chunk");
+        assert_eq!(updated.received_bytes, chunk.len() as u64);
+        assert!(updated.temp_path.exists());
 
         let first = manager
             .finish(7, "ws_a", upload_id.as_str(), 12)

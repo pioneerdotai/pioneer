@@ -221,6 +221,27 @@ impl Reporter {
             }
         }
     }
+    /// Partial success is not recovery. Observe each retained row failure with
+    /// the same typed diagnostic extraction and rate policy as a failed call.
+    pub(super) fn observe_finalizations(
+        &mut self,
+        result: &anyhow::Result<pioneer_crud::TurnFinalizationReconciliationSummary>,
+        now: Instant,
+    ) {
+        match result {
+            Ok(summary) if !summary.failures.is_empty() => {
+                for error in &summary.failures {
+                    let diagnostic = Diagnostic::extract(self.operation, error.as_ref());
+                    if let Some(snapshot) = self.failure(diagnostic, now) {
+                        snapshot.emit(false);
+                    }
+                }
+            }
+            Ok(summary) if !summary.pass_complete || summary.pass_failed => {}
+            _ => self.observe(result, now),
+        }
+    }
+
     /// Only an observed empty pending set closes an occurrence episode. Idle
     /// backoff passes neither add failures nor recover. The empty observation
     /// is a point-in-time fact; later source writes can start a new episode.

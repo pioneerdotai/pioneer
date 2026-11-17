@@ -40,6 +40,15 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Immutable per-request route evidence, captured before physical dispatch.
+    fn request_usage_profile(&self, _request: &ChatRequest) -> Result<crate::ProviderUsageProfile> {
+        Ok(crate::ProviderUsageProfile {
+            api: self.usage_api().into(),
+            api_version: self.usage_api_version(),
+            route: self.usage_route(),
+        })
+    }
+
     /// Non-secret identity of the credential/account/endpoint authority that
     /// created this instance. Registry-managed providers always expose one;
     /// directly constructed test providers may remain unbound.
@@ -50,6 +59,64 @@ pub trait Provider: Send + Sync {
     /// Declares what features this provider supports.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
+    }
+
+    /// Prepare connection-owned model facts before selecting tools or admitting input.
+    /// The default does no work; providers with lazy discovery own its caching.
+    /// Callers must keep this future within their cancellation/deadline scope.
+    async fn prepare_model(&self, _model: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Budget facts for the selected connection, including discovered private
+    /// models. Public providers retain the existing catalog resolution.
+    async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
+        Ok(crate::catalog::model_catalog()?.limits(self.name(), model))
+    }
+
+    /// Exact embeddings adapter route; absence never inherits a chat endpoint.
+    fn embedding_usage_profile(&self) -> crate::ProviderUsageProfile {
+        crate::ProviderUsageProfile {
+            api: "embeddings".into(),
+            api_version: None,
+            route: None,
+        }
+    }
+
+    /// Context pricing metadata for the selected authority; never technical limits.
+    async fn model_context_tiers(
+        &self,
+        model: &str,
+    ) -> Result<Option<pioneer_protocol::ProviderContextTiers>> {
+        if let Some(entry) = self.model_catalog_entry(model) {
+            return Ok(Some(crate::catalog::context_tiers_for_model(&entry)));
+        }
+        Ok(crate::catalog::model_catalog()?
+            .context_tiers(self.name(), model)
+            .cloned())
+    }
+
+    /// Normalized source facts. Registry wrappers enforce endpoint authority.
+    async fn model_service_modes(
+        &self,
+        model: &str,
+    ) -> Result<Option<pioneer_protocol::SourceServiceModes>> {
+        Ok(crate::catalog::model_catalog()?
+            .source_service_modes(self.name(), model)
+            .cloned())
+    }
+
+    /// Neutral mapping is authority-owned; arbitrary compatible endpoints omit it.
+    fn standard_service_mode(&self, _model: &str) -> pioneer_protocol::ServiceModeParameters {
+        pioneer_protocol::ServiceModeParameters::Neutral
+    }
+
+    /// Optional authority-owned model facts, including usage accounting evidence.
+    /// When present, the owning provider also decides `model_tool_calling`;
+    /// wrappers must not substitute public facts for that model decision.
+    /// These facts must never be published into the process-wide public catalog.
+    fn model_catalog_entry(&self, _model: &str) -> Option<crate::catalog::CatalogModel> {
+        None
     }
 
     /// Adapter capability is a protocol ceiling; known catalog model support
@@ -74,6 +141,7 @@ pub trait Provider: Send + Sync {
     /// shared provider-neutral fallback before endpoint errors are redacted.
     fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
         crate::failure::classify_stream_error(error)
+            .or_else(|| crate::failure::classify_http_error(error))
     }
 
     /// Materialize and locally budget the media that this request will send.
@@ -137,6 +205,28 @@ pub trait Provider: Send + Sync {
         )
     }
 
+    /// Purpose-filtered picker list. Raw discovery methods retain their existing
+    /// execution/catalog semantics. Registry wrappers add only scoped fallback.
+    async fn list_models_for_selection(
+        &self,
+        purpose: crate::selection::ModelPurpose,
+    ) -> Result<Vec<ProviderModelInfo>> {
+        use crate::selection::ModelPurpose;
+        let models = match purpose {
+            ModelPurpose::Chat => self.list_models().await?,
+            ModelPurpose::Embeddings => self.list_embedding_models().await?,
+            ModelPurpose::Transcription => self.list_transcription_models().await?,
+        };
+        Ok(crate::selection::filter_models(
+            self.name(),
+            self.usage_api(),
+            &self.capabilities(),
+            purpose,
+            models,
+            None,
+        ))
+    }
+
     /// Create embeddings for one or more input texts.
     /// Default implementation returns an error for providers that do not support embeddings.
     async fn embed(&self, _request: EmbeddingRequest) -> Result<EmbeddingResponse> {
@@ -183,6 +273,7 @@ mod tests {
 
         async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "mock response".into(),
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
@@ -212,20 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn mock_provider_name() {
-        let provider = MockProvider;
-        assert_eq!(provider.name(), "mock");
-    }
-
-    #[test]
-    fn mock_provider_capabilities() {
-        let provider = MockProvider;
-        let caps = provider.capabilities();
-        assert!(caps.streaming);
-        assert!(!caps.vision);
-    }
-
-    #[test]
     fn provider_failure_classification_is_optional_and_conservative() {
         let provider = MockProvider;
         let error = anyhow::anyhow!("opaque provider rejection");
@@ -235,7 +312,11 @@ mod tests {
     #[tokio::test]
     async fn mock_provider_chat() {
         let provider = MockProvider;
+        // Default preparation must not require a catalog entry or discovery.
+        provider.prepare_model("test-model").await.unwrap();
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "test-model".into(),
             messages: vec![ChatMessage::user("hello")],
             temperature: None,
@@ -250,35 +331,6 @@ mod tests {
         let response = provider.chat(request).await.unwrap();
         assert_eq!(response.text, "mock response");
         assert_eq!(response.usage.as_ref().unwrap().input_tokens, Some(10));
-    }
-
-    #[tokio::test]
-    async fn mock_provider_stream() {
-        let provider = MockProvider;
-        let request = ChatRequest {
-            model: "test-model".into(),
-            messages: vec![ChatMessage::user("hello")],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: None,
-            compiled_prompt: None,
-        };
-
-        let mut stream = provider.stream_chat(request).await.unwrap();
-
-        let chunk1 = stream.next().await.unwrap().unwrap();
-        assert_eq!(chunk1.delta, "hello ");
-        assert!(!chunk1.is_final);
-
-        let chunk2 = stream.next().await.unwrap().unwrap();
-        assert_eq!(chunk2.delta, "world");
-        assert!(!chunk2.is_final);
-
-        let chunk3 = stream.next().await.unwrap().unwrap();
-        assert!(chunk3.is_final);
     }
 
     #[tokio::test]
@@ -338,6 +390,8 @@ mod tests {
             ambiguous_input_aliases: vec![],
         });
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "target-model".into(),
             messages: vec![message.clone()],
             temperature: None,

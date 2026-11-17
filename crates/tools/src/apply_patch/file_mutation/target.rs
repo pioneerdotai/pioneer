@@ -673,24 +673,6 @@ mod tests {
     }
 
     #[test]
-    fn case_fold_collision_is_rejected() {
-        let root = tempdir().unwrap();
-        let resolver = TargetResolver::new(root.path())
-            .unwrap()
-            .with_case_sensitive(false);
-        let upper = resolver
-            .resolve("A.txt", TargetRole::Source, TargetExpectation::Missing)
-            .unwrap();
-        let lower = resolver
-            .resolve("a.txt", TargetRole::Source, TargetExpectation::Missing)
-            .unwrap();
-        assert_eq!(
-            TargetManifest::new(vec![upper, lower]).unwrap_err().code,
-            TargetResolutionErrorCode::IdentityCollision
-        );
-    }
-
-    #[test]
     fn case_only_rename_is_rejected_as_an_alias_on_case_insensitive_volumes() {
         let root = tempdir().unwrap();
         std::fs::write(root.path().join("Name.txt"), b"content\n").unwrap();

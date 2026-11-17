@@ -6,12 +6,13 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+pioneer-observability.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 hex.workspace = true
 http.workspace = true
 futures-util.workspace = true
-sse-stream = "0.2"
+sse-stream = "0.2.6"
 process-wrap.workspace = true
 rmcp.workspace = true
 reqwest_0_13 = { package = "reqwest", version = "0.13.3", default-features = false, features = ["rustls"] }
@@ -23,6 +24,9 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 axum = "0.8"

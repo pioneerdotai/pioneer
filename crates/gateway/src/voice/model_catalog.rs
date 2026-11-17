@@ -89,14 +89,6 @@ pub(crate) fn voice_model_catalog_entry(model_id: &str) -> Option<VoiceModelCata
 }
 
 #[cfg(test)]
-pub(crate) fn parakeet_v3_int8_install_layout(
-    config: &AppConfig,
-    runtime_home: &Path,
-) -> Result<VoiceModelInstallLayout> {
-    voice_model_install_layout(&parakeet_v3_int8_catalog_entry(), config, runtime_home)
-}
-
-#[cfg(test)]
 pub(crate) fn voice_model_install_layout_for_id(
     model_id: &str,
     config: &AppConfig,
@@ -311,22 +303,5 @@ mod tests {
         for unsafe_child in ["../escape", "folder/file", "folder\\file", "/absolute", ""] {
             assert!(contained_join(runtime_home, unsafe_child, "test path").is_err());
         }
-    }
-
-    #[test]
-    fn parakeet_compatibility_helpers_resolve_from_shared_catalog() {
-        let config = AppConfig::load().expect("load config");
-        let runtime_home = PathBuf::from("/tmp/pioneer-runtime");
-        let entry = parakeet_v3_int8_catalog_entry();
-        let layout =
-            parakeet_v3_int8_install_layout(&config, runtime_home.as_path()).expect("layout");
-
-        assert_eq!(entry.id, PARAKEET_V3_INT8_MODEL_ID);
-        assert_eq!(entry.archive_type, VoiceModelArchiveType::TarGzDirectory);
-        assert_eq!(
-            layout.install_dir.file_name().unwrap(),
-            entry.install_dir_name
-        );
-        assert_eq!(layout.model_data_dir, layout.install_dir);
     }
 }

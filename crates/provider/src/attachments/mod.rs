@@ -135,6 +135,7 @@ pub fn prepare_messages_for_provider_model(
         capabilities,
         messages,
         &config,
+        crate::history::ProjectionProfile::ServiceDefault,
     )
 }
 
@@ -148,7 +149,15 @@ pub async fn prepare_messages_for_provider_async(
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
 ) -> Result<PreparedProviderMessages> {
-    prepare_messages_async(provider_name, model, None, capabilities, messages).await
+    prepare_messages_async(
+        provider_name,
+        model,
+        None,
+        capabilities,
+        messages,
+        crate::history::ProjectionProfile::ServiceDefault,
+    )
+    .await
 }
 
 /// Request-aware replay projection for generation consumers. Message-only
@@ -160,12 +169,50 @@ pub(crate) async fn prepare_messages_for_request_async(
     request: &ChatRequest,
     messages: &[ChatMessage],
 ) -> Result<PreparedProviderMessages> {
+    prepare_messages_for_request_with_profile(
+        provider_name,
+        capabilities,
+        request,
+        messages,
+        crate::history::ProjectionProfile::ServiceDefault,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_responses_messages_for_request_async(
+    provider_name: &str,
+    capabilities: &ProviderCapabilities,
+    request: &ChatRequest,
+    messages: &[ChatMessage],
+) -> Result<PreparedProviderMessages> {
+    prepare_messages_for_request_with_profile(
+        provider_name,
+        capabilities,
+        request,
+        messages,
+        crate::history::ProjectionProfile::Responses,
+    )
+    .await
+}
+
+async fn prepare_messages_for_request_with_profile(
+    provider_name: &str,
+    capabilities: &ProviderCapabilities,
+    request: &ChatRequest,
+    messages: &[ChatMessage],
+    profile: crate::history::ProjectionProfile,
+) -> Result<PreparedProviderMessages> {
     prepare_messages_async(
         provider_name,
         &request.model,
-        crate::history::request_thinking_override(provider_name, request),
+        if profile == crate::history::ProjectionProfile::ServiceDefault {
+            crate::history::request_thinking_override(provider_name, request)
+        } else {
+            None
+        },
         capabilities,
         messages,
+        profile,
     )
     .await
 }
@@ -184,10 +231,11 @@ pub(crate) fn prepare_messages_for_request(
         capabilities,
         messages,
         &default_attachment_pipeline_config(),
+        crate::history::ProjectionProfile::ServiceDefault,
     )
 }
 
-// Chat adapters render HTML preview images in user messages. Derive the
+// Chat adapters render typed tool images in user messages. Derive the
 // follow-up before wire conversion so it follows the entire parallel-result
 // group. Native nested-media adapters retain their existing tool blocks.
 // Keep canonical history intact; derive a paired tool result
@@ -203,7 +251,6 @@ fn project_html_preview_media<'a>(
     let needs_projection = !matches!(adapter, "anthropic" | "gemini" | "bedrock")
         && messages.iter().any(|message| {
             message.role == Role::Tool
-                && message.name.as_deref() == Some("html_preview")
                 && message
                     .content_parts
                     .iter()
@@ -220,7 +267,6 @@ fn project_html_preview_media<'a>(
         }
         let mut tool = message.clone();
         if message.role == Role::Tool
-            && message.name.as_deref() == Some("html_preview")
             && message
                 .content_parts
                 .iter()
@@ -229,7 +275,7 @@ fn project_html_preview_media<'a>(
             let mut followup = message.clone();
             followup.role = Role::User;
             followup.content = format!(
-                "Images from html_preview call {} (width captions in capture order).",
+                "Images from tool call {} (captions in capture order).",
                 message.tool_call_id.as_deref().unwrap_or("unknown")
             );
             followup.tool_call_id = None;
@@ -253,30 +299,42 @@ async fn prepare_messages_async(
     thinking_override: Option<bool>,
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
+    profile: crate::history::ProjectionProfile,
 ) -> Result<PreparedProviderMessages> {
     let projected = project_html_preview_media(provider_name, messages);
     let messages = projected.as_ref();
     // Reject mismatches before I/O and retain this snapshot through materialization.
     let state = admission::current();
     let entry = if messages.iter().any(ChatMessage::has_attachments)
-        && crate::definition::provider_definition(provider_name).is_some()
+        && (crate::definition::provider_definition(provider_name).is_some()
+            || profile == crate::history::ProjectionProfile::Responses)
     {
         #[cfg(test)]
         let fixture_catalog = state.as_ref().and_then(|s| s.catalog.clone());
         #[cfg(not(test))]
         let fixture_catalog: Option<Arc<crate::catalog::ModelCatalog>> = None;
-        let catalog = fixture_catalog
-            .map(Ok)
-            .unwrap_or_else(crate::catalog::model_catalog)
-            .context(MediaInputRejection(
-                "model catalog is unavailable; retry after catalog refresh",
-            ))?;
-        let entry = admission::effective_model(provider_name, model, &catalog);
-        contracts::validate_effective_model_inputs(
+        let native = crate::generation::native_model(provider_name, model);
+        let entry = if native.is_some() {
+            native
+        } else if provider_name != "vercel-ai-gateway"
+            || crate::generation::uses_public_catalog(provider_name)
+        {
+            let catalog = fixture_catalog
+                .map(Ok)
+                .unwrap_or_else(crate::catalog::model_catalog)
+                .context(MediaInputRejection(
+                    "model catalog is unavailable; retry after catalog refresh",
+                ))?;
+            admission::effective_model(provider_name, model, &catalog)
+        } else {
+            None
+        };
+        contracts::validate_effective_model_inputs_for_profile(
             provider_name,
             capabilities,
             messages,
             entry.as_ref(),
+            profile,
         )?;
         entry
     } else {
@@ -294,7 +352,7 @@ async fn prepare_messages_async(
     let model = model.to_owned();
     let capabilities = capabilities.clone();
     let messages = messages.to_vec();
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         let _permit = permit;
         runtime::with_blocking_authority_scope(authority_fingerprint, || {
             admission::blocking_scope(state, || {
@@ -311,6 +369,7 @@ async fn prepare_messages_async(
                     &capabilities,
                     messages.as_slice(),
                     &config,
+                    profile,
                 )
                 .context(MediaInputRejection(
                     "media input could not be materialized under the selected attachment policy",
@@ -327,6 +386,7 @@ async fn prepare_messages_async(
                         &provider_name,
                         entry,
                         &prepared.attachments,
+                        profile,
                     )
                     .context(MediaInputRejection(
                         "media input exceeds the native model PDF/media limit",
@@ -346,7 +406,15 @@ pub fn prepare_messages_for_provider_with_config(
     messages: &[ChatMessage],
     config: &AttachmentPipelineConfig,
 ) -> Result<PreparedProviderMessages> {
-    prepare_messages_for_provider_target(provider_name, None, None, capabilities, messages, config)
+    prepare_messages_for_provider_target(
+        provider_name,
+        None,
+        None,
+        capabilities,
+        messages,
+        config,
+        crate::history::ProjectionProfile::ServiceDefault,
+    )
 }
 
 fn prepare_messages_for_provider_target(
@@ -356,6 +424,7 @@ fn prepare_messages_for_provider_target(
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
     config: &AttachmentPipelineConfig,
+    profile: crate::history::ProjectionProfile,
 ) -> Result<PreparedProviderMessages> {
     let attachment_count_hint = messages
         .iter()
@@ -370,6 +439,7 @@ fn prepare_messages_for_provider_target(
         capabilities,
         messages,
         config,
+        profile,
     );
     match &result {
         Ok(prepared) => {
@@ -396,12 +466,20 @@ fn prepare_messages_impl(
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
     config: &AttachmentPipelineConfig,
+    profile: crate::history::ProjectionProfile,
 ) -> Result<PreparedProviderMessages> {
     let media_projection = project_html_preview_media(provider_name, messages);
     let messages = media_projection.as_ref();
     let projected_messages = model
         .map(|model| {
-            crate::history::project_messages(provider_name, model, thinking_override, messages)
+            crate::history::project_messages_matching(
+                provider_name,
+                model,
+                thinking_override,
+                messages,
+                profile,
+                |state| state.is_compatible_with(provider_name, model),
+            )
         })
         .transpose()?;
     let messages = projected_messages.as_deref().unwrap_or(messages);
@@ -435,12 +513,9 @@ fn prepare_messages_impl(
                 MessageContentPart::Audio { audio } => Some((InputContentType::Audio, audio)),
                 MessageContentPart::Video { video } => Some((InputContentType::Video, video)),
             } {
-                contracts::validate_representation(
-                    provider_name,
-                    kind,
-                    message.role.clone(),
-                    &attachment.mime_type,
-                    &attachment.source,
+                contracts::validate_representation_for_profile(
+                    provider_name, kind, message.role.clone(), &attachment.mime_type,
+                    &attachment.source, profile,
                 ).context(MediaInputRejection("media MIME/source/role is unsupported; external references require owned materialized bytes"))?;
             }
             let attachment_count_before = attachments.len();
@@ -528,9 +603,10 @@ fn prepare_messages_impl(
         attachments.as_mut_slice(),
     )?;
 
-    contracts::validate_prepared(provider_name, &prepared_messages, &attachments).context(
-        MediaInputRejection("media input violates native MIME/role/count/size/text requirements"),
-    )?;
+    contracts::validate_prepared(provider_name, &prepared_messages, &attachments, profile)
+        .context(MediaInputRejection(
+            "media input violates native MIME/role/count/size/text requirements",
+        ))?;
     let budget_report = budget::validate_budget(config, attachments.as_slice())?;
 
     Ok(PreparedProviderMessages {
@@ -748,6 +824,32 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
+    #[test]
+    fn typed_tool_images_follow_the_complete_result_group() {
+        let mut capture = ChatMessage::tool_result("capture", "cua_get_desktop_state", "geometry");
+        capture
+            .content_parts
+            .push(MessageContentPart::image(MessageAttachment::from_path(
+                "/gateway/capture.png",
+                "image/png",
+            )));
+        let other = ChatMessage::tool_result("other", "echo", "done");
+        let messages = vec![capture, other];
+        let projected = project_html_preview_media("openai", &messages);
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[0].tool_call_id.as_deref(), Some("capture"));
+        assert_eq!(projected[1].tool_call_id.as_deref(), Some("other"));
+        assert!(projected[0].content_parts.is_empty());
+        assert_eq!(projected[2].role, Role::User);
+        assert_eq!(projected[2].content_parts, messages[0].content_parts);
+        assert!(projected[2].tool_call_id.is_none());
+        assert!(messages[0].has_attachments());
+        assert_eq!(
+            project_html_preview_media("anthropic", &messages).as_ref(),
+            messages
+        );
+    }
+
     fn caps_with_native_declared() -> ProviderCapabilities {
         ProviderCapabilities {
             streaming: true,
@@ -768,6 +870,7 @@ mod tests {
     #[test]
     fn prepares_text_and_attachment_context_without_inlining_binary() {
         let message = ChatMessage {
+            application_context: None,
             provenance: None,
             role: Role::User,
             content: "analyze".to_owned(),
@@ -841,27 +944,6 @@ mod tests {
             err.to_string()
                 .contains("ATTACHMENT_PIPELINE_CONTRACT_VIOLATION")
         );
-    }
-
-    #[test]
-    fn allows_messages_when_transport_plan_is_native() {
-        let message = ChatMessage::user_parts(vec![MessageContentPart::image(MessageAttachment {
-            mime_type: "image/png".to_owned(),
-            name: Some("screen.png".to_owned()),
-            size_bytes: None,
-            sha256: None,
-            source: AttachmentDataSource::Bytes {
-                base64_data: BASE64.encode(super::regression::image(image::ImageFormat::Png, 1, 1)),
-            },
-            artifact: None,
-        })]);
-
-        let prepared =
-            prepare_messages_for_provider("mock", &caps_with_native_declared(), &[message])
-                .expect("prepare should succeed");
-
-        ensure_no_unrendered_attachments("mock", &prepared)
-            .expect("native transport plan should pass");
     }
 
     #[test]

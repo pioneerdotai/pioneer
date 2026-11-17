@@ -265,3 +265,14 @@ pub(crate) async fn release(
     tx.commit().await?;
     Ok(())
 }
+
+pub(crate) async fn next_deadline<C: ConnectionTrait>(db: &C) -> Result<Option<i64>> {
+    Ok(pending::Entity::find()
+        .select_only()
+        .column(pending::Column::DueAt)
+        .order_by_asc(pending::Column::DueAt)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?)
+}

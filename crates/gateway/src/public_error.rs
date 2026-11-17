@@ -125,16 +125,25 @@ pub(crate) mod test_support {
     use tracing_subscriber::prelude::*;
 
     fn event_subscriber() -> impl tracing::Subscriber + Send + Sync {
-        tracing_subscriber::registry().with(sentry::integrations::tracing::layer().event_filter(
-            |metadata| {
-                use sentry::integrations::tracing::EventFilter;
-                match *metadata.level() {
-                    tracing::Level::ERROR => EventFilter::Event,
-                    tracing::Level::TRACE => EventFilter::Ignore,
-                    _ => EventFilter::Breadcrumb,
-                }
-            },
-        ))
+        tracing_subscriber::registry()
+            .with(
+                sentry::integrations::tracing::SpanLayer::new()
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            )
+            .with(
+                sentry::integrations::tracing::BreadcrumbLayer::new().with_filter(
+                    tracing_subscriber::filter::filter_fn(|metadata| {
+                        matches!(
+                            *metadata.level(),
+                            tracing::Level::WARN | tracing::Level::INFO | tracing::Level::DEBUG
+                        )
+                    }),
+                ),
+            )
+            .with(
+                sentry::integrations::tracing::ErrorLayer::new()
+                    .with_filter(tracing_subscriber::filter::LevelFilter::ERROR),
+            )
     }
 
     /// Thread-local tracing and isolated Sentry hub backed exclusively by

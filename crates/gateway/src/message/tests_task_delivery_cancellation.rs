@@ -6,7 +6,7 @@ const RACE_TIME: i64 = 4_300_000_000;
 async fn race_processor() -> (tempfile::TempDir, Arc<MessageProcessor>, String) {
     let (directory, workspaces, store, workspace_id) = setup_pooled_file_workspace_manager().await;
     let sessions = Arc::new(SessionManager::new());
-    let (sender, _receiver) = mpsc::channel(32);
+    let (sender, _receiver) = crate::session::test_support::outbound_channel(32);
     let connection_id = register_authenticated_test_connection(sessions.as_ref(), sender).await;
     let processor = Arc::new(MessageProcessor::with_agent_manager(
         Arc::new(ThreadManager::new("o4-mini", "openai")),

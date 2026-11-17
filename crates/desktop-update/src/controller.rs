@@ -114,12 +114,18 @@ impl DesktopUpdatePort for NativeDesktopUpdatePort {
                 if plan.cancelled.load(Ordering::Acquire) {
                     return Err("cancelled".into());
                 }
-                std::process::Command::new(&prepared.helper_path)
+                let child = std::process::Command::new(&prepared.helper_path)
                     .arg("apply")
                     .arg("--plan")
                     .arg(&prepared.plan_path)
                     .spawn()
                     .map_err(|error| error.to_string())?;
+                let _observation = pioneer_observability::resources::ChildRegistration::register(
+                    Some(child.id()),
+                    pioneer_observability::resources::ChildRole::DesktopHelper,
+                    None,
+                );
+                // Existing fire-and-forget updater ownership is unchanged.
                 Ok(Outcome::Applied)
             })(),
         };

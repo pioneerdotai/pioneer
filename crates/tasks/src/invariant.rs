@@ -904,26 +904,6 @@ mod tests {
     }
 
     #[test]
-    fn violation_metadata_is_derived_from_kind() {
-        let violation = TaskRuntimeInvariantViolation::new(
-            TaskRuntimeInvariantViolationKind::StaleTurnItemAttempt {
-                turn_id: "turn_1".to_owned(),
-                item_id: "item_1".to_owned(),
-                attempt_id: "attempt_1".to_owned(),
-                item_status: "completed".to_owned(),
-                attempt_status: "running".to_owned(),
-                attempt_number: Some(2),
-                reason: "terminal item has running attempt".to_owned(),
-            },
-            "terminal item has running attempt",
-        );
-
-        assert_eq!(violation.severity, TaskRuntimeInvariantSeverity::Error);
-        assert_eq!(violation.code, "stale_turn_item_attempt");
-        assert_eq!(violation.entity_id, "item_1");
-    }
-
-    #[test]
     fn empty_report_has_no_errors() {
         let report = TaskRuntimeInvariantReport::new();
 

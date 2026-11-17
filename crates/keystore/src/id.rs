@@ -14,6 +14,7 @@ pub const GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE: &str = "pioneer.gateway.access
 pub const GATEWAY_AUTH_CREDENTIAL_HMAC_KEY_SERVICE: &str =
     "pioneer.gateway.auth_credential_hmac_key";
 pub const GATEWAY_REMOTE_ACCESS_SECRET_SERVICE: &str = "pioneer.gateway.remote_access_secret";
+pub const TASK_WEBHOOK_SECRET_SERVICE: &str = "pioneer.gateway.task_webhook_secret";
 pub const DESKTOP_GATEWAY_SESSION_SERVICE: &str = "pioneer.desktop.gateway_session";
 
 const GATEWAY_AUTH_KEY_USER: &str = "gateway";
@@ -115,6 +116,13 @@ impl SecretId {
         Self::from_service_user(GATEWAY_REMOTE_ACCESS_SECRET_SERVICE, secret_ref)
     }
 
+    pub fn task_webhook_secret(secret_ref: &str) -> Result<Self> {
+        Self::from_service_user(
+            TASK_WEBHOOK_SECRET_SERVICE,
+            validate_user("task webhook secret ref", secret_ref)?,
+        )
+    }
+
     pub fn service(&self) -> &str {
         &self.service
     }
@@ -148,6 +156,7 @@ pub enum SecretKind {
     GatewayAuthCredentialHmacKey,
     GatewayRemoteAccessSecret,
     DesktopGatewaySession,
+    TaskWebhookSecret,
 }
 
 impl SecretKind {
@@ -165,6 +174,7 @@ impl SecretKind {
             SecretKind::GatewayAuthCredentialHmacKey => GATEWAY_AUTH_CREDENTIAL_HMAC_KEY_SERVICE,
             SecretKind::GatewayRemoteAccessSecret => GATEWAY_REMOTE_ACCESS_SECRET_SERVICE,
             SecretKind::DesktopGatewaySession => DESKTOP_GATEWAY_SESSION_SERVICE,
+            SecretKind::TaskWebhookSecret => TASK_WEBHOOK_SECRET_SERVICE,
         }
     }
 
@@ -184,6 +194,7 @@ impl SecretKind {
             }
             GATEWAY_REMOTE_ACCESS_SECRET_SERVICE => Some(SecretKind::GatewayRemoteAccessSecret),
             DESKTOP_GATEWAY_SESSION_SERVICE => Some(SecretKind::DesktopGatewaySession),
+            TASK_WEBHOOK_SECRET_SERVICE => Some(SecretKind::TaskWebhookSecret),
             _ => None,
         }
     }
@@ -281,111 +292,93 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_id_trims_and_normalizes() {
-        let id = SecretId::provider_api_key("  OpenRouter  ").expect("provider id");
-
-        assert_eq!(id.service(), PROVIDER_API_KEY_SERVICE);
-        assert_eq!(id.user(), "openrouter");
+    fn secret_factories_preserve_stable_service_user_pairs() {
+        for (case, id, service, user, kind) in [
+            (
+                "provider_id_trims_and_normalizes",
+                SecretId::provider_api_key("  OpenRouter  ").unwrap(),
+                PROVIDER_API_KEY_SERVICE,
+                "openrouter",
+                SecretKind::ProviderApiKey,
+            ),
+            (
+                "workspace_provider_id_is_scoped_by_workspace",
+                SecretId::workspace_provider_api_key("  ws_1  ", "  OpenRouter  ").unwrap(),
+                PROVIDER_API_KEY_SERVICE,
+                "workspace:ws_1:provider:openrouter",
+                SecretKind::ProviderApiKey,
+            ),
+            (
+                "workspace_provider_proxy_id_is_scoped_by_workspace",
+                SecretId::workspace_provider_proxy("  ws_1  ", "  OpenRouter  ").unwrap(),
+                PROVIDER_PROXY_SERVICE,
+                "workspace:ws_1:provider:openrouter",
+                SecretKind::ProviderProxy,
+            ),
+            (
+                "workspace_provider_base_url_id_is_scoped_by_workspace",
+                SecretId::workspace_provider_base_url("  ws_1  ", "  OpenAI  ").unwrap(),
+                PROVIDER_BASE_URL_SERVICE,
+                "workspace:ws_1:provider:openai",
+                SecretKind::ProviderBaseUrl,
+            ),
+            (
+                "workspace_cli_runtime_proxy_id_is_scoped_by_workspace",
+                SecretId::workspace_cli_runtime_proxy("  ws_1  ", "  codex_work  ").unwrap(),
+                CLI_RUNTIME_PROXY_SERVICE,
+                "workspace:ws_1:runtime:codex_work",
+                SecretKind::CliRuntimeProxy,
+            ),
+            (
+                "model_catalog_proxy_id_is_gateway_global",
+                SecretId::model_catalog_proxy(),
+                MODEL_CATALOG_PROXY_SERVICE,
+                GATEWAY_AUTH_KEY_USER,
+                SecretKind::ModelCatalogProxy,
+            ),
+            (
+                "mcp_secret_maps_to_stable_pair",
+                SecretId::mcp_secret("gateway_settings:mcp:server:token").unwrap(),
+                MCP_SECRET_SERVICE,
+                "gateway_settings:mcp:server:token",
+                SecretKind::McpSecret,
+            ),
+            (
+                "user_jwt_token_maps_to_future_non_superuser_pair",
+                SecretId::user_jwt_token("user:alice:desktop").unwrap(),
+                USER_JWT_TOKEN_SERVICE,
+                "user:alice:desktop",
+                SecretKind::UserJwtToken,
+            ),
+            (
+                "gateway_access_jwt_signing_key_maps_to_stable_pair",
+                SecretId::gateway_access_jwt_signing_key(),
+                GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE,
+                GATEWAY_AUTH_KEY_USER,
+                SecretKind::GatewayAccessJwtSigningKey,
+            ),
+            (
+                "desktop_session_maps_to_dedicated_stable_pair",
+                SecretId::desktop_gateway_session("local").unwrap(),
+                DESKTOP_GATEWAY_SESSION_SERVICE,
+                "local",
+                SecretKind::DesktopGatewaySession,
+            ),
+        ] {
+            assert_eq!(id.service(), service, "{case}");
+            assert_eq!(id.user(), user, "{case}");
+            assert_eq!(SecretKind::from_service(id.service()), Some(kind), "{case}");
+        }
     }
 
     #[test]
-    fn workspace_provider_id_is_scoped_by_workspace() {
-        let id = SecretId::workspace_provider_api_key("  ws_1  ", "  OpenRouter  ")
-            .expect("provider id");
-
-        assert_eq!(id.service(), PROVIDER_API_KEY_SERVICE);
-        assert_eq!(id.user(), "workspace:ws_1:provider:openrouter");
-    }
-
-    #[test]
-    fn workspace_provider_proxy_id_is_scoped_by_workspace() {
-        let id =
-            SecretId::workspace_provider_proxy("  ws_1  ", "  OpenRouter  ").expect("proxy id");
-
-        assert_eq!(id.service(), PROVIDER_PROXY_SERVICE);
-        assert_eq!(id.user(), "workspace:ws_1:provider:openrouter");
-    }
-
-    #[test]
-    fn workspace_provider_base_url_id_is_scoped_by_workspace() {
-        let id =
-            SecretId::workspace_provider_base_url("  ws_1  ", "  OpenAI  ").expect("base url id");
-
-        assert_eq!(id.service(), PROVIDER_BASE_URL_SERVICE);
-        assert_eq!(id.user(), "workspace:ws_1:provider:openai");
-        assert_eq!(
-            SecretKind::from_service(id.service()),
-            Some(SecretKind::ProviderBaseUrl)
-        );
-    }
-
-    #[test]
-    fn workspace_cli_runtime_proxy_id_is_scoped_by_workspace() {
-        let id = SecretId::workspace_cli_runtime_proxy("  ws_1  ", "  codex_work  ")
-            .expect("runtime proxy id");
-
-        assert_eq!(id.service(), CLI_RUNTIME_PROXY_SERVICE);
-        assert_eq!(id.user(), "workspace:ws_1:runtime:codex_work");
-    }
-
-    #[test]
-    fn model_catalog_proxy_id_is_gateway_global() {
-        let id = SecretId::model_catalog_proxy();
-        assert_eq!(id.service(), MODEL_CATALOG_PROXY_SERVICE);
-        assert_eq!(id.user(), GATEWAY_AUTH_KEY_USER);
-        assert_eq!(
-            SecretKind::from_service(id.service()),
-            Some(SecretKind::ModelCatalogProxy)
-        );
-    }
-
-    #[test]
-    fn empty_provider_id_is_rejected() {
-        let err = SecretId::provider_api_key("   ").expect_err("empty provider rejected");
-
-        assert!(matches!(err, KeystoreError::InvalidSecretId(_)));
-    }
-
-    #[test]
-    fn path_semantics_are_rejected() {
-        let err = SecretId::provider_api_key("../openrouter").expect_err("path rejected");
-
-        assert!(matches!(err, KeystoreError::InvalidSecretId(_)));
-    }
-
-    #[test]
-    fn mcp_secret_maps_to_stable_pair() {
-        let id = SecretId::mcp_secret("gateway_settings:mcp:server:token").expect("mcp id");
-
-        assert_eq!(id.service(), MCP_SECRET_SERVICE);
-        assert_eq!(id.user(), "gateway_settings:mcp:server:token");
-    }
-
-    #[test]
-    fn user_jwt_token_maps_to_future_non_superuser_pair() {
-        let id = SecretId::user_jwt_token("user:alice:desktop").expect("user jwt token id");
-
-        assert_eq!(id.service(), USER_JWT_TOKEN_SERVICE);
-        assert_eq!(id.user(), "user:alice:desktop");
-    }
-
-    #[test]
-    fn gateway_access_jwt_signing_key_maps_to_stable_pair() {
-        let id = SecretId::gateway_access_jwt_signing_key();
-
-        assert_eq!(id.service(), GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE);
-        assert_eq!(id.user(), GATEWAY_AUTH_KEY_USER);
-    }
-
-    #[test]
-    fn desktop_session_maps_to_dedicated_stable_pair() {
-        let id = SecretId::desktop_gateway_session("local").expect("desktop session id");
-
-        assert_eq!(id.service(), DESKTOP_GATEWAY_SESSION_SERVICE);
-        assert_eq!(id.user(), "local");
-        assert_eq!(
-            SecretKind::from_service(id.service()),
-            Some(SecretKind::DesktopGatewaySession)
-        );
+    fn provider_ids_reject_empty_and_path_components() {
+        for provider in ["   ", "../openrouter"] {
+            let error = SecretId::provider_api_key(provider).expect_err(provider);
+            assert!(
+                matches!(error, KeystoreError::InvalidSecretId(_)),
+                "{provider:?}"
+            );
+        }
     }
 }

@@ -1758,9 +1758,8 @@ mod tests {
     use futures_util::{StreamExt, stream::BoxStream};
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
-        AgentManager, PreflightLoopConfig, SkillsDependenciesLoopConfig, SkillsLoopConfig,
-        SkillsRuntimeLoopConfig, SkillsSecurityLoopConfig, SkillsValidationLoopConfig,
-        ToolLoopConfig,
+        AgentManager, SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
+        SkillsSecurityLoopConfig, SkillsValidationLoopConfig, ToolLoopConfig,
     };
     use pioneer_entity::turn;
     use pioneer_memory::hooks::MemoryLoopConfig;
@@ -1846,14 +1845,6 @@ mod tests {
         requests: StdMutex<Vec<ChatRequest>>,
     }
 
-    struct PinnedOverlayNativeProvider {
-        skill_id: SkillId,
-        started: Notify,
-        release: Notify,
-        requests: StdMutex<Vec<ChatRequest>>,
-        round: AtomicUsize,
-    }
-
     impl BlockingLearningProvider {
         fn new() -> Self {
             Self {
@@ -1921,25 +1912,6 @@ mod tests {
         }
     }
 
-    impl PinnedOverlayNativeProvider {
-        fn new(skill_id: SkillId) -> Self {
-            Self {
-                skill_id,
-                started: Notify::new(),
-                release: Notify::new(),
-                requests: StdMutex::new(Vec::new()),
-                round: AtomicUsize::new(0),
-            }
-        }
-
-        fn requests(&self) -> Vec<ChatRequest> {
-            self.requests
-                .lock()
-                .expect("pinned overlay request lock")
-                .clone()
-        }
-    }
-
     #[async_trait]
     impl Provider for ScriptedLearningProvider {
         fn name(&self) -> &str {
@@ -1964,6 +1936,7 @@ mod tests {
                 bail!("learning response script exhausted");
             };
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text,
                 usage: None,
                 reasoning_content: None,
@@ -2009,6 +1982,7 @@ mod tests {
                 bail!("workspace-scoped provider failure");
             }
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: serde_json::json!({
                     "digestRevision": 1,
                     "observations": []
@@ -2075,6 +2049,7 @@ mod tests {
             self.started.notify_one();
             self.release.notified().await;
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: serde_json::json!({
                     "digestRevision": 1,
                     "observations": []
@@ -2093,84 +2068,6 @@ mod tests {
             _request: ChatRequest,
         ) -> AnyhowResult<BoxStream<'static, AnyhowResult<StreamChunk>>> {
             bail!("learner/reviewer contracts must use non-streaming chat")
-        }
-    }
-
-    #[async_trait]
-    impl Provider for PinnedOverlayNativeProvider {
-        fn name(&self) -> &str {
-            "pinned-native"
-        }
-
-        fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities {
-                streaming: false,
-                vision: false,
-                tool_calling: true,
-                embeddings: false,
-                transcription: false,
-                input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
-            }
-        }
-
-        async fn chat(&self, request: ChatRequest) -> AnyhowResult<ChatResponse> {
-            let is_preflight = request.compiled_prompt.is_none();
-            self.requests
-                .lock()
-                .expect("pinned overlay request lock")
-                .push(request);
-            if is_preflight {
-                return Ok(ChatResponse {
-                    text: r#"{"tools":{"visibleTools":[]}}"#.to_owned(),
-                    usage: None,
-                    reasoning_content: None,
-                    provider_replay_state: None,
-                    termination: pioneer_provider::ProviderTermination::Complete,
-                    tool_calls: Vec::new(),
-                });
-            }
-            if self.round.fetch_add(1, Ordering::SeqCst) == 0 {
-                self.started.notify_one();
-                self.release.notified().await;
-                return Ok(ChatResponse {
-                    text: String::new(),
-                    usage: None,
-                    reasoning_content: None,
-                    provider_replay_state: None,
-                    termination: pioneer_provider::ProviderTermination::ToolCalls,
-                    tool_calls: vec![ProviderToolCall {
-                        id: "read_pinned_agent_skill".to_owned(),
-                        name: "read_skill".to_owned(),
-                        arguments: format!(r#"{{"skill_id":"skill:{}"}}"#, self.skill_id),
-                    }],
-                });
-            }
-            Ok(ChatResponse {
-                text: "The pinned learned procedure was read.".to_owned(),
-                usage: None,
-                reasoning_content: None,
-                provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
-                tool_calls: Vec::new(),
-            })
-        }
-
-        async fn stream_chat(
-            &self,
-            request: ChatRequest,
-        ) -> AnyhowResult<BoxStream<'static, AnyhowResult<StreamChunk>>> {
-            let response = self.chat(request).await?;
-            let mut chunks = Vec::new();
-            if !response.text.is_empty() {
-                chunks.push(Ok(StreamChunk::delta(response.text)));
-            }
-            if !response.tool_calls.is_empty() {
-                chunks.push(Ok(StreamChunk::tool_calls(response.tool_calls)));
-            }
-            chunks.push(Ok(StreamChunk::final_chunk_with(
-                pioneer_provider::ProviderTermination::Complete,
-            )));
-            Ok(futures_util::stream::iter(chunks).boxed())
         }
     }
 
@@ -2212,23 +2109,13 @@ mod tests {
         }
 
         async fn chat(&self, request: ChatRequest) -> AnyhowResult<ChatResponse> {
-            let is_preflight = request.compiled_prompt.is_none();
             self.requests
                 .lock()
                 .expect("native request lock")
                 .push(request);
-            if is_preflight {
-                return Ok(ChatResponse {
-                    text: r#"{"tools":{"visibleTools":[]}}"#.to_owned(),
-                    usage: None,
-                    reasoning_content: None,
-                    provider_replay_state: None,
-                    termination: pioneer_provider::ProviderTermination::Complete,
-                    tool_calls: Vec::new(),
-                });
-            }
             if self.round.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Ok(ChatResponse {
+                    messages: Vec::new(),
                     text: String::new(),
                     usage: None,
                     reasoning_content: None,
@@ -2242,6 +2129,7 @@ mod tests {
                 });
             }
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "The learned procedure was read.".to_owned(),
                 usage: None,
                 reasoning_content: None,
@@ -2297,6 +2185,9 @@ mod tests {
 
     fn source_thread_for_workspace(workspace_id: &str, thread_id: &str, created_at: i64) -> Thread {
         Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -2320,6 +2211,7 @@ mod tests {
 
     fn source_turn(turn_id: &str) -> Turn {
         Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: TurnKind::Conversation,
@@ -2514,7 +2406,6 @@ mod tests {
     fn agent_tool_loop_config() -> ToolLoopConfig {
         ToolLoopConfig {
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-            preflight: PreflightLoopConfig::default(),
             web: WebToolsConfig::default(),
             computer_use: ComputerUseToolsConfig::default(),
             skills: SkillsLoopConfig {
@@ -3105,7 +2996,9 @@ mod tests {
             learning_provider
                 .requests()
                 .iter()
-                .all(|request| request.max_tokens.is_none()
+                .all(|request| request.model == "learner-model"
+                    && request.temperature.is_none()
+                    && request.max_tokens.is_none()
                     && request.reasoning
                         == Some(pioneer_provider::ReasoningConfig::effort(
                             pioneer_protocol::ReasoningEffort::High
@@ -3169,6 +3062,7 @@ mod tests {
                     "/workspace",
                     (ENABLED_AT + 11) * 1000,
                 ),
+                None,
             )
             .await
             .expect("native Agent turn must start");
@@ -3197,21 +3091,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(native_requests.len() >= 2);
         let first = &native_requests[0];
-        let compiled = first
-            .compiled_prompt
-            .as_ref()
-            .expect("native request must use production prompt compiler");
         assert!(
-            compiled
-                .full_system_text
+            first.compiled_prompt.is_some(),
+            "native request must use production prompt compiler"
+        );
+        let prepared_input = first
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .application_context
+                    .as_ref()
+                    .is_some_and(|metadata| metadata["kind"] == "turn_input")
+            })
+            .expect("native request must carry prepared turn input");
+        assert!(
+            prepared_input
+                .content
                 .contains(&format!("skill:{skill_id}"))
         );
-        assert!(compiled.full_system_text.contains(version_id.as_str()));
-        assert!(
-            compiled
-                .full_system_text
-                .contains("Verify release checksum")
-        );
+        assert!(prepared_input.content.contains(version_id.as_str()));
+        assert!(prepared_input.content.contains("Verify release checksum"));
         assert!(
             first
                 .tools
@@ -6083,137 +5983,6 @@ mod tests {
                 .try_get::<i64>("", "value")
                 .expect("contract run count must decode"),
             1
-        );
-    }
-
-    #[tokio::test]
-    async fn started_ordinary_turn_keeps_its_owned_agent_overlay_snapshot() {
-        let skill_id =
-            SkillId::new("PPPPPPPPPPPPPPPPPPPPP").expect("pinned skill ID must be valid");
-        let provider = Arc::new(PinnedOverlayNativeProvider::new(skill_id.clone()));
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "pinned-native",
-            provider.clone(),
-        ));
-        let manager = AgentManager::new(registry, agent_tool_loop_config());
-        manager
-            .ensure_thread("thread_pinned_overlay", WORKSPACE)
-            .await
-            .expect("pinned overlay thread must initialize");
-        let mut events = manager
-            .take_durable_receiver("thread_pinned_overlay")
-            .await
-            .expect("pinned overlay durable receiver must exist");
-        let original_body = "Original instructions pinned when the turn starts.".to_owned();
-        let mut external_entry = AgentSkillRuntimeEntry {
-            skill_id: skill_id.clone(),
-            slug: "pinned-overlay".to_owned(),
-            version_id: "QQQQQQQQQQQQQQQQQQQQQ".to_owned(),
-            version_number: 1,
-            display_name: "Pinned overlay".to_owned(),
-            runtime_description: "Use this pinned learned procedure.".to_owned(),
-            body: original_body.clone(),
-            fingerprint: "pinned-overlay-fingerprint".to_owned(),
-        };
-        let started = provider.started.notified();
-        tokio::pin!(started);
-        manager
-            .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
-                "thread_pinned_overlay",
-                "turn_pinned_overlay",
-                ThreadMode::Agent,
-                "pinned-model",
-                "pinned-native",
-                HashMap::new(),
-                SkillCatalogSnapshot {
-                    version: 0,
-                    generated_at_unix: ENABLED_AT,
-                    skills: Vec::new(),
-                },
-                vec![external_entry.clone()],
-                vec![UserInput::Text {
-                    text: "Use the procedure pinned at turn start.".to_owned(),
-                    text_elements: Vec::new(),
-                }],
-                Vec::new(),
-                Vec::new(),
-                HashMap::new(),
-                Vec::new(),
-                None,
-                default_turn_permission_profile_snapshot(),
-                TurnExecutionSecuritySnapshot::unrestricted_full_access(
-                    "/workspace",
-                    ENABLED_AT * 1000,
-                ),
-            )
-            .await
-            .expect("pinned overlay turn must start");
-        timeout(Duration::from_secs(5), async {
-            loop {
-                tokio::select! {
-                    _ = &mut started => return,
-                    event = events.recv() => {
-                        let Some(event) = event else {
-                            panic!("pinned overlay durable event lane closed");
-                        };
-                        events.acknowledge_last(Ok(()));
-                        match event {
-                            AgentDurableEvent::TurnFailed { error, .. } => {
-                                panic!("pinned overlay turn failed before provider call: {error}")
-                            }
-                            AgentDurableEvent::TurnCompleted { .. } => {
-                                panic!("pinned overlay turn completed before provider call")
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("pinned overlay provider call must start");
-
-        external_entry.body = "Replacement instructions from later Settings state.".to_owned();
-        external_entry.version_id = "RRRRRRRRRRRRRRRRRRRRR".to_owned();
-        provider.release.notify_one();
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let Some(event) = events.recv().await else {
-                    panic!("pinned overlay durable event lane closed");
-                };
-                events.acknowledge_last(Ok(()));
-                match event {
-                    AgentDurableEvent::TurnCompleted { .. } => return,
-                    AgentDurableEvent::TurnFailed { error, .. } => {
-                        panic!("pinned overlay turn failed: {error}")
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("pinned overlay turn must terminate");
-
-        let requests = provider
-            .requests()
-            .into_iter()
-            .filter(|request| request.compiled_prompt.is_some())
-            .collect::<Vec<_>>();
-        assert!(requests.len() >= 2);
-        let read_result = requests[1]
-            .messages
-            .iter()
-            .find(|message| {
-                message.role == Role::Tool && message.name.as_deref() == Some("read_skill")
-            })
-            .expect("pinned turn must receive read_skill output");
-        assert!(read_result.content.contains(original_body.as_str()));
-        assert!(read_result.content.contains("QQQQQQQQQQQQQQQQQQQQQ"));
-        assert!(!read_result.content.contains(external_entry.body.as_str()));
-        assert!(
-            !read_result
-                .content
-                .contains(external_entry.version_id.as_str())
         );
     }
 

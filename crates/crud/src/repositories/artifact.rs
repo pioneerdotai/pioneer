@@ -1,3 +1,6 @@
+#[path = "artifact_publications.rs"]
+mod publications;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
@@ -94,19 +97,6 @@ impl ArtifactRepository {
             .map(|row| row.map(blob_record_from_model))
     }
 
-    pub async fn create_blob<C: ConnectionTrait>(
-        &self,
-        db: &C,
-        record: NewArtifactBlobRecord,
-    ) -> ArtifactCrudResult<ArtifactBlobRecord> {
-        let now = now();
-        let id = generate_id(21);
-        let size_bytes = to_i64_size(record.size_bytes)?;
-        let metadata_json = metadata_to_db(&record.metadata)?;
-        self.create_blob_prepared(db, record, id, now, size_bytes, metadata_json)
-            .await
-    }
-
     pub(crate) async fn create_blob_prepared<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -136,42 +126,6 @@ impl ArtifactRepository {
             source,
         })?;
         Ok(blob_record_from_model(model))
-    }
-
-    pub async fn find_or_create_blob<C: ConnectionTrait>(
-        &self,
-        db: &C,
-        record: NewArtifactBlobRecord,
-    ) -> ArtifactCrudResult<ArtifactBlobRecord> {
-        if let Some(existing) = self
-            .find_blob_by_workspace_sha(
-                db,
-                &record.workspace_id,
-                &record.sha256,
-                record.size_bytes,
-                &record.storage_backend,
-            )
-            .await?
-        {
-            return Ok(existing);
-        }
-
-        match self.create_blob(db, record.clone()).await {
-            Ok(model) => Ok(model),
-            Err(ArtifactCrudError::Database { .. }) => self
-                .find_blob_by_workspace_sha(
-                    db,
-                    &record.workspace_id,
-                    &record.sha256,
-                    record.size_bytes,
-                    &record.storage_backend,
-                )
-                .await?
-                .ok_or_else(|| ArtifactCrudError::NotFound {
-                    message: "artifact blob insert failed and no existing row was found".to_owned(),
-                }),
-            Err(error) => Err(error),
-        }
     }
 
     pub(crate) async fn find_or_create_blob_prepared<C: ConnectionTrait>(
@@ -224,8 +178,10 @@ impl ArtifactRepository {
         id: String,
         now: DateTimeWithTimeZone,
         metadata_json: String,
+        released_copies: bool,
+        io_locator: Option<&super::html_preview_io_work::HtmlPreviewIoLocator>,
     ) -> ArtifactCrudResult<ArtifactRecord> {
-        artifact::ActiveModel {
+        let model = artifact::ActiveModel {
             id: Set(id),
             workspace_id: Set(request.workspace_id.clone()),
             primary_thread_id: Set(request.primary_thread_id.clone()),
@@ -233,12 +189,16 @@ impl ArtifactRepository {
             display_name: Set(request.display_name.clone()),
             kind: Set(kind_to_db(request.kind)),
             mime_type: Set(request.mime_type.clone()),
-            status: Set(status_to_db(ArtifactStatus::Ready)),
+            status: Set(status_to_db(if released_copies {
+                ArtifactStatus::Deleted
+            } else {
+                ArtifactStatus::Ready
+            })),
             created_by_kind: Set(created_by_kind_to_db(request.created_by_kind)),
             created_by_actor_id: Set(request.created_by_actor_id.clone()),
             created_at: Set(now),
             updated_at: Set(now),
-            deleted_at: Set(None),
+            deleted_at: Set(if released_copies { Some(now) } else { None }),
             metadata_json: Set(metadata_json),
         }
         .insert(db)
@@ -246,8 +206,22 @@ impl ArtifactRepository {
         .map_err(|source| ArtifactCrudError::Database {
             message: "failed to insert artifact".to_owned(),
             source,
-        })
-        .map(artifact_record_from_model)
+        })?;
+        if released_copies {
+            super::html_preview_io_work::request_prepared(
+                db,
+                super::html_preview_io_work::HtmlPreviewIoFamily::Copies,
+                io_locator.expect("prepared released-copy locator"),
+                0,
+                &model.workspace_id,
+            )
+            .await
+            .map_err(|error| ArtifactCrudError::Database {
+                message: "failed to enqueue released copies".into(),
+                source: super::html_preview_io_work::into_database_error(error),
+            })?;
+        }
+        Ok(artifact_record_from_model(model))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -153,19 +153,13 @@ pub enum ThreadEpisodicAdaptiveStrategy {
 pub struct ThreadEpisodicScoreBreakdown {
     pub final_score: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memvid_score: Option<f32>,
+    pub rank_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lexical_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_score: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exact_source_boost: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recency_boost: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_role_boost: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -180,8 +174,6 @@ pub struct ThreadEpisodicAdaptiveDiagnostics {
     pub cutoff_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cutoff_reason: Option<String>,
-    #[serde(default)]
-    pub native_memvid_adaptive_used: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -438,13 +430,10 @@ mod tests {
                 score: 0.87,
                 score_breakdown: ThreadEpisodicScoreBreakdown {
                     final_score: 0.87,
-                    memvid_score: Some(0.75),
+                    rank_score: Some(0.75),
                     semantic_score: Some(0.72),
                     lexical_score: None,
                     temporal_score: None,
-                    exact_source_boost: Some(0.1),
-                    recency_boost: Some(0.02),
-                    source_role_boost: None,
                 },
                 adaptive_diagnostics: Some(ThreadEpisodicAdaptiveDiagnostics {
                     search_mode: ThreadEpisodicSearchMode::Auto,
@@ -455,7 +444,6 @@ mod tests {
                     results_returned: 3,
                     cutoff_score: Some(0.45),
                     cutoff_reason: Some("combined_cutoff".to_owned()),
-                    native_memvid_adaptive_used: true,
                 }),
                 created_at: Some(123),
             }],

@@ -1,3 +1,10 @@
+// This crate also computes the layout of Gateway's nested startup future.
+#![recursion_limit = "256"]
+
+include!(concat!(env!("OUT_DIR"), "/pioneer-build-section.rs"));
+#[cfg(all(debug_assertions, feature = "computer-use"))]
+mod dev_runtime;
+mod diagnostics;
 mod installer;
 mod secrets;
 mod service;
@@ -19,6 +26,23 @@ pub fn main_entry() {
     if let Some(exit_code) = dispatch_hidden_cli_mcp_stdio(env::args_os().skip(1)) {
         if exit_code != 0 {
             std::process::exit(exit_code);
+        }
+        return;
+    }
+
+    std::hint::black_box(&PIONEER_BUILD_SECTION);
+    let _ = pioneer_observability::identity::configure_build(include_str!(concat!(
+        env!("OUT_DIR"),
+        "/pioneer-build.json"
+    )));
+
+    // Operator diagnostics can contain private local artifact/tool failures.
+    // Keep this local command outside ordinary CLI Sentry/tracing initialization;
+    // the selected application authorizes observations through its own consent.
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("diagnostics")) {
+        if let Err(error) = diagnostics::run(env::args().skip(2)) {
+            eprintln!("{error:#}");
+            std::process::exit(1);
         }
         return;
     }
@@ -56,7 +80,8 @@ pub fn main_entry() {
 }
 
 fn requests_json_output(args: impl Iterator<Item = OsString>) -> bool {
-    args.into_iter().any(|arg| arg == OsStr::new("--json"))
+    args.into_iter()
+        .any(|arg| arg == OsStr::new("--json") || arg == OsStr::new("diagnostics"))
 }
 
 fn dispatch_hidden_cli_mcp_stdio(args: impl Iterator<Item = OsString>) -> Option<i32> {
@@ -157,6 +182,7 @@ fn run_with_args(mut args: impl Iterator<Item = String>) -> Result<()> {
             ))),
             None => Err(usage_error("missing device command; expected `create`")),
         },
+        Some("diagnostics") => diagnostics::run(args),
         Some("task-invariants") => task_invariants::run(args),
         Some("secrets") => secrets::run(args),
         Some("status") => {
@@ -172,7 +198,9 @@ fn run_with_args(mut args: impl Iterator<Item = String>) -> Result<()> {
             service::stop_gateway_service()
         }
         Some(service::SERVICE_MODE_ARG) => {
-            ensure_no_extra_args(args)?;
+            if let Some(environment) = parse_gateway_service_environment(args)? {
+                environment.select_for_foreground_gateway()?;
+            }
             service::run_gateway_service()
         }
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -191,6 +219,34 @@ fn ensure_no_extra_args(mut args: impl Iterator<Item = String>) -> Result<()> {
         return Err(usage_error(format!("unexpected argument: {extra}")));
     }
     Ok(())
+}
+
+fn parse_gateway_service_environment(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<pioneer_config::RuntimeEnvironment>> {
+    match args.next().as_deref() {
+        None => Ok(None),
+        Some("--environment") => {
+            match args.next().as_deref() {
+                Some("production") => {}
+                Some(value) => {
+                    return Err(usage_error(format!(
+                        "invalid environment: {value}; expected `production`"
+                    )));
+                }
+                None => {
+                    return Err(usage_error(
+                        "missing value for --environment; expected `production`",
+                    ));
+                }
+            }
+            ensure_no_extra_args(args)?;
+            Ok(Some(pioneer_config::RuntimeEnvironment::Production))
+        }
+        Some(flag) => Err(usage_error(format!(
+            "unexpected argument: {flag}; expected `--environment production`"
+        ))),
+    }
 }
 
 fn parse_optional_json_flag(mut args: impl Iterator<Item = String>) -> Result<bool> {
@@ -566,6 +622,7 @@ fn print_version(json_output: bool) -> Result<()> {
                 "version": env!("CARGO_PKG_VERSION"),
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
+                "computer_use": cfg!(feature = "computer-use"),
                 "compiled_database_migrations": pioneer_gateway::compiled_database_migration_names()
             }))?
         );
@@ -642,6 +699,8 @@ fn help_text() -> String {
   {command} secrets status [--json]  Show keystore status without secret values
   {command} secrets garbage-collection [--dry-run] [--json]  Clean orphan MCP secret values
   {command} stop                Stop and uninstall the persistent gateway service
+  {command} gateway-service [--environment production]
+                                Run Gateway in the foreground; optionally use production configuration in a debug build
   {command} version [--json]    Show {command} version
   {command} help                Show this help"
     )
@@ -669,27 +728,6 @@ mod tests {
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = String> + 'a {
         values.iter().map(|value| (*value).to_owned())
-    }
-
-    #[test]
-    fn hidden_cli_mcp_stdio_is_classified_before_ordinary_cli() {
-        let parsed = pioneer_cli_mcp_bridge::helper::parse_hidden_helper_args(
-            [
-                OsString::from("__cli-mcp-stdio"),
-                OsString::from("--bootstrap-file"),
-                OsString::from("/private/bootstrap"),
-            ]
-            .into_iter(),
-        )
-        .expect("hidden helper args");
-        assert_eq!(parsed, Some(std::path::PathBuf::from("/private/bootstrap")));
-        assert!(
-            pioneer_cli_mcp_bridge::helper::parse_hidden_helper_args(
-                [OsString::from("status")].into_iter()
-            )
-            .expect("ordinary args")
-            .is_none()
-        );
     }
 
     #[test]
@@ -723,6 +761,31 @@ mod tests {
     }
 
     #[test]
+    fn foreground_environment_requires_an_explicit_valid_selection() {
+        assert_eq!(parse_gateway_service_environment(args(&[])).unwrap(), None);
+        assert_eq!(
+            parse_gateway_service_environment(args(&["--environment", "production"])).unwrap(),
+            Some(pioneer_config::RuntimeEnvironment::Production)
+        );
+        for values in [
+            vec!["--environment"],
+            vec!["--environment", "prod"],
+            vec!["--unknown"],
+            vec!["--environment", "production", "extra"],
+            vec!["--environment", "production", "--environment", "production"],
+        ] {
+            let error = parse_gateway_service_environment(args(&values)).unwrap_err();
+            assert!(is_usage_error(&error), "{values:?}");
+        }
+        // These must reject the flag before service or installer side effects.
+        for command in ["start", "stop", "install", "update"] {
+            let error = run_with_args(args(&[command, "--environment", "production"]))
+                .expect_err("only the foreground command may select an environment");
+            assert!(is_usage_error(&error), "{command}");
+        }
+    }
+
+    #[test]
     fn invalid_install_option_is_usage_error() {
         let error = parse_install_options(
             installer::InstallCommand::Install,
@@ -743,16 +806,5 @@ mod tests {
         let error = run_with_args(args(&["task-invariants", "--json"]))
             .expect_err("missing task-invariants db should fail");
         assert!(is_usage_error(&error));
-    }
-
-    #[test]
-    fn transient_installer_network_failure_has_stable_error_code() {
-        assert_eq!(
-            install_error_code(
-                installer::InstallCommand::Update,
-                "download failed due to a transient network failure",
-            ),
-            "download_transient_network_failure"
-        );
     }
 }

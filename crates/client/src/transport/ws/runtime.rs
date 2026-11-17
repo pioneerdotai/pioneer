@@ -1,5 +1,209 @@
 mod client;
 mod command_sender;
+pub(crate) use command_sender::ConnectionRequestTransport;
+
+// Minimal distinct domain-control reserve. Keep it through the response, not
+// only until the frame leaves the queue; this is not a measured throughput cap.
+const SOCKET_CANCEL_CAPACITY: usize = 1;
+const MAX_SOCKET_CANCEL_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionScope {
+    connection: u64,
+    incarnation: u64,
+}
+#[derive(Clone)]
+pub(crate) struct SocketReceipt {
+    scope: ConnectionScope,
+    live: Arc<Mutex<bool>>,
+    cancels: tokio::sync::mpsc::Sender<SocketCancel>,
+    voice_cancels: tokio::sync::mpsc::Sender<SocketCancel>,
+    cancel_slots: Arc<tokio::sync::Semaphore>,
+    voice_cancel_slots: Arc<tokio::sync::Semaphore>,
+    voice: tokio::sync::mpsc::Sender<super::voice_budget::QueuedVoiceAudio>,
+}
+impl SocketReceipt {
+    pub(crate) fn new(connection: u64) -> (Self, SocketCancelReceiver) {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let (cancels, receiver) = tokio::sync::mpsc::channel(SOCKET_CANCEL_CAPACITY);
+        let (voice_cancels, voice_receiver) = tokio::sync::mpsc::channel(SOCKET_CANCEL_CAPACITY);
+        let cancel_slots = Arc::new(tokio::sync::Semaphore::new(SOCKET_CANCEL_CAPACITY));
+        let voice_cancel_slots = Arc::new(tokio::sync::Semaphore::new(SOCKET_CANCEL_CAPACITY));
+        let live = Arc::new(Mutex::new(true));
+        let (voice, voice_rx) = tokio::sync::mpsc::channel(128);
+        let owner = SocketCancelReceiver {
+            receiver,
+            voice_receiver,
+            voice: Some(voice_rx),
+            live: live.clone(),
+            slots: cancel_slots.clone(),
+            voice_slots: voice_cancel_slots.clone(),
+        };
+        (
+            Self {
+                scope: ConnectionScope {
+                    connection,
+                    incarnation: NEXT
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                            next.checked_add(1)
+                        })
+                        .expect("socket incarnation exhausted"),
+                },
+                live,
+                cancels,
+                voice_cancels,
+                cancel_slots,
+                voice_cancel_slots,
+                voice,
+            },
+            owner,
+        )
+    }
+
+    pub(crate) fn admit_voice(
+        &self,
+        payload: super::voice_budget::QueuedVoiceAudio,
+    ) -> anyhow::Result<()> {
+        let live = self.live.lock().unwrap();
+        anyhow::ensure!(*live, "voice socket retired");
+        self.voice
+            .try_send(payload)
+            .map_err(|_| anyhow::anyhow!("voice socket capacity full or retired"))
+    }
+
+    pub(crate) fn admit_cancel(
+        &self,
+        request_id: String,
+        payload: String,
+        response: crate::rpc::JsonRpcResponseSender,
+    ) -> std::result::Result<(), String> {
+        // Bound retained payload as well as count. The gateway deferred budget
+        // is also 4 MiB; a control request is normally only a few identifiers.
+        if payload.len() > MAX_SOCKET_CANCEL_BYTES {
+            let message = "websocket Cancel payload too large";
+            let _ = response.send(Err(crate::rpc::JsonRpcResponseError::transport(message)));
+            return Err(message.into());
+        }
+        let voice_cancel = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .is_some_and(|v| {
+                v["method"] == pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL
+            });
+        let slots = if voice_cancel {
+            &self.voice_cancel_slots
+        } else {
+            &self.cancel_slots
+        };
+        let slot = match slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                let message = "websocket Cancel capacity full or retired";
+                let _ = response.send(Err(crate::rpc::JsonRpcResponseError::transport(message)));
+                return Err(message.into());
+            }
+        };
+        self.bind_request(&response);
+        if !response.is_active() || !response.hold_control_slot(slot) {
+            response.cancel();
+            return Err("websocket Cancel request retired".into());
+        }
+        let fallback = response.clone();
+        let mailbox = if voice_cancel {
+            &self.voice_cancels
+        } else {
+            &self.cancels
+        };
+        mailbox
+            .try_send(SocketCancel {
+                request_id,
+                payload,
+                response,
+            })
+            .map_err(|_| {
+                let message = "websocket Cancel mailbox full or closed";
+                let _ = fallback.send(Err(crate::rpc::JsonRpcResponseError::transport(message)));
+                message.to_owned()
+            })
+    }
+
+    pub(crate) fn bind_request(&self, response: &crate::rpc::JsonRpcResponseSender) {
+        response.bind_transport(self.live.clone());
+    }
+    pub(crate) fn retire(&self) {
+        *self.live.lock().unwrap() = false;
+        self.cancel_slots.close();
+        self.voice_cancel_slots.close();
+    }
+    fn is_current(&self) -> bool {
+        *self.live.lock().unwrap()
+    }
+}
+/// Only exact turn/voice Cancel methods bypass queued ordinary commands. This
+/// selects transport admission, not request validity or gateway authorization.
+pub(super) fn is_domain_cancel(payload: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Method<'a> {
+        #[serde(borrow)]
+        method: std::borrow::Cow<'a, str>,
+    }
+    serde_json::from_str::<Method<'_>>(payload).is_ok_and(|request| {
+        matches!(
+            request.method.as_ref(),
+            pioneer_protocol::constants::methods::TURN_CANCEL
+                | pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL
+        )
+    })
+}
+
+pub(crate) struct SocketCancel {
+    pub(super) request_id: String,
+    pub(super) payload: String,
+    pub(super) response: crate::rpc::JsonRpcResponseSender,
+}
+
+pub(crate) struct SocketCancelReceiver {
+    pub(super) receiver: tokio::sync::mpsc::Receiver<SocketCancel>,
+    pub(super) voice_receiver: tokio::sync::mpsc::Receiver<SocketCancel>,
+    pub(super) voice: Option<tokio::sync::mpsc::Receiver<super::voice_budget::QueuedVoiceAudio>>,
+    live: Arc<Mutex<bool>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    voice_slots: Arc<tokio::sync::Semaphore>,
+}
+impl SocketCancelReceiver {
+    pub(super) async fn recv(&mut self) -> Option<SocketCancel> {
+        tokio::select! { item = self.receiver.recv() => item, item = self.voice_receiver.recv() => item }
+    }
+}
+impl Drop for SocketCancelReceiver {
+    fn drop(&mut self) {
+        *self.live.lock().unwrap() = false;
+        self.slots.close();
+        self.voice_slots.close();
+        self.receiver.close();
+        self.voice_receiver.close();
+        while let Ok(command) = self.voice_receiver.try_recv() {
+            let _ = command
+                .response
+                .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "voice Cancel owner dropped",
+                )));
+        }
+        while let Ok(command) = self.receiver.try_recv() {
+            let _ = command
+                .response
+                .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "websocket Cancel owner dropped",
+                )));
+        }
+    }
+}
+
+pub(crate) struct SocketLifetime(pub(crate) SocketReceipt);
+impl Drop for SocketLifetime {
+    fn drop(&mut self) {
+        self.0.retire();
+    }
+}
 
 use crate::transport::http::{GatewayHttpAccess, GatewayHttpAuthorityError};
 use anyhow::{Context, Result, anyhow};
@@ -43,12 +247,13 @@ use pioneer_protocol::{
     SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
     SkillsUploadChunkAckNotification, SkillsUploadFinishParams, SkillsUploadFinishResponse,
     SkillsUploadStartParams, SkillsUploadStartResponse, TaskAcceptParams, TaskAcceptResponse,
-    TaskCancelParams, TaskCancelResponse, TaskReviseParams, TaskReviseResponse,
-    TaskUserNotificationAcknowledgeParams, TaskUserNotificationAcknowledgeResponse,
-    TaskUserNotificationListParams, TaskUserNotificationListResponse, ThreadAgentsDocArchiveParams,
-    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
-    ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocResolveForThreadResponse,
-    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFileViewGrantCreateParams,
+    TaskCancelParams, TaskCancelResponse, TaskFinishParams, TaskFinishResponse, TaskReviseParams,
+    TaskReviseResponse, TaskUserNotificationAcknowledgeParams,
+    TaskUserNotificationAcknowledgeResponse, TaskUserNotificationListParams,
+    TaskUserNotificationListResponse, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadParams,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveParams,
+    ThreadAgentsDocSaveResponse, ThreadFileViewGrantCreateParams,
     ThreadFileViewGrantCreateResponse, ThreadFolderCreateParams, ThreadFolderCreateResponse,
     ThreadFolderDeleteParams, ThreadFolderDeleteResponse, ThreadFolderMoveParams,
     ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse, ThreadMoveParams,
@@ -73,19 +278,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use super::client::{GatewayWsCommand, spawn_worker};
+use super::client::{GatewayWsCommand, WsSender, spawn_worker, work_channel};
 use super::{GatewayWsConnectSpec, GatewayWsEvent};
+use pioneer_observability::work::Boundary;
 
 const UPLOAD_CHUNK_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct GatewayWsCommandSender {
-    command_tx: UnboundedSender<GatewayWsCommand>,
+    command_tx: WsSender<GatewayWsCommand>,
+    voice_budget: Arc<super::voice_budget::VoiceTransportBudget>,
     next_connection_id: Arc<AtomicU64>,
+    socket: Arc<Mutex<Option<SocketReceipt>>>,
     session_access: Arc<Mutex<Option<GatewayHttpAccess>>>,
     connection_generations: Arc<Mutex<GatewayConnectionGenerations>>,
+    #[cfg(test)]
+    test_cancels: Arc<Mutex<Option<SocketCancelReceiver>>>,
     #[cfg(test)]
     pub(crate) test_requests:
         Arc<Mutex<Option<Arc<dyn crate::rpc::JsonRpcRequestTransport + Send + Sync>>>>,
@@ -94,9 +303,9 @@ pub struct GatewayWsCommandSender {
 #[derive(Clone)]
 pub struct GatewayWsClient {
     command_sender: GatewayWsCommandSender,
-    event_rx: Arc<Mutex<Receiver<GatewayWsEvent>>>,
+    event_rx: Arc<Mutex<Receiver<pioneer_observability::work::WorkItem<GatewayWsEvent>>>>,
     #[cfg(test)]
-    test_event_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<GatewayWsEvent>>>>,
+    test_event_tx: Arc<Mutex<Option<super::client::GatewayWsEventSender>>>,
 }
 
 #[derive(Default)]

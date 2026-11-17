@@ -8,6 +8,7 @@ license.workspace = true
 gpui-kit = { workspace = true, features = ["component"] }
 pioneer-client.workspace = true
 pioneer-desktop-foundation.workspace = true
+pioneer-protocol.workspace = true
 rust-i18n.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

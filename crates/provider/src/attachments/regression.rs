@@ -104,6 +104,8 @@ pub(crate) fn request(model: &str, parts: Vec<MessageContentPart>) -> ChatReques
     let mut message = ChatMessage::user_parts(parts);
     message.content = "analyze".into();
     ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: model.into(),
         messages: vec![message],
         temperature: None,
@@ -125,6 +127,11 @@ pub(crate) fn state(provider: &str, model: &str, constraints: Value) -> Admissio
         "bedrock" => "amazon-bedrock",
         _ => provider,
     };
+    if provider == "openai" && model == "gpt-audio" {
+        models[key][model] = models[key]["media"].clone();
+        models[key][model]["id"] = json!(model);
+        models[key][model]["api"] = json!("openai-completions");
+    }
     if !models[key][model].is_null() {
         models[key][model]["inputConstraints"] = constraints;
     }
@@ -133,9 +140,16 @@ pub(crate) fn state(provider: &str, model: &str, constraints: Value) -> Admissio
         // fixture's Responses membership does not establish Chat audio support.
         models[key][model]["api"] = json!("openai-completions");
     }
+    let mut origins: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/capabilities/provenance.json"
+    ))
+    .unwrap();
+    if provider == "openai" && model == "gpt-audio" {
+        origins[key][model] = origins[key]["media"].clone();
+    }
     let c = crate::catalog::ModelCatalog::parse(
         &serde_json::to_string(&models).unwrap(),
-        include_str!("../../tests/fixtures/capabilities/provenance.json"),
+        &origins.to_string(),
     )
     .unwrap();
     AdmissionState::for_test(Arc::new(c))
@@ -323,20 +337,26 @@ async fn effective_mime_actual_bytes_aliases_and_strict_policy_reach_admission()
     let mut config = super::default_attachment_pipeline_config();
     config.normalization.strict_mime_match = true;
     strict.pipeline_config = Some(config);
-    assert!(
-        scoped(
-            Arc::new(strict),
-            super::input_estimate::prepare(
-                "groq",
-                &caps,
-                request(
-                    "vision",
-                    vec![part(InputContentType::Image, "image/png", &jpeg)]
-                )
-            )
-        )
-        .await
-        .is_err()
+    let error = scoped(
+        Arc::new(strict),
+        super::input_estimate::prepare(
+            "groq",
+            &caps,
+            request(
+                "vision",
+                vec![part(InputContentType::Image, "image/png", &jpeg)],
+            ),
+        ),
+    )
+    .await
+    .err()
+    .expect("strict MIME mismatch must fail");
+    assert_eq!(
+        error
+            .downcast_ref::<super::errors::AttachmentPipelineError>()
+            .expect("strict admission must fail at the MIME guard")
+            .code(),
+        "MIME_MISMATCH"
     );
     for mime in ["audio/wav", " AUDIO/X-WAV "] {
         let s = Arc::new(state("openrouter", "media", json!({})));
@@ -359,7 +379,7 @@ async fn effective_mime_actual_bytes_aliases_and_strict_policy_reach_admission()
 
 #[tokio::test]
 async fn authorized_path_and_url_pins_survive_budget_renderer_and_replay_without_io() {
-    use crate::providers::OpenAiCompatibleProvider;
+    use crate::providers::ChatCompletionsApiCompatibleProvider;
     use crate::{InputTypeSupport, Provider};
     for ingress in ["path", "url"] {
         let bytes = image(image::ImageFormat::Png, 1, 1);
@@ -394,7 +414,7 @@ async fn authorized_path_and_url_pins_survive_budget_renderer_and_replay_without
                 AttachmentDataSource::Url { url: url.into() }
             };
         }
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "groq",
             "https://example.com/v1",
             "unused",
@@ -661,7 +681,7 @@ async fn count_and_duration_boundary_constraints_are_native_admission_not_token_
 #[tokio::test]
 async fn groq_payload_cap_counts_the_entire_normal_and_stream_json() {
     use crate::{InputTypeSupport, Provider};
-    let provider = crate::providers::OpenAiCompatibleProvider::new(
+    let provider = crate::providers::ChatCompletionsApiCompatibleProvider::new(
         "groq",
         "https://example.com/v1",
         "unused",
@@ -1395,25 +1415,26 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
                 false,
             ));
         }
+        let model = if name == "openai" {
+            "gpt-audio"
+        } else {
+            "media"
+        };
         for (kind, mime, bytes, limit, allowed) in cases {
             let key = if kind == InputContentType::Audio {
                 "audio"
             } else {
                 "video"
             };
-            let s = Arc::new(state(
-                name,
-                "media",
-                json!({key:{"maxDurationMillis":limit}}),
-            ));
-            let req = request("media", vec![part(kind, mime, &bytes)]);
+            let s = Arc::new(state(name, model, json!({key:{"maxDurationMillis":limit}})));
+            let req = request(model, vec![part(kind, mime, &bytes)]);
             let budget = scoped(s.clone(), provider.prepare_input_budget(req.clone())).await;
             assert_eq!(budget.is_ok(), allowed, "{name} {mime} {limit}");
             let admission = scoped(
                 s.clone(),
                 super::prepare_messages_for_provider_async(
                     name,
-                    "media",
+                    model,
                     &provider.capabilities(),
                     &req.messages,
                 ),
@@ -1440,10 +1461,10 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
             .chain(super::media_fixtures::invalid_mp3_trims(b"Xing"))
         {
             let req = request(
-                "media",
+                model,
                 vec![part(InputContentType::Audio, "audio/mpeg", &bytes)],
             );
-            let s = Arc::new(state(name, "media", json!({})));
+            let s = Arc::new(state(name, model, json!({})));
             assert!(
                 scoped(s.clone(), provider.prepare_input_budget(req.clone()))
                     .await
@@ -1453,7 +1474,7 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
                 s,
                 super::prepare_messages_for_provider_async(
                     name,
-                    "media",
+                    model,
                     &provider.capabilities(),
                     &req.messages,
                 ),
@@ -1473,13 +1494,10 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
                 vbr_adts(441)
             };
             truncated.pop();
-            let req = request(
-                "media",
-                vec![part(InputContentType::Audio, mime, &truncated)],
-            );
+            let req = request(model, vec![part(InputContentType::Audio, mime, &truncated)]);
             assert!(
                 scoped(
-                    Arc::new(state(name, "media", json!({}))),
+                    Arc::new(state(name, model, json!({}))),
                     provider.prepare_input_budget(req)
                 )
                 .await
@@ -1753,10 +1771,19 @@ pub(crate) fn html_preview_fixture(
     let catalog =
         crate::catalog::ModelCatalog::parse(&models.to_string(), &provenance.to_string()).unwrap();
     let state = Arc::new(AdmissionState::for_test(Arc::new(catalog)));
+    let frames = [
+        ("light", 360),
+        ("light", 768),
+        ("light", 1024),
+        ("dark", 360),
+        ("dark", 768),
+        ("dark", 1024),
+    ];
     let mut preview = ChatMessage::tool_result("preview-call", "html_preview", json!({
-        "previews":([360,768,1024].map(|width|json!({"width":width,"diagnostics":["resource load error"],"artifact":{"artifact_id":format!("capture-{width}"),"version_id":format!("version-{width}")}})))
+        "formatVersion":2,
+        "previews":(frames.map(|(appearance,width)|json!({"appearance":appearance,"width":width,"diagnostics":["resource load error"],"artifact":{"artifact_id":format!("capture-{appearance}-{width}"),"version_id":format!("version-{appearance}-{width}")}})))
     }).to_string());
-    for width in [360, 768, 1024] {
+    for (appearance, width) in frames {
         let png = image(image::ImageFormat::Png, width, 8);
         let mut image = match part(InputContentType::Image, "image/png", &png) {
             MessageContentPart::Image { image } => image,
@@ -1764,11 +1791,11 @@ pub(crate) fn html_preview_fixture(
         };
         image.artifact = Some(AttachmentArtifactContext {
             workspace_id: "workspace".into(),
-            artifact_id: format!("capture-{width}"),
-            artifact_version_id: Some(format!("version-{width}")),
+            artifact_id: format!("capture-{appearance}-{width}"),
+            artifact_version_id: Some(format!("version-{appearance}-{width}")),
         });
         preview.content_parts.push(MessageContentPart::text(format!(
-            "HTML preview — {width} CSS px"
+            "HTML preview — {appearance}, {width} CSS px"
         )));
         preview.content_parts.push(MessageContentPart::image(image));
     }

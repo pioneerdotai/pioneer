@@ -7,8 +7,8 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, Order, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -375,6 +375,74 @@ pub async fn finish_running_attempt<C: ConnectionTrait>(
     Ok(true)
 }
 
+pub(crate) async fn is_unconfirmed_cli_mcp_attempt<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    Ok(turn_item_attempt::Entity::find_by_id(attempt_id.to_owned())
+        .filter(turn_item_attempt::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item_attempt::Column::ItemId.eq(item_id.to_owned()))
+        .filter(turn_item_attempt::Column::Status.eq("interrupted"))
+        .filter(turn_item_attempt::Column::FailureReason.eq("turn_terminal_before_item_completed"))
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// Correct only the diagnostic gap created by terminal-Turn cleanup. A
+/// confirmed managed MCP outcome is not a retry or reactivation of execution.
+pub(crate) async fn finish_unconfirmed_cli_mcp_attempt<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+    attempt_id: &str,
+    status: TurnItemAttemptStatus,
+    failure_reason: Option<String>,
+    completed_event_sequence: i64,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let status = turn_item_attempt_status_to_db(status);
+    let affected = turn_item_attempt::Entity::update_many()
+        .col_expr(turn_item_attempt::Column::Status, Expr::value(status))
+        .col_expr(
+            turn_item_attempt::Column::FailureReason,
+            Expr::value(failure_reason),
+        )
+        .col_expr(
+            turn_item_attempt::Column::UpdatedAt,
+            Expr::value(updated_at),
+        )
+        .filter(turn_item_attempt::Column::Id.eq(attempt_id.to_owned()))
+        .filter(turn_item_attempt::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item_attempt::Column::ItemId.eq(item_id.to_owned()))
+        .filter(turn_item_attempt::Column::StartedEventSequence.lt(completed_event_sequence))
+        .filter(turn_item_attempt::Column::Status.eq("interrupted"))
+        .filter(turn_item_attempt::Column::FailureReason.eq("turn_terminal_before_item_completed"))
+        .exec(db)
+        .await?
+        .rows_affected;
+    if affected == 0 {
+        return Ok(false);
+    }
+    let affected = turn_item::Entity::update_many()
+        .col_expr(
+            turn_item::Column::ActiveAttemptStatus,
+            Expr::value(Some(status)),
+        )
+        .col_expr(turn_item::Column::UpdatedAt, Expr::value(updated_at))
+        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item::Column::ItemId.eq(item_id.to_owned()))
+        .filter(turn_item::Column::ActiveAttemptId.eq(attempt_id.to_owned()))
+        .filter(turn_item::Column::ActiveAttemptStatus.eq("interrupted"))
+        .exec(db)
+        .await?
+        .rows_affected;
+    anyhow::ensure!(affected == 1, "CLI MCP unconfirmed attempt lost its item");
+    Ok(true)
+}
+
 fn clears_attempt_payload(status: TurnItemAttemptStatus) -> bool {
     matches!(
         status,
@@ -386,13 +454,59 @@ fn clears_attempt_payload(status: TurnItemAttemptStatus) -> bool {
     )
 }
 
-pub async fn list_expired_running_attempts<C: ConnectionTrait>(
+pub(crate) async fn list_expired_running_attempt_page_scoped<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
     limit: u64,
-) -> Result<Vec<RunningAttemptSnapshot>> {
+    after: Option<&crate::TimeoutCandidateCursor>,
+    turn_id: Option<&str>,
+) -> Result<(
+    Vec<RunningAttemptSnapshot>,
+    Option<crate::TimeoutCandidateCursor>,
+)> {
+    let scope = turn_id
+        .map(|id| Condition::all().add(turn_item_attempt::Column::TurnId.eq(id)))
+        .unwrap_or_else(Condition::all);
+    let (upper_started_at, upper_id) = if let Some(cursor) = after {
+        (cursor.upper_started_at, cursor.upper_id.clone())
+    } else {
+        let Some(upper) = turn_item_attempt::Entity::find()
+            .filter(scope.clone())
+            .select_only()
+            .column(turn_item_attempt::Column::StartedAt)
+            .column(turn_item_attempt::Column::Id)
+            .filter(turn_item_attempt::Column::Status.eq("running"))
+            .order_by_desc(turn_item_attempt::Column::StartedAt)
+            .order_by_desc(turn_item_attempt::Column::Id)
+            .into_tuple::<(DateTimeWithTimeZone, String)>()
+            .one(db)
+            .await?
+        else {
+            return Ok((Vec::new(), None));
+        };
+        upper
+    };
+    let upper = Condition::any()
+        .add(turn_item_attempt::Column::StartedAt.lt(upper_started_at))
+        .add(
+            Condition::all()
+                .add(turn_item_attempt::Column::StartedAt.eq(upper_started_at))
+                .add(turn_item_attempt::Column::Id.lte(upper_id.clone())),
+        );
     let running = turn_item_attempt_status_to_db(TurnItemAttemptStatus::Running);
+    let after = after.map_or_else(Condition::all, |cursor| {
+        Condition::any()
+            .add(turn_item_attempt::Column::StartedAt.gt(cursor.started_at))
+            .add(
+                Condition::all()
+                    .add(turn_item_attempt::Column::StartedAt.eq(cursor.started_at))
+                    .add(turn_item_attempt::Column::Id.gt(cursor.id.clone())),
+            )
+    });
     let rows = turn_item_attempt::Entity::find()
+        .filter(scope.clone())
+        .filter(after)
+        .filter(upper)
         .filter(turn_item_attempt::Column::Status.eq(running))
         // Legacy attempts remain non-destructive until the background data
         // migration has assigned their authoritative execution class.
@@ -403,13 +517,29 @@ pub async fn list_expired_running_attempts<C: ConnectionTrait>(
                 .or(Expr::col(turn_item_attempt::Column::IdleDeadlineAt).lte(now))
                 .or(Expr::col(turn_item_attempt::Column::LeaseExpiresAt).lte(now)),
         )
-        .order_by(turn_item_attempt::Column::StartedAt, Order::Asc)
+        .order_by_asc(turn_item_attempt::Column::StartedAt)
+        .order_by_asc(turn_item_attempt::Column::Id)
         .limit(limit)
         .all(db)
         .await
         .context("failed to query expired running attempts")?;
 
-    rows.into_iter().map(running_snapshot_from_model).collect()
+    let next = if limit > 0 && rows.len() as u64 == limit {
+        rows.last().map(|row| crate::TimeoutCandidateCursor {
+            started_at: row.started_at,
+            id: row.id.clone(),
+            upper_started_at,
+            upper_id: upper_id.clone(),
+        })
+    } else {
+        None
+    };
+    Ok((
+        rows.into_iter()
+            .map(running_snapshot_from_model)
+            .collect::<Result<Vec<_>>>()?,
+        next,
+    ))
 }
 
 pub async fn prepare_running_attempt_timeout<C: ConnectionTrait>(
@@ -917,7 +1047,38 @@ pub(crate) async fn prepare_terminal_running_attempts<C: ConnectionTrait>(
             let terminal_state = TurnItemTerminalState::Failed {
                 reason: Some("turn_terminal_before_item_completed".to_owned()),
             };
+            let managed_mcp = crate::is_managed_cli_mcp_item(&terminal_item);
             terminalize_turn_item_payload(&mut terminal_item, terminal_state.clone());
+            if managed_mcp
+                && let TurnItem::DynamicToolCall { success, outcome, display, storage, .. } = &mut terminal_item
+            {
+                // Turn closure proves neither execution failure nor accepted
+                // cancellation. Retain an explicit unknown, non-retryable gap.
+                *success = None;
+                *outcome = Some(pioneer_protocol::ToolOutcome {
+                    status: pioneer_protocol::ToolOutcomeStatus::FatalError,
+                    error_class: Some(pioneer_protocol::ToolErrorClass::Unknown),
+                    should_retry: false,
+                    retry_hint: None,
+                    incomplete: true,
+                    incomplete_reason: Some("cli_mcp_result_unconfirmed".to_owned()),
+                });
+                let mark_metadata = |metadata: &mut pioneer_protocol::ToolMetadata| {
+                    metadata.insert("status", pioneer_protocol::ToolMetadataValue::from_json(
+                        serde_json::json!("unconfirmed")));
+                    metadata.insert("success", pioneer_protocol::ToolMetadataValue::Null);
+                    metadata.insert("responseDelivery", pioneer_protocol::ToolMetadataValue::from_json(
+                        serde_json::json!("unconfirmed")));
+                };
+                if let pioneer_protocol::ToolDisplayPayload::Summary(summary) = display {
+                    mark_metadata(&mut summary.metadata);
+                }
+                match storage {
+                    pioneer_protocol::ToolStoragePayload::Summary(summary) => mark_metadata(&mut summary.metadata),
+                    pioneer_protocol::ToolStoragePayload::Metadata { metadata } => mark_metadata(metadata),
+                    _ => {}
+                }
+            }
             let terminal_item_payload = serde_json::to_string(&terminal_item)
                 .context("failed to encode terminalized turn item")?;
             Ok(PreparedTerminalRunningAttempt {
@@ -1068,6 +1229,64 @@ pub async fn list_running_attempts_by_item_type<C: ConnectionTrait>(
     rows.into_iter().map(running_snapshot_from_model).collect()
 }
 
+pub async fn running_attempt_upper_id_by_item_type<C: ConnectionTrait>(
+    db: &C,
+    item_type: TurnItemType,
+) -> Result<Option<String>> {
+    Ok(turn_item_attempt::Entity::find()
+        .select_only()
+        .column(turn_item_attempt::Column::Id)
+        .filter(turn_item_attempt::Column::Status.eq("running"))
+        .filter(turn_item_attempt::Column::ItemType.eq(turn_item_type_to_db(item_type)))
+        .order_by_desc(turn_item_attempt::Column::Id)
+        .into_tuple::<String>()
+        .one(db)
+        .await?)
+}
+
+/// Stable bounded discovery for command supervision. Continue from raw rows,
+/// including skipped legacy rows, within the captured upper frontier.
+pub(crate) async fn list_running_attempt_page_by_item_type_bounded_scoped<C: ConnectionTrait>(
+    db: &C,
+    item_type: TurnItemType,
+    after_id: Option<&str>,
+    upper_id: &str,
+    limit: u64,
+    turn_id: Option<&str>,
+) -> Result<(Vec<RunningAttemptSnapshot>, Option<String>)> {
+    let limit = limit.clamp(1, 1_024);
+    let mut query = turn_item_attempt::Entity::find()
+        .filter(turn_item_attempt::Column::Id.lte(upper_id))
+        .filter(
+            turn_item_attempt::Column::Status.eq(turn_item_attempt_status_to_db(
+                TurnItemAttemptStatus::Running,
+            )),
+        )
+        .filter(turn_item_attempt::Column::ItemType.eq(turn_item_type_to_db(item_type)));
+    if let Some(turn_id) = turn_id {
+        query = query.filter(turn_item_attempt::Column::TurnId.eq(turn_id));
+    }
+    if let Some(after_id) = after_id {
+        query = query.filter(turn_item_attempt::Column::Id.gt(after_id));
+    }
+    let rows = query
+        .order_by_asc(turn_item_attempt::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to list running attempt page by item type")?;
+    let next = if rows.len() == limit as usize {
+        rows.last().map(|row| row.id.clone())
+    } else {
+        None
+    };
+    let snapshots = rows
+        .into_iter()
+        .map(running_snapshot_from_model)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((snapshots, next))
+}
+
 pub async fn find_latest_running_attempt<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -1079,23 +1298,43 @@ pub async fn find_latest_running_attempt<C: ConnectionTrait>(
         .transpose()
 }
 
-pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
+/// Fixed-ceiling discovery for a finite timeout backfill pass. Cursor progress
+/// is based on raw selected rows and committed by the caller after processing.
+pub async fn list_timed_out_without_recovery_page<C: ConnectionTrait>(
     db: &C,
     limit: u64,
-) -> Result<Vec<TimedOutAttemptSnapshot>> {
+    after: Option<&str>,
+    upper: Option<&str>,
+) -> Result<(Vec<TimedOutAttemptSnapshot>, Option<String>)> {
+    let limit = limit.clamp(1, 512);
     let timed_out_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::TimedOut);
-    let rows = turn_item_attempt::Entity::find()
+    let mut query = turn_item_attempt::Entity::find()
         .filter(turn_item_attempt::Column::Status.eq(timed_out_status))
         .filter(turn_item_attempt::Column::ExecutionClass.is_not_null())
         .filter(turn_item_attempt::Column::RecoveryAction.is_null())
-        .filter(turn_item_attempt::Column::RecoverySuppressedReason.is_null())
-        .order_by_asc(turn_item_attempt::Column::UpdatedAt)
+        .filter(turn_item_attempt::Column::RecoverySuppressedReason.is_null());
+    if let Some(after) = after {
+        query = query.filter(turn_item_attempt::Column::Id.gt(after));
+    }
+    if let Some(upper) = upper {
+        query = query.filter(turn_item_attempt::Column::Id.lte(upper));
+    }
+    let rows = query
+        .order_by_asc(turn_item_attempt::Column::Id)
         .limit(limit)
         .all(db)
         .await
         .context("failed to query timed_out attempts without recovery")?;
+    let next = if rows.len() as u64 == limit {
+        rows.last()
+            .filter(|row| Some(row.id.as_str()) != upper)
+            .map(|row| row.id.clone())
+    } else {
+        None
+    };
 
-    rows.into_iter()
+    let snapshots = rows
+        .into_iter()
         .map(|row| -> Result<TimedOutAttemptSnapshot> {
             let execution_class = row
                 .execution_class
@@ -1123,7 +1362,8 @@ pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
                 hard_deadline_at: row.hard_deadline_at,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((snapshots, next))
 }
 
 fn running_snapshot_from_model(row: turn_item_attempt::Model) -> Result<RunningAttemptSnapshot> {

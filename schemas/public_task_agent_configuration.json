@@ -126,6 +126,11 @@
     "TaskAgentReviewPolicy": {
       "type": "object",
       "properties": {
+        "disableTimeoutAcceptance": {
+          "description": "Mandatory-review marker: never resolve this policy through the legacy review timeout. Legacy records default to false.",
+          "type": "boolean",
+          "default": false
+        },
         "maxRevisionRounds": {
           "type": "integer",
           "format": "uint32",

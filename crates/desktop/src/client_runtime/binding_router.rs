@@ -117,10 +117,14 @@ impl DesktopClientBindingRouter {
                 };
                 // No router/entity/table borrow survives a callback. A recipient
                 // may synchronously drop its own or another window's registration.
-                for (target, publication) in deliveries {
+                for (target, publication, work) in deliveries {
                     if let Some(registration) = target.upgrade() {
                         if let Some(target) = registration.sink.upgrade() {
-                            target.publish(publication);
+                            work.execution_child(
+                                pioneer_observability::work::WorkKind::ClientPublication,
+                                pioneer_observability::work::ExecutorRole::DesktopForeground,
+                            )
+                            .run(|| target.publish(publication));
                         }
                     }
                 }
@@ -136,7 +140,11 @@ impl DesktopClientBindingRouter {
     fn drain(
         &self,
         core: &ClientCore,
-    ) -> Vec<(LocalWeak<RegisteredTarget>, ClientPublicationReference)> {
+    ) -> Vec<(
+        LocalWeak<RegisteredTarget>,
+        ClientPublicationReference,
+        pioneer_observability::work::WorkCarrier,
+    )> {
         let mut routes = self.routes.borrow_mut();
         if !routes.active {
             return Vec::new();
@@ -148,7 +156,16 @@ impl DesktopClientBindingRouter {
                 .get(publication.scope())
                 .and_then(|route| route.targets.get(&id))
             {
-                deliveries.push((Rc::downgrade(target), publication));
+                deliveries.push((
+                    Rc::downgrade(target),
+                    publication,
+                    pioneer_observability::work::WorkCarrier::independent(
+                        pioneer_observability::work::Boundary::ClientPublication,
+                        pioneer_observability::work::WorkKind::ClientPublication,
+                        pioneer_observability::work::Trigger::Lifecycle,
+                        pioneer_observability::work::ExecutorRole::DesktopForeground,
+                    ),
+                ));
             }
         }
         routes.scopes.retain(|_, route| {
@@ -156,6 +173,7 @@ impl DesktopClientBindingRouter {
                 .targets
                 .retain(|_, target| target.sink.strong_count() > 0);
             while let Some(event) = route.subscription.try_next() {
+                let work = route.subscription.pending_work();
                 let publication = match event {
                     ClientSubscriptionEvent::Publication { publication, .. } => Some(publication),
                     ClientSubscriptionEvent::ResnapshotRequired { scope, .. } => {
@@ -164,16 +182,15 @@ impl DesktopClientBindingRouter {
                 };
                 if let Some(publication) = publication {
                     deliveries.extend(
-                        route
-                            .targets
-                            .values()
-                            .map(|target| (Rc::downgrade(target), publication.clone())),
+                        route.targets.values().map(|target| {
+                            (Rc::downgrade(target), publication.clone(), work.clone())
+                        }),
                     );
                 }
             }
             !route.targets.is_empty()
         });
-        deliveries.sort_by_key(|(_, publication)| publication.snapshot().sequence());
+        deliveries.sort_by_key(|(_, publication, _)| publication.snapshot().sequence());
         deliveries
     }
 
@@ -191,10 +208,14 @@ impl DesktopClientBindingRouter {
     }
 
     pub(super) fn deliver_pending(&self, core: &ClientCore) {
-        for (target, publication) in self.drain(core) {
+        for (target, publication, work) in self.drain(core) {
             if let Some(registration) = target.upgrade() {
                 if let Some(sink) = registration.sink.upgrade() {
-                    sink.publish(publication);
+                    work.execution_child(
+                        pioneer_observability::work::WorkKind::ClientPublication,
+                        pioneer_observability::work::ExecutorRole::DesktopForeground,
+                    )
+                    .run(|| sink.publish(publication));
                 }
             }
         }
@@ -285,7 +306,7 @@ mod tests {
         let sequences: Vec<_> = router
             .drain(&core)
             .into_iter()
-            .map(|(_, publication)| publication.snapshot().sequence())
+            .map(|(_, publication, _)| publication.snapshot().sequence())
             .collect();
         assert!(sequences.len() >= 4);
         assert!(sequences.windows(2).all(|pair| pair[0] <= pair[1]));
@@ -323,10 +344,14 @@ mod tests {
         );
         let deliveries = router.drain(&core);
         drop(first_registration);
-        for (registration, publication) in deliveries {
+        for (registration, publication, work) in deliveries {
             if let Some(registration) = registration.upgrade() {
                 if let Some(target) = registration.sink.upgrade() {
-                    target.publish(publication);
+                    work.execution_child(
+                        pioneer_observability::work::WorkKind::ClientPublication,
+                        pioneer_observability::work::ExecutorRole::DesktopForeground,
+                    )
+                    .run(|| target.publish(publication));
                 }
             }
         }

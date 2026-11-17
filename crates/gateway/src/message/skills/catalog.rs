@@ -65,7 +65,7 @@ fn projected_skill_policy_state(
     }
 }
 
-fn member_skill_is_operationally_visible(
+pub(in crate::message) fn member_skill_is_operationally_visible(
     skill: &pioneer_skills::SkillDefinition,
     effective_policy: &pioneer_skills::EffectiveSkillPolicy,
     installed_in_workspace: bool,
@@ -73,6 +73,22 @@ fn member_skill_is_operationally_visible(
     skill.is_available()
         && effective_policy.enabled
         && (matches!(skill.identity.source_kind, SkillSourceKind::System) || installed_in_workspace)
+}
+
+pub(in crate::message) fn skill_is_disclosed(
+    principal: &crate::auth::AuthenticatedSessionPrincipal,
+    skill: &pioneer_skills::SkillDefinition,
+    effective_policy: &pioneer_skills::EffectiveSkillPolicy,
+    installed_in_workspace: bool,
+) -> bool {
+    let authorization = crate::authorization::AuthorizationService::new();
+    authorization.skill_allowed(
+        principal.kind,
+        principal.role_key.as_ref(),
+        skill.identity.skill_id.as_str(),
+    ) && (authorization.role_disclosure_policy(principal.kind, principal.role_key.as_ref())
+        != Some(crate::authorization::RoleDisclosurePolicy::Collaborator)
+        || member_skill_is_operationally_visible(skill, effective_policy, installed_in_workspace))
 }
 
 #[cfg(test)]
@@ -132,6 +148,29 @@ mod cli_runtime_resolver_tests {
         })
     }
 
+    #[test]
+    fn plugin_host_constraint_prevents_implicit_flags_without_relaxing_enabled_policy() {
+        use pioneer_skills::policy::{
+            SkillPolicy, SkillPolicyKey, SkillPolicySet, effective_policy_for_skill,
+        };
+        let mut skill = definition("bundled", SkillSourceKind::User);
+        let key = SkillPolicyKey::new(skill.identity.skill_id.clone());
+        let mut policies = SkillPolicySet::default();
+        policies.workspace_by_key.insert(
+            key,
+            SkillPolicy {
+                enabled: Some(false),
+                allow_implicit_invocation: Some(true),
+            },
+        );
+        let standalone = effective_policy_for_skill(&skill, &policies);
+        assert!(standalone.allow_implicit_invocation);
+        skill.host_explicit_only = true;
+        let owned = effective_policy_for_skill(&skill, &policies);
+        assert!(!owned.allow_implicit_invocation);
+        assert!(!owned.enabled);
+    }
+
     fn attachment(
         slug: &str,
         source_kind: SkillSourceKind,
@@ -158,6 +197,8 @@ mod cli_runtime_resolver_tests {
         assert!(projected.allow_implicit_invocation_editable);
         assert!(pioneer_client::skills::catalog::skill_is_user_selectable(
             &SkillListItem {
+                plugin_owner: None,
+                package_owner: None,
                 skill_id: skill.identity.skill_id.clone(),
                 pack: None,
                 owner: skill.identity.owner.clone(),
@@ -454,8 +495,14 @@ impl MessageProcessor {
         attachments: &[crate::cli_runtime::skills::CliRuntimeSkillAttachment],
         mcp_availability: &pioneer_agent::AgentMcpAvailability,
         include_task_orchestration: bool,
+        include_threads: bool,
+        include_html: bool,
     ) -> anyhow::Result<Vec<pioneer_skills::ResolvedSkill>> {
-        if attachments.is_empty() && !include_task_orchestration {
+        if attachments.is_empty()
+            && !include_task_orchestration
+            && !include_threads
+            && !include_html
+        {
             return Ok(Vec::new());
         }
         let context = self.skills_runtime_context(workspace_id)?;
@@ -496,8 +543,15 @@ impl MessageProcessor {
             &catalog,
             &resolution,
         )?;
-        if include_task_orchestration {
-            for slug in ["tasks", "subagents"] {
+        {
+            let mut required = Vec::new();
+            if include_task_orchestration {
+                required.extend(["tasks", "subagents"]);
+            }
+            if include_html {
+                required.push("html");
+            }
+            for slug in required {
                 let skill = resolution
                     .active
                     .iter()
@@ -506,9 +560,7 @@ impl MessageProcessor {
                             && skill.definition.identity.slug == slug
                     })
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "required CLI orchestration skill pioneer/{slug} is unavailable"
-                        )
+                        anyhow::anyhow!("required CLI system skill pioneer/{slug} is unavailable")
                     })?;
                 if !selected
                     .iter()
@@ -516,6 +568,24 @@ impl MessageProcessor {
                 {
                     selected.push(skill.clone());
                 }
+            }
+        }
+        if include_threads {
+            let skill = resolution
+                .active
+                .iter()
+                .find(|skill| {
+                    crate::cli_runtime::skills::cli_orchestration_skill(&skill.definition)
+                        && skill.definition.identity.slug == "threads"
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("required CLI skill pioneer/threads is unavailable")
+                })?;
+            if !selected
+                .iter()
+                .any(|selected| selected.skill_id == skill.skill_id)
+            {
+                selected.push(skill.clone());
             }
         }
         Ok(selected)
@@ -723,16 +793,12 @@ impl MessageProcessor {
             .skills
             .iter()
             .filter(|skill| {
-                crate::authorization::AuthorizationService::new().skill_allowed(
-                    request_context.principal().kind,
-                    request_context.principal().role_key.as_ref(),
-                    skill.identity.skill_id.as_str(),
-                ) && (!member
-                    || member_skill_is_operationally_visible(
-                        skill,
-                        &effective_policy_for_skill(skill, &policy_set),
-                        installation_by_id.contains_key(&skill.identity.skill_id),
-                    ))
+                skill_is_disclosed(
+                    request_context.principal(),
+                    skill,
+                    &effective_policy_for_skill(skill, &policy_set),
+                    installation_by_id.contains_key(&skill.identity.skill_id),
+                )
             })
             .map(|skill| {
                 let installation = installation_by_id.get(&skill.identity.skill_id);
@@ -763,6 +829,8 @@ impl MessageProcessor {
                     .map(|excluded| excluded.reason.as_db_value().to_owned());
 
                 SkillListItem {
+                    plugin_owner: None,
+                    package_owner: None,
                     skill_id: skill.identity.skill_id.clone(),
                     pack: installation.and_then(|item| {
                         item.pack_id.clone().zip(item.pack_member_key.clone()).map(
@@ -825,6 +893,46 @@ impl MessageProcessor {
             }
         }
 
+        let ids = response_items
+            .iter()
+            .map(|item| item.skill_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let owners = match self.crud_store.skill_plugin_owners(&ids).await {
+            Ok(owners) => owners
+                .into_iter()
+                .filter_map(|(owner, parent)| {
+                    owner.skill_id.clone().zip(parent).map(|(id, parent)| {
+                        (
+                            id,
+                            pioneer_protocol::PackageOwner {
+                                kind: parent.kind,
+                                package_id: owner.package_id,
+                                member_key: owner.member_key,
+                            },
+                        )
+                    })
+                })
+                .collect::<std::collections::HashMap<_, _>>(),
+            Err(_) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        "skill ownership unavailable",
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        for item in &mut response_items {
+            item.package_owner = owners.get(item.skill_id.as_str()).cloned();
+            item.plugin_owner = item
+                .package_owner
+                .as_ref()
+                .and_then(pioneer_protocol::PackageOwner::as_plugin);
+        }
         let response_payload = SkillListResponse {
             snapshot_version: self.current_skills_snapshot_version(),
             generated_at: now_timestamp_secs(),

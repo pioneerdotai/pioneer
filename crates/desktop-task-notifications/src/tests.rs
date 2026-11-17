@@ -41,7 +41,7 @@ impl DesktopNotificationPort for FakePort {
 }
 fn input(revision: u64, actionable: bool) -> Arc<TaskInboxPublication> {
     Arc::new(serde_json::from_value(serde_json::json!({
-        "workspace_id":"a", "revision":revision, "next_cursor":null,"unread_count":if actionable {1}else{0}, "loading":false, "error":null, "opened":null, "native_notifications":[],
+        "workspace_id":"a", "revision":revision, "next_cursor":null,"unread_count":if actionable {1}else{0}, "loading":false, "request_busy":false, "completed_operation_id":null, "error":null, "opened":null, "native_notifications":[],
         "items":[{"revision":revision,"dismissing":false,"notification":{"workspaceId":"a","taskId":"t","runId":"r","title":"Task","threadId":"root","threadTitle":"Root","status":"succeeded","completedAt":1,"readAt":if actionable { None } else { Some(2) }}}]
     })).unwrap())
 }
@@ -174,7 +174,6 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
     });
     let popup = cx.debug_bounds("task-inbox-popup").unwrap();
     let viewport = cx.debug_bounds("task-inbox-viewport").unwrap();
-    let header = cx.debug_bounds("task-inbox-header").unwrap();
     let footer = cx.debug_bounds("task-inbox-footer").unwrap();
     assert_eq!(popup.left(), viewport.left());
     assert_eq!(
@@ -182,7 +181,11 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
         viewport.right(),
         "scroll viewport reaches popup edge"
     );
-    assert!(header.bottom() <= viewport.top());
+    assert_eq!(
+        popup.top(),
+        viewport.top(),
+        "history starts at the top of the headerless popup"
+    );
     assert!(viewport.bottom() <= footer.top());
     assert!(cx.debug_bounds("task-inbox-read-all").is_some());
     for _ in 0..32 {
@@ -202,7 +205,11 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
                 .all(|item| item.is_actionable())
         );
     });
-    assert_eq!(cx.debug_bounds("task-inbox-header").unwrap(), header);
+    assert_eq!(
+        cx.debug_bounds("task-inbox-popup").unwrap().top(),
+        popup.top(),
+        "popup stays anchored while the history scrolls"
+    );
     assert_eq!(
         cx.debug_bounds("task-inbox-footer").unwrap(),
         footer,

@@ -25,10 +25,6 @@
       "type": "number",
       "format": "float"
     },
-    "native_memvid_adaptive_used": {
-      "type": "boolean",
-      "default": false
-    },
     "results_returned": {
       "type": "integer",
       "format": "uint32",

@@ -42,12 +42,18 @@ pub struct OpenRouterProvider {
     base_url: String,
     timeout_policy: ProviderTimeoutPolicy,
     client: Client,
+    embedding_tariffs:
+        std::sync::RwLock<std::collections::BTreeMap<String, crate::catalog::CatalogModel>>,
 }
 
 // ── OpenRouter API request types ────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
 struct ApiChatRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
     model: String,
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -467,7 +473,7 @@ impl OpenRouterFailure {
         stage: ProviderFailureStage,
         retry_after_ms: Option<u64>,
     ) -> Self {
-        let status = error
+        let native_status = error
             .code
             .as_ref()
             .and_then(|code| {
@@ -477,7 +483,18 @@ impl OpenRouterFailure {
             .and_then(|code| u16::try_from(code).ok())
             .filter(|code| (100..=599).contains(code));
         let description = error.description();
-        Self::from_envelope(Some(error), id, status, retry_after_ms, &description, stage)
+        let mut failure = Self::from_envelope(
+            Some(error),
+            id,
+            native_status,
+            retry_after_ms,
+            &description,
+            stage,
+        );
+        // A native event code retains its established classification meaning,
+        // but is not an HTTP failure status: generation runs after HTTP success.
+        failure.classification.http_status = None;
+        failure
     }
 
     // Classify the original transport failure before discarding its text and
@@ -629,8 +646,10 @@ impl OpenRouterArchitecture {
 #[serde(transparent)]
 struct OpenRouterReasoningMetadata(serde_json::Map<String, serde_json::Value>);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OpenRouterPricing {
+    #[serde(flatten)]
+    additional: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
@@ -662,6 +681,8 @@ impl OpenRouterProvider {
         let generation =
             crate::generation::chat_fields_from_catalog(catalog, "openrouter", request)?;
         Ok(ApiChatRequest {
+            session_id: None,
+            cache_control: None,
             generation,
             model: request.model.clone(),
             messages,
@@ -703,6 +724,7 @@ impl OpenRouterProvider {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
+            embedding_tariffs: std::sync::RwLock::new(Default::default()),
         }
     }
 
@@ -1024,6 +1046,36 @@ impl OpenRouterProvider {
         format!("{}/embeddings", self.base_url)
     }
 
+    fn build_native_request(
+        &self,
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let mut body = Self::build_request_from_prepared(request, prepared, stream)?;
+        body.cache_control = crate::usage::openrouter_cache_control(&self.base_url, &request.model);
+        body.session_id = self.cache_session_id();
+        Ok(body)
+    }
+
+    fn cache_session_id(&self) -> Option<String> {
+        if self.base_url != BASE_URL {
+            return None;
+        }
+        let authority = crate::attachments::runtime::current_authority_fingerprint()
+            .unwrap_or_else(|_| {
+                crate::continuation::replay_authority(
+                    "openrouter-cache-routing",
+                    &[&self.base_url, &self.api_key],
+                )
+            });
+        let authority = crate::continuation::replay_authority(
+            "openrouter-cache-routing",
+            &[&authority, &self.base_url],
+        );
+        crate::prompt_cache::Comparison::begin(&authority)?.affinity_key()
+    }
+
     fn with_app_attribution(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request
             .header("HTTP-Referer", APP_REFERER)
@@ -1047,7 +1099,19 @@ impl OpenRouterProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
+        Self::api_error_for_operation(response, false).await
+    }
+
+    async fn api_error_for_operation(
+        response: reqwest::Response,
+        embedding: bool,
+    ) -> anyhow::Error {
         let facts = ResponseFailureFacts::capture(&response);
+        // HTTP 413 is sufficient payload evidence even if its body cannot
+        // fit the bounded reader. Preserve safe header facts and drop transport.
+        if embedding && facts.http_status == Some(413) {
+            return OpenRouterFailure::http("", 413, facts.retry_after_ms, facts.request_id).into();
+        }
         let body = match crate::http::read_response_text_bounded(
             response,
             16 * 1024,
@@ -1058,13 +1122,27 @@ impl OpenRouterProvider {
             Ok(body) => body,
             Err(error) => return facts.failure(error, ProviderFailureStage::Connect),
         };
-        OpenRouterFailure::http(
+        let status = facts.http_status.expect("non-success response");
+        let usage = crate::usage::http_error_usage(
             &body,
-            facts.http_status.expect("non-success response"),
-            facts.retry_after_ms,
-            facts.request_id,
-        )
-        .into()
+            if embedding {
+                "embeddings"
+            } else {
+                "chat_completions"
+            },
+            facts.request_id.as_deref(),
+        );
+        let mut failure =
+            OpenRouterFailure::http(&body, status, facts.retry_after_ms, facts.request_id);
+        if embedding {
+            failure.classification.class = super::embedding::classify_input_failure(status, &body);
+        }
+        let error = failure.into();
+        if let Some(usage) = usage {
+            crate::usage::with_error_usage(error, &usage)
+        } else {
+            error
+        }
     }
 
     async fn list_model_entries(
@@ -1379,12 +1457,21 @@ impl OpenRouterProvider {
         crate::ProviderStream {
             stream: Box::pin(chunk_stream),
             diagnostics,
+            message_delivery: crate::ProviderMessageDelivery::default(),
         }
     }
 }
 
 #[async_trait]
 impl crate::traits::Provider for OpenRouterProvider {
+    fn embedding_usage_profile(&self) -> crate::ProviderUsageProfile {
+        crate::ProviderUsageProfile {
+            api: "embeddings".into(),
+            api_version: None,
+            route: crate::usage::route(&self.base_url, "/embeddings"),
+        }
+    }
+
     fn usage_api(&self) -> &'static str {
         "chat_completions"
     }
@@ -1399,6 +1486,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         error
             .downcast_ref::<OpenRouterFailure>()
             .map(|failure| failure.classification.clone())
+            .or_else(|| crate::failure::classify_http_error(error))
     }
 
     fn name(&self) -> &str {
@@ -1461,7 +1549,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = Self::build_request_from_prepared(&request, &prepared, false)?;
+        let api_request = self.build_native_request(&request, &prepared, false)?;
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -1514,8 +1602,8 @@ impl crate::traits::Provider for OpenRouterProvider {
                 .with_reported_model(body.get("model").and_then(serde_json::Value::as_str));
             observed.update(&usage);
             // Chat Completions can report generation failure inside HTTP 200,
-            // either at the top level or in a choice. The envelope code, not 200,
-            // is the failure status in this case.
+            // either at the top level or in a choice. Its native code is a
+            // classification hint, never an HTTP failure status.
             if let Some(error) = body
                 .get("error")
                 .filter(|error| !error.is_null())
@@ -1578,6 +1666,7 @@ impl crate::traits::Provider for OpenRouterProvider {
             }
 
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text,
                 usage,
                 termination,
@@ -1617,7 +1706,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         .await?;
         crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = Self::build_request_from_prepared(&request, &prepared, true)?;
+        let api_request = self.build_native_request(&request, &prepared, true)?;
 
         let request_builder = Self::with_app_attribution(
             self.client
@@ -1672,20 +1761,108 @@ impl crate::traits::Provider for OpenRouterProvider {
             .list_model_entries(self.models_request())
             .await?
             .into_iter()
-            .map(provider_model_from_openrouter_model_entry)
+            .map(|entry| {
+                let mut model = provider_model_from_openrouter_model_entry(entry);
+                // The default OpenRouter list is filtered to text output and
+                // served by /chat/completions. Explicit native modalities can
+                // narrow that operation-scoped evidence, including private URLs.
+                model.capabilities.chat = Some(
+                    model
+                        .capabilities
+                        .input_modalities
+                        .as_ref()
+                        .is_none_or(|input| input.iter().any(|kind| kind == "text"))
+                        && model
+                            .capabilities
+                            .output_modalities
+                            .as_ref()
+                            .is_none_or(|output| output.iter().any(|kind| kind == "text")),
+                );
+                model
+            })
             .collect())
     }
 
     async fn list_embedding_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        Ok(self
+        let entries = self
             .list_model_entries(
                 self.models_request()
                     .query(&[("output_modalities", "embeddings")]),
             )
-            .await?
+            .await?;
+        let captured = chrono::Utc::now().to_rfc3339();
+        let mut tariffs = std::collections::BTreeMap::new();
+        for entry in &entries {
+            if let Some(pricing) = &entry.pricing {
+                let mut raw = serde_json::to_value(pricing)?;
+                let mut unknown = false;
+                if let Some(fields) = raw.as_object_mut() {
+                    fields.retain(|key, _| {
+                        let allowed = matches!(
+                            key.as_str(),
+                            "prompt"
+                                | "completion"
+                                | "image"
+                                | "request"
+                                | "input_cache_read"
+                                | "input_cache_write"
+                                | "overrides"
+                                | "web_search"
+                                | "audio"
+                                | "internal_reasoning"
+                        );
+                        unknown |= !allowed;
+                        // Public pricing evidence is lossless even for unknown
+                        // conditions. Private responses retain only the allowlist.
+                        allowed || self.base_url == BASE_URL
+                    });
+                }
+                let metadata = std::collections::BTreeMap::from([
+                    ("pricingEvidenceVersion".into(), serde_json::json!(1)),
+                    (
+                        "pricingUnits".into(),
+                        serde_json::json!("USD_per_million_tokens"),
+                    ),
+                    ("pricingCapturedAt".into(), serde_json::json!(captured)),
+                    (
+                        "pricingSource".into(),
+                        serde_json::json!({"url":"https://openrouter.ai/api/v1/models","units":"USD_per_token","raw":raw,
+                        "unknownRateContract":(unknown || self.base_url!=BASE_URL).then_some("unsupported_or_nonpublic_source_contract")}),
+                    ),
+                ]);
+                tariffs.insert(
+                    entry.id.clone(),
+                    crate::catalog::CatalogModel {
+                        id: entry.id.clone(),
+                        name: entry.id.clone(),
+                        provider: "openrouter".into(),
+                        api: "openai-embeddings".into(),
+                        base_url: self.base_url.clone(),
+                        context_window: entry.context_length.unwrap_or(0),
+                        max_tokens: 0,
+                        reasoning: false,
+                        input: vec!["text".into()],
+                        cost: serde_json::json!({}),
+                        metadata,
+                    },
+                );
+            }
+        }
+        self.embedding_tariffs
+            .write()
+            .expect("embedding tariff snapshot")
+            .extend(tariffs);
+        Ok(entries
             .into_iter()
             .map(openrouter_embedding_model_from_openrouter_model_entry)
             .collect())
+    }
+    fn model_catalog_entry(&self, model: &str) -> Option<crate::catalog::CatalogModel> {
+        self.embedding_tariffs
+            .read()
+            .expect("embedding tariff snapshot")
+            .get(model)
+            .cloned()
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
@@ -1716,20 +1893,26 @@ impl crate::traits::Provider for OpenRouterProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            return Err(Self::api_error_for_operation(response, true).await);
         }
 
+        let request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
         let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
             response,
             Default::default(),
             "provider_response",
         )
         .await?;
-        response.into_response(expected_count)
+        super::embedding::with_request_id(response.into_response(expected_count), request_id)
     }
 }
 
-const OPENROUTER_GATEWAY_REASONING_EFFORTS: &[&str] =
+const OPENROUTER_REASONING_EFFORT_VALUES: &[&str] =
     &["max", "xhigh", "high", "medium", "low", "minimal", "none"];
 
 fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> ProviderModelInfo {
@@ -1776,6 +1959,9 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
     }
 
     ProviderModelInfo {
+        service_modes: None,
+        context_authority: None,
+        context_tiers: None,
         id: m.id.clone(),
         name: m.name,
         description: m.description,
@@ -1812,7 +1998,15 @@ fn openrouter_embedding_model_from_openrouter_model_entry(
     m: OpenRouterModelEntry,
 ) -> ProviderModelInfo {
     let mut model = provider_model_from_openrouter_model_entry(m);
-    model.capabilities.embeddings = Some(true);
+    // The server filter proves the operation when modalities are absent, but
+    // cannot erase an explicit narrower native output list.
+    model.capabilities.embeddings = Some(model.capabilities.output_modalities.as_ref().is_none_or(
+        |output| {
+            output
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "embedding" | "embeddings"))
+        },
+    ));
     model.family = Some("embedding".to_owned());
     model
 }
@@ -1825,22 +2019,9 @@ fn openrouter_reasoning_capabilities(
     let efforts = fields.get("supported_efforts");
     let values = efforts.and_then(serde_json::Value::as_array);
     let complete = values.is_some_and(|v| v.iter().all(serde_json::Value::is_string));
-    // Documented null = generic gateway vocabulary; omitted within a reasoning
-    // object = no effort selection. Neither is a confirmed per-model enum.
-    // https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
-    native.insert(
-        "effort.enum".into(),
-        if efforts.is_none() {
-            Some(false)
-        } else if complete {
-            Some(true)
-        } else {
-            None
-        },
-    );
-    if efforts.is_some_and(serde_json::Value::is_null) {
-        native.insert("effort.gateway".into(), Some(true));
-    }
+    // Missing, null and malformed selectors remain unknown; only an actual
+    // string array (including []) establishes a closed enum.
+    native.insert("effort.enum".into(), complete.then_some(true));
     let mut options = Vec::new();
     if complete {
         for value in values.unwrap() {
@@ -1851,14 +2032,9 @@ fn openrouter_reasoning_capabilities(
                 options.push(value.to_owned());
             }
         }
-    } else if native.get("effort.gateway") == Some(&Some(true)) {
-        options = OPENROUTER_GATEWAY_REASONING_EFFORTS
-            .iter()
-            .map(|v| (*v).into())
-            .collect();
     }
-    if complete || native.get("effort.gateway") == Some(&Some(true)) {
-        for value in OPENROUTER_GATEWAY_REASONING_EFFORTS {
+    if complete {
+        for value in OPENROUTER_REASONING_EFFORT_VALUES {
             native
                 .entry(format!("effort.{value}"))
                 .or_insert(Some(options.iter().any(|v| v == value)));
@@ -1912,9 +2088,8 @@ fn openrouter_reasoning_capabilities(
 pub(crate) fn preserve_native_reasoning(reasoning: &mut ProviderModelReasoningCapabilities) {
     let native = &reasoning.native;
     let complete = native.get("effort.enum") == Some(&Some(true));
-    let gateway = native.get("effort.gateway") == Some(&Some(true));
-    if complete || gateway {
-        reasoning.effort_options = OPENROUTER_GATEWAY_REASONING_EFFORTS
+    if complete {
+        reasoning.effort_options = OPENROUTER_REASONING_EFFORT_VALUES
             .iter()
             .filter(|e| native.get(&format!("effort.{e}")) == Some(&Some(true)))
             .map(|e| (*e).to_owned())
@@ -1928,8 +2103,8 @@ pub(crate) fn preserve_native_reasoning(reasoning: &mut ProviderModelReasoningCa
     // default_enabled/mandatory alone do not establish either capability.
     if native.get("supports_token_budget") == Some(&Some(true))
         || native.iter().any(|(k, v)| {
-            k.starts_with("effort.")
-                && !matches!(k.as_str(), "effort.enum" | "effort.gateway")
+            k.strip_prefix("effort.")
+                .is_some_and(|effort| ReasoningEffort::from_str(effort).is_some())
                 && *v == Some(true)
         })
     {
@@ -2082,7 +2257,7 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("budget"));
             let error = provider
-                .embed(EmbeddingRequest::new(model, vec![" a".repeat(8193)]))
+                .embed(EmbeddingRequest::new(model, vec!["abcd".repeat(8193)]))
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("token budget"));
@@ -2141,7 +2316,7 @@ mod tests {
         }
     }
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
-    use crate::providers::OpenAiCompatibleProvider;
+    use crate::providers::ChatCompletionsApiCompatibleProvider;
     use crate::tools::stream::IncrementalLineDecoder;
     use crate::traits::Provider;
     use crate::types::{
@@ -2239,26 +2414,97 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_reasoning_metadata_null_efforts_uses_gateway_values() {
-        let model = model_from_json(
-            r#"{
-                "data": [{
-                    "id": "anthropic/claude",
-                    "reasoning": {
-                        "supported_efforts": null,
-                        "supports_max_tokens": true
+    #[tokio::test]
+    async fn unknown_router_selector_uses_catalog_but_closed_lists_are_not_widened() {
+        let id = "quartz-router-901";
+        let catalog = crate::generation::test_catalog_model(
+            "openrouter",
+            id,
+            "openai/gpt-5.4",
+            serde_json::json!({"reasoning":true,"thinkingLevelMap":{"low":"low","high":"high"}}),
+        );
+        for (selector, expected, native_expected) in [
+            (None, vec!["low", "high"], vec![]),
+            (Some(serde_json::Value::Null), vec!["low", "high"], vec![]),
+            (Some(serde_json::json!({})), vec!["low", "high"], vec![]),
+            (
+                Some(serde_json::json!(["high", 42])),
+                vec!["low", "high"],
+                vec![],
+            ),
+            (Some(serde_json::json!([])), vec![], vec![]),
+            (Some(serde_json::json!(["low"])), vec!["low"], vec!["low"]),
+        ] {
+            let mut metadata = serde_json::json!({"supported":true,"supports_max_tokens":true});
+            if let Some(selector) = selector {
+                metadata["supported_efforts"] = selector;
+            }
+            let parsed = model_from_json(
+                &serde_json::json!({"data":[{"id":id,"reasoning":metadata}]}).to_string(),
+            );
+            let native = parsed
+                .capabilities
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .native
+                .clone();
+            for snapshot in [None, Some(&catalog)] {
+                let mut models = vec![parsed.clone()];
+                if let Some(catalog) = snapshot {
+                    catalog.enrich("openrouter", &mut models);
+                }
+                let reasoning = models[0].capabilities.reasoning.as_ref().unwrap();
+                let expected_options = if snapshot.is_some() {
+                    expected.clone()
+                } else {
+                    native_expected.clone()
+                };
+                assert_eq!(reasoning.effort_options, expected_options);
+                assert_eq!(reasoning.default_effort, None);
+                for effort in [
+                    None,
+                    Some(ReasoningEffort::Low),
+                    Some(ReasoningEffort::High),
+                ] {
+                    let mut request = crate::generation::test_request(id);
+                    request.reasoning = effort.map(ReasoningConfig::Effort);
+                    for stream in [false, true] {
+                        let result = crate::generation::with_native_reasoning(
+                            "openrouter",
+                            true,
+                            [(id.into(), native.clone())].into_iter().collect(),
+                            async {
+                                OpenRouterProvider::build_chat_request_with_catalog(
+                                    &request,
+                                    vec![],
+                                    stream,
+                                    snapshot,
+                                )
+                            },
+                        )
+                        .await;
+                        let directly_confirmed = effort.is_some_and(|effort| {
+                            native.get(&format!("effort.{}", effort.as_str())) == Some(&Some(true))
+                        });
+                        let catalog_confirmed = snapshot.is_some()
+                            && effort.is_some_and(|effort| expected.contains(&effort.as_str()));
+                        assert_eq!(
+                            result.is_ok(),
+                            effort.is_none() || directly_confirmed || catalog_confirmed
+                        );
+                        if let Ok(body) = result {
+                            let body = serde_json::to_value(body).unwrap();
+                            if let Some(effort) = effort {
+                                assert_eq!(body["reasoning"]["effort"], effort.as_str());
+                            } else {
+                                assert!(body.get("reasoning").is_none());
+                            }
+                        }
                     }
-                }]
-            }"#,
-        );
-
-        let reasoning = model.capabilities.reasoning.expect("reasoning metadata");
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["max", "xhigh", "high", "medium", "low", "minimal", "none"]
-        );
-        assert_eq!(reasoning.supports_token_budget, Some(true));
+                }
+            }
+        }
     }
 
     #[test]
@@ -2344,26 +2590,11 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_custom_base_url() {
-        let provider = OpenRouterProvider::with_base_url("key", "http://localhost:8080");
-        assert_eq!(provider.base_url, "http://localhost:8080");
-    }
-
-    #[test]
     fn custom_base_url_keeps_prefix_without_double_slash() {
         let provider = OpenRouterProvider::with_base_url("key", "http://localhost:8080/gateway/");
         assert_eq!(
             provider.models_url(),
             "http://localhost:8080/gateway/models"
-        );
-    }
-
-    #[test]
-    fn chat_completions_url_built_correctly() {
-        let provider = OpenRouterProvider::new("key");
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://openrouter.ai/api/v1/chat/completions"
         );
     }
 
@@ -2605,7 +2836,7 @@ mod tests {
             name: "inspect".to_owned(),
             arguments: "{}".to_owned(),
         }];
-        let replay = OpenAiCompatibleProvider::assistant_replay_state(
+        let replay = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             "deepseek",
             None,
             Some("portable deepseek reasoning".to_owned()),
@@ -2722,7 +2953,7 @@ mod tests {
     #[test]
     fn convert_messages_tool_attachment_splits_into_tool_and_user_messages() {
         let mut tool_message =
-            ChatMessage::tool_result("call_1", "computer_use", "{\"status\":\"ok\"}");
+            ChatMessage::tool_result("call_1", "cua_get_window_state", "{\"status\":\"ok\"}");
         tool_message.content_parts.push(MessageContentPart::image(MessageAttachment {
             mime_type: "image/png".to_owned(),
             name: Some("snapshot.png".to_owned()),
@@ -2750,7 +2981,10 @@ mod tests {
         assert_eq!(api_messages[0].role, "user");
         assert_eq!(api_messages[1].role, "tool");
         assert_eq!(api_messages[1].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(api_messages[1].name.as_deref(), Some("computer_use"));
+        assert_eq!(
+            api_messages[1].name.as_deref(),
+            Some("cua_get_window_state")
+        );
         assert_eq!(api_messages[2].role, "user");
         match api_messages[2].content.as_ref() {
             Some(ApiMessageContent::Parts(parts)) => {
@@ -2767,6 +3001,8 @@ mod tests {
     #[test]
     fn api_request_serializes_correctly() {
         let request = ApiChatRequest {
+            session_id: None,
+            cache_control: None,
             generation: Default::default(),
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![
@@ -2809,86 +3045,6 @@ mod tests {
     }
 
     #[test]
-    fn api_request_serializes_reasoning_options() {
-        let request = ApiChatRequest {
-            generation: Default::default(),
-            model: "openai/gpt-5".into(),
-            messages: vec![ApiMessage {
-                role: "user".into(),
-                content: Some(ApiMessageContent::Text("Hello".into())),
-                reasoning_content: None,
-                reasoning_details: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            }],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: Some(ApiReasoningOptions {
-                effort: "medium".to_owned(),
-            }),
-            stream: false,
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"reasoning\":{\"effort\":\"medium\"}"));
-    }
-
-    #[test]
-    fn api_request_serializes_reasoning_options_for_any_model() {
-        let request = ApiChatRequest {
-            generation: Default::default(),
-            model: "anthropic/claude-sonnet-4".into(),
-            messages: vec![ApiMessage {
-                role: "user".into(),
-                content: Some(ApiMessageContent::Text("Hello".into())),
-                reasoning_content: None,
-                reasoning_details: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            }],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: Some(ApiReasoningOptions {
-                effort: "medium".to_owned(),
-            }),
-            stream: false,
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"reasoning\":{\"effort\":\"medium\"}"));
-    }
-
-    #[test]
-    fn api_response_deserializes() {
-        let json = r#"{"choices":[{"message":{"content":"Hi from OpenRouter"}}]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices.len(), 1);
-        assert_eq!(
-            response.choices[0].message.content.as_deref(),
-            Some("Hi from OpenRouter")
-        );
-    }
-
-    #[test]
-    fn api_response_reasoning_field_does_not_override_content_text() {
-        let json = r#"{"choices":[{"message":{"content":"","reasoning":"thinking"}}]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices[0].message.effective_content(), "");
-        assert_eq!(
-            response.choices[0].message.reasoning.as_deref(),
-            Some("thinking")
-        );
-    }
-
-    #[test]
     fn api_response_preserves_structured_reasoning_details() {
         let json = r#"{
             "choices": [{
@@ -2921,42 +3077,6 @@ mod tests {
     }
 
     #[test]
-    fn api_response_with_usage() {
-        let json = r#"{
-            "choices": [{"message": {"content": "Hello"}}],
-            "usage": {"prompt_tokens": 42, "completion_tokens": 15}
-        }"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = response._usage.unwrap().normalized();
-        assert_eq!(usage.input_tokens, Some(42));
-        assert_eq!(usage.output_tokens, Some(15));
-    }
-
-    #[test]
-    fn api_response_empty_choices() {
-        let json = r#"{"choices":[]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(response.choices.is_empty());
-    }
-
-    #[test]
-    fn stream_response_deserializes_delta() {
-        let json = r#"{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices.len(), 1);
-        assert_eq!(response.choices[0].delta.content.as_deref(), Some("Hello"));
-        assert!(response.choices[0].finish_reason.is_none());
-    }
-
-    #[test]
-    fn stream_response_deserializes_finish() {
-        let json = r#"{"choices":[{"delta":{"content":null},"finish_reason":"stop"}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
-        assert!(!response.choices[0].delta.has_payload());
-    }
-
-    #[test]
     fn stream_response_distinguishes_empty_terminal_repeats_from_real_payload() {
         for json in [
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
@@ -2975,15 +3095,6 @@ mod tests {
             let response: StreamResponse = serde_json::from_str(json).unwrap();
             assert!(response.choices[0].delta.has_payload(), "{json}");
         }
-    }
-
-    #[test]
-    fn stream_response_allows_usage_with_empty_post_terminal_choices() {
-        let json = r#"{"usage":{"prompt_tokens":42,"completion_tokens":15},"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-
-        assert!(response.usage.is_some());
-        assert!(!response.choices[0].delta.has_payload());
     }
 
     #[tokio::test]
@@ -3006,6 +3117,8 @@ mod tests {
         .unwrap();
         let response = provider
             .chat(ChatRequest {
+                tool_declarations: None,
+                service_mode: None,
                 model: "fixture".into(),
                 messages: vec![ChatMessage::user("hello")],
                 temperature: None,
@@ -3119,29 +3232,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_response_deserializes_error_envelope_without_delta() {
-        let json = r#"{"error":{"message":"upstream failed","type":"provider_error","code":524},"choices":[{"finish_reason":"error"}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-
-        assert_eq!(
-            response.error.unwrap().description(),
-            "upstream failed, type=provider_error, code=524"
-        );
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("error"));
-        assert!(response.choices[0].delta.content.is_none());
-    }
-
-    #[test]
-    fn stream_response_deserializes_reasoning_field() {
-        let json = r#"{"choices":[{"delta":{"reasoning":"trace"},"finish_reason":null}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            response.choices[0].delta.reasoning.as_deref(),
-            Some("trace")
-        );
-    }
-
-    #[test]
     fn stream_response_preserves_reasoning_detail_chunks_in_order() {
         let first: StreamResponse = serde_json::from_str(
             r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"first"}]},"finish_reason":null}]}"#,
@@ -3164,19 +3254,80 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
+    fn default_endpoint_and_capabilities() {
         use crate::traits::Provider;
         let provider = OpenRouterProvider::new("key");
-        assert_eq!(provider.name(), "openrouter");
-    }
-
-    #[test]
-    fn provider_capabilities() {
-        use crate::traits::Provider;
-        let provider = OpenRouterProvider::new("key");
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn api_response_preserves_literal_choice_content_and_reasoning() {
+        for (json, expected) in [
+            (
+                r#"{"choices":[{"message":{"content":"","reasoning":"thinking"}}]}"#,
+                vec![("".to_owned(), Some("thinking"))],
+            ),
+            (r#"{"choices":[]}"#, vec![]),
+        ] {
+            let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+            let actual = response
+                .choices
+                .iter()
+                .map(|choice| {
+                    (
+                        choice.message.effective_content(),
+                        choice.message.reasoning.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn stream_response_preserves_finish_error_and_reasoning_envelopes() {
+        type ChoiceView<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, bool);
+        let cases: [(&str, Option<&str>, Vec<ChoiceView<'_>>); 3] = [
+            (
+                r#"{"choices":[{"delta":{"content":null},"finish_reason":"stop"}]}"#,
+                None,
+                vec![(Some("stop"), None, None, false)],
+            ),
+            (
+                r#"{"error":{"message":"upstream failed","type":"provider_error","code":524},"choices":[{"finish_reason":"error"}]}"#,
+                Some("upstream failed, type=provider_error, code=524"),
+                vec![(Some("error"), None, None, false)],
+            ),
+            (
+                r#"{"choices":[{"delta":{"reasoning":"trace"},"finish_reason":null}]}"#,
+                None,
+                vec![(None, None, Some("trace"), true)],
+            ),
+        ];
+        for (json, expected_error, expected_choices) in cases {
+            let response: StreamResponse = serde_json::from_str(json).unwrap();
+            let error = response.error.as_ref().map(StreamError::description);
+            assert_eq!(error.as_deref(), expected_error, "{json}");
+            let choices = response
+                .choices
+                .iter()
+                .map(|choice| {
+                    (
+                        choice.finish_reason.as_deref(),
+                        choice.delta.content.as_deref(),
+                        choice.delta.reasoning.as_deref(),
+                        choice.delta.has_payload(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(choices, expected_choices, "{json}");
+        }
     }
 }
 
@@ -3733,5 +3884,70 @@ mod merged_stream_boundary_tests {
                 assert!(crate::failure::provider_stream_incomplete(error).is_some());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_session_tests {
+    use super::*;
+    use crate::{ChatMessage, traits::Provider};
+
+    #[tokio::test]
+    async fn native_session_wire_is_stable_and_scope_bound() {
+        let provider = OpenRouterProvider::new("session-fixture-key");
+        assert!(provider.cache_session_id().is_none());
+        crate::prompt_cache::scope("router-session-workspace", "owner", "main", async {
+            let key = provider.cache_session_id().unwrap();
+            assert_eq!(key.len(), 64);
+            assert_eq!(
+                OpenRouterProvider::new("session-fixture-key").cache_session_id(),
+                Some(key.clone())
+            );
+            for stream in [false, true] {
+                for (model, text) in [("fixture-one", "first"), ("fixture-two", "next turn")] {
+                    let mut request =
+                        super::super::history_test_support::request(vec![ChatMessage::user(text)]);
+                    request.model = model.into();
+                    let prepared = crate::attachments::prepare_messages_for_provider(
+                        provider.name(),
+                        &provider.capabilities(),
+                        &request.messages,
+                    )
+                    .unwrap();
+                    let request = provider
+                        .build_native_request(&request, &prepared, stream)
+                        .unwrap();
+                    let wire = serde_json::to_value(request).unwrap();
+                    assert_eq!(wire["session_id"], key);
+                    assert_eq!(wire["stream"], stream);
+                    assert_eq!(wire["model"], model);
+                    assert_eq!(wire["messages"][0]["content"], text);
+                }
+            }
+            assert_ne!(
+                OpenRouterProvider::new("changed-key").cache_session_id(),
+                Some(key.clone())
+            );
+            assert!(
+                OpenRouterProvider::with_base_url(
+                    "session-fixture-key",
+                    "https://proxy.example/api/v1"
+                )
+                .cache_session_id()
+                .is_none()
+            );
+            for (workspace, owner, purpose) in [
+                ("other-router-workspace", "owner", "main"),
+                ("router-session-workspace", "child", "main"),
+                ("router-session-workspace", "owner", "preflight"),
+                ("router-session-workspace", "owner", "compaction"),
+            ] {
+                crate::prompt_cache::scope(workspace, owner, purpose, async {
+                    assert_ne!(provider.cache_session_id(), Some(key.clone()));
+                })
+                .await;
+            }
+        })
+        .await;
     }
 }

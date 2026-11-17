@@ -51,9 +51,7 @@ impl AdministrationAvatars {
     pub(crate) fn scopes(&self) -> Vec<ClientScope> {
         self.demand
             .keys()
-            .map(|key| ClientScope::Avatar {
-                principal_id: key.clone(),
-            })
+            .map(|key| ClientScope::Image { key: key.clone() })
             .collect()
     }
     pub(crate) fn reconcile(
@@ -100,9 +98,7 @@ impl AdministrationAvatars {
         for key in self.demand.keys() {
             if let Some(publication) = self
                 .binding
-                .publication(&ClientScope::Avatar {
-                    principal_id: key.clone(),
-                })
+                .publication(&ClientScope::Image { key: key.clone() })
                 .and_then(|p| p.snapshot().payload::<AvatarPublication>())
             {
                 self.publications.insert(key.clone(), publication);
@@ -128,7 +124,7 @@ impl AdministrationAvatars {
             .iter()
             .find(|(_, demand)| &demand.request.principal_id == principal)?;
         let avatar = self.publications.get(key)?;
-        (avatar.avatar_revision() == demand.request.avatar_revision).then(|| AvatarInput {
+        (avatar.revision() == demand.request.avatar_revision).then(|| AvatarInput {
             cached_image_path: avatar.local_path().map(|path| path.as_path().to_owned()),
         })
     }

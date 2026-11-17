@@ -28,6 +28,7 @@ pub(crate) async fn append_skills(
         let mut remaining = 256 * 1024usize;
         for skill in skills {
             let files = pioneer_skills::snapshot_skill_package(
+                std::path::Path::new(&skill.definition.identity.source_root),
                 std::path::Path::new(&skill.definition.identity.skill_dir),
                 256,
                 remaining,

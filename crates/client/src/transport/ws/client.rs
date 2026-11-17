@@ -1,5 +1,6 @@
 //! WebSocket client worker.
 
+use super::runtime::{SocketCancelReceiver, SocketLifetime, SocketReceipt};
 use super::{
     GatewayWsConnectSpec, GatewayWsEvent,
     decode::{
@@ -12,17 +13,14 @@ use super::{
         WEBSOCKET_PONG_TIMEOUT_MESSAGE, WEBSOCKET_STREAM_ENDED_MESSAGE, connect_failed_event,
         connected_event, connecting_event, disconnect_reason_from_close, disconnected_event,
         next_reconnect_plan, should_retry_after_connect_failure, terminal_reason_from_disconnect,
-        websocket_ping_failed_message, websocket_pong_send_failed_message,
         websocket_read_failed_message, websocket_write_failed_message,
     },
 };
 use crate::rpc::{JsonRpcResponseSender, PendingJsonRpcRequests};
 use anyhow::{Context as _, Result};
-use futures_util::{SinkExt, StreamExt};
-use pioneer_protocol::{
-    ArtifactUploadChunkAckNotification, AuthSecretString, GatewayNotification,
-    SkillsUploadChunkAckNotification,
-};
+use futures_util::{SinkExt, StreamExt, future::Either};
+use pioneer_protocol::{AuthSecretString, GatewayNotification, SkillsUploadChunkAckNotification};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, sync::mpsc::Sender, thread};
 use tokio::{
@@ -32,6 +30,125 @@ use tokio::{
     time::{Instant, MissedTickBehavior, sleep, timeout},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+use pioneer_observability::work::{Boundary, ExecutorRole, WorkItem, WorkKind};
+
+/// Process-local event carrier; protocol/FFI event DTOs remain unchanged.
+#[derive(Clone)]
+pub struct GatewayWsEventSender {
+    inner: Sender<WorkItem<GatewayWsEvent>>,
+    queue: pioneer_observability::queues::QueueObserver,
+}
+impl From<Sender<WorkItem<GatewayWsEvent>>> for GatewayWsEventSender {
+    fn from(inner: Sender<WorkItem<GatewayWsEvent>>) -> Self {
+        Self {
+            inner,
+            queue: pioneer_observability::queues::QueueObserver::new(
+                pioneer_observability::queues::QueueKind::ClientController,
+                None,
+                "Gateway event payload bytes unavailable without serialization",
+            ),
+        }
+    }
+}
+impl GatewayWsEventSender {
+    pub fn send(
+        &self,
+        event: GatewayWsEvent,
+    ) -> std::result::Result<(), std::sync::mpsc::SendError<GatewayWsEvent>> {
+        use pioneer_observability::queues::QueueBytes;
+        self.inner
+            .send(
+                WorkItem::new(
+                    event,
+                    Boundary::EventLane,
+                    WorkKind::Event,
+                    ExecutorRole::ClientController,
+                )
+                .observed(self.queue.clone(), QueueBytes::Unsupported),
+            )
+            .map_err(|error| {
+                if let Some((queue, bytes)) = &error.0.queue {
+                    queue.rejected_send(*bytes);
+                }
+                std::sync::mpsc::SendError(error.0.value)
+            })
+    }
+}
+pub(super) struct WsSender<T> {
+    inner: UnboundedSender<WorkItem<T>>,
+    boundary: Boundary,
+    queue: pioneer_observability::queues::QueueObserver,
+}
+impl<T> Clone for WsSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            boundary: self.boundary,
+            queue: self.queue.clone(),
+        }
+    }
+}
+pub(super) trait WsQueued {
+    fn observed_bytes(&self) -> pioneer_observability::queues::QueueBytes;
+}
+impl<T: WsQueued> WsSender<T> {
+    pub(super) fn send(&self, value: T) -> Result<(), tokio::sync::mpsc::error::SendError<T>> {
+        let bytes = value.observed_bytes();
+        self.inner
+            .send(
+                WorkItem::new(
+                    value,
+                    self.boundary,
+                    if matches!(self.boundary, Boundary::ClientRpc) {
+                        WorkKind::ClientRpc
+                    } else {
+                        WorkKind::ClientCommand
+                    },
+                    ExecutorRole::ClientWs,
+                )
+                .observed(self.queue.clone(), bytes),
+            )
+            .map_err(|error| {
+                if let Some((queue, bytes)) = &error.0.queue {
+                    queue.rejected_send(*bytes);
+                }
+                tokio::sync::mpsc::error::SendError(error.0.value)
+            })
+    }
+}
+impl<T> From<UnboundedSender<WorkItem<T>>> for WsSender<T> {
+    fn from(inner: UnboundedSender<WorkItem<T>>) -> Self {
+        Self {
+            inner,
+            boundary: Boundary::ClientCommand,
+            queue: pioneer_observability::queues::QueueObserver::new(
+                pioneer_observability::queues::QueueKind::ClientCommands,
+                None,
+                "command payload bytes; non-payload fields excluded",
+            ),
+        }
+    }
+}
+pub(super) fn work_channel<T>(boundary: Boundary) -> (WsSender<T>, UnboundedReceiver<WorkItem<T>>) {
+    let (inner, receiver) = unbounded_channel();
+    (
+        WsSender {
+            inner,
+            boundary,
+            queue: pioneer_observability::queues::QueueObserver::new(
+                if matches!(boundary, Boundary::ClientRpc) {
+                    pioneer_observability::queues::QueueKind::ClientRpc
+                } else {
+                    pioneer_observability::queues::QueueKind::ClientCommands
+                },
+                None,
+                "UTF-8 or binary payload bytes; other command fields excluded",
+            ),
+        },
+        receiver,
+    )
+}
 
 pub enum GatewayWsCommand {
     Connect {
@@ -59,20 +176,18 @@ pub enum GatewayWsCommand {
         response_tx: JsonRpcResponseSender,
     },
     BinaryUploadChunk {
+        expected_connection: Option<u64>,
         upload_id: String,
         offset: u64,
         payload: Vec<u8>,
         response_tx: Sender<std::result::Result<SkillsUploadChunkAckNotification, String>>,
     },
     ArtifactBinaryUploadChunk {
+        expected_connection: Option<u64>,
         upload_id: String,
         offset: u64,
         payload: Vec<u8>,
-        response_tx: Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
-    },
-    VoiceBinaryChunk {
-        expected_connection: Option<u64>,
-        payload: Vec<u8>,
+        response_tx: JsonRpcResponseSender,
     },
     Disconnect,
     DisconnectConnection {
@@ -103,250 +218,397 @@ enum ConnectionRpcCommand {
         upload_id: String,
         offset: u64,
         payload: Vec<u8>,
-        response_tx: Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
+        response_tx: JsonRpcResponseSender,
     },
-    VoiceBinaryChunk {
-        payload: Vec<u8>,
-    },
+}
+
+impl ConnectionRpcCommand {
+    fn fail(self, reason: &str) {
+        match self {
+            Self::Request { response_tx, .. } | Self::RenewAccess { response_tx, .. } => {
+                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(reason)));
+            }
+            Self::BinaryUploadChunk { response_tx, .. } => {
+                let _ = response_tx.send(Err(reason.to_owned()));
+            }
+            Self::ArtifactBinaryUploadChunk { response_tx, .. } => {
+                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(reason)));
+            }
+        }
+    }
+}
+
+fn fail_queued_connection_commands(
+    rpc_rx: &mut UnboundedReceiver<WorkItem<ConnectionRpcCommand>>,
+    reason: &str,
+) {
+    while let Ok(item) = rpc_rx.try_recv() {
+        let mut queue = item.queue.as_ref().map(|(queue, _)| queue.processing());
+        let (command, carrier) = item.received(
+            Boundary::ClientRpc,
+            WorkKind::ClientRpc,
+            ExecutorRole::ClientWs,
+        );
+        carrier.run(|| command.fail(reason));
+        if let Some(queue) = queue.as_mut() {
+            queue.processed();
+        }
+    }
+}
+
+/// Also drains commands when the connection task is aborted during connect/backoff
+/// or while a socket write is pending. Retained cancellation handles are not owners
+/// of transport progress and must not keep these requests waiting after teardown.
+struct ConnectionCommandReceiver(UnboundedReceiver<WorkItem<ConnectionRpcCommand>>);
+
+impl Drop for ConnectionCommandReceiver {
+    fn drop(&mut self) {
+        self.0.close();
+        fail_queued_connection_commands(&mut self.0, "websocket connection owner dropped");
+    }
+}
+
+// Renewals must remain admissible while voice backpressure pauses the data FIFO.
+// Only one renewal may be pending; this ingress adds one bounded waiting slot.
+struct RenewalSender(tokio::sync::mpsc::Sender<WorkItem<ConnectionRpcCommand>>);
+struct RenewalReceiver(tokio::sync::mpsc::Receiver<WorkItem<ConnectionRpcCommand>>);
+
+fn renewal_channel() -> (RenewalSender, RenewalReceiver) {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    (RenewalSender(tx), RenewalReceiver(rx))
+}
+
+impl RenewalSender {
+    fn send(&self, command: ConnectionRpcCommand) -> Result<(), ()> {
+        self.0
+            .try_send(WorkItem::new(
+                command,
+                Boundary::ClientRpc,
+                WorkKind::ClientRpc,
+                ExecutorRole::ClientWs,
+            ))
+            .map_err(|error| {
+                error
+                    .into_inner()
+                    .value
+                    .fail("connection renewal unavailable");
+            })
+    }
+}
+
+impl Drop for RenewalReceiver {
+    fn drop(&mut self) {
+        self.0.close();
+        while let Ok(item) = self.0.try_recv() {
+            item.value.fail("websocket connection owner dropped");
+        }
+    }
 }
 
 struct ActiveConnectionTask {
     connection_id: u64,
     handle: JoinHandle<()>,
-    rpc_tx: UnboundedSender<ConnectionRpcCommand>,
+    rpc_tx: WsSender<ConnectionRpcCommand>,
+    renewal_tx: RenewalSender,
 }
 
-pub fn spawn_worker(
-    command_rx: UnboundedReceiver<GatewayWsCommand>,
-    event_tx: Sender<GatewayWsEvent>,
+pub(crate) fn spawn_worker(
+    command_rx: UnboundedReceiver<WorkItem<GatewayWsCommand>>,
+    event_tx: GatewayWsEventSender,
+    socket: Arc<Mutex<Option<SocketReceipt>>>,
 ) {
+    let worker_work = pioneer_observability::work::WorkCarrier::child(
+        Boundary::StdThread,
+        WorkKind::WorkerLifecycle,
+        pioneer_observability::work::Trigger::Lifecycle,
+        ExecutorRole::ClientWs,
+    );
     thread::spawn(move || {
         let runtime = Runtime::new().expect("failed to create tokio runtime for websocket worker");
-        runtime.block_on(async move {
-            run_worker(command_rx, event_tx).await;
-        });
+        let _runtime_observer = pioneer_observability::runtime::register(
+            runtime.handle(),
+            pioneer_observability::runtime::RuntimeRole::ClientWs,
+        );
+        _runtime_observer.block_on(
+            &runtime,
+            worker_work.scope(async move {
+                run_worker(command_rx, event_tx, socket).await;
+            }),
+        );
     });
 }
 
 async fn run_worker(
-    mut command_rx: UnboundedReceiver<GatewayWsCommand>,
-    event_tx: Sender<GatewayWsEvent>,
+    mut command_rx: UnboundedReceiver<WorkItem<GatewayWsCommand>>,
+    event_tx: GatewayWsEventSender,
+    socket: Arc<Mutex<Option<SocketReceipt>>>,
 ) {
     let mut connection_task: Option<ActiveConnectionTask> = None;
 
-    while let Some(command) = command_rx.recv().await {
-        match command {
-            GatewayWsCommand::Connect {
+    while let Some(item) = pioneer_observability::live::waiting(
+        pioneer_observability::live::WaitKind::QueueItem,
+        command_rx.recv(),
+    )
+    .await
+    {
+        let mut queue = item.queue.as_ref().map(|(queue, _)| queue.processing());
+        let (command, carrier) = item.received(
+            Boundary::ClientCommand,
+            WorkKind::ClientCommand,
+            ExecutorRole::ClientWs,
+        );
+        let proceed = carrier
+            .scope(handle_command(
+                command,
+                &mut connection_task,
+                &event_tx,
+                &socket,
+            ))
+            .await;
+        if let Some(queue) = queue.as_mut() {
+            queue.processed();
+        }
+        if !proceed {
+            break;
+        }
+    }
+    abort_connection_task(&mut connection_task).await;
+}
+async fn handle_command(
+    command: GatewayWsCommand,
+    connection_task: &mut Option<ActiveConnectionTask>,
+    event_tx: &GatewayWsEventSender,
+    socket: &Arc<Mutex<Option<SocketReceipt>>>,
+) -> bool {
+    match command {
+        GatewayWsCommand::Connect {
+            connection_id,
+            spec,
+            initial_result_tx,
+            retry_initial_failure,
+        } => {
+            abort_connection_task(connection_task).await;
+            let (rpc_tx, rpc_rx) = work_channel(Boundary::ClientRpc);
+            let (renewal_tx, renewal_rx) = renewal_channel();
+            *connection_task = Some(ActiveConnectionTask {
                 connection_id,
-                spec,
-                initial_result_tx,
-                retry_initial_failure,
-            } => {
-                abort_connection_task(&mut connection_task).await;
-                let (rpc_tx, rpc_rx) = unbounded_channel();
-                connection_task = Some(ActiveConnectionTask {
-                    connection_id,
-                    handle: tokio::spawn(run_connection_task(
+                handle: tokio::spawn(pioneer_observability::work::inherit(
+                    Boundary::ClientRpc,
+                    WorkKind::WorkerLifecycle,
+                    ExecutorRole::ClientWs,
+                    run_connection_task(
                         connection_id,
                         spec,
                         initial_result_tx,
                         retry_initial_failure,
                         event_tx.clone(),
-                        rpc_rx,
+                        ConnectionCommandReceiver(rpc_rx),
+                        renewal_rx,
                         None,
-                    )),
-                    rpc_tx,
-                });
+                        socket.clone(),
+                    ),
+                )),
+                rpc_tx,
+                renewal_tx,
+            });
+        }
+        GatewayWsCommand::Replace {
+            connection_id,
+            spec,
+            result_tx,
+        } => {
+            if session_access_is_expired(&spec, unix_timestamp_secs()) {
+                let _ = result_tx.send(Err("access_refresh_required".to_owned()));
+                return true;
             }
-            GatewayWsCommand::Replace {
-                connection_id,
-                spec,
-                result_tx,
-            } => {
-                if session_access_is_expired(&spec, unix_timestamp_secs()) {
-                    let _ = result_tx.send(Err("access_refresh_required".to_owned()));
-                    continue;
-                }
-                let _ = event_tx.send(connecting_event(connection_id, &spec));
-                match connect_websocket(&spec).await {
-                    Ok(stream) => {
-                        abort_connection_task(&mut connection_task).await;
-                        let (rpc_tx, rpc_rx) = unbounded_channel();
-                        connection_task = Some(ActiveConnectionTask {
-                            connection_id,
-                            handle: tokio::spawn(run_connection_task(
+            let _ = event_tx.send(connecting_event(connection_id, &spec));
+            match connect_websocket(&spec).await {
+                Ok(stream) => {
+                    abort_connection_task(connection_task).await;
+                    let (rpc_tx, rpc_rx) = work_channel(Boundary::ClientRpc);
+                    let (renewal_tx, renewal_rx) = renewal_channel();
+                    *connection_task = Some(ActiveConnectionTask {
+                        connection_id,
+                        handle: tokio::spawn(pioneer_observability::work::inherit(
+                            Boundary::ClientRpc,
+                            WorkKind::WorkerLifecycle,
+                            ExecutorRole::ClientWs,
+                            run_connection_task(
                                 connection_id,
                                 spec,
                                 None,
                                 true,
                                 event_tx.clone(),
-                                rpc_rx,
+                                ConnectionCommandReceiver(rpc_rx),
+                                renewal_rx,
                                 Some(stream),
-                            )),
-                            rpc_tx,
-                        });
-                        let _ = result_tx.send(Ok(()));
-                    }
-                    Err(error) => {
-                        let message = format!("{error:#}");
-                        let _ = event_tx.send(connect_failed_event(
-                            connection_id,
-                            &spec,
-                            message.clone(),
-                        ));
-                        let _ = result_tx.send(Err(message));
-                    }
+                                socket.clone(),
+                            ),
+                        )),
+                        rpc_tx,
+                        renewal_tx,
+                    });
+                    let _ = result_tx.send(Ok(()));
                 }
-            }
-            GatewayWsCommand::RenewAccess {
-                connection_id,
-                spec,
-                refresh_generation,
-                deadline,
-                response_tx,
-            } => {
-                let fallback = response_tx.clone();
-                if let Some(task) = connection_task
-                    .as_ref()
-                    .filter(|task| task.connection_id == connection_id)
-                {
-                    if task
-                        .rpc_tx
-                        .send(ConnectionRpcCommand::RenewAccess {
-                            spec,
-                            refresh_generation,
-                            deadline,
-                            response_tx,
-                        })
-                        .is_ok()
-                    {
-                        continue;
-                    }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let _ =
+                        event_tx.send(connect_failed_event(connection_id, &spec, message.clone()));
+                    let _ = result_tx.send(Err(message));
                 }
-                let _ = fallback.send(Err(crate::rpc::JsonRpcResponseError::transport(
-                    "connection renewal retired",
-                )));
-            }
-            GatewayWsCommand::Request {
-                expected_connection,
-                request_id,
-                payload,
-                response_tx,
-            } => {
-                let Some(connection_task) = connection_task.as_mut() else {
-                    let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
-                        "websocket is not connected",
-                    )));
-                    continue;
-                };
-
-                if expected_connection.is_some_and(|id| id != connection_task.connection_id) {
-                    let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
-                        "websocket request connection retired",
-                    )));
-                    continue;
-                }
-
-                let fallback_tx = response_tx.clone();
-                if connection_task
-                    .rpc_tx
-                    .send(ConnectionRpcCommand::Request {
-                        request_id,
-                        payload,
-                        response_tx,
-                    })
-                    .is_err()
-                {
-                    let _ = fallback_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
-                        "websocket connection task is unavailable",
-                    )));
-                }
-            }
-            GatewayWsCommand::BinaryUploadChunk {
-                upload_id,
-                offset,
-                payload,
-                response_tx,
-            } => {
-                let Some(connection_task) = connection_task.as_mut() else {
-                    let _ = response_tx.send(Err("websocket is not connected".to_owned()));
-                    continue;
-                };
-
-                let fallback_tx = response_tx.clone();
-                if connection_task
-                    .rpc_tx
-                    .send(ConnectionRpcCommand::BinaryUploadChunk {
-                        upload_id,
-                        offset,
-                        payload,
-                        response_tx,
-                    })
-                    .is_err()
-                {
-                    let _ = fallback_tx
-                        .send(Err("websocket connection task is unavailable".to_owned()));
-                }
-            }
-            GatewayWsCommand::ArtifactBinaryUploadChunk {
-                upload_id,
-                offset,
-                payload,
-                response_tx,
-            } => {
-                let Some(connection_task) = connection_task.as_mut() else {
-                    let _ = response_tx.send(Err("websocket is not connected".to_owned()));
-                    continue;
-                };
-
-                let fallback_tx = response_tx.clone();
-                if connection_task
-                    .rpc_tx
-                    .send(ConnectionRpcCommand::ArtifactBinaryUploadChunk {
-                        upload_id,
-                        offset,
-                        payload,
-                        response_tx,
-                    })
-                    .is_err()
-                {
-                    let _ = fallback_tx
-                        .send(Err("websocket connection task is unavailable".to_owned()));
-                }
-            }
-            GatewayWsCommand::VoiceBinaryChunk {
-                expected_connection,
-                payload,
-            } => {
-                let Some(connection_task) = connection_task.as_mut() else {
-                    continue;
-                };
-
-                if expected_connection.is_some_and(|id| id != connection_task.connection_id) {
-                    continue;
-                }
-                let _ = connection_task
-                    .rpc_tx
-                    .send(ConnectionRpcCommand::VoiceBinaryChunk { payload });
-            }
-            GatewayWsCommand::Disconnect => {
-                abort_connection_task(&mut connection_task).await;
-            }
-            GatewayWsCommand::DisconnectConnection { connection_id } => {
-                if connection_task
-                    .as_ref()
-                    .is_some_and(|task| task.connection_id == connection_id)
-                {
-                    abort_connection_task(&mut connection_task).await;
-                }
-            }
-            GatewayWsCommand::Shutdown => {
-                break;
             }
         }
-    }
+        GatewayWsCommand::RenewAccess {
+            connection_id,
+            spec,
+            refresh_generation,
+            deadline,
+            response_tx,
+        } => {
+            let fallback = response_tx.clone();
+            if let Some(task) = connection_task
+                .as_ref()
+                .filter(|task| task.connection_id == connection_id)
+            {
+                if task
+                    .renewal_tx
+                    .send(ConnectionRpcCommand::RenewAccess {
+                        spec,
+                        refresh_generation,
+                        deadline,
+                        response_tx,
+                    })
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+            let _ = fallback.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                "connection renewal retired",
+            )));
+        }
+        GatewayWsCommand::Request {
+            expected_connection,
+            request_id,
+            payload,
+            response_tx,
+        } => {
+            if !response_tx.is_active() {
+                response_tx.cancel();
+                return true;
+            }
+            let Some(connection_task) = connection_task.as_mut() else {
+                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "websocket is not connected",
+                )));
+                return true;
+            };
 
-    abort_connection_task(&mut connection_task).await;
+            if expected_connection.is_some_and(|id| id != connection_task.connection_id) {
+                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "websocket request connection retired",
+                )));
+                return true;
+            }
+
+            let fallback_tx = response_tx.clone();
+            if connection_task
+                .rpc_tx
+                .send(ConnectionRpcCommand::Request {
+                    request_id,
+                    payload,
+                    response_tx,
+                })
+                .is_err()
+            {
+                let _ = fallback_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "websocket connection task is unavailable",
+                )));
+            }
+        }
+        GatewayWsCommand::BinaryUploadChunk {
+            expected_connection,
+            upload_id,
+            offset,
+            payload,
+            response_tx,
+        } => {
+            let Some(connection_task) = connection_task.as_mut() else {
+                let _ = response_tx.send(Err("websocket is not connected".to_owned()));
+                return true;
+            };
+
+            if expected_connection.is_some_and(|id| id != connection_task.connection_id) {
+                let _ = response_tx.send(Err("websocket connection changed".to_owned()));
+                return true;
+            }
+            let fallback_tx = response_tx.clone();
+            if connection_task
+                .rpc_tx
+                .send(ConnectionRpcCommand::BinaryUploadChunk {
+                    upload_id,
+                    offset,
+                    payload,
+                    response_tx,
+                })
+                .is_err()
+            {
+                let _ =
+                    fallback_tx.send(Err("websocket connection task is unavailable".to_owned()));
+            }
+        }
+        GatewayWsCommand::ArtifactBinaryUploadChunk {
+            expected_connection,
+            upload_id,
+            offset,
+            payload,
+            response_tx,
+        } => {
+            let Some(connection_task) = connection_task.as_mut() else {
+                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "websocket is not connected",
+                )));
+                return true;
+            };
+
+            if !response_tx.is_active()
+                || expected_connection.is_some_and(|id| id != connection_task.connection_id)
+            {
+                response_tx.cancel();
+                return true;
+            }
+            let fallback_tx = response_tx.clone();
+            if connection_task
+                .rpc_tx
+                .send(ConnectionRpcCommand::ArtifactBinaryUploadChunk {
+                    upload_id,
+                    offset,
+                    payload,
+                    response_tx,
+                })
+                .is_err()
+            {
+                let _ = fallback_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                    "websocket connection task is unavailable",
+                )));
+            }
+        }
+        GatewayWsCommand::Disconnect => {
+            abort_connection_task(connection_task).await;
+        }
+        GatewayWsCommand::DisconnectConnection { connection_id } => {
+            if connection_task
+                .as_ref()
+                .is_some_and(|task| task.connection_id == connection_id)
+            {
+                abort_connection_task(connection_task).await;
+            }
+        }
+        GatewayWsCommand::Shutdown => {
+            return false;
+        }
+    }
+    true
 }
 
 async fn abort_connection_task(connection_task: &mut Option<ActiveConnectionTask>) {
@@ -361,9 +623,11 @@ async fn run_connection_task(
     mut spec: GatewayWsConnectSpec,
     mut initial_result_tx: Option<Sender<std::result::Result<(), String>>>,
     retry_initial_failure: bool,
-    event_tx: Sender<GatewayWsEvent>,
-    mut rpc_rx: UnboundedReceiver<ConnectionRpcCommand>,
+    event_tx: GatewayWsEventSender,
+    mut rpc_rx: ConnectionCommandReceiver,
+    mut renewal_rx: RenewalReceiver,
     mut established_stream: Option<GatewayWebSocket>,
+    socket: Arc<Mutex<Option<SocketReceipt>>>,
 ) {
     let mut has_connected = false;
     let mut attempt: u32 = 0;
@@ -382,7 +646,11 @@ async fn run_connection_task(
             Some(stream) => Ok(stream),
             None => {
                 let _ = event_tx.send(connecting_event(connection_id, &spec));
-                connect_websocket(&spec).await
+                pioneer_observability::live::waiting(
+                    pioneer_observability::live::WaitKind::Network,
+                    connect_websocket(&spec),
+                )
+                .await
             }
         };
         match connection {
@@ -391,15 +659,26 @@ async fn run_connection_task(
                 attempt = 0;
                 backoff = spec.timings.reconnect_initial;
 
+                let (receipt, cancels) = SocketReceipt::new(connection_id);
+                *socket.lock().unwrap() = Some(receipt.clone());
+                let _lifetime = SocketLifetime(receipt.clone());
                 if let Some(sender) = initial_result_tx.take() {
                     let _ = sender.send(Ok(()));
                 }
 
                 let _ = event_tx.send(connected_event(connection_id, &spec));
 
-                let reason =
-                    monitor_connection(stream, &mut spec, connection_id, &event_tx, &mut rpc_rx)
-                        .await;
+                let reason = monitor_connection(
+                    stream,
+                    &mut spec,
+                    connection_id,
+                    &event_tx,
+                    &mut rpc_rx.0,
+                    &mut renewal_rx.0,
+                    receipt,
+                    cancels,
+                )
+                .await;
 
                 let _ = event_tx.send(disconnected_event(connection_id, &spec, reason.clone()));
 
@@ -411,7 +690,8 @@ async fn run_connection_task(
                 let delay = plan.delay;
                 let _ = event_tx.send(plan.event);
 
-                sleep(delay).await;
+                pioneer_observability::live::retry(delay.as_millis().min(u64::MAX as u128) as u64);
+                pioneer_observability::live::sleeping(delay, sleep(delay)).await;
                 backoff = plan.next_backoff;
             }
             Err(error) => {
@@ -435,7 +715,8 @@ async fn run_connection_task(
                 let delay = plan.delay;
                 let _ = event_tx.send(plan.event);
 
-                sleep(delay).await;
+                pioneer_observability::live::retry(delay.as_millis().min(u64::MAX as u128) as u64);
+                pioneer_observability::live::sleeping(delay, sleep(delay)).await;
                 backoff = plan.next_backoff;
             }
         }
@@ -493,29 +774,253 @@ fn same_session(left: &GatewayWsConnectSpec, right: &GatewayWsConnectSpec) -> bo
             })
 }
 
+/// One waiting frame beyond the frame currently being written. This is the
+/// smallest handoff that decouples admission from socket progress, not a tuned
+/// throughput limit. Control has its own single slot so data cannot hide Pong.
+const WRITER_HANDOFF_CAPACITY: usize = 1;
+
+struct WriterFrame {
+    message: Message,
+    request: Option<JsonRpcResponseSender>,
+    carrier: pioneer_observability::work::WorkCarrier,
+    correlation: Option<pioneer_observability::scenario::Correlation>,
+    voice_reservation: Option<super::voice_budget::VoiceReservation>,
+}
+
+impl WriterFrame {
+    fn new(message: Message, request: Option<JsonRpcResponseSender>) -> Self {
+        let (correlation, request_work) = request
+            .as_ref()
+            .and_then(|request| request.observation_context())
+            .map(|(correlation, work)| {
+                let writer_work = correlation
+                    .run(|| work.execution_child(WorkKind::ClientRpc, ExecutorRole::ClientWs));
+                (Some(correlation), writer_work)
+            })
+            .unwrap_or_else(|| {
+                (
+                    None,
+                    pioneer_observability::work::WorkCarrier::child(
+                        Boundary::ClientRpc,
+                        WorkKind::ClientRpc,
+                        pioneer_observability::work::Trigger::Rpc,
+                        ExecutorRole::ClientWs,
+                    ),
+                )
+            });
+        Self {
+            message,
+            correlation,
+            request,
+            voice_reservation: None,
+            carrier: request_work,
+        }
+    }
+
+    fn voice(payload: super::voice_budget::QueuedVoiceAudio) -> Self {
+        let mut frame = Self::new(Message::Binary(payload.bytes.into()), None);
+        frame.voice_reservation = Some(payload.reservation);
+        frame
+    }
+}
+
+async fn connection_writer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut writer: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
+    mut data: tokio::sync::mpsc::Receiver<WriterFrame>,
+    mut voice: tokio::sync::mpsc::Receiver<super::voice_budget::QueuedVoiceAudio>,
+    mut control: tokio::sync::mpsc::Receiver<WriterFrame>,
+    mut cancels: tokio::sync::mpsc::Receiver<WriterFrame>,
+    mut voice_cancels: tokio::sync::mpsc::Receiver<WriterFrame>,
+    connection_id: u64,
+) -> String {
+    let mut prefer_cancel = true;
+    let mut fenced = std::collections::VecDeque::new();
+    loop {
+        let cancel = async {
+            tokio::select! { frame = cancels.recv() => frame, frame = voice_cancels.recv() => frame }
+        };
+        tokio::pin!(cancel);
+        let from_fence = !fenced.is_empty();
+        let frame = if from_fence {
+            tokio::select! {
+                biased;
+                frame = control.recv() => frame,
+                frame = &mut cancel, if prefer_cancel => { prefer_cancel = false; frame },
+                frame = async { fenced.pop_front() } => { prefer_cancel = true; frame },
+            }
+        } else {
+            let ordinary = async {
+                tokio::select! {
+                    frame = voice.recv() => frame.map(WriterFrame::voice),
+                    frame = data.recv() => frame,
+                }
+            };
+            tokio::pin!(ordinary);
+            tokio::select! {
+                biased;
+                // Domain Cancel cannot consume or displace transport control.
+                frame = control.recv() => frame,
+                frame = async {
+                    if prefer_cancel {
+                        tokio::select! {
+                            biased;
+                            frame = &mut cancel => Either::Left(frame),
+                            frame = &mut ordinary => Either::Right(frame),
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            frame = &mut ordinary => Either::Right(frame),
+                            frame = &mut cancel => Either::Left(frame),
+                        }
+                    }
+                } => match frame {
+                    Either::Left(frame) => { prefer_cancel = false; frame }
+                    Either::Right(frame) => { prefer_cancel = true; frame }
+                },
+            }
+        };
+        let Some(frame) = frame else {
+            return "websocket writer channel closed".to_owned();
+        };
+        if !from_fence
+            && matches!(&frame.message, Message::Text(text)
+            if serde_json::from_str::<serde_json::Value>(text).ok()
+                .and_then(|v| v.get("method").and_then(|v| v.as_str()).map(str::to_owned))
+                .is_some_and(|method| method == pioneer_protocol::constants::methods::VOICE_SESSION_FINALIZE))
+        {
+            // Capture only the already admitted prefix. The voice budget still
+            // owns every payload while this bounded writer-local fence drains.
+            let prefix = voice.len();
+            for _ in 0..prefix {
+                if let Ok(payload) = voice.try_recv() {
+                    fenced.push_back(WriterFrame::voice(payload));
+                }
+            }
+            fenced.push_back(frame);
+            continue;
+        }
+        let WriterFrame {
+            message,
+            request,
+            carrier,
+            voice_reservation,
+            correlation,
+        } = frame;
+        let write = carrier.scope_result(async {
+            if let Some(request) = request.as_ref() {
+                if !request.try_start_write() {
+                    return Ok(());
+                }
+            }
+            let startup_write = match &message {
+                Message::Text(payload) if request.is_some() => {
+                    pioneer_observability::turn_startup::client_write(payload, connection_id)
+                }
+                _ => None,
+            };
+            // Once claimed, finish this write even if the local request retires.
+            // Dropping this future is allowed only together with both socket halves.
+            let result = writer.send(message).await;
+            drop(startup_write);
+            result
+        });
+        let result = if let Some(correlation) = correlation {
+            correlation.scope(write).await
+        } else {
+            write.await
+        };
+        drop(voice_reservation);
+        if let Err(error) = result {
+            return websocket_write_failed_message(error);
+        }
+    }
+}
+
+struct ConnectionWaiters {
+    connection_id: u64,
+    requests: PendingJsonRpcRequests,
+    renewal: Option<PendingAccessRenewal>,
+    uploads: HashMap<String, Sender<std::result::Result<SkillsUploadChunkAckNotification, String>>>,
+    artifact_uploads: PendingJsonRpcRequests,
+}
+
+impl ConnectionWaiters {
+    fn fail_all(&mut self, reason: &str) {
+        if let Some(pending) = self.renewal.take() {
+            let _ = pending
+                .response_tx
+                .send(Err(crate::rpc::JsonRpcResponseError::transport(reason)));
+        }
+        fail_pending_requests(&mut self.requests, reason);
+        fail_pending_upload_chunks(&mut self.uploads, reason);
+        fail_pending_artifact_upload_chunks(&mut self.artifact_uploads, reason);
+    }
+}
+
+impl Drop for ConnectionWaiters {
+    fn drop(&mut self) {
+        self.fail_all("websocket connection owner dropped");
+        pioneer_observability::turn_startup::connection_lost(self.connection_id);
+    }
+}
+
 async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: tokio_tungstenite::WebSocketStream<S>,
     spec: &mut GatewayWsConnectSpec,
     connection_id: u64,
-    event_tx: &Sender<GatewayWsEvent>,
-    rpc_rx: &mut UnboundedReceiver<ConnectionRpcCommand>,
+    event_tx: &GatewayWsEventSender,
+    rpc_rx: &mut UnboundedReceiver<WorkItem<ConnectionRpcCommand>>,
+    renewal_rx: &mut tokio::sync::mpsc::Receiver<WorkItem<ConnectionRpcCommand>>,
+    receipt: SocketReceipt,
+    mut cancels: SocketCancelReceiver,
 ) -> String {
-    let (mut writer, mut reader) = stream.split();
+    let (writer, mut reader) = stream.split();
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(WRITER_HANDOFF_CAPACITY);
+    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(1);
+    let (voice_cancel_tx, voice_cancel_rx) = tokio::sync::mpsc::channel(1);
+    let writer = connection_writer(
+        writer,
+        data_rx,
+        cancels
+            .voice
+            .take()
+            .expect("voice receiver owned by socket"),
+        control_rx,
+        cancel_rx,
+        voice_cancel_rx,
+        connection_id,
+    );
+    tokio::pin!(writer);
     let mut ping_interval = tokio::time::interval(spec.timings.ping_interval);
     ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_pong = Instant::now();
-    let mut pending_requests = PendingJsonRpcRequests::default();
-    let mut renewal: Option<PendingAccessRenewal> = None;
-    let mut pending_upload_chunks = HashMap::new();
-    let mut pending_artifact_upload_chunks = HashMap::new();
+    let mut waiters = ConnectionWaiters {
+        connection_id,
+        requests: PendingJsonRpcRequests::default(),
+        renewal: None,
+        uploads: HashMap::new(),
+        artifact_uploads: PendingJsonRpcRequests::default(),
+    };
 
+    let _lifetime = SocketLifetime(receipt.clone());
+    // One deferred Finalize frame. Audio bypasses this ordinary handoff;
+    // renewal and domain Cancel also retain independent ingress.
+    let mut pending_data: Option<WriterFrame> = None;
+    let mut prefer_commands = false;
+    let mut prefer_cancels = true;
     let disconnect_reason = loop {
-        let renewal_deadline = renewal.as_ref().map_or_else(
+        let renewal_deadline = waiters.renewal.as_ref().map_or_else(
             || Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
             |pending| pending.deadline,
         );
         tokio::select! {
-            _ = tokio::time::sleep_until(renewal_deadline), if renewal.is_some() => {
+            // Poll the writer before admission to avoid an artificial Full.
+            // Alternate ready reads/commands below so neither can starve the other.
+            biased;
+            reason = &mut writer => { break reason; }
+            _ = tokio::time::sleep_until(renewal_deadline), if waiters.renewal.is_some() => {
                 break "connection renewal timeout".to_owned();
             }
             _ = ping_interval.tick() => {
@@ -523,114 +1028,110 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                     break WEBSOCKET_PONG_TIMEOUT_MESSAGE.to_owned();
                 }
 
-                if let Err(error) = writer.send(Message::Ping(Vec::new().into())).await {
-                    break websocket_ping_failed_message(error);
+                if control_tx.try_send(WriterFrame::new(Message::Ping(Vec::new().into()), None)).is_err() {
+                    break "websocket control writer handoff full or closed".to_owned();
                 }
             }
-            command = rpc_rx.recv() => {
-                match command {
-                    Some(ConnectionRpcCommand::RenewAccess { spec: next, refresh_generation, deadline, response_tx }) => {
-                        if Instant::now() >= deadline || renewal.is_some() || !same_session(spec, &next) || session_access_is_expired(spec, unix_timestamp_secs()) {
-                            let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport("connection renewal unavailable")));
-                            continue;
-                        }
-                        let Some(token) = next.auth_token.clone() else {
-                            let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::InvalidResponse));
-                            continue;
-                        };
-                        let params = pioneer_protocol::AuthAccessRenewParams { access_token: token, refresh_generation };
-                        let request = crate::rpc::build_json_rpc_request_payload(
-                            pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW,
-                            serde_json::to_value(params).expect("access renewal params"),
-                        ).expect("access renewal request");
-                        renewal = Some(PendingAccessRenewal { request_id: request.request_id,
-                            spec: next, response_tx, deadline });
-                        if writer.send(Message::Text(request.payload.into())).await.is_err() {
-                            break "connection renewal write failed".to_owned();
-                        }
-                    }
-                    Some(ConnectionRpcCommand::Request { request_id, payload, response_tx }) => {
-                        pending_requests.insert(request_id.clone(), response_tx);
-                        let startup_write = pioneer_observability::turn_startup::client_write(&payload, connection_id);
-                        let write_result = writer.send(Message::Text(payload.into())).await;
-                        drop(startup_write);
-                        if let Err(error) = write_result {
-                            let message = websocket_write_failed_message(error);
-                            if let Some(response_tx) = pending_requests.remove(request_id.as_str()) {
-                                let _ = response_tx.send(Err(
-                                    crate::rpc::JsonRpcResponseError::transport(message.clone()),
-                                ));
-                            }
-                            break message;
-                        }
-                    }
-                    Some(ConnectionRpcCommand::BinaryUploadChunk { upload_id, offset, payload, response_tx }) => {
-                        let ack_key = upload_ack_key(upload_id.as_str(), offset);
-                        pending_upload_chunks.insert(ack_key.clone(), response_tx);
-                        if let Err(error) = writer.send(Message::Binary(payload.into())).await {
-                            if let Some(response_tx) = pending_upload_chunks.remove(&ack_key) {
-                                let _ = response_tx.send(Err(format!("websocket binary write failed: {error}")));
-                            }
-                            break format!("websocket binary write failed: {error}");
-                        }
-                    }
-                    Some(ConnectionRpcCommand::ArtifactBinaryUploadChunk { upload_id, offset, payload, response_tx }) => {
-                        let ack_key = upload_ack_key(upload_id.as_str(), offset);
-                        pending_artifact_upload_chunks.insert(ack_key.clone(), response_tx);
-                        if let Err(error) = writer.send(Message::Binary(payload.into())).await {
-                            if let Some(response_tx) = pending_artifact_upload_chunks.remove(&ack_key) {
-                                let _ = response_tx.send(Err(format!("websocket binary write failed: {error}")));
-                            }
-                            break format!("websocket binary write failed: {error}");
-                        }
-                    }
-                    Some(ConnectionRpcCommand::VoiceBinaryChunk { payload }) => {
-                        if let Err(error) = writer.send(Message::Binary(payload.into())).await {
-                            break format!("websocket voice binary write failed: {error}");
-                        }
-                    }
-                    None => {
-                        break WEBSOCKET_COMMAND_CHANNEL_CLOSED_MESSAGE.to_owned();
-                    }
+            permit = data_tx.reserve(), if pending_data.is_some() => {
+                match permit {
+                    Ok(permit) => { permit.send(pending_data.take().expect("pending data frame")); }
+                    Err(_) => break "websocket data writer handoff closed".to_owned(),
                 }
             }
-            payload = reader.next() => {
+            input = async {
+                let command = async {
+                    tokio::select! {
+                        item = renewal_rx.recv() => item,
+                        item = rpc_rx.recv(), if pending_data.is_none() => item,
+                    }
+                };
+                tokio::pin!(command);
+                let regular = async {
+                if prefer_commands {
+                    tokio::select! {
+                        biased;
+                        item = &mut command => Either::Left(item),
+                        payload = reader.next() => Either::Right(payload),
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        payload = reader.next() => Either::Right(payload),
+                        item = &mut command => Either::Left(item),
+                    }
+                }
+                };
+                tokio::pin!(regular);
+                if prefer_cancels {
+                    tokio::select! {
+                        biased;
+                        cancel = cancels.recv() => Either::Left(cancel),
+                        input = &mut regular => Either::Right(input),
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        input = &mut regular => Either::Right(input),
+                        cancel = cancels.recv() => Either::Left(cancel),
+                    }
+                }
+            } => match input {
+            Either::Left(cancel) => {
+                prefer_cancels = false;
+                let Some(cancel) = cancel else { break "websocket Cancel admission closed".to_owned(); };
+                if !cancel.response.is_active() { cancel.response.cancel(); continue; }
+                // Same pending owner, before frame admission/claim. Final writer
+                // claim still checks physical/subscription/deadline/cancellation.
+                waiters.requests.insert(cancel.request_id, cancel.response.clone());
+                let voice_control = serde_json::from_str::<serde_json::Value>(&cancel.payload).ok()
+                    .is_some_and(|v| v["method"] == pioneer_protocol::constants::methods::VOICE_SESSION_CANCEL);
+                let frame = WriterFrame::new(Message::Text(cancel.payload.into()), Some(cancel.response.clone()));
+                let handoff = if voice_control { &voice_cancel_tx } else { &cancel_tx };
+                if handoff.try_send(frame).is_err() {
+                    let _ = cancel.response.send(Err(crate::rpc::JsonRpcResponseError::transport("websocket Cancel writer handoff full or closed")));
+                }
+            }
+            Either::Right(input) => {
+            prefer_cancels = true;
+            match input {
+            Either::Right(payload) => {
+                prefer_commands = true;
+                let carrier=pioneer_observability::work::WorkCarrier::independent(Boundary::EventLane,WorkKind::Event,pioneer_observability::work::Trigger::Event,ExecutorRole::ClientWs);
+                let failure=carrier.scope(async {
                 match payload {
                     Some(Ok(Message::Pong(_))) => {
                         last_pong = Instant::now();
                     }
                     Some(Ok(Message::Ping(payload))) => {
-                        if let Err(error) = writer.send(Message::Pong(payload)).await {
-                            break websocket_pong_send_failed_message(error);
+                        if control_tx.try_send(WriterFrame::new(Message::Pong(payload), None)).is_err() {
+                            return Some("websocket control writer handoff full or closed".to_owned());
                         }
                         last_pong = Instant::now();
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        break frame
+                        return Some(frame
                             .map(|value| {
                                 disconnect_reason_from_close(
                                     u16::from(value.code),
                                     value.reason.as_ref(),
                                 )
                             })
-                            .unwrap_or_else(|| WEBSOCKET_CLOSED_BY_PEER_MESSAGE.to_owned());
+                            .unwrap_or_else(|| WEBSOCKET_CLOSED_BY_PEER_MESSAGE.to_owned()));
                     }
                     Some(Ok(Message::Text(payload))) => {
                         if let Some((id, result)) = serde_json::from_str::<serde_json::Value>(&payload)
                             .ok().as_ref().and_then(crate::rpc::decode_json_rpc_response_value)
-                            && renewal.as_ref().is_some_and(|pending| pending.request_id == id)
+                            && waiters.renewal.as_ref().is_some_and(|pending| pending.request_id == id)
                         {
-                            let pending = renewal.take().expect("matched renewal");
+                            let pending = waiters.renewal.take().expect("matched renewal");
                             let result = result.and_then(|value| {
                                 let response: pioneer_protocol::AuthAccessRenewResponse = serde_json::from_value(value)
                                     .map_err(|_| crate::rpc::JsonRpcResponseError::InvalidResponse)?;
-                                if Instant::now() >= pending.deadline || pending.spec.session.as_ref().is_none_or(|identity|
+                                if !pending.response_tx.is_active() || Instant::now() >= pending.deadline || pending.spec.session.as_ref().is_none_or(|identity|
                                     identity.access_expires_at_unix != response.access_expires_at_unix)
                                     || response.access_expires_at_unix <= unix_timestamp_secs() {
                                     return Err(crate::rpc::JsonRpcResponseError::InvalidResponse);
                                 }
-                                // Reconnect reads this same spec, after server acknowledgement only.
-                                *spec = pending.spec;
                                 Ok(serde_json::Value::Null)
                             }).map_err(|error| {
                                 // Do not let peer-supplied text enter lifecycle diagnostics.
@@ -649,51 +1150,131 @@ async fn monitor_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
                                     || crate::gateway::session_lifecycle::auth_code_requires_refresh(code))
                                     .unwrap_or("connection renewal rejected").to_owned()
                             });
-                            let _ = pending.response_tx.send(result);
-                            if let Some(reason) = failure { break reason; }
-                            continue;
+                            let acknowledged = result.is_ok();
+                            let delivered = pending.response_tx.send(result);
+                            if let Some(reason) = failure { return Some(reason); }
+                            if delivered.is_err() { return Some("connection renewal retired".to_owned()); }
+                            if acknowledged {
+                                // Reconnect reads this spec only after a live, acknowledged renewal.
+                                *spec = pending.spec;
+                            }
+                            return None;
                         }
                         let notification = process_text_payload(
                             payload.as_ref(),
                             connection_id,
-                            &mut pending_requests,
-                            &mut pending_upload_chunks,
-                            &mut pending_artifact_upload_chunks,
+                            &mut waiters.requests,
+                            &mut waiters.uploads,
+                            &mut waiters.artifact_uploads,
                             event_tx,
                         );
                         if let Some(GatewayNotification::AuthSessionRevoked(notification)) =
                             notification
                         {
-                            break notification.reason.as_str().to_owned();
+                            return Some(notification.reason.as_str().to_owned());
                         }
                     }
                     Some(Ok(Message::Binary(_))) => {}
                     Some(Ok(Message::Frame(_))) => {}
                     Some(Err(error)) => {
-                        break websocket_read_failed_message(error);
+                        return Some(websocket_read_failed_message(error));
                     }
                     None => {
-                        break WEBSOCKET_STREAM_ENDED_MESSAGE.to_owned();
+                        return Some(WEBSOCKET_STREAM_ENDED_MESSAGE.to_owned());
                     }
                 }
+                None
+                }).await;
+                if let Some(reason)=failure { break reason; }
+            }
+            Either::Left(item) => {
+                prefer_commands = false;
+                let Some(item)=item else {break WEBSOCKET_COMMAND_CHANNEL_CLOSED_MESSAGE.to_owned();};
+                let mut queue=item.queue.as_ref().map(|(queue,_)|queue.processing());
+                let (command,carrier)=item.received(Boundary::ClientRpc,WorkKind::ClientRpc,ExecutorRole::ClientWs);
+                let failure=carrier.scope(async {
+                match Some(command) {
+                    Some(ConnectionRpcCommand::RenewAccess { spec: next, refresh_generation, deadline, response_tx }) => {
+                        if Instant::now() >= deadline || waiters.renewal.is_some() || !same_session(spec, &next) || session_access_is_expired(spec, unix_timestamp_secs()) {
+                            let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport("connection renewal unavailable")));
+                            return None;
+                        }
+                        let Some(token) = next.auth_token.clone() else {
+                            let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::InvalidResponse));
+                            return None;
+                        };
+                        let params = pioneer_protocol::AuthAccessRenewParams { access_token: token, refresh_generation };
+                        let request = crate::rpc::build_json_rpc_request_payload(
+                            pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW,
+                            serde_json::to_value(params).expect("access renewal params"),
+                        ).expect("access renewal request");
+                        let frame = WriterFrame::new(Message::Text(request.payload.into()), Some(response_tx.clone()));
+                        waiters.renewal = Some(PendingAccessRenewal { request_id: request.request_id,
+                            spec: next, response_tx, deadline });
+                        if control_tx.try_send(frame).is_err() {
+                            return Some("connection renewal writer handoff full or closed".to_owned());
+                        }
+                    }
+                    Some(ConnectionRpcCommand::Request { request_id, payload, response_tx }) => {
+                        if !response_tx.is_active() { response_tx.cancel(); return None; }
+                        waiters.requests.insert(request_id, response_tx.clone());
+                        // Registration precedes admission, including a possible fast response.
+                        let frame = WriterFrame::new(Message::Text(payload.into()), Some(response_tx.clone()));
+                        match data_tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) if matches!(&frame.message, Message::Text(payload)
+                                if serde_json::from_str::<serde_json::Value>(payload.as_ref()).ok()
+                                    .is_some_and(|rpc| rpc["method"] == pioneer_protocol::constants::methods::VOICE_SESSION_FINALIZE)) => {
+                                // Only voice Finalize waits; ordinary RPC overload stays unchanged.
+                                pending_data = Some(frame);
+                            }
+                            Err(_) => {
+                                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                                    "websocket writer handoff full or closed",
+                                )));
+                            }
+                        }
+                    }
+                    Some(ConnectionRpcCommand::BinaryUploadChunk { upload_id, offset, payload, response_tx }) => {
+                        let ack_key = upload_ack_key(upload_id.as_str(), offset);
+                        waiters.uploads.insert(ack_key.clone(), response_tx);
+                        if data_tx.try_send(WriterFrame::new(Message::Binary(payload.into()), None)).is_err() {
+                            if let Some(response_tx) = waiters.uploads.remove(&ack_key) {
+                                let _ = response_tx.send(Err("websocket writer handoff full or closed".to_owned()));
+                            }
+                        }
+                    }
+                    Some(ConnectionRpcCommand::ArtifactBinaryUploadChunk { upload_id, offset, payload, response_tx }) => {
+                        if !response_tx.is_active() { response_tx.cancel(); return None; }
+                        let ack_key = upload_ack_key(upload_id.as_str(), offset);
+                        waiters.artifact_uploads.insert(ack_key.clone(), response_tx.clone());
+                        if data_tx.try_send(WriterFrame::new(Message::Binary(payload.into()), Some(response_tx))).is_err() {
+                            if let Some(response_tx) = waiters.artifact_uploads.remove(&ack_key) {
+                                let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport("websocket writer handoff full or closed")));
+                            }
+                        }
+                    }
+
+                    None => {
+                        return Some(WEBSOCKET_COMMAND_CHANNEL_CLOSED_MESSAGE.to_owned());
+                    }
+                }
+                None
+                }).await;
+                if let Some(queue)=queue.as_mut(){queue.processed();}
+                if let Some(failure)=failure {break failure;}
+            }
+            }
+            }
             }
         }
     };
-    pioneer_observability::turn_startup::connection_lost(connection_id);
-
-    if let Some(pending) = renewal.take() {
-        let _ = pending
-            .response_tx
-            .send(Err(crate::rpc::JsonRpcResponseError::transport(
-                disconnect_reason.clone(),
-            )));
+    receipt.retire();
+    waiters.fail_all(&disconnect_reason);
+    fail_queued_connection_commands(rpc_rx, &disconnect_reason);
+    while let Ok(item) = renewal_rx.try_recv() {
+        item.value.fail(&disconnect_reason);
     }
-    fail_pending_requests(&mut pending_requests, disconnect_reason.as_str());
-    fail_pending_upload_chunks(&mut pending_upload_chunks, disconnect_reason.as_str());
-    fail_pending_artifact_upload_chunks(
-        &mut pending_artifact_upload_chunks,
-        disconnect_reason.as_str(),
-    );
     disconnect_reason
 }
 
@@ -725,9 +1306,23 @@ mod tests {
         next.session.as_mut().unwrap().access_expires_at_unix += 600;
         let expires = next.session.as_ref().unwrap().access_expires_at_unix;
         let (events, _event_rx) = mpsc::channel();
-        let (commands, mut command_rx) = unbounded_channel();
+        let events = GatewayWsEventSender::from(events);
+        let (commands, mut command_rx) = work_channel(Boundary::ClientRpc);
+        let (renewals, mut renewal_rx) = renewal_channel();
+        let (receipt, cancels) = SocketReceipt::new(7);
+        let audio = receipt.clone();
         let task = tokio::spawn(async move {
-            monitor_connection(stream, &mut spec, 7, &events, &mut command_rx).await;
+            monitor_connection(
+                stream,
+                &mut spec,
+                7,
+                &events,
+                &mut command_rx,
+                &mut renewal_rx.0,
+                receipt,
+                cancels,
+            )
+            .await;
             spec
         });
         let request = crate::rpc::build_json_rpc_request_payload(
@@ -740,17 +1335,23 @@ mod tests {
             .send(ConnectionRpcCommand::Request {
                 request_id: request.request_id.clone(),
                 payload: request.payload,
-                response_tx: rpc_tx,
+                response_tx: JsonRpcResponseSender::new(
+                    rpc_tx,
+                    std::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+                ),
             })
             .unwrap();
         while !matches!(peer.next().await.unwrap().unwrap(), Message::Text(_)) {}
         let (ack, ack_rx) = mpsc::channel();
-        commands
+        renewals
             .send(ConnectionRpcCommand::RenewAccess {
                 spec: next,
                 refresh_generation: 2,
                 deadline: Instant::now() + Duration::from_secs(2),
-                response_tx: ack,
+                response_tx: JsonRpcResponseSender::new(
+                    ack,
+                    std::time::Instant::now() + Duration::from_secs(2),
+                ),
             })
             .unwrap();
         let renewal_id = loop {
@@ -771,7 +1372,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             ack_rx
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap()
@@ -783,10 +1384,12 @@ mod tests {
             rpc_rx.try_recv().is_err(),
             "renewal must retain the pending RPC"
         );
-        commands
-            .send(ConnectionRpcCommand::VoiceBinaryChunk {
-                payload: vec![1, 2, 3],
-            })
+        audio
+            .admit_voice(
+                std::sync::Arc::new(super::super::voice_budget::VoiceTransportBudget::default())
+                    .admit(vec![1, 2, 3])
+                    .unwrap(),
+            )
             .unwrap();
         loop {
             if let Message::Binary(bytes) = peer.next().await.unwrap().unwrap() {
@@ -802,7 +1405,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             rpc_rx
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap()
@@ -824,9 +1427,9 @@ mod tests {
     fn ws_client_worker_connects_and_emits_events() {
         let gateway_base_url = reserve_unused_local_address();
         let server = TestWsServer::start(gateway_base_url.clone());
-        let (command_tx, command_rx) = unbounded_channel();
+        let (command_tx, command_rx) = work_channel(Boundary::ClientCommand);
         let (event_tx, event_rx) = mpsc::channel();
-        spawn_worker(command_rx, event_tx);
+        spawn_worker(command_rx, event_tx.into(), Arc::default());
 
         let (initial_tx, initial_rx) = mpsc::channel();
         command_tx
@@ -847,10 +1450,12 @@ mod tests {
 
         let first = event_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("connecting event");
+            .expect("connecting event")
+            .value;
         let second = event_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("connected event");
+            .expect("connected event")
+            .value;
         assert!(matches!(
             first,
             GatewayWsEvent::Connecting {
@@ -872,7 +1477,7 @@ mod tests {
         server.join();
     }
 
-    fn connect_spec(gateway_base_url: String) -> GatewayWsConnectSpec {
+    pub(super) fn connect_spec(gateway_base_url: String) -> GatewayWsConnectSpec {
         GatewayWsConnectSpec {
             endpoint_id: "local".to_owned(),
             endpoint_name: "Local".to_owned(),
@@ -941,3 +1546,34 @@ mod tests {
         assert!(session_access_is_expired(&spec, 100));
     }
 }
+
+impl WsQueued for GatewayWsCommand {
+    fn observed_bytes(&self) -> pioneer_observability::queues::QueueBytes {
+        use pioneer_observability::queues::QueueBytes;
+        match self {
+            Self::Request { payload, .. } => QueueBytes::Known(payload.len() as u64),
+            Self::BinaryUploadChunk { payload, .. }
+            | Self::ArtifactBinaryUploadChunk { payload, .. } => {
+                QueueBytes::Known(payload.len() as u64)
+            }
+            _ => QueueBytes::Unsupported,
+        }
+    }
+}
+impl WsQueued for ConnectionRpcCommand {
+    fn observed_bytes(&self) -> pioneer_observability::queues::QueueBytes {
+        use pioneer_observability::queues::QueueBytes;
+        match self {
+            Self::Request { payload, .. } => QueueBytes::Known(payload.len() as u64),
+            Self::BinaryUploadChunk { payload, .. }
+            | Self::ArtifactBinaryUploadChunk { payload, .. } => {
+                QueueBytes::Known(payload.len() as u64)
+            }
+            _ => QueueBytes::Unsupported,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "client_lifecycle_tests.rs"]
+mod lifecycle_tests;

@@ -12,6 +12,7 @@ pub struct SkillPackageFile {
 
 #[cfg(unix)]
 pub fn snapshot_skill_package(
+    source_root: &Path,
     root: &Path,
     max_files: usize,
     max_bytes: usize,
@@ -34,23 +35,25 @@ pub fn snapshot_skill_package(
         depth: usize,
     ) -> Result<()> {
         ensure!(depth <= 32, "skill package exceeds directory depth budget");
-        #[cfg(target_os = "linux")]
-        let fd_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
-        #[cfg(not(target_os = "linux"))]
-        let fd_path = format!("/dev/fd/{}", directory.as_raw_fd());
-        let mut entries = std::fs::read_dir(fd_path)?
+        // Enumerate the held directory itself on every Unix platform. /dev/fd
+        // does not expose directory contents on macOS; reopening a pathname
+        // would also let an ancestor rename redirect the inventory.
+        let mut entries = rustix::fs::Dir::read_from(directory)?
+            .filter_map(|entry| match entry {
+                Ok(entry) if matches!(entry.file_name().to_bytes(), b"." | b"..") => None,
+                entry => Some(entry.map(|entry| entry.file_name().to_owned())),
+            })
             .take(max_files.saturating_add(1))
-            .collect::<std::io::Result<Vec<_>>>()?;
+            .collect::<std::result::Result<Vec<_>, rustix::io::Errno>>()?;
         ensure!(
             entries.len() <= max_files,
             "skill package exceeds entry budget"
         );
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
+        entries.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        for name in entries {
             ensure!(*entries_left > 0, "skill package exceeds entry budget");
             *entries_left -= 1;
-            let name = entry
-                .file_name()
+            let name = name
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("skill package path must be UTF-8"))?;
             if matches!(
@@ -129,8 +132,20 @@ pub fn snapshot_skill_package(
         root.is_absolute() && max_files > 0 && max_bytes > 0,
         "invalid package export scope or budget"
     );
-    // Anchor every component, not only the package's final directory. A
-    // renamed ancestor must not redirect this export through a symlink.
+    // The configured source is the authorization boundary used by the skill
+    // resolver. It may use an OS alias such as macOS /var -> /private/var.
+    // Canonicalize only that trusted boundary; never resolve package components
+    // or support entries through links beneath it.
+    ensure!(
+        source_root.is_absolute(),
+        "skill source root must be absolute"
+    );
+    let relative = root
+        .strip_prefix(source_root)
+        .context("skill package is outside its configured source root")?;
+    let root = source_root.canonicalize()?.join(relative);
+    // Anchor every canonical source and relative package component, not only
+    // the final directory. A rename must not redirect capture through a link.
     let mut directory = File::open("/")?;
     for component in root.components() {
         let std::path::Component::Normal(name) = component else {
@@ -173,6 +188,7 @@ pub fn snapshot_skill_package(
 
 #[cfg(not(unix))]
 pub fn snapshot_skill_package(
+    _source_root: &Path,
     _root: &Path,
     _max_files: usize,
     _max_bytes: usize,
@@ -186,16 +202,43 @@ mod tests {
     #[test]
     fn package_export_rejects_links_and_enforces_total_bytes() {
         let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().canonicalize().unwrap();
+        let source_root = temporary.path().canonicalize().unwrap();
+        let root = source_root.join("skill");
+        std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("SKILL.md"), "body").unwrap();
-        assert!(snapshot_skill_package(&root, 8, 3).is_err());
+        assert!(snapshot_skill_package(&source_root, &root, 8, 3).is_err());
         assert_eq!(
-            snapshot_skill_package(&root, 8, 4).unwrap()[0].bytes,
+            snapshot_skill_package(&source_root, &root, 1, 4).unwrap()[0].bytes,
             b"body"
         );
+        std::fs::create_dir(root.join("support")).unwrap();
+        std::fs::write(root.join("support/asset.txt"), "asset").unwrap();
+        assert!(snapshot_skill_package(&source_root, &root, 8, 8).is_err());
+        let files = snapshot_skill_package(&source_root, &root, 8, 9).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[1].relative_path, "support/asset.txt");
+        assert_eq!(files[1].bytes, b"asset");
+        // Configured roots may use an alias, but a link beneath that boundary
+        // cannot substitute either the package or an ancestor directory.
+        let aliases = tempfile::tempdir().unwrap();
+        let alias = aliases.path().join("source-alias");
+        std::os::unix::fs::symlink(&source_root, &alias).unwrap();
+        let aliased = snapshot_skill_package(&alias, &alias.join("skill"), 8, 9).unwrap();
+        assert_eq!(aliased[0].bytes, b"body");
+        assert_eq!(aliased[1].bytes, b"asset");
+        std::os::unix::fs::symlink(&root, source_root.join("linked-skill")).unwrap();
+        assert!(
+            snapshot_skill_package(&source_root, &source_root.join("linked-skill"), 8, 9).is_err()
+        );
+        std::os::unix::fs::symlink(&source_root, source_root.join("linked-parent")).unwrap();
+        assert!(
+            snapshot_skill_package(&source_root, &source_root.join("linked-parent/skill"), 8, 9)
+                .is_err()
+        );
+        assert!(snapshot_skill_package(&root, &source_root, 8, 9).is_err());
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("private"), "secret").unwrap();
         std::os::unix::fs::symlink(outside.path().join("private"), root.join("linked")).unwrap();
-        assert!(snapshot_skill_package(&root, 8, 1024).is_err());
+        assert!(snapshot_skill_package(&source_root, &root, 8, 1024).is_err());
     }
 }

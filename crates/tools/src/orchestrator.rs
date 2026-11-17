@@ -77,9 +77,10 @@ impl PostExecutionPolicy {
 
     fn apply(&self, invocation: &ToolInvocation, result: &mut AnyToolResult) {
         let raw_output_json = result.raw_output_json();
-        let outcome =
+        let outcome = result.output.delegated_outcome().unwrap_or_else(|| {
             self.classifier
-                .classify_result(invocation, &raw_output_json, result.success());
+                .classify_result(invocation, &raw_output_json, result.success())
+        });
         result.set_outcome(outcome);
     }
 
@@ -284,8 +285,18 @@ impl ToolOrchestrator {
         intent: &PermissionIntent,
         key: &crate::PermissionRequestKey,
         reason: PermissionDecisionReason,
+        trace: &ToolEventTrace,
     ) -> PermissionApprovalResolution {
-        tokio::select! {
+        use pioneer_observability::{
+            scenario::Correlation,
+            tool_call::{Fact, Measurement, Phase},
+        };
+        let mut observation = Measurement::start(Phase::Approval, &Correlation::capture());
+        let wait = pioneer_observability::live::WaitGuard::new(
+            pioneer_observability::live::WaitKind::UserOrProvider,
+        );
+        trace.emit_stage(invocation.attempt_id, "approval.wait.started", None, None);
+        let resolution = tokio::select! {
             biased;
             _ = invocation.cancellation.cancelled() => {
                 PermissionApprovalResolution::Cancelled
@@ -297,7 +308,16 @@ impl ToolOrchestrator {
                 key,
                 reason,
             ) => resolution,
-        }
+        };
+        trace.emit_stage(invocation.attempt_id, "approval.wait.completed", None, None);
+        drop(wait);
+        observation.finish(match &resolution {
+            PermissionApprovalResolution::Cancelled => Fact::Cancelled,
+            PermissionApprovalResolution::Deny { .. } => Fact::Rejected,
+            PermissionApprovalResolution::Expired => Fact::Expired,
+            _ => Fact::Returned,
+        });
+        resolution
     }
 
     async fn revalidate_permission_context(
@@ -404,6 +424,31 @@ impl ToolOrchestrator {
     }
 
     pub async fn run_with_context(
+        &self,
+        registry: &ToolRegistry,
+        invocation: ToolInvocation,
+        trace: &ToolEventTrace,
+        permission_context: &PermissionEvaluationContext,
+    ) -> Result<AnyToolResult, ToolError> {
+        // A dynamic proxy re-enters the complete permission/handler pipeline.
+        // Box its attempt before composing observation scopes to bound the
+        // stack state retained by each level without spawning or detaching it.
+        let attempt =
+            Box::pin(self.run_observed_attempt(registry, invocation, trace, permission_context));
+        pioneer_provider::usage::scope_causal_parent(
+            format!("tool:{}:{}:1", trace.turn_id(), trace.tool_call_id()),
+            crate::observation::scope_trace(
+                trace.clone(),
+                crate::observation::measure(
+                    pioneer_observability::tool_call::Phase::Attempt,
+                    attempt,
+                ),
+            ),
+        )
+        .await
+    }
+
+    async fn run_observed_attempt(
         &self,
         registry: &ToolRegistry,
         mut invocation: ToolInvocation,
@@ -748,42 +793,58 @@ impl ToolOrchestrator {
         reason: Option<PermissionDecisionReason>,
         cached: bool,
     ) -> Result<(), ToolError> {
-        let turn_id = permission_context
-            .turn_id
-            .clone()
-            .unwrap_or_else(|| trace.turn_id().to_owned());
-        let (security_snapshot_id, security_snapshot_version) = security_snapshot_audit_fields(
-            turn_id.as_str(),
-            invocation.execution_security_snapshot.as_ref(),
+        let mut audit_observation = pioneer_observability::tool_call::Measurement::start(
+            if cached {
+                pioneer_observability::tool_call::Phase::CachedGrant
+            } else {
+                pioneer_observability::tool_call::Phase::PermissionAudit
+            },
+            &pioneer_observability::scenario::Correlation::capture(),
         );
-        trace
-            .emit_permission_audit(
-                invocation.attempt_id,
-                TurnPermissionAuditEvent {
-                    workspace_id: permission_context.workspace_id.clone().unwrap_or_default(),
-                    thread_id: permission_context.thread_id.clone().unwrap_or_default(),
-                    turn_id,
-                    event_kind,
-                    profile_mode: permission_context.permission_profile.mode,
-                    profile_source: permission_context.permission_profile.source,
-                    security_snapshot_id,
-                    security_snapshot_version,
-                    security_reason_code: None,
-                    security_capability: None,
-                    item_id: Some(invocation.call_id.clone()),
-                    tool_call_id: Some(invocation.call_id.clone()),
-                    tool_name: Some(invocation.tool_name.clone()),
-                    action_kind: Some(intent.action),
-                    request_key: request_key.map(|key| TurnPermissionAuditRequestKey {
-                        action_kind: key.action,
-                        scope_hash: key.normalized_scope_hash.clone(),
-                    }),
-                    decision,
-                    reason,
-                    cached,
-                },
-            )
-            .await
+        let result = async {
+            let turn_id = permission_context
+                .turn_id
+                .clone()
+                .unwrap_or_else(|| trace.turn_id().to_owned());
+            let (security_snapshot_id, security_snapshot_version) = security_snapshot_audit_fields(
+                turn_id.as_str(),
+                invocation.execution_security_snapshot.as_ref(),
+            );
+            trace
+                .emit_permission_audit(
+                    invocation.attempt_id,
+                    TurnPermissionAuditEvent {
+                        workspace_id: permission_context.workspace_id.clone().unwrap_or_default(),
+                        thread_id: permission_context.thread_id.clone().unwrap_or_default(),
+                        turn_id,
+                        event_kind,
+                        profile_mode: permission_context.permission_profile.mode,
+                        profile_source: permission_context.permission_profile.source,
+                        security_snapshot_id,
+                        security_snapshot_version,
+                        security_reason_code: None,
+                        security_capability: None,
+                        item_id: Some(invocation.call_id.clone()),
+                        tool_call_id: Some(invocation.call_id.clone()),
+                        tool_name: Some(invocation.tool_name.clone()),
+                        action_kind: Some(intent.action),
+                        request_key: request_key.map(|key| TurnPermissionAuditRequestKey {
+                            action_kind: key.action,
+                            scope_hash: key.normalized_scope_hash.clone(),
+                        }),
+                        decision,
+                        reason,
+                        cached,
+                    },
+                )
+                .await
+        }
+        .await;
+        audit_observation.finish(match &result {
+            Ok(()) => pioneer_observability::tool_call::Fact::Returned,
+            Err(error) => crate::observation::error_fact(error),
+        });
+        result
     }
 
     async fn evaluate_permission(
@@ -792,6 +853,10 @@ impl ToolOrchestrator {
         permission_context: &PermissionEvaluationContext,
         trace: &ToolEventTrace,
     ) -> Result<PermissionEvaluationGrant, ToolError> {
+        let mut policy = pioneer_observability::tool_call::Measurement::start(
+            pioneer_observability::tool_call::Phase::Policy,
+            &pioneer_observability::scenario::Correlation::capture(),
+        );
         trace.emit_stage(
             invocation.attempt_id,
             "permission.evaluate.started",
@@ -839,6 +904,10 @@ impl ToolOrchestrator {
             Some(permission_decision_trace_payload(&decision, &intent)),
         );
 
+        policy.finish(match &decision {
+            PermissionDecision::Deny { .. } => pioneer_observability::tool_call::Fact::Rejected,
+            _ => pioneer_observability::tool_call::Fact::Returned,
+        });
         match decision {
             PermissionDecision::Allow { reason } => {
                 self.emit_permission_audit(
@@ -937,6 +1006,7 @@ impl ToolOrchestrator {
                         &intent,
                         &key,
                         reason,
+                        trace,
                     )
                     .await;
                 match resolution {
@@ -1123,6 +1193,7 @@ impl ToolOrchestrator {
                 &intent,
                 &key,
                 PermissionDecisionReason::SandboxDenied,
+                trace,
             )
             .await;
 
@@ -1311,6 +1382,7 @@ impl ToolOrchestrator {
                 &intent,
                 &key,
                 PermissionDecisionReason::SandboxDenied,
+                trace,
             )
             .await;
 
@@ -2722,8 +2794,8 @@ mod tests {
             assert_eq!(intent.action, PermissionActionKind::ComputerUse);
             assert_eq!(reason, PermissionDecisionReason::PolicyRequiresApproval);
             assert_eq!(
-                intent.scope.entries.get("action").map(String::as_str),
-                Some("act")
+                intent.scope.entries.get("operation").map(String::as_str),
+                Some("cua_type_text")
             );
             assert!(intent.scope.entries.contains_key("payload_hash"));
             match &invocation.payload {
@@ -3035,18 +3107,13 @@ mod tests {
     #[tokio::test]
     async fn supervised_computer_use_prompt_dispatches_exact_payload_once() {
         let arguments = serde_json::json!({
-            "action": "act",
-            "session_id": 42,
-            "act": {
-                "type": "input",
-                "text": "exact payload must survive approval",
-                "target": { "node_id": "field-1" }
-            }
+            "target": { "kind": "window", "pid": 42, "window_id": 9 },
+            "text": "exact payload must survive approval", "delivery_mode": "background"
         });
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let approval_calls = Arc::new(AtomicUsize::new(0));
         let registry = registry_with_named_handlers([(
-            "computer_use",
+            "cua_type_text",
             Arc::new(FunctionPayloadAssertHandler {
                 calls: handler_calls.clone(),
                 expected_arguments: arguments.clone(),
@@ -3068,9 +3135,9 @@ mod tests {
                 pioneer_protocol::TurnPermissionProfileSource::Composer,
             ),
         );
-        let invocation = invocation_for_tool("computer_use", ToolPayload::Function { arguments });
+        let invocation = invocation_for_tool("cua_type_text", ToolPayload::Function { arguments });
         let trace =
-            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "computer_use");
+            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "cua_type_text");
 
         orchestrator
             .run_with_context(&registry, invocation, &trace, &context)
@@ -3398,170 +3465,6 @@ mod tests {
         );
         assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn web_fetch_approval_applies_origin_scoped_network_grant() {
-        let workspace = temp_path("web-fetch-network-grant");
-        std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
-
-        let handler_calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(NetworkSnapshotAssertHandler {
-            calls: handler_calls.clone(),
-            required_url: Some("https://example.com/docs"),
-            denied_url: Some("https://example.com:8443/docs"),
-            expect_enabled: false,
-        });
-        let registry =
-            registry_with_named_handlers([("web_fetch", handler as Arc<dyn ToolHandler>)]);
-        let broker_calls = Arc::new(AtomicUsize::new(0));
-        let orchestrator = ToolOrchestrator::with_approval_broker(
-            OrchestratorPolicy::default(),
-            Arc::new(CountingApprovalBroker {
-                calls: broker_calls.clone(),
-                resolution: PermissionApprovalResolution::AllowOnce,
-            }),
-        );
-        let context = PermissionEvaluationContext::for_turn(
-            "workspace_test",
-            "thread_test",
-            "turn",
-            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
-                pioneer_protocol::TurnPermissionMode::Supervised,
-                pioneer_protocol::TurnPermissionProfileSource::Composer,
-            ),
-        );
-        let mut invocation = invocation_for_tool(
-            "web_fetch",
-            ToolPayload::Function {
-                arguments: serde_json::json!({ "url": "https://example.com/docs" }),
-            },
-        );
-        invocation.workdir = workspace.clone();
-        let invocation =
-            with_execution_security_snapshot(invocation, read_only_snapshot(workspace.as_path()));
-
-        let trace =
-            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "web_fetch");
-        orchestrator
-            .run_with_context(&registry, invocation, &trace, &context)
-            .await
-            .expect("approved fetch should receive host-scoped network access");
-
-        assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(workspace);
-    }
-
-    #[tokio::test]
-    async fn web_search_approval_applies_network_grant() {
-        let workspace = temp_path("web-search-network-grant");
-        std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
-
-        let handler_calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(NetworkSnapshotAssertHandler {
-            calls: handler_calls.clone(),
-            required_url: Some("https://duckduckgo.com/html/"),
-            denied_url: Some("https://unrelated.example/"),
-            expect_enabled: false,
-        });
-        let registry =
-            registry_with_named_handlers([("web_search", handler as Arc<dyn ToolHandler>)]);
-        let broker_calls = Arc::new(AtomicUsize::new(0));
-        let orchestrator = ToolOrchestrator::with_approval_broker(
-            OrchestratorPolicy::default(),
-            Arc::new(CountingApprovalBroker {
-                calls: broker_calls.clone(),
-                resolution: PermissionApprovalResolution::AllowOnce,
-            }),
-        );
-        let context = PermissionEvaluationContext::for_turn(
-            "workspace_test",
-            "thread_test",
-            "turn",
-            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
-                pioneer_protocol::TurnPermissionMode::Supervised,
-                pioneer_protocol::TurnPermissionProfileSource::Composer,
-            ),
-        );
-        let mut invocation = invocation_for_tool(
-            "web_search",
-            ToolPayload::Function {
-                arguments: serde_json::json!({ "query": "pioneer permissions" }),
-            },
-        );
-        invocation.workdir = workspace.clone();
-        let invocation =
-            with_execution_security_snapshot(invocation, read_only_snapshot(workspace.as_path()));
-
-        let trace =
-            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "web_search");
-        orchestrator
-            .run_with_context(&registry, invocation, &trace, &context)
-            .await
-            .expect("approved search should receive network access");
-
-        assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(workspace);
-    }
-
-    #[tokio::test]
-    async fn mcp_network_policy_runs_after_approval_grant_is_installed() {
-        let workspace = temp_path("mcp-network-grant");
-        std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
-
-        let handler_calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(NetworkSnapshotAssertHandler {
-            calls: handler_calls.clone(),
-            required_url: None,
-            denied_url: None,
-            expect_enabled: true,
-        });
-        let registry =
-            registry_with_named_handlers([("mcp.example", handler as Arc<dyn ToolHandler>)]);
-        let broker_calls = Arc::new(AtomicUsize::new(0));
-        let orchestrator = ToolOrchestrator::with_approval_broker(
-            OrchestratorPolicy::default(),
-            Arc::new(CountingApprovalBroker {
-                calls: broker_calls.clone(),
-                resolution: PermissionApprovalResolution::AllowOnce,
-            }),
-        );
-        let context = PermissionEvaluationContext::for_turn(
-            "workspace_test",
-            "thread_test",
-            "turn",
-            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
-                pioneer_protocol::TurnPermissionMode::Supervised,
-                pioneer_protocol::TurnPermissionProfileSource::Composer,
-            ),
-        );
-        let mut invocation = invocation_for_tool(
-            "mcp.example",
-            ToolPayload::Mcp {
-                server: "example".to_owned(),
-                tool: "send_email".to_owned(),
-                arguments: serde_json::json!({}),
-                read_only_hint: Some(false),
-                destructive_hint: Some(false),
-                open_world_hint: Some(true),
-            },
-        );
-        invocation.workdir = workspace.clone();
-        let invocation =
-            with_execution_security_snapshot(invocation, read_only_snapshot(workspace.as_path()));
-
-        let trace =
-            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "mcp.example");
-        orchestrator
-            .run_with_context(&registry, invocation, &trace, &context)
-            .await
-            .expect("approved open-world MCP call should receive bounded network access");
-
-        assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
@@ -4000,40 +3903,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_ask_dispatches_after_approval() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let handler: Arc<dyn ToolHandler> = Arc::new(CountingHandler {
-            calls: calls.clone(),
-            first_error: None,
-            success_text: "ok",
-        });
-        let registry = registry_with_handler(handler);
-        let intent = PermissionIntent::new(
-            PermissionActionKind::ShellCommand,
-            PermissionRequestScope::from_pairs([("tool_name", "tool")]),
-        );
-        let orchestrator = ToolOrchestrator::with_permission_evaluator_and_approval_broker(
-            OrchestratorPolicy::default(),
-            PostExecutionPolicy::default(),
-            Arc::new(StaticEvaluator {
-                decision: PermissionDecision::Ask {
-                    key: default_test_request_key(&intent),
-                    reason: PermissionDecisionReason::PolicyRequiresApproval,
-                },
-            }),
-            Arc::new(StaticPermissionApprovalBroker::allow_once()),
-        );
-
-        let trace = crate::events::ToolEventBus::default().start_trace("turn", "call_1", "tool");
-        let context = default_test_permission_context();
-        let result = orchestrator
-            .run_with_context(&registry, invocation(), &trace, &context)
-            .await;
-        assert!(result.is_ok());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
     async fn permission_ask_denied_does_not_dispatch() {
         let calls = Arc::new(AtomicUsize::new(0));
         let handler: Arc<dyn ToolHandler> = Arc::new(CountingHandler {
@@ -4190,6 +4059,15 @@ mod tests {
             .run_with_context(&registry, invocation(), &trace, &context)
             .await;
         assert!(first.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first
+                .as_ref()
+                .expect("first approved call should succeed")
+                .outcome
+                .status,
+            crate::context::ToolOutcomeStatus::Ok
+        );
         let trace = crate::events::ToolEventBus::default().start_trace("turn", "call_2", "tool");
         let second = orchestrator
             .run_with_context(&registry, invocation(), &trace, &context)
@@ -4525,27 +4403,6 @@ mod tests {
         assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn post_execution_policy_sets_outcome_on_success() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(CountingHandler {
-            calls: calls.clone(),
-            first_error: None,
-            success_text: "ok",
-        });
-        let registry = registry_with_handler(handler);
-        let orchestrator = ToolOrchestrator::default();
-
-        let trace = crate::events::ToolEventBus::default().start_trace("turn", "call_1", "tool");
-        let context = default_test_permission_context();
-        let result = orchestrator
-            .run_with_context(&registry, invocation(), &trace, &context)
-            .await
-            .expect("run should succeed");
-
-        assert_eq!(result.outcome.status, crate::context::ToolOutcomeStatus::Ok);
-    }
-
     #[test]
     fn classify_error_outcome_uses_classifier() {
         let orchestrator = ToolOrchestrator::default();
@@ -4560,5 +4417,115 @@ mod tests {
             Some(crate::context::ToolErrorClass::CommandNotFound)
         );
         assert!(outcome.should_retry);
+    }
+
+    #[test]
+    fn approved_network_invocation_inputs_receive_their_exact_grants_before_dispatch() {
+        let cases = [
+            // web_fetch_approval_applies_origin_scoped_network_grant
+            (
+                "web-fetch-network-grant",
+                "web_fetch",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "url": "https://example.com/docs" }),
+                },
+                Some("https://example.com/docs"),
+                Some("https://example.com:8443/docs"),
+                false,
+                "approved fetch should receive host-scoped network access",
+            ),
+            // web_search_approval_applies_network_grant
+            (
+                "web-search-network-grant",
+                "web_search",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "query": "pioneer permissions" }),
+                },
+                Some("https://duckduckgo.com/html/"),
+                Some("https://unrelated.example/"),
+                false,
+                "approved search should receive network access",
+            ),
+            // mcp_network_policy_runs_after_approval_grant_is_installed
+            (
+                "mcp-network-grant",
+                "mcp.example",
+                ToolPayload::Mcp {
+                    server: "example".to_owned(),
+                    tool: "send_email".to_owned(),
+                    arguments: serde_json::json!({}),
+                    read_only_hint: Some(false),
+                    destructive_hint: Some(false),
+                    open_world_hint: Some(true),
+                },
+                None,
+                None,
+                true,
+                "approved open-world MCP call should receive bounded network access",
+            ),
+        ];
+        for (
+            workspace_prefix,
+            tool_name,
+            payload,
+            required_url,
+            denied_url,
+            expect_enabled,
+            message,
+        ) in cases
+        {
+            let body = async {
+                let workspace = temp_path(workspace_prefix);
+                std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
+                let handler_calls = Arc::new(AtomicUsize::new(0));
+                let handler = Arc::new(NetworkSnapshotAssertHandler {
+                    calls: handler_calls.clone(),
+                    required_url,
+                    denied_url,
+                    expect_enabled,
+                });
+                let registry =
+                    registry_with_named_handlers([(tool_name, handler as Arc<dyn ToolHandler>)]);
+                let broker_calls = Arc::new(AtomicUsize::new(0));
+                let orchestrator = ToolOrchestrator::with_approval_broker(
+                    OrchestratorPolicy::default(),
+                    Arc::new(CountingApprovalBroker {
+                        calls: broker_calls.clone(),
+                        resolution: PermissionApprovalResolution::AllowOnce,
+                    }),
+                );
+                let context = PermissionEvaluationContext::for_turn(
+                    "workspace_test",
+                    "thread_test",
+                    "turn",
+                    pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                        pioneer_protocol::TurnPermissionMode::Supervised,
+                        pioneer_protocol::TurnPermissionProfileSource::Composer,
+                    ),
+                );
+                let mut invocation = invocation_for_tool(tool_name, payload);
+                invocation.workdir = workspace.clone();
+                let invocation = with_execution_security_snapshot(
+                    invocation,
+                    read_only_snapshot(workspace.as_path()),
+                );
+                let trace =
+                    crate::events::ToolEventBus::default().start_trace("turn", "call_1", tool_name);
+                orchestrator
+                    .run_with_context(&registry, invocation, &trace, &context)
+                    .await
+                    .expect(message);
+                assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+                let _ = std::fs::remove_dir_all(workspace);
+            };
+            tokio::pin!(body);
+            let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("case runtime should build");
+            runtime.block_on(body);
+        }
     }
 }

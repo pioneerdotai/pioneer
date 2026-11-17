@@ -1,6 +1,7 @@
 mod frozen_storage;
 pub(crate) mod html_previews;
 mod native_event_cleanup;
+mod portable_payload;
 mod projection_receipt_cleanup;
 mod zstd_payload_compression;
 
@@ -23,6 +24,7 @@ pub(crate) async fn run(
     let cache = super::zstd_column::PreparedDictionaryCache::new(crud_store.as_ref());
     tokio::join!(
         zstd_payload_compression::run(crud_store.clone(), cancellation.clone(), cache),
+        portable_payload::run(crud_store.clone(), cancellation.clone()),
         projection_receipt_cleanup::run(crud_store.clone(), cancellation.clone()),
         frozen_storage::run(crud_store.clone(), cancellation.clone()),
         html_previews::run(crud_store.clone(), artifacts, cancellation.clone()),

@@ -55,13 +55,15 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout as tokio_timeout};
+use tokio::time::{Instant, sleep, timeout as tokio_timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 const OPENCODE_SERVER_USERNAME: &str = "opencode";
@@ -706,21 +708,347 @@ struct OpenCodeServerProcess {
     closed: std::sync::atomic::AtomicBool,
     api: OpenCodeApiClient,
     version: Option<String>,
-    process: Mutex<CLIAgentProcess>,
-    stdin: Mutex<Option<ChildStdin>>,
-    stdout_reader: JoinHandle<()>,
+    process: Arc<Mutex<CLIAgentProcess>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdout_reader: Arc<Mutex<Option<JoinHandle<()>>>>,
+    stdout_failure: Arc<std::sync::Mutex<Option<String>>>,
     stderr: pioneer_cli_agent_runtime::process::StderrRing,
     shutdown_grace: Duration,
-    _catalog_plugin: tempfile::TempDir,
+    _catalog_plugin: Arc<tempfile::TempDir>,
 }
 
 impl OpenCodeServerProcess {
     async fn close(&self) -> Result<()> {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.stdout_reader.abort();
+        let mut stdout_reader = self.stdout_reader.lock().await;
+        if let Some(reader) = stdout_reader.as_ref() {
+            reader.abort();
+        }
         self.stdin.lock().await.take();
         let mut process = self.process.lock().await;
-        terminate_opencode_process(&mut process, self.shutdown_grace).await
+        let process_result = terminate_opencode_process(&mut process, self.shutdown_grace).await;
+        drop(process);
+        if let Some(reader) = stdout_reader.as_mut() {
+            let result = reader.await;
+            stdout_reader.take();
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                *self
+                    .stdout_failure
+                    .lock()
+                    .expect("OpenCode stdout failure poisoned") =
+                    Some("OpenCode stdout worker failed".to_owned());
+            }
+        }
+        process_result?;
+        // A consumed worker panic remains a failed stop on subsequent attempts.
+        match self
+            .stdout_failure
+            .lock()
+            .expect("OpenCode stdout failure poisoned")
+            .clone()
+        {
+            Some(error) => Err(anyhow!("{error}")),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for OpenCodeServerProcess {
+    fn drop(&mut self) {
+        if let Ok(reader) = self.stdout_reader.try_lock() {
+            if let Some(reader) = reader.as_ref() {
+                reader.abort();
+            }
+        }
+        if let Ok(mut process) = self.process.try_lock() {
+            process.abort_service();
+        }
+    }
+}
+
+// Published synchronously after spawn, before address/health awaits. The
+// retained factory owns the pre-address pipe future; this owner retains the
+// process/stderr and any subsequently spawned stdout task across factory Err.
+struct OpenCodeStartupOwner {
+    process: Arc<Mutex<CLIAgentProcess>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdout_reader: Arc<Mutex<Option<JoinHandle<()>>>>,
+    stdout_failure: Arc<std::sync::Mutex<Option<String>>>,
+    catalog_plugin: Arc<tempfile::TempDir>,
+    process_cleanup_confirmed: std::sync::atomic::AtomicBool,
+    failure: std::sync::Mutex<Option<String>>,
+}
+impl OpenCodeStartupOwner {
+    fn new(
+        process: CLIAgentProcess,
+        catalog_plugin: tempfile::TempDir,
+        startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
+    ) -> Arc<Self> {
+        let owner = Arc::new(Self {
+            process: Arc::new(Mutex::new(process)),
+            stdin: Default::default(),
+            stdout_reader: Default::default(),
+            stdout_failure: Default::default(),
+            catalog_plugin: Arc::new(catalog_plugin),
+            process_cleanup_confirmed: std::sync::atomic::AtomicBool::new(false),
+            failure: Default::default(),
+        });
+        startup.retain_session(owner.clone());
+        owner
+    }
+
+    async fn failed_attempt(
+        &self,
+        mut failure: OpenCodeStartupFailure,
+        deadline: Instant,
+    ) -> OpenCodeStartupFailure {
+        self.process_cleanup_confirmed
+            .store(failure.cleanup_error.is_none(), Ordering::Release);
+        let mut reader = self.stdout_reader.lock().await;
+        if let Some(task) = reader.as_mut() {
+            task.abort();
+            match timeout_at(deadline, task).await {
+                Ok(result) => {
+                    reader.take();
+                    if result.is_err_and(|error| !error.is_cancelled()) {
+                        failure
+                            .cleanup_error
+                            .get_or_insert("OpenCode startup stdout worker failed".into());
+                    }
+                }
+                Err(_) => {
+                    failure
+                        .cleanup_error
+                        .get_or_insert("startup stdout cleanup deadline exhausted".into());
+                }
+            }
+        }
+        if let Some(error) = &failure.cleanup_error {
+            self.failure
+                .lock()
+                .expect("OpenCode startup failure poisoned")
+                .get_or_insert(error.clone());
+        }
+        failure
+    }
+}
+#[async_trait]
+impl CLIAgentRuntimeSession for OpenCodeStartupOwner {
+    async fn close(&self) -> Result<()> {
+        let mut reader = self.stdout_reader.lock().await;
+        if let Some(task) = reader.as_ref() {
+            task.abort();
+        }
+        self.stdin.lock().await.take();
+        if !self.process_cleanup_confirmed.load(Ordering::Acquire) {
+            let mut process = self.process.lock().await;
+            let deadline = Instant::now() + OPENCODE_SHUTDOWN_GRACE;
+            let result = timeout_at(
+                deadline,
+                terminate_opencode_process(&mut process, OPENCODE_SHUTDOWN_GRACE),
+            )
+            .await
+            .map_err(|_| anyhow!("OpenCode startup cleanup deadline expired"))
+            .and_then(|result| result);
+            if let Err(error) = &result {
+                self.failure
+                    .lock()
+                    .expect("OpenCode startup failure poisoned")
+                    .get_or_insert(format!("OpenCode startup cleanup failed: {error:#}"));
+            }
+            let group = process.terminate_service_group(deadline).await;
+            if let Err(error) = &group {
+                self.failure
+                    .lock()
+                    .expect("OpenCode startup failure poisoned")
+                    .get_or_insert(format!("OpenCode startup group cleanup failed: {error:#}"));
+            }
+            if result.is_ok() && group.is_ok() {
+                self.process_cleanup_confirmed
+                    .store(true, Ordering::Release);
+            }
+        }
+        if let Some(task) = reader.as_mut() {
+            let result = task.await;
+            reader.take();
+            if result.is_err_and(|error| !error.is_cancelled()) {
+                self.failure
+                    .lock()
+                    .expect("OpenCode startup failure poisoned")
+                    .get_or_insert("OpenCode startup stdout worker failed".into());
+            }
+        }
+        match self
+            .failure
+            .lock()
+            .expect("OpenCode startup failure poisoned")
+            .clone()
+        {
+            Some(error) => Err(anyhow!("{error}")),
+            None => Ok(()),
+        }
+    }
+}
+impl Drop for OpenCodeStartupOwner {
+    fn drop(&mut self) {
+        // A successful server shares these handles. Dropping the placeholder
+        // must not abort that live handoff. Drop alone is never strict proof.
+        if Arc::strong_count(&self.process) == 1 {
+            if let Ok(reader) = self.stdout_reader.try_lock() {
+                if let Some(reader) = reader.as_ref() {
+                    reader.abort();
+                }
+            }
+            if let Ok(mut process) = self.process.try_lock() {
+                process.abort_service();
+            }
+        }
+    }
+}
+
+const OPENCODE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const OPENCODE_STARTUP_MAX_ATTEMPTS: usize = 3;
+const OPENCODE_STARTUP_EXIT_DRAIN: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeStartupStage {
+    Stdio,
+    AddressEof,
+    AddressRead,
+    AddressInvalid,
+    Timeout,
+    Health,
+}
+
+#[derive(Debug)]
+struct OpenCodeStartupFailure {
+    stage: OpenCodeStartupStage,
+    detail: String,
+    status: Option<ExitStatus>,
+    stderr: Vec<String>,
+    sqlite_busy: bool,
+    cleanup_error: Option<String>,
+}
+
+impl std::fmt::Display for OpenCodeStartupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let status = self
+            .status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "exit status unavailable".into());
+        let busy = if self.sqlite_busy {
+            "; SQLite database contention"
+        } else {
+            ""
+        };
+        let cleanup = self.cleanup_error.as_deref().unwrap_or("complete");
+        f.write_str(&bounded_safe_detail(&format!(
+            "OpenCode server startup failed ({:?}; {status}{busy}); {}; cleanup: {cleanup}; stderr: {}",
+            self.stage, self.detail, self.stderr.join(" | ")
+        )))
+    }
+}
+
+impl std::error::Error for OpenCodeStartupFailure {}
+
+#[derive(Debug)]
+struct OpenCodeStartupPreparationTimeout(&'static str);
+
+impl std::fmt::Display for OpenCodeStartupPreparationTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OpenCode startup deadline exhausted {}; no process was spawned for this attempt",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for OpenCodeStartupPreparationTimeout {}
+
+fn opencode_sqlite_startup_conflict(
+    stage: OpenCodeStartupStage,
+    natural_status: Option<ExitStatus>,
+    stderr: &[String],
+) -> bool {
+    // Require an unsuccessful natural exit, before any usable endpoint. A
+    // timeout/health/boundary failure must never become retryable from stderr.
+    stage == OpenCodeStartupStage::AddressEof
+        && natural_status.is_some_and(|status| !status.success() && status.code().is_some())
+        && stderr
+            .iter()
+            .any(|line| line.trim() == "SQLiteError: database is locked")
+}
+
+fn opencode_startup_safe_detail(value: &str, env: &SensitiveEnvironment) -> String {
+    // In addition to StderrRing's exact secret redactions, hide launch values
+    // if the child echoes its environment/config. Never attach raw error chains.
+    let mut value = value.to_owned();
+    let mut values = env
+        .expose_iter()
+        .map(|(_, value)| value)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    for secret in values {
+        value = value.replace(secret, "[REDACTED]");
+    }
+    pioneer_protocol::sanitize_runtime_diagnostic_line(&value)
+}
+
+async fn opencode_startup_failure(
+    process: &mut CLIAgentProcess,
+    stage: OpenCodeStartupStage,
+    error: anyhow::Error,
+    env: &SensitiveEnvironment,
+    deadline: Instant,
+) -> OpenCodeStartupFailure {
+    // stdout EOF can win the race against the stderr reader and child reaping.
+    // wait() joins stderr; a descendant holding that pipe cannot block forever.
+    let mut natural_status = process.try_wait().ok().flatten();
+    if stage == OpenCodeStartupStage::AddressEof {
+        let drain_deadline = deadline.min(Instant::now() + OPENCODE_STARTUP_EXIT_DRAIN);
+        if let Ok(Ok(status)) = timeout_at(drain_deadline, process.wait()).await {
+            natural_status = Some(status);
+        } else if natural_status.is_none() {
+            natural_status = process.try_wait().ok().flatten();
+        }
+    }
+    let cleanup_error = match timeout_at(deadline, async {
+        terminate_opencode_process(process, Duration::from_secs(2)).await?;
+        // Parent exit and drained pipes are insufficient: descendants may
+        // have closed all their channels and still hold the shared store.
+        process.terminate_service_group(deadline).await?;
+        #[cfg(all(test, unix))]
+        startup_tests::pause_at(startup_tests::StartupPhase::GroupCleanupConfirmed).await;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(opencode_startup_safe_detail(&format!("{error:#}"), env)),
+        Err(_) => {
+            process.abort_service();
+            Some("startup deadline exhausted during process cleanup; owned process group force-termination requested".into())
+        }
+    };
+    let stderr = process.stderr().lines().await;
+    let sqlite_busy = opencode_sqlite_startup_conflict(stage, natural_status, &stderr);
+    let status = natural_status.or_else(|| process.try_wait().ok().flatten());
+    OpenCodeStartupFailure {
+        stage,
+        detail: opencode_startup_safe_detail(&format!("{error:#}"), env),
+        status,
+        stderr: pioneer_protocol::sanitize_runtime_diagnostic_lines(
+            stderr
+                .into_iter()
+                .map(|line| opencode_startup_safe_detail(&line, env))
+                .collect(),
+        ),
+        sqlite_busy,
+        cleanup_error,
     }
 }
 
@@ -773,7 +1101,82 @@ async fn spawn_opencode_server(
     environment: &SensitiveEnvironment,
     process_generation: Option<u64>,
     managed_data_home: &Path,
+    startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
 ) -> Result<OpenCodeServerProcess> {
+    // One budget covers preparation, all attempts, health, draining/cleanup and
+    // backoff. Outer readiness (60s) and compaction deadlines may cancel sooner.
+    let deadline = Instant::now() + Duration::from_millis(instance.startup_probe_timeout_ms.max(1));
+    let mut last_confirmed_error: Option<anyhow::Error> = None;
+    for attempt in 1..=OPENCODE_STARTUP_MAX_ATTEMPTS {
+        startup.check_admission()?;
+        let error = match spawn_opencode_server_attempt(
+            instance,
+            cwd,
+            environment,
+            process_generation,
+            managed_data_home,
+            deadline,
+            startup,
+        )
+        .await
+        {
+            Ok(server) => return Ok(server),
+            Err(error) => error,
+        };
+        if error.is::<OpenCodeStartupPreparationTimeout>()
+            && let Some(previous) = last_confirmed_error.take()
+        {
+            // Keep just the last completed process failure, explicitly scoped
+            // to its attempt. Preparation itself has neither exit nor stderr.
+            return Err(previous).with_context(|| {
+                format!(
+                    "{error} (attempt {attempt}); last completed process attempt {} follows",
+                    attempt - 1
+                )
+            });
+        }
+        let retry = error
+            .downcast_ref::<OpenCodeStartupFailure>()
+            .is_some_and(|failure| failure.sqlite_busy && failure.cleanup_error.is_none());
+        if !retry || attempt == OPENCODE_STARTUP_MAX_ATTEMPTS {
+            return Err(error)
+                .with_context(|| format!("OpenCode startup failed after {attempt} attempt(s)"));
+        }
+        // Independent jitter prevents simultaneous probes repeating in lockstep.
+        let delay = Duration::from_millis(rand::random_range(100..=250) * attempt as u64);
+        if Instant::now() + delay >= deadline {
+            return Err(error).context("OpenCode startup deadline exhausted before SQLite retry");
+        }
+        if timeout_at(deadline, async {
+            let delay = sleep(delay);
+            #[cfg(all(test, unix))]
+            startup_tests::pause_at(startup_tests::StartupPhase::RetryDelay).await;
+            delay.await;
+        })
+        .await
+        .is_err()
+            || Instant::now() >= deadline
+        {
+            return Err(error)
+                .context("OpenCode startup deadline exhausted during SQLite retry delay");
+        }
+        last_confirmed_error = Some(error);
+    }
+    unreachable!("OpenCode startup attempt limit is nonzero")
+}
+
+async fn spawn_opencode_server_attempt(
+    instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    cwd: &Path,
+    environment: &SensitiveEnvironment,
+    process_generation: Option<u64>,
+    managed_data_home: &Path,
+    deadline: Instant,
+    startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
+) -> Result<OpenCodeServerProcess> {
+    if Instant::now() >= deadline {
+        return Err(OpenCodeStartupPreparationTimeout("before preparation").into());
+    }
     validate_opencode_custom_args(&instance.app_server_args)
         .context("invalid OpenCode custom launch arguments")?;
     let password = SecretString::new(format!(
@@ -818,16 +1221,22 @@ async fn spawn_opencode_server(
         .prefix("pioneer-opencode-catalog-")
         .tempdir()?;
     let catalog_rpc_id = format!("pioneer.catalog.{}", uuid::Uuid::new_v4().simple());
-    tokio::fs::write(
-        catalog_plugin.path().join("package.json"),
-        r#"{"name":"pioneer-opencode-catalog","type":"module","main":"server.js"}"#,
-    )
-    .await?;
-    tokio::fs::write(
-        catalog_plugin.path().join("server.js"),
-        include_str!("opencode_catalog.js").replace("__PIONEER_CATALOG_ID__", &catalog_rpc_id),
-    )
-    .await?;
+    timeout_at(deadline, async {
+        #[cfg(all(test, unix))]
+        startup_tests::pause_at(startup_tests::StartupPhase::PreparingPlugin).await;
+        tokio::fs::write(
+            catalog_plugin.path().join("package.json"),
+            r#"{"name":"pioneer-opencode-catalog","type":"module","main":"server.js"}"#,
+        )
+        .await?;
+        tokio::fs::write(
+            catalog_plugin.path().join("server.js"),
+            include_str!("opencode_catalog.js").replace("__PIONEER_CATALOG_ID__", &catalog_rpc_id),
+        )
+        .await
+    })
+    .await
+    .map_err(|_| OpenCodeStartupPreparationTimeout("preparing catalog plugin"))??;
     let plugin_url = reqwest::Url::from_directory_path(catalog_plugin.path())
         .map_err(|_| anyhow!("OpenCode V2 catalog plugin path is invalid"))?;
     // Native V2 inline config. Global/project MCP entries are removed before
@@ -873,29 +1282,49 @@ async fn spawn_opencode_server(
     process_config
         .args
         .extend(instance.app_server_args.iter().cloned());
-    let mut process = spawn_cli_agent_process(&process_config)
+    if Instant::now() >= deadline {
+        return Err(OpenCodeStartupPreparationTimeout("before spawn").into());
+    }
+    let process = spawn_cli_agent_process(&process_config)
         .with_context(|| format!("failed to spawn OpenCode server `{}`", instance.binary_path))?;
+    let owner = OpenCodeStartupOwner::new(process, catalog_plugin, startup);
+    let mut process_guard = owner.process.lock().await;
+    let process = &mut *process_guard;
     let stderr = process.stderr();
     let (stdout, stdin) = match process.take_stdio() {
         Ok(stdio) => stdio,
         Err(error) => {
-            let _ = terminate_opencode_process(&mut process, Duration::from_secs(2)).await;
-            return Err(error).context("failed to capture OpenCode server stdio");
+            let failure = opencode_startup_failure(
+                process,
+                OpenCodeStartupStage::Stdio,
+                error,
+                &process_config.env,
+                deadline,
+            )
+            .await;
+            return Err(owner.failed_attempt(failure, deadline).await.into());
         }
     };
+    *owner.stdin.lock().await = Some(stdin);
     let mut reader = BufReader::new(stdout);
-    let startup_timeout = Duration::from_millis(instance.startup_probe_timeout_ms.max(1));
-    let base_url = tokio_timeout(startup_timeout, async {
+    let mut failure_stage = OpenCodeStartupStage::AddressRead;
+    let base_url = timeout_at(deadline, async {
         let mut line = String::new();
         loop {
             line.clear();
-            let read = reader.read_line(&mut line).await?;
+            let read = reader.read_line(&mut line);
+            #[cfg(all(test, unix))]
+            let read = startup_tests::observe_address_read(read).await?;
+            #[cfg(not(all(test, unix)))]
+            let read = read.await?;
             if read == 0 {
+                failure_stage = OpenCodeStartupStage::AddressEof;
                 bail!("OpenCode server exited before publishing its listen address");
             }
             if let Ok(address) = serde_json::from_str::<JsonValue>(line.trim())
                 && let Some(url) = address["url"].as_str()
             {
+                failure_stage = OpenCodeStartupStage::AddressInvalid;
                 let parsed =
                     reqwest::Url::parse(url).context("invalid OpenCode V2 stdio listen URL")?;
                 if parsed.scheme() != "http"
@@ -914,15 +1343,26 @@ async fn spawn_opencode_server(
         }
     })
     .await
-    .map_err(|_| anyhow!("OpenCode server startup timed out"));
+    .map_err(|_| {
+        failure_stage = OpenCodeStartupStage::Timeout;
+        anyhow!("OpenCode server startup timed out waiting for listen address")
+    });
     let base_url = match base_url {
         Ok(Ok(base_url)) => base_url,
         Ok(Err(error)) | Err(error) => {
-            let _ = terminate_opencode_process(&mut process, Duration::from_secs(2)).await;
-            return Err(error).context("OpenCode server did not publish a usable listen address");
+            let failure = opencode_startup_failure(
+                process,
+                failure_stage,
+                error,
+                &process_config.env,
+                deadline,
+            )
+            .await;
+            return Err(owner.failed_attempt(failure, deadline).await.into());
         }
     };
-    let stdout_reader = tokio::spawn(async move {
+    let mut stdout_slot = owner.stdout_reader.lock().await;
+    *stdout_slot = Some(tokio::spawn(async move {
         let mut line = String::new();
         loop {
             line.clear();
@@ -931,7 +1371,8 @@ async fn spawn_opencode_server(
                 Ok(_) => {}
             }
         }
-    });
+    }));
+    drop(stdout_slot);
     let api = OpenCodeApiClient {
         client: http_client,
         base_url,
@@ -940,7 +1381,21 @@ async fn spawn_opencode_server(
         password,
         catalog_rpc_id,
     };
-    let version = match api.health(startup_timeout).await.and_then(|health| {
+    let health = timeout_at(
+        deadline,
+        api.health(deadline.saturating_duration_since(Instant::now())),
+    )
+    .await;
+    let (health, health_stage) = match health {
+        Ok(health) if Instant::now() < deadline => (health, OpenCodeStartupStage::Health),
+        _ => (
+            Err(anyhow!(
+                "OpenCode server startup timed out during health probe"
+            )),
+            OpenCodeStartupStage::Timeout,
+        ),
+    };
+    let version = match health.and_then(|health| {
         anyhow::ensure!(
             health["pid"].as_u64() == process.id().map(u64::from),
             "OpenCode V2 info belongs to another process"
@@ -949,21 +1404,28 @@ async fn spawn_opencode_server(
     }) {
         Ok(version) => version,
         Err(error) => {
-            stdout_reader.abort();
-            let _ = terminate_opencode_process(&mut process, Duration::from_secs(2)).await;
-            return Err(error).context("OpenCode server health probe failed");
+            let failure = opencode_startup_failure(
+                process,
+                health_stage,
+                error,
+                &process_config.env,
+                deadline,
+            )
+            .await;
+            return Err(owner.failed_attempt(failure, deadline).await.into());
         }
     };
     Ok(OpenCodeServerProcess {
         closed: std::sync::atomic::AtomicBool::new(false),
         api,
         version,
-        process: Mutex::new(process),
-        stdin: Mutex::new(Some(stdin)),
-        stdout_reader,
+        process: owner.process.clone(),
+        stdin: owner.stdin.clone(),
+        stdout_reader: owner.stdout_reader.clone(),
+        stdout_failure: owner.stdout_failure.clone(),
         stderr,
-        shutdown_grace: Duration::from_secs(5),
-        _catalog_plugin: catalog_plugin,
+        shutdown_grace: OPENCODE_SHUTDOWN_GRACE,
+        _catalog_plugin: owner.catalog_plugin.clone(),
     })
 }
 
@@ -989,6 +1451,7 @@ pub(crate) struct OpenCodeSummaryService {
     instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
     environment: SensitiveEnvironment,
     owner: Mutex<Option<(Arc<OpenCodeServerProcess>, tempfile::TempDir)>>,
+    startup: crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
     data_home: PathBuf,
 }
 impl OpenCodeSummaryService {
@@ -1002,6 +1465,7 @@ impl OpenCodeSummaryService {
             environment,
             data_home,
             owner: Mutex::new(None),
+            startup: Default::default(),
         }
     }
     pub(crate) async fn summarize(
@@ -1022,6 +1486,7 @@ impl OpenCodeSummaryService {
                 &self.environment,
                 None,
                 &self.data_home,
+                &self.startup,
             )
             .await?,
         );
@@ -1078,6 +1543,8 @@ impl OpenCodeSummaryService {
     pub(crate) async fn cleanup(&self) -> Result<()> {
         if let Some((server, _temporary)) = self.owner.lock().await.take() {
             server.close().await?;
+        } else if let Some(startup) = self.startup.session() {
+            startup.close().await?;
         }
         Ok(())
     }
@@ -1159,10 +1626,24 @@ pub(crate) async fn probe_opencode_instance(
         };
     }
     let managed_home = opencode_managed_data_home(cwd, instance);
-    let server = match spawn_opencode_server(instance, cwd, environment, None, &managed_home).await
+    let startup = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup::default();
+    let server = match spawn_opencode_server(
+        instance,
+        cwd,
+        environment,
+        None,
+        &managed_home,
+        &startup,
+    )
+    .await
     {
         Ok(server) => server,
         Err(error) => {
+            if let Some(owner) = startup.session() {
+                if let Err(cleanup) = owner.close().await {
+                    tracing::warn!(error = %bounded_safe_detail(&cleanup.to_string()), "OpenCode probe startup cleanup failed");
+                }
+            }
             let missing = error.chain().any(|source| {
                 source
                     .downcast_ref::<std::io::Error>()
@@ -1174,6 +1655,10 @@ pub(crate) async fn probe_opencode_instance(
                 OpenCodeProbeStatus::SpawnFailed
             };
             let message = bounded_safe_detail(format!("{error:#}").as_str());
+            let stderr = error
+                .downcast_ref::<OpenCodeStartupFailure>()
+                .map(|failure| failure.stderr.clone())
+                .unwrap_or_default();
             return OpenCodeProbeSnapshot {
                 status,
                 message: Some(message.clone()),
@@ -1189,7 +1674,7 @@ pub(crate) async fn probe_opencode_instance(
                     .to_owned(),
                     message,
                 }],
-                stderr: Vec::new(),
+                stderr,
                 models: Vec::new(),
             };
         }
@@ -1455,7 +1940,7 @@ impl OpenCodeRuntimeState {
 fn spawn_opencode_event_stream(
     server: Arc<OpenCodeServerProcess>,
     state: Arc<Mutex<OpenCodeRuntimeState>>,
-    event_tx: mpsc::Sender<RuntimeEvent>,
+    event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     cancellation: CancellationToken,
     include_native: bool,
     budget: pioneer_cli_agent_runtime::NativeEventBudget,
@@ -1529,7 +2014,7 @@ fn spawn_opencode_event_stream(
                         {
                             Ok(events) => {
                                 for event in events {
-                                    tokio::select! { _=cancellation.cancelled()=>return, result=event_tx.send(event)=>if result.is_err(){return;} }
+                                    tokio::select! { _=cancellation.cancelled()=>return, result=event_tx.send(pioneer_observability::work::WorkItem::new(event,pioneer_observability::work::Boundary::EventLane,pioneer_observability::work::WorkKind::Event,pioneer_observability::work::ExecutorRole::Event))=>if result.is_err(){return;} }
                                 }
                             }
                             Err(_) => break,
@@ -1662,7 +2147,7 @@ fn spawn_opencode_event_stream(
                 for event in events {
                     tokio::select! {
                         _ = cancellation.cancelled() => return,
-                        result = event_tx.send(event) => if result.is_err() { return; },
+                        result = event_tx.send(pioneer_observability::work::WorkItem::new(event,pioneer_observability::work::Boundary::EventLane,pioneer_observability::work::WorkKind::Event,pioneer_observability::work::ExecutorRole::Event)) => if result.is_err() { return; },
                     }
                 }
             }
@@ -1683,7 +2168,7 @@ fn spawn_opencode_event_stream(
 async fn fail_opencode_ingress(
     server: &OpenCodeServerProcess,
     state: &Arc<Mutex<OpenCodeRuntimeState>>,
-    tx: &mpsc::Sender<RuntimeEvent>,
+    tx: &mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     timeout: Duration,
 ) {
     let (session, events) = {
@@ -1700,7 +2185,16 @@ async fn fail_opencode_ingress(
     }
     let _ = server.close().await;
     for event in events {
-        if tx.send(event).await.is_err() {
+        if tx
+            .send(pioneer_observability::work::WorkItem::new(
+                event,
+                pioneer_observability::work::Boundary::EventLane,
+                pioneer_observability::work::WorkKind::Event,
+                pioneer_observability::work::ExecutorRole::Event,
+            ))
+            .await
+            .is_err()
+        {
             break;
         }
     }
@@ -1715,7 +2209,7 @@ async fn wait_or_cancel(cancellation: &CancellationToken, duration: Duration) ->
 
 async fn emit_opencode_stream_diagnostic(
     state: &Arc<Mutex<OpenCodeRuntimeState>>,
-    event_tx: &mpsc::Sender<RuntimeEvent>,
+    event_tx: &mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     message: String,
 ) {
     let state = state.lock().await;
@@ -1730,7 +2224,14 @@ async fn emit_opencode_stream_diagnostic(
         native: None,
     });
     drop(state);
-    let _ = event_tx.send(event).await;
+    let _ = event_tx
+        .send(pioneer_observability::work::WorkItem::new(
+            event,
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::ExecutorRole::Event,
+        ))
+        .await;
 }
 
 async fn map_opencode_event(
@@ -2855,6 +3356,14 @@ enum OpenCodeRequiredMcpBridgeState {
         server: JoinHandle<Result<(), crate::cli_runtime::mcp::server::CliMcpBridgeServerError>>,
         active_turn: Option<OpenCodeActiveMcpTurn>,
     },
+    Stopping {
+        handle: Option<CliMcpBridgeFacadeHandle>,
+        server: Option<
+            JoinHandle<Result<(), crate::cli_runtime::mcp::server::CliMcpBridgeServerError>>,
+        >,
+        outcome: Option<Result<(), String>>,
+        cleanup_done: bool,
+    },
     Failed,
 }
 
@@ -2883,7 +3392,8 @@ impl OpenCodeRequiredMcpBridge {
             let mut state = self.state.lock().await;
             match &*state {
                 OpenCodeRequiredMcpBridgeState::Ready { .. } => return Ok(()),
-                OpenCodeRequiredMcpBridgeState::Failed => {
+                OpenCodeRequiredMcpBridgeState::Failed
+                | OpenCodeRequiredMcpBridgeState::Stopping { .. } => {
                     bail!("OpenCode required MCP bridge generation is failed")
                 }
                 OpenCodeRequiredMcpBridgeState::Serving { bound_grant, .. } => bound_grant.clone(),
@@ -2904,10 +3414,16 @@ impl OpenCodeRequiredMcpBridge {
                         Arc::new(CorrelatingTurnMcpInvoker {
                             inner: self.invoker.clone(),
                             native_items: self.native_items.clone(),
+                            codex_binding: None,
+                            opencode_binding: Some((
+                                self.supervisor.coordinator(),
+                                attachment.bound_grant.clone(),
+                            )),
                         }),
                         self.projection_generation,
                         self.projection.clone(),
                         self.facade_limits.clone(),
+                        crate::cli_runtime::mcp::facade::CliMcpCallContract::OpenCode,
                     )
                     .map_err(|error| anyhow!("OpenCode MCP facade build failed: {error}"))?;
                     let server = tokio::spawn(server.run());
@@ -2958,18 +3474,72 @@ impl OpenCodeRequiredMcpBridge {
         }
     }
 
-    async fn fail_closed(&self) {
+    async fn request_stop(&self) {
         let mut state = self.state.lock().await;
-        let previous = std::mem::replace(&mut *state, OpenCodeRequiredMcpBridgeState::Failed);
-        match previous {
-            OpenCodeRequiredMcpBridgeState::Serving { server, .. }
-            | OpenCodeRequiredMcpBridgeState::Ready { server, .. } => server.abort(),
-            OpenCodeRequiredMcpBridgeState::Pending | OpenCodeRequiredMcpBridgeState::Failed => {}
+        if let OpenCodeRequiredMcpBridgeState::Stopping { handle, .. } = &*state {
+            if let Some(handle) = handle {
+                handle.request_shutdown();
+            }
+            return;
         }
-        drop(state);
-        self.supervisor.revoke_session(&self.process_instance).await;
+        let previous = std::mem::replace(&mut *state, OpenCodeRequiredMcpBridgeState::Failed);
+        *state = match previous {
+            OpenCodeRequiredMcpBridgeState::Serving { handle, server, .. }
+            | OpenCodeRequiredMcpBridgeState::Ready { handle, server, .. } => {
+                handle.request_shutdown();
+                OpenCodeRequiredMcpBridgeState::Stopping {
+                    handle: Some(handle),
+                    server: Some(server),
+                    outcome: None,
+                    cleanup_done: false,
+                }
+            }
+            _ => OpenCodeRequiredMcpBridgeState::Stopping {
+                handle: None,
+                server: None,
+                outcome: Some(Ok(())),
+                cleanup_done: false,
+            },
+        };
     }
-
+    async fn stop_and_wait(&self) -> Result<()> {
+        self.request_stop().await;
+        let mut state = self.state.lock().await;
+        let OpenCodeRequiredMcpBridgeState::Stopping {
+            server,
+            outcome,
+            cleanup_done,
+            ..
+        } = &mut *state
+        else {
+            bail!("OpenCode bridge stop ownership changed");
+        };
+        if outcome.is_none() {
+            let task = server
+                .as_mut()
+                .ok_or_else(|| anyhow!("OpenCode bridge completion is unknown"))?;
+            let result = match task.await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(_) => Err("OpenCode MCP facade worker failed".to_owned()),
+            };
+            server.take();
+            *outcome = Some(result);
+        }
+        outcome.clone().unwrap().map_err(|e| anyhow!("{e}"))?;
+        if !*cleanup_done {
+            if !self.launch.cleanup_confirmed()
+                && !self
+                    .supervisor
+                    .revoke_session_result(&self.process_instance)
+                    .await?
+                && !self.launch.cleanup_confirmed()
+            {
+                bail!("CLI MCP cleanup owner is unknown");
+            }
+            *cleanup_done = true;
+        }
+        Ok(())
+    }
     async fn prepare_turn(
         &self,
         pioneer_thread_id: &str,
@@ -3041,8 +3611,7 @@ impl OpenCodeRequiredMcpBridge {
             )
             .await
             .map_err(|error| anyhow!("failed to activate OpenCode MCP turn: {error:?}"))?;
-        self.native_items
-            .activate_scope(native_thread_id, native_turn_id);
+        self.native_items.clear();
         handle
             .set_activation(Some(turn.activation_generation))
             .await;
@@ -3073,7 +3642,6 @@ impl OpenCodeRequiredMcpBridge {
             .await
             .map_err(|error| anyhow!("failed to terminalize OpenCode MCP turn: {error:?}"))?;
         handle.set_activation(None).await;
-        self.native_items.deactivate_scope();
         Ok(())
     }
 }
@@ -3126,7 +3694,9 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
         &self,
         process_instance: &CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
+        startup: &crate::cli_runtime::manager::CLIAgentRuntimeSessionStartup,
     ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+        startup.check_admission()?;
         let native_session_id = match &launch_spec.continuation {
             CliProviderContinuation::OpenCodeServerSession { native_session_id } => {
                 native_session_id.clone()
@@ -3191,9 +3761,13 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                 {
                     Ok(reservation) => reservation,
                     Err(error) => {
-                        self.bridge_supervisor
-                            .revoke_session(process_instance)
-                            .await;
+                        if let Err(error) = self
+                            .bridge_supervisor
+                            .revoke_session_result(process_instance)
+                            .await
+                        {
+                            tracing::warn!(error = %error, "CLI MCP cleanup retained");
+                        }
                         return Err(anyhow!(
                             "failed to stage OpenCode MCP projection: {error:?}"
                         ));
@@ -3219,25 +3793,29 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
             &launch_spec.options.env,
             Some(process_instance.generation()),
             &opencode_managed_data_home(&self.runtime_home, &instance),
+            startup,
         )
         .await
         {
             Ok(server) => Arc::new(server),
-            Err(error) => {
-                if prepared_mcp.is_some() {
-                    self.bridge_supervisor
-                        .revoke_session(process_instance)
-                        .await;
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
+        let retained = Arc::new(OpenCodeStartupSession {
+            server: server.clone(),
+            bridge: Default::default(),
+            event_stream: Default::default(),
+            event_stream_failure: Default::default(),
+            cancellation: CancellationToken::new(),
+            failure: Default::default(),
+        });
+        startup.retain_session(retained.clone());
+        startup.check_admission()?;
         let request_timeout = Duration::from_millis(instance.request_timeout_ms.max(1));
         let initialized: Result<Option<Arc<OpenCodeRequiredMcpBridge>>> = async {
             if let Some(projection) = launch_projection.as_ref() {
                 let binary = instance.binary_path.clone();
                 let version = server.version.clone();
-                let (actual_contract, _) = tokio::task::spawn_blocking(move || {
+                let (actual_contract, _) = pioneer_observability::work::spawn_blocking(move || {
                     crate::cli_runtime::mcp::readiness::opencode_executable_fingerprints(
                         &binary,
                         version.as_deref(),
@@ -3280,10 +3858,14 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                     provider_contract_fingerprint: prepared.provider_contract_fingerprint,
                     isolation_contract_fingerprint: prepared.isolation_contract_fingerprint,
                     invoker: self.turn_mcp_invoker.clone(),
-                    native_items: Arc::new(NativeMcpCorrelationLedger::scoped()),
+                    native_items: Arc::new(NativeMcpCorrelationLedger::default()),
                     facade_limits: self.mcp_limits.facade_limits(),
                     state: Mutex::new(OpenCodeRequiredMcpBridgeState::Pending),
                 });
+                *retained
+                    .bridge
+                    .lock()
+                    .expect("OpenCode startup bridge poisoned") = Some(bridge.clone());
                 let helper = crate::cli_runtime::config::resolve_current_pioneer_cli_mcp_helper()?;
                 let add = server.api.add_pioneer_mcp(
                     helper.as_path(),
@@ -3294,7 +3876,6 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                     instance.startup_probe_timeout_ms.max(1),
                 ));
                 if let Err(error) = tokio::try_join!(add, ready) {
-                    bridge.fail_closed().await;
                     return Err(error).context("OpenCode MCP initialization failed");
                 }
                 Some(bridge)
@@ -3310,13 +3891,7 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
         .await;
         let required_mcp_bridge = match initialized {
             Ok(initialized) => initialized,
-            Err(error) => {
-                let _ = server.close().await;
-                self.bridge_supervisor
-                    .revoke_session(process_instance)
-                    .await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let (event_tx, event_rx) = mpsc::channel(instance.event_channel_capacity.max(1));
         let state = Arc::new(Mutex::new(OpenCodeRuntimeState {
@@ -3324,16 +3899,13 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
             cwd: Some(cwd.to_string_lossy().into_owned()),
             ..Default::default()
         }));
-        let cancellation = CancellationToken::new();
+        let cancellation = retained.cancellation.clone();
         if !launch_spec.native_event_budget.is_valid() {
-            let _ = server.close().await;
-            if let Some(bridge) = &required_mcp_bridge {
-                bridge.fail_closed().await;
-            }
             bail!("invalid admitted OpenCode native event budget");
         }
         let (ready_tx, ready_rx) = watch::channel(false);
-        let event_stream = spawn_opencode_event_stream(
+        let mut stream_slot = retained.event_stream.lock().await;
+        *stream_slot = Some(spawn_opencode_event_stream(
             server.clone(),
             state.clone(),
             event_tx.clone(),
@@ -3342,16 +3914,12 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
             launch_spec.native_event_budget,
             ready_tx,
             request_timeout,
-        );
+        ));
+        drop(stream_slot);
         if let Err(error) =
             wait_opencode_subscription(ready_rx.clone(), &cancellation, request_timeout).await
         {
             cancellation.cancel();
-            event_stream.abort();
-            if let Some(bridge) = &required_mcp_bridge {
-                bridge.fail_closed().await;
-            }
-            let _ = server.close().await;
             return Err(error);
         }
         Ok(Arc::new(OpenCodeCLIAgentRuntimeSession {
@@ -3366,7 +3934,8 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                 runtime_kind: "opencode".to_owned(),
                 events: event_rx,
             })),
-            event_stream: std::sync::Mutex::new(Some(event_stream)),
+            event_stream: retained.event_stream.clone(),
+            event_stream_failure: retained.event_stream_failure.clone(),
             cancellation,
             required_mcp_bridge,
             stream_ready: ready_rx,
@@ -3378,15 +3947,85 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
     }
 }
 
+// Retain the spawned process in the manager's factory owner until the full
+// session is published, including failures or cancellation during initialization.
+struct OpenCodeStartupSession {
+    server: Arc<OpenCodeServerProcess>,
+    bridge: std::sync::Mutex<Option<Arc<OpenCodeRequiredMcpBridge>>>,
+    event_stream: Arc<Mutex<Option<JoinHandle<()>>>>,
+    event_stream_failure: Arc<std::sync::Mutex<Option<String>>>,
+    cancellation: CancellationToken,
+    failure: std::sync::Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl CLIAgentRuntimeSession for OpenCodeStartupSession {
+    async fn close(&self) -> Result<()> {
+        self.cancellation.cancel();
+        let bridge = self
+            .bridge
+            .lock()
+            .expect("OpenCode startup bridge poisoned")
+            .clone();
+        if let Some(bridge) = &bridge {
+            bridge.request_stop().await;
+        }
+        let mut stream = self.event_stream.lock().await;
+        if let Some(task) = stream.as_mut() {
+            task.abort();
+            let result = task.await;
+            stream.take();
+            if result.is_err_and(|error| !error.is_cancelled()) {
+                *self
+                    .event_stream_failure
+                    .lock()
+                    .expect("OpenCode stream failure poisoned") =
+                    Some("OpenCode event stream worker failed".into());
+            }
+        }
+        if let Err(error) = self.server.close().await {
+            self.failure
+                .lock()
+                .expect("OpenCode startup failure poisoned")
+                .get_or_insert(error.to_string());
+        }
+        if let Some(bridge) = bridge {
+            if let Err(error) = bridge.stop_and_wait().await {
+                self.failure
+                    .lock()
+                    .expect("OpenCode startup failure poisoned")
+                    .get_or_insert(error.to_string());
+            }
+        }
+        let mut failure = self
+            .failure
+            .lock()
+            .expect("OpenCode startup failure poisoned");
+        if let Some(error) = self
+            .event_stream_failure
+            .lock()
+            .expect("OpenCode stream failure poisoned")
+            .clone()
+        {
+            failure.get_or_insert(error);
+        }
+        match failure.clone() {
+            Some(error) => Err(anyhow!("{error}")),
+            None => Ok(()),
+        }
+    }
+}
+
 struct OpenCodeCLIAgentRuntimeSession {
     runtime_id: String,
     process_instance: CliSessionInstanceId,
     server: Arc<OpenCodeServerProcess>,
     state: Arc<Mutex<OpenCodeRuntimeState>>,
     request_timeout: Duration,
-    event_tx: mpsc::Sender<RuntimeEvent>,
+    event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     event_receivers: std::sync::Mutex<Option<CLIAgentRuntimeEventReceivers>>,
-    event_stream: std::sync::Mutex<Option<JoinHandle<()>>>,
+    event_stream: Arc<Mutex<Option<JoinHandle<()>>>>,
+    event_stream_failure: Arc<std::sync::Mutex<Option<String>>>,
     cancellation: CancellationToken,
     required_mcp_bridge: Option<Arc<OpenCodeRequiredMcpBridge>>,
     stream_ready: watch::Receiver<bool>,
@@ -3400,19 +4039,41 @@ struct OpenCodeCLIAgentRuntimeSession {
 impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
     async fn close(&self) -> Result<()> {
         self.cancellation.cancel();
-        if let Some(stream) = self
-            .event_stream
-            .lock()
-            .expect("OpenCode event stream mutex should not be poisoned")
-            .take()
-        {
-            stream.abort();
+        if let Some(bridge) = &self.required_mcp_bridge {
+            bridge.request_stop().await;
+        }
+        let mut stream = self.event_stream.lock().await;
+        if let Some(task) = stream.as_mut() {
+            task.abort();
+            let result = task.await;
+            stream.take();
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                *self
+                    .event_stream_failure
+                    .lock()
+                    .expect("OpenCode stream failure poisoned") =
+                    Some("OpenCode event stream worker failed".to_owned());
+            }
         }
         self.pending_prompt.lock().await.take();
-        if let Some(bridge) = self.required_mcp_bridge.as_ref() {
-            bridge.fail_closed().await;
+        let server_result = self.server.close().await;
+        let bridge_result = if let Some(bridge) = &self.required_mcp_bridge {
+            bridge.stop_and_wait().await
+        } else {
+            Ok(())
+        };
+        if let Some(error) = self
+            .event_stream_failure
+            .lock()
+            .expect("OpenCode stream failure poisoned")
+            .clone()
+        {
+            return Err(anyhow!("{error}"));
         }
-        self.server.close().await
+        server_result?;
+        bridge_result
     }
 
     async fn validate_replacement_launch(&self, launch: &CliSessionLaunchSpec) -> Result<()> {
@@ -3911,7 +4572,15 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
                 terminalize_opencode_failure(&mut state, None)
             };
             for event in events {
-                let _ = self.event_tx.send(event).await;
+                let _ = self
+                    .event_tx
+                    .send(pioneer_observability::work::WorkItem::new(
+                        event,
+                        pioneer_observability::work::Boundary::EventLane,
+                        pioneer_observability::work::WorkKind::Event,
+                        pioneer_observability::work::ExecutorRole::Event,
+                    ))
+                    .await;
             }
             if let Err(shutdown) = shutdown {
                 return Err(error.context(format!(
@@ -4013,7 +4682,15 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
             complete_opencode_turn(&mut state, "interrupted", None)
         };
         for event in events {
-            let _ = self.event_tx.send(event).await;
+            let _ = self
+                .event_tx
+                .send(pioneer_observability::work::WorkItem::new(
+                    event,
+                    pioneer_observability::work::Boundary::EventLane,
+                    pioneer_observability::work::WorkKind::Event,
+                    pioneer_observability::work::ExecutorRole::Event,
+                ))
+                .await;
         }
         // Resolve the durable waiters even when shutdown itself reports an
         // error. The caller still receives that failure instead of success.
@@ -4444,11 +5121,16 @@ impl OpenCodeCLIAgentRuntimeSession {
         drop(state);
         if emit {
             self.event_tx
-                .send(RuntimeEvent::TurnStarted(RuntimeTurnStarted {
-                    native_thread_id: Some(session.to_owned()),
-                    native_turn_id: turn.to_owned(),
-                    native: None,
-                }))
+                .send(pioneer_observability::work::WorkItem::new(
+                    RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                        native_thread_id: Some(session.to_owned()),
+                        native_turn_id: turn.to_owned(),
+                        native: None,
+                    }),
+                    pioneer_observability::work::Boundary::EventLane,
+                    pioneer_observability::work::WorkKind::Event,
+                    pioneer_observability::work::ExecutorRole::Event,
+                ))
                 .await
                 .map_err(|_| anyhow!("OpenCode event channel is closed"))?;
         }
@@ -4833,33 +5515,106 @@ fn refresh_opencode_message_ownership(state: &mut OpenCodeRuntimeState, messages
 pub(crate) fn opencode_usage_metadata<'a>(
     messages: impl IntoIterator<Item = &'a JsonValue>,
 ) -> JsonValue {
-    let mut input = None;
-    let mut output = None;
-    let mut reasoning = None;
-    let mut read = None;
-    let mut write = None;
+    let mut totals = [Some(0_u64); 5];
+    let mut known_parts = [None; 5];
     let mut reported = false;
-    fn add(total: &mut Option<u64>, value: Option<u64>) {
-        if let Some(value) = value {
-            *total = Some(total.unwrap_or(0).saturating_add(value));
-        }
-    }
+    let mut responses = Vec::new();
+    let mut responses_truncated = false;
+    let mut has_responses = false;
+    let mut cost_total = Some(0.0_f64);
     fn sum(values: &[Option<u64>]) -> Option<u64> {
-        values.iter().flatten().copied().reduce(u64::saturating_add)
+        values
+            .iter()
+            .try_fold(0_u64, |total, value| total.checked_add((*value)?))
     }
     for message in messages {
         if !matches!(message["type"].as_str(), Some("assistant" | "compaction")) {
             continue;
         }
         let tokens = &message["tokens"];
+        has_responses = true;
+        let cost = message["cost"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.);
+        cost_total = cost_total
+            .and_then(|total| cost.map(|n| total + n))
+            .filter(|n| n.is_finite());
+        if responses.len() < 8 {
+            let mut response = json!({"native_tokens":{
+                "input":tokens["input"].as_u64(), "output":tokens["output"].as_u64(),
+                "reasoning":tokens["reasoning"].as_u64(), "total":tokens["total"].as_u64(),
+                "cache":{"read":tokens["cache"]["read"].as_u64(),"write":tokens["cache"]["write"].as_u64()}
+            }});
+            for key in ["id", "sessionID", "parentID", "modelID", "providerID"] {
+                if let Some(value) =
+                    pioneer_provider::usage::cli_statistics_identifier(&message[key])
+                {
+                    response[key] = json!(value);
+                }
+            }
+            let mut model = serde_json::Map::new();
+            for key in ["id", "providerID", "variant"] {
+                if let Some(value) =
+                    pioneer_provider::usage::cli_statistics_identifier(&message["model"][key])
+                {
+                    model.insert(key.to_owned(), json!(value));
+                }
+            }
+            if !model.is_empty() {
+                response["model"] = JsonValue::Object(model);
+            }
+            for key in ["created", "streamed", "completed"] {
+                if let Some(value) = message["time"][key].as_u64() {
+                    response["time"][key] = json!(value);
+                }
+            }
+            if let (Some(start), Some(end)) = (
+                message["time"]["created"].as_u64(),
+                message["time"]["completed"].as_u64(),
+            ) {
+                if let Some(duration) = end.checked_sub(start) {
+                    response["duration_ms"] = json!(duration);
+                }
+            }
+            if let Some(cost) = cost {
+                response["cost_usd"] = json!(cost);
+            }
+            responses.push(response);
+        } else {
+            responses_truncated = true;
+        }
         reported |= tokens.is_object();
-        add(&mut input, tokens["input"].as_u64());
-        add(&mut output, tokens["output"].as_u64());
-        add(&mut reasoning, tokens["reasoning"].as_u64());
-        add(&mut read, tokens["cache"]["read"].as_u64());
-        add(&mut write, tokens["cache"]["write"].as_u64());
+        for (index, value) in [
+            tokens["input"].as_u64(),
+            tokens["output"].as_u64(),
+            tokens["reasoning"].as_u64(),
+            tokens["cache"]["read"].as_u64(),
+            tokens["cache"]["write"].as_u64(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            totals[index] = totals[index].and_then(|total| total.checked_add(value?));
+            if let Some(value) = value {
+                known_parts[index] =
+                    Some(known_parts[index].unwrap_or(0_u64).saturating_add(value));
+            }
+        }
     }
+    if !reported {
+        totals = [None; 5];
+    }
+    let [input, output, reasoning, read, write] = totals;
+    // Bound only additional evidence; aggregate categories and reader scope are
+    // computed above from every message and must not be re-sanitized away.
+    let evidence = pioneer_provider::usage::bounded_cli_statistics(&json!({
+        "responses":responses, "responses_truncated":responses_truncated,
+    }));
     json!({
+        "runtime":"opencode", "scope":"turn_snapshot",
+        "cost_usd":if has_responses {cost_total} else {None},
+        "responses":evidence["responses"], "responses_truncated":evidence["responses_truncated"],
+        "cost_basis":"opencode_reported_unknown_origin",
         "input_tokens":sum(&[input, read, write]),
         "output_tokens":sum(&[output, reasoning]),
         "uncached_input_tokens":input,
@@ -4868,6 +5623,7 @@ pub(crate) fn opencode_usage_metadata<'a>(
         "cache_read_input_tokens":read,
         "cache_creation_input_tokens":write,
         "semantics":"opencode_v2_exclusive_cache_separate_reasoning",
+        "known_partial_tokens": {"input":known_parts[0],"output":known_parts[1],"reasoning":known_parts[2],"cache_read":known_parts[3],"cache_write":known_parts[4]},
         "native_tokens":reported.then(||json!({"input":input,"output":output,"reasoning":reasoning,"cache":{"read":read,"write":write}})),
     })
 }
@@ -4920,7 +5676,11 @@ fn project_opencode_messages(
         }
     }
     let usage = opencode_usage_metadata(opencode_turn_messages(messages, &root));
-    if usage["native_tokens"].is_object() {
+    if usage["native_tokens"].is_object()
+        || usage["responses"]
+            .as_array()
+            .is_some_and(|responses| !responses.is_empty())
+    {
         state.last_usage = Some(usage);
     }
     events
@@ -5355,6 +6115,10 @@ fn bounded_safe_detail(value: &str) -> String {
     format!("{}…", &value[..end])
 }
 
+#[cfg(all(test, unix))]
+#[path = "opencode_startup_tests.rs"]
+pub(crate) mod startup_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5612,6 +6376,7 @@ mod tests {
             thread_id: "thread".into(),
             turn_id: "turn".into(),
             recovery: None,
+            codex_retry_attempt_id: None,
         };
         let shell = observation
             .reconciliation_events
@@ -5877,6 +6642,75 @@ mod tests {
     }
 
     #[test]
+    fn v2_usage_retains_response_cost_identity_and_native_timing_only() {
+        let usage = opencode_usage_metadata([&json!({
+            "type":"assistant", "id":"message", "sessionID":"session", "model":{"id":"model","providerID":"provider","variant":"high"},
+            "cost":0.25, "time":{"created":100,"completed":130}, "secret":"SECRET",
+            "tokens":{"input":10,"output":3,"reasoning":7,"cache":{"read":80,"write":20}}
+        })]);
+        assert_eq!(usage["cost_usd"], 0.25);
+        assert_eq!(usage["responses"][0]["id"], "message");
+        assert_eq!(usage["responses"][0]["model"]["id"], "model");
+        assert_eq!(usage["responses"][0]["model"]["providerID"], "provider");
+        assert_eq!(usage["responses"][0]["duration_ms"], 30);
+        assert_eq!(usage["input_tokens"], 110);
+        assert_eq!(usage["output_tokens"], 10);
+        assert!(!usage.to_string().contains("SECRET"));
+    }
+
+    #[test]
+    fn v2_interactive_usage_bounds_evidence_before_durable_projection() {
+        let mut native = history("succeeded");
+        let mut step = native[1].clone();
+        step["content"] = json!([]);
+        step["cost"] = json!(0.25);
+        step["model"]["id"] = json!("x".repeat(129));
+        let mut messages = vec![native[0].clone()];
+        for index in 0..64 {
+            step["id"] = json!(format!("msg_{index}"));
+            messages.push(step.clone());
+        }
+        messages.push(native.as_array_mut().unwrap().remove(2));
+        let observation =
+            opencode_observation_from_messages("ses_test", "msg_user", &json!(messages), false)
+                .unwrap();
+        let usage = observation.reconciliation_events.iter().find(|event| {
+            matches!(event, RuntimeEvent::ItemCompleted(item) if item.item_kind == "tokenUsage")
+        }).unwrap();
+        let projected = crate::cli_runtime::projector::project_cli_runtime_event(
+            &crate::cli_runtime::projector::CLIRuntimeProjectorContext {
+                workspace_id: "workspace".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                recovery: None,
+                codex_retry_attempt_id: None,
+            },
+            usage,
+        );
+        let pioneer_protocol::AgentDurableEvent::ItemCompleted { notification } =
+            &projected.durable[0]
+        else {
+            panic!("durable usage")
+        };
+        let pioneer_protocol::TurnItem::SystemEvent {
+            details: Some(details),
+            ..
+        } = &notification.item
+        else {
+            panic!("usage item")
+        };
+        let usage = &details["usage"];
+        assert_eq!(usage["responses"].as_array().unwrap().len(), 8);
+        assert_eq!(usage["responses_truncated"], true);
+        assert!(usage["responses"][0]["model"].get("id").is_none());
+        assert_eq!(usage["input_tokens"], 640);
+        assert_eq!(usage["output_tokens"], 128);
+        assert_eq!(usage["cost_usd"], 16.0);
+        assert_eq!(usage["scope"], "turn_snapshot");
+        assert!(serde_json::to_string(&notification.item).unwrap().len() < 16 * 1024);
+    }
+
+    #[test]
     fn v2_usage_normalizes_exclusive_categories_once_and_preserves_missing_zero() {
         let messages = json!([
             {"type":"assistant","tokens":{"input":10,"output":3,"reasoning":7,"cache":{"read":80,"write":20}}},
@@ -5908,11 +6742,27 @@ mod tests {
         let zero = opencode_usage_metadata([
             &json!({"type":"assistant","tokens":{"input":0,"output":0,"cache":{"read":0}}}),
         ]);
-        assert_eq!(zero["input_tokens"], 0);
-        assert_eq!(zero["output_tokens"], 0);
+        assert!(zero["input_tokens"].is_null());
+        assert!(zero["output_tokens"].is_null());
         assert_eq!(zero["uncached_input_tokens"], 0);
         assert!(zero["reasoning_tokens"].is_null());
         assert!(zero["cache_creation_input_tokens"].is_null());
+        let complete_zero = opencode_usage_metadata([
+            &json!({"type":"assistant","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}),
+        ]);
+        assert_eq!(complete_zero["input_tokens"], 0);
+        assert_eq!(complete_zero["output_tokens"], 0);
+        let missing_in_one_message = opencode_usage_metadata([
+            &json!({"type":"assistant","tokens":{"input":10,"output":2,"reasoning":0,"cache":{"read":80,"write":0}}}),
+            &json!({"type":"assistant","tokens":{"input":5,"output":1,"reasoning":0,"cache":{"write":0}}}),
+        ]);
+        assert!(missing_in_one_message["input_tokens"].is_null());
+        assert!(missing_in_one_message["cache_read_input_tokens"].is_null());
+        assert_eq!(
+            missing_in_one_message["known_partial_tokens"]["cache_read"],
+            80
+        );
+        assert_eq!(missing_in_one_message["uncached_input_tokens"], 15);
     }
 
     #[tokio::test]

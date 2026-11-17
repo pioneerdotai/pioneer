@@ -5,8 +5,6 @@ use pioneer_client::gateway::{
 use serde::{Deserialize, Serialize};
 pub const CLIENT_NOT_INITIALIZED_CODE: &str = "client_not_initialized";
 pub const GATEWAY_DISCONNECTED_CODE: &str = "gateway_disconnected";
-#[cfg(test)]
-pub const VOICE_RECONFIGURATION_BUSY_CODE: &str = "voice_reconfiguration_busy";
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

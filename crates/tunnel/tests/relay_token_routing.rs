@@ -46,7 +46,7 @@ impl Relay {
         let ingress_addr = ingress.local_addr().unwrap();
         let config = format!(
             "[relay]\ncontrol_addr = \"{control_addr}\"\ningress_addr = \"{ingress_addr}\"\n{}{}",
-            tunnel("oskin1", "first.example", "first-key"),
+            tunnel("oskin1", "first.example/pioneer/public/", "first-key"),
             tunnel("rechkin", "second.example", "second-key"),
         );
         let (shutdown, rx) = broadcast::channel(1);
@@ -176,6 +176,15 @@ async fn two_gateways_with_default_name_route_by_key_and_reconnect_independently
         )
         .unwrap();
         connect_gateway(&gateway, key).await;
+        let expected = if key == "first-key" {
+            "https://first.example/pioneer/public/"
+        } else {
+            "https://second.example/"
+        };
+        assert_eq!(
+            gateway.status_snapshot().public_base_url.unwrap().as_str(),
+            expected
+        );
         gateways.push(gateway);
         upstreams.push(task);
         homes.push(home);
@@ -193,6 +202,7 @@ async fn two_gateways_with_default_name_route_by_key_and_reconnect_independently
             .ends_with("second-gateway")
     );
     gateways[0].shutdown().await;
+    assert!(gateways[0].status_snapshot().public_base_url.is_none());
     connect_gateway(&gateways[0], "first-key").await;
     assert!(
         relay
@@ -206,6 +216,16 @@ async fn two_gateways_with_default_name_route_by_key_and_reconnect_independently
             .await
             .ends_with("second-gateway")
     );
+    gateways[1].shutdown().await;
+    connect_gateway(&gateways[0], "second-key").await;
+    assert_eq!(
+        gateways[0]
+            .status_snapshot()
+            .public_base_url
+            .unwrap()
+            .as_str(),
+        "https://second.example/",
+    );
     for gateway in gateways {
         gateway.shutdown().await;
     }
@@ -218,11 +238,11 @@ async fn handshake(relay: &Relay, id: [u8; 32], proof_key: [u8; 32]) -> (TcpStre
     timeout(Duration::from_secs(5), async {
         let mut socket = TcpStream::connect(relay.control).await.unwrap();
         socket.write_all(&0u32.to_le_bytes()).await.unwrap();
-        socket.write_u8(1).await.unwrap();
+        socket.write_u8(2).await.unwrap();
         socket.write_all(&id).await.unwrap();
         let mut hello = [0; 37];
         socket.read_exact(&mut hello).await.unwrap();
-        assert_eq!(&hello[..5], &[0, 0, 0, 0, 1]);
+        assert_eq!(&hello[..5], &[0, 0, 0, 0, 2]);
         let mut proof = proof_key.to_vec();
         proof.extend_from_slice(&hello[5..]);
         socket.write_all(&hash(&proof)).await.unwrap();
@@ -254,8 +274,12 @@ async fn token_lookup_requires_secret_proof_and_rejects_service_name_handshake()
             .1,
         2
     );
-    let (_first, ack) = handshake(&relay, first_id, hash(b"first-key")).await;
+    let (mut first, ack) = handshake(&relay, first_id, hash(b"first-key")).await;
     assert_eq!(ack, 0);
+    let len = first.read_u16().await.unwrap();
+    let mut url = vec![0; usize::from(len)];
+    first.read_exact(&mut url).await.unwrap();
+    assert_eq!(url.as_slice(), b"https://first.example/pioneer/public/");
 }
 
 #[test]

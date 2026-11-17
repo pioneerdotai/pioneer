@@ -69,6 +69,11 @@ impl MessageProcessor {
             .await;
             return;
         };
+        let push_mutation = read_all
+            .then(|| {
+                self.begin_push_mutation(context.connection_id(), workspace.workspace_id(), false)
+            })
+            .flatten();
         let result = async {
             let limit = params.limit.unwrap_or(30).clamp(1, 100) as usize;
             // A short read snapshot keeps the page and total on the same ACL
@@ -83,8 +88,17 @@ impl MessageProcessor {
                 .await?;
                 // The mutation is durable and writer capacity has been released.
                 // Invalidate even if the subsequent response snapshot fails.
-                self.notify_task_completion_inbox_read(context, workspace.workspace_id())
-                    .await;
+                self.dirty_push_inbox(
+                    workspace.workspace_id(),
+                    Some(&context.principal().principal_id),
+                    Some(context.connection_id()),
+                );
+                self.notify_task_completion_inbox_read_legacy(
+                    context,
+                    workspace.workspace_id(),
+                    false,
+                )
+                .await;
             }
             let snapshot = db.begin_read().await?;
             let rows = pioneer_crud::list_task_completion_inbox(
@@ -117,6 +131,18 @@ impl MessageProcessor {
         .await;
         match result {
             Ok(response) => {
+                if let Some(mutation) = push_mutation {
+                    mutation.finish(
+                        None,
+                        Some(pioneer_protocol::TaskInboxPatch {
+                            replace: true,
+                            upserts: response.entries.clone(),
+                            removes: Vec::new(),
+                            unread_count: response.unread_count,
+                            next_cursor: response.next_cursor.clone(),
+                        }),
+                    );
+                }
                 self.send_task_response(context.connection_id(), id, &response)
                     .await;
             }
@@ -158,12 +184,30 @@ impl MessageProcessor {
             .await;
             return;
         };
+        let push_mutation = mark_read
+            .then(|| {
+                self.begin_push_mutation(context.connection_id(), workspace.workspace_id(), false)
+            })
+            .flatten();
         let result = async {
             let db = self.crud_store.database_connection();
             if mark_read {
                 let at = chrono::Utc::now().to_rfc3339();
                 pioneer_crud::mark_task_completion_inbox_read(&db, &access, &params.run_id, &at)
                     .await?;
+                self.dirty_push_peers(
+                    context,
+                    workspace.workspace_id(),
+                    None,
+                    Some(&params.run_id),
+                );
+                // Commit already happened; notify peers even if response loading fails.
+                self.notify_task_completion_inbox_read_legacy(
+                    context,
+                    workspace.workspace_id(),
+                    false,
+                )
+                .await;
             }
             let snapshot = db.begin_read().await?;
             let row =
@@ -185,12 +229,20 @@ impl MessageProcessor {
         .await;
         match result {
             Ok(Some(entry)) => {
+                if let Some(mutation) = push_mutation {
+                    mutation.finish(
+                        None,
+                        Some(pioneer_protocol::TaskInboxPatch {
+                            replace: false,
+                            upserts: Vec::new(),
+                            removes: vec![params.run_id.clone()],
+                            unread_count: entry.unread_count,
+                            next_cursor: None,
+                        }),
+                    );
+                }
                 self.send_task_response(context.connection_id(), id, &entry)
                     .await;
-                if mark_read {
-                    self.notify_task_completion_inbox_read(context, workspace.workspace_id())
-                        .await;
-                }
             }
             Ok(None) => {
                 self.send_error(
@@ -247,16 +299,26 @@ impl MessageProcessor {
         .await;
         match result {
             Ok(confirmed) => {
-                self.send_task_response(context.connection_id(), id, &confirmed)
-                    .await;
                 if !confirmed.is_empty() {
-                    self.notify_task_completion_inbox_read_excluding_source(
+                    for run in &confirmed {
+                        self.dirty_push(
+                            workspace.workspace_id(),
+                            None,
+                            None,
+                            Some(run),
+                            false,
+                            Some(&context.principal().principal_id),
+                        );
+                    }
+                    self.notify_task_completion_inbox_read_legacy(
                         context,
                         workspace.workspace_id(),
                         true,
                     )
                     .await;
                 }
+                self.send_task_response(context.connection_id(), id, &confirmed)
+                    .await;
             }
             Err(_) => {
                 self.send_error(
@@ -273,11 +335,12 @@ impl MessageProcessor {
         context: &RequestContext,
         workspace_id: &str,
     ) {
-        self.notify_task_completion_inbox_read_excluding_source(context, workspace_id, false)
+        self.dirty_push_inbox(workspace_id, Some(&context.principal().principal_id), None);
+        self.notify_task_completion_inbox_read_legacy(context, workspace_id, false)
             .await;
     }
 
-    async fn notify_task_completion_inbox_read_excluding_source(
+    async fn notify_task_completion_inbox_read_legacy(
         &self,
         context: &RequestContext,
         workspace_id: &str,
@@ -299,6 +362,7 @@ impl MessageProcessor {
         let hint = pioneer_protocol::TaskCompletionInboxChangedNotification {
             workspace_id: workspace_id.to_owned(),
         };
+        let connections = self.legacy_push_connections(connections, false, true);
         self.send_notification_to_connections(
             events::TASK_COMPLETION_INBOX_CHANGED,
             &hint,
@@ -308,7 +372,7 @@ impl MessageProcessor {
     }
 }
 
-fn decode_inbox_cursor(cursor: &str) -> anyhow::Result<(String, String)> {
+pub(super) fn decode_inbox_cursor(cursor: &str) -> anyhow::Result<(String, String)> {
     anyhow::ensure!(cursor.len() <= 256, "invalid inbox cursor");
     let (at, id): (String, String) = serde_json::from_str(cursor)?;
     anyhow::ensure!(
@@ -318,7 +382,7 @@ fn decode_inbox_cursor(cursor: &str) -> anyhow::Result<(String, String)> {
     Ok((at, id))
 }
 
-fn completion_inbox_entry(
+pub(super) fn completion_inbox_entry(
     workspace: &str,
     row: pioneer_crud::TaskCompletionInboxRow,
 ) -> anyhow::Result<TaskCompletionInboxEntry> {
@@ -336,6 +400,7 @@ fn completion_inbox_entry(
         thread_title: row.thread_title,
         status: row.status,
         completed_at: row.completed_at,
+        completed_key: row.completed_key,
         summary: row.summary,
         error: error
             .as_ref()

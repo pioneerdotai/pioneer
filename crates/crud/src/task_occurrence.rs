@@ -25,13 +25,35 @@ impl CrudStore {
         &self,
         now: i64,
     ) -> Result<Vec<TaskOccurrenceReconcileCandidate>> {
+        let discovery = self
+            .discover_task_occurrence_reconcile_with_audit(now)
+            .await?;
+        if let Some(error) = discovery.audit_error {
+            return Err(error);
+        }
+        Ok(discovery.candidates)
+    }
+
+    pub async fn discover_task_occurrence_reconcile_with_audit(
+        &self,
+        now: i64,
+    ) -> Result<OccurrenceReconcileDiscovery<TaskOccurrenceReconcileCandidate>> {
         let maintenance = self.with_maintenance_access();
-        queue::discover(
+        let audit_error = maintenance
+            .audit_legacy_occurrence_producers(true)
+            .await
+            .err();
+        // Independent durable tickets remain serviceable after an audit error.
+        let candidates = queue::discover(
             &maintenance.connection,
             now,
             queue::TASK_OCCURRENCE_RUN_QUOTA,
         )
-        .await
+        .await?;
+        Ok(OccurrenceReconcileDiscovery {
+            candidates,
+            audit_error,
+        })
     }
 
     pub async fn has_pending_task_occurrence_reconcile(&self) -> Result<bool> {
@@ -120,83 +142,94 @@ impl CrudStore {
             &contracts::TerminalOccurrenceMetadata,
         )>,
     ) -> Result<TaskOccurrenceTerminalRepairOutcome> {
-        let tx = self.connection.begin().await?;
+        let change = crate::task_events::TaskWorkChange::for_source(&self.connection, "r", run_id);
         let result = async {
-            if let Some((claim, _)) = prepared
-                && !queue::owns(&tx, claim).await?
-            {
-                return Ok(TaskOccurrenceTerminalRepairOutcome::StaleClaim);
-            }
-            let current = contracts::load_terminal_occurrence_metadata(&tx, run_id).await?;
-            if let Some((_, facts)) = prepared
-                && facts != &current
-            {
-                // Task scope refresh may not yet have expanded to this run.
-                // Compare values, including bindings, rather than timestamps.
-                return Ok(TaskOccurrenceTerminalRepairOutcome::StaleClaim);
-            }
-            let outcome = match current.expected_status() {
-                Some(status) => {
-                    let occurrence = current
-                        .occurrence
-                        .as_ref()
-                        .expect("predicate requires occurrence");
-                    if occurrence.status == contracts::task_occurrence_status_to_db(&status) {
-                        TaskOccurrenceTerminalRepairOutcome::AlreadyConsistent
-                    } else if contracts::repair_terminal_task_occurrence_status(
-                        &tx,
-                        occurrence,
-                        status,
-                        now.max(occurrence.updated_at.timestamp()),
-                    )
-                    .await?
-                    {
-                        TaskOccurrenceTerminalRepairOutcome::Changed
-                    } else {
-                        // M=true failure keeps the claimed, delayed obligation.
-                        return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
-                    }
+            let tx = self.connection.begin().await?;
+            let result = async {
+                if let Some((claim, _)) = prepared
+                    && !queue::owns(&tx, claim).await?
+                {
+                    return Ok(TaskOccurrenceTerminalRepairOutcome::StaleClaim);
                 }
-                None if current.run.is_none() => TaskOccurrenceTerminalRepairOutcome::NotFound,
-                None if current.execution.is_none() => {
-                    TaskOccurrenceTerminalRepairOutcome::NotRepairable
+                let current = contracts::load_terminal_occurrence_metadata(&tx, run_id).await?;
+                if let Some((_, facts)) = prepared
+                    && facts != &current
+                {
+                    // Task scope refresh may not yet have expanded to this run.
+                    // Compare values, including bindings, rather than timestamps.
+                    return Ok(TaskOccurrenceTerminalRepairOutcome::StaleClaim);
                 }
-                None if current.occurrence.is_none() => {
-                    TaskOccurrenceTerminalRepairOutcome::NotFound
-                }
-                None => TaskOccurrenceTerminalRepairOutcome::NotRepairable,
-            };
-            if prepared.is_some() {
-                // Our own occurrence UPDATE refreshes generation/clears token.
-                // Recheck consistency and ACK the CURRENT snapshot atomically.
-                let consistent = if outcome == TaskOccurrenceTerminalRepairOutcome::Changed {
-                    !contracts::load_terminal_occurrence_metadata(&tx, run_id)
+                let outcome = match current.expected_status() {
+                    Some(status) => {
+                        let occurrence = current
+                            .occurrence
+                            .as_ref()
+                            .expect("predicate requires occurrence");
+                        if occurrence.status == contracts::task_occurrence_status_to_db(&status) {
+                            TaskOccurrenceTerminalRepairOutcome::AlreadyConsistent
+                        } else if contracts::repair_terminal_task_occurrence_status(
+                            &tx,
+                            occurrence,
+                            status,
+                            now.max(occurrence.updated_at.timestamp()),
+                        )
                         .await?
-                        .is_mismatch()
-                } else {
-                    !current.is_mismatch()
+                        {
+                            TaskOccurrenceTerminalRepairOutcome::Changed
+                        } else {
+                            // M=true failure keeps the claimed, delayed obligation.
+                            return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
+                        }
+                    }
+                    None if current.run.is_none() => TaskOccurrenceTerminalRepairOutcome::NotFound,
+                    None if current.execution.is_none() => {
+                        TaskOccurrenceTerminalRepairOutcome::NotRepairable
+                    }
+                    None if current.occurrence.is_none() => {
+                        TaskOccurrenceTerminalRepairOutcome::NotFound
+                    }
+                    None => TaskOccurrenceTerminalRepairOutcome::NotRepairable,
                 };
-                if consistent {
-                    if let Some(row) = pending::Entity::find_by_id(run_id.to_owned())
-                        .one(&tx)
-                        .await?
-                    {
-                        queue::acknowledge(&tx, &row).await?;
+                if prepared.is_some() {
+                    // Our own occurrence UPDATE refreshes generation/clears token.
+                    // Recheck consistency and ACK the CURRENT snapshot atomically.
+                    let consistent = if outcome == TaskOccurrenceTerminalRepairOutcome::Changed {
+                        !contracts::load_terminal_occurrence_metadata(&tx, run_id)
+                            .await?
+                            .is_mismatch()
+                    } else {
+                        !current.is_mismatch()
+                    };
+                    if consistent {
+                        if let Some(row) = pending::Entity::find_by_id(run_id.to_owned())
+                            .one(&tx)
+                            .await?
+                        {
+                            queue::acknowledge(&tx, &row).await?;
+                        }
                     }
                 }
-            }
-            Ok(outcome)
-        }
-        .await;
-        match result {
-            Ok(outcome) => {
-                tx.commit().await?;
                 Ok(outcome)
             }
-            Err(error) => {
-                let _ = tx.rollback().await;
-                Err(error)
+            .await;
+            match result {
+                Ok(outcome) => {
+                    tx.commit().await?;
+                    Ok(outcome)
+                }
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    Err(error)
+                }
             }
         }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(matches!(
+                value,
+                TaskOccurrenceTerminalRepairOutcome::Changed
+            ));
+        }
+        result
     }
 }

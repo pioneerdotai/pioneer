@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PluginsRemoveParams",
+  "type": "object",
+  "properties": {
+    "expected_revision": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "plugin_id": {
+      "type": "string"
+    },
+    "purge_data": {
+      "type": "boolean"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id",
+    "plugin_id",
+    "expected_revision",
+    "purge_data"
+  ]
+}

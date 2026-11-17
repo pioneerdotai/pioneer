@@ -1,11 +1,10 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::{
-    AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCapsuleRecord,
-    AgentMemoryListFilter, CrudStore, MemoryLifecycleActorRecord, MemoryWorkspaceGuard,
-    NewAgentMemoryCandidate, NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision,
-    NewAgentMemoryQualityDecision, NewAgentMemoryQuarantine, NewAgentMemoryRepairJob,
-    ResolveAgentMemoryQuarantine, global_agent_memory_scope_key, memory_scope_key_hash,
-    workspace_agent_memory_scope_key,
+    AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryListFilter,
+    CrudStore, MemoryLifecycleActorRecord, MemoryWorkspaceGuard, NewAgentMemoryCandidate,
+    NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision,
+    NewAgentMemoryQuarantine, NewAgentMemoryRepairJob, ResolveAgentMemoryQuarantine,
+    global_agent_memory_scope_key, memory_scope_key_hash, workspace_agent_memory_scope_key,
 };
 use pioneer_protocol::{
     MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory, MemoryEvidenceClass,
@@ -88,11 +87,7 @@ fn new_memory(
         confidence: 1.0,
         importance: 0.7,
         content_preview: Some(preview.to_owned()),
-        capsule_id: None,
-        capsule_ref: Some(format!("memvid://{id}")),
-        frame_id: Some(1),
-        frame_uri: Some(format!("frame://{id}")),
-        frame_version: 1,
+        payload_version: 1,
         source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
         source_thread_id: Some("thread_memory_a".to_owned()),
         source_turn_id: Some("turn_memory_a".to_owned()),
@@ -602,7 +597,7 @@ async fn agent_memory_candidate_dedupe_and_decision_roundtrip() {
         category: MemoryCategory::ProjectFact,
         key: Some("project.memory".to_owned()),
         status: None,
-        candidate_text: "Use memvid for agent memory.".to_owned(),
+        candidate_text: "Use SQLite for agent memory.".to_owned(),
         confidence: 0.9,
         reason: "Repeated explicit project instruction.".to_owned(),
         source_context_kind: Some(MemorySourceContextKind::ToolResult),
@@ -610,7 +605,7 @@ async fn agent_memory_candidate_dedupe_and_decision_roundtrip() {
         source_turn_id: Some("turn_candidate".to_owned()),
         source_item_id: None,
         created_by: None,
-        dedupe_key: Some("dedupe_memvid".to_owned()),
+        dedupe_key: Some("dedupe_sqlite".to_owned()),
         metadata_json: None,
     };
 
@@ -845,81 +840,16 @@ async fn agent_memory_quality_decision_roundtrips_typed_policy_dimensions() {
 }
 
 #[tokio::test]
-async fn agent_memory_capsule_upsert_and_repair_status_roundtrip() {
-    let (_, store) = setup_store().await;
-    let capsule = store
-        .upsert_agent_memory_capsule(
-            AgentMemoryCapsuleRecord {
-                id: Some("capsule_memory_a".to_owned()),
-                scope: scope(MemoryScopeKind::Workspace, "ws_memory_a"),
-                scope_key_hash: None,
-                workspace_id: None,
-                scope_slot: None,
-                capsule_ref: "memvid://workspace/ws_memory_a".to_owned(),
-                storage_uri: "file:///tmp/ws_memory_a.mv2".to_owned(),
-                backend: "memvid".to_owned(),
-                format: "mv2".to_owned(),
-                encrypted: false,
-                status: "active".to_owned(),
-                repair_status: "ok".to_owned(),
-                content_hash: None,
-                active_record_count: 0,
-                metadata_json: None,
-                created_at_unix: None,
-                updated_at_unix: None,
-                last_error: None,
-            },
-            600,
-        )
-        .await
-        .expect("upsert capsule");
-    assert_eq!(capsule.workspace_id.as_deref(), Some("ws_memory_a"));
-
-    let primary = store
-        .find_primary_agent_memory_capsule(scope(MemoryScopeKind::Workspace, "ws_memory_a"))
-        .await
-        .expect("find primary capsule")
-        .expect("primary capsule should exist");
-    assert_eq!(primary.capsule_ref, "memvid://workspace/ws_memory_a");
-
-    let by_ref = store
-        .find_agent_memory_capsule_by_ref("memvid://workspace/ws_memory_a")
-        .await
-        .expect("find by ref")
-        .expect("capsule by ref should exist");
-    assert_eq!(by_ref.id.as_deref(), Some("capsule_memory_a"));
-
-    store
-        .mark_agent_memory_capsule_repair_status(
-            "capsule_memory_a",
-            "repair_needed",
-            Some("missing frame".to_owned()),
-            601,
-        )
-        .await
-        .expect("mark capsule repair")
-        .expect("capsule should exist");
-
-    let repair_needed = store
-        .list_agent_memory_capsules_needing_repair(Some("ws_memory_a"), 10)
-        .await
-        .expect("list repair capsules");
-    assert_eq!(repair_needed.len(), 1);
-    assert_eq!(repair_needed[0].id.as_deref(), Some("capsule_memory_a"));
-}
-
-#[tokio::test]
 async fn agent_memory_repair_job_claim_complete_and_retry_roundtrip() {
     let (_, store) = setup_store().await;
     let completed_job = store
         .enqueue_agent_memory_repair_job(
             NewAgentMemoryRepairJob {
-                job_kind: "reindex_capsule".to_owned(),
+                job_kind: "backend_payload_missing".to_owned(),
                 workspace_id: Some("ws_memory_a".to_owned()),
                 scope_kind: Some(MemoryScopeKind::Workspace),
                 scope_key_hash: Some("scope_hash".to_owned()),
                 memory_id: None,
-                capsule_id: Some("capsule_memory_a".to_owned()),
                 priority: 10,
                 max_attempts: 3,
                 scheduled_at_unix: 700,
@@ -953,12 +883,11 @@ async fn agent_memory_repair_job_claim_complete_and_retry_roundtrip() {
     let retry_job = store
         .enqueue_agent_memory_repair_job(
             NewAgentMemoryRepairJob {
-                job_kind: "compact_capsule".to_owned(),
+                job_kind: "backend_delete_failed".to_owned(),
                 workspace_id: Some("ws_memory_a".to_owned()),
                 scope_kind: Some(MemoryScopeKind::Workspace),
                 scope_key_hash: Some("scope_hash".to_owned()),
                 memory_id: None,
-                capsule_id: Some("capsule_memory_a".to_owned()),
                 priority: 1,
                 max_attempts: 2,
                 scheduled_at_unix: 710,

@@ -93,11 +93,15 @@ impl ClientCore {
             )?;
             let service = ArtifactHttpDownloadService::new(session, runtime_home);
             let progress = |progress| operation.update_progress(progress);
-            let result = tokio::runtime::Runtime::new()?.block_on(service.download(
-                request,
-                cancellation.clone(),
-                Some(&progress),
-            ))?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            let _runtime_observer = pioneer_observability::runtime::register(
+                runtime.handle(),
+                pioneer_observability::runtime::RuntimeRole::ClientHttp,
+            );
+            let result = _runtime_observer.block_on(
+                &runtime,
+                service.download(request, cancellation.clone(), Some(&progress)),
+            )?;
             anyhow::ensure!(
                 !cancellation.is_cancelled() && self.artifact_action_matches(identity),
                 "artifact operation cancelled"

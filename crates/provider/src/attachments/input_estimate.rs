@@ -24,6 +24,37 @@ pub(crate) async fn prepare(
     capabilities: &crate::ProviderCapabilities,
     mut request: ChatRequest,
 ) -> Result<PreparedInputBudget> {
+    // Service-default serializers send full definitions, never positional items.
+    request.tool_declarations = None;
+    prepare_with_profile(
+        provider,
+        capabilities,
+        request,
+        crate::history::ProjectionProfile::ServiceDefault,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_responses(
+    provider: &str,
+    capabilities: &crate::ProviderCapabilities,
+    request: ChatRequest,
+) -> Result<PreparedInputBudget> {
+    prepare_with_profile(
+        provider,
+        capabilities,
+        request,
+        crate::history::ProjectionProfile::Responses,
+    )
+    .await
+}
+
+async fn prepare_with_profile(
+    provider: &str,
+    capabilities: &crate::ProviderCapabilities,
+    mut request: ChatRequest,
+    profile: crate::history::ProjectionProfile,
+) -> Result<PreparedInputBudget> {
     // Budget indexes must address the same provider view that materialization
     // emits, including tool-to-user preview media follow-ups.
     if let std::borrow::Cow::Owned(messages) =
@@ -41,11 +72,12 @@ pub(crate) async fn prepare(
             media: vec![],
         });
     }
-    let prepared = super::prepare_messages_for_request_async(
+    let prepared = super::prepare_messages_for_request_with_profile(
         provider,
         capabilities,
         &request,
         &request.messages,
+        profile,
     )
     .await?;
     super::ensure_no_unrendered_attachments(provider, &prepared)?;
@@ -53,7 +85,7 @@ pub(crate) async fn prepare(
     let provider = provider.to_owned();
     // Header/document parsing and base64 encoding remain outside async workers
     // and outside every DB scope. The pipeline bounds both count and bytes.
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         let mut media = Vec::with_capacity(prepared.attachments.len());
         for attachment in prepared.attachments {
             let tokens = estimate(&provider, &request.model, &attachment)?;
@@ -98,9 +130,7 @@ pub(crate) async fn prepare(
 }
 
 fn text_tokens(text: &str) -> u64 {
-    tiktoken_rs::cl100k_base_singleton()
-        .encode_with_special_tokens(text)
-        .len() as u64
+    pioneer_compaction::text_tokens(text)
 }
 
 fn estimate(provider: &str, model: &str, attachment: &PreparedAttachment) -> Result<u64> {
@@ -241,7 +271,7 @@ pub fn image_tokens(provider: &str, model: &str, width: u32, height: u32) -> Res
     };
     // Count original patches without assuming an undocumented resizing cap.
     // Other vision models use this explicit local approximation; provider
-    // overflow recovery remains necessary, as for text tokenization.
+    // overflow recovery remains necessary, as for text estimation.
     Ok(u64::from(width.div_ceil(32))
         .saturating_mul(u64::from(height.div_ceil(32)))
         .saturating_mul(multiplier)
@@ -774,6 +804,8 @@ mod tests {
                 "image/png",
             )));
         let request = ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: "gpt-4o".into(),
             messages: vec![message],
             temperature: None,

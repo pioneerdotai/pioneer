@@ -6,6 +6,7 @@ use pioneer_protocol::{TaskDeliveryAttempt, TaskDeliveryAttemptStatus, TaskDeliv
 use sea_orm::{ConnectionTrait, TransactionTrait};
 
 use crate::repositories::{task_delivery, task_event};
+use crate::task_events::materialize_task_events;
 use crate::{AppendedTaskEvent, CrudStore, TaskEventPayload};
 
 /// A losing worker has no durable effect and must not be finalized again.
@@ -31,6 +32,17 @@ impl std::fmt::Display for CancellationSnapshotChanged {
 }
 impl std::error::Error for CancellationSnapshotChanged {}
 
+/// No cancellation event committed in this quantum. A concurrent webhook run
+/// arrived after preparation; rebuild the cancellation plan from durable state.
+#[derive(Debug)]
+pub struct TaskCancellationRunsChanged;
+impl std::fmt::Display for TaskCancellationRunsChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("webhook cancellation run set changed before commit")
+    }
+}
+impl std::error::Error for TaskCancellationRunsChanged {}
+
 impl CrudStore {
     pub async fn get_task_delivery_attempt(
         &self,
@@ -49,10 +61,21 @@ impl CrudStore {
         transition: TaskDeliveryTransition,
         at: i64,
     ) -> Result<TaskDeliveryTransitionOutcome<AppendedTaskEvent>> {
-        self.run_serialized_write(|| {
-            self.transition_task_delivery_once(event.clone(), transition, at, None)
-        })
-        .await
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [event.task_id().to_owned()],
+        );
+        let result = async {
+            self.run_serialized_write(|| {
+                self.transition_task_delivery_once(event.clone(), transition, at, None)
+            })
+            .await
+        }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(matches!(value, TaskDeliveryTransitionOutcome::Applied(event) if event.append_status.is_inserted()));
+        }
+        result
     }
 
     /// Recovery preparation reads a selected delivery, exact attempt and retry.
@@ -64,13 +87,24 @@ impl CrudStore {
         cutoff: i64,
         at: i64,
     ) -> Result<TaskDeliveryTransitionOutcome<AppendedTaskEvent>> {
-        self.transition_task_delivery_once(
-            event,
-            TaskDeliveryTransition::Recover { cutoff },
-            at,
-            Some(snapshot),
-        )
-        .await
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            [event.task_id().to_owned()],
+        );
+        let result = async {
+            self.transition_task_delivery_once(
+                event,
+                TaskDeliveryTransition::Recover { cutoff },
+                at,
+                Some(snapshot),
+            )
+            .await
+        }
+        .await;
+        if let Ok(value) = &result {
+            change.completed(matches!(value, TaskDeliveryTransitionOutcome::Applied(event) if event.append_status.is_inserted()));
+        }
+        result
     }
 
     async fn transition_task_delivery_once(
@@ -268,7 +302,7 @@ impl CrudStore {
         match result {
             Ok(TaskDeliveryTransitionOutcome::Applied(event)) => {
                 tx.commit().await?;
-                Ok(TaskDeliveryTransitionOutcome::Applied(event))
+                Ok(TaskDeliveryTransitionOutcome::Applied(event.into_owned()))
             }
             Ok(TaskDeliveryTransitionOutcome::Superseded) => {
                 tx.rollback().await?;
@@ -301,19 +335,35 @@ impl CrudStore {
         action: Option<crate::AgentCommitInput>,
         actor_id: Option<String>,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        let mut appended = Vec::new();
-        if action.is_some() {
-            return self
-                .append_task_cancellation_quantum(events, at, action, actor_id)
-                .await;
-        }
-        for chunk in events.chunks(crate::MAX_ATOMIC_TASK_EVENT_BATCH_SIZE) {
-            appended.extend(
-                self.append_task_cancellation_quantum(chunk.to_vec(), at, None, actor_id.clone())
+        let change = crate::task_events::TaskWorkChange::for_tasks(
+            &self.connection,
+            events.iter().map(|event| event.task_id().to_owned()),
+        );
+        let result = async {
+            let mut appended = Vec::new();
+            if action.is_some() {
+                return self
+                    .append_task_cancellation_quantum(events, at, action, actor_id)
+                    .await;
+            }
+            for chunk in events.chunks(crate::MAX_ATOMIC_TASK_EVENT_BATCH_SIZE) {
+                appended.extend(
+                    self.append_task_cancellation_quantum(
+                        chunk.to_vec(),
+                        at,
+                        None,
+                        actor_id.clone(),
+                    )
                     .await?,
-            );
+                );
+            }
+            Ok(appended)
         }
-        Ok(appended)
+        .await;
+        if let Ok(value) = &result {
+            change.completed(crate::task_events::inserted_task_events(value));
+        }
+        result
     }
 
     async fn append_task_cancellation_quantum(
@@ -426,11 +476,74 @@ impl CrudStore {
                 event.set_delivery_boundary(boundary);
             }
         }
+        // Build bounded existence queries outside writer admission. Only the
+        // final TaskCancelled quantum needs this fence: prior quanta may already
+        // have cancelled their runs, which are excluded by terminal status.
+        // The transaction rechecks both webhook capability and unmatched live
+        // runs, so no POST can land between this decision and cancellation.
+        use pioneer_entity::{task_run as fenced_run, task_trigger as fenced_trigger};
+        use sea_orm::sea_query::{Expr, ExprTrait, Query};
+        let mut run_fences = Vec::new();
+        for event in &prepared {
+            let TaskEventPayload::TaskCancelled { task_id, .. } = event.payload() else {
+                continue;
+            };
+            let webhook = Query::select()
+                .expr(Expr::val(1))
+                .from(fenced_trigger::Entity)
+                .and_where(Expr::col(fenced_trigger::Column::TaskId).eq(task_id.as_str()))
+                .and_where(Expr::col(fenced_trigger::Column::WebhookSecretRef).is_not_null())
+                .limit(1)
+                .to_owned();
+            let covered = prepared
+                .iter()
+                .filter_map(|event| match event.payload() {
+                    TaskEventPayload::RunCancelled {
+                        task_id: owner,
+                        run_id,
+                        ..
+                    } if owner == task_id => Some(run_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut unmatched = Query::select()
+                .expr(Expr::val(1))
+                .from(fenced_run::Entity)
+                .and_where(Expr::col(fenced_run::Column::TaskId).eq(task_id.as_str()))
+                .and_where(Expr::col(fenced_run::Column::Status).is_not_in([
+                    "succeeded",
+                    "failed",
+                    "blocked",
+                    "cancelled",
+                    "timed_out",
+                ]))
+                .limit(1)
+                .to_owned();
+            if !covered.is_empty() {
+                unmatched.and_where(Expr::col(fenced_run::Column::Id).is_not_in(covered));
+            }
+            run_fences.push((webhook, unmatched));
+        }
         #[cfg(any(test, feature = "test-support"))]
         self.pause_delivery_commit_for_test(TaskDeliveryCommitTestKind::Cancellation)
             .await;
+        let control_change = self.control_work_change(
+            "gateway.control",
+            &[
+                crate::GatewayControlWake::Resources,
+                crate::GatewayControlWake::Actions,
+            ],
+        );
+        let mut action_changed = false;
         let tx = self.connection.begin().await?;
         let result = async {
+            for (webhook, unmatched) in &run_fences {
+                if tx.query_one(webhook).await?.is_some()
+                    && tx.query_one(unmatched).await?.is_some()
+                {
+                    return Err(anyhow::Error::new(TaskCancellationRunsChanged));
+                }
+            }
             // Revalidate the actual transition inside the writer. A cancellation
             // losing to an earlier terminal commit must not read that result.
             use pioneer_entity::task_run as run;
@@ -470,7 +583,7 @@ impl CrudStore {
                     if event.append_status.is_inserted()
                         && let TaskEventPayload::RunCancelled {
                             task_id, run_id, ..
-                        } = &event.payload
+                        } = event.payload.as_ref()
                         && transitioning.contains(run_id)
                     {
                         let workspace = event
@@ -490,6 +603,9 @@ impl CrudStore {
                 }
             }
             if let Some(action) = &action {
+                action_changed =
+                    !crate::repositories::agent_domain::agent_action_commit_exists(&tx, action)
+                        .await?;
                 crate::repositories::agent_domain::commit_agent_action(&tx, action).await?;
             }
             Ok(appended)
@@ -498,7 +614,8 @@ impl CrudStore {
         match result {
             Ok(appended) => {
                 tx.commit().await?;
-                Ok(appended)
+                control_change.completed(action_changed);
+                Ok(materialize_task_events(appended))
             }
             Err(error) => {
                 let _ = tx.rollback().await;

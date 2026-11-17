@@ -31,3 +31,8 @@ pub type AgentEventHubError = ExecutionEventHubError;
 
 #[cfg(test)]
 mod tests;
+
+pub use progress::ProgressEventReceiver;
+
+#[cfg(test)]
+pub(crate) static OBSERVATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

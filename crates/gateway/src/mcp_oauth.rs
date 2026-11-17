@@ -114,6 +114,9 @@ pub(crate) async fn consume_oauth_events(
             authorization_url: event.authorization_url.clone().map(AuthSecretString::new),
             diagnostic: event.diagnostic.clone(),
         };
+        service
+            .notify_plugin_runtime_changed(&event.workspace_id, &event.installation_id)
+            .await;
         if let Some(client) = event.client_id {
             if !service
                 .authorized_management_notification_recipients(vec![client])
@@ -127,7 +130,7 @@ pub(crate) async fn consume_oauth_events(
                         let _ = service
                             .inner
                             .session_manager
-                            .send_text(client, payload)
+                            .try_send_notification_text(client, payload)
                             .await;
                     }
                 }

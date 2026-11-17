@@ -47,8 +47,13 @@ impl ClientCore {
                     .build()
                     .map_err(|_| "invitation_unavailable".into())
                     .and_then(|runtime| {
-                        runtime
+                        let _runtime_observer = pioneer_observability::runtime::register(
+                            runtime.handle(),
+                            pioneer_observability::runtime::RuntimeRole::ClientController,
+                        );
+                        _runtime_observer
                             .block_on(
+                                &runtime,
                                 crate::transport::ws::auth_exchange::AuthExchangeClient::new(
                                     timeout,
                                 )

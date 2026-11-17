@@ -60,6 +60,11 @@ pub(crate) struct DesktopShellView {
     providers: Option<Entity<pioneer_desktop_providers::ProviderCatalogView>>,
     mcp: Option<Entity<pioneer_desktop_mcp::McpCatalogView>>,
     skills: Option<Entity<pioneer_desktop_skills::SkillsCatalogView>>,
+    plugins: Option<Entity<pioneer_desktop_packages::PackageCatalogView>>,
+    app_view: Option<Entity<pioneer_desktop_apps::AppView>>,
+    app_events: Option<Subscription>,
+    app_panel_layout_subscription: Option<Subscription>,
+    _app_catalog_events: Subscription,
     agents_document: Option<Entity<pioneer_desktop_agents_doc::AgentsDocumentEditor>>,
     desktop_update: Option<Entity<pioneer_desktop_update::DesktopUpdateView>>,
     task_notifications: Option<Entity<pioneer_desktop_task_notifications::TaskNotificationView>>,
@@ -87,6 +92,9 @@ impl DesktopShellView {
             self.onboarding.as_ref().map(|root| root.clone().into())
         } else {
             match route.route() {
+                MainRoute::Plugins | MainRoute::Apps => {
+                    self.plugins.as_ref().map(|root| root.clone().into())
+                }
                 MainRoute::Threads => self.thread.as_ref().map(|(_, root)| root.clone().into()),
                 MainRoute::AgentsDoc => self
                     .agents_document
@@ -113,6 +121,9 @@ impl DesktopShellView {
         } else {
             px(0.)
         };
+        if let Some(view) = &self.plugins {
+            view.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+        }
         if let Some(view) = &self.providers {
             view.update(cx, |view, cx| view.set_sidebar_width(width, cx));
         }
@@ -135,6 +146,9 @@ impl DesktopShellView {
             view.update(cx, |view, cx| view.set_window_active(active, cx));
         }
         if let Some(view) = &self.skills {
+            view.update(cx, |view, cx| view.set_window_active(active, cx));
+        }
+        if let Some(view) = &self.plugins {
             view.update(cx, |view, cx| view.set_window_active(active, cx));
         }
         if let Some(view) = &self.settings {
@@ -323,6 +337,13 @@ impl DesktopShellView {
             let runtime = cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>();
             (runtime.core(), runtime.registrar())
         };
+        if !cx.has_global::<pioneer_desktop_foundation::ImageViewConfig>() {
+            cx.set_global(pioneer_desktop_foundation::ImageViewConfig::new(
+                client.clone(),
+                registrar.clone(),
+                Arc::new(crate::platform::images::DesktopImageViews(client.clone())),
+            ));
+        }
         let onboarding = pioneer_desktop_onboarding::OnboardingView::new(
             pioneer_desktop_onboarding::OnboardingConfig {
                 client: client.clone(),
@@ -374,6 +395,67 @@ impl DesktopShellView {
         );
         let skills = pioneer_desktop_skills::SkillsCatalogView::new(
             pioneer_desktop_skills::SkillsCatalogConfig::new(client.clone(), registrar.clone()),
+            window,
+            cx,
+        );
+        let details_client = client.clone();
+        let details_registrar = registrar.clone();
+        let plugins = pioneer_desktop_packages::PackageCatalogView::new(
+            client.clone(),
+            registrar.clone(),
+            Box::new(move |kind, workspace, plugin, component, window, cx| {
+                if let Some(id) = component.mcp_installation_id.clone() {
+                    let view = pioneer_desktop_mcp::McpCatalogView::new_package_details(
+                        pioneer_desktop_mcp::McpCatalogConfig::new(
+                            details_client.clone(),
+                            details_registrar.clone(),
+                        ),
+                        kind,
+                        workspace.to_owned(),
+                        plugin.to_owned(),
+                        id,
+                        window,
+                        cx,
+                    );
+                    let sidebar = view.read(cx).sidebar();
+                    let bounds_owner = view.downgrade();
+                    Some(pioneer_desktop_packages::PluginComponentDetails::new(
+                        view.into(),
+                        sidebar,
+                        move |width, active, cx| {
+                            let _ = bounds_owner.update(cx, |view, cx| {
+                                view.set_embedded_context(width, active, cx)
+                            });
+                        },
+                    ))
+                } else {
+                    component.skill_id.clone().map(|id| {
+                        let view = pioneer_desktop_skills::SkillsCatalogView::new_package_details(
+                            pioneer_desktop_skills::SkillsCatalogConfig::new(
+                                details_client.clone(),
+                                details_registrar.clone(),
+                            ),
+                            kind,
+                            workspace.to_owned(),
+                            plugin.to_owned(),
+                            id,
+                            window,
+                            cx,
+                        );
+                        let sidebar = view.read(cx).sidebar();
+                        let bounds_owner = view.downgrade();
+                        pioneer_desktop_packages::PluginComponentDetails::new(
+                            view.into(),
+                            sidebar,
+                            move |width, active, cx| {
+                                let _ = bounds_owner.update(cx, |view, cx| {
+                                    view.set_embedded_context(width, active, cx)
+                                });
+                            },
+                        )
+                    })
+                }
+            }),
             window,
             cx,
         );
@@ -506,6 +588,20 @@ impl DesktopShellView {
         } else {
             WindowRoute::Main
         });
+        let app_catalog_events = cx.subscribe_in(
+            &plugins,
+            window,
+            |shell, _, event: &pioneer_desktop_packages::PackageCatalogEvent, window, cx| {
+                match event {
+                    pioneer_desktop_packages::PackageCatalogEvent::OpenApp {
+                        workspace_id,
+                        app_id,
+                    } => shell.open_app_view(workspace_id.clone(), app_id.clone(), window, cx),
+                }
+            },
+        );
+        let plugins_sidebar =
+            pioneer_desktop_packages::PackageCatalogView::sidebar_surface(&plugins, cx);
         let sidebar = cx.new(|cx| SidebarHostView {
             workspaces: workspaces.clone(),
             desktop_update: desktop_update.clone(),
@@ -514,6 +610,7 @@ impl DesktopShellView {
             providers: providers.read(cx).sidebar(),
             administration: administration.read(cx).sidebar(),
             mcp: mcp.read(cx).sidebar(),
+            plugins_sidebar,
             skills: skills.read(cx).sidebar(),
         });
         let layout_subscription = cx.observe(&layout, |view, _, cx| {
@@ -590,6 +687,11 @@ impl DesktopShellView {
             administration: Some(administration),
             mcp: Some(mcp),
             skills: Some(skills),
+            plugins: Some(plugins),
+            app_view: None,
+            app_panel_layout_subscription: None,
+            app_events: None,
+            _app_catalog_events: app_catalog_events,
             agents_document: None,
             desktop_update,
             task_notifications: Some(task_notifications),
@@ -620,7 +722,24 @@ impl DesktopShellView {
     }
 
     fn mount_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let visible = self.navigation.is_visible(MainRoute::Threads);
+        let expanded = self.app_view.as_ref().is_some_and(|view| {
+            view.read(cx).placement() == pioneer_desktop_apps::AppPlacement::Expanded
+        });
+        let visible = self.navigation.is_visible(MainRoute::Threads) && !expanded;
+        if let Some(view) = &self.app_view {
+            let main = self.navigation.snapshot().window_route() == WindowRoute::Main;
+            let sidebar_visible =
+                pioneer_desktop_thread::ThreadView::window_app_panel_visible(window, cx);
+            let thread = self.navigation.snapshot().route() == MainRoute::Threads;
+            view.update(cx, |view, cx| {
+                view.set_visible(
+                    main && (view.placement() != pioneer_desktop_apps::AppPlacement::Right
+                        || !thread
+                        || sidebar_visible),
+                    cx,
+                )
+            });
+        }
         let (client, registrar) = {
             let runtime = cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>();
             (runtime.core(), runtime.registrar())
@@ -683,6 +802,8 @@ impl DesktopShellView {
                                 },
                                 None,
                             );
+                        } else {
+                            core.observe_unavailable_task_selection();
                         }
                     }
                     pioneer_desktop_thread::ThreadNavigationEvent::CloseTaskThread => {
@@ -691,9 +812,12 @@ impl DesktopShellView {
                     pioneer_desktop_thread::ThreadNavigationEvent::OpenMcpServer { server_id } => {
                         core.navigate(
                             NavigationIntent::Navigate {
-                                destination: SemanticDestination::Mcp {
-                                    server_id: Some(server_id.clone()),
-                                },
+                                destination: core.navigation_snapshot().workspace_id().map_or(
+                                    SemanticDestination::Mcp {
+                                        server_id: Some(server_id.clone()),
+                                    },
+                                    |workspace| core.mcp_destination(workspace, server_id),
+                                ),
                             },
                             None,
                         );
@@ -709,6 +833,106 @@ impl DesktopShellView {
         if let Some(update) = &self.desktop_update {
             update.update(cx, |view, cx| view.check(window, cx));
         }
+    }
+    fn open_app_view(
+        &mut self,
+        workspace: String,
+        app: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        pioneer_desktop_thread::ThreadView::set_window_app_panel(window, None, cx);
+        let height = self.layout.read(cx).app_height();
+        pioneer_desktop_thread::ThreadView::set_window_app_bottom(window, None, height, cx);
+        self.app_events.take();
+        if let Some(previous) = self.app_view.take() {
+            previous.read(cx).hide(cx);
+        }
+        let client = cx
+            .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core();
+        let Ok(view) = pioneer_desktop_apps::AppView::new(client, workspace, app, window, cx)
+        else {
+            return;
+        };
+        self.app_events = Some(cx.subscribe_in(
+            &view,
+            window,
+            |shell, _, event: &pioneer_desktop_apps::AppViewEvent, window, cx| {
+                if matches!(event, pioneer_desktop_apps::AppViewEvent::Close) {
+                    pioneer_desktop_thread::ThreadView::set_window_app_panel(window, None, cx);
+                    let height = shell.layout.read(cx).app_height();
+                    pioneer_desktop_thread::ThreadView::set_window_app_bottom(
+                        window, None, height, cx,
+                    );
+                    shell.app_view.take();
+                    shell.app_events.take();
+                    window.focus(&shell.action_region, cx);
+                } else {
+                    let panel = shell
+                        .app_view
+                        .as_ref()
+                        .filter(|view| {
+                            view.read(cx).placement() == pioneer_desktop_apps::AppPlacement::Right
+                        })
+                        .map(|view| view.clone().into());
+                    pioneer_desktop_thread::ThreadView::set_window_app_panel(window, panel, cx);
+                    let bottom = shell
+                        .app_view
+                        .as_ref()
+                        .filter(|view| {
+                            view.read(cx).placement() == pioneer_desktop_apps::AppPlacement::Bottom
+                        })
+                        .map(|view| view.clone().into());
+                    let height = shell.layout.read(cx).app_height();
+                    pioneer_desktop_thread::ThreadView::set_window_app_bottom(
+                        window, bottom, height, cx,
+                    );
+                }
+                let expanded = shell.app_view.as_ref().is_some_and(|view| {
+                    view.read(cx).placement() == pioneer_desktop_apps::AppPlacement::Expanded
+                });
+                if let Some((_, thread)) = &shell.thread {
+                    let visible =
+                        !expanded && shell.navigation.snapshot().route() == MainRoute::Threads;
+                    thread.update(cx, |thread, cx| thread.set_visible(visible, window, cx));
+                }
+                cx.notify();
+            },
+        ));
+        self.app_panel_layout_subscription = Some(
+            pioneer_desktop_thread::ThreadView::observe_window_app_panel(
+                window,
+                cx,
+                |shell, sidebar_visible, height, _, cx| {
+                    if shell.layout.read(cx).app_height() != height {
+                        shell
+                            .layout
+                            .update(cx, |layout, cx| layout.set_app_height(height, cx));
+                    }
+                    if let Some(view) = &shell.app_view {
+                        let thread = shell.navigation.snapshot().route() == MainRoute::Threads;
+                        view.update(cx, |view, cx| {
+                            view.set_visible(
+                                view.placement() != pioneer_desktop_apps::AppPlacement::Right
+                                    || !thread
+                                    || sidebar_visible,
+                                cx,
+                            )
+                        });
+                    }
+                },
+            ),
+        );
+        let height = self.layout.read(cx).app_height();
+        pioneer_desktop_thread::ThreadView::set_window_app_bottom(
+            window,
+            Some(view.clone().into()),
+            height,
+            cx,
+        );
+        self.app_view = Some(view);
+        cx.notify();
     }
     fn activate_navigation(&mut self, route: MainRoute, cx: &mut Context<Self>) {
         use pioneer_client::navigation::{NavigationIntent, SemanticDestination, SettingsRoute};
@@ -732,6 +956,8 @@ impl DesktopShellView {
                 route: SettingsRoute::Account,
             },
             MainRoute::Mcp if self.can_manage => SemanticDestination::Mcp { server_id: None },
+            MainRoute::Apps if self.can_manage => SemanticDestination::Apps,
+            MainRoute::Plugins if self.can_manage => SemanticDestination::Plugins,
             MainRoute::Skills if self.can_manage => SemanticDestination::Skills { skill_id: None },
             _ => return,
         };
@@ -826,12 +1052,17 @@ impl DesktopShellView {
         if let Some(view) = self.workspaces.take() {
             view.update(cx, |view, cx| view.close(cx));
         }
+        pioneer_desktop_thread::ThreadView::set_window_app_panel(window, None, cx);
+        let height = self.layout.read(cx).app_height();
+        pioneer_desktop_thread::ThreadView::set_window_app_bottom(window, None, height, cx);
+        self.app_events.take();
+        self.app_view.take();
         self.navigation.close();
         self.sidebar.take();
     }
 }
 impl Render for DesktopShellView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.onboarding.is_none() {
             return div().into_any_element();
         }
@@ -839,8 +1070,15 @@ impl Render for DesktopShellView {
         let title = TitleBarSurface {
             content: self.title_bar(cx),
         };
-        let selected = self.selected_screen();
-        let thread_mounted = route.route() == MainRoute::Threads && self.thread.is_some();
+        let placement = self.app_view.as_ref().map(|view| view.read(cx).placement());
+        let expanded = placement == Some(pioneer_desktop_apps::AppPlacement::Expanded);
+        let selected = if expanded {
+            self.app_view.as_ref().map(|view| view.clone().into())
+        } else {
+            self.selected_screen()
+        };
+        let thread_mounted =
+            !expanded && route.route() == MainRoute::Threads && self.thread.is_some();
         let screen = ScreenHostView { selected };
         let body = if route.window_route() == WindowRoute::Main {
             DesktopBody {
@@ -851,6 +1089,25 @@ impl Render for DesktopShellView {
                     .clone()
                     .into_any_element(),
                 thread_mounted,
+                expanded,
+                bottom_app: self
+                    .app_view
+                    .as_ref()
+                    .filter(|_| {
+                        placement == Some(pioneer_desktop_apps::AppPlacement::Bottom)
+                            && !thread_mounted
+                    })
+                    .map(|view| view.clone().into()),
+                right_app: self
+                    .app_view
+                    .as_ref()
+                    .filter(|_| {
+                        placement == Some(pioneer_desktop_apps::AppPlacement::Right)
+                            && !thread_mounted
+                    })
+                    .map(|view| view.clone().into()),
+                right_width: pioneer_desktop_thread::ThreadView::window_app_panel_width(window, cx),
+                max_app_height: (window.viewport_size().height * 0.65).max(px(180.)),
                 screen: screen.into_any_element(),
                 bottom: BottomBarSurface {
                     content: crate::desktop_chrome::bottom_bar(
@@ -882,6 +1139,12 @@ impl Render for DesktopShellView {
                     view.activate_navigation(MainRoute::Mcp, cx)
                 }),
             )
+            .on_action(cx.listener(|view, _: &OpenApps, _, cx| {
+                view.activate_navigation(MainRoute::Apps, cx)
+            }))
+            .on_action(cx.listener(|view, _: &OpenPlugins, _, cx| {
+                view.activate_navigation(MainRoute::Plugins, cx)
+            }))
             .on_action(cx.listener(|view, _: &OpenSkills, _, cx| {
                 view.activate_navigation(MainRoute::Skills, cx)
             }))
@@ -939,6 +1202,7 @@ struct SidebarHostView {
     providers: AnyView,
     administration: AnyView,
     mcp: AnyView,
+    plugins_sidebar: AnyView,
     skills: AnyView,
 }
 impl Render for SidebarHostView {
@@ -965,6 +1229,7 @@ impl Render for SidebarHostView {
             MainRoute::Providers => &self.providers,
             MainRoute::Administration => &self.administration,
             MainRoute::Mcp | MainRoute::McpDetails => &self.mcp,
+            MainRoute::Plugins | MainRoute::Apps => &self.plugins_sidebar,
             MainRoute::Skills | MainRoute::SkillDetails => &self.skills,
             MainRoute::Threads | MainRoute::AgentsDoc => unreachable!(),
         }
@@ -988,47 +1253,103 @@ struct DesktopBody {
     sidebar: AnyElement,
     screen: AnyElement,
     thread_mounted: bool,
+    expanded: bool,
+    bottom_app: Option<AnyView>,
+    right_app: Option<AnyView>,
+    right_width: Pixels,
+    max_app_height: Pixels,
     bottom: AnyElement,
     layout: Entity<ShellStateStore>,
 }
 impl RenderOnce for DesktopBody {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let visible = self.layout.read(cx).sidebar_visible();
+        let visible = self.layout.read(cx).sidebar_visible() && !self.expanded;
+        let right_visible = self.right_app.is_some();
+        let bottom_visible = self.bottom_app.is_some();
         let width = self.layout.read(cx).sidebar_width();
+        let height = self.layout.read(cx).app_height().min(self.max_app_height);
         let layout = self.layout.downgrade();
-        let thread_mounted = self.thread_mounted;
         let screen = div().relative().size_full().child(
             div()
                 .absolute()
                 .top_0()
                 .left_0()
                 .right_0()
-                .bottom(if thread_mounted { -rems(2.) } else { rems(0.) })
+                .bottom(if self.thread_mounted && self.bottom_app.is_none() {
+                    -rems(2.)
+                } else {
+                    rems(0.)
+                })
                 .child(self.screen),
         );
+        let center = gpui_kit::component::resizable::v_resizable("desktop-app-bottom")
+            .on_resize(move |state, window, cx| {
+                if let Some(height) = state
+                    .read(cx)
+                    .sizes()
+                    .get(1)
+                    .copied()
+                    .filter(|_| bottom_visible)
+                {
+                    pioneer_desktop_thread::ThreadView::resize_window_app_bottom(
+                        window, height, cx,
+                    );
+                }
+            })
+            .child(resizable_panel().child(screen))
+            .child(
+                resizable_panel()
+                    .visible(bottom_visible)
+                    .size(height)
+                    .fixed()
+                    .size_range(px(180.)..self.max_app_height)
+                    .child(
+                        self.bottom_app
+                            .map(|view| view.into_any_element())
+                            .unwrap_or_else(|| div().into_any_element()),
+                    ),
+            );
+        let columns = h_resizable("desktop-layout")
+            .on_resize(move |state, window, cx| {
+                if let Some(width) = state
+                    .read(cx)
+                    .sizes()
+                    .get(2)
+                    .copied()
+                    .filter(|_| right_visible)
+                {
+                    pioneer_desktop_thread::ThreadView::resize_window_app_panel(window, width, cx);
+                }
+                if let Some(width) = state.read(cx).sizes().first().copied().filter(|_| visible) {
+                    let _ = layout.update(cx, |layout, cx| layout.set_sidebar_width(width, cx));
+                }
+            })
+            .child(
+                resizable_panel()
+                    .visible(visible)
+                    .size(width)
+                    .fixed()
+                    .size_range(px(260.)..px(520.))
+                    .child(self.sidebar),
+            )
+            .child(resizable_panel().child(center))
+            .child(
+                resizable_panel()
+                    .visible(self.right_app.is_some())
+                    .size(self.right_width)
+                    .fixed()
+                    .size_range(px(320.)..px(640.))
+                    .child(
+                        self.right_app
+                            .map(|view| view.into_any_element())
+                            .unwrap_or_else(|| div().into_any_element()),
+                    ),
+            );
         v_flex()
             .relative()
             .size_full()
             .pb_8()
-            .child(
-                div().flex_1().min_h_0().w_full().child(
-                    h_resizable("desktop-layout")
-                        .on_resize(move |state, _, cx| {
-                            if let Some(width) = state.read(cx).sizes().first().copied() {
-                                let _ = layout
-                                    .update(cx, |layout, cx| layout.set_sidebar_width(width, cx));
-                            }
-                        })
-                        .child(
-                            resizable_panel()
-                                .visible(visible)
-                                .size(width)
-                                .size_range(px(260.)..px(520.))
-                                .child(self.sidebar),
-                        )
-                        .child(resizable_panel().child(screen)),
-                ),
-            )
+            .child(div().flex_1().min_h_0().w_full().child(columns))
             .child(
                 div()
                     .absolute()

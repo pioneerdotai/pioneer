@@ -12,11 +12,170 @@ use pioneer_artifacts::{
     ArtifactToolContext, ArtifactToolHandler, ArtifactToolNotification,
     ArtifactToolNotificationSink, ArtifactToolState, artifact_tool_specs,
 };
+use pioneer_observability::{
+    closing::{Closing, Fact, Loss, Phase},
+    live::WaitKind,
+};
 use pioneer_tools::{
     ToolError, ToolExtensionBundle, ToolHandler, ToolInvocation, ToolOutput, ToolPayload,
 };
 use std::sync::{Arc, Weak};
 use tracing::warn;
+
+pub(super) struct ArtifactClosing {
+    correlation: pioneer_observability::scenario::Correlation,
+    wait: Option<Closing>,
+}
+
+pub(super) struct GatewayCuaImageSink(pub Weak<MessageProcessor>);
+impl std::fmt::Debug for GatewayCuaImageSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GatewayCuaImageSink")
+    }
+}
+
+#[async_trait]
+impl pioneer_tools::handlers::computer_use::ComputerUseImageSink for GatewayCuaImageSink {
+    async fn admit(
+        &self,
+        owner: &str,
+        call_id: &str,
+        index: usize,
+        bytes: Vec<u8>,
+        mime: &str,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<pioneer_provider::MessageAttachment, ToolError> {
+        use pioneer_artifacts::{ArtifactBindingTarget, IngestArtifactBytesRequest};
+        use pioneer_protocol::{
+            ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
+            ArtifactRole,
+        };
+        use sha2::{Digest, Sha256};
+        let processor = self
+            .0
+            .upgrade()
+            .ok_or_else(|| ToolError::execution_failed("CUA artifact service unavailable"))?;
+        let (thread_id, workspace_id) = processor
+            .crud_store
+            .get_turn_location(owner)
+            .await
+            .map_err(|_| ToolError::execution_failed("CUA artifact turn lookup failed"))?
+            .ok_or_else(|| ToolError::execution_failed("CUA artifact turn missing"))?;
+        let mut generation = None;
+        for action in [
+            crate::authorization::ResourceAction::ArtifactCreateThread,
+            crate::authorization::ResourceAction::ArtifactBindThread,
+            crate::authorization::ResourceAction::ArtifactRead,
+        ] {
+            let authorized = processor
+                .revalidate_tool_execution_authorization(
+                    &workspace_id,
+                    &thread_id,
+                    owner,
+                    None,
+                    action,
+                )
+                .await
+                .map_err(|_| {
+                    ToolError::execution_failed(
+                        "CUA artifact authorization denied; do not replay operation",
+                    )
+                })?;
+            let current = authorized.validated_policy_generation();
+            if generation.is_some_and(|previous| previous != current) {
+                return Err(ToolError::execution_failed(
+                    "CUA artifact authorization changed",
+                ));
+            }
+            generation = Some(current);
+        }
+        // A CLI process generation may reuse a JSON-RPC request ID. Never let
+        // same owner/call/part identity return different capture bytes from an
+        // earlier generation's idempotent ArtifactService admission.
+        let capture_digest = hex::encode(Sha256::digest(&bytes));
+        let summary = processor
+            .artifact_service
+            .ingest_tool_bytes(
+                IngestArtifactBytesRequest {
+                    workspace_id: workspace_id.clone(),
+                    primary_thread_id: Some(thread_id.clone()),
+                    bytes,
+                    display_name: "Computer capture".into(),
+                    kind: ArtifactKind::Image,
+                    mime_type: Some(mime.into()),
+                    created_by_kind: ArtifactCreatedByKind::Tool,
+                    created_by_actor_id: Some("cua_capture".into()),
+                    binding: Some(ArtifactBindingTarget {
+                        thread_id: Some(thread_id.clone()),
+                        turn_id: Some(owner.into()),
+                        message_id: None,
+                        turn_item_id: None,
+                        tool_call_id: Some(call_id.into()),
+                        task_id: None,
+                        task_run_id: None,
+                        binding_kind: ArtifactBindingKind::ToolOutput,
+                        direction: ArtifactBindingDirection::Output,
+                        role: Some(ArtifactRole::Tool),
+                        item_index: Some(index as i64),
+                    }),
+                    metadata: Default::default(),
+                },
+                hex::encode(Sha256::digest(
+                    serde_json::to_vec(&serde_json::json!([
+                        "cua_capture",
+                        workspace_id,
+                        thread_id,
+                        owner,
+                        call_id,
+                        index,
+                        mime,
+                        capture_digest
+                    ]))
+                    .expect("CUA identity serializes"),
+                )),
+                generation.expect("artifact authorization actions"),
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|_| {
+                ToolError::execution_failed(
+                    "CUA artifact admission failed; do not replay operation",
+                )
+            })?;
+        processor
+            .revalidate_tool_execution_authorization(
+                &workspace_id,
+                &thread_id,
+                owner,
+                None,
+                crate::authorization::ResourceAction::ArtifactRead,
+            )
+            .await
+            .map_err(|_| ToolError::execution_failed("CUA artifact read authorization changed"))?;
+        if cancellation.is_cancelled() {
+            return Err(ToolError::execution_failed(
+                "CUA image admission cancelled; do not replay operation",
+            ));
+        }
+        // Retain an artifact-backed original-byte path instead of duplicating
+        // base64 in canonical history. CLI ignores this local representation and
+        // performs its own bounded read using the exact artifact identity.
+        let resolved = processor
+            .artifact_service
+            .resolve_provider_attachment(
+                &workspace_id,
+                &summary.artifact.artifact_id,
+                summary.artifact.version_id.as_deref(),
+            )
+            .await
+            .map_err(|_| {
+                ToolError::execution_failed(
+                    "CUA artifact resolution failed; do not replay operation",
+                )
+            })?;
+        Ok(resolved.attachment)
+    }
+}
 
 pub(crate) struct GatewayArtifactToolProvider {
     processor: Weak<MessageProcessor>,
@@ -52,6 +211,27 @@ impl GatewayArtifactFinalizationProvider {
 
 #[async_trait]
 impl TurnToolProvider for GatewayArtifactToolProvider {
+    async fn authorize_skill_invocation(
+        &self,
+        context: TurnToolContext,
+        skill_id: pioneer_protocol::SkillId,
+    ) -> Result<(), String> {
+        let processor = self.processor()?;
+        if !processor
+            .crud_store
+            .plugin_turn_child_available(
+                &context.turn_id,
+                "skill",
+                skill_id.as_str(),
+                &context.workspace_id,
+            )
+            .await
+            .map_err(|_| "skill ownership unavailable".to_owned())?
+        {
+            return Err("plugin selection is unavailable for this turn".into());
+        }
+        Ok(())
+    }
     async fn materialize_turn_tools(
         &self,
         context: TurnToolContext,
@@ -135,7 +315,17 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             .collect::<Vec<_>>();
         bundles.extend(agent_actions.bundles);
         bundles.push(processor.html_tools(context_for_results.clone()));
-        bundles.push(processor.thread_result_tools(context_for_results));
+        // Hidden registration is a discoverable capability. Do not advertise
+        // readers to a native execution that cannot read its source capsule.
+        if processor
+            .thread_read_authority(&context_for_results)
+            .await
+            .is_ok()
+        {
+            bundles.push(processor.thread_read_tools(context_for_results.clone()));
+            bundles.push(processor.thread_search_tools(context_for_results.clone()));
+            bundles.push(processor.thread_result_tools(context_for_results));
+        }
 
         Ok(TurnToolMaterialization {
             bundles,
@@ -403,10 +593,16 @@ impl MessageProcessor {
         turn_id: &str,
         final_text: &str,
     ) -> TurnFinalizationDecision {
-        let diagnostics = self
-            .artifact_finalization_diagnostics_for_final_text(turn_id, Some(final_text))
+        let parent = self.artifact_finalization_parent(turn_id).await;
+        let mut gate = Closing::start(Phase::ArtifactCheck, &parent);
+        let diagnostics = gate
+            .correlation()
+            .scope(self.artifact_finalization_diagnostics_for_final_text(turn_id, Some(final_text)))
             .await;
         if diagnostics.is_empty() {
+            gate.finish(Fact::Confirmed);
+            self.resolve_artifact_wait(turn_id, Fact::Confirmed, gate.correlation())
+                .await;
             return TurnFinalizationDecision::Allow;
         }
 
@@ -414,18 +610,24 @@ impl MessageProcessor {
             .artifact_finalization_retry_turns
             .lock()
             .await
-            .contains(turn_id);
+            .contains_key(turn_id);
         if let Some(instruction) =
             artifact_finalization_diagnostics::artifact_finalization_retry_instruction(
                 diagnostics.as_slice(),
                 retry_already_used,
             )
-            && self.mark_artifact_finalization_retry_used(turn_id).await
+            && self
+                .mark_artifact_finalization_retry_used(turn_id, gate.correlation())
+                .await
         {
+            gate.finish(Fact::Retrying);
             self.log_artifact_finalization_diagnostics(thread_id, turn_id, diagnostics.as_slice());
             return TurnFinalizationDecision::Retry { instruction };
         }
 
+        gate.finish(Fact::Rejected);
+        self.resolve_artifact_wait(turn_id, Fact::Rejected, gate.correlation())
+            .await;
         self.log_artifact_finalization_diagnostics(thread_id, turn_id, diagnostics.as_slice());
         TurnFinalizationDecision::Fail {
             message: artifact_finalization_diagnostics::artifact_finalization_terminal_error(
@@ -439,19 +641,31 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) -> bool {
+        let parent = self.artifact_finalization_parent(turn_id).await;
+        let mut gate = Closing::start(Phase::ArtifactCheck, &parent);
         let final_text = self
             .turn_final_assistant_texts
             .lock()
             .await
             .get(turn_id)
             .cloned();
-        let diagnostics = self
-            .artifact_finalization_diagnostics_for_final_text(turn_id, final_text.as_deref())
-            .await;
+        let diagnostics =
+            gate.correlation()
+                .scope(self.artifact_finalization_diagnostics_for_final_text(
+                    turn_id,
+                    final_text.as_deref(),
+                ))
+                .await;
         if diagnostics.is_empty() {
+            gate.finish(Fact::Confirmed);
+            self.resolve_artifact_wait(turn_id, Fact::Confirmed, gate.correlation())
+                .await;
             return false;
         }
-
+        // This gate fails the turn immediately; it is not a deferred wait.
+        gate.finish(Fact::Rejected);
+        self.resolve_artifact_wait(turn_id, Fact::Rejected, gate.correlation())
+            .await;
         self.log_artifact_finalization_diagnostics(thread_id, turn_id, diagnostics.as_slice());
         self.report_turn_failure(
             thread_id.to_owned(),
@@ -509,9 +723,69 @@ impl MessageProcessor {
         }
     }
 
-    async fn mark_artifact_finalization_retry_used(&self, turn_id: &str) -> bool {
+    pub(super) async fn artifact_finalization_ref(
+        &self,
+        turn_id: &str,
+    ) -> Option<pioneer_observability::scenario::Correlation> {
+        self.artifact_finalization_retry_turns
+            .lock()
+            .await
+            .get(turn_id)
+            .and_then(Option::as_ref)
+            .map(|state| state.correlation.clone())
+    }
+    async fn artifact_finalization_parent(
+        &self,
+        turn_id: &str,
+    ) -> pioneer_observability::scenario::Correlation {
+        self.artifact_finalization_ref(turn_id)
+            .await
+            .map(|retained| Closing::continue_from(&retained))
+            .unwrap_or_else(Closing::capture)
+    }
+    async fn resolve_artifact_wait(
+        &self,
+        turn_id: &str,
+        fact: Fact,
+        parent: pioneer_observability::scenario::Correlation,
+    ) {
+        let wait = {
+            let mut turns = self.artifact_finalization_retry_turns.lock().await;
+            turns
+                .get_mut(turn_id)
+                .and_then(Option::as_mut)
+                .and_then(|state| {
+                    state.correlation = parent;
+                    state.wait.take()
+                })
+        };
+        if let Some(mut wait) = wait {
+            wait.finish(fact);
+        }
+    }
+
+    async fn mark_artifact_finalization_retry_used(
+        &self,
+        turn_id: &str,
+        parent: pioneer_observability::scenario::Correlation,
+    ) -> bool {
         let mut retry_turns = self.artifact_finalization_retry_turns.lock().await;
-        retry_turns.insert(turn_id.to_owned())
+        if retry_turns.contains_key(turn_id) {
+            return false;
+        }
+        let wait = if retry_turns.len() < 64 {
+            let mut wait = Closing::start(Phase::ArtifactWait, &parent);
+            wait.wait(WaitKind::UserOrProvider);
+            Some(ArtifactClosing {
+                correlation: wait.correlation(),
+                wait: Some(wait),
+            })
+        } else {
+            Closing::loss(Loss::OwnerCapacity);
+            None
+        };
+        retry_turns.insert(turn_id.to_owned(), wait);
+        true
     }
 
     pub(super) async fn clear_artifact_finalization_state(&self, turn_id: &str) {

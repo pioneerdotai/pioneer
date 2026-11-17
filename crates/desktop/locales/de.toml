@@ -54,6 +54,13 @@ remove = "Erwähnung entfernen"
 cancel = "Antwort abbrechen"
 
 [chat.composer.model]
+service_label = "Servicestufe"
+service_standard = "Standard"
+service_invalid = "Die gespeicherte Servicestufe ist nicht verfügbar. Wählen Sie Standard oder einen anderen Modus."
+context_label = "Kontextfenster"
+context_auto = "Automatisch — bis %{tokens} Token"
+context_up_to = "Bis %{tokens} Token"
+context_invalid = "Die gespeicherte Kontextauswahl ist nicht verfügbar. Wählen Sie Automatisch oder ein anderes Fenster."
 select_label = "Modell auswählen"
 dialog_title = "Modell auswählen"
 provider_label = "Anbieter"
@@ -440,6 +447,13 @@ hide = "Pioneer ausblenden"
 hide_others = "Andere ausblenden"
 show_all = "Alle einblenden"
 quit = "Pioneer beenden"
+
+[menu.edit]
+name = "Bearbeiten"
+cut = "Ausschneiden"
+copy = "Kopieren"
+paste = "Einfügen"
+select_all = "Alles auswählen"
 
 [menu.about]
 version = "Version %{version}"
@@ -980,13 +994,6 @@ description = "Verhindert, dass der Computer bei Inaktivität in den Ruhezustand
 label = "Telemetrie senden"
 description = "Erfassung von Diagnose- und Leistungsdaten erlauben."
 
-[settings.general.preflight_model]
-label = "Preflight-Modell"
-description = "Wähle Anbieter und Modell für die interne Planung vor einem Zug. Standard verwendet das Modell des aktuellen Threads."
-default = "Standard"
-select_model = "Modell auswählen"
-dialog_title = "Preflight-Modell auswählen"
-
 [settings.voice_input]
 label = "Spracheingabe"
 description = "Ein lokales Transkriptionsmodell für Sprachnachrichten verwenden."
@@ -1041,10 +1048,6 @@ description = "Steuere, wie Pioneer dauerhaften Speicher verwendet."
 [settings.memory.enabled]
 label = "Speicher"
 description = "Pioneer darf gespeicherte Fakten und Projektentscheidungen verwenden, wenn es hilfreich ist."
-
-[settings.memory.active_recall]
-label = "Aktiver Abruf"
-description = "Zusätzliche schreibgeschützte Abrufplanung für kontextreiche Aufgaben ausführen."
 
 [settings.memory.proactive_writes]
 label = "Proaktives Speichern"
@@ -1762,3 +1765,9 @@ reason_unknown = "Der Vorgang wurde nicht wie erwartet abgeschlossen. Gateway-Pr
 [mcp.oauth]
 callback_received = "Antwort angenommen. Prüfen Sie das Anmeldeergebnis in Pioneer."
 callback_rejected = "Anmeldung abgelehnt. Kehren Sie zu Pioneer zurück und melden Sie sich erneut an."
+
+[plugins]
+title = "Plugins"
+
+[apps]
+title = "Apps"

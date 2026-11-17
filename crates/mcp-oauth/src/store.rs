@@ -144,9 +144,11 @@ impl OAuthPersistence {
     pub(crate) async fn client_secret(&self, reference: &str) -> Result<Option<String>, AuthError> {
         let store = self.secrets.clone();
         let id = SecretId::mcp_secret(reference).map_err(|_| storage_error())?;
-        tokio::task::spawn_blocking(move || store.get_string(&id).map_err(|_| storage_error()))
-            .await
-            .map_err(|_| storage_error())?
+        pioneer_observability::work::spawn_blocking(move || {
+            store.get_string(&id).map_err(|_| storage_error())
+        })
+        .await
+        .map_err(|_| storage_error())?
     }
     /// Management/backend reads expose only confirmed ordinary credentials.
     /// The pending envelope remains available for recovery under the file lease.
@@ -168,7 +170,7 @@ impl OAuthPersistence {
     async fn read_raw(&self, id: &str) -> Result<Option<AuthorizationRecord>, AuthError> {
         let store = self.secrets.clone();
         let id = SecretId::mcp_oauth(id).map_err(|_| storage_error())?;
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             store
                 .get_string(&id)
                 .map_err(|_| storage_error())?
@@ -240,7 +242,7 @@ impl OAuthPersistence {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let (completion, completed) = tokio::sync::watch::channel(false);
         let owner = self.io.clone();
-        let task = tokio::task::spawn_blocking(move || {
+        let task = pioneer_observability::work::spawn_blocking(move || {
             // The task keeps the IO owner alive even if every async adapter is
             // dropped. Completion also signals on panic; no payload is exposed.
             let _owner = owner;
@@ -322,7 +324,7 @@ impl OAuthPersistence {
         let local = tokio::select! { _=cancellation.cancelled()=>return Err(storage_error()), guard=gate.lock_owned()=>guard };
         if let Some(dir) = self.lock_dir.clone() {
             let id = id.to_owned();
-            let file = tokio::task::spawn_blocking(move || {
+            let file = pioneer_observability::work::spawn_blocking(move || {
                 pioneer_keystore::ensure_private_runtime_dir(&dir).map_err(|_| storage_error())?;
                 use sha2::{Digest, Sha256};
                 let path = dir.join(format!(
@@ -383,7 +385,7 @@ impl OAuthPersistence {
     async fn promotion_fenced(&self, id: &str) -> Result<bool, AuthError> {
         let store = self.secrets.clone();
         let id = SecretId::mcp_oauth(&format!("{id}::promotion")).map_err(|_| storage_error())?;
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             store
                 .get_string(&id)
                 .map(|value| value.is_some())
@@ -485,7 +487,7 @@ impl OAuthPersistence {
         // before enumerating; an uncommitted put must not evade orphan GC.
         self.drain().await;
         let store = self.secrets.clone();
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             store
                 .list(SecretFilter::Kind(SecretKind::McpOAuth))
                 .map(|rows| {

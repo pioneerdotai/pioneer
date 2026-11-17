@@ -19,10 +19,8 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 pub struct TaskNotificationLabels {
     title: String,
     task: String,
-    loading: String,
     empty: String,
     completed: String,
-    mark_read: String,
     open: String,
     mark_all_read: String,
     read: String,
@@ -35,6 +33,7 @@ pub struct TaskNotificationLabels {
     loading_failed: String,
     format_time: fn(i64) -> String,
 }
+
 impl TaskNotificationLabels {
     pub fn new(
         title: String,
@@ -56,14 +55,13 @@ impl TaskNotificationLabels {
             timed_out: completed.clone(),
             loading_failed: empty.clone(),
             format_time: |at| at.to_string(),
-            mark_read,
             title,
             task,
-            loading,
             empty,
             completed,
         }
     }
+
     pub fn history(
         mut self,
         open: String,
@@ -81,6 +79,7 @@ impl TaskNotificationLabels {
         self.loading_failed = loading_failed;
         self
     }
+
     pub fn terminal_statuses(
         mut self,
         failed: String,
@@ -94,12 +93,15 @@ impl TaskNotificationLabels {
         self.timed_out = timed_out;
         self
     }
+
     pub fn time_formatter(mut self, formatter: fn(i64) -> String) -> Self {
         self.format_time = formatter;
         self
     }
 }
+
 pub use pioneer_client::tasks::notifications::TaskNotificationEffect as TaskNotificationIdentity;
+
 /// An optional OS surface. The current in-app inbox does not imply OS delivery.
 pub trait DesktopNotificationPort {
     fn present(
@@ -110,12 +112,14 @@ pub trait DesktopNotificationPort {
     );
     fn remove(&self, identity: &TaskNotificationIdentity);
 }
+
 pub struct TaskNotificationConfig {
     client: Arc<ClientCore>,
     registrar: Arc<dyn ClientBindingRegistrar>,
     labels: TaskNotificationLabels,
     native: Option<Arc<dyn DesktopNotificationPort>>,
 }
+
 impl TaskNotificationConfig {
     pub fn new(
         client: Arc<ClientCore>,
@@ -129,15 +133,18 @@ impl TaskNotificationConfig {
             native: None,
         }
     }
+
     pub fn notification_port(mut self, port: Arc<dyn DesktopNotificationPort>) -> Self {
         self.native = Some(port);
         self
     }
 }
+
 struct Binding {
     publications: RefCell<HashMap<ClientScope, ClientPublicationReference>>,
     changed: tokio::sync::watch::Sender<u64>,
 }
+
 impl Default for Binding {
     fn default() -> Self {
         Self {
@@ -146,6 +153,7 @@ impl Default for Binding {
         }
     }
 }
+
 impl ClientPublicationSink for Binding {
     fn publish(&self, publication: ClientPublicationReference) {
         let mut current = self.publications.borrow_mut();
@@ -159,6 +167,7 @@ impl ClientPublicationSink for Binding {
         self.changed.send_modify(|serial| *serial += 1);
     }
 }
+
 actions!(
     task_notifications,
     [RetryTask, NextResult, PreviousResult, OpenSelectedResult]
@@ -171,31 +180,37 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("enter", OpenSelectedResult, Some("TaskCompletionInbox")),
     ]);
 }
+
 #[derive(Clone, Debug, PartialEq, gpui_kit::Action, serde::Deserialize)]
 #[action(no_json)]
 pub struct DismissTask {
     pub notification_id: String,
     pub revision: u64,
 }
+
 #[derive(Clone, Debug, PartialEq, gpui_kit::Action, serde::Deserialize)]
 #[action(no_json)]
 pub struct OpenTask {
     pub notification_id: String,
     pub revision: u64,
 }
+
 pub enum TaskNotificationEvent {
     OpenThread { thread_id: String },
 }
+
 struct NativeDelivery {
     identity: TaskNotificationIdentity,
     active: Arc<std::sync::atomic::AtomicBool>,
 }
+
 impl Drop for NativeDelivery {
     fn drop(&mut self) {
         self.active
             .store(false, std::sync::atomic::Ordering::Release);
     }
 }
+
 pub struct TaskNotificationView {
     client: Arc<ClientCore>,
     registrar: Arc<dyn ClientBindingRegistrar>,
@@ -217,7 +232,9 @@ pub struct TaskNotificationView {
     selected_run: Option<String>,
     lazy: LazyInboxDemand,
 }
+
 impl EventEmitter<TaskNotificationEvent> for TaskNotificationView {}
+
 impl TaskNotificationView {
     pub fn new(config: TaskNotificationConfig, cx: &mut Context<Self>) -> Self {
         let binding = Arc::new(Binding::default());
@@ -261,6 +278,7 @@ impl TaskNotificationView {
         view.sync(cx);
         view
     }
+
     fn sync(&mut self, cx: &mut Context<Self>) {
         let workspace = self
             .client
@@ -332,6 +350,7 @@ impl TaskNotificationView {
         self.sync_native();
         cx.notify();
     }
+
     pub fn refresh(&self) {
         if let Some(workspace) = &self.workspace {
             self.client.dispatch(ClientIntent::TaskNotification {
@@ -341,6 +360,7 @@ impl TaskNotificationView {
             });
         }
     }
+
     fn dismiss(&self, id: String, revision: u64) {
         if let Some(workspace) = &self.workspace {
             self.client.dispatch(ClientIntent::TaskNotification {
@@ -352,6 +372,7 @@ impl TaskNotificationView {
             });
         }
     }
+
     fn sync_native(&mut self) {
         let Some(port) = &self.native else {
             return;
@@ -428,6 +449,7 @@ impl TaskNotificationView {
         }
         self.delivered = live;
     }
+
     fn clear_native(&mut self) {
         if let Some(port) = &self.native {
             for identity in self.delivered.values() {
@@ -439,6 +461,7 @@ impl TaskNotificationView {
         }
         self.delivered.clear();
     }
+
     pub fn close(&mut self) {
         self.changes.take();
         self.inbox_registration.take();
@@ -447,11 +470,13 @@ impl TaskNotificationView {
         self.input = None;
     }
 }
+
 impl Drop for TaskNotificationView {
     fn drop(&mut self) {
         self.close();
     }
 }
+
 /// A changed cursor/range creates one deferred demand. Failed cursors require
 /// an explicit Retry; repeated measurement never issues another request.
 #[derive(Default)]
@@ -461,6 +486,7 @@ struct LazyInboxDemand {
     fill_pages: usize,
     failed: bool,
 }
+
 impl LazyInboxDemand {
     fn observe(&mut self, cursor: Option<&str>, failed: bool) {
         if self.requested_cursor.as_deref() != cursor {
@@ -473,11 +499,13 @@ impl LazyInboxDemand {
             self.failed = true;
         }
     }
+
     fn retry(&mut self) {
         self.requested_cursor = None;
         self.failed = false;
         self.fill_pages = 0;
     }
+
     fn demand(
         &mut self,
         end: usize,
@@ -512,6 +540,7 @@ impl LazyInboxDemand {
         Some(cursor.to_owned())
     }
 }
+
 impl TaskNotificationView {
     fn open(&self, id: String, revision: u64) {
         if let Some(workspace) = &self.workspace {
@@ -524,6 +553,7 @@ impl TaskNotificationView {
             });
         }
     }
+
     fn read_all(&self) {
         if let Some(workspace_id) = &self.workspace {
             self.client.dispatch(ClientIntent::TaskNotification {
@@ -533,6 +563,7 @@ impl TaskNotificationView {
             });
         }
     }
+
     fn retry(&mut self) {
         self.lazy.retry();
         if let Some(workspace_id) = &self.workspace {
@@ -543,6 +574,7 @@ impl TaskNotificationView {
             });
         }
     }
+
     fn viewport_demand(&mut self, end: usize, cx: &mut Context<Self>) {
         let Some(input) = &self.input else {
             return;
@@ -595,6 +627,7 @@ impl TaskNotificationView {
             });
         }
     }
+
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let Some(input) = &self.input else { return };
         let items = input.items();
@@ -614,24 +647,13 @@ impl TaskNotificationView {
         self.scroll.scroll_to_item(ix, ScrollStrategy::Top);
         cx.notify();
     }
+
     fn render_row(
         &self,
         item: &pioneer_client::tasks::notifications::TaskInboxItem,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let entry = item.notification();
-        let status = match entry.status {
-            pioneer_client::tasks::notifications::TaskRunStatus::Succeeded => {
-                &self.labels.completed
-            }
-            pioneer_client::tasks::notifications::TaskRunStatus::Failed => &self.labels.failed,
-            pioneer_client::tasks::notifications::TaskRunStatus::Blocked => &self.labels.blocked,
-            pioneer_client::tasks::notifications::TaskRunStatus::Cancelled => {
-                &self.labels.cancelled
-            }
-            pioneer_client::tasks::notifications::TaskRunStatus::TimedOut => &self.labels.timed_out,
-            _ => &self.labels.completed,
-        };
         let summary = entry
             .error
             .clone()
@@ -641,98 +663,99 @@ impl TaskNotificationView {
         let read_id = open_id.clone();
         let revision = item.revision();
         let busy = item.is_dismissing();
-        v_flex()
+
+        div()
             .id(SharedString::from(format!(
                 "task-inbox-row-{}",
                 entry.run_id
             )))
             .w_full()
-            .h(rems(8.))
-            .p_2()
-            .pr_4()
-            .gap_1()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .when(
-                self.selected_run.as_deref() == Some(entry.run_id.as_str()),
-                |this| this.bg(cx.theme().muted),
-            )
+            .h_full()
+            .pb_2()
+            .on_click(cx.listener(move |view, _, _, _| view.open(open_id.clone(), revision)))
             .child(
                 div()
-                    .text_sm()
-                    .font_semibold()
-                    .truncate()
-                    .child(if entry.title.is_empty() {
-                        self.labels.task.clone()
-                    } else {
-                        entry.title.clone()
-                    }),
-            )
-            .child(
-                h_flex()
+                    .id("task-inbox-card")
                     .w_full()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(div().flex_1().min_w_0().truncate().child(
-                        if entry.thread_title.trim().is_empty() {
-                            entry.thread_id.clone()
-                        } else {
-                            entry.thread_title.clone()
-                        },
-                    ))
-                    .child((self.labels.format_time)(entry.completed_at)),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .text_xs()
-                    .child(status.clone())
-                    .child(div().text_color(cx.theme().muted_foreground).child(
-                        if item.is_actionable() {
-                            self.labels.unread.clone()
-                        } else {
-                            self.labels.read.clone()
-                        },
-                    )),
-            )
-            .child(div().text_xs().truncate().child(summary))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new(format!("open-task-inbox-{open_id}"))
-                            .ghost()
-                            .small()
-                            .label(self.labels.open.clone())
-                            .disabled(busy)
-                            .on_click(cx.listener(move |view, _, _, _| {
-                                view.open(open_id.clone(), revision)
-                            })),
+                    .h_full()
+                    .rounded_lg()
+                    .border_1()
+                    .p_2()
+                    .border_color(cx.theme().border)
+                    .hover(|this| this.bg(cx.theme().muted))
+                    .when(
+                        self.selected_run.as_deref() == Some(entry.run_id.as_str()),
+                        |this| this.bg(cx.theme().muted),
                     )
-                    .when(item.is_actionable(), |this| {
-                        this.child(
-                            Button::new(format!("read-task-inbox-{read_id}"))
-                                .ghost()
-                                .small()
-                                .label(self.labels.mark_read.clone())
-                                .disabled(busy)
-                                .on_click(cx.listener(move |view, _, _, _| {
-                                    view.dismiss(read_id.clone(), revision)
-                                })),
-                        )
-                    }),
+                    .child(
+                        v_flex()
+                            .justify_between()
+                            .w_full()
+                            .h_full()
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .child(div().text_sm().font_semibold().truncate().child(
+                                        if entry.thread_title.trim().is_empty() {
+                                            entry.thread_id.clone()
+                                        } else {
+                                            entry.thread_title.clone()
+                                        },
+                                    ))
+                                    .child(
+                                        v_flex()
+                                            .child(div().text_xs().truncate().child(
+                                                if entry.title.is_empty() {
+                                                    self.labels.task.clone()
+                                                } else {
+                                                    entry.title.clone()
+                                                },
+                                            ))
+                                            .child(
+                                                div().text_xs().italic().truncate().child(summary),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(div().when(item.is_actionable(), |this| {
+                                        this.child(
+                                            Button::new(format!("read-task-inbox-{read_id}"))
+                                                .ghost()
+                                                .xsmall()
+                                                .compact()
+                                                .disabled(busy)
+                                                .child(div().opacity(0.6).child(IconName::EyeOff))
+                                                .on_click(cx.listener(move |view, _, _, _| {
+                                                    view.dismiss(read_id.clone(), revision)
+                                                })),
+                                        )
+                                    }))
+                                    .child(
+                                        div().text_xs().opacity(0.6).child((self
+                                            .labels
+                                            .format_time)(
+                                            entry.completed_at
+                                        )),
+                                    ),
+                            ),
+                    ),
             )
             .into_any_element()
     }
 }
+
 impl Render for TaskNotificationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let unread = self.input.as_ref().map_or(0, |p| p.unread_count());
+        let loading = self.input.as_ref().is_some_and(|p| p.is_loading());
         let labels = self.labels.clone();
         let owner = cx.weak_entity();
         let open_owner = owner.clone();
+
         div()
             .track_focus(&self.focus)
             .key_context("TaskNotifications")
@@ -764,19 +787,22 @@ impl Render for TaskNotificationView {
                             .accessibility_label(labels.title.clone())
                             .child(
                                 h_flex()
-                                    .gap_1()
+                                    .gap_1p5()
                                     .child(
                                         Icon::new(IconName::Bell)
                                             .size_3p5()
                                             .opacity(if unread > 0 { 1.0 } else { 0.6 }),
                                     )
-                                    .when(unread > 0, |this| {
+                                    .when(unread > 0 && !loading, |this| {
                                         this.child(
                                             div()
                                                 .text_xs()
                                                 .text_color(cx.theme().primary)
                                                 .child(unread.to_string()),
                                         )
+                                    })
+                                    .when(loading, |this| {
+                                        this.child(div().child(Spinner::new().small()))
                                     }),
                             ),
                     )
@@ -795,11 +821,11 @@ impl Render for TaskNotificationView {
                         let count = input.as_ref().map_or(0, |p| p.items().len());
                         // Fixed row geometry follows interface zoom. Only visible
                         // rows create elements; run IDs retain each control's identity.
-                        let sizes =
-                            std::rc::Rc::new(vec![
-                                size(Pixels::ZERO, window.rem_size() * 8.);
-                                count
-                            ]);
+                        let row_height = window.rem_size() * 7.5;
+                        let sizes = std::rc::Rc::new(vec![size(Pixels::ZERO, row_height); count]);
+                        // Include the viewport's top padding, capped at h_80.
+                        let viewport_height =
+                            (row_height * count as f32).min(window.rem_size() * 20.);
                         let retry_owner = owner.downgrade();
                         let all_owner = owner.downgrade();
                         v_flex()
@@ -847,128 +873,130 @@ impl Render for TaskNotificationView {
                             ))
                             .w_96()
                             .debug_selector(|| "task-inbox-popup".into())
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .h_8()
-                                    .p_2()
-                                    .pb_0()
-                                    .gap_2()
-                                    .debug_selector(|| "task-inbox-header".into())
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(
+                            .when_else(
+                                count == 0 && !loading && !failed,
+                                |this| {
+                                    this.child(
                                         div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(labels.title.clone()),
+                                            .p_4()
+                                            .text_xs()
+                                            .text_center()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(labels.empty.clone()),
                                     )
-                                    .when(loading, |this| {
-                                        this.child(
-                                            h_flex()
-                                                .gap_1()
-                                                .text_xs()
-                                                .font_normal()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(Spinner::new().small())
-                                                .child(labels.loading.clone()),
-                                        )
-                                    }),
-                            )
-                            .when(failed, |this| {
-                                this.child(
-                                    v_flex()
-                                        .px_2()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().danger)
-                                                .child(labels.loading_failed.clone()),
-                                        )
-                                        .child(
-                                            Button::new("retry-task-inbox")
-                                                .ghost()
-                                                .small()
-                                                .label(labels.retry.clone())
-                                                .on_click(move |_, _, cx| {
-                                                    let _ = retry_owner
-                                                        .update(cx, |view, _| view.retry());
-                                                }),
-                                        ),
-                                )
-                            })
-                            .when(count == 0 && !loading && !failed, |this| {
-                                this.child(
-                                    div()
-                                        .p_2()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(labels.empty.clone()),
-                                )
-                            })
-                            .when(count > 0, |this| {
-                                this.child(
-                                    div()
-                                        .h_80()
-                                        .debug_selector(|| "task-inbox-viewport".into())
-                                        .w_full()
-                                        .relative()
-                                        .child(
-                                            v_virtual_list(
-                                                owner.clone(),
-                                                "task-inbox-list",
-                                                sizes,
-                                                |view, range, _, cx| {
-                                                    view.viewport_demand(range.end, cx);
-                                                    let Some(input) = view.input.clone() else {
-                                                        return Vec::new();
-                                                    };
-                                                    range
-                                                        .filter_map(|ix| {
-                                                            input.items().get(ix).map(|item| {
-                                                                view.render_row(item, cx)
-                                                            })
-                                                        })
-                                                        .collect::<Vec<_>>()
-                                                },
-                                            )
-                                            .track_scroll(&scroll),
-                                        )
-                                        .vertical_scrollbar(&scroll),
-                                )
-                            })
-                            .child(Separator::horizontal())
-                            .child(
-                                h_flex()
-                                    .debug_selector(|| "task-inbox-footer".into())
-                                    .p_2()
-                                    .pt_0()
-                                    .justify_start()
-                                    .child(
-                                        Button::new("read-all-task-inbox")
-                                            .debug_selector(|| "task-inbox-read-all".into())
-                                            .ghost()
-                                            .xsmall()
-                                            .compact()
-                                            .disabled(
-                                                loading
-                                                    || input.as_ref().is_none_or(|input| {
-                                                        input.unread_count() == 0
-                                                    }),
-                                            )
-                                            .child(
+                                },
+                                |this| {
+                                    this.gap_2()
+                                        .when(failed, |this| {
+                                            this.child(
                                                 div()
-                                                    .opacity(0.6)
-                                                    .child(labels.mark_all_read.clone()),
+                                                    .p_4()
+                                                    .pb_2()
+                                                    .text_xs()
+                                                    .text_center()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(labels.loading_failed.clone()),
                                             )
-                                            .on_click(move |_, _, cx| {
-                                                let _ =
-                                                    all_owner.update(cx, |view, _| view.read_all());
-                                            }),
-                                    ),
+                                        })
+                                        .when(count > 0, |this| {
+                                            this.child(
+                                                div()
+                                                    .h(viewport_height)
+                                                    .debug_selector(|| "task-inbox-viewport".into())
+                                                    .w_full()
+                                                    .p_2()
+                                                    .pb_0()
+                                                    .relative()
+                                                    .child(
+                                                        v_virtual_list(
+                                                            owner.clone(),
+                                                            "task-inbox-list",
+                                                            sizes,
+                                                            |view, range, _, cx| {
+                                                                view.viewport_demand(range.end, cx);
+                                                                let Some(input) =
+                                                                    view.input.clone()
+                                                                else {
+                                                                    return Vec::new();
+                                                                };
+                                                                range
+                                                                    .filter_map(|ix| {
+                                                                        input.items().get(ix).map(
+                                                                            |item| {
+                                                                                view.render_row(
+                                                                                    item, cx,
+                                                                                )
+                                                                            },
+                                                                        )
+                                                                    })
+                                                                    .collect::<Vec<_>>()
+                                                            },
+                                                        )
+                                                        .track_scroll(&scroll),
+                                                    )
+                                                    .vertical_scrollbar(&scroll),
+                                            )
+                                        })
+                                        .child(Separator::horizontal())
+                                        .child(
+                                            h_flex()
+                                                .debug_selector(|| "task-inbox-footer".into())
+                                                .p_2()
+                                                .pt_0()
+                                                .justify_start()
+                                                .gap_2()
+                                                .when(count > 0, |this| {
+                                                    this.child(
+                                                        Button::new("read-all-task-inbox")
+                                                            .debug_selector(|| {
+                                                                "task-inbox-read-all".into()
+                                                            })
+                                                            .ghost()
+                                                            .xsmall()
+                                                            .compact()
+                                                            .disabled(loading)
+                                                            .child(
+                                                                div()
+                                                                    .opacity(0.6)
+                                                                    .child(IconName::EyeOff),
+                                                            )
+                                                            .child(div().opacity(0.6).child(
+                                                                labels.mark_all_read.clone(),
+                                                            ))
+                                                            .on_click(move |_, _, cx| {
+                                                                let _ = all_owner
+                                                                    .update(cx, |view, _| {
+                                                                        view.read_all()
+                                                                    });
+                                                            }),
+                                                    )
+                                                })
+                                                .when(failed, |this| {
+                                                    this.child(
+                                                        Button::new("retry-task-inbox")
+                                                            .ghost()
+                                                            .xsmall()
+                                                            .compact()
+                                                            .child(
+                                                                div()
+                                                                    .opacity(0.6)
+                                                                    .child(IconName::RefreshCw),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .opacity(0.6)
+                                                                    .child(labels.retry.clone()),
+                                                            )
+                                                            .on_click(move |_, _, cx| {
+                                                                let _ = retry_owner
+                                                                    .update(cx, |view, _| {
+                                                                        view.retry()
+                                                                    });
+                                                            }),
+                                                    )
+                                                }),
+                                        )
+                                },
                             )
                             .into_any_element()
                     }),

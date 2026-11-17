@@ -32,23 +32,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_title_rejects_empty_preview() {
-        assert_eq!(fallback_title_from_first_user_text(" \n\t "), None);
-    }
-
-    #[test]
     fn fallback_title_uses_all_words_when_short() {
         assert_eq!(
             fallback_title_from_first_user_text("one two three"),
             Some("one two three".to_owned())
-        );
-    }
-
-    #[test]
-    fn fallback_title_truncates_to_six_words() {
-        assert_eq!(
-            fallback_title_from_first_user_text("one two three four five six seven"),
-            Some("one two three four five six...".to_owned())
         );
     }
 

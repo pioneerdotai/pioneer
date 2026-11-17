@@ -4,6 +4,9 @@
 //! providers continue through `pioneer-agent`, while local `CLIAgentRuntime`
 //! executions are routed through `pioneer-cli-agent-runtime`.
 
+// Portable payload observation adds nested futures to Gateway's database paths.
+#![recursion_limit = "256"]
+
 mod administrative_audit;
 mod artifact_delivery;
 mod artifact_prompt_refs;
@@ -17,20 +20,23 @@ pub mod cli_mcp_client_validation;
 mod cli_runtime;
 pub mod codex_mcp_conformance;
 pub(crate) mod compaction;
+#[cfg(feature = "computer-use")]
+mod computer_use;
 mod database;
 mod epic5_observability;
 mod helpers;
 mod hook_run_store;
 mod hook_runtime;
+mod host_api;
 mod human_interaction;
 mod identity;
+mod images;
 mod invitation;
 mod keep_awake;
 mod mcp_oauth;
 mod mcp_secrets;
 mod mcp_service;
 mod member;
-mod memory_policy;
 mod memory_runtime;
 mod memory_tools;
 mod message;
@@ -56,7 +62,6 @@ mod tests;
 mod thread;
 mod thread_episodic;
 mod thread_episodic_embedding;
-mod thread_episodic_hooks;
 mod thread_file_delivery;
 mod transport;
 mod turn_mcp;
@@ -65,6 +70,7 @@ mod turn_security;
 mod usage_journal;
 mod view_grants;
 mod voice;
+mod webhook_address;
 mod workspace;
 
 use anyhow::{Context, Result};
@@ -76,7 +82,7 @@ use pioneer_config::{
 };
 use pioneer_crud::CrudStore;
 use pioneer_hooks::HookAwaitPolicy;
-use pioneer_memory::hooks::{MemoryActiveRecallMode, MemoryLoopConfig};
+use pioneer_memory::hooks::MemoryLoopConfig;
 use pioneer_protocol::AuthDeviceCreateResponse;
 use pioneer_protocol::GatewayReadinessStatus;
 use pioneer_provider::{
@@ -143,11 +149,17 @@ const GATEWAY_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// poll stack can exceed Tokio's 2 MiB default in debug builds, so the runtime
 /// uses a bounded 8 MiB worker stack. Keeping this policy here prevents the
 /// standalone and service entry points from drifting apart.
-pub fn build_gateway_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+pub fn build_gateway_runtime() -> std::io::Result<pioneer_observability::runtime::ObservedRuntime> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(GATEWAY_WORKER_STACK_SIZE)
         .build()
+        .map(|runtime| {
+            pioneer_observability::runtime::ObservedRuntime::new(
+                runtime,
+                pioneer_observability::runtime::RuntimeRole::Gateway,
+            )
+        })
 }
 
 fn create_voice_input_supervisor(
@@ -181,6 +193,13 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
 pub async fn run_gateway_until_shutdown_with_startup(
     startup: pioneer_observability::GatewayStartupTrace,
 ) -> Result<()> {
+    struct LocalObservers;
+    impl Drop for LocalObservers {
+        fn drop(&mut self) {
+            pioneer_observability::stop_local_observers();
+        }
+    }
+    let _observers = LocalObservers;
     let result = run_gateway_until_shutdown_inner(&startup).await;
     if result.is_err() {
         startup.finish_failure();
@@ -237,6 +256,9 @@ async fn run_gateway_until_shutdown_inner(
             );
         }
     }
+    if let Err(error) = pioneer_observability::diagnostics::start_local_diagnostics(&runtime_home) {
+        warn!(%error,"local diagnostics unavailable");
+    }
     let security_validate_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::SecurityValidate);
     config
@@ -244,6 +266,10 @@ async fn run_gateway_until_shutdown_inner(
         .auth
         .validate_session_security()
         .context("invalid Gateway session security configuration")?;
+    config
+        .gateway
+        .validate_outbound()
+        .context("invalid Gateway outbound configuration")?;
     security_validate_stage.succeed();
     let voice_models = voice_model_catalog();
     info!(
@@ -344,7 +370,7 @@ async fn run_gateway_until_shutdown_inner(
             "expired pending device sessions marked terminal"
         );
     }
-    auth_service.spawn_auth_maintenance();
+    let auth_maintenance = auth_service.spawn_auth_maintenance();
     security_stage.succeed();
 
     let services_initialize_stage =
@@ -443,13 +469,15 @@ async fn run_gateway_until_shutdown_inner(
         crud_store.clone(),
     )));
 
-    let provider_timeout_policy = ProviderTimeoutPolicy::from_secs(
+    let mut provider_timeout_policy = ProviderTimeoutPolicy::from_secs(
         config.gateway.provider.connect_timeout_secs,
         config.gateway.provider.first_chunk_timeout_secs,
         config.gateway.provider.inter_chunk_idle_timeout_secs,
         config.gateway.provider.non_stream_request_timeout_secs,
         config.gateway.provider.max_stream_duration_secs,
     );
+    provider_timeout_policy.use_default_flex_timeouts =
+        config.gateway.provider.use_default_flex_timeouts;
 
     let provider_registry = Arc::new(
         ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
@@ -506,6 +534,8 @@ async fn run_gateway_until_shutdown_inner(
 
     let web_cfg = &config.gateway.tools.web;
     let computer_use_cfg = &config.gateway.tools.computer_use;
+    #[cfg(feature = "computer-use")]
+    let mut computer_use_runtime = computer_use::GatewayComputerUse::new(&runtime_home);
     let tool_retry_cfg = &config.gateway.tools.retry;
     let provider_attachments_cfg = &config.gateway.provider.attachments;
     let skills_cfg = &config.gateway.skills;
@@ -611,12 +641,6 @@ async fn run_gateway_until_shutdown_inner(
 
     let tool_loop_config = ToolLoopConfig {
         provider: provider_timeout_policy,
-        preflight: pioneer_agent::PreflightLoopConfig {
-            provider_name: config.gateway.preflight_model.model_provider_override(),
-            model: config.gateway.preflight_model.model_override(),
-            timeout_ms: None,
-            max_output_chars: None,
-        },
         web: WebToolsConfig {
             default_timeout_ms: web_cfg.default_timeout_ms,
             hard_max_timeout_ms: web_cfg.hard_max_timeout_ms,
@@ -637,31 +661,12 @@ async fn run_gateway_until_shutdown_inner(
         },
         computer_use: ComputerUseToolsConfig {
             runtime_home_dir: runtime_home.clone(),
-            artifacts_subdir: computer_use_cfg.artifacts_subdir.clone(),
-            retention_hours: computer_use_cfg.retention_hours,
             max_total_bytes: computer_use_cfg.max_total_bytes,
-            run_max_steps_default: computer_use_cfg.run_max_steps_default,
-            snapshot_transport_max_bytes: computer_use_cfg.snapshot_transport_max_bytes,
-            snapshot_transport_max_side_px: computer_use_cfg.snapshot_transport_max_side_px,
-            snapshot_transport_min_side_px: computer_use_cfg.snapshot_transport_min_side_px,
-            snapshot_downscale_factor: computer_use_cfg.snapshot_downscale_factor,
-            accessibility_tree_max_depth: computer_use_cfg.accessibility_tree_max_depth,
-            accessibility_tree_max_nodes: computer_use_cfg.accessibility_tree_max_nodes,
-            accessibility_tree_max_serialized_bytes: computer_use_cfg
-                .accessibility_tree_max_serialized_bytes,
-            accessibility_tree_text_max_chars: computer_use_cfg.accessibility_tree_text_max_chars,
-            semantic_action_timeout_ms: computer_use_cfg.semantic_action_timeout_ms,
-            app_activation_timeout_ms: computer_use_cfg.app_activation_timeout_ms,
-            input_simulation_enabled: computer_use_cfg.input_simulation_enabled,
-            launch_if_missing_default: computer_use_cfg.launch_if_missing_default,
-            allowed_launch_commands: computer_use_cfg.allowed_launch_commands.clone(),
-            preflight_screenshot_probe_enabled: computer_use_cfg.preflight_screenshot_probe_enabled,
-            max_consecutive_same_snapshot_hash: computer_use_cfg.max_consecutive_same_snapshot_hash,
-            max_consecutive_same_action_signature: computer_use_cfg
-                .max_consecutive_same_action_signature,
-            max_consecutive_no_progress_steps: computer_use_cfg.max_consecutive_no_progress_steps,
-            max_recovery_attempts_per_step: computer_use_cfg.max_recovery_attempts_per_step,
-            max_recovery_attempts_per_run: computer_use_cfg.max_recovery_attempts_per_run,
+            #[cfg(feature = "computer-use")]
+            backend: Some(computer_use_runtime.backend()),
+            #[cfg(not(feature = "computer-use"))]
+            backend: None,
+            image_admission: Default::default(),
         },
         skills: pioneer_agent::SkillsLoopConfig {
             enabled: skills_cfg.enabled,
@@ -736,16 +741,14 @@ async fn run_gateway_until_shutdown_inner(
 
     let memory_runtime = Arc::new(GatewayMemoryRuntime::from_config(
         crud_store.clone(),
-        runtime_home.as_path(),
         &config.gateway.memory,
     )?);
 
     let task_runtime_config = task_runtime_config_from_gateway_tasks_config(&config.gateway.tasks);
 
-    let thread_episodic_storage_root = config
-        .gateway
-        .memory
-        .resolve_capsules_root(runtime_home.as_path())?;
+    // Retain the existing coordinator lock location and finite legacy cleanup
+    // boundary. Searchable data no longer creates files under this directory.
+    let thread_episodic_lock_root = runtime_home.join("memory/locks");
     let thread_episodic_workspace_vector_search_configs =
         gateway_settings.workspace_thread_episodic_vector_search_configs();
     let self_improvement_workspace_configs = gateway_settings.workspace_self_improvement_configs();
@@ -789,7 +792,7 @@ async fn run_gateway_until_shutdown_inner(
         tool_loop_config,
         memory_runtime,
         runtime_home.clone(),
-        thread_episodic_storage_root.clone(),
+        thread_episodic_lock_root.clone(),
         config.gateway.artifacts.clone(),
         task_runtime_config,
         thread_episodic_runtime_config_from_gateway_config(&config.gateway.thread_episodic),
@@ -797,6 +800,7 @@ async fn run_gateway_until_shutdown_inner(
             command_execution_timeout: config.gateway.resilience.command_execution,
             provider_stream_item_timeout: config.gateway.resilience.provider_stream_items,
             context_compaction_timeout: context_compaction_timeout_config,
+            context_compaction: config.gateway.context_compaction,
             cli_runtime_command_heartbeat: config.gateway.cli_agent_runtime.command_heartbeat,
         },
     )
@@ -845,7 +849,6 @@ async fn run_gateway_until_shutdown_inner(
     message_processor
         .cleanup_stale_skill_uploads(now_timestamp_secs())
         .await;
-    let remote_access_config = config.gateway.remote_access.clone();
     let startup_thread_episodic_vector_search_config =
         config.gateway.thread_episodic.vector_search.clone();
     let startup_thread_episodic_indexing_enabled =
@@ -858,6 +861,14 @@ async fn run_gateway_until_shutdown_inner(
     services_prepare_stage.succeed();
     let listener_bind_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::ListenerBind);
+    let post_remote_access_config = config.gateway.remote_access.clone();
+    let local_operations = transport::local_operations::LocalOperations::start(
+        &runtime_home,
+        &config,
+        auth_service.clone(),
+        message_processor.artifact_service.clone(),
+    )
+    .await?;
     let handle = spawn_server(
         config,
         auth,
@@ -888,11 +899,7 @@ async fn run_gateway_until_shutdown_inner(
     let post_message_processor = message_processor.clone();
     let post_crud_store = message_processor.crud_store.clone();
     let post_self_improvement_supervisor = self_improvement_supervisor.clone();
-    let post_remote_access_supervisor = remote_access_supervisor.clone();
-    let post_remote_access_config = remote_access_config.clone();
-    let post_gateway_settings = gateway_settings.clone();
-    let post_gateway_secrets = gateway_secrets.clone();
-    let post_thread_episodic_storage_root = thread_episodic_storage_root.clone();
+    let post_thread_episodic_lock_root = thread_episodic_lock_root.clone();
     let post_workspace_vector_search_configs =
         thread_episodic_workspace_vector_search_configs.clone();
     let post_provider_registry = provider_registry.clone();
@@ -920,7 +927,7 @@ async fn run_gateway_until_shutdown_inner(
                 ),
             }
             let restore_directory = catalog_directory.clone();
-            match tokio::task::spawn_blocking(move || {
+            match pioneer_observability::work::spawn_blocking(move || {
                 pioneer_provider::catalog::runtime::restore_or_install_catalog(
                     restore_directory.as_path(),
                 )
@@ -947,6 +954,7 @@ async fn run_gateway_until_shutdown_inner(
             post_startup = Some(post_startup::PostStartupSupervisor::start(
                 move |scope| async move {
                     let cancellation = scope.cancellation();
+                    post_message_processor.spawn_cli_runtime_idle_cleanup(&scope);
                     let catalog_directory = post_runtime_home.join("providers").join("models");
                     let catalog_cancellation = cancellation.clone();
                     scope.spawn(async move {
@@ -1025,26 +1033,13 @@ async fn run_gateway_until_shutdown_inner(
                         _ = post_message_processor.start_skills_watcher() => {}
                     }
 
-                    match remote_access_desired_state(
-                        &post_remote_access_config,
-                        &post_gateway_settings,
-                        post_gateway_secrets.as_ref(),
-                    ) {
-                        Ok(desired) => {
-                            let result = tokio::select! {
-                                _ = cancellation.cancelled() => return,
-                                result = post_remote_access_supervisor.apply(desired) => result,
-                            };
-                            if let Err(error) = result {
-                                warn!(error = %format!("{error:#}"), "failed to apply initial remote access settings");
-                                post_readiness
-                                    .set_degraded(ReadinessDegradation::RemoteAccess, true);
-                            }
-                        }
-                        Err(error) => {
-                            warn!(error = %format!("{error:#}"), "failed to resolve initial remote access state");
-                            post_readiness.set_degraded(ReadinessDegradation::RemoteAccess, true);
-                        }
+                    let result = tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        result = post_message_processor.apply_initial_remote_access(&post_remote_access_config) => result,
+                    };
+                    if let Err(error) = result {
+                        warn!(error = %format!("{error:#}"), "failed to apply initial remote access settings");
+                        post_readiness.set_degraded(ReadinessDegradation::RemoteAccess, true);
                     }
 
                     tokio::select! {
@@ -1064,7 +1059,7 @@ async fn run_gateway_until_shutdown_inner(
                         post_crud_store.clone(),
                         startup_thread_episodic_indexing_enabled,
                         startup_thread_episodic_index_executor_config,
-                        post_thread_episodic_storage_root,
+                        post_thread_episodic_lock_root,
                         startup_thread_episodic_vector_search_config,
                         post_workspace_vector_search_configs,
                         post_provider_registry,
@@ -1101,8 +1096,11 @@ async fn run_gateway_until_shutdown_inner(
         }
     };
 
+    let local_operations_shutdown_result = local_operations.shutdown().await;
     info!("gateway daemon stopping with telemetry snapshot");
     handle.set_readiness(GatewayReadinessStatus::Starting);
+    #[cfg(feature = "computer-use")]
+    computer_use_runtime.shutdown().await;
     message_processor
         .shutdown_thread_episodic_index_runner()
         .await;
@@ -1116,6 +1114,7 @@ async fn run_gateway_until_shutdown_inner(
     message_processor
         .shutdown_provider_readiness_supervisor()
         .await;
+    message_processor.shutdown_app_runtimes().await;
     message_processor.shutdown_skills_watcher().await;
     message_processor.shutdown_resilience_workers().await;
     let patch_telemetry = pioneer_tools::apply_patch::patch_telemetry().snapshot();
@@ -1141,11 +1140,12 @@ async fn run_gateway_until_shutdown_inner(
     message_processor.shutdown_cli_runtime_manager().await;
     message_processor.shutdown_mcp_service().await;
     self_improvement_supervisor.shutdown().await;
+    auth_maintenance.shutdown().await;
     let database_close_result = database
         .close()
         .await
         .context("failed to close gateway database connection");
-    match tokio::task::spawn_blocking(move || {
+    match pioneer_observability::work::spawn_blocking(move || {
         pioneer_observability::shutdown_observability(telemetry_shutdown_timeout)
     })
     .await
@@ -1162,6 +1162,7 @@ async fn run_gateway_until_shutdown_inner(
     }
 
     runtime_result?;
+    local_operations_shutdown_result?;
     server_shutdown_result?;
     database_close_result?;
     Ok(())
@@ -1220,10 +1221,20 @@ pub async fn create_device(
     config: &AppConfig,
     runtime_home: &Path,
 ) -> Result<AuthDeviceCreateResponse> {
+    let database = database::initialize_existing_for_operations(runtime_home, config).await;
+    let database = match database {
+        Err(error) if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() => {
+            return transport::local_operations::request(
+                runtime_home,
+                config,
+                transport::local_operations::Operation::DeviceCreate,
+            )
+            .await;
+        }
+        result => result?,
+    }
+    .context("Gateway database must exist before creating a device")?;
     let gateway_secrets = GatewaySecrets::open(runtime_home)?;
-    let database = database::initialize_existing_for_operations(runtime_home, config)
-        .await?
-        .context("Gateway database must exist before creating a device")?;
     let identity = Arc::new(
         bootstrap_identity(&database)
             .await
@@ -1306,12 +1317,7 @@ fn build_cli_runtime_manager(
 
 fn memory_loop_config_from_gateway_memory_config(config: &GatewayMemoryConfig) -> MemoryLoopConfig {
     let mut memory = MemoryLoopConfig::default();
-    memory.deterministic_recall_enabled = config.enabled && config.deterministic_recall_enabled;
     memory.tools_enabled = config.enabled && config.tools_enabled;
-
-    if !config.enabled || !config.active_recall_enabled || !memory.deterministic_recall_enabled {
-        memory.active_recall.mode = MemoryActiveRecallMode::Disabled;
-    }
 
     memory.post_turn_extractor.enabled = config.enabled && config.proactive_writes_enabled;
     memory.post_turn_extractor.provider_enabled = config.enabled && config.proactive_writes_enabled;
@@ -1336,9 +1342,6 @@ fn task_runtime_config_from_gateway_tasks_config(config: &GatewayTasksConfig) ->
         review: TaskReviewRuntimeConfig {
             enabled: config.review.enabled,
             allow_task_create_review_policy: config.review.allow_task_create_review_policy,
-            default_parent_review_for_immediate_attached_agent_tasks: config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks,
             default_max_revision_rounds: config.review.default_max_revision_rounds,
             auto_accept_after_seconds: config.review.auto_accept_after_seconds,
         },
@@ -1398,13 +1401,7 @@ pub(crate) fn memory_loop_config_from_gateway_memory_settings(
     settings: &GatewayMemorySettings,
 ) -> MemoryLoopConfig {
     let mut memory = MemoryLoopConfig::default();
-    memory.deterministic_recall_enabled = settings.enabled && settings.deterministic_recall_enabled;
     memory.tools_enabled = settings.enabled && settings.tools_enabled;
-
-    if !settings.enabled || !settings.active_recall_enabled || !memory.deterministic_recall_enabled
-    {
-        memory.active_recall.mode = MemoryActiveRecallMode::Disabled;
-    }
 
     memory.post_turn_extractor.enabled = settings.enabled && settings.proactive_writes_enabled;
     memory.post_turn_extractor.provider_enabled =
@@ -1442,7 +1439,6 @@ fn thread_episodic_runtime_config_from_gateway_config(
             retry_base_delay_secs: config.retry_base_delay_secs,
             retry_max_delay_secs: config.retry_max_delay_secs,
             max_attempts: config.max_attempts,
-            near_capacity_percent: config.near_capacity_percent,
         },
         recall_service: ThreadEpisodicRecallServiceConfig {
             enabled: config.enabled && config.recall_enabled,
@@ -1453,7 +1449,6 @@ fn thread_episodic_runtime_config_from_gateway_config(
             max_hit_chars: config.max_hit_chars,
             default_max_candidates: config.default_max_candidates,
             max_candidate_work: config.max_candidate_work,
-            max_segments: config.max_segments,
             min_relevancy: config.min_relevancy,
             min_results: config.min_results,
             snippet_chars: config.snippet_chars,
@@ -1478,7 +1473,6 @@ pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
             retry_base_delay_secs: settings.retry_base_delay_secs,
             retry_max_delay_secs: settings.retry_max_delay_secs,
             max_attempts: settings.max_attempts,
-            near_capacity_percent: settings.near_capacity_percent,
         },
         recall_service: ThreadEpisodicRecallServiceConfig {
             enabled: settings.enabled && settings.recall_enabled,
@@ -1489,7 +1483,6 @@ pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
             max_hit_chars: settings.max_hit_chars as usize,
             default_max_candidates: settings.default_max_candidates,
             max_candidate_work: settings.max_candidate_work,
-            max_segments: settings.max_segments as u64,
             min_relevancy: settings.min_relevancy,
             min_results: settings.min_results,
             snippet_chars: settings.snippet_chars,
@@ -1568,7 +1561,6 @@ mod runtime_tests {
         task_runtime_config_from_gateway_tasks_config,
         thread_episodic_runtime_config_from_gateway_settings,
     };
-    use crate::secrets::GatewaySecrets;
     use crate::settings::GatewayThreadEpisodicSettings;
     use crate::voice::model_catalog::{VoiceModelCatalogEntry, VoiceModelInstallLayout};
     use crate::voice::model_install::{
@@ -1588,8 +1580,6 @@ mod runtime_tests {
         GatewayToolsConfig,
     };
     use pioneer_hooks::HookAwaitPolicy;
-    use pioneer_keystore::MemorySecretStore;
-    use pioneer_memory::hooks::MemoryActiveRecallMode;
     use pioneer_protocol::{GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase};
     use pioneer_skills::SkillTrustLevel;
     use std::sync::Arc;
@@ -1651,6 +1641,13 @@ mod runtime_tests {
     struct StartupProbeEngineLoader;
 
     impl VoiceEngineLoader for StartupProbeEngineLoader {
+        fn prepare_vad(
+            &self,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> std::result::Result<(), VoiceTranscriptionError> {
+            Ok(()) // Deterministic lifecycle fixture; no native model operations.
+        }
+
         fn load(
             &self,
             _entry: &VoiceModelCatalogEntry,
@@ -1704,93 +1701,12 @@ mod runtime_tests {
         );
     }
 
-    #[tokio::test]
-    async fn voice_startup_legacy_install() {
-        let runtime_home = tempfile::tempdir().expect("runtime home");
-        let legacy_install = runtime_home
-            .path()
-            .join("models/voice/parakeet-tdt-0.6b-v3-int8");
-        std::fs::create_dir_all(&legacy_install).expect("legacy install directory");
-        std::fs::write(legacy_install.join(".ready"), b"legacy").expect("legacy ready marker");
-        let installer = Arc::new(StartupProbeInstaller::new());
-
-        let supervisor =
-            create_voice_input_supervisor(installer.clone(), Arc::new(StartupProbeEngineLoader));
-        start_voice_input_supervisor(&supervisor, VoiceInputDesiredState::default())
-            .expect("legacy-disabled startup");
-        tokio::task::yield_now().await;
-
-        assert!(legacy_install.exists());
-        assert_eq!(installer.inspections.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            supervisor.runtime_snapshot().phase,
-            GatewayVoiceInputRuntimePhase::Disabled
-        );
-    }
-
-    #[test]
-    fn provider_key_resolver_reads_latest_keystore_value() {
-        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
-
-        assert!(secrets.resolve_provider_api_key("deepseek").is_empty());
-
-        secrets
-            .set_provider_api_key("deepseek", "sk-test-key")
-            .expect("set key");
-
-        assert_eq!(secrets.resolve_provider_api_key("deepseek"), "sk-test-key");
-    }
-
-    #[test]
-    fn path_templates_expand_home_directory_token() {
-        let expanded = expand_home_directory_templates(
-            &[
-                "{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned(),
-                "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
-            ],
-            "/Users/alexander/.pioneer.local",
-        );
-
-        assert_eq!(
-            expanded,
-            vec![
-                "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}/user".to_owned(),
-                "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}/registry"
-                    .to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn path_templates_leave_plain_paths_unchanged() {
-        let expanded = expand_home_directory_templates(
-            &[
-                "/opt/pioneer/skills/system".to_owned(),
-                ".agents/skills".to_owned(),
-            ],
-            ".pioneer",
-        );
-
-        assert_eq!(
-            expanded,
-            vec![
-                "/opt/pioneer/skills/system".to_owned(),
-                ".agents/skills".to_owned(),
-            ]
-        );
-    }
-
     #[test]
     fn gateway_memory_config_maps_to_memory_loop_defaults() {
         let loop_config =
             memory_loop_config_from_gateway_memory_config(&GatewayMemoryConfig::default());
 
-        assert!(loop_config.deterministic_recall_enabled);
         assert!(loop_config.tools_enabled);
-        assert_eq!(
-            loop_config.active_recall.mode,
-            MemoryActiveRecallMode::Hybrid
-        );
         assert!(loop_config.post_turn_extractor.enabled);
         assert!(loop_config.post_turn_extractor.provider_enabled);
         assert!(loop_config.post_turn_extractor.proactive_writes_enabled);
@@ -1810,12 +1726,7 @@ mod runtime_tests {
             ..GatewayMemoryConfig::default()
         });
 
-        assert!(!loop_config.deterministic_recall_enabled);
         assert!(!loop_config.tools_enabled);
-        assert_eq!(
-            loop_config.active_recall.mode,
-            MemoryActiveRecallMode::Disabled
-        );
         assert!(!loop_config.post_turn_extractor.enabled);
         assert!(!loop_config.post_turn_extractor.provider_enabled);
         assert!(!loop_config.post_turn_extractor.proactive_writes_enabled);
@@ -1877,33 +1788,8 @@ mod runtime_tests {
     }
 
     #[test]
-    fn execution_windows_config_prefers_new_section_over_legacy_budget() {
-        let config = execution_windows_config_from_gateway_tools_config(&GatewayToolsConfig {
-            budget: GatewayToolLoopBudgetConfig {
-                max_agent_rounds_per_turn: 17,
-                max_tool_calls_per_turn: 23,
-            },
-            execution_windows: Some(GatewayExecutionWindowsConfig {
-                window: GatewayExecutionWindowBudgetConfig {
-                    max_agent_rounds_per_window: 31,
-                    max_tool_calls_per_window: 37,
-                    ..GatewayExecutionWindowBudgetConfig::default()
-                },
-                total: GatewayExecutionWindowTotalBudgetConfig::default(),
-            }),
-            retry: GatewayToolRetryBudgetConfig::default(),
-            ..GatewayToolsConfig::default()
-        });
-
-        assert_eq!(config.window.max_agent_rounds_per_window, 31);
-        assert_eq!(config.window.max_tool_calls_per_window, 37);
-    }
-
-    #[test]
     fn gateway_memory_config_can_disable_individual_product_features() {
         let loop_config = memory_loop_config_from_gateway_memory_config(&GatewayMemoryConfig {
-            deterministic_recall_enabled: false,
-            active_recall_enabled: true,
             tools_enabled: false,
             proactive_writes_enabled: false,
             background_extraction_enabled: false,
@@ -1911,12 +1797,7 @@ mod runtime_tests {
             ..GatewayMemoryConfig::default()
         });
 
-        assert!(!loop_config.deterministic_recall_enabled);
         assert!(!loop_config.tools_enabled);
-        assert_eq!(
-            loop_config.active_recall.mode,
-            MemoryActiveRecallMode::Disabled
-        );
         assert!(!loop_config.post_turn_extractor.enabled);
         assert!(!loop_config.post_turn_extractor.provider_enabled);
         assert!(!loop_config.post_turn_extractor.proactive_writes_enabled);
@@ -1954,11 +1835,6 @@ mod runtime_tests {
 
         assert!(runtime_config.review.enabled);
         assert!(!runtime_config.review.allow_task_create_review_policy);
-        assert!(
-            runtime_config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        );
         assert_eq!(runtime_config.review.default_max_revision_rounds, 5);
         assert_eq!(runtime_config.review.auto_accept_after_seconds, 300);
     }
@@ -1974,7 +1850,6 @@ mod runtime_tests {
             max_hit_chars: 700,
             default_max_candidates: 9,
             max_candidate_work: 33,
-            max_segments: 5,
             min_relevancy: 0.4,
             min_results: 2,
             snippet_chars: 220,
@@ -1982,7 +1857,6 @@ mod runtime_tests {
             retry_base_delay_secs: 11,
             retry_max_delay_secs: 121,
             max_attempts: 4,
-            near_capacity_percent: 81.0,
             vector_search: pioneer_config::GatewayThreadEpisodicVectorSearchConfig::default(),
         };
 
@@ -1998,14 +1872,12 @@ mod runtime_tests {
         assert_eq!(runtime.index_executor.retry_base_delay_secs, 11);
         assert_eq!(runtime.index_executor.retry_max_delay_secs, 121);
         assert_eq!(runtime.index_executor.max_attempts, 4);
-        assert_eq!(runtime.index_executor.near_capacity_percent, 81.0);
         assert!(!runtime.recall_service.enabled);
         assert_eq!(runtime.recall_service.default_prompt_chars, 1_500);
         assert_eq!(runtime.recall_service.max_prompt_chars, 6_000);
         assert_eq!(runtime.recall_service.max_hit_chars, 700);
         assert_eq!(runtime.recall_service.default_max_candidates, 9);
         assert_eq!(runtime.recall_service.max_candidate_work, 33);
-        assert_eq!(runtime.recall_service.max_segments, 5);
         assert_eq!(runtime.recall_service.min_relevancy, 0.4);
         assert_eq!(runtime.recall_service.min_results, 2);
         assert_eq!(runtime.recall_service.snippet_chars, 220);
@@ -2053,6 +1925,41 @@ mod runtime_tests {
                 .to_string()
                 .contains("invalid trust level `supertrusted`")
         );
+    }
+
+    #[test]
+    fn path_templates_preserve_literal_expansion_results() {
+        for (label, paths, home, expected) in [
+            (
+                "home token",
+                vec![
+                    "{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned(),
+                    "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
+                ],
+                "/Users/alexander/.pioneer.local",
+                vec![
+                    "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}/user"
+                        .to_owned(),
+                    "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}/registry"
+                        .to_owned(),
+                ],
+            ),
+            (
+                "plain paths",
+                vec![
+                    "/opt/pioneer/skills/system".to_owned(),
+                    ".agents/skills".to_owned(),
+                ],
+                ".pioneer",
+                vec![
+                    "/opt/pioneer/skills/system".to_owned(),
+                    ".agents/skills".to_owned(),
+                ],
+            ),
+        ] {
+            let expanded = expand_home_directory_templates(&paths, home);
+            assert_eq!(expanded, expected, "{label}");
+        }
     }
 }
 

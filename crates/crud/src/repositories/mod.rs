@@ -3,7 +3,6 @@ pub mod agent_domain;
 pub mod agent_identity_catalog;
 pub mod agent_memory;
 pub mod agent_memory_candidate;
-pub mod agent_memory_capsule;
 pub mod agent_memory_event;
 pub(crate) mod agent_memory_identity;
 pub mod agent_memory_policy_decision;
@@ -40,8 +39,6 @@ pub mod mcp_server_installation;
 pub(crate) mod membership;
 pub(crate) mod native_cancellation_context;
 pub(crate) mod native_event_cleanup;
-#[cfg(test)]
-pub(crate) mod native_event_cleanup_baseline;
 pub mod native_terminal_effect_outbox;
 pub mod patch_history;
 pub mod policy;
@@ -126,6 +123,8 @@ mod compaction_check_result;
 pub(crate) mod task_event_fanout;
 pub(crate) mod task_run_occurrence_reconcile;
 
+pub(crate) mod plugins;
+
 pub(crate) mod task_occurrence_reconcile;
 
 pub(crate) mod frozen_storage_lifetime;
@@ -137,3 +136,22 @@ pub(crate) mod task_cancellation_actor;
 pub(crate) mod task_child_cleanup;
 
 pub(crate) mod unread_start;
+
+pub(crate) mod thread_history_read;
+
+pub(crate) mod portable_payload;
+pub(crate) mod portable_payload_legacy_text;
+
+mod portable_payload_json;
+
+pub mod html_preview_io_work;
+pub(crate) mod recovery_watchdog;
+pub(crate) mod task_child_producers;
+
+pub mod task_child_work;
+
+pub(crate) mod task_occurrence_producers;
+
+pub mod execution_observability;
+pub(crate) mod plugin_metadata;
+pub(crate) mod thread_episodic_search;

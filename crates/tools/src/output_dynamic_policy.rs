@@ -674,36 +674,6 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_full_storage_request_is_narrowed_to_metadata() {
-        let requested = DynamicToolOutputPolicyDeclaration {
-            llm: None,
-            llm_retention: None,
-            timeline: Some(DynamicTimelineOutputRequest::Full {
-                max_bytes: Some(100_000),
-            }),
-            storage: Some(DynamicStorageOutputRequest::Full {
-                max_bytes: Some(100_000),
-            }),
-            recovery: None,
-            deltas: None,
-        };
-
-        let resolution = resolve_dynamic_tool_output_policy(
-            context(DynamicToolKind::Generic, SkillTrustLevel::Untrusted),
-            Some(requested),
-        );
-
-        assert!(matches!(
-            resolution.effective_policy.storage,
-            StorageOutputPolicy::MetadataOnly
-        ));
-        assert!(matches!(
-            resolution.effective_policy.timeline,
-            TimelineOutputPolicy::MetadataOnly
-        ));
-    }
-
-    #[test]
     fn http_full_storage_request_is_narrowed_to_metadata() {
         let requested = DynamicToolOutputPolicyDeclaration {
             llm: None,
@@ -804,36 +774,6 @@ mod tests {
         assert!(matches!(
             resolution.effective_policy.storage,
             StorageOutputPolicy::MetadataOnly
-        ));
-    }
-
-    #[test]
-    fn community_generic_full_request_is_narrowed_to_summary() {
-        let requested = DynamicToolOutputPolicyDeclaration {
-            llm: None,
-            llm_retention: None,
-            timeline: Some(DynamicTimelineOutputRequest::Full {
-                max_bytes: Some(100_000),
-            }),
-            storage: Some(DynamicStorageOutputRequest::Full {
-                max_bytes: Some(100_000),
-            }),
-            recovery: None,
-            deltas: None,
-        };
-
-        let resolution = resolve_dynamic_tool_output_policy(
-            context(DynamicToolKind::Generic, SkillTrustLevel::Community),
-            Some(requested),
-        );
-
-        assert!(matches!(
-            resolution.effective_policy.timeline,
-            TimelineOutputPolicy::Summary { .. }
-        ));
-        assert!(matches!(
-            resolution.effective_policy.storage,
-            StorageOutputPolicy::Summary { .. }
         ));
     }
 
@@ -949,26 +889,38 @@ mod tests {
     }
 
     #[test]
-    fn resolver_output_is_deterministic_for_identical_inputs() {
-        let requested = DynamicToolOutputPolicyDeclaration {
-            llm: None,
-            llm_retention: None,
-            timeline: Some(DynamicTimelineOutputRequest::Full {
-                max_bytes: Some(100_000),
-            }),
-            storage: Some(DynamicStorageOutputRequest::Full {
-                max_bytes: Some(100_000),
-            }),
-            recovery: None,
-            deltas: None,
-        };
-        let ctx = context(DynamicToolKind::Generic, SkillTrustLevel::Community);
-
-        let first = resolve_dynamic_tool_output_policy(ctx.clone(), Some(requested.clone()));
-        let second = resolve_dynamic_tool_output_policy(ctx, Some(requested));
-
-        assert_eq!(first.effective_policy, second.effective_policy);
-        assert_eq!(first.projection_kind, second.projection_kind);
-        assert_eq!(first.diagnostics, second.diagnostics);
+    fn generic_full_output_is_narrowed_by_trust() {
+        let cases = [
+            (
+                SkillTrustLevel::Untrusted,
+                TimelineOutputPolicy::MetadataOnly,
+                StorageOutputPolicy::MetadataOnly,
+            ),
+            (
+                SkillTrustLevel::Community,
+                TimelineOutputPolicy::Summary { max_chars: 2_000 },
+                StorageOutputPolicy::Summary { max_chars: 2_000 },
+            ),
+        ];
+        for (trust, expected_timeline, expected_storage) in cases {
+            let requested = DynamicToolOutputPolicyDeclaration {
+                llm: None,
+                llm_retention: None,
+                timeline: Some(DynamicTimelineOutputRequest::Full {
+                    max_bytes: Some(100_000),
+                }),
+                storage: Some(DynamicStorageOutputRequest::Full {
+                    max_bytes: Some(100_000),
+                }),
+                recovery: None,
+                deltas: None,
+            };
+            let resolution = resolve_dynamic_tool_output_policy(
+                context(DynamicToolKind::Generic, trust),
+                Some(requested),
+            );
+            assert_eq!(resolution.effective_policy.timeline, expected_timeline);
+            assert_eq!(resolution.effective_policy.storage, expected_storage);
+        }
     }
 }

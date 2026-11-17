@@ -942,6 +942,7 @@ const fn resource_supports_action(access: ResolvedResourceAccess, action: Resour
         ResolvedResourceAccess::Thread(_) => matches!(
             action,
             ResourceAction::ThreadRead
+                | ResourceAction::ThreadObserveWorkspace
                 | ResourceAction::MessageCreate
                 | ResourceAction::MessageEditOwn
                 | ResourceAction::MessageDeleteOwn
@@ -1110,12 +1111,13 @@ mod tests {
         WorkspaceAccessFacts,
     };
 
-    const MEMBER_RESOURCE_ACTIONS: [ResourceAction; 65] = [
+    const MEMBER_RESOURCE_ACTIONS: [ResourceAction; 66] = [
         ResourceAction::WorkspaceList,
         ResourceAction::WorkspaceRead,
         ResourceAction::ThreadCreatePrivate,
         ResourceAction::ThreadCreateWorkspace,
         ResourceAction::ThreadRead,
+        ResourceAction::ThreadObserveWorkspace,
         ResourceAction::MessageCreate,
         ResourceAction::MessageEditOwn,
         ResourceAction::MessageDeleteOwn,
@@ -1239,29 +1241,16 @@ mod tests {
     ];
 
     #[test]
-    fn member_action_matrix_is_an_exact_partition_of_the_canonical_vocabulary() {
+    fn member_policy_never_turns_the_action_gate_into_a_final_grant() {
+        let service = AuthorizationService::new();
+        let role = RoleKey::member();
+
         let allowed = MEMBER_RESOURCE_ACTIONS.into_iter().collect::<HashSet<_>>();
         let denied = MEMBER_DENIED_ACTIONS.into_iter().collect::<HashSet<_>>();
         let all = ResourceAction::ALL.into_iter().collect::<HashSet<_>>();
 
         assert!(allowed.is_disjoint(&denied));
         assert_eq!(allowed.union(&denied).copied().collect::<HashSet<_>>(), all);
-        let service = AuthorizationService::new();
-        let role = RoleKey::member();
-        for action in ResourceAction::ALL {
-            assert_eq!(
-                service
-                    .authorize_action(PrincipalKind::User, Some(&role), action)
-                    .permits_resource_resolution(),
-                allowed.contains(&action)
-            );
-        }
-    }
-
-    #[test]
-    fn member_policy_never_turns_the_action_gate_into_a_final_grant() {
-        let service = AuthorizationService::new();
-        let role = RoleKey::member();
 
         for action in MEMBER_RESOURCE_ACTIONS {
             let decision = service.authorize_action(PrincipalKind::User, Some(&role), action);

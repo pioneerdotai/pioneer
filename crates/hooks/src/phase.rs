@@ -7,7 +7,6 @@ use std::str::FromStr;
 pub enum HookPhase {
     TurnPrePolicy,
     TurnPrePromptContext,
-    TurnPostPreflightPromptContext,
     TurnPreToolMaterialization,
     TurnPrePromptCompile,
     TurnPostPromptCompile,
@@ -21,7 +20,6 @@ impl HookPhase {
         match self {
             Self::TurnPrePolicy => "turn.pre_policy",
             Self::TurnPrePromptContext => "turn.pre_prompt_context",
-            Self::TurnPostPreflightPromptContext => "turn.post_preflight_prompt_context",
             Self::TurnPreToolMaterialization => "turn.pre_tool_materialization",
             Self::TurnPrePromptCompile => "turn.pre_prompt_compile",
             Self::TurnPostPromptCompile => "turn.post_prompt_compile",
@@ -51,8 +49,10 @@ impl FromStr for HookPhase {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "turn.pre_policy" => Ok(Self::TurnPrePolicy),
-            "turn.pre_prompt_context" => Ok(Self::TurnPrePromptContext),
-            "turn.post_preflight_prompt_context" => Ok(Self::TurnPostPreflightPromptContext),
+            // Read legacy hook-run/audit metadata without restoring an executable phase.
+            "turn.pre_prompt_context" | "turn.post_preflight_prompt_context" => {
+                Ok(Self::TurnPrePromptContext)
+            }
             "turn.pre_tool_materialization" => Ok(Self::TurnPreToolMaterialization),
             "turn.pre_prompt_compile" => Ok(Self::TurnPrePromptCompile),
             "turn.post_prompt_compile" => Ok(Self::TurnPostPromptCompile),
@@ -126,11 +126,6 @@ mod tests {
             serde_json::json!("turn.pre_tool_materialization")
         );
         assert_eq!(
-            serde_json::to_value(HookPhase::TurnPostPreflightPromptContext)
-                .expect("phase serializes"),
-            serde_json::json!("turn.post_preflight_prompt_context")
-        );
-        assert_eq!(
             serde_json::to_value(HookPhase::RuntimeTurnPreContext).expect("phase serializes"),
             serde_json::json!("runtime.turn_pre_context")
         );
@@ -148,14 +143,25 @@ mod tests {
         assert_eq!(phase, HookPhase::TurnPreToolMaterialization);
 
         let phase: HookPhase =
-            serde_json::from_value(serde_json::json!("turn.post_preflight_prompt_context"))
-                .expect("phase deserializes");
-        assert_eq!(phase, HookPhase::TurnPostPreflightPromptContext);
-
-        let phase: HookPhase =
             serde_json::from_value(serde_json::json!("runtime.turn_pre_context"))
                 .expect("phase deserializes");
         assert_eq!(phase, HookPhase::RuntimeTurnPreContext);
+    }
+
+    #[test]
+    fn legacy_post_preflight_phase_reads_and_serializes_as_prompt_context() {
+        let legacy = "turn.post_preflight_prompt_context";
+        // CRUD hook_run and hook_audit_event row decoders both use FromStr.
+        let phase = HookPhase::from_str(legacy).expect("legacy stored phase reads");
+        assert_eq!(phase, HookPhase::TurnPrePromptContext);
+        let decoded: HookPhase = serde_json::from_value(serde_json::json!(legacy))
+            .expect("legacy nested JSON phase reads");
+        assert_eq!(decoded, phase);
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::json!("turn.pre_prompt_context")
+        );
+        assert!(HookPhase::from_str("turn.unknown_legacy_phase").is_err());
     }
 
     #[test]

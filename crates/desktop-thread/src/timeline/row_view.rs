@@ -31,6 +31,7 @@ pub(crate) struct RowPresentation {
     pub(super) reasoning_has_body: bool,
     workspace_id: Option<String>,
     author: TimelineAuthorPresentation,
+    pub(super) plugin_images: pioneer_desktop_foundation::ImageViews,
     pub(super) catalog_input:
         Option<Arc<pioneer_client::composer::catalog::ComposerCatalogPublication>>,
     principal_capabilities: pioneer_client::authorization::PrincipalPresentationCapabilities,
@@ -139,6 +140,27 @@ impl RowPresentation {
                 _ => String::new(),
             })
             .unwrap_or_default();
+        let mut plugin_images = slot
+            .view
+            .as_ref()
+            .map(|row| row.read(cx).presentation.plugin_images.clone())
+            .unwrap_or_else(|| {
+                pioneer_desktop_foundation::ImageViews::new().placeholder("icons/box.svg")
+            });
+        let icons = slot
+            .snapshot()
+            .item()
+            .map(|item| match &item.item {
+                pioneer_client::timeline::types::TurnItem::UserMessage { attachments, .. } => {
+                    pioneer_client::timeline::labels::parse_user_attachments(attachments)
+                        .into_iter()
+                        .flat_map(|a| a.plugin_icon.into_iter().chain(a.dark_icon))
+                        .collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        plugin_images.reconcile(icons, cx);
         let (dino, elapsed) = (None, None);
         let presentation = Self {
             actions: RowActions {
@@ -164,6 +186,7 @@ impl RowPresentation {
             workspace_id: screen.thread_workspace_id(&screen.thread_id),
             author: screen.current_timeline_author_presentation(exact_author),
             catalog_input: screen.catalog_input.clone(),
+            plugin_images,
             principal_capabilities: screen.principal_presentation_capabilities(),
             thread_capabilities: screen.thread_presentation_capabilities(&screen.thread_id),
             artifact_policy,
@@ -319,6 +342,10 @@ impl RowPresentation {
 }
 
 pub(crate) struct TimelineRowView {
+    update: pioneer_observability::updates::RenderBatch,
+    update_generation: u64,
+    update_visible: bool,
+    update_rendered: Option<(u64, u64)>,
     #[cfg(test)]
     renders: usize,
     presentation: RowPresentation,
@@ -326,12 +353,117 @@ pub(crate) struct TimelineRowView {
     html_visible: bool,
 }
 impl TimelineRowView {
+    pub(super) fn bind_update(
+        &mut self,
+        batch: pioneer_observability::updates::RenderBatch,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if !batch.covers_row(
+            &self.presentation.thread_id,
+            generation,
+            self.presentation.snapshot.id().as_str(),
+            self.presentation.snapshot.revision(),
+        ) {
+            self.update = Default::default();
+            self.update_rendered = None;
+            return;
+        }
+        let expected = batch
+            .authorization_generation()
+            .unwrap_or(self.presentation.html_auth_generation);
+        let client = Arc::downgrade(&self.presentation.html_client);
+        batch.require_validity(move || {
+            client
+                .upgrade()
+                .is_some_and(|client| client.authorization_connection_generation() == expected)
+        });
+        self.update = batch;
+        self.update_generation = generation;
+        self.update_rendered = None;
+        self.update_visible = false;
+        let target =
+            self.update_target(pioneer_observability::updates::RendererBoundary::HtmlVisibleLayout);
+        for html in &self.presentation.html {
+            html.update(cx, |html, _| {
+                html.bind_update(self.update.clone(), target.clone())
+            });
+        }
+    }
+    pub(super) fn set_update_visible(&mut self, visible: bool) {
+        self.update_visible = visible;
+        if visible {
+            self.observe_rendered_update();
+        }
+    }
+    fn record_rendered_update(&mut self, rendered: (u64, u64), window: &Window) {
+        let body_visible = (!self.presentation.supports_body() || self.presentation.is_expanded())
+            && (!self
+                .presentation
+                .snapshot
+                .content()
+                .is_some_and(|content| content.task_timeline)
+                || self.presentation.is_expanded());
+        if window.is_visible()
+            && body_visible
+            && self.presentation.actions.owner.upgrade().is_some()
+            && self.update.is_pending()
+            && rendered
+                == (
+                    self.update_generation,
+                    self.presentation.snapshot.revision(),
+                )
+        {
+            self.update_rendered = Some(rendered);
+            if self.update_visible {
+                self.observe_rendered_update();
+            }
+        }
+    }
+    fn observe_rendered_update(&self) {
+        if !self.update.is_pending() {
+            return;
+        }
+        if self.update_rendered
+            == Some((
+                self.update_generation,
+                self.presentation.snapshot.revision(),
+            ))
+        {
+            self.update.observe_row(
+                &self.presentation.thread_id,
+                self.update_generation,
+                self.presentation.snapshot.id().as_str(),
+                self.presentation.snapshot.revision(),
+                pioneer_observability::updates::RendererBoundary::GpuiRender,
+                None,
+            );
+        }
+    }
+    fn update_target(
+        &self,
+        boundary: pioneer_observability::updates::RendererBoundary,
+    ) -> pioneer_observability::updates::RenderTarget {
+        pioneer_observability::updates::RenderTarget {
+            thread: self.presentation.thread_id.clone(),
+            generation: self.update_generation,
+            row: self.presentation.snapshot.id().as_str().to_owned(),
+            revision: self.presentation.snapshot.revision(),
+            boundary,
+            part: None,
+        }
+    }
+
     pub(super) fn new(
         presentation: RowPresentation,
         body_height: Option<Pixels>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut owner = Self {
+            update: Default::default(),
+            update_generation: 0,
+            update_visible: false,
+            update_rendered: None,
             #[cfg(test)]
             renders: 0,
             presentation,
@@ -466,7 +598,7 @@ impl TimelineRowView {
     }
 }
 impl Render for TimelineRowView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         {
             self.renders += 1;
@@ -486,7 +618,31 @@ impl Render for TimelineRowView {
                 pioneer_observability::turn_startup::presented(&item.turn_id);
             }
         }
-        self.presentation.render(cx)
+        let element = self.presentation.render(cx);
+        let owner_visible =
+            self.update.is_pending() && self.presentation.actions.owner.upgrade().is_some();
+        let body_visible = (!self.presentation.supports_body() || self.presentation.is_expanded())
+            && (!self
+                .presentation
+                .snapshot
+                .content()
+                .is_some_and(|content| content.task_timeline)
+                || self.presentation.is_expanded());
+        if window.is_visible() && owner_visible && body_visible {
+            let owner = cx.weak_entity();
+            let rendered = (
+                self.update_generation,
+                self.presentation.snapshot.revision(),
+            );
+            // Render only describes the row. Commit its observation after this
+            // pass, while rejecting a rebind or replacement before delivery.
+            window.defer(cx, move |window, cx| {
+                let _ = owner.update(cx, |view, _| {
+                    view.record_rendered_update(rendered, window);
+                });
+            });
+        }
+        element
     }
 }
 
@@ -874,19 +1030,32 @@ impl TimelineView {
                 {
                     continue;
                 }
-                let terminal =
-                    if terminal_rows.contains(slot.snapshot().id().as_str()) {
-                        slot.snapshot().item().filter(|item| matches!(item.item,
-                        pioneer_client::timeline::types::TurnItem::CommandExecution { .. }))
+                let terminal = if terminal_rows.contains(slot.snapshot().id().as_str()) {
+                    slot.snapshot()
+                        .item()
+                        .filter(|item| {
+                            matches!(
+                                item.item,
+                                pioneer_client::timeline::types::TurnItem::CommandExecution { .. }
+                            )
+                        })
                         .map(|item| {
                             let entry = &slot.projection.timeline[0];
                             let previous = view.read(cx).presentation.terminal.clone();
                             let width = view.read(cx).presentation.key.content_width;
-                            self.prepare_command_terminal(entry, item, width, previous.as_ref(), cx)
+                            let batch = view.read(cx).update.clone();
+                            if batch.is_pending() {
+                                let target = view.read(cx).update_target(
+                                    pioneer_observability::updates::RendererBoundary::TerminalReader);
+                                batch.with_target(target, || self.prepare_command_terminal(
+                                    entry, item, width, previous.as_ref(), cx))
+                            } else {
+                                self.prepare_command_terminal(entry, item, width, previous.as_ref(), cx)
+                            }
                         })
-                    } else {
-                        None
-                    };
+                } else {
+                    None
+                };
                 view.update(cx, |view, cx| {
                     view.set_terminal(terminal, cx);
                 });
@@ -919,10 +1088,17 @@ pub(super) fn row_dependency_revision(
     }
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     match row.item().map(|item| &item.item) {
-        Some(TurnItem::UserMessage { .. }) => {
+        Some(TurnItem::UserMessage { attachments, .. }) => {
             ptr(&screen.identity_input).hash(&mut hash);
             ptr(&screen.thread_member_input).hash(&mut hash);
-            ptr(&screen.artifact_input).hash(&mut hash);
+            if attachments.iter().any(|attachment| {
+                matches!(
+                    attachment,
+                    pioneer_client::timeline::types::UserMessageAttachment::Artifact { .. }
+                )
+            }) {
+                ptr(&screen.artifact_input).hash(&mut hash);
+            }
             ptr(&screen.thread_capability_input).hash(&mut hash);
             screen
                 .active_artifact_presentation_policy()
@@ -1012,6 +1188,281 @@ mod tests {
         core::{ClientCore, ClientScope},
         timeline::semantic::{TopLevelPageMergeMode, WorkPageMergeMode},
     };
+
+    #[gpui_kit::test]
+    fn artifact_publication_invalidates_only_artifact_consumers(cx: &mut TestAppContext) {
+        use pioneer_client::{
+            artifacts::{ArtifactRef, HtmlPublication, store::ArtifactPublication},
+            timeline::types::UserMessageAttachment,
+        };
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        install_thread_timeline(&client, "a", "initial");
+        let artifact: ArtifactRef = serde_json::from_value(serde_json::json!({
+            "artifact_id":"document","version_id":"version","display_name":"Document",
+            "kind":"file","mime_type":"text/html","size_bytes":10,
+            "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status":"ready"
+        }))
+        .unwrap();
+        let non_artifacts: Vec<UserMessageAttachment> = serde_json::from_value(serde_json::json!([
+            {"type":"localFile","path":""},
+            {"type":"skill","capability":{"skillId":"SSSSSSSSSSSSSSSSSSSSS","label":"Skill",
+                "slug":"skill","sourceKind":"user"}},
+            {"type":"mcpTool","capability":{"id":"tool","label":"Tool","serverName":"server",
+                "rawToolName":"tool","scopeKind":"workspace"}}
+        ]))
+        .unwrap();
+        let mut blocks = [
+            ("plain", Vec::new()),
+            ("non-artifact", non_artifacts),
+            ("artifact", vec![UserMessageAttachment::Artifact { artifact: artifact.clone() }]),
+        ].into_iter().enumerate().map(|(index, (id, attachments))| {
+            serde_json::json!({"workspaceId":"workspace","threadId":"a","blockId":id,
+                "turnId":id,"sortKey":index.to_string(),
+                "kind":{"kind":"user_message","text":id,"mode":"Message","attachments":attachments}})
+        }).collect::<Vec<_>>();
+        blocks.push(
+            serde_json::json!({"workspaceId":"workspace","threadId":"a","blockId":"html",
+            "turnId":"html","sortKey":"3","kind":{"kind":"assistant_message","itemId":"html",
+                "text":"Document","htmlPublications":[HtmlPublication {
+                    workspace_id: "workspace".into(), thread_id: "a".into(), turn_id: "html".into(),
+                    call_id: "html-call".into(), title: "Document".into(), artifact,
+                }]}}),
+        );
+        client.apply_thread_timeline_page(
+            serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace","threadId":"a","projectionVersion":1,"blocks":blocks,
+                "page":{"hasMoreBefore":false,"hasMoreAfter":false}
+            }))
+            .unwrap(),
+            TopLevelPageMergeMode::Reset,
+        );
+        let (registrar, deliver) = binding_router(client.clone());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::new(
+                ThreadView::new(
+                    ThreadViewConfig::new(
+                        client.clone(),
+                        "a".into(),
+                        registrar,
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                    ),
+                    window,
+                    cx,
+                ),
+                window,
+                cx,
+            )
+        });
+        deliver();
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        let thread = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<ThreadView>().unwrap()
+        });
+        let timeline = thread.read_with(cx, |view, _| view.timeline_for_test());
+        timeline.update(cx, |view, cx| {
+            let prepared = view.thread_timeline_view_state.prepared.clone().unwrap();
+            assert_eq!(prepared.slots.len(), 4);
+            assert!(view.artifact_input.is_none());
+            for (slot, (key, _)) in prepared.slots.iter().zip(&prepared.row_inputs) {
+                assert_eq!(
+                    key.dependencies_revision,
+                    row_dependency_revision(view, slot.snapshot(), cx)
+                );
+                assert!(view.layout_store.height(key).is_some());
+                assert!(slot.view.as_ref().unwrap().read(cx).matches_input(key));
+            }
+            let publication = Arc::new(ArtifactPublication {
+                thread_id: "a".into(),
+                workspace_id: "workspace".into(),
+                revision: 1,
+                generation: 1,
+                items: Vec::new(),
+                request: Default::default(),
+                downloads: Vec::new(),
+                actions: Vec::new(),
+                previews: Vec::new(),
+            });
+            // Keep both allocations alive, including across the no-op and removal.
+            let replacement = Arc::new((*publication).clone());
+            let mut previous = prepared
+                .row_inputs
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for (input, changed, present) in [
+                (Some(publication.clone()), true, true),
+                (Some(publication.clone()), false, true),
+                (Some(replacement.clone()), true, true),
+                (None, true, false),
+            ] {
+                view.artifact_input = input;
+                for (index, (slot, (key, _))) in
+                    prepared.slots.iter().zip(&prepared.row_inputs).enumerate()
+                {
+                    let depends = matches!(key.id.as_str(), "artifact" | "html");
+                    let next = RowMeasurementKey {
+                        dependencies_revision: row_dependency_revision(view, slot.snapshot(), cx),
+                        ..key.clone()
+                    };
+                    assert_eq!(
+                        next != previous[index],
+                        depends && changed,
+                        "{}",
+                        key.id.as_str()
+                    );
+                    assert_eq!(next == *key, !depends || !present, "{}", key.id.as_str());
+                    // These are the actual shared-key consumers: a cache hit skips
+                    // measurement, and matches_input skips rebuilding RowPresentation.
+                    assert_eq!(
+                        view.layout_store.height(&next).is_some(),
+                        !depends || !present
+                    );
+                    assert_eq!(
+                        slot.view.as_ref().unwrap().read(cx).matches_input(&next),
+                        !depends || !present
+                    );
+                    previous[index] = next;
+                }
+            }
+            // Change the real authorization generation while holding all screen
+            // publications fixed, isolating the independent HTML fence.
+            let generation = client.authorization_connection_generation();
+            client.begin_authorization_epoch(Some(("replacement".into(), 1)));
+            assert_ne!(generation, client.authorization_connection_generation());
+            for (slot, (key, _)) in prepared.slots.iter().zip(&prepared.row_inputs) {
+                let next = RowMeasurementKey {
+                    dependencies_revision: row_dependency_revision(view, slot.snapshot(), cx),
+                    ..key.clone()
+                };
+                let is_html = key.id.as_str() == "html";
+                assert_eq!(next != *key, is_html);
+                assert_eq!(view.layout_store.height(&next).is_none(), is_html);
+                assert_eq!(
+                    !slot.view.as_ref().unwrap().read(cx).matches_input(&next),
+                    is_html
+                );
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn repeated_measurement_releases_html_child_after_retirement(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        install_thread_timeline(&client, "a", "initial");
+        // Pending HTML still has a retained view and is included in the row's
+        // element tree, but cannot start downloads or mount a native WebView.
+        client.apply_thread_timeline_page(
+            serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace","threadId":"a","projectionVersion":2,
+                "blocks":[{"workspaceId":"workspace","threadId":"a","blockId":"html",
+                    "turnId":"turn","sortKey":"1","kind":{"kind":"assistant_message",
+                        "itemId":"html","text":"Document","htmlPublications":[{
+                            "workspaceId":"workspace","threadId":"a","turnId":"turn",
+                            "callId":"html-call","title":"Document","artifact":{
+                                "artifact_id":"document","version_id":"version","display_name":"Document",
+                                "kind":"file","mime_type":"text/html","size_bytes":10,
+                                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                "status":"pending"
+                            }
+                        }]}}],
+                "page":{"hasMoreBefore":false,"hasMoreAfter":false}
+            }))
+            .unwrap(),
+            TopLevelPageMergeMode::Reset,
+        );
+        let (registrar, deliver) = binding_router(client.clone());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::new(
+                ThreadView::new(
+                    ThreadViewConfig::new(
+                        client.clone(),
+                        "a".into(),
+                        registrar,
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                    ),
+                    window,
+                    cx,
+                ),
+                window,
+                cx,
+            )
+        });
+        deliver();
+        cx.run_until_parked();
+        let thread = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<ThreadView>().unwrap()
+        });
+        let timeline = thread.read_with(cx, |view, _| view.timeline_for_test());
+        // Mount the list to obtain its pane width, then measure and commit the
+        // initial publication before capturing the child created at commit.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                super::super::controller::DesktopTimelineController::viewport(view, window, cx);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        let (id, child) = timeline.read_with(cx, |view, cx| {
+            let prepared = view.thread_timeline_view_state.prepared.as_ref().unwrap();
+            let slot = prepared
+                .slots
+                .iter()
+                .find(|slot| slot.snapshot().id().as_str() == "html")
+                .unwrap();
+            let row = slot.view.as_ref().unwrap().read(cx);
+            assert_eq!(row.presentation.html.len(), 1);
+            (
+                slot.snapshot().id().clone(),
+                row.presentation.html[0].downgrade(),
+            )
+        });
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                timeline.update(cx, |view, cx| {
+                    // Reconciliation runs in update with the existing HTML
+                    // child, so this must exercise measurement, not a cache hit.
+                    view.layout_store.invalidate_row(&id);
+                    view.reconcile_timeline(window, cx);
+                    assert!(view.measurement_coordinator.draw.is_some());
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            cx.run_until_parked();
+            timeline.read_with(cx, |view, _| {
+                assert!(view.measurement_coordinator.draw.is_none());
+            });
+        }
+        assert!(child.upgrade().is_some());
+        timeline.update(cx, |view, cx| view.retire_timeline_rows(cx));
+        drop(timeline);
+        drop(thread);
+        drop(root);
+        drop(deliver);
+        drop(client);
+        // Dispose retained frame owners as well as the row registry. Only a
+        // leaked temporary measurement element could keep this child alive.
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        assert!(
+            child.upgrade().is_none(),
+            "measurement retained the retired HTML child"
+        );
+    }
 
     fn publish_work(client: &Arc<ClientCore>, revision: i64, extra: bool) {
         let work = serde_json::json!({"turnId":"turn","presentation":"expanded_terminal_no_final","state":"completed",
@@ -1272,6 +1723,66 @@ mod tests {
             });
         }
         assert!(painted, "the actual retained message must paint");
+        // Reuse the actual retained row and renderer; a callback-shaped unit
+        // test alone cannot establish that GPUI production rendering emits it.
+        let _lock = crate::test_support::UPDATE_OBSERVATION_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(true);
+        let (stale, row, generation, target) = cx.update(|_, cx| {
+            timeline.update(cx, |view, cx| {
+                use pioneer_observability::updates::{
+                    RenderBatch, RenderTarget, RendererBoundary, UpdateContext,
+                };
+                let prepared = view.thread_timeline_view_state.prepared.as_ref().unwrap();
+                let slot = &prepared.slots[0];
+                let generation = prepared.model.snapshot.as_ref().unwrap().generation();
+                let target = RenderTarget {
+                    thread: view.thread_id.clone(),
+                    generation,
+                    row: slot.snapshot().id().as_str().to_owned(),
+                    revision: slot.snapshot().revision(),
+                    boundary: RendererBoundary::GpuiRender,
+                    part: None,
+                };
+                let mut newer = target.clone();
+                newer.revision += 1;
+                let batch = RenderBatch::new(UpdateContext::source(None), [newer]);
+                let row = slot.view.as_ref().unwrap().clone();
+                row.update(cx, |row, cx| {
+                    row.bind_update(batch.clone(), generation, cx);
+                    row.set_update_visible(true);
+                    cx.notify();
+                });
+                (batch, row, generation, target)
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        assert!(
+            stale.is_pending(),
+            "painting the old snapshot cannot confirm a newer revision"
+        );
+        stale.retire(false);
+        let batch = cx.update(|_, cx| {
+            use pioneer_observability::updates::{RenderBatch, UpdateContext};
+            let batch = RenderBatch::new(UpdateContext::source(None), [target.clone()]);
+            row.update(cx, |row, cx| {
+                row.bind_update(batch.clone(), generation, cx);
+                row.set_update_visible(true);
+                cx.notify();
+            });
+            batch
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        assert!(
+            !batch.observe(
+                &target,
+                pioneer_observability::updates::RendererBoundary::GpuiRender
+            ),
+            "the actual row render must have consumed this exact target already"
+        );
+        pioneer_observability::set_telemetry_enabled(old);
     }
     #[gpui_kit::test]
     fn large_work_history_retains_only_visible_expanded_terminals(cx: &mut TestAppContext) {

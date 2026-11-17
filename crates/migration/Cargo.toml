@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+pioneer-sqlite.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 sea-orm-migration = { workspace = true, features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 serde_json.workspace = true

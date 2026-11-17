@@ -186,8 +186,10 @@ impl OnboardingView {
                             this.child(
                                 div()
                                     .w_full()
-                                    .text_sm()
-                                    .opacity(0.6)
+                                    .p_4()
+                                    .text_xs()
+                                    .text_center()
+                                    .text_color(popover_cx.theme().muted_foreground)
                                     .child(t!("gateway.popover.no_available").to_string()),
                             )
                         })
@@ -209,6 +211,7 @@ impl OnboardingView {
                                                 ghost_active,
                                                 desktop_entity.clone(),
                                                 popover_entity.clone(),
+                                                popover_cx,
                                             )
                                         },
                                     ),
@@ -274,6 +277,7 @@ impl OnboardingView {
         ghost_active: Hsla,
         desktop_entity: Entity<Self>,
         popover_entity: Entity<PopoverState>,
+        cx: &App,
     ) -> AnyElement {
         let endpoint_id = endpoint.id.clone();
         let endpoint_name = endpoint.name.clone();
@@ -292,8 +296,9 @@ impl OnboardingView {
             })
             .w_full()
             .min_w_0()
-            .cursor_pointer()
             .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
             .p_2()
             .text_color(option_foreground)
             .when(is_active, |this| this.bg(option_muted_background))

@@ -1,6 +1,10 @@
 use super::*;
+use crate::message::agent_runtime::TurnFailureRecoveryKind;
+use crate::message::turn_handlers::cli_runtime_provider_key;
 use crate::turn_mcp::invoker::{TurnMcpInvocation, TurnMcpInvocationOrigin, TurnMcpInvoker};
 use crate::turn_mcp::result::CanonicalMcpToolResult;
+use futures_util::future::BoxFuture;
+use pioneer_protocol::AgentMessagePhase;
 use std::path::Path;
 
 async fn start_task_cli_fixture(
@@ -13,20 +17,31 @@ async fn start_task_cli_fixture(
     start_task_cli_fixture_with_task_config(kind, pioneer_tasks::TaskRuntimeConfig::default()).await
 }
 
-// Keep repeated fixture and invocation state machines off the enclosing test frame.
-// These tests still run on the production Gateway worker stack.
-fn start_task_cli_fixture_with_task_config(
+async fn start_task_cli_fixture_with_task_config(
     kind: CLIAgentRuntimeKind,
     task_config: pioneer_tasks::TaskRuntimeConfig,
-) -> MessageFuture<
-    'static,
+) -> (
+    CliRuntimeSkillPreflightHarness,
+    Arc<MessageProcessor>,
+    String,
+) {
+    start_task_cli_fixture_with_models(kind, task_config, &[]).await
+}
+
+fn start_task_cli_fixture_with_models<'a>(
+    kind: CLIAgentRuntimeKind,
+    task_config: pioneer_tasks::TaskRuntimeConfig,
+    models: &'a [&'a str],
+) -> BoxFuture<
+    'a,
     (
         CliRuntimeSkillPreflightHarness,
         Arc<MessageProcessor>,
         String,
     ),
 > {
-    message_future(async move {
+    // Keep fixture setup out of the matrix caller's inline future.
+    Box::pin(async move {
         let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
         harness.processor.task_runtime = Arc::new(pioneer_tasks::TaskRuntime::new_with_config(
             harness.crud_store.clone(),
@@ -37,6 +52,16 @@ fn start_task_cli_fixture_with_task_config(
         let turn_id = format!("cli_tasks_turn_{kind:?}").to_lowercase();
         seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
         let processor = Arc::new(harness.processor.clone());
+        for model in models {
+            processor
+                .mark_cli_reasoning_model_ready_for_tests(
+                    &harness.workspace_id,
+                    &harness.runtime_id,
+                    model,
+                )
+                .await
+                .unwrap();
+        }
         processor.bind_agent_tool_bridges().await;
         let request = cli_runtime_turn_start_request_with_capabilities(
             &generate_test_request_id("cli-tasks", &format!("{kind:?}")),
@@ -54,6 +79,176 @@ fn start_task_cli_fixture_with_task_config(
 
         (harness, processor, turn_id)
     })
+}
+
+#[test]
+fn cli_explicit_model_and_reasoning_reach_native_launch_and_survive_mcp_replay() {
+    run_standard_stack_message_test("CLI explicit launch selection", async {
+        let (harness, processor, parent) = start_task_cli_fixture_with_models(
+            CLIAgentRuntimeKind::Codex,
+            pioneer_tasks::TaskRuntimeConfig::default(),
+            &[],
+        )
+        .await;
+        // Readiness can expose another allowed model after parent admission.
+        processor
+            .mark_cli_reasoning_model_ready_for_tests(
+                &harness.workspace_id,
+                &harness.runtime_id,
+                "catalog-cli-choice",
+            )
+            .await
+            .unwrap();
+        let options = invoke_task(
+            &processor,
+            &parent,
+            "launch-options",
+            "threads_start_options",
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert!(!options.is_error, "{options:?}");
+        // The MCP envelope adds transport metadata beside the domain fields.
+        let identities: Vec<pioneer_protocol::AgentToolIdentityOption> =
+            serde_json::from_value(options.structured_content.unwrap()["identities"].clone())
+                .unwrap();
+        let identity = identities
+            .iter()
+            .find(|identity| {
+                identity.source_kind
+                    == pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+            })
+            .unwrap();
+        let provider = format!("cli_runtime:{}", harness.runtime_id);
+        let arguments = json!({
+            "title":"Explicit CLI model", "goal":"Use the selected CLI model and effort",
+            "launch":{"identity":{"kind":"exact","id":identity.id},
+                "profile":{"kind":"model","providerId":provider,"modelId":"catalog-cli-choice"},
+                "reasoning":{"effort":"high"}}
+        });
+        harness
+            .cli_session
+            .set_next_native_turn_id("explicit-cli-child")
+            .await;
+        let created = invoke_task(
+            &processor,
+            &parent,
+            "explicit-cli",
+            "task_create",
+            arguments.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!created.is_error, "{created:?}");
+        let created = created.structured_content.unwrap();
+        let child =
+            wait_for_task_cli_child(&processor, created["runId"].as_str().unwrap(), None).await;
+        let starts = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
+        let child_authority = processor
+            .load_turn_execution_authorization_context(&child.turn_id)
+            .await
+            .unwrap();
+        assert!(
+            child_authority
+                .grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+        );
+        let child_facade =
+            ThreadsFacade::new(&processor, &child.turn_id, CLIAgentRuntimeKind::Codex).await;
+        let options = child_facade
+            .call(
+                "task-child-options",
+                "task-child-options",
+                "threads_start_options",
+                json!({}),
+            )
+            .await;
+        let private_option = options["threadCreationOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["label"] == "Current collaboration")
+            .unwrap()["id"]
+            .clone();
+        let created_thread = child_facade
+            .call(
+                "task-child-create",
+                "task-child-create",
+                "thread_create",
+                json!({"optionId":private_option}),
+            )
+            .await;
+        assert_eq!(created_thread["status"], "accepted");
+        let start = &starts[1];
+        assert_eq!(start.native_thread_id, child.native_thread_id);
+        assert_eq!(start.model.as_deref(), Some("catalog-cli-choice"));
+        assert_eq!(start.effort.as_deref(), Some("high"));
+        assert_eq!(child.runtime_id, harness.runtime_id);
+        let snapshot = processor
+            .crud_store
+            .get_turn_runtime_snapshot(&child.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.provider_name, provider);
+        assert_eq!(snapshot.model, "catalog-cli-choice");
+        assert_eq!(snapshot.reasoning_effort.as_deref(), Some("high"));
+        let actor = processor
+            .crud_store
+            .get_task_actor_contract(created["taskId"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(actor.derived_child_launch_grant_json.as_deref().unwrap())
+                .unwrap();
+        assert!(saved["child_launch_grant"].get("profiles").is_none());
+        assert_eq!(saved["profile"]["modelId"], "catalog-cli-choice");
+        assert_eq!(
+            actor.resolved_identity_id.as_deref(),
+            Some(identity.id.as_str())
+        );
+        assert_eq!(
+            actor
+                .launch
+                .as_ref()
+                .unwrap()
+                .execution
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .effort,
+            "high"
+        );
+        let replay = invoke_task(
+            &processor,
+            &parent,
+            "explicit-cli",
+            "task_create",
+            arguments,
+        )
+        .await
+        .unwrap();
+        assert!(!replay.is_error, "{replay:?}");
+        assert_eq!(
+            replay.structured_content.unwrap()["taskId"],
+            created["taskId"]
+        );
+        assert_eq!(
+            harness.cli_session.turn_starts.lock().await.len(),
+            2,
+            "replay must not launch a second child with current defaults"
+        );
+        assert_eq!(
+            processor
+                .crud_store
+                .get_task_actor_contract(created["taskId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap(),
+            actor
+        );
+    });
 }
 
 async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &str) {
@@ -75,10 +270,297 @@ async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &st
     .expect("CLI task fixture activation");
 }
 
+// Keep construction of the large dispatch future out of the fixture poll
+// frame. Boxing at each call site still leaves that temporary in the caller.
+#[inline(never)]
+fn process_cli_fixture_outbox(
+    processor: &Arc<MessageProcessor>,
+) -> MessageFuture<
+    '_,
+    anyhow::Result<crate::message::agent_action_tools::AgentActionOutboxProcessingBatch>,
+> {
+    message_future(
+        crate::message::agent_action_tools::process_due_agent_action_outbox(processor, 64),
+    )
+}
+
+#[test]
+fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
+    run_standard_stack_message_test("Threads committed CLI first dispatch", async {
+        // The parent exercises ordinary fresh CLI admission. The child below
+        // must go through the same dispatcher with its already-admitted Turn.
+        let (harness, processor, parent) = start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let starts_before = harness.cli_session.turn_starts.lock().await.len();
+        let options = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-options",
+            "threads_start_options",
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert!(!options.is_error, "{options:?}");
+        let options = options.structured_content.unwrap();
+        let creation = options["threadCreationOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["label"] == "New delegated root")
+            .unwrap();
+        let created = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-target",
+            "thread_create",
+            json!({"optionId": creation["id"]}),
+        )
+        .await
+        .unwrap();
+        assert!(!created.is_error, "{created:?}");
+        let created = created.structured_content.unwrap();
+        let target = created["targetOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| {
+                !options["targetOptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|old| old["id"] == target["id"])
+            })
+            .unwrap();
+        let created_row = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+            created["outboxId"].as_str().unwrap(),
+        )
+        .one(&processor.crud_store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+        let created_payload: JsonValue = serde_json::from_str(&created_row.payload_json).unwrap();
+        // This regression owns committed foreground CLI dispatch. The
+        // Collaborative Task path has its own facade/lifecycle regression.
+        super::thread_launch_choices::foreground_target_fixture(
+            &processor,
+            created_payload["created_thread_id"].as_str().unwrap(),
+        )
+        .await;
+        let arguments = json!({
+            "targetOptionId": target["id"],
+            "input": [{"type":"text", "text":"First command in the delegated CLI root"}]
+        });
+        let accepted = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-start",
+            "threads_turn_start",
+            arguments.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!accepted.is_error, "{accepted:?}");
+        let db = processor.crud_store.database_connection();
+        let accepted = accepted.structured_content.unwrap();
+        let outbox = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+            accepted["outboxId"].as_str().unwrap(),
+        )
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        let action_id = outbox.action_id.clone();
+        let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
+        let params: pioneer_protocol::TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        let child = &params.turn_id;
+        assert!(
+            processor
+                .crud_store
+                .get_turn_runtime_snapshot(child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            processor
+                .crud_store
+                .get_cli_runtime_turn_binding(child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            processor
+                .crud_store
+                .latest_cli_runtime_turn_attempt(child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let before = processor
+            .crud_store
+            .get_turn(&params.thread_id, child)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert!(matches!(&before.author.as_ref().unwrap().actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(id) if id.as_str() == outbox.owner_execution_id));
+        let admission = processor
+            .crud_store
+            .get_turn_admission(child)
+            .await
+            .unwrap()
+            .unwrap();
+        let grant = pioneer_crud::load_agent_execution_grant(
+            &db,
+            payload["spawned_execution_id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let authority = processor
+            .load_turn_execution_authorization_context(child)
+            .await
+            .unwrap()
+            .authorization_fingerprint()
+            .unwrap();
+        let security = processor
+            .crud_store
+            .get_turn_execution_security_snapshot(child)
+            .await
+            .unwrap()
+            .unwrap();
+        // Canonical admission must not be inserted again, even idempotently.
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER reject_repeat_thread_admission BEFORE INSERT ON turn_admission WHEN NEW.turn_id='{child}' BEGIN SELECT RAISE(ABORT,'repeated committed admission'); END"
+        )).await.unwrap();
+        // The recording session otherwise reuses the parent's native ID,
+        // which the durable attempt ledger correctly rejects for a new Turn.
+        harness
+            .cli_session
+            .set_next_native_turn_id("first-delegated-cli-child")
+            .await;
+        // Keep the dispatcher state out of this already large fixture future.
+        // The production runtime's bounded worker stack still applies.
+        let batch = process_cli_fixture_outbox(&processor).await.unwrap();
+        assert!(batch.errors.is_empty(), "{:#?}", batch.errors);
+        wait_for_task_cli_activation(&processor, child).await;
+        let starts = harness.cli_session.turn_starts.lock().await.clone();
+        assert_eq!(starts.len(), starts_before + 1);
+        assert!(
+            starts
+                .last()
+                .unwrap()
+                .input
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["text"] == "First command in the delegated CLI root" })
+        );
+        assert_eq!(starts.last().unwrap().model, params.model);
+        assert_eq!(
+            starts.last().unwrap().effort.as_deref(),
+            params.reasoning.as_ref().map(|r| r.effort.as_str())
+        );
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn_admission(child)
+                .await
+                .unwrap()
+                .unwrap(),
+            admission
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution_grant(&db, &grant.execution_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            grant
+        );
+        // Preparation binds MCP and Skill projections after admission. The
+        // immutable authority ceiling and provenance must stay the same.
+        assert_eq!(
+            processor
+                .load_turn_execution_authorization_context(child)
+                .await
+                .unwrap()
+                .authorization_fingerprint()
+                .unwrap(),
+            authority
+        );
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn_execution_security_snapshot(child)
+                .await
+                .unwrap()
+                .unwrap(),
+            security
+        );
+        let after = processor
+            .crud_store
+            .get_turn(&params.thread_id, child)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(after.author, before.author);
+        assert_eq!(after.mode, before.mode);
+        assert_eq!(after.origin, before.origin);
+        assert_eq!(
+            processor.crud_store.get_turn_inputs(child).await.unwrap(),
+            params.input
+        );
+        assert_eq!(
+            processor
+                .thread_manager
+                .thread_get(&params.thread_id)
+                .await
+                .unwrap()
+                .turns
+                .iter()
+                .filter(|turn| &turn.id == child)
+                .count(),
+            1
+        );
+        assert!(
+            processor
+                .crud_store
+                .latest_cli_runtime_turn_attempt(child)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let delivered = pioneer_crud::load_agent_action_outbox(&db, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.status, "delivered");
+        let replay = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-start",
+            "threads_turn_start",
+            arguments,
+        )
+        .await
+        .unwrap();
+        assert!(!replay.is_error, "{replay:?}");
+        process_cli_fixture_outbox(&processor).await.unwrap();
+        assert_eq!(
+            harness.cli_session.turn_starts.lock().await.len(),
+            starts_before + 1
+        );
+    });
+}
+
 // Creation returns a durable TaskRun before its asynchronously admitted child
 // necessarily exists. Observe that run's authoritative binding, rather than
 // assuming nullable child ids in a creation response are already populated.
-async fn wait_for_task_cli_child(
+pub(super) async fn wait_for_task_cli_child(
     processor: &MessageProcessor,
     run_id: &str,
     previous_turn_id: Option<&str>,
@@ -99,7 +581,14 @@ async fn wait_for_task_cli_child(
                 && binding.status == "running"
                 && binding.native_turn_id.is_some()
                 && binding.mcp.is_some()
+                && let Some(transition) = processor
+                    .try_cli_runtime_turn_transition(&binding)
+                    .await
+                    .unwrap()
             {
+                // Activation persists the binding before releasing its gate.
+                // Return an active child only after that startup handoff.
+                drop(transition);
                 return binding;
             }
             tokio::task::yield_now().await;
@@ -115,11 +604,10 @@ fn invoke_task<'a>(
     call_id: &'a str,
     name: &'a str,
     arguments: JsonValue,
-) -> MessageFuture<
-    'a,
-    Result<CanonicalMcpToolResult, crate::turn_mcp::invoker::TurnMcpInvocationError>,
-> {
-    message_future(async move {
+) -> BoxFuture<'a, Result<CanonicalMcpToolResult, crate::turn_mcp::invoker::TurnMcpInvocationError>>
+{
+    // Keep the real MCP invocation future off the scenario matrix's worker stack.
+    Box::pin(async move {
         let binding = processor
             .crud_store
             .get_cli_runtime_turn_binding(turn_id)
@@ -138,6 +626,8 @@ fn invoke_task<'a>(
                     runtime_id: Some(binding.runtime_id),
                     session_generation: Some(generation),
                     provider_call_id: call_id.to_owned(),
+                    native_call: None,
+                    admission_deadline: None,
                     canonical_callable_name: name.to_owned(),
                     arguments,
                     origin: TurnMcpInvocationOrigin::CliFacade,
@@ -146,6 +636,1342 @@ fn invoke_task<'a>(
             )
             .await
     })
+}
+
+// Replay provider-shaped native completions through the existing durable item
+// lane. The fixture invokes real task handlers, while no provider process runs.
+async fn deliver_task_cli_outcome(
+    harness: &CliRuntimeSkillPreflightHarness,
+    processor: &Arc<MessageProcessor>,
+    turn_id: &str,
+    call_id: &str,
+    name: &str,
+    arguments: JsonValue,
+    result: &CanonicalMcpToolResult,
+    native_success: bool,
+    identified: bool,
+) {
+    let binding = processor
+        .crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let key = CLIAgentRuntimeSessionKey::new(
+        &binding.workspace_id,
+        &binding.runtime_id,
+        &binding.continuation_thread_id,
+    )
+    .unwrap();
+    let handle = harness.cli_manager.existing_session(&key).await.unwrap();
+    let returned = match binding.runtime_kind.as_str() {
+        "opencode" => result.content.clone(),
+        "claude" => json!({"content":result.content,"isError":result.is_error}),
+        _ => {
+            json!({"content":result.content,"structuredContent":result.structured_content,"isError":result.is_error})
+        }
+    };
+    processor
+        .handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
+                native_thread_id: Some(binding.native_thread_id),
+                native_turn_id: binding.native_turn_id.unwrap(),
+                native_item_id: call_id.into(),
+                item_kind: "mcpToolCall".into(),
+                text: None,
+                summary: vec![],
+                content: vec![],
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: Some(json!({"canonicalCallableName":name,"rawToolName":name,
+            "serverName":if identified {"pioneer_tasks"} else {"foreign"},
+            "serverInstallationId":if identified {"pioneer-task-tools-v1"} else {"foreign"},
+            "providerCallId":call_id,"invocationCorrelationId":format!("fixture-{call_id}"),
+            "sessionGeneration":binding.mcp.as_ref().unwrap().session_generation,
+            "manifestHash":binding.mcp.as_ref().unwrap().manifest_hash,
+            "arguments":arguments,"result":returned,"success":native_success,
+            "status":if native_success {"completed"} else {"failed"},
+            "message":"display preview deliberately contains no task facts"})),
+                native_item_redacted: None,
+                native: None,
+            }),
+        )
+        .await;
+}
+
+async fn observed_cli_tasks(
+    processor: &Arc<MessageProcessor>,
+    turn_id: &str,
+) -> std::collections::BTreeSet<String> {
+    let binding = processor
+        .crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    use pioneer_agent::TaskToolProvider;
+    let context = pioneer_agent::TaskTurnContext {
+        workspace_id: binding.workspace_id,
+        thread_id: binding.thread_id,
+        turn_id: turn_id.into(),
+    };
+    let observed = crate::task_tools::observed_terminal_task_outcomes(processor, &context)
+        .await
+        .unwrap();
+    crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(processor))
+        .attached_task_finalization_snapshot(context)
+        .await
+        .unwrap()
+        .terminal
+        .into_iter()
+        .filter(|item| item.was_observed(&observed))
+        .map(|item| item.task_id)
+        .collect()
+}
+
+#[test]
+fn cli_accepted_nested_result_keeps_substantive_final_without_another_attempt() {
+    run_standard_stack_message_test("CLI accepted final delivery", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            let config = review_enabled_task_runtime_config();
+            let (harness, processor, root) =
+                start_task_cli_fixture_with_task_config(kind, config).await;
+            *harness.cli_session.next_native_turn_id.lock().await =
+                Some(format!("middle_{kind:?}"));
+            let parent = invoke_task(&processor, &root, "parent-create", "task_create", json!({
+                "requireReview":true, "title":"Integrate research", "goal":"Review research and provide the final explanation",
+                "outputInstructions":"Return the complete explanation."
+            })).await.unwrap().structured_content.unwrap();
+            let middle =
+                wait_for_task_cli_child(&processor, parent["runId"].as_str().unwrap(), None).await;
+            *harness.cli_session.next_native_turn_id.lock().await =
+                Some(format!("researcher_{kind:?}"));
+            let child = invoke_task(&processor, &middle.turn_id, "child-create", "task_create", json!({
+                "requireReview":true, "title":"Research", "goal":"Return specific evidence", "outputInstructions":"Return all evidence."
+            })).await.unwrap().structured_content.unwrap();
+            let researcher =
+                wait_for_task_cli_child(&processor, child["runId"].as_str().unwrap(), None).await;
+            let research_text = "The build fails because the generated source contract is stale. Regenerate it from the current inputs.";
+            finish_task_cli_child(&harness, &processor, &researcher.turn_id, research_text).await;
+            let args = json!({"runIds":[child["runId"]],"timeoutMs":10000});
+            let review = invoke_task(
+                &processor,
+                &middle.turn_id,
+                "child-wait",
+                "task_wait",
+                args.clone(),
+            )
+            .await
+            .unwrap();
+            let candidate = &review.structured_content.as_ref().unwrap()["reviewRequired"][0];
+            assert_eq!(candidate["reviewContent"]["content"], research_text);
+            assert_eq!(candidate["reviewContent"]["truncated"], false);
+            deliver_task_cli_outcome(
+                &harness,
+                &processor,
+                &middle.turn_id,
+                "child-wait",
+                "task_wait",
+                args,
+                &review,
+                true,
+                true,
+            )
+            .await;
+            assert!(
+                observed_cli_tasks(&processor, &middle.turn_id)
+                    .await
+                    .is_empty(),
+                "reviewRequired is not terminal"
+            );
+            let args = json!({"taskId":child["taskId"],"runId":child["runId"],"candidateId":candidate["candidate"]["id"]});
+            let accepted = invoke_task(
+                &processor,
+                &middle.turn_id,
+                "child-accept",
+                "task_accept",
+                args.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                accepted.structured_content.as_ref().unwrap()["taskTerminal"],
+                true
+            );
+            assert!(
+                observed_cli_tasks(&processor, &middle.turn_id)
+                    .await
+                    .is_empty(),
+                "backend commit alone is not delivery"
+            );
+            deliver_task_cli_outcome(
+                &harness,
+                &processor,
+                &middle.turn_id,
+                "child-accept",
+                "task_accept",
+                args,
+                &accepted,
+                true,
+                true,
+            )
+            .await;
+            assert!(
+                observed_cli_tasks(&processor, &middle.turn_id)
+                    .await
+                    .contains(child["taskId"].as_str().unwrap())
+            );
+            let starts = harness.cli_session.turn_starts.lock().await.len();
+            let final_text = "Regenerate the source contract, commit the generated changes, and rebuild. The research was reviewed and the evidence supports this fix.";
+            finish_task_cli_child(&harness, &processor, &middle.turn_id, final_text).await;
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                starts,
+                "{kind:?}: accepted research must not require an ACK attempt"
+            );
+            assert_eq!(
+                processor
+                    .crud_store
+                    .latest_cli_runtime_turn_attempt(&middle.turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .attempt_index,
+                1
+            );
+            let final_item = processor
+                .crud_store
+                .completed_turn_final_answer(
+                    &middle.workspace_id,
+                    &middle.thread_id,
+                    &middle.turn_id,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(final_item, TurnItem::AgentMessage { phase: AgentMessagePhase::FinalAnswer, ref text, .. } if text == final_text)
+            );
+            let upper_review = invoke_task(
+                &processor,
+                &root,
+                "parent-wait",
+                "task_wait",
+                json!({"runIds":[parent["runId"]],"timeoutMs":10000}),
+            )
+            .await
+            .unwrap();
+            let upper = &upper_review.structured_content.as_ref().unwrap()["reviewRequired"][0];
+            assert_eq!(
+                upper["reviewContent"]["content"], final_text,
+                "upper parent receives exactly the accepted final"
+            );
+        }
+    });
+}
+
+#[test]
+fn cli_terminal_outcomes_require_successful_identified_durable_delivery() {
+    run_standard_stack_message_test("CLI terminal outcome recovery", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            for tool in ["task_wait", "task_get", "task_cancel"] {
+                let (harness, processor, turn_id) = start_task_cli_fixture(kind).await;
+                *harness.cli_session.next_native_turn_id.lock().await =
+                    Some(format!("terminal_child_{kind:?}"));
+                let created = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "terminal-create",
+                    "task_create",
+                    json!({"title":"Terminal child","goal":"Inspect the project"}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                wait_for_task_cli_child(&processor, created["runId"].as_str().unwrap(), None).await;
+                let id = created["taskId"].as_str().unwrap();
+                let cancel_args = json!({"taskId":id});
+                let cancelled = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "cancel-commit",
+                    "task_cancel",
+                    cancel_args.clone(),
+                )
+                .await
+                .unwrap();
+                assert!(!cancelled.is_error);
+                assert!(observed_cli_tasks(&processor, &turn_id).await.is_empty());
+                let args = if tool == "task_wait" {
+                    json!({"taskIds":[id],"timeoutMs":1})
+                } else {
+                    cancel_args
+                };
+                let result =
+                    invoke_task(&processor, &turn_id, "terminal-outcome", tool, args.clone())
+                        .await
+                        .unwrap();
+                assert!(!result.is_error);
+                // A confirmed execution in canonical history is not a native
+                // delivery receipt, even when its complete Task payload exists.
+                let cli = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let frozen = processor
+                    .crud_store
+                    .list_turn_mcp_bindings(&turn_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|binding| binding.canonical_callable_name == tool)
+                    .unwrap();
+                let invocation = TurnMcpInvocation {
+                    workspace_id: cli.workspace_id,
+                    thread_id: cli.thread_id,
+                    turn_id: turn_id.clone(),
+                    runtime_id: Some(cli.runtime_id),
+                    session_generation: Some(cli.mcp.as_ref().unwrap().session_generation as u64),
+                    provider_call_id: "terminal-outcome".into(),
+                    native_call: Some(crate::turn_mcp::invoker::NativeMcpCallIdentity {
+                        native_thread_id: cli.native_thread_id,
+                        native_turn_id: cli.native_turn_id.unwrap(),
+                        native_item_id: "terminal-outcome".into(),
+                    }),
+                    admission_deadline: None,
+                    canonical_callable_name: tool.into(),
+                    arguments: args.clone(),
+                    origin: TurnMcpInvocationOrigin::CliFacade,
+                };
+                let execution = crate::cli_runtime::projector::confirmed_mcp_call_completed(
+                    &invocation,
+                    &frozen,
+                    &cli.mcp.unwrap().manifest_hash,
+                    &Ok(result.clone()),
+                    false,
+                );
+                processor
+                    .crud_store
+                    .materialize_item_completed(execution, now_timestamp_secs())
+                    .await
+                    .unwrap();
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id).await.is_empty(),
+                    "canonical execution alone must not bypass the Task delivery gate"
+                );
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "terminal-outcome",
+                    tool,
+                    args.clone(),
+                    &result,
+                    false,
+                    true,
+                )
+                .await;
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id).await.is_empty(),
+                    "failed native item cannot inherit committed mutation success"
+                );
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "foreign-outcome",
+                    tool,
+                    args.clone(),
+                    &result,
+                    true,
+                    false,
+                )
+                .await;
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id).await.is_empty(),
+                    "name alone is not identity"
+                );
+                // Retrying the same committed mutation yields only references,
+                // which must not mask the failed native result.
+                let replay =
+                    invoke_task(&processor, &turn_id, "terminal-outcome", tool, args.clone())
+                        .await
+                        .unwrap();
+                if tool == "task_cancel" {
+                    assert_eq!(
+                        replay.structured_content.as_ref().unwrap()["alreadyCommitted"],
+                        true
+                    );
+                    deliver_task_cli_outcome(
+                        &harness,
+                        &processor,
+                        &turn_id,
+                        "commit-replay",
+                        tool,
+                        args.clone(),
+                        &replay,
+                        true,
+                        true,
+                    )
+                    .await;
+                    assert!(observed_cli_tasks(&processor, &turn_id).await.is_empty());
+                }
+                let revision = processor
+                    .crud_store
+                    .get_task(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .revision;
+                let received =
+                    invoke_task(&processor, &turn_id, "received-outcome", tool, args.clone())
+                        .await
+                        .unwrap();
+                // A new received native item establishes knowledge; re-reading
+                // the durable source after reconstruction needs no mutation.
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "received-outcome",
+                    tool,
+                    args,
+                    &received,
+                    true,
+                    true,
+                )
+                .await;
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .revision,
+                    revision,
+                    "retry must not repeat the terminal state mutation"
+                );
+                let mut reconstructed = (*processor).clone();
+                reconstructed.crud_store =
+                    Arc::new(CrudStore::new(processor.crud_store.database_connection()));
+                let reconstructed = Arc::new(reconstructed);
+                assert_eq!(
+                    observed_cli_tasks(&reconstructed, &turn_id).await,
+                    std::collections::BTreeSet::from([id.to_owned()])
+                );
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .status,
+                    TaskStatus::Cancelled
+                );
+                *harness.cli_session.next_native_turn_id.lock().await =
+                    Some(format!("other_child_{kind:?}"));
+                let other = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "other-create",
+                    "task_create",
+                    json!({"title":"Other child","goal":"Inspect another part"}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                wait_for_task_cli_child(&processor, other["runId"].as_str().unwrap(), None).await;
+                assert!(
+                    !observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(other["taskId"].as_str().unwrap())
+                );
+                let binding = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let key = CLIAgentRuntimeSessionKey::new(
+                    &binding.workspace_id,
+                    &binding.runtime_id,
+                    &binding.continuation_thread_id,
+                )
+                .unwrap();
+                let handle = harness.cli_manager.existing_session(&key).await.unwrap();
+                processor
+                    .handle_cli_runtime_timeline_event(
+                        handle.instance(),
+                        RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                            item: None,
+                            native_thread_id: Some(binding.native_thread_id.clone()),
+                            native_turn_id: binding.native_turn_id.clone().unwrap(),
+                            native_item_id: "premature-final".into(),
+                            item_kind: "agentMessage".into(),
+                            text: Some("Premature completion".into()),
+                            summary: vec![],
+                            content: vec![],
+                            phase: RuntimeAgentMessagePhase::FinalAnswer,
+                            metadata: None,
+                            native_item_redacted: None,
+                            native: None,
+                        }),
+                    )
+                    .await;
+                assert!(
+                    matches!(
+                        processor
+                            .crud_store
+                            .get_turn_item(&turn_id, "premature-final")
+                            .await
+                            .unwrap(),
+                        Some(TurnItem::AgentMessage {
+                            phase: AgentMessagePhase::Commentary,
+                            ..
+                        })
+                    ),
+                    "another child still blocks the final"
+                );
+                let args = json!({"taskId":other["taskId"]});
+                let cancelled = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "other-cancel",
+                    "task_cancel",
+                    args.clone(),
+                )
+                .await
+                .unwrap();
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "other-cancel",
+                    "task_cancel",
+                    args,
+                    &cancelled,
+                    true,
+                    true,
+                )
+                .await;
+                let starts = harness.cli_session.turn_starts.lock().await.len();
+                finish_task_cli_child(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "Child cancellation was observed; the remaining explanation is complete.",
+                )
+                .await;
+                assert_eq!(
+                    harness.cli_session.turn_starts.lock().await.len(),
+                    starts,
+                    "{kind:?}/{tool}: terminal delivery must not add an attempt"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
+    run_standard_stack_message_test("CLI same-run observation freshness", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            for tool in ["task_get", "task_wait"] {
+                let (harness, processor, turn_id) = start_task_cli_fixture(kind).await;
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("resume_a")
+                    .await;
+                let a = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "create-a",
+                    "task_create",
+                    json!({"title":"Child A","goal":"Inspect A"}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                let a_child =
+                    wait_for_task_cli_child(&processor, a["runId"].as_str().unwrap(), None).await;
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("resume_b")
+                    .await;
+                let b = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "create-b",
+                    "task_create",
+                    json!({"title":"Child B","goal":"Inspect B"}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                wait_for_task_cli_child(&processor, b["runId"].as_str().unwrap(), None).await;
+                let a_id = a["taskId"].as_str().unwrap();
+                let run_id = a["runId"].as_str().unwrap();
+                assert!(
+                    processor
+                        .mark_turn_blocked(
+                            a_child.thread_id.clone(),
+                            a_child.turn_id.clone(),
+                            "blocked child A".into()
+                        )
+                        .await
+                );
+                message_future(processor.reconcile_terminal_task_child_turns(64))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task_run_turn_by_turn(&a_child.thread_id, &a_child.turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    pioneer_protocol::TaskRunTurnStatus::Blocked
+                );
+                let first_error = processor
+                    .crud_store
+                    .get_task_run(run_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .error;
+                let args = if tool == "task_wait" {
+                    json!({"taskIds":[a_id],"timeoutMs":1})
+                } else {
+                    json!({"taskId":a_id})
+                };
+                let first = invoke_task(&processor, &turn_id, "first-outcome", tool, args.clone())
+                    .await
+                    .unwrap();
+                assert!(!first.is_error);
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "first-outcome",
+                    tool,
+                    args.clone(),
+                    &first,
+                    true,
+                    true,
+                )
+                .await;
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(a_id)
+                );
+                let binding = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let state = processor
+                    .cli_task_finalization_state(&binding)
+                    .await
+                    .unwrap();
+                assert!(state.blocks_completion(), "B remains pending");
+                let a_outcomes = state
+                    .snapshot
+                    .terminal
+                    .iter()
+                    .filter(|item| item.task_id == a_id)
+                    .map(|item| item.outcome())
+                    .collect::<std::collections::BTreeSet<_>>();
+                // Both new semantic markers and legacy ID-only markers must not
+                // turn into a bypass after the very same run is reopened.
+                for details in [json!({"outcomes":a_outcomes}), json!({"taskIds":[a_id]})] {
+                    processor
+                        .crud_store
+                        .materialize_item_completed(
+                            ItemCompletedNotification {
+                                workspace_id: binding.workspace_id.clone(),
+                                thread_id: binding.thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                item: TurnItem::SystemEvent {
+                                    id: pioneer_protocol::generate_id(21),
+                                    level: pioneer_protocol::SystemEventLevel::Info,
+                                    message: "Previously delivered A outcome".into(),
+                                    code: Some("task.terminal.observed".into()),
+                                    details: Some(details),
+                                },
+                            },
+                            now_timestamp_secs(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let updated = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "update-b",
+                    "task_update",
+                    json!({"taskId":b["taskId"],"title":"Child B still active"}),
+                )
+                .await
+                .unwrap();
+                assert!(!updated.is_error);
+                let mut reconstructed = (*processor).clone();
+                reconstructed.crud_store =
+                    Arc::new(CrudStore::new(processor.crud_store.database_connection()));
+                let processor = Arc::new(reconstructed);
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(a_id),
+                    "B revision cannot invalidate unchanged A after restart"
+                );
+                let before = processor
+                    .crud_store
+                    .get_task(a_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .revision;
+                let now = now_timestamp_secs();
+                let job = processor
+                    .crud_store
+                    .enqueue_recovery_job(
+                        a_child.turn_id.clone(),
+                        "resume-a".into(),
+                        pioneer_protocol::TurnItemType::Reasoning,
+                        None,
+                        pioneer_protocol::RecoveryTrigger::Timeout,
+                        pioneer_protocol::RecoveryAction::BlockResumable,
+                        Some("blocked A".into()),
+                        None,
+                        None,
+                        None,
+                        0,
+                        0,
+                        json!({}),
+                        json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                processor
+                    .crud_store
+                    .mark_recovery_job_terminal(
+                        &job.id,
+                        RecoveryJobStatus::Blocked,
+                        Some("blocked A".into()),
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                let stale_terminal = processor
+                    .crud_store
+                    .prepare_task_terminal_transition(
+                        pioneer_protocol::TaskEventPayload::RunBlocked {
+                            task_id: a_id.into(),
+                            run_id: run_id.into(),
+                            error: first_error.clone(),
+                            blocked_at: now,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                // The fixture keeps both terminal snapshots alive across the
+                // resume. Heap-own the storage future rather than composing
+                // its transaction state into this already large CLI scenario.
+                let closing_bus = processor.task_runtime.event_bus();
+                let closing_ticket = closing_bus.closing_lifecycle_ticket();
+                let old_generation = closing_bus.closing_run_generation(run_id);
+                let resumed = Box::pin(processor.crud_store.resume_task_owned_turn(
+                    &a_child.thread_id,
+                    &a_child.turn_id,
+                    Some(&job.id),
+                    now,
+                    processor.turn_execution_owner_id.as_ref(),
+                    now + 100,
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+                let pioneer_crud::TaskOwnedTurnResumeOutcome::Resumed {
+                    observation_sequence,
+                    task,
+                    run,
+                    task_run_turn: mut resumed_turn,
+                    ..
+                } = resumed
+                else {
+                    panic!("same-run task-owned resume must succeed");
+                };
+                assert_eq!(run.id, run_id);
+                assert!(task.revision > before);
+                assert!(observation_sequence > 0);
+                closing_bus.admit_closing_run(
+                    closing_ticket,
+                    &task.id,
+                    &run.id,
+                    observation_sequence,
+                    true,
+                );
+                assert_ne!(closing_bus.closing_run_generation(run_id), old_generation);
+                assert!(closing_bus.closing_run_generation(run_id).is_some());
+                assert!(
+                    processor
+                        .crud_store
+                        .commit_task_terminal_transition(stale_terminal)
+                        .await
+                        .is_err(),
+                    "a terminal write prepared before resume must lose its occurrence fence"
+                );
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task_run(run_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    pioneer_protocol::TaskRunStatus::Running,
+                    "stale terminal rejection must roll back the entire transition"
+                );
+                assert!(
+                    processor
+                        .cli_task_finalization_state(&binding)
+                        .await
+                        .unwrap()
+                        .blocks_completion()
+                );
+                // New terminal outcome deliberately has the same run, status and
+                // error as the first. Only durable task revision differs.
+                let resumed_execution = pioneer_tasks::TaskExecutionHandle::new(
+                    processor.crud_store.clone(),
+                    processor.task_runtime.event_bus(),
+                    a_id.into(),
+                    run_id.into(),
+                );
+                resumed_turn.status = pioneer_protocol::TaskRunTurnStatus::Blocked;
+                resumed_turn.completed_at = Some(now + 1);
+                resumed_execution
+                    .record_task_run_turn_blocked(
+                        resumed_turn.clone(),
+                        first_error.clone(),
+                        now + 1,
+                    )
+                    .await
+                    .unwrap();
+                resumed_execution
+                    .block_run(first_error.clone(), now + 1)
+                    .await
+                    .unwrap();
+                let reblocked = processor
+                    .crud_store
+                    .get_latest_task_run_turn(run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    reblocked.status,
+                    pioneer_protocol::TaskRunTurnStatus::Blocked
+                );
+                assert_eq!(reblocked.completed_at, Some(now + 1));
+                let revision = processor
+                    .crud_store
+                    .get_task(a_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .revision;
+                resumed_execution
+                    .record_task_run_turn_blocked(resumed_turn, first_error.clone(), now + 2)
+                    .await
+                    .unwrap();
+                resumed_execution
+                    .block_run(first_error, now + 2)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(a_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .revision,
+                    revision,
+                    "replaying the new outcome must not project it twice"
+                );
+                assert!(
+                    !observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(a_id)
+                );
+                let b_args = json!({"taskId":b["taskId"]});
+                let cancelled = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "cancel-b",
+                    "task_cancel",
+                    b_args.clone(),
+                )
+                .await
+                .unwrap();
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "cancel-b",
+                    "task_cancel",
+                    b_args,
+                    &cancelled,
+                    true,
+                    true,
+                )
+                .await;
+                let state = processor
+                    .cli_task_finalization_state(&binding)
+                    .await
+                    .unwrap();
+                assert!(state.snapshot.pending.is_empty());
+                assert!(
+                    state.blocks_completion(),
+                    "new A outcome alone still gates finalization"
+                );
+                let mut restarted = (*processor).clone();
+                restarted.crud_store =
+                    Arc::new(CrudStore::new(processor.crud_store.database_connection()));
+                let processor = Arc::new(restarted);
+                assert!(
+                    !observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(a_id),
+                    "old items and both marker forms cannot cover reopened A"
+                );
+                let latest = invoke_task(&processor, &turn_id, "new-outcome", tool, args.clone())
+                    .await
+                    .unwrap();
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "new-outcome",
+                    tool,
+                    args.clone(),
+                    &latest,
+                    false,
+                    true,
+                )
+                .await;
+                assert!(
+                    processor
+                        .cli_task_finalization_state(&binding)
+                        .await
+                        .unwrap()
+                        .blocks_completion(),
+                    "failed delivery cannot observe new A"
+                );
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "new-outcome-success",
+                    tool,
+                    args,
+                    &latest,
+                    true,
+                    true,
+                )
+                .await;
+                assert!(
+                    !processor
+                        .cli_task_finalization_state(&binding)
+                        .await
+                        .unwrap()
+                        .blocks_completion()
+                );
+                let starts = harness.cli_session.turn_starts.lock().await.len();
+                let final_text = "A was resumed in its original run and blocked again; B was cancelled. Both current outcomes have been integrated.";
+                finish_task_cli_child(&harness, &processor, &turn_id, final_text).await;
+                assert_eq!(harness.cli_session.turn_starts.lock().await.len(), starts);
+                assert!(
+                    matches!(processor.crud_store.completed_turn_final_answer(&binding.workspace_id, &binding.thread_id, &turn_id).await.unwrap().unwrap(), TurnItem::AgentMessage { ref text, phase:AgentMessagePhase::FinalAnswer, .. } if text == final_text)
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn cli_recovery_delivers_exact_task_facts_and_preserves_substantive_final() {
+    run_standard_stack_message_test("CLI task payload recovery", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            // 0: fresh recovery, 1: committed receipt before marker, 2: marker before provider start.
+            for window in 0..3 {
+                let config = review_enabled_task_runtime_config();
+                let (harness, processor, root) =
+                    start_task_cli_fixture_with_task_config(kind, config).await;
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("payload_middle")
+                    .await;
+                let parent = invoke_task(&processor, &root, "payload-parent", "task_create", json!({"requireReview":true, "title":"Integrate recovered work","goal":"Return the full explanation"})).await.unwrap().structured_content.unwrap();
+                let middle =
+                    wait_for_task_cli_child(&processor, parent["runId"].as_str().unwrap(), None)
+                        .await;
+                let turn_id = middle.turn_id.clone();
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("payload_child")
+                    .await;
+                let child = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "payload-create",
+                    "task_create",
+                    json!({"requireReview":true, "title":"Payload child","goal":"Inspect the project"}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                wait_for_task_cli_child(&processor, child["runId"].as_str().unwrap(), None).await;
+                let future = invoke_task(&processor, &turn_id, "payload-schedule", "task_create", json!({
+                    "title":"Future project inspection", "goal":"Inspect the project on schedule",
+                    "instructions":["Inspect current project state and report findings without changing files."],
+                    "outputInstructions":"Return a concise status report.",
+                    "trigger":{"kind":"cron","cronExpr":"0 7 * * *","timezone":"Europe/Moscow"}
+                })).await.unwrap().structured_content.unwrap();
+                assert_eq!(future["waitable"], false);
+                let cancelled = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "payload-cancel",
+                    "task_cancel",
+                    json!({"taskId":child["taskId"]}),
+                )
+                .await
+                .unwrap();
+                assert!(!cancelled.is_error);
+                let binding = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let key = CLIAgentRuntimeSessionKey::new(
+                    &binding.workspace_id,
+                    &binding.runtime_id,
+                    &binding.continuation_thread_id,
+                )
+                .unwrap();
+                let handle = harness.cli_manager.existing_session(&key).await.unwrap();
+                let saved_input = if window == 2 {
+                    *harness.cli_session.fail_next_resume.lock().await = true;
+                    processor
+                        .handle_cli_runtime_timeline_event(
+                            handle.instance(),
+                            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                                native_thread_id: Some(binding.native_thread_id.clone()),
+                                native_turn_id: binding.native_turn_id.clone().unwrap(),
+                                status: "completed".into(),
+                                native: None,
+                            }),
+                        )
+                        .await;
+                    let attempt = timeout(Duration::from_secs(10), async {
+                        loop {
+                            let attempt = processor
+                                .crud_store
+                                .latest_cli_runtime_turn_attempt(&turn_id)
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            if attempt.attempt_index == 2
+                                && attempt.status
+                                    == pioneer_crud::CliRuntimeTurnAttemptStatus::Failed
+                            {
+                                break attempt;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        harness.cli_session.turn_starts.lock().await.len(),
+                        3,
+                        "provider never received continuation"
+                    );
+                    assert!(
+                        observed_cli_tasks(&processor, &turn_id)
+                            .await
+                            .contains(child["taskId"].as_str().unwrap())
+                    );
+                    let receipt = processor
+                        .crud_store
+                        .get_cli_runtime_native_event(&format!("{}:task-continuation", attempt.id))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let payload: JsonValue =
+                        serde_json::from_str(&receipt.payload_redacted_json).unwrap();
+                    assert!(
+                        processor
+                            .report_turn_failure(
+                                binding.thread_id.clone(),
+                                turn_id.clone(),
+                                TurnFailureRecoveryKind::RuntimeFailure,
+                                "process lost before task payload delivery".into()
+                            )
+                            .await
+                    );
+                    Some(payload["input"].clone())
+                } else {
+                    let saved = if window == 1 {
+                        // Persist precisely the production renderer's block + semantic
+                        // facts, then model a crash before the separate marker write.
+                        let state = processor
+                            .cli_task_finalization_state(&binding)
+                            .await
+                            .unwrap();
+                        let input = serde_json::to_value(vec![
+                            pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
+                                text: state.continuation_text(),
+                            },
+                        ])
+                        .unwrap();
+                        let now = chrono::Utc::now().fixed_offset();
+                        let receipt = pioneer_crud::NewCliRuntimeNativeEvent {
+                            id: "crashed-task-input".into(),
+                            runtime_id: binding.runtime_id.clone(),
+                            runtime_kind: binding.runtime_kind.clone(),
+                            workspace_id: Some(binding.workspace_id.clone()),
+                            thread_id: Some(binding.thread_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            native_thread_id: Some(binding.native_thread_id.clone()),
+                            native_turn_id: binding.native_turn_id.clone(),
+                            native_method: "gateway/task_continuation".into(),
+                            payload_redacted_json: json!({"input":input,"terminalObservations":state.continuation_outcomes()}).to_string(),
+                            sequence: now.timestamp_millis(),
+                            created_at: now,
+                        };
+                        processor
+                            .crud_store
+                            .append_cli_runtime_native_event(receipt)
+                            .await
+                            .unwrap();
+                        assert!(
+                            observed_cli_tasks(&processor, &turn_id).await.is_empty(),
+                            "receipt commit is not observation"
+                        );
+                        Some(input)
+                    } else {
+                        None
+                    };
+                    processor
+                        .handle_cli_runtime_timeline_event(
+                            handle.instance(),
+                            RuntimeEvent::TurnInterrupted(RuntimeTurnInterrupted {
+                                native_thread_id: Some(binding.native_thread_id.clone()),
+                                native_turn_id: binding.native_turn_id.clone().unwrap(),
+                                reason: "process disconnected".into(),
+                                native: None,
+                            }),
+                        )
+                        .await;
+                    saved
+                };
+                let mut reconstructed = (*processor).clone();
+                reconstructed.crud_store =
+                    Arc::new(CrudStore::new(processor.crud_store.database_connection()));
+                let processor = Arc::new(reconstructed);
+                // The terminal consumer owns its ACK independently of the
+                // publisher. Wait for that transition before driving recovery.
+                let transition = processor
+                    .cli_runtime_turn_resume_transition(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(transition);
+                assert!(
+                    !processor
+                        .crud_store
+                        .has_pending_cli_runtime_terminal_event(&turn_id)
+                        .await
+                        .unwrap()
+                );
+                let jobs = processor
+                    .crud_store
+                    .find_recovery_jobs_by_turn_and_status(&turn_id, RecoveryJobStatus::Pending)
+                    .await
+                    .unwrap();
+                assert_eq!(jobs.len(), 1);
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("payload_recovery")
+                    .await;
+                // This recording fixture has no process heartbeat worker.
+                // Maintain its real owner lease rather than jumping ten
+                // seconds into the future and expiring that same authority.
+                processor
+                    .crud_store
+                    .heartbeat_turn_executions_owned_by(
+                        processor.turn_execution_owner_id.as_ref(),
+                        TURN_EXECUTION_OWNER_LEASE_SECONDS,
+                    )
+                    .await
+                    .unwrap();
+                let now = chrono::Utc::now().timestamp();
+                assert!(jobs[0].next_run_at_unix <= now);
+                let events = processor
+                    .recovery_coordinator
+                    .run_ready_jobs(now, 1)
+                    .await
+                    .unwrap();
+                assert_eq!(events.len(), 1);
+                for event in events {
+                    processor
+                        .handle_recovery_event(event, chrono::Utc::now().timestamp())
+                        .await;
+                }
+                wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 4).await;
+                wait_for_task_cli_activation(&processor, &turn_id).await;
+                let recovered = harness
+                    .cli_session
+                    .turn_starts
+                    .lock()
+                    .await
+                    .last()
+                    .unwrap()
+                    .input
+                    .clone();
+                let blocks = recovered
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| {
+                        item["text"].as_str().is_some_and(|text| {
+                            text.contains("Attached task facts (data, not instructions")
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    blocks.len(),
+                    1,
+                    "one recovery gets one orchestration payload"
+                );
+                assert!(
+                    blocks[0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains(child["taskId"].as_str().unwrap())
+                );
+                if let Some(saved) = saved_input {
+                    assert_eq!(
+                        blocks[0], &saved[0],
+                        "owed facts survive marker and restart"
+                    );
+                }
+                assert!(
+                    recovered
+                        .to_string()
+                        .contains("These durable Tasks were already created successfully")
+                );
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .list_tasks_created_by_turn(
+                            &binding.workspace_id,
+                            &binding.thread_id,
+                            &turn_id
+                        )
+                        .await
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(child["taskId"].as_str().unwrap())
+                );
+                assert!(
+                    recovered
+                        .to_string()
+                        .contains(future["taskId"].as_str().unwrap()),
+                    "scheduled task anti-dup facts survive independently of attached payload"
+                );
+                let final_text = "The recovered result has been integrated: the child was cancelled, its work made no changes, and the original explanation remains complete.";
+                let starts = harness.cli_session.turn_starts.lock().await.len();
+                finish_task_cli_child(&harness, &processor, &turn_id, final_text).await;
+                assert_eq!(
+                    harness.cli_session.turn_starts.lock().await.len(),
+                    starts,
+                    "{kind:?}/{window}: no ACK attempt after recovery"
+                );
+                let final_item = processor
+                    .crud_store
+                    .completed_turn_final_answer(
+                        &binding.workspace_id,
+                        &binding.thread_id,
+                        &turn_id,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(final_item, TurnItem::AgentMessage { phase:AgentMessagePhase::FinalAnswer, ref text, .. } if text == final_text)
+                );
+                let upper = invoke_task(
+                    &processor,
+                    &root,
+                    "payload-upper-wait",
+                    "task_wait",
+                    json!({"runIds":[parent["runId"]],"timeoutMs":10000}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                assert_eq!(
+                    upper["reviewRequired"][0]["reviewContent"]["content"], final_text,
+                    "upper parent gets the recovered substantive final"
+                );
+            }
+        }
+    });
 }
 
 #[test]
@@ -469,9 +2295,9 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                         label: Some(format!("tests/{user_name}")),
                     }]
                 );
-                assert_eq!(bindings.len(), 3);
+                assert_eq!(bindings.len(), 5);
                 assert!(bindings.iter().any(|binding| binding.skill_id == user_id && binding.source_kind == "user"));
-                for slug in ["tasks", "subagents"] {
+                for slug in ["tasks", "subagents", "html", "threads"] {
                     assert!(
                         bindings
                             .iter()
@@ -512,30 +2338,78 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                 );
                 let starts = harness.cli_session.turn_starts.lock().await;
                 let start = &starts[0];
-                let instructions = start.instructions.elevated().unwrap().text();
+                let turn_text = start
+                    .input
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 if kind == CLIAgentRuntimeKind::Claude {
-                    assert!(instructions.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents")),
-                        "application order must retain the user's selected skill before automatic tasks/subagents");
+                    assert!(
+                        turn_text.contains(&format!("Selected skills:\n- {user_name}")),
+                        "turn context must identify the user's explicit skill selection"
+                    );
                 }
-                for name in [
-                    "pioneer-system-tasks",
-                    "pioneer-system-subagents",
-                    user_name,
-                ] {
-                    assert!(instructions.contains(name), "{kind:?}: {name}");
-                    if kind != CLIAgentRuntimeKind::Claude {
-                        assert!(start.input.as_array().unwrap().iter().any(|item| {
-                            item["type"] == "skill"
-                                && item["name"] == name
-                                && item["path"]
-                                    == harness
-                                        .native_home
-                                        .join("skills")
-                                        .join(name)
-                                        .join("SKILL.md")
-                                        .display()
-                                        .to_string()
-                        }));
+                if kind != CLIAgentRuntimeKind::Claude {
+                    let native_skills = start
+                        .input
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|item| item["type"] == "skill")
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        native_skills.len(),
+                        1,
+                        "only the explicit user selection invokes a skill"
+                    );
+                    assert_eq!(native_skills[0]["name"], user_name);
+                    assert_eq!(
+                        native_skills[0]["path"],
+                        exported_user.join("SKILL.md").display().to_string()
+                    );
+                    let references = start
+                        .input
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|item| item["text"].as_str())
+                        .filter_map(|text| {
+                            text.strip_prefix("Current required Pioneer skill exports (replaces earlier required-export references): ")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(references.len(), 1);
+                    let exports: serde_json::Value =
+                        serde_json::Deserializer::from_str(references[0])
+                            .into_iter::<serde_json::Value>()
+                            .next()
+                            .unwrap()
+                            .unwrap();
+                    let exports = exports.as_array().unwrap();
+                    assert_eq!(exports.len(), 4);
+                    for slug in ["tasks", "subagents", "html", "threads"] {
+                        let name = format!("pioneer-system-{slug}");
+                        let export = exports
+                            .iter()
+                            .find(|export| export["name"] == name)
+                            .unwrap();
+                        assert_eq!(
+                            export["path"],
+                            harness
+                                .native_home
+                                .join("skills")
+                                .join(&name)
+                                .join("SKILL.md")
+                                .display()
+                                .to_string()
+                        );
+                        assert!(
+                            export["folderHash"]
+                                .as_str()
+                                .is_some_and(|hash| !hash.is_empty())
+                        );
                     }
                 }
                 // Claude receives the same selected names/paths through the
@@ -624,7 +2498,6 @@ fn cli_attached_tasks_inherit_the_exact_selected_mcp_tool() {
                 vec![selected],
                 "inherit the selected tool, not the broader admitted server ceiling"
             );
-            wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
             let child_binding = wait_for_task_cli_child(
                 &processor,
                 child.structured_content.as_ref().unwrap()["runId"]
@@ -633,6 +2506,9 @@ fn cli_attached_tasks_inherit_the_exact_selected_mcp_tool() {
                 None,
             )
             .await;
+            // Creation only persists the run; await its admitted child before
+            // checking the recording session's provider dispatch.
+            wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
             let child_turn_id = child_binding.turn_id.as_str();
             let child_bindings = processor
                 .crud_store
@@ -675,13 +2551,91 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 .list_turn_mcp_bindings(&turn_id)
                 .await
                 .unwrap();
-            for definition in crate::turn_mcp::native_tools::NativeToolFamily::Tasks.definitions() {
+            for definition in crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                .definitions()
+                .into_iter()
+                .chain(crate::message::thread_read_tools::thread_read_tool_specs())
+                .chain(crate::message::thread_search_tools::thread_search_tool_specs())
+                .chain(crate::message::thread_tool_results::thread_result_tool_specs())
+            {
                 assert!(
                     bindings
                         .iter()
                         .any(|binding| binding.raw_tool_name == definition.spec.name)
                 );
             }
+            for name in [
+                "threads_identity_models_list",
+                "thread_message_send",
+                "thread_create",
+                "threads_turn_start",
+            ] {
+                assert!(
+                    bindings.iter().any(|binding| binding.raw_tool_name == name),
+                    "authorized thread operation must reach the ordinary CLI catalog: {name}"
+                );
+            }
+            // The fixed CLI binding must reach the shared observation handlers,
+            // rather than only publishing a schema with no native dispatcher.
+            let listed = invoke_task(
+                &processor,
+                &turn_id,
+                "read-list",
+                "threads_list",
+                json!({"limit":100}),
+            )
+            .await
+            .unwrap();
+            assert!(!listed.is_error, "{kind:?}: {listed:?}");
+            let thread_id = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(&turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .thread_id;
+            assert!(
+                listed.structured_content.as_ref().unwrap()["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["threadId"] == thread_id)
+            );
+            let history = invoke_task(
+                &processor,
+                &turn_id,
+                "read-history",
+                "threads_history_read",
+                json!({"threadId":thread_id,"limit":2}),
+            )
+            .await
+            .unwrap();
+            assert!(!history.is_error, "{kind:?}: {history:?}");
+            assert!(history.structured_content.as_ref().unwrap()["events"].is_array());
+            // Anchor schema and dispatch travel through the same frozen family
+            // for every provider, rather than a provider-specific history path.
+            let near = invoke_task(
+                &processor,
+                &turn_id,
+                "read-history-anchor",
+                "threads_history_read",
+                json!({"threadId":thread_id,"limit":1,"anchor":{"turnId":turn_id}}),
+            )
+            .await
+            .unwrap();
+            assert!(!near.is_error, "{kind:?}: {near:?}");
+            let near = near.structured_content.as_ref().unwrap();
+            assert_eq!(near["events"][0]["turnId"], turn_id);
+            assert_eq!(near["direction"], "older");
+            let newer = invoke_task(
+                &processor, &turn_id, "read-history-newer", "threads_history_read",
+                json!({"threadId":thread_id,"limit":1,"direction":"newer","cursor":near["reverseCursor"]}),
+            ).await.unwrap();
+            assert!(!newer.is_error, "{kind:?}: {newer:?}");
+            assert_eq!(
+                newer.structured_content.as_ref().unwrap()["direction"],
+                "newer"
+            );
             let skills = processor
                 .crud_store
                 .find_turn_skill_bindings(&turn_id)
@@ -689,10 +2643,10 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 .unwrap();
             assert_eq!(
                 skills.len(),
-                2,
-                "orchestration skills are automatic even without user attachments"
+                4,
+                "system skills are automatic even without user attachments"
             );
-            for slug in ["tasks", "subagents"] {
+            for slug in ["tasks", "subagents", "html", "threads"] {
                 assert!(
                     skills
                         .iter()
@@ -792,6 +2746,222 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                     .len(),
                 1
             );
+            // Invocations recreate facade handlers: receipt replay must survive
+            // loss of the first response, rather than depend on an in-memory cache.
+            let before = processor
+                .crud_store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let run_args = json!({"taskId":task_id,"idempotencyKey":"extra-check"});
+            let first_run = invoke_task(
+                &processor,
+                &turn_id,
+                "run-now-a",
+                "task_run_now",
+                run_args.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(!first_run.is_error, "{first_run:?}");
+            let run_id = first_run.structured_content.as_ref().unwrap()["runId"].clone();
+            drop(first_run);
+            let repeated = invoke_task(&processor, &turn_id, "run-now-b", "task_run_now", run_args)
+                .await
+                .unwrap();
+            assert!(!repeated.is_error, "{repeated:?}");
+            assert_eq!(
+                repeated.structured_content.as_ref().unwrap()["runId"],
+                run_id
+            );
+            let after = processor
+                .crud_store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.triggers, before.triggers);
+            assert_eq!(after.runs.len(), before.runs.len() + 1);
+            let run = after
+                .runs
+                .iter()
+                .find(|run| run.id == run_id.as_str().unwrap())
+                .unwrap();
+            assert!(run.trigger_id.is_none());
+            assert!(
+                processor
+                    .crud_store
+                    .get_task_occurrence_contract_by_run(&run.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let denied = invoke_task(
+                &processor,
+                &turn_id,
+                "foreign-run-now",
+                "task_run_now",
+                json!({"taskId":"123456789012345678901"}),
+            )
+            .await
+            .unwrap();
+            assert!(denied.is_error);
+            // The interval adapter shares the same queue contract, including
+            // independent scheduled/manual occurrence identities.
+            let mut interval_args = args.clone();
+            interval_args["idempotencyKey"] = json!("interval-monitor");
+            interval_args["trigger"] = json!({"kind":"interval", "intervalSeconds":1800, "intervalAnchorAt":4000000000_i64});
+            let interval = invoke_task(
+                &processor,
+                &turn_id,
+                "interval-create",
+                "task_create",
+                interval_args,
+            )
+            .await
+            .unwrap();
+            assert!(!interval.is_error, "{interval:?}");
+            let interval_id = interval.structured_content.as_ref().unwrap()["taskId"]
+                .as_str()
+                .unwrap();
+            let interval_before = processor
+                .crud_store
+                .get_task(interval_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let extra = invoke_task(
+                &processor,
+                &turn_id,
+                "interval-extra",
+                "task_run_now",
+                json!({"taskId":interval_id}),
+            )
+            .await
+            .unwrap();
+            assert!(!extra.is_error, "{extra:?}");
+            let interval_after = processor
+                .crud_store
+                .get_task(interval_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(interval_after.triggers, interval_before.triggers);
+            assert_eq!(interval_after.runs.len(), 1);
+            // Each refusal owns a fresh task. In particular blocked/finish
+            // cannot pass merely because an earlier pause already rejects runs.
+            for restriction in ["paused", "blocked", "finished"] {
+                let mut restricted_args = args.clone();
+                restricted_args["idempotencyKey"] = json!(format!("restriction-{restriction}"));
+                let restricted = invoke_task(
+                    &processor,
+                    &turn_id,
+                    &format!("create-{restriction}"),
+                    "task_create",
+                    restricted_args,
+                )
+                .await
+                .unwrap();
+                assert!(!restricted.is_error, "{restricted:?}");
+                let restricted_id = restricted.structured_content.as_ref().unwrap()["taskId"]
+                    .as_str()
+                    .unwrap();
+                let before = processor
+                    .crud_store
+                    .get_task(restricted_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(before.triggers[0].status, TaskTriggerStatus::Active);
+                assert!(!before.task.status.is_terminal());
+                assert!(before.task.finish_request().is_none());
+                assert!(before.runs.is_empty());
+                if restriction == "paused" {
+                    let result = invoke_task(
+                        &processor,
+                        &turn_id,
+                        "apply-paused",
+                        "task_pause",
+                        json!({"taskId":restricted_id}),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!result.is_error, "{result:?}");
+                } else {
+                    // Seed each task-state guard with the existing event fixture.
+                    // Full block/finish transitions also stop triggers (and finish
+                    // may terminalize the task), masking the guard under test.
+                    let mut task = before.task.clone();
+                    if restriction == "blocked" {
+                        task.status = TaskStatus::Blocked;
+                    } else {
+                        task.metadata
+                            .get_or_insert_with(Default::default)
+                            .finish_request = Some(pioneer_protocol::TaskFinishRequest {
+                            requested_at: chrono::Utc::now().timestamp(),
+                            reason: None,
+                            first_run_number: 1,
+                        });
+                    }
+                    processor
+                        .crud_store
+                        .append_task_events(
+                            vec![pioneer_protocol::TaskEventPayload::TaskUpdated {
+                                task,
+                                trigger: None,
+                                agent_spec: None,
+                                changed_fields: vec![restriction.to_owned()],
+                                updated_at: chrono::Utc::now().timestamp(),
+                            }],
+                            chrono::Utc::now().timestamp(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let restricted_state = processor
+                    .crud_store
+                    .get_task(restricted_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if restriction == "blocked" {
+                    assert_eq!(restricted_state.task.status, TaskStatus::Blocked);
+                    assert_eq!(
+                        restricted_state.triggers[0].status,
+                        TaskTriggerStatus::Active
+                    );
+                    assert!(restricted_state.task.finish_request().is_none());
+                }
+                if restriction == "finished" {
+                    assert!(!restricted_state.task.status.is_terminal());
+                    assert_eq!(
+                        restricted_state.triggers[0].status,
+                        TaskTriggerStatus::Active
+                    );
+                    assert!(restricted_state.task.finish_request().is_some());
+                }
+                let refused = invoke_task(
+                    &processor,
+                    &turn_id,
+                    &format!("refuse-{restriction}"),
+                    "task_run_now",
+                    json!({"taskId":restricted_id}),
+                )
+                .await
+                .unwrap();
+                assert!(refused.is_error, "{restriction}: {refused:?}");
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(restricted_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .runs,
+                    before.runs
+                );
+            }
             let options = invoke_task(
                 &processor,
                 &turn_id,
@@ -860,6 +3030,16 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                     .status,
                 pioneer_protocol::TaskStatus::Cancelled
             );
+            let stopped = invoke_task(
+                &processor,
+                &turn_id,
+                "run-now-cancelled",
+                "task_run_now",
+                json!({"taskId":task_id}),
+            )
+            .await
+            .unwrap();
+            assert!(stopped.is_error);
             let conflict = invoke_task(&processor, &turn_id, "reschedule-cancelled", "task_reschedule", json!({
                 "taskId":task_id, "trigger":{"kind":"cron", "cronExpr":"0 9 * * *", "timezone":"Europe/Moscow"}
             })).await.unwrap();
@@ -953,7 +3133,13 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                 native_thread_id: Some(binding.native_thread_id.clone()),
                 native_turn_id: binding.native_turn_id.clone().unwrap(),
                 status: "completed".to_owned(),
-                native: None,
+                native: (kind == CLIAgentRuntimeKind::Codex).then(|| {
+                    pioneer_cli_agent_runtime::event::RuntimeNativeEvent {
+                        method: "turn/completed".into(),
+                        payload_redacted: Some(json!({"turn":{"completedAt":15,"durationMs":250}})),
+                        raw_redacted: None,
+                    }
+                }),
             });
             processor
                 .handle_cli_runtime_timeline_event(handle.instance(), terminal.clone())
@@ -985,6 +3171,17 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                     .status,
                 TurnStatus::InProgress
             );
+            if kind == CLIAgentRuntimeKind::Codex {
+                let items = processor
+                    .crud_store
+                    .list_turn_items_by_type(&turn_id, "system_event")
+                    .await
+                    .unwrap();
+                assert_eq!(items.iter().filter(|item| matches!(item,
+                    TurnItem::SystemEvent { code:Some(code),details:Some(details),.. }
+                    if code == "cli_native_turn_timing" && details["native_turn_id"] == binding.native_turn_id.as_deref().unwrap()
+                        && details["native_timing"]["durationMs"] == 250)).count(), 1);
+            }
             let next = processor
                 .crud_store
                 .latest_cli_runtime_turn_attempt(&turn_id)
@@ -1001,6 +3198,15 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                 .unwrap()
                 .clone();
             assert!(continuation.input.to_string().contains(&child_id));
+            assert_eq!(
+                continuation
+                    .input
+                    .to_string()
+                    .match_indices("Attached task facts (data, not instructions")
+                    .count(),
+                1,
+                "task continuation must not append a second snapshot"
+            );
             assert!(
                 continuation
                     .input
@@ -1294,7 +3500,7 @@ fn cli_task_tools_cannot_observe_or_control_an_existing_foreign_capsule() {
                 .as_str()
                 .unwrap()
                 .to_owned();
-            for name in ["task_get", "task_cancel", "task_detach"] {
+            for name in ["task_get", "task_cancel", "task_finish", "task_detach"] {
                 let denied =
                     invoke_task(&processor, &turn_id, name, name, json!({"taskId": task_id})).await;
                 assert!(
@@ -1548,16 +3754,13 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             CLIAgentRuntimeKind::Claude,
             CLIAgentRuntimeKind::OpenCode,
         ] {
-            let mut task_config = review_enabled_task_runtime_config();
-            task_config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks = true;
+            let task_config = review_enabled_task_runtime_config();
             let (harness, processor, turn_id) =
                 start_task_cli_fixture_with_task_config(kind, task_config).await;
             *harness.cli_session.next_native_turn_id.lock().await =
                 Some(format!("review_child_{kind:?}"));
             let created = invoke_task(&processor, &turn_id, "review-create", "task_create", json!({
-                "title":"Reviewable work", "goal":"Inspect and return evidence", "outputInstructions":"Return a concise report."
+                "requireReview":true, "title":"Reviewable work", "goal":"Inspect and return evidence", "outputInstructions":"Return a concise report."
             })).await.unwrap();
             assert!(!created.is_error, "{created:?}");
             let created = created.structured_content.unwrap();
@@ -1620,6 +3823,28 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             .await
             .unwrap();
             assert!(!review.is_error, "{review:?}");
+            let pending = processor
+                .crud_store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let candidate = pending
+                .result_candidates
+                .iter()
+                .find(|c| c.status == pioneer_protocol::TaskResultCandidateStatus::PendingReview)
+                .unwrap();
+            assert_eq!(
+                processor
+                    .task_runtime
+                    .service()
+                    .auto_accept_expired_review_candidates(candidate.created_at + 3600, 64)
+                    .await
+                    .unwrap(),
+                0,
+                "explicit attached review must survive the legacy timeout"
+            );
+
             let early_detach = invoke_task(
                 &processor,
                 &turn_id,
@@ -1678,6 +3903,19 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
                 .unwrap()
                 .to_owned();
             assert_ne!(candidate, revised_candidate);
+            let stale = invoke_task(
+                &processor,
+                &turn_id,
+                "accept-stale-candidate",
+                "task_accept",
+                json!({"taskId":task_id,"runId":run_id,"candidateId":candidate}),
+            )
+            .await
+            .unwrap();
+            assert!(
+                stale.is_error,
+                "an old round cannot authorize the revised candidate"
+            );
             let accepted = invoke_task(
                 &processor,
                 &turn_id,
@@ -1706,7 +3944,7 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
                 &turn_id,
                 "detach-create",
                 "task_create",
-                json!({"title":"Continue separately","goal":"Inspect another part of the project"}),
+                json!({"requireReview": false, "title":"Continue separately","goal":"Inspect another part of the project"}),
             )
             .await
             .unwrap();
@@ -1735,6 +3973,13 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
                 current.task.lifecycle_policy.unwrap().attachment,
                 pioneer_protocol::TaskAttachmentMode::Detached
             );
+            assert!(
+                current.agent_specs.iter().all(|spec| spec
+                    .review_policy
+                    .as_ref()
+                    .is_none_or(|policy| !policy.is_enabled())),
+                "explicit false must preserve automatic completion"
+            );
             let cancelled = invoke_task(
                 &processor,
                 &turn_id,
@@ -1745,6 +3990,3597 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             .await
             .unwrap();
             assert!(!cancelled.is_error);
+        }
+    });
+}
+
+#[test]
+fn cli_task_finish_round_trip_uses_the_existing_capsule_and_persisted_state() {
+    run_standard_stack_message_test("CLI task finish facade", async {
+        let (harness, processor, turn_id) =
+            start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let created = invoke_task(
+            &processor,
+            &turn_id,
+            "finish-create",
+            "task_create",
+            json!({
+                "title": "Monitor until stopped", "goal": "Check for changes",
+                "instructions": ["Inspect and report changes."],
+                "outputInstructions": "Return findings.",
+                "trigger": {"kind": "cron", "cronExpr": "0 7 * * *", "timezone": "UTC"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!created.is_error, "{created:?}");
+        let task_id = created.structured_content.unwrap()["taskId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let finished = invoke_task(
+            &processor,
+            &turn_id,
+            "finish-stop",
+            "task_finish",
+            json!({"taskId": task_id, "reason": "User requested a permanent stop"}),
+        )
+        .await
+        .unwrap();
+        assert!(!finished.is_error, "{finished:?}");
+        let output = finished.structured_content.unwrap();
+        assert_eq!(output["alreadyFinished"], false);
+        assert_eq!(output["task"]["status"], "completed");
+        assert_eq!(
+            output["task"]["finishRequest"]["reason"],
+            "User requested a permanent stop"
+        );
+        let stored = harness
+            .crud_store
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.task.status, TaskStatus::Completed);
+        assert!(
+            stored.runs.is_empty(),
+            "finish must not synthesize an agent run"
+        );
+        let recovered_receipt = invoke_task(
+            &processor,
+            &turn_id,
+            "finish-stop",
+            "task_finish",
+            json!({"taskId": task_id, "reason": "User requested a permanent stop"}),
+        )
+        .await
+        .unwrap();
+        assert!(!recovered_receipt.is_error, "{recovered_receipt:?}");
+        let recovered_receipt = recovered_receipt.structured_content.unwrap();
+        assert_eq!(recovered_receipt["alreadyCommitted"], true);
+        assert_eq!(recovered_receipt["alreadyFinished"], true);
+        assert_eq!(recovered_receipt["task"]["id"], task_id);
+        assert_eq!(recovered_receipt["task"]["status"], "completed");
+        assert_eq!(
+            harness
+                .crud_store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .task
+                .revision,
+            stored.task.revision,
+            "durable receipt replay must only read the stopped task"
+        );
+        let repeated = invoke_task(
+            &processor,
+            &turn_id,
+            "finish-repeat",
+            "task_finish",
+            json!({"taskId": task_id}),
+        )
+        .await
+        .unwrap();
+        assert!(!repeated.is_error, "{repeated:?}");
+        assert_eq!(
+            repeated.structured_content.unwrap()["alreadyFinished"],
+            true
+        );
+        let read = invoke_task(
+            &processor,
+            &turn_id,
+            "finish-read",
+            "task_get",
+            json!({"taskId": task_id}),
+        )
+        .await
+        .unwrap();
+        assert!(!read.is_error, "{read:?}");
+        assert_eq!(
+            read.structured_content.unwrap()["task"]["finishRequest"]["reason"],
+            "User requested a permanent stop"
+        );
+    });
+}
+
+#[test]
+fn cli_frozen_reader_catalog_does_not_gain_search_after_upgrade() {
+    run_standard_stack_message_test("CLI frozen search admission", async {
+        let (_harness, processor, turn_id) =
+            start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let bindings = processor
+            .crud_store
+            .list_turn_mcp_bindings(&turn_id)
+            .await
+            .unwrap();
+        // A newly selected threads catalog admits the registered search reader.
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.raw_tool_name == "threads_search")
+        );
+        // Reproduce an older persisted selection, which admitted the other
+        // readers but predates search. Current definitions must not widen it.
+        let previous_bindings = bindings
+            .into_iter()
+            .filter(|binding| binding.raw_tool_name != "threads_search")
+            .collect::<Vec<_>>();
+        assert!(
+            previous_bindings
+                .iter()
+                .any(|binding| binding.raw_tool_name == "threads_history_read")
+        );
+        processor
+            .crud_store
+            .replace_turn_mcp_bindings(&turn_id, &previous_bindings, 1_792_781_981)
+            .await
+            .unwrap();
+        let error = invoke_task(
+            &processor,
+            &turn_id,
+            "unbound-upgrade-search",
+            "threads_search",
+            json!({"query":"prior decision","limit":1}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::ToolUnbound
+        );
+        assert!(
+            !processor
+                .crud_store
+                .list_turn_mcp_bindings(&turn_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|binding| binding.raw_tool_name == "threads_search")
+        );
+    });
+}
+
+// Record both legacy and paginated retrieval at the existing backend boundary,
+// while retaining real indexes and source/authorization checks.
+struct RecordingRecallSearchBackend {
+    inner: pioneer_memory::SqliteThreadEpisodicBackend,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl pioneer_memory::ThreadEpisodicSearchBackend for RecordingRecallSearchBackend {
+    async fn validate_document(
+        &self,
+        request: pioneer_memory::ThreadEpisodicIndexDocument,
+    ) -> Result<
+        pioneer_memory::ThreadEpisodicValidationResult,
+        pioneer_memory::ThreadEpisodicSearchError,
+    > {
+        self.inner.validate_document(request).await
+    }
+
+    async fn search(
+        &self,
+        request: pioneer_memory::ThreadEpisodicSearchRequest,
+    ) -> Result<pioneer_memory::ThreadEpisodicSearchOutput, pioneer_memory::ThreadEpisodicSearchError>
+    {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.search(request).await
+    }
+
+    async fn search_page(
+        &self,
+        request: pioneer_memory::ThreadEpisodicSearchRequest,
+        page_size: usize,
+        cursor: Option<String>,
+        embedding: Option<pioneer_memory::ThreadEpisodicIndexEmbedding>,
+    ) -> Result<pioneer_memory::ThreadEpisodicSearchPage, pioneer_memory::ThreadEpisodicSearchError>
+    {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .search_page(request, page_size, cursor, embedding)
+            .await
+    }
+}
+
+#[test]
+fn admitted_cli_prompt_context_does_not_recall_and_keeps_explicit_history_search() {
+    run_standard_stack_message_test("no automatic recall and explicit history search", async {
+        use crate::thread_episodic::ThreadEpisodicRecallService;
+        use pioneer_hooks::*;
+        let (_harness, processor, turn_id) =
+            start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let backend = Arc::new(RecordingRecallSearchBackend {
+            inner: pioneer_memory::SqliteThreadEpisodicBackend::new(processor.crud_store.clone()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut configured = processor.as_ref().clone();
+        configured.thread_episodic_recall_service = Arc::new(
+            ThreadEpisodicRecallService::with_embedding_provider_resolver(
+                configured.crud_store.clone(),
+                backend.clone(),
+                None,
+            ),
+        );
+        configured.memory_runtime = Arc::new(GatewayMemoryRuntime::enabled_with_backend_for_test(
+            configured.crud_store.clone(),
+            Arc::new(pioneer_memory::InMemoryMemoryBackend::default()),
+        ));
+        let processor = Arc::new(configured);
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(&turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let other = "indexed-recall-other-conversation";
+        processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,'Other indexed conversation','',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
+            [other.into(),binding.thread_id.clone().into()])).await.unwrap();
+        let capsule = binding.workspace_id.clone();
+        crate::message::thread_search_tools::tests::seed(
+            &processor,
+            &capsule,
+            other,
+            "hook-other-source",
+            "searchneedle remembered in the other conversation",
+        )
+        .await;
+        let context = pioneer_agent::TurnToolContext {
+            workspace_id: binding.workspace_id.clone(),
+            thread_id: binding.thread_id.clone(),
+            turn_id: turn_id.clone(),
+        };
+        let tool = processor
+            .search_threads_page(
+                &context,
+                pioneer_protocol::ThreadsSearchParams {
+                    query: "searchneedle".into(),
+                    limit: 10,
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tool["threads"][0]["threadId"], other,
+            "positive control: admitted execution can read the other source"
+        );
+        assert!(backend.calls.load(Ordering::SeqCst) > 0);
+        let search_calls = backend.calls.load(Ordering::SeqCst);
+        let mut config = processor
+            .thread_episodic_runtime_config
+            .read()
+            .unwrap()
+            .clone();
+        config.enabled = true;
+        config.indexing_enabled = true;
+        config.recall_enabled = true;
+        processor.apply_thread_episodic_runtime_config(config).await;
+        let mut policy = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("recall", "allow"),
+            ("prompt", "full"),
+            ("read_tools", "allow"),
+            ("remember_tool", "allow"),
+            ("forget_tool", "allow"),
+            ("post_turn_extraction", "allow"),
+            ("active_memory", "allow"),
+            ("reason_code", "default_allow_read"),
+            ("source", "default_fallback"),
+        ] {
+            policy.insert(
+                HookMetadataKey::new(key).unwrap(),
+                HookValue::Text(value.into()),
+            );
+        }
+        policy.insert(
+            HookMetadataKey::new("explicit_remember").unwrap(),
+            HookValue::Bool(false),
+        );
+        policy.insert(
+            HookMetadataKey::new("explicit_forget").unwrap(),
+            HookValue::Bool(false),
+        );
+        policy.insert(
+            HookMetadataKey::new("confidence").unwrap(),
+            HookValue::F64(1.0),
+        );
+        let policies = HookPolicySet::merge_contributions([PolicyContribution {
+            domain: HookDomain::new("memory").unwrap(),
+            key: HookPolicyKey::new("turn_policy").unwrap(),
+            value: HookValue::Object(policy),
+            priority: 500,
+            diagnostics: Vec::new(),
+        }]);
+        let decoded_policy =
+            pioneer_memory::hooks::memory_turn_policy_from_hook_policy_set(&policies)
+                .expect("memory policy must exist")
+                .expect("the allow policy must decode before testing absence of recall");
+        assert_eq!(
+            decoded_policy.source,
+            pioneer_memory::hooks::MemoryPolicySource::DefaultFallback
+        );
+        assert_eq!(
+            decoded_policy.read_tools,
+            pioneer_memory::hooks::MemoryReadToolPolicy::Allow
+        );
+        assert_eq!(
+            decoded_policy.recall,
+            pioneer_memory::hooks::MemoryRecallPolicy::Allow
+        );
+        assert_eq!(
+            decoded_policy.prompt,
+            pioneer_memory::hooks::MemoryPromptPolicy::Full
+        );
+        let hook_context = HookContext {
+            workspace_id: Some(HookWorkspaceId::new(binding.workspace_id.clone()).unwrap()),
+            thread_id: Some(HookThreadId::new(binding.thread_id.clone()).unwrap()),
+            turn_id: Some(HookTurnId::new(turn_id.clone()).unwrap()),
+            ..HookContext::default()
+        };
+        // Include the current conversation in the indexed corpus as well.
+        crate::message::thread_search_tools::tests::seed(
+            &processor,
+            &capsule,
+            &binding.thread_id,
+            "runner-own-source",
+            "searchneedle own runner context",
+        )
+        .await;
+        for state in ["empty", "saved", "read_error"] {
+            if state == "saved" {
+                let runtime = processor.memory_runtime();
+                for (key, content) in [
+                    (
+                        "recall-deterministic",
+                        "The Searchneedle project uses cobalt storage for audit logs.",
+                    ),
+                    (
+                        "recall-project",
+                        "Use amber ledger storage for this project",
+                    ),
+                ] {
+                    runtime
+                        .service()
+                        .remember(
+                            runtime.operation_context(Some(binding.workspace_id.clone()), None),
+                            memory_remember_params(
+                                MemoryScope {
+                                    kind: MemoryScopeKind::Workspace,
+                                    key: binding.workspace_id.clone(),
+                                },
+                                MemoryCategory::ProjectFact,
+                                Some(key),
+                                content,
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let current = if state == "read_error" {
+                // Reuse the failing backend to exercise actual service errors,
+                // with control-plane rows still present from the saved case.
+                let mut failing = processor.as_ref().clone();
+                failing.memory_runtime =
+                    Arc::new(GatewayMemoryRuntime::enabled_with_backend_for_test(
+                        failing.crud_store.clone(),
+                        Arc::new(pioneer_memory::NoopMemoryBackend),
+                    ));
+                Arc::new(failing)
+            } else {
+                processor.clone()
+            };
+            current.bind_memory_bridge_if_enabled().await;
+            for reinstall in [false, true] {
+                if reinstall {
+                    let mut config = current
+                        .thread_episodic_runtime_config
+                        .read()
+                        .unwrap()
+                        .clone();
+                    config.enabled = true;
+                    config.indexing_enabled = true;
+                    config.recall_enabled = true;
+                    current.apply_thread_episodic_runtime_config(config).await;
+                    current.reinstall_memory_hook_runtime_if_bound().await;
+                    current.ensure_hook_runtime_with_run_store().await;
+                }
+                let runtime = current.hook_runtime.read().await.clone().unwrap();
+                let response = runtime
+                    .run_phase_to_completion(
+                        HookPhaseRequest::new(
+                            HookPhase::TurnPrePromptContext,
+                            hook_context.clone(),
+                            HookInput::turn_pre_prompt_context(
+                                TurnPrePromptContextHookInput::from_parts(
+                                    "searchneedle",
+                                    Some("test-model"),
+                                    Some("openai"),
+                                ),
+                            ),
+                        )
+                        .with_policy_set(policies.clone()),
+                    )
+                    .await
+                    .unwrap();
+                let rendered = serde_json::to_string(&response.contributions).unwrap();
+                for absent in [
+                    "cobalt storage for audit logs",
+                    "amber ledger storage",
+                    "remembered in the other conversation",
+                    "own runner context",
+                ] {
+                    assert!(!rendered.contains(absent), "{state}: {response:?}");
+                }
+                assert_eq!(
+                    backend.calls.load(Ordering::SeqCst),
+                    search_calls,
+                    "prompt preparation must not search history: {state}, reinstall={reinstall}"
+                );
+            }
+        }
+        let tool = invoke_task(
+            &processor,
+            &turn_id,
+            "explicit-history-after-recall",
+            "threads_search",
+            json!({"query":"searchneedle", "limit":10}),
+        )
+        .await
+        .unwrap();
+        assert!(!tool.is_error, "{tool:?}");
+        assert_eq!(
+            tool.structured_content.unwrap()["threads"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // The frozen CLI handlers retain the original fixture processor. Also
+        // exercise the configured processor to validate the recording backend.
+        let page = processor
+            .search_threads_page(
+                &context,
+                pioneer_protocol::ThreadsSearchParams {
+                    query: "searchneedle".into(),
+                    limit: 10,
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["threads"].as_array().unwrap().len(), 2);
+        assert!(backend.calls.load(Ordering::SeqCst) > search_calls);
+        // Materialize a real restricted Agent policy intersected with the
+        // admitted root adapter. The initiating user's workspace ACL stays
+        // broad; this binding omits workspace observation by role policy.
+        let parent_binding = processor.agent_action_binding(&turn_id).await.unwrap();
+        let parent_adapter = parent_binding.adapter.lock().await;
+        let facts = parent_adapter.persistence_facts();
+        let (restricted, options, capabilities) =
+            crate::authorization::materialize_selected_task_agent_action_binding(
+                pioneer_protocol::AgentExecutionId::new("Esearchrunner12345678").unwrap(),
+                &facts.home_root_thread_id,
+                facts.root_execution_id.clone(),
+                "search-runner",
+                facts.identity.clone(),
+                facts.profile.clone(),
+                1,
+                1,
+                1,
+                "agent_runner",
+                facts.agent_authorization_policy_generation,
+                &parent_adapter,
+            )
+            .unwrap();
+        let restricted_facts = restricted.persistence_facts();
+        assert!(
+            restricted_facts
+                .agent_authorization_allowed_actions
+                .iter()
+                .any(|a| a == crate::authorization::ResourceAction::ThreadRead.safe_name())
+        );
+        assert!(
+            !restricted_facts
+                .agent_authorization_allowed_actions
+                .iter()
+                .any(|a| a
+                    == crate::authorization::ResourceAction::ThreadObserveWorkspace.safe_name())
+        );
+        drop(parent_adapter);
+        processor
+            .register_agent_action_binding(
+                turn_id.clone(),
+                crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                    restricted,
+                    options,
+                    capabilities,
+                ),
+            )
+            .await;
+        let limited = processor
+            .search_threads_page(
+                &context,
+                pioneer_protocol::ThreadsSearchParams {
+                    query: "searchneedle".into(),
+                    limit: 10,
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited["threads"].as_array().unwrap().len(), 1);
+        assert_eq!(limited["threads"][0]["threadId"], binding.thread_id);
+        assert_eq!(
+            limited["threads"][0]["fragments"][0]["source"]["itemId"],
+            "runner-own-source"
+        );
+        assert!(!limited.to_string().contains("hook-other-source"));
+    });
+}
+
+#[test]
+fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() {
+    run_standard_stack_message_test("search byte boundary continuation", async {
+        let (_harness, processor, turn_id) =
+            start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(&turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let capsule = binding.workspace_id.clone();
+        let mut titles = ["A".to_owned(), "B".to_owned(), "C".to_owned()];
+        // Give the three sources distinct lexical relevance. Equal documents
+        // are ordered by generated occurrence IDs, not by their thread names.
+        for (n, (thread, text)) in [
+            (
+                "byte-boundary-a",
+                "boundaryneedle boundaryneedle boundaryneedle saved decision",
+            ),
+            (
+                "byte-boundary-b",
+                "boundaryneedle boundaryneedle ordinary saved decision",
+            ),
+            (
+                "byte-boundary-c",
+                "boundaryneedle ordinary ordinary saved decision",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
+                "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,?,'',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
+                [thread.into(),titles[n].clone().into(),binding.thread_id.clone().into()])).await.unwrap();
+            crate::message::thread_search_tools::tests::seed(
+                &processor,
+                &capsule,
+                thread,
+                &format!("byte-source-{n}"),
+                text,
+            )
+            .await;
+        }
+        let context = pioneer_agent::TurnToolContext {
+            workspace_id: binding.workspace_id.clone(),
+            thread_id: binding.thread_id.clone(),
+            turn_id,
+        };
+        let params = json!({"query":"boundaryneedle", "limit":2, "cursor":null});
+        // Calibrate with the actual CLI response: two cards plus a nextCursor.
+        // Enlarge the first title so those same two raw cards fit by one byte,
+        // but their ToolResultView wrapper would exceed the policy limit.
+        let calibration = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-calibration",
+            "threads_search",
+            params.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!calibration.is_error);
+        let mut raw = calibration.structured_content.unwrap();
+        for key in ["tool_outcome", "partial_output", "truncated"] {
+            raw.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(raw["threads"].as_array().unwrap().len(), 2);
+        assert_eq!(raw["threads"][0]["threadId"], "byte-boundary-a");
+        assert_eq!(raw["threads"][1]["threadId"], "byte-boundary-b");
+        assert!(raw["nextCursor"].is_string());
+        let limit = 2 * 1024 * 1024;
+        let overhead = serde_json::to_vec(&raw).unwrap().len() - titles[0].len();
+        titles[0] = "A".repeat(limit - 1 - overhead);
+        raw["threads"][0]["title"] = titles[0].clone().into();
+        assert_eq!(serde_json::to_vec(&raw).unwrap().len(), limit - 1);
+        assert!(
+            pioneer_tools::ToolResultView::Json {
+                value: raw,
+                truncated: false
+            }
+            .serialized_size_bytes()
+                > limit
+        );
+        processor
+            .crud_store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE thread SET name=? WHERE id=?",
+                [titles[0].clone().into(), "byte-boundary-a".into()],
+            ))
+            .await
+            .unwrap();
+
+        let first = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-first",
+            "threads_search",
+            params.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!first.is_error);
+        let first_text = first.content[0]["text"].as_str().unwrap();
+        assert!(first_text.len() <= limit);
+        let first = first.structured_content.unwrap();
+        assert!(serde_json::to_vec(&first).unwrap().len() <= limit);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(first_text).unwrap(),
+            first
+        );
+        assert!(first.get("preview").is_none());
+        assert_eq!(first["truncated"], false);
+        assert_eq!(first["threads"].as_array().unwrap().len(), 1);
+        assert_eq!(first["threads"][0]["threadId"], "byte-boundary-a");
+        assert_eq!(first["threads"][0]["title"], titles[0]);
+        assert_eq!(first["eof"], false);
+        let cursor = first["nextCursor"].as_str().unwrap().to_owned();
+        let mut next_params = params.clone();
+        next_params["cursor"] = cursor.clone().into();
+        let second = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-second",
+            "threads_search",
+            next_params.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!second.is_error);
+        let second = second.structured_content.unwrap();
+        assert!(serde_json::to_vec(&second).unwrap().len() <= limit);
+        assert!(second.get("preview").is_none());
+        assert_eq!(second["threads"].as_array().unwrap().len(), 2);
+        assert_eq!(second["threads"][0]["threadId"], "byte-boundary-b");
+        assert_eq!(second["threads"][0]["title"], titles[1]);
+        assert_eq!(second["threads"][1]["threadId"], "byte-boundary-c");
+        assert_eq!(second["threads"][1]["title"], titles[2]);
+        assert_eq!(second["eof"], true);
+        assert_eq!(second["nextCursor"], JsonValue::Null);
+        let mut wrong_query = next_params.clone();
+        wrong_query["query"] = "different query".into();
+        assert!(
+            invoke_task(
+                &processor,
+                &context.turn_id,
+                "search-wrong-query",
+                "threads_search",
+                wrong_query,
+            )
+            .await
+            .is_err()
+        );
+        // The fixture's current user is a Superuser. Narrow the execution
+        // through the real Agent role intersection instead of pretending a
+        // private-thread ACL can revoke that user's absolute access.
+        let parent_binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let parent_adapter = parent_binding.adapter.lock().await;
+        let facts = parent_adapter.persistence_facts();
+        let (restricted, options, capabilities) =
+            crate::authorization::materialize_selected_task_agent_action_binding(
+                pioneer_protocol::AgentExecutionId::new("Ebyteboundary12345678").unwrap(),
+                &facts.home_root_thread_id,
+                facts.root_execution_id.clone(),
+                "byte-boundary-runner",
+                facts.identity.clone(),
+                facts.profile.clone(),
+                1,
+                1,
+                1,
+                "agent_runner",
+                facts.agent_authorization_policy_generation,
+                &parent_adapter,
+            )
+            .unwrap();
+        drop(parent_adapter);
+        processor
+            .register_agent_action_binding(
+                context.turn_id.clone(),
+                crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                    restricted,
+                    options,
+                    capabilities,
+                ),
+            )
+            .await;
+        // Cursors are bound to the original authority. A narrower identity
+        // must restart the search rather than reuse the previous page token.
+        let stale_cursor = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-revoked-cursor",
+            "threads_search",
+            next_params,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            stale_cursor.code,
+            crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::InvalidRequest
+        );
+        let after_revocation = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-revoked",
+            "threads_search",
+            params,
+        )
+        .await
+        .unwrap();
+        assert!(!after_revocation.is_error);
+        let after_revocation = after_revocation.structured_content.unwrap();
+        assert!(after_revocation["threads"].as_array().unwrap().is_empty());
+        assert_eq!(after_revocation["eof"], true);
+        assert!(!after_revocation.to_string().contains("byte-boundary-b"));
+    });
+}
+
+// Permission-matrix fixture using real admission and the recording CLI runtime.
+// The primary positive facade test below uses process_request_for_connection.
+async fn start_threads_cli_fixture(
+    kind: CLIAgentRuntimeKind,
+    denied: &[&str],
+) -> (
+    CliRuntimeSkillPreflightHarness,
+    Arc<MessageProcessor>,
+    String,
+) {
+    let mut profile = default_test_permission_profile();
+    profile.effective_policy.denied_tools = denied.iter().map(|name| (*name).to_owned()).collect();
+    start_threads_cli_fixture_with_policy(kind, profile).await
+}
+
+async fn start_threads_cli_fixture_with_policy(
+    kind: CLIAgentRuntimeKind,
+    profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+) -> (
+    CliRuntimeSkillPreflightHarness,
+    Arc<MessageProcessor>,
+    String,
+) {
+    let harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+    *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
+    let thread = format!("cli_threads_{kind:?}").to_lowercase();
+    let turn = format!("cli_threads_turn_{kind:?}").to_lowercase();
+    seed_cli_runtime_skill_preflight_thread(&harness, &thread).await;
+    let processor = Arc::new(harness.processor.clone());
+    processor
+        .mark_cli_reasoning_model_ready_for_tests(
+            &harness.workspace_id,
+            &harness.runtime_id,
+            "threads-cli-choice",
+        )
+        .await
+        .unwrap();
+    processor.bind_agent_tool_bridges().await;
+    let request: JsonValue =
+        serde_json::from_str(&cli_runtime_turn_start_request_with_capabilities(
+            &generate_test_request_id("threads", &format!("{kind:?}")),
+            &thread,
+            &turn,
+            &harness.runtime_id,
+            kind,
+            vec![],
+        ))
+        .unwrap();
+    let params: pioneer_protocol::TurnStartParams =
+        serde_json::from_value(request["params"].clone()).unwrap();
+    let connection = processor
+        .session_manager
+        .connection_context(harness.connection_id)
+        .await
+        .unwrap();
+    use crate::authorization::{
+        ExecutionAdmissionEntryPoint, ExecutionAdmissionRequest, ExecutionAdmissionService,
+        ResourceAction,
+    };
+    let source = processor
+        .crud_store
+        .get_thread_model(&thread)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut params = params;
+    params.model = Some(source.model.clone());
+    params.model_provider = Some(cli_runtime_provider_key(&harness.runtime_id));
+    let admission = ExecutionAdmissionRequest::for_turn(
+        ExecutionAdmissionEntryPoint::CliRuntime,
+        ResourceAction::AgentTurnStart,
+        Vec::new(),
+        &harness.workspace_id,
+        &thread,
+        &format!("cli_runtime:{}", harness.runtime_id),
+        &source.model,
+        &params,
+        &[],
+        None,
+    )
+    .unwrap();
+    let context = ExecutionAdmissionService::new(processor.crud_store.as_ref().clone())
+        .admit_context(
+            connection.principal(),
+            processor
+                .authorization_invalidation_hub
+                .current_revision()
+                .await
+                .unwrap(),
+            &admission,
+            Some(&pioneer_protocol::task_permission_cap_from_snapshot(
+                &profile,
+            )),
+        )
+        .await
+        .unwrap();
+    let mut security = test_full_access_execution_security_snapshot();
+    security.backend.execution_backend = match kind {
+        CLIAgentRuntimeKind::Acp => pioneer_protocol::TurnSecurityExecutionBackendKind::Acp,
+        CLIAgentRuntimeKind::Codex => pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli,
+        CLIAgentRuntimeKind::Claude => {
+            pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
+        }
+        CLIAgentRuntimeKind::OpenCode => {
+            pioneer_protocol::TurnSecurityExecutionBackendKind::OpenCodeCli
+        }
+    };
+    security.permission_profile = profile.clone();
+    let revalidation = processor
+        .execution_leases
+        .revalidate_context(
+            processor.crud_store.as_ref(),
+            &context,
+            crate::authorization::ResourceAction::AgentTurnStart,
+            processor
+                .authorization_invalidation_hub
+                .current_revision()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    // Durable authority must use the committed-agent response and activation
+    // path; a fresh TurnStart response is rejected before native preparation.
+    let author = super::super::message_turn::resolve_turn_author_snapshot(
+        processor.crud_store.as_ref(),
+        &pioneer_protocol::PersistedActorRef::Principal(
+            connection.principal().principal_id.clone(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let outcome = processor
+        .thread_manager
+        .agent_turn_start_with_permission_profile(params.clone(), profile.clone(), author.clone())
+        .await
+        .unwrap();
+    let admission = context
+        .durable_turn_admission_after_revalidation(
+            &thread,
+            &turn,
+            params.execution_backend.as_ref(),
+            &revalidation,
+        )
+        .unwrap();
+    processor
+        .crud_store
+        .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+            &outcome.materialization.thread,
+            outcome.materialization.sandbox_mode,
+            &outcome.materialization.turn,
+            &outcome.materialization.input,
+            params
+                .reasoning
+                .as_ref()
+                .map(|reasoning| reasoning.effort.as_str()),
+            Default::default(),
+            author.actor.clone(),
+            processor
+                .turn_profile_selected_audit_event(&outcome)
+                .unwrap(),
+            &context.to_persisted_json().unwrap(),
+            None,
+            Some(admission),
+            Some(
+                crate::message::turn_handlers::new_turn_execution(
+                    processor.turn_execution_owner_id.as_ref(),
+                    params.execution_backend.as_ref(),
+                    &outcome.materialization,
+                )
+                .unwrap(),
+            ),
+            &security,
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // Threads-only catalogs do not include task_create, whose normal launch
+    // path persists this snapshot before binding the root Agent execution.
+    processor
+        .crud_store
+        .upsert_turn_runtime_snapshot(
+            crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+                &thread,
+                &harness.workspace_id,
+                &turn,
+                pioneer_protocol::ThreadMode::Agent,
+                &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                &source.model,
+                &cli_runtime_provider_key(&harness.runtime_id),
+                None,
+                &HashMap::new(),
+                &params.input,
+                &params.capabilities,
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("Threads fixture runtime snapshot should persist");
+    let response = crate::message::turn_handlers::TurnStartSuccessResponse::DurableAgent {
+        permission_profile: profile,
+        execution_security_snapshot: security,
+        continuation_thread_id: thread.clone(),
+        context_thread_id: thread.clone(),
+        agent_author: author,
+        admitted_outcome: Some(Box::new(outcome)),
+        completion: Arc::new(std::sync::Mutex::new(Some(sender))),
+    };
+    let (_, diagnostics) =
+        crate::public_error::test_support::capture_events_async(processor.turn_start_cli_runtime(
+            harness.connection_id,
+            serde_json::from_value(request["id"].clone()).unwrap(),
+            pioneer_protocol::PersistedActorRef::Principal(
+                connection.principal().principal_id.clone(),
+            ),
+            params,
+            harness.runtime_id.clone(),
+            kind,
+            crate::message::turn_handlers::TurnExecutionAuthority::Durable {
+                context,
+                revalidation: Arc::new(revalidation),
+            },
+            response,
+        ))
+        .await;
+    let prepared = receiver
+        .await
+        .expect("Threads fixture preparation should return a result")
+        .unwrap_or_else(|error| {
+            panic!("Threads fixture durable CLI preparation failed: {error:#}; diagnostics: {diagnostics:#?}")
+        });
+    processor
+        .activate_prepared_committed_agent_cli_runtime_turn(prepared)
+        .await
+        .expect("Threads fixture durable CLI activation should succeed");
+    wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+    wait_for_task_cli_activation(&processor, &turn).await;
+    (harness, processor, turn)
+}
+
+#[tokio::test]
+async fn early_public_stop_and_cli_initial_attempt_share_the_exact_writer_fence() {
+    for phase in [
+        "stop_first",
+        "cli_first",
+        "replacement_generation",
+        "same_owner_generation",
+    ] {
+        let kind = CLIAgentRuntimeKind::Codex;
+        let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+        *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
+        let thread = "cli_early_stop_race";
+        let turn = "cli_early_stop_race_turn";
+        seed_cli_runtime_skill_preflight_thread(&harness, thread).await;
+        let processor = Arc::new(harness.processor.clone());
+        processor.bind_agent_tool_bridges().await;
+        processor.arm_completed_history_preparation_barrier("__cli_before_initial_binding__");
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &generate_test_request_id("early-cli", "start"),
+            thread,
+            turn,
+            &harness.runtime_id,
+            kind,
+            vec![],
+        );
+        let start = tokio::spawn({
+            let processor = processor.clone();
+            let connection = harness.connection_id;
+            async move {
+                processor
+                    .process_request_for_connection(connection, &request)
+                    .await
+            }
+        });
+        timeout(
+            Duration::from_secs(10),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        let store = &harness.crud_store;
+        let owner = store.get_turn_execution(turn).await.unwrap().unwrap();
+        assert!(
+            store
+                .latest_cli_runtime_turn_attempt(turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .native_cancellation_context(turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let cancel_id = generate_test_request_id("early-cli", "cancel");
+        let cancel_request = json!({"jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
+            "params":{"thread_id":thread,"turn_id":turn}})
+        .to_string();
+        if phase == "stop_first" {
+            processor
+                .process_request_for_connection(harness.connection_id, &cancel_request)
+                .await;
+            let reply = recv_response_by_id(&mut harness.rx, &cancel_id).await;
+            let reply: TurnCancelResponse = serde_json::from_value(reply.result).unwrap();
+            assert_eq!(reply.turn.status, TurnStatus::Interrupted);
+            processor.release_completed_history_preparation_barrier();
+            timeout(Duration::from_secs(10), start)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .latest_cli_runtime_turn_attempt(turn)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            // Stop has observed no CLI attempt, but has not entered its writer.
+            let reached = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            *processor
+                .native_cancellation_materialization_barrier
+                .lock()
+                .await = Some((reached.clone(), release.clone()));
+            let stop = tokio::spawn({
+                let processor = processor.clone();
+                let connection = harness.connection_id;
+                async move {
+                    processor
+                        .process_request_for_connection(connection, &cancel_request)
+                        .await
+                }
+            });
+            timeout(Duration::from_secs(10), reached.notified())
+                .await
+                .unwrap();
+            processor.arm_completed_history_preparation_barrier("__cli_after_initial_binding__");
+            processor.release_completed_history_preparation_barrier();
+            timeout(
+                Duration::from_secs(10),
+                processor.wait_for_completed_history_preparation_barrier(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                store
+                    .latest_cli_runtime_turn_attempt(turn)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            if matches!(phase, "replacement_generation" | "same_owner_generation") {
+                let replacement = store
+                    .claim_expired_turn_execution(
+                        &owner,
+                        if phase == "same_owner_generation" {
+                            &owner.owner_id
+                        } else {
+                            "replacement-cli-owner"
+                        },
+                        owner.lease_until.timestamp() + 1,
+                        owner.lease_until.timestamp() + 100,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let before = store.get_turn(thread, turn).await.unwrap().unwrap();
+                release.notify_one();
+                timeout(Duration::from_secs(10), stop)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                recv_error_by_id(&mut harness.rx, &cancel_id).await;
+                assert!(!store.native_turn_has_accepted_terminal(turn).await.unwrap());
+                assert_eq!(store.get_turn(thread, turn).await.unwrap().unwrap(), before);
+                assert_eq!(
+                    store.get_turn_execution(turn).await.unwrap().unwrap(),
+                    replacement
+                );
+                // The stale launch is held at the real preparation boundary.
+                start.abort();
+                let _ = start.await;
+                processor.release_completed_history_preparation_barrier();
+                assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+                continue;
+            }
+            // Keep activation's gate owned until Stop loses its early writer.
+            processor
+                .arm_completed_history_preparation_barrier("__early_stop_cli_after_phase_change__");
+            release.notify_one();
+            timeout(
+                Duration::from_secs(10),
+                processor.wait_for_completed_history_preparation_barrier(),
+            )
+            .await
+            .unwrap();
+            processor.release_completed_history_preparation_barrier();
+            processor.release_completed_history_preparation_barrier();
+            timeout(Duration::from_secs(10), start)
+                .await
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(10), stop)
+                .await
+                .unwrap()
+                .unwrap();
+            let reply = recv_response_by_id(&mut harness.rx, &cancel_id).await;
+            let reply: TurnCancelResponse = serde_json::from_value(reply.result).unwrap();
+            assert_eq!(reply.turn.status, TurnStatus::Interrupted);
+            let binding = store
+                .get_cli_runtime_turn_binding(turn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.status, "interrupted");
+            assert_eq!(
+                store
+                    .latest_cli_runtime_turn_attempt(turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted
+            );
+            assert!(!harness.cli_session.interrupts.lock().await.is_empty());
+        }
+        assert!(
+            store
+                .native_cancellation_context(turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let saved = store.get_turn(thread, turn).await.unwrap().unwrap().1;
+        assert_eq!(saved.status, TurnStatus::Interrupted);
+        assert_eq!(
+            processor
+                .thread_manager
+                .turn_get(thread, turn)
+                .await
+                .unwrap()
+                .1,
+            saved
+        );
+        let stopped = store.get_turn_execution(turn).await.unwrap().unwrap();
+        assert_eq!(stopped.owner_id, owner.owner_id);
+        assert_eq!(stopped.owner_generation, owner.owner_generation);
+        assert_eq!(
+            stopped.status,
+            pioneer_crud::TurnExecutionStatus::Interrupted
+        );
+        let db = store.database_connection();
+        let response = pioneer_crud::load_agent_turn_response(&db, turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let resource =
+            pioneer_crud::load_agent_execution_resource_state(&db, &response.execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(resource.status, "cancelled");
+        let permit =
+            pioneer_entity::agent_running_permit::Entity::find_by_id(resource.permit_id.unwrap())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(permit.status, "released");
+        assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+    }
+}
+
+struct ThreadsFacade {
+    facade: Arc<crate::cli_runtime::mcp::facade::CliMcpToolFacade>,
+    context: crate::cli_runtime::mcp::facade::CliMcpFacadeRequestContext,
+    native_items: Arc<crate::cli_runtime::mcp::native_correlation::NativeMcpCorrelationLedger>,
+    claude_items: Arc<crate::cli_runtime::claude_session::ClaudeNativeMcpCorrelationLedger>,
+    kind: CLIAgentRuntimeKind,
+    native_thread: String,
+    native_turn: String,
+}
+
+impl ThreadsFacade {
+    async fn new(processor: &MessageProcessor, turn: &str, kind: CLIAgentRuntimeKind) -> Self {
+        use crate::cli_runtime::mcp::{
+            coordinator::CliMcpCoordinator, facade::*, grants::*, native_correlation::*,
+        };
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let tools = processor
+            .crud_store
+            .list_turn_mcp_bindings(turn)
+            .await
+            .unwrap();
+        use crate::turn_mcp::native_tools::NativeToolFamily;
+        let definitions = [
+            NativeToolFamily::Html,
+            NativeToolFamily::ComputerUse,
+            NativeToolFamily::Tasks,
+            NativeToolFamily::Threads,
+        ]
+        .into_iter()
+        .flat_map(|family| {
+            let selected = &tools;
+            family
+                .definitions()
+                .into_iter()
+                .filter(move |spec| {
+                    selected.iter().any(|binding| {
+                        binding.server_installation_id == family.server_id()
+                            && binding.raw_tool_name == spec.spec.name
+                    })
+                })
+                .map(move |spec| (family, spec))
+        })
+        .collect();
+        let canonical =
+            crate::turn_mcp::ResolvedMcpTurnProjection::empty(&binding.workspace_id, turn)
+                .with_native_tools(definitions, crate::turn_mcp::McpProjectionLimits::default())
+                .unwrap();
+        let metadata = binding.mcp.as_ref().unwrap();
+        assert_eq!(canonical.manifest_hash, metadata.manifest_hash);
+        let limits =
+            crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(128);
+        let projection = match kind {
+            CLIAgentRuntimeKind::Acp => unreachable!("this harness tests native item correlation"),
+            CLIAgentRuntimeKind::Codex => {
+                crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection(
+                    canonical,
+                    metadata.provider_contract_fingerprint.clone(),
+                )
+                .unwrap()
+                .facade_projection(limits)
+                .unwrap()
+            }
+            CLIAgentRuntimeKind::Claude => {
+                crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection(
+                    canonical,
+                    metadata.provider_contract_fingerprint.clone(),
+                )
+                .unwrap()
+                .facade_projection(limits)
+                .unwrap()
+            }
+            CLIAgentRuntimeKind::OpenCode => {
+                crate::cli_runtime::opencode_mcp::build_opencode_mcp_session_launch_projection(
+                    canonical,
+                    metadata.provider_contract_fingerprint.clone(),
+                )
+                .unwrap()
+                .facade_projection(limits)
+                .unwrap()
+            }
+        };
+        let key = CLIAgentRuntimeSessionKey::new(
+            &binding.workspace_id,
+            &binding.runtime_id,
+            &binding.continuation_thread_id,
+        )
+        .unwrap();
+        let instance =
+            crate::cli_runtime::session_instance::CliSessionInstanceId::unmanaged_for_test(
+                key,
+                binding.mcp.as_ref().unwrap().session_generation as u64,
+            )
+            .unwrap();
+        let scope = CliMcpGrantScope::new(
+            instance,
+            CliMcpManifestHash::new(binding.mcp.as_ref().unwrap().manifest_hash.clone()).unwrap(),
+        );
+        let coordinator = Arc::new(CliMcpCoordinator::default());
+        let issued = coordinator
+            .issue_grant(
+                scope.clone(),
+                (pioneer_crud::utc_now().timestamp_millis() as u64) + 60_000,
+            )
+            .await
+            .unwrap();
+        let reservation = coordinator
+            .stage_projection(&issued.grant_ref(), projection.fingerprint().clone())
+            .await
+            .unwrap();
+        let bound = coordinator
+            .attach(
+                &pioneer_cli_mcp_bridge::AttachRequest {
+                    session_id: issued.bridge_session_id,
+                    generation: pioneer_cli_mcp_bridge::BridgeGeneration::new(
+                        scope.process_instance.generation(),
+                    )
+                    .unwrap(),
+                    nonce: issued.nonce,
+                },
+                &scope,
+                CliMcpConnectionId::for_test(1),
+            )
+            .await
+            .unwrap();
+        let native_items = Arc::new(NativeMcpCorrelationLedger::default());
+        let claude_items = Arc::new(
+            crate::cli_runtime::claude_session::ClaudeNativeMcpCorrelationLedger::default(),
+        );
+        let inner: Arc<dyn TurnMcpInvoker> = Arc::new(processor.mcp_service.turn_mcp_invoker());
+        let invoker: Arc<dyn TurnMcpInvoker> = match kind {
+            CLIAgentRuntimeKind::Claude => Arc::new(
+                crate::cli_runtime::claude_session::ClaudeCorrelatingTurnMcpInvoker {
+                    inner,
+                    native_items: claude_items.clone(),
+                    coordinator: coordinator.clone(),
+                    bound_grant: bound.clone(),
+                },
+            ),
+            _ => Arc::new(CorrelatingTurnMcpInvoker {
+                inner,
+                native_items: native_items.clone(),
+                opencode_binding: (kind == CLIAgentRuntimeKind::OpenCode)
+                    .then(|| (coordinator.clone(), bound.clone())),
+                codex_binding: (kind == CLIAgentRuntimeKind::Codex).then(|| {
+                    CodexMcpCorrelationBinding {
+                        coordinator: coordinator.clone(),
+                        bound_grant: bound.clone(),
+                    }
+                }),
+            }),
+        };
+        let facade = CliMcpToolFacade::try_new(
+            coordinator.clone(),
+            invoker,
+            projection,
+            Arc::new(CliMcpNoopProgressSink),
+            crate::cli_runtime::mcp::limits::CliMcpFacadeLimits::default(),
+            match kind {
+                CLIAgentRuntimeKind::Codex => CliMcpCallContract::Codex,
+                CLIAgentRuntimeKind::Claude => CliMcpCallContract::Claude,
+                CLIAgentRuntimeKind::OpenCode => CliMcpCallContract::OpenCode,
+                CLIAgentRuntimeKind::Acp => CliMcpCallContract::Acp,
+            },
+        )
+        .unwrap();
+        let mut context = CliMcpFacadeRequestContext {
+            bound_grant: bound,
+            projection_generation: reservation.generation,
+            activation_generation: None,
+        };
+        let initialized = facade.handle_message(&context, json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}})).await.unwrap();
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        facade
+            .handle_message(
+                &context,
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            )
+            .await;
+        let listed = facade
+            .handle_message(
+                &context,
+                json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}),
+            )
+            .await
+            .unwrap();
+        assert!(listed.get("error").is_none(), "{listed}");
+        let active = coordinator
+            .reserve_turn(
+                &context.bound_grant.grant_ref(),
+                context.projection_generation,
+                &binding.thread_id,
+                turn,
+            )
+            .await
+            .unwrap();
+        let native_thread = binding.native_thread_id;
+        let native_turn = binding.native_turn_id.unwrap();
+        coordinator
+            .activate_turn(
+                &context.bound_grant,
+                active.activation_generation,
+                native_thread.clone(),
+                native_turn.clone(),
+            )
+            .await
+            .unwrap();
+        context.activation_generation = Some(active.activation_generation);
+        Self {
+            facade,
+            context,
+            native_items,
+            claude_items,
+            kind,
+            native_thread,
+            native_turn,
+        }
+    }
+
+    async fn call(&self, rpc: &str, item: &str, name: &str, arguments: JsonValue) -> JsonValue {
+        let response = self.call_response(rpc, item, name, arguments).await;
+        assert!(response.get("error").is_none(), "{name}: {response}");
+        assert_ne!(response["result"]["isError"], true, "{name}: {response}");
+        response["result"]["structuredContent"].clone()
+    }
+
+    fn call_response<'a>(
+        &'a self,
+        rpc: &'a str,
+        item: &'a str,
+        name: &'a str,
+        arguments: JsonValue,
+    ) -> BoxFuture<'a, JsonValue> {
+        // Each matrix case drives the real facade on the normal Gateway stack.
+        Box::pin(async move {
+            let fingerprint =
+                crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&arguments).unwrap();
+            let item_id = match self.kind {
+                CLIAgentRuntimeKind::Acp => unreachable!("native correlation fixture"),
+                CLIAgentRuntimeKind::Claude => format!("toolu_{item}"),
+                CLIAgentRuntimeKind::OpenCode => format!("assistant:tool:{item}"),
+                CLIAgentRuntimeKind::Codex => item.to_owned(),
+            };
+            if self.kind == CLIAgentRuntimeKind::Claude {
+                self.claude_items
+                    .register(
+                        &crate::cli_runtime::claude_mcp::ClaudeNativeMcpItemBinding {
+                            native_thread_id: self.native_thread.clone(),
+                            native_turn_id: self.native_turn.clone(),
+                            native_item_id: item_id,
+                            canonical_callable_name: name.to_owned(),
+                            arguments_fingerprint: fingerprint,
+                            metadata: pioneer_protocol::ToolMetadata::empty(),
+                        },
+                    )
+                    .unwrap();
+            } else {
+                self.native_items
+                    .register(
+                        crate::cli_runtime::mcp::native_correlation::NativeMcpItemBinding {
+                            native_thread_id: self.native_thread.clone(),
+                            native_turn_id: self.native_turn.clone(),
+                            native_item_id: item_id,
+                            canonical_callable_name: name.to_owned(),
+                            arguments_fingerprint: fingerprint,
+                        },
+                    )
+                    .unwrap();
+            }
+            let (wire, meta) = match self.kind {
+                CLIAgentRuntimeKind::Acp => unreachable!("native correlation fixture"),
+                CLIAgentRuntimeKind::Codex => (
+                    arguments,
+                    json!({"callId":item,"threadId":self.native_thread,"x-codex-turn-metadata":{"thread_id":self.native_thread,"turn_id":self.native_turn}}),
+                ),
+                CLIAgentRuntimeKind::Claude => (
+                    arguments,
+                    json!({"claudecode/toolUseId":format!("toolu_{item}")}),
+                ),
+                CLIAgentRuntimeKind::OpenCode => (
+                    json!({"__pioneer_mcp":{"sessionID":self.native_thread,"messageID":"assistant","id":item},"arguments":arguments}),
+                    json!({"ai.opencode/sessionID":self.native_thread}),
+                ),
+            };
+            let (response, diagnostics) = crate::public_error::test_support::capture_events_async(
+            self.facade.handle_message(&self.context, json!({"jsonrpc":"2.0","id":rpc,"method":"tools/call","params":{"name":name,"arguments":wire,"_meta":meta}})),
+        ).await;
+            response.unwrap_or_else(|| panic!("{name}: no response; diagnostics: {diagnostics:#?}"))
+        })
+    }
+}
+
+#[test]
+fn cli_threads_read_errors_keep_safe_reasons_through_the_admitted_facade() {
+    run_standard_stack_message_test("Threads CLI safe read errors", async {
+        fn assert_read_error(response: &JsonValue, message: &str, reason: &str) {
+            assert!(response.get("error").is_none(), "{response}");
+            let result = &response["result"];
+            assert_eq!(result["isError"], true, "{response}");
+            // Exact public payloads exclude source IDs, raw arguments, paths,
+            // SQL and ToolError diagnostics from both MCP representations.
+            let expected = json!({"error":message});
+            assert_eq!(result["structuredContent"], expected);
+            assert_eq!(
+                result["content"],
+                json!([{"type":"text","text":expected.to_string()}])
+            );
+            assert_eq!(result["_meta"]["pioneer"]["reasonCode"], reason);
+            let wire = response.to_string();
+            for private in [
+                "private_token",
+                "/private/source.sqlite",
+                "secret-diagnostic",
+                "unavailable-private-source",
+                "private fragment title",
+                "old-workspace-revision",
+            ] {
+                assert!(!wire.contains(private), "private read diagnostic leaked");
+            }
+        }
+
+        let (harness, processor, turn) = start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(&turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let thread = binding.thread_id;
+        let facade = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex).await;
+        // Admission, immutable projection, exact native correlation and Gateway
+        // dispatch are the same path as the positive facade regression below.
+        let context = pioneer_agent::TurnToolContext {
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: thread.clone(),
+            turn_id: turn.clone(),
+        };
+        let authority = processor.thread_read_authority(&context).await.unwrap();
+        let codec = processor.thread_read_cursor_codec().unwrap();
+        // An authentic pre-change cursor must not be interpreted using the new
+        // order, even when issued to this same principal/execution and limit.
+        let legacy_cursor = codec
+            .encode(
+                &json!({"revision":"old-workspace-revision","after":thread,"fragment":null}),
+                &authority.scope("list", "", false, 1),
+            )
+            .unwrap();
+        let incompatible =
+            "invalid or incompatible cursor; restart reading with the same resource and parameters";
+        for (item, cursor) in [
+            ("legacy-list", legacy_cursor),
+            (
+                "invalid-list",
+                "SELECT private_token FROM /private/source.sqlite; secret-diagnostic".into(),
+            ),
+        ] {
+            let response = facade
+                .call_response(
+                    item,
+                    item,
+                    "threads_list",
+                    json!({"limit":1,"cursor":cursor}),
+                )
+                .await;
+            assert_read_error(&response, incompatible, "read_cursor_incompatible");
+        }
+
+        // These arguments satisfy the frozen JSON schema. Unanchored newer
+        // history is rejected by the actual read handler's semantic validation,
+        // after admission rather than by JSON-RPC or a mock executor.
+        let invalid = facade
+            .call_response(
+                "invalid-history",
+                "invalid-history",
+                "threads_history_read",
+                json!({"threadId":thread,"limit":1,"direction":"newer"}),
+            )
+            .await;
+        assert_read_error(
+            &invalid,
+            "invalid read parameters",
+            "read_invalid_parameters",
+        );
+        for (item, name, arguments) in [
+            (
+                "unavailable-history",
+                "threads_history_read",
+                json!({"threadId":"unavailable-private-source","limit":1}),
+            ),
+            (
+                "unavailable-children",
+                "threads_children_list",
+                json!({"threadId":"unavailable-private-source","recursive":false,"limit":1}),
+            ),
+        ] {
+            let response = facade.call_response(item, item, name, arguments).await;
+            assert_read_error(
+                &response,
+                "source unavailable or access denied",
+                "read_source_unavailable",
+            );
+        }
+
+        processor
+            .crud_store
+            .update_thread_name(&thread, &"private fragment title 🌍\"\n".repeat(150_000))
+            .await
+            .unwrap();
+        let first = facade
+            .call(
+                "fragment-first",
+                "fragment-first",
+                "threads_list",
+                json!({"limit":1}),
+            )
+            .await;
+        assert_eq!(first["threads"][0]["threadId"], thread);
+        assert_eq!(first["threads"][0]["fragment"]["offset"], 0);
+        assert_eq!(first["threads"][0]["fragment"]["eof"], false);
+        let cursor = first["nextCursor"].as_str().unwrap();
+        processor
+            .crud_store
+            .update_thread_name(&thread, "changed private fragment title")
+            .await
+            .unwrap();
+        let changed = facade
+            .call_response(
+                "fragment-changed",
+                "fragment-changed",
+                "threads_list",
+                json!({"limit":1,"cursor":cursor}),
+            )
+            .await;
+        assert_read_error(
+            &changed,
+            "cursor is stale; restart reading from the first page",
+            "read_source_changed",
+        );
+
+        let malformed = facade
+            .facade
+            .handle_bytes(&facade.context, b"{")
+            .await
+            .unwrap();
+        let malformed: JsonValue = serde_json::from_slice(&malformed).unwrap();
+        assert_eq!(malformed["error"]["code"], -32700);
+        assert!(malformed.get("result").is_none());
+    });
+}
+
+#[test]
+fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_providers() {
+    run_standard_stack_message_test("Threads CLI integration", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            let (harness, processor, turn) = start_task_cli_fixture_with_models(
+                kind,
+                pioneer_tasks::TaskRuntimeConfig::default(),
+                &["threads-cli-choice"],
+            )
+            .await;
+            let bindings = processor
+                .crud_store
+                .list_turn_mcp_bindings(&turn)
+                .await
+                .unwrap();
+            assert_eq!(
+                bindings
+                    .iter()
+                    .filter(|tool| tool.raw_tool_name == "threads_start_options")
+                    .count(),
+                1
+            );
+            let authority = processor
+                .load_turn_execution_authorization_context(&turn)
+                .await
+                .unwrap();
+            let permission =
+                pioneer_protocol::task_permission_cap_snapshot(authority.permission_profile_cap());
+            assert!(permission.effective_policy.allowed_tools.is_empty());
+            assert!(!permission.effective_policy.allowed_tools_restricted);
+            assert!(
+                authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
+            for tool in bindings.iter().filter(|tool| {
+                pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.raw_tool_name.as_str())
+            }) {
+                let expected = if kind == CLIAgentRuntimeKind::OpenCode {
+                    format!("pioneer_{}", tool.raw_tool_name)
+                } else {
+                    format!("mcp__pioneer__{}", tool.raw_tool_name)
+                };
+                assert_eq!(tool.provider_callable_name, expected);
+                assert!(
+                    crate::turn_mcp::native_tools::current_identity(&harness.workspace_id, tool)
+                        .is_ok()
+                );
+            }
+            let facade = ThreadsFacade::new(&processor, &turn, kind).await;
+            let options = facade
+                .call("options", "options", "threads_start_options", json!({}))
+                .await;
+            let creation = options["threadCreationOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|option| option["label"] == "Current collaboration")
+                .unwrap()["id"]
+                .clone();
+            let create_args = json!({"optionId":creation});
+            let created = facade
+                .call("create", "create", "thread_create", create_args.clone())
+                .await;
+            assert_eq!(created["status"], "accepted");
+            let create_item_id = match kind {
+                CLIAgentRuntimeKind::Acp => unreachable!("native correlation fixture"),
+                CLIAgentRuntimeKind::Codex => "create",
+                CLIAgentRuntimeKind::Claude => "toolu_create",
+                CLIAgentRuntimeKind::OpenCode => "assistant:tool:create",
+            };
+            let original_completion = processor
+                .crud_store
+                .get_turn_item(&turn, create_item_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let replay = ThreadsFacade::new(&processor, &turn, kind)
+                .await
+                .call("create-reconnected", "create", "thread_create", create_args)
+                .await;
+            assert_eq!(replay["receiptId"], created["receiptId"]);
+            assert_eq!(
+                processor
+                    .crud_store
+                    .get_turn_item(&turn, create_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                original_completion,
+                "reconnecting must preserve the original canonical execution outcome"
+            );
+            let caller = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(&turn)
+                .await
+                .unwrap()
+                .unwrap();
+            let events = processor
+                .crud_store
+                .get_turn_item_events(&caller.thread_id, &turn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                events
+                    .events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.payload,
+                        pioneer_protocol::TurnItemEventPayload::ItemCompleted { item, .. }
+                            if item.item_id() == create_item_id
+                    ))
+                    .count(),
+                1,
+                "receipt replay must not append a second completion"
+            );
+            assert_eq!(replay["threadResult"], created["threadResult"]);
+            assert_eq!(created["threadResult"]["workspaceId"], harness.workspace_id);
+            let created_thread = processor
+                .crud_store
+                .get_thread_model(created["threadResult"]["threadId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(created_thread.workspace_id, harness.workspace_id);
+            assert!(created["threadResult"].get("turnId").is_none());
+            let target = created["targetOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|option| {
+                    !options["targetOptions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|old| old["id"] == option["id"])
+                })
+                .unwrap()["id"]
+                .clone();
+            let send_args = json!({"targetOptionId":target,"input":[{"type":"text","text":"Facade message without model execution"}]});
+            let sent = facade
+                .call("send", "send", "thread_message_send", send_args.clone())
+                .await;
+            let replay = ThreadsFacade::new(&processor, &turn, kind)
+                .await
+                .call("send-reconnected", "send", "thread_message_send", send_args)
+                .await;
+            assert_eq!(sent["receiptId"], replay["receiptId"]);
+            assert_eq!(sent["threadResult"], replay["threadResult"]);
+            assert_eq!(sent["threadResult"]["threadId"], created_thread.id);
+            let listed = facade
+                .call("read", "read", "threads_list", json!({"limit":100}))
+                .await;
+            assert!(
+                listed["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["threadId"] == caller.thread_id),
+                "the admitted CLI caller's standalone conversation remains listed"
+            );
+            let descendants = facade
+                .call(
+                    "read-children",
+                    "read-children",
+                    "threads_children_list",
+                    json!({"threadId":caller.thread_id,"recursive":false,"limit":100}),
+                )
+                .await;
+            let children = descendants["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|thread| {
+                    thread["parentThreadId"] == format!("cli_tasks_{kind:?}").to_lowercase()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                children.len(),
+                1,
+                "replayed creation must not add another thread"
+            );
+            let child = children[0]["threadId"].clone();
+            assert!(
+                !listed["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["threadId"] == child),
+                "hidden home-capsule children must not be standalone list cards"
+            );
+            assert_eq!(children[0]["threadId"], created["threadResult"]["threadId"]);
+            let history = facade
+                .call(
+                    "history",
+                    "history",
+                    "threads_history_read",
+                    json!({"threadId":sent["threadResult"]["threadId"],"anchor":{"turnId":sent["threadResult"]["turnId"]},"limit":100}),
+                )
+                .await;
+            assert_eq!(
+                history
+                    .to_string()
+                    .matches("Facade message without model execution")
+                    .count(),
+                1
+            );
+            let identity = options["identities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|identity| identity["sourceKind"] == "cli_runtime_instance")
+                .unwrap()["id"]
+                .clone();
+            let models = facade
+                .call(
+                    "models",
+                    "models",
+                    "threads_identity_models_list",
+                    json!({"identityId":identity}),
+                )
+                .await;
+            let executor = models["executors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|executor| {
+                    executor["providerId"] == format!("cli_runtime:{}", harness.runtime_id)
+                })
+                .unwrap();
+            let model = executor["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["id"] == "threads-cli-choice")
+                .unwrap();
+            let effort = model["reasoning"]["effort_options"].as_array().unwrap()[0].clone();
+            let args = json!({"targetOptionId":target,"input":[{"type":"text","text":"Report findings in this conversation"}],"launch":{"identity":{"kind":"exact","id":identity},"profile":{"kind":"model","providerId":executor["providerId"],"modelId":model["id"]},"reasoning":{"effort":effort}}});
+            let started = facade
+                .call("start", "start", "threads_turn_start", args.clone())
+                .await;
+            let replay = ThreadsFacade::new(&processor, &turn, kind)
+                .await
+                .call("start-reconnected", "start", "threads_turn_start", args)
+                .await;
+            assert_eq!(started["receiptId"], replay["receiptId"]);
+            let native_start_item = match kind {
+                CLIAgentRuntimeKind::Acp => unreachable!("native correlation fixture"),
+                CLIAgentRuntimeKind::Codex => "start".to_owned(),
+                CLIAgentRuntimeKind::Claude => "toolu_start".to_owned(),
+                CLIAgentRuntimeKind::OpenCode => "assistant:tool:start".to_owned(),
+            };
+            let logical_call = crate::turn_mcp::native_tools::cli_task_call_id(
+                &turn,
+                "threads_turn_start",
+                &native_start_item,
+                &json!({}),
+            );
+            let action = crate::authorization::action_id_for_call(&logical_call);
+            let outbox = pioneer_crud::load_agent_action_outbox(
+                &processor.crud_store.database_connection(),
+                action.as_str(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
+            let params: pioneer_protocol::TurnStartParams =
+                serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            assert_eq!(
+                started["threadResult"],
+                json!({"workspaceId":harness.workspace_id,"threadId":params.thread_id,"turnId":params.turn_id,"executionId":payload["spawned_execution_id"]})
+            );
+            assert_eq!(replay["threadResult"], started["threadResult"]);
+            let response = pioneer_crud::load_agent_turn_response(
+                &processor.crud_store.database_connection(),
+                &params.turn_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                started["threadResult"]["executionId"],
+                response.execution_id
+            );
+            assert_eq!(params.model.as_deref(), model["id"].as_str());
+            assert_eq!(
+                params.model_provider.as_deref(),
+                executor["providerId"].as_str()
+            );
+            assert_eq!(
+                params.reasoning.as_ref().unwrap().effort,
+                effort.as_str().unwrap()
+            );
+            assert_eq!(payload["dispatch"]["identity"]["id"], identity);
+            harness
+                .cli_session
+                .set_next_native_turn_id("threads-facade-explicit-child")
+                .await;
+            process_cli_fixture_outbox(&processor).await.unwrap();
+            let calls = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
+            assert_eq!(calls[1].model.as_deref(), model["id"].as_str());
+            assert_eq!(calls[1].effort.as_deref(), effort.as_str());
+            // One replayed start has one persisted child execution and payload.
+            assert_eq!(replay["outcome"], "agent_action_already_committed");
+        }
+        let (_harness, processor, turn) =
+            start_threads_cli_fixture(CLIAgentRuntimeKind::Codex, &["threads_search"]).await;
+        assert!(
+            !processor
+                .crud_store
+                .list_turn_mcp_bindings(&turn)
+                .await
+                .unwrap()
+                .iter()
+                .any(|binding| binding.raw_tool_name == "threads_search")
+        );
+        let denied = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex)
+            .await
+            .call_response(
+                "denied-search",
+                "denied-search",
+                "threads_search",
+                json!({"query":"test","limit":1}),
+            )
+            .await;
+        assert_eq!(denied["error"]["data"]["kind"], "tool_unbound");
+        let (_harness, processor, turn) =
+            start_threads_cli_fixture(CLIAgentRuntimeKind::Codex, &["threads_start_options"]).await;
+        let bindings = processor
+            .crud_store
+            .list_turn_mcp_bindings(&turn)
+            .await
+            .unwrap();
+        assert!(
+            !bindings
+                .iter()
+                .any(|tool| tool.raw_tool_name == "threads_start_options")
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|tool| tool.raw_tool_name == "threads_list")
+        );
+        let facade = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex).await;
+        let denied = facade.facade.handle_message(&facade.context, json!({"jsonrpc":"2.0","id":"denied-options","method":"tools/call","params":{"name":"threads_start_options","arguments":{}}})).await.unwrap();
+        assert_eq!(denied["error"]["data"]["kind"], "tool_unbound");
+    });
+}
+
+#[test]
+fn cli_threads_permission_matrix_preserves_restricted_names_denies_and_missing_grants() {
+    run_standard_stack_message_test("CLI Threads permission ceiling", async {
+        for (restricted, allowed, denied, expect_create, expect_models) in [
+            (false, vec![], vec![], true, true),
+            (true, vec![], vec![], false, false),
+            (false, vec!["thread_create"], vec![], true, false),
+            (
+                false,
+                vec!["thread_create"],
+                vec!["thread_create"],
+                false,
+                false,
+            ),
+        ] {
+            let mut profile = default_test_permission_profile();
+            profile.effective_policy.allowed_tools_restricted = restricted;
+            profile.effective_policy.allowed_tools =
+                allowed.into_iter().map(str::to_owned).collect();
+            profile.effective_policy.denied_tools = denied.into_iter().map(str::to_owned).collect();
+            let (_harness, processor, turn) =
+                start_threads_cli_fixture_with_policy(CLIAgentRuntimeKind::Codex, profile).await;
+            let bindings = processor
+                .crud_store
+                .list_turn_mcp_bindings(&turn)
+                .await
+                .unwrap();
+            assert_eq!(
+                bindings
+                    .iter()
+                    .any(|binding| binding.raw_tool_name == "thread_create"),
+                expect_create
+            );
+            assert_eq!(
+                bindings
+                    .iter()
+                    .any(|binding| binding.raw_tool_name == "threads_identity_models_list"),
+                expect_models
+            );
+            assert!(
+                bindings
+                    .iter()
+                    .filter(|binding| binding.raw_tool_name == "threads_start_options")
+                    .count()
+                    <= 1
+            );
+        }
+        let (harness, processor, turn) = start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let facade = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex).await;
+        let options = facade
+            .call(
+                "old-options",
+                "old-options",
+                "threads_start_options",
+                json!({}),
+            )
+            .await;
+        let option = options["threadCreationOptions"][0]["id"].clone();
+        let original_binding = processor.agent_action_binding(&turn).await.unwrap();
+        let mut limited_binding = original_binding.clone();
+        limited_binding
+            .capabilities
+            .remove(&pioneer_protocol::AgentToolCapability::ThreadCreate);
+        processor
+            .register_agent_action_binding(turn.clone(), limited_binding)
+            .await;
+        let limited = facade
+            .call_response(
+                "limited-create",
+                "limited-create",
+                "thread_create",
+                json!({"optionId":option}),
+            )
+            .await;
+        assert!(
+            limited.get("error").is_some() || limited["result"]["isError"] == true,
+            "{limited}"
+        );
+        assert_ne!(
+            limited["error"]["data"]["kind"], "invalid_request",
+            "correlation must reach the restricted binding"
+        );
+        assert!(
+            limited["result"]["structuredContent"]
+                .get("threadResult")
+                .is_none()
+        );
+        processor
+            .register_agent_action_binding(turn.clone(), original_binding)
+            .await;
+        // Model an older immutable admission with no creation actions, retaining
+        // the already-frozen transport catalog. Broader current user rights
+        // cannot substitute for either missing action grant.
+        let authority = processor
+            .load_turn_execution_authorization_context(&turn)
+            .await
+            .unwrap();
+        let mut encoded: JsonValue =
+            serde_json::from_str(&authority.to_persisted_json().unwrap()).unwrap();
+        let private = crate::authorization::ResourceAction::ThreadCreatePrivate.safe_name();
+        let workspace = crate::authorization::ResourceAction::ThreadCreateWorkspace.safe_name();
+        encoded["grant_manifest"]["actions"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|value| value.as_str() != Some(private) && value.as_str() != Some(workspace));
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(&turn, &encoded.to_string())
+            .await
+            .unwrap();
+        let reply = facade
+            .call_response(
+                "old-create",
+                "old-create",
+                "thread_create",
+                json!({"optionId":option}),
+            )
+            .await;
+        assert_eq!(
+            reply["error"]["data"]["kind"], "permission_denied",
+            "{reply}"
+        );
+        let restored = processor
+            .load_turn_execution_authorization_context(&turn)
+            .await
+            .unwrap();
+        assert!(!restored.grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate));
+        assert!(
+            !restored.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+        );
+        // A new Task must not restore creation rights absent from the source
+        // execution, despite Full Access and the initiator's current role.
+        harness
+            .cli_session
+            .set_next_native_turn_id("old-manifest-task-child")
+            .await;
+        let task = facade
+            .call(
+                "old-task-create",
+                "old-task-create",
+                "task_create",
+                json!({"title":"Retain the source ceiling","goal":"Inspect without creating conversations"}),
+            )
+            .await;
+        let admission = processor
+            .crud_store
+            .get_task_execution_admission(task["taskId"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let admission = crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+            &admission.authorization_context_json,
+        )
+        .unwrap();
+        let child =
+            wait_for_task_cli_child(&processor, task["runId"].as_str().unwrap(), None).await;
+        let child_authority = processor
+            .load_turn_execution_authorization_context(&child.turn_id)
+            .await
+            .unwrap();
+        for context in [&admission, &child_authority] {
+            assert!(
+                !context.grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+            );
+            assert!(
+                !context.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
+        }
+        assert!(
+            processor
+                .crud_store
+                .list_turn_mcp_bindings(&child.turn_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|binding| binding.raw_tool_name != "thread_create")
+        );
+        let child_facade =
+            ThreadsFacade::new(&processor, &child.turn_id, CLIAgentRuntimeKind::Codex).await;
+        let child_options = child_facade
+            .call(
+                "old-child-options",
+                "old-child-options",
+                "threads_start_options",
+                json!({}),
+            )
+            .await;
+        assert!(
+            child_options["threadCreationOptions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let denied = child_facade
+            .call_response(
+                "old-child-create",
+                "old-child-create",
+                "thread_create",
+                json!({"optionId":option}),
+            )
+            .await;
+        assert!(
+            denied.get("error").is_some() || denied["result"]["isError"] == true,
+            "{denied}"
+        );
+    });
+}
+
+#[test]
+fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() {
+    run_standard_stack_message_test("immutable Task readmission ceiling", async {
+        for persisted in [true, false] {
+            let (harness, processor, turn) =
+                start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+            harness
+                .cli_session
+                .set_next_native_turn_id("immutable-resume-child")
+                .await;
+            let facade = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex).await;
+            let created = facade
+                .call(
+                    "resume-create",
+                    "resume-create",
+                    "task_create",
+                    json!({"title":"Preserve admitted Task authority","goal":"Readmitted work"}),
+                )
+                .await;
+            let task_id = created["taskId"].as_str().unwrap();
+            let child =
+                wait_for_task_cli_child(&processor, created["runId"].as_str().unwrap(), None).await;
+            let saved = processor
+                .crud_store
+                .get_task_execution_admission(task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let original =
+                crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+                    &saved.authorization_context_json,
+                )
+                .unwrap();
+            assert!(
+                original.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
+            // The running binding is persisted before startup releases its
+            // session gate. Wait for that handoff and hold the gate while blocking.
+            let transition = timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(transition) = processor
+                        .try_cli_runtime_turn_transition(&child)
+                        .await
+                        .unwrap()
+                    {
+                        break transition;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Task child must release its startup transition");
+            assert!(
+                processor
+                    .mark_turn_blocked_with_transition(
+                        child.thread_id.clone(),
+                        child.turn_id.clone(),
+                        "resumable Task".into(),
+                        Some(transition),
+                    )
+                    .await
+            );
+            message_future(processor.reconcile_terminal_task_child_turns(64))
+                .await
+                .unwrap();
+            assert_eq!(
+                processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .status,
+                pioneer_protocol::TaskStatus::Blocked
+            );
+            // A different, still-running execution in the same capsule may
+            // manage A without lending its own create rights to a new admission.
+            // Model the restricted source on the principal-authored root fixture
+            // before task_create derives the sibling admission and execution graph.
+            let source = processor
+                .load_turn_execution_authorization_context(&turn)
+                .await
+                .unwrap();
+            let mut encoded: JsonValue =
+                serde_json::from_str(&source.to_persisted_json().unwrap()).unwrap();
+            encoded["grant_manifest"]["actions"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|action| {
+                    action.as_str()
+                        != Some(
+                            crate::authorization::ResourceAction::ThreadCreatePrivate.safe_name(),
+                        )
+                        && action.as_str()
+                            != Some(
+                                crate::authorization::ResourceAction::ThreadCreateWorkspace
+                                    .safe_name(),
+                            )
+                });
+            processor
+                .crud_store
+                .set_turn_execution_authorization_context(&turn, &encoded.to_string())
+                .await
+                .unwrap();
+            harness
+                .cli_session
+                .set_next_native_turn_id("immutable-resume-caller")
+                .await;
+            let sibling = facade.call("resume-caller-create", "resume-caller-create", "task_create",
+                json!({"title":"Authorized Task controller","goal":"Manage another permitted Task"}),
+            ).await;
+            let caller =
+                wait_for_task_cli_child(&processor, sibling["runId"].as_str().unwrap(), None).await;
+            assert_ne!(caller.turn_id, turn);
+            // The normal loader checks the child's graph fingerprint and lineage.
+            // Never rewrite an already-pinned Task child's authority envelope.
+            let caller_authority = processor
+                .load_turn_execution_authorization_context(&caller.turn_id)
+                .await
+                .unwrap();
+            assert!(
+                !caller_authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+            );
+            assert!(
+                !caller_authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
+            assert_eq!(caller_authority.root_thread_id(), saved.root_thread_id);
+            if !persisted {
+                // Model the supported legacy case with no immutable admission;
+                // source ceiling applies when the real readmission path creates it.
+                pioneer_entity::task_execution_admission::Entity::delete_by_id(task_id)
+                    .exec(&processor.crud_store.database_connection())
+                    .await
+                    .unwrap();
+            }
+            let caller_facade =
+                ThreadsFacade::new(&processor, &caller.turn_id, CLIAgentRuntimeKind::Codex).await;
+            let resumed = caller_facade
+                .call(
+                    "resume-frozen",
+                    "resume-frozen",
+                    "task_resume",
+                    json!({"taskId":task_id}),
+                )
+                .await;
+            assert_eq!(resumed["task"]["id"], task_id, "{resumed}");
+            assert_ne!(
+                processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .status,
+                pioneer_protocol::TaskStatus::Blocked
+            );
+            let current = processor
+                .crud_store
+                .get_task_execution_admission(task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if persisted {
+                assert_eq!(
+                    current, saved,
+                    "existing immutable admission is reused verbatim"
+                );
+            } else {
+                let legacy =
+                    crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+                        &current.authorization_context_json,
+                    )
+                    .unwrap();
+                assert!(
+                    !legacy
+                        .grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+                );
+                assert!(
+                    !legacy
+                        .grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+                );
+            }
+            let caller = processor
+                .load_turn_execution_authorization_context(&caller.turn_id)
+                .await
+                .unwrap();
+            assert!(
+                !caller.grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+            );
+            assert!(
+                !caller.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
+        }
+    });
+}
+
+#[test]
+fn ordinary_cli_delegated_root_dispatch_uses_cli_attempt_and_replays_without_native_actor() {
+    run_standard_stack_message_test("CLI Threads first root dispatch", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            for proof_fault in ["none", "lease", "context", "catalog"] {
+                let (harness, processor, turn) = start_task_cli_fixture(kind).await;
+                let facade = ThreadsFacade::new(&processor, &turn, kind).await;
+                let options = facade
+                    .call(
+                        "root-options",
+                        "root-options",
+                        "threads_start_options",
+                        json!({}),
+                    )
+                    .await;
+                let creation = options["threadCreationOptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|option| option["label"] == "New delegated root")
+                    .unwrap()["id"]
+                    .clone();
+                let created = facade
+                    .call(
+                        "root-create",
+                        "root-create",
+                        "thread_create",
+                        json!({"optionId":creation}),
+                    )
+                    .await;
+                let target = created["targetOptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|option| {
+                        !options["targetOptions"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|old| old["id"] == option["id"])
+                    })
+                    .unwrap()["id"]
+                    .clone();
+                // This suite covers direct CLI receipts and their existing
+                // proof fences. Collaborative Task admission is covered below.
+                let created_row = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+                    created["outboxId"].as_str().unwrap(),
+                )
+                .one(&processor.crud_store.database_connection())
+                .await
+                .unwrap()
+                .unwrap();
+                let created_payload: JsonValue =
+                    serde_json::from_str(&created_row.payload_json).unwrap();
+                super::thread_launch_choices::foreground_target_fixture(
+                    &processor,
+                    created_payload["created_thread_id"].as_str().unwrap(),
+                )
+                .await;
+                let started = facade.call("root-start", "root-start", "threads_turn_start", json!({
+                "targetOptionId":target, "input":[{"type":"text","text":"Ordinary CLI root execution"}],
+            })).await;
+                let db = processor.crud_store.database_connection();
+                let outbox = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+                    started["outboxId"].as_str().unwrap(),
+                )
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+                let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
+                let params: pioneer_protocol::TurnStartParams =
+                    serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+                let execution = pioneer_crud::load_agent_execution(
+                    &db,
+                    payload["spawned_execution_id"].as_str().unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(execution.parent_execution_id.is_none());
+                assert_eq!(execution.work_graph_root_execution_id, execution.id);
+                assert_eq!(execution.home_root_thread_id, params.thread_id);
+                assert!(
+                    processor
+                        .crud_store
+                        .get_task_run_turn_by_turn(&params.thread_id, &params.turn_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(matches!(
+                    processor
+                        .agent_manager
+                        .observe_turn(&params.thread_id, &params.turn_id)
+                        .await,
+                    Err(pioneer_agent::AgentControlError::ThreadNotFound)
+                ));
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("threads-independent-cli")
+                    .await;
+                if proof_fault != "none" {
+                    processor.arm_completed_history_preparation_barrier(
+                        if proof_fault == "lease" {
+                            "__cli_agent_before_lease_proof__"
+                        } else if proof_fault == "catalog" {
+                            "__cli_agent_catalog_before_task_proof__"
+                        } else {
+                            "__cli_agent_before_context_proof__"
+                        },
+                    );
+                    let dispatch = tokio::spawn({
+                        let processor = processor.clone();
+                        async move { process_cli_fixture_outbox(&processor).await.unwrap() }
+                    });
+                    timeout(
+                        Duration::from_secs(10),
+                        processor.wait_for_completed_history_preparation_barrier(),
+                    )
+                    .await
+                    .unwrap();
+                    db.execute_unprepared("ALTER TABLE turn RENAME TO unavailable_turn")
+                        .await
+                        .unwrap();
+                    if proof_fault == "catalog" {
+                        processor.arm_completed_history_preparation_barrier(
+                            "__cli_agent_catalog_proof_failed__",
+                        );
+                    }
+                    processor.release_completed_history_preparation_barrier();
+                    if proof_fault == "catalog" {
+                        timeout(
+                            Duration::from_secs(10),
+                            processor.wait_for_completed_history_preparation_barrier(),
+                        )
+                        .await
+                        .unwrap();
+                        // Restore before the finalizer caller decides whether to
+                        // write Blocked: terminal persistence is now available.
+                        db.execute_unprepared("ALTER TABLE unavailable_turn RENAME TO turn")
+                            .await
+                            .unwrap();
+                        processor.release_completed_history_preparation_barrier();
+                    }
+                    dispatch.await.unwrap();
+                    if proof_fault != "catalog" {
+                        db.execute_unprepared("ALTER TABLE unavailable_turn RENAME TO turn")
+                            .await
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        processor
+                            .crud_store
+                            .get_turn(&params.thread_id, &params.turn_id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .1
+                            .status,
+                        pioneer_protocol::TurnStatus::InProgress
+                    );
+                    assert!(
+                        !processor
+                            .crud_store
+                            .native_turn_has_accepted_terminal(&params.turn_id)
+                            .await
+                            .unwrap()
+                    );
+                    assert!(
+                        processor
+                            .crud_store
+                            .latest_cli_runtime_turn_attempt(&params.turn_id)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(harness.cli_session.turn_starts.lock().await.len(), 1);
+                    use sea_orm::{ActiveModelTrait, Set};
+                    let failed =
+                        pioneer_entity::agent_action_outbox::Entity::find_by_id(&outbox.id)
+                            .one(&db)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(
+                        failed.last_error.as_deref(),
+                        Some("outbox_storage_unavailable")
+                    );
+                    let mut retry: pioneer_entity::agent_action_outbox::ActiveModel = failed.into();
+                    retry.next_attempt_at =
+                        Set(Some(pioneer_crud::utc_now() - chrono::Duration::seconds(1)));
+                    retry.update(&db).await.unwrap();
+                }
+                process_cli_fixture_outbox(&processor).await.unwrap();
+                wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
+                wait_for_task_cli_activation(&processor, &params.turn_id).await;
+                assert!(
+                    processor
+                        .crud_store
+                        .latest_cli_runtime_turn_attempt(&params.turn_id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(matches!(
+                    processor
+                        .agent_manager
+                        .observe_turn(&params.thread_id, &params.turn_id)
+                        .await,
+                    Err(pioneer_agent::AgentControlError::ThreadNotFound)
+                ));
+                // Lose the dispatch ACK, then replay the exact durable operation.
+                use sea_orm::{ActiveModelTrait, Set};
+                let mut pending: pioneer_entity::agent_action_outbox::ActiveModel =
+                    pioneer_entity::agent_action_outbox::Entity::find_by_id(&outbox.id)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .into();
+                pending.status = Set("pending".into());
+                pending.delivered_at = Set(None);
+                pending.next_attempt_at = Set(None);
+                pending.update(&db).await.unwrap();
+                process_cli_fixture_outbox(&processor).await.unwrap();
+                assert_eq!(harness.cli_session.turn_starts.lock().await.len(), 2);
+            }
+        }
+    });
+}
+
+#[test]
+fn cli_threads_collaborative_admission_uses_one_detached_task_and_normal_stop() {
+    run_standard_stack_message_test("CLI shared thread launch", async {
+        let (harness, processor, source_turn) =
+            start_threads_cli_fixture(CLIAgentRuntimeKind::Codex, &[]).await;
+        let facade = ThreadsFacade::new(&processor, &source_turn, CLIAgentRuntimeKind::Codex).await;
+        let options = facade
+            .call(
+                "shared-options",
+                "shared-options",
+                "threads_start_options",
+                json!({}),
+            )
+            .await;
+        let creation = options["threadCreationOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["label"] == "New delegated root")
+            .unwrap()["id"]
+            .clone();
+        let created = facade
+            .call(
+                "shared-create",
+                "shared-create",
+                "thread_create",
+                json!({"optionId":creation}),
+            )
+            .await;
+        let target = created["targetOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| {
+                !options["targetOptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|old| old["id"] == target["id"])
+            })
+            .unwrap()["id"]
+            .clone();
+        harness
+            .cli_session
+            .set_next_native_turn_id("shared-detached-child")
+            .await;
+        let identity = options["identities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|identity| identity["sourceKind"] == "cli_runtime_instance")
+            .unwrap()["id"]
+            .clone();
+        let arguments = json!({"targetOptionId":target,"input":[{"type":"text","text":"Continue independently"}],
+            "launch":{"identity":{"kind":"exact","id":identity},"profile":{"kind":"model","providerId":format!("cli_runtime:{}", harness.runtime_id),"modelId":"threads-cli-choice"},"reasoning":{"effort":"high"}}});
+        let started = facade
+            .call(
+                "shared-start",
+                "shared-start",
+                "threads_turn_start",
+                arguments.clone(),
+            )
+            .await;
+        let db = processor.crud_store.database_connection();
+        let outbox = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+            started["outboxId"].as_str().unwrap(),
+        )
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
+        assert_eq!(payload["execution_mode"], "detached_task");
+        assert!(payload.get("dispatch").is_none());
+        let task_id = payload["task_id"].as_str().unwrap();
+        assert_eq!(
+            started["threadResult"],
+            json!({"workspaceId":harness.workspace_id,"threadId":payload["thread_id"],"turnId":payload["turn_id"],"taskId":task_id})
+        );
+        assert_eq!(
+            created["threadResult"]["threadId"],
+            started["threadResult"]["threadId"]
+        );
+        let task = processor
+            .crud_store
+            .get_task(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let launch = &task
+            .task
+            .metadata
+            .as_ref()
+            .unwrap()
+            .composer_work
+            .as_ref()
+            .unwrap()
+            .launch;
+        let child = wait_for_task_cli_child(&processor, &task.runs[0].id, None).await;
+        assert_ne!(child.thread_id, launch.thread_id);
+        assert_ne!(started["threadResult"]["threadId"], child.thread_id);
+        assert_ne!(started["threadResult"]["turnId"], child.turn_id);
+        assert_eq!(
+            processor
+                .crud_store
+                .get_thread_model(&launch.thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .origin_kind,
+            ThreadOriginKind::Collaborative
+        );
+        assert_eq!(
+            processor
+                .crud_store
+                .get_thread_model(&child.thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .origin_kind,
+            ThreadOriginKind::TaskRun
+        );
+        let (_, admission) = processor
+            .crud_store
+            .get_turn(&launch.thread_id, &launch.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            admission.work_owner,
+            pioneer_protocol::TurnWorkOwner::DetachedTask
+        );
+        assert_eq!(admission.status, TurnStatus::Completed);
+        assert!(matches!(
+            admission.author.as_ref().unwrap().actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(_)
+        ));
+        assert!(
+            processor
+                .crud_store
+                .get_turn_work_projection(&launch.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let contract = processor
+            .crud_store
+            .get_task_actor_contract(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(contract.work_graph_root_execution_id.is_none());
+        assert_eq!(contract.resolved_identity_id.as_deref(), identity.as_str());
+        let starts = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
+        assert_eq!(starts[1].model.as_deref(), Some("threads-cli-choice"));
+        assert_eq!(starts[1].effort.as_deref(), Some("high"));
+        let replay = ThreadsFacade::new(&processor, &source_turn, CLIAgentRuntimeKind::Codex)
+            .await
+            .call(
+                "shared-reconnected",
+                "shared-start",
+                "threads_turn_start",
+                arguments,
+            )
+            .await;
+        assert_eq!(started["receiptId"], replay["receiptId"]);
+        assert_eq!(started["threadResult"], replay["threadResult"]);
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            processor
+                .crud_store
+                .list_tasks_created_by_turn(
+                    &task.task.workspace_id,
+                    &launch.thread_id,
+                    &launch.turn_id
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            wait_for_cli_runtime_turn_starts(&harness.cli_session, 2)
+                .await
+                .len(),
+            2
+        );
+        let child_facade =
+            ThreadsFacade::new(&processor, &child.turn_id, CLIAgentRuntimeKind::Codex).await;
+        let child_options = child_facade
+            .call(
+                "same-child-options",
+                "same-child-options",
+                "threads_start_options",
+                json!({}),
+            )
+            .await;
+        let same_child = child_options["targetOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| target["label"] == "Current thread")
+            .unwrap()["id"]
+            .clone();
+        let continued = child_facade.call("same-child-start", "same-child-start", "threads_turn_start", json!({"targetOptionId":same_child,"input":[{"type":"text","text":"Continue in this execution thread"}]})).await;
+        let continuation_outbox = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+            continued["outboxId"].as_str().unwrap(),
+        )
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        let continuation: JsonValue =
+            serde_json::from_str(&continuation_outbox.payload_json).unwrap();
+        assert!(continuation.get("task_id").is_none());
+        assert_eq!(continuation["dispatch"]["thread_id"], child.thread_id);
+        assert_eq!(
+            continued["threadResult"],
+            json!({"workspaceId":harness.workspace_id,"threadId":child.thread_id,"turnId":continuation["dispatch"]["turn_id"],"executionId":continuation["spawned_execution_id"]})
+        );
+        let (_, continued_turn) = processor
+            .crud_store
+            .get_turn(
+                continued["threadResult"]["threadId"].as_str().unwrap(),
+                continued["threadResult"]["turnId"].as_str().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            continued_turn.work_owner,
+            pioneer_protocol::TurnWorkOwner::Turn
+        );
+        assert_ne!(continued_turn.id, child.turn_id);
+        assert!(
+            processor
+                .crud_store
+                .list_tasks_created_by_turn(
+                    &task.task.workspace_id,
+                    &child.thread_id,
+                    &child.turn_id
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let request_id = generate_test_request_id("shared-stop", "task");
+        processor.process_request_for_connection(harness.connection_id, &json!({
+            "jsonrpc":"2.0", "id":request_id, "method":"task/cancel", "params":{"taskId":task_id,"reason":"Stop the detached work"}
+        }).to_string()).await;
+        assert_eq!(
+            wait_for_task_status(processor.crud_store.clone(), task_id, TaskStatus::Cancelled)
+                .await,
+            TaskStatus::Cancelled
+        );
+        let (_, parent) = processor
+            .crud_store
+            .get_turn(&launch.thread_id, &launch.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.status, TurnStatus::Completed);
+    });
+}
+
+// Holds an actually dispatched planned run while the facade admits extra work.
+#[derive(Default)]
+struct HoldingPlannedSystemExecutor {
+    handle: std::sync::Mutex<Option<pioneer_tasks::TaskExecutionHandle>>,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tasks::TaskExecutor for HoldingPlannedSystemExecutor {
+    fn kind(&self) -> TaskExecutorKind {
+        TaskExecutorKind::System
+    }
+    async fn start_run(
+        &self,
+        _context: pioneer_tasks::TaskExecutionContext,
+        run: TaskRun,
+        handle: pioneer_tasks::TaskExecutionHandle,
+    ) -> pioneer_tasks::TaskRuntimeResult<pioneer_tasks::TaskExecutorStartOutcome> {
+        handle.mark_started(run.created_at).await?;
+        *self.handle.lock().unwrap() = Some(handle);
+        Ok(pioneer_tasks::TaskExecutorStartOutcome::Started)
+    }
+    async fn cancel_run(
+        &self,
+        _context: pioneer_tasks::TaskExecutionContext,
+        _run_id: &str,
+        _reason: &str,
+        _handle: pioneer_tasks::TaskExecutionHandle,
+    ) -> pioneer_tasks::TaskRuntimeResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn extra_run_completion_preserves_and_executes_original_one_shot() {
+    run_standard_stack_message_test("Extra run preserves one-shot execution", async {
+        // Heap-allocate setup, dispatch and terminal-transition futures: embedding
+        // them in this matrix adds its large frame to their poll stack in debug builds.
+        for scenario in [
+            "future",
+            "queued",
+            "failed",
+            "retry",
+            "finish",
+            "cancel",
+            "planned_first",
+            "planned_first_failed",
+        ] {
+            let scheduled_already_queued = scenario == "queued";
+            let fails = matches!(scenario, "failed" | "retry");
+            let (_harness, processor, turn_id) =
+                Box::pin(start_task_cli_fixture(CLIAgentRuntimeKind::Codex)).await;
+            let binding = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            // Reuse the real System executor so completion goes through queue,
+            // execution handle, terminal writer and configured delivery.
+            let mut params = test_task_create_params(
+                &binding.workspace_id,
+                &binding.thread_id,
+                &turn_id,
+                "One-shot with extra check",
+                3,
+            );
+            params.executor_kind = TaskExecutorKind::System;
+            params.agent_spec = None;
+            params.lifecycle_policy = None;
+            params.trigger = TaskTriggerInput {
+                spec: TaskTriggerSpec::ScheduledAt {
+                    scheduled_at: 4_000_000_000,
+                    timezone: Some("UTC".to_owned()),
+                    catch_up_policy: None,
+                },
+            };
+            params.delivery_policy = Some(TaskDeliveryPolicy {
+                mode: TaskDeliveryMode::Thread,
+                thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+                thread_id: Some(binding.thread_id.clone()),
+                webhook_url: None,
+                include_result: true,
+                format: TaskDeliveryFormat::Summary,
+            });
+            if scenario == "retry" {
+                params.retry_policy = Some(TaskRetryPolicy {
+                    max_attempts: 2,
+                    backoff: TaskRetryBackoffKind::None,
+                    initial_delay_seconds: None,
+                    max_delay_seconds: None,
+                    retry_on: vec![pioneer_protocol::TaskErrorClass::Internal],
+                });
+            }
+            if matches!(scenario, "planned_first" | "planned_first_failed") {
+                params.concurrency_policy = Some(pioneer_protocol::TaskConcurrencyPolicy {
+                    key: None,
+                    max_parallel_runs: 1,
+                    on_conflict: pioneer_protocol::TaskConcurrencyConflictPolicy::Queue,
+                });
+            }
+            let created = Box::pin(
+                processor
+                    .task_runtime
+                    .service()
+                    .create_task(pioneer_tasks::TaskCreateContext::default(), params),
+            )
+            .await
+            .unwrap();
+            let task_id = &created.task.id;
+            assert_eq!(
+                created.task.lifecycle_policy.as_ref().unwrap().completion,
+                TaskCompletionBehavior::CompleteOnTerminalRun
+            );
+            let planned_first = matches!(scenario, "planned_first" | "planned_first_failed");
+            let holding = Arc::new(HoldingPlannedSystemExecutor::default());
+            let mut planned_terminal = None;
+            if planned_first {
+                processor
+                    .task_runtime
+                    .register_executor(holding.clone())
+                    .await;
+                Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
+                    .await
+                    .unwrap();
+                let running = processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(running.runs.len(), 1);
+                assert_eq!(running.runs[0].status, TaskRunStatus::Running);
+                assert_eq!(running.triggers[0].status, TaskTriggerStatus::Exhausted);
+                let terminal = if scenario == "planned_first_failed" {
+                    TaskEventPayload::RunFailed {
+                        task_id: task_id.clone(),
+                        run_id: running.runs[0].id.clone(),
+                        error: Some(pioneer_protocol::TaskError {
+                            recovery_diagnostic: None,
+                            code: "primary_failed".to_owned(),
+                            message: "primary check failed".to_owned(),
+                            class: pioneer_protocol::TaskErrorClass::Internal,
+                            details: None,
+                            failed_run_id: Some(running.runs[0].id.clone()),
+                        }),
+                        completed_at: chrono::Utc::now().timestamp(),
+                    }
+                } else {
+                    TaskEventPayload::RunCompleted {
+                        task_id: task_id.clone(),
+                        run_id: running.runs[0].id.clone(),
+                        result: None,
+                        completed_at: chrono::Utc::now().timestamp(),
+                    }
+                };
+                // Deliberately prepare before extra admission: the writer must
+                // reload completion facts instead of committing TaskCompleted.
+                let prepared = Box::pin(
+                    processor
+                        .crud_store
+                        .prepare_task_terminal_transition(terminal.clone()),
+                )
+                .await
+                .unwrap();
+                planned_terminal = Some((prepared, terminal));
+            }
+            let args =
+                json!({"taskId":task_id, "idempotencyKey":format!("one-shot-extra-{scenario}")});
+            let extra = invoke_task(
+                &processor,
+                &turn_id,
+                &format!("extra-{scenario}"),
+                "task_run_now",
+                args.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(!extra.is_error, "{extra:?}");
+            let run_id = extra.structured_content.as_ref().unwrap()["runId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            if let Some((prepared, terminal)) = planned_terminal {
+                Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
+                    .await
+                    .unwrap();
+                let waiting = processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(waiting.runs.len(), 2);
+                assert_eq!(waiting.runs[0].status, TaskRunStatus::Running);
+                assert_eq!(waiting.runs[1].status, TaskRunStatus::Queued);
+                assert!(waiting.runs[1].trigger_id.is_none());
+                let outcome = Box::pin(
+                    processor
+                        .crud_store
+                        .commit_task_terminal_transition(prepared),
+                )
+                .await
+                .unwrap();
+                processor
+                    .task_runtime
+                    .event_bus()
+                    .publish_many(outcome.events)
+                    .await;
+                let after_primary = processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!after_primary.task.status.is_terminal());
+                assert_eq!(after_primary.runs[1].status, TaskRunStatus::Queued);
+                let primary_handle = holding.handle.lock().unwrap().take().unwrap();
+                match &terminal {
+                    TaskEventPayload::RunCompleted {
+                        result,
+                        completed_at,
+                        ..
+                    } => Box::pin(primary_handle.complete_run(result.clone(), *completed_at))
+                        .await
+                        .unwrap(),
+                    TaskEventPayload::RunFailed {
+                        error,
+                        completed_at,
+                        ..
+                    } => Box::pin(primary_handle.fail_run(error.clone(), *completed_at))
+                        .await
+                        .unwrap(),
+                    _ => unreachable!(),
+                }
+                let replay = invoke_task(
+                    &processor,
+                    &turn_id,
+                    &format!("replay-{scenario}"),
+                    "task_run_now",
+                    args,
+                )
+                .await
+                .unwrap();
+                assert!(!replay.is_error, "{replay:?}");
+                assert_eq!(replay.structured_content.as_ref().unwrap()["runId"], run_id);
+                processor
+                    .task_runtime
+                    .register_executor(Arc::new(CompletingSystemExecutor))
+                    .await;
+                Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
+                    .await
+                    .unwrap();
+                let completed = processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(completed.runs.len(), 2);
+                assert_eq!(completed.runs[1].id, run_id);
+                assert_eq!(completed.runs[1].status, TaskRunStatus::Succeeded);
+                assert_eq!(
+                    completed.task.lifecycle_policy,
+                    created.task.lifecycle_policy
+                );
+                assert_eq!(
+                    completed.task.status,
+                    if scenario == "planned_first_failed" {
+                        TaskStatus::Failed
+                    } else {
+                        TaskStatus::Completed
+                    }
+                );
+                if scenario == "planned_first_failed" {
+                    assert_eq!(
+                        completed.task.error.as_ref().unwrap().code,
+                        "primary_failed"
+                    );
+                }
+                let extra_handle = pioneer_tasks::TaskExecutionHandle::new(
+                    processor.crud_store.clone(),
+                    processor.task_runtime.event_bus(),
+                    task_id.clone(),
+                    run_id.clone(),
+                );
+                Box::pin(extra_handle.complete_run(
+                    completed.runs[1].result.clone(),
+                    completed.runs[1].completed_at.unwrap(),
+                ))
+                .await
+                .unwrap();
+                Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(task_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .runs,
+                    completed.runs
+                );
+                let deliveries = processor
+                    .task_runtime
+                    .service()
+                    .list_deliveries(TaskDeliveriesParams {
+                        workspace_id: binding.workspace_id.clone(),
+                        task_id: Some(task_id.clone()),
+                        run_id: None,
+                        statuses: Vec::new(),
+                        limit: Some(100),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(deliveries.deliveries.len(), 2);
+                continue;
+            }
+            let now = chrono::Utc::now().timestamp();
+            if scheduled_already_queued || fails || matches!(scenario, "finish" | "cancel") {
+                let handle = pioneer_tasks::TaskExecutionHandle::new(
+                    processor.crud_store.clone(),
+                    processor.task_runtime.event_bus(),
+                    task_id.clone(),
+                    run_id.clone(),
+                );
+                handle.mark_started(now).await.unwrap();
+                if matches!(scenario, "finish" | "cancel") {
+                    let tool = if scenario == "finish" {
+                        "task_finish"
+                    } else {
+                        "task_cancel"
+                    };
+                    let stop = invoke_task(
+                        &processor,
+                        &turn_id,
+                        &format!("stop-{scenario}"),
+                        tool,
+                        json!({"taskId":task_id}),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!stop.is_error, "{stop:?}");
+                    if scenario == "finish" {
+                        Box::pin(handle.complete_run(None, now)).await.unwrap();
+                    }
+                    processor
+                        .task_runtime
+                        .register_executor(Arc::new(CompletingSystemExecutor))
+                        .await;
+                    Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
+                        .await
+                        .unwrap();
+                    let stopped = processor
+                        .crud_store
+                        .get_task(task_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(stopped.runs.len(), 1);
+                    assert_eq!(
+                        stopped.task.status,
+                        if scenario == "finish" {
+                            TaskStatus::Completed
+                        } else {
+                            TaskStatus::Cancelled
+                        }
+                    );
+                    assert_eq!(
+                        stopped.runs[0].status,
+                        if scenario == "finish" {
+                            TaskRunStatus::Succeeded
+                        } else {
+                            TaskRunStatus::Cancelled
+                        }
+                    );
+                    assert_eq!(stopped.triggers[0].status, TaskTriggerStatus::Cancelled);
+                    continue;
+                }
+                let before_planned_fire = if scheduled_already_queued {
+                    Some(
+                        Box::pin(processor.crud_store.prepare_task_terminal_transition(
+                            TaskEventPayload::RunCompleted {
+                                task_id: task_id.clone(),
+                                run_id: run_id.clone(),
+                                result: None,
+                                completed_at: now,
+                            },
+                        ))
+                        .await
+                        .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                // No System executor yet: the planned fire becomes a queued
+                // sibling while the additional occurrence owns the serial slot.
+                if scheduled_already_queued {
+                    Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
+                        .await
+                        .unwrap();
+                    let queued = processor
+                        .crud_store
+                        .get_task(task_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(queued.runs.len(), 2);
+                    assert_eq!(queued.runs[1].status, TaskRunStatus::Queued);
+                    assert_eq!(queued.runs[0].status, TaskRunStatus::Running);
+                }
+                if fails {
+                    Box::pin(handle.fail_run(
+                        Some(pioneer_protocol::TaskError {
+                            recovery_diagnostic: None,
+                            code: "extra_failed".to_owned(),
+                            message: "extra check failed".to_owned(),
+                            class: pioneer_protocol::TaskErrorClass::Internal,
+                            details: None,
+                            failed_run_id: Some(run_id.clone()),
+                        }),
+                        now,
+                    ))
+                    .await
+                    .unwrap();
+                } else {
+                    if let Some(prepared) = before_planned_fire {
+                        let outcome = Box::pin(
+                            processor
+                                .crud_store
+                                .commit_task_terminal_transition(prepared),
+                        )
+                        .await
+                        .unwrap();
+                        processor
+                            .task_runtime
+                            .event_bus()
+                            .publish_many(outcome.events)
+                            .await;
+                    }
+                    Box::pin(handle.complete_run(None, now)).await.unwrap();
+                }
+            } else {
+                processor
+                    .task_runtime
+                    .register_executor(Arc::new(CompletingSystemExecutor))
+                    .await;
+                Box::pin(processor.task_runtime.process_due_once(now))
+                    .await
+                    .unwrap();
+            }
+            let after_extra = processor
+                .crud_store
+                .get_task(task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!after_extra.task.status.is_terminal());
+            assert_eq!(
+                after_extra.task.lifecycle_policy,
+                created.task.lifecycle_policy
+            );
+            let completed = after_extra
+                .runs
+                .iter()
+                .find(|run| run.id == run_id)
+                .unwrap();
+            assert_eq!(
+                completed.status,
+                if fails {
+                    TaskRunStatus::Failed
+                } else {
+                    TaskRunStatus::Succeeded
+                }
+            );
+            if fails {
+                assert_eq!(completed.error.as_ref().unwrap().code, "extra_failed");
+            }
+            if !scheduled_already_queued {
+                assert_eq!(after_extra.triggers[0].spec, created.trigger.spec);
+                assert_eq!(after_extra.triggers[0].next_fire_at, Some(4_000_000_000));
+            }
+            // A reconstructed handle replays the terminal outcome, and a fresh
+            // facade invocation recovers the original durable operation receipt.
+            let recovered = pioneer_tasks::TaskExecutionHandle::new(
+                processor.crud_store.clone(),
+                processor.task_runtime.event_bus(),
+                task_id.clone(),
+                run_id.clone(),
+            );
+            if fails {
+                Box::pin(
+                    recovered.fail_run(completed.error.clone(), completed.completed_at.unwrap()),
+                )
+                .await
+                .unwrap();
+            } else {
+                Box::pin(
+                    recovered
+                        .complete_run(completed.result.clone(), completed.completed_at.unwrap()),
+                )
+                .await
+                .unwrap();
+            }
+            let replay = invoke_task(
+                &processor,
+                &turn_id,
+                &format!("extra-replay-{scenario}"),
+                "task_run_now",
+                args,
+            )
+            .await
+            .unwrap();
+            assert!(!replay.is_error, "{replay:?}");
+            assert_eq!(replay.structured_content.as_ref().unwrap()["runId"], run_id);
+            processor
+                .task_runtime
+                .register_executor(Arc::new(CompletingSystemExecutor))
+                .await;
+            if scenario == "retry" {
+                Box::pin(processor.task_runtime.process_due_once(now))
+                    .await
+                    .unwrap();
+                let retried = processor
+                    .crud_store
+                    .get_task(task_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retried.runs.len(), 2);
+                assert_eq!(
+                    retried.runs[1].retry_of_run_id.as_deref(),
+                    Some(run_id.as_str())
+                );
+                assert_eq!(retried.runs[1].status, TaskRunStatus::Succeeded);
+                assert!(!retried.task.status.is_terminal());
+                assert_eq!(retried.triggers[0].next_fire_at, Some(4_000_000_000));
+            }
+            Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
+                .await
+                .unwrap();
+            Box::pin(processor.task_runtime.process_due_once(4_000_000_000))
+                .await
+                .unwrap();
+            let final_state = processor
+                .crud_store
+                .get_task(task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                final_state.runs.len(),
+                if scenario == "retry" { 3 } else { 2 }
+            );
+            assert_eq!(
+                final_state
+                    .runs
+                    .iter()
+                    .filter(|run| run.status == TaskRunStatus::Failed)
+                    .count(),
+                usize::from(fails)
+            );
+            assert_eq!(
+                final_state.runs.last().unwrap().status,
+                TaskRunStatus::Succeeded
+            );
+            assert_eq!(
+                final_state
+                    .runs
+                    .iter()
+                    .filter(|run| run.trigger_id.as_deref() == Some(created.trigger.id.as_str()))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                final_state.task.status,
+                if scenario == "failed" {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Completed
+                }
+            );
+            if scenario == "failed" {
+                assert_eq!(
+                    final_state.task.error.as_ref().unwrap().code,
+                    "extra_failed"
+                );
+            }
+            let deliveries = processor
+                .task_runtime
+                .service()
+                .list_deliveries(pioneer_protocol::TaskDeliveriesParams {
+                    workspace_id: binding.workspace_id.clone(),
+                    task_id: Some(task_id.clone()),
+                    run_id: None,
+                    statuses: Vec::new(),
+                    limit: Some(100),
+                })
+                .await
+                .unwrap();
+            assert_eq!(deliveries.deliveries.len(), 2);
+            if scenario == "failed" {
+                let failed_delivery = deliveries
+                    .deliveries
+                    .iter()
+                    .find(|delivery| delivery.run_id == run_id)
+                    .unwrap();
+                assert_eq!(
+                    failed_delivery.error_snapshot.as_ref().unwrap().code,
+                    "extra_failed"
+                );
+            }
         }
     });
 }

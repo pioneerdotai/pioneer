@@ -15,7 +15,6 @@ pub struct Model {
     pub scope_kind: Option<String>,
     pub scope_key_hash: Option<String>,
     pub memory_id: Option<String>,
-    pub capsule_id: Option<String>,
     pub priority: i64,
     pub attempts: i64,
     pub max_attempts: i64,

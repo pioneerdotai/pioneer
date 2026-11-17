@@ -1,5 +1,8 @@
 //! Shell-neutral reductions for voice session command responses and events.
 
+pub mod capture_worker;
+pub mod resampling;
+
 use pioneer_protocol::{
     VoiceSessionFinalizeResponse, VoiceSessionOutcome, VoiceSessionResultNotification,
 };

@@ -11,6 +11,7 @@ struct CompletionProvider {
 
 fn response(termination: ProviderTermination) -> ChatResponse {
     ChatResponse {
+        messages: Vec::new(),
         text: r#"{"facts":[]}"#.to_owned(),
         termination,
         usage: None,
@@ -82,9 +83,13 @@ async fn extractor_completion_policy_stream_and_non_stream() {
                     StreamChunk::final_chunk_with(termination.clone()),
                 ],
             };
-            let result =
-                request_post_turn_extractor_json(&provider, "selected-model", "extract".to_owned())
-                    .await;
+            let result = request_post_turn_extractor_json(
+                &provider,
+                "selected-model",
+                "extract".to_owned(),
+                None,
+            )
+            .await;
             if let Some(class) = class {
                 let error = result.unwrap_err();
                 assert!(!error.retryable);
@@ -108,9 +113,10 @@ async fn extractor_eof_even_after_valid_json_is_retryable_but_missing_final_term
             response: response(ProviderTermination::Complete),
             chunks: vec![StreamChunk::delta(text)],
         };
-        let error = request_post_turn_extractor_json(&provider, "model", "extract".to_owned())
-            .await
-            .unwrap_err();
+        let error =
+            request_post_turn_extractor_json(&provider, "model", "extract".to_owned(), None)
+                .await
+                .unwrap_err();
         assert!(error.retryable);
         assert_eq!(metadata(&error, "failure_class"), "stream_truncated");
     }
@@ -121,7 +127,7 @@ async fn extractor_eof_even_after_valid_json_is_retryable_but_missing_final_term
         response: response(ProviderTermination::Complete),
         chunks: vec![final_chunk],
     };
-    let error = request_post_turn_extractor_json(&provider, "model", "extract".to_owned())
+    let error = request_post_turn_extractor_json(&provider, "model", "extract".to_owned(), None)
         .await
         .unwrap_err();
     assert!(!error.retryable);
@@ -146,9 +152,10 @@ async fn extractor_unexpected_tools_and_byte_limit_fail_closed() {
                 StreamChunk::final_chunk_with(ProviderTermination::Complete),
             ],
         };
-        let error = request_post_turn_extractor_json(&provider, "model", "extract".to_owned())
-            .await
-            .unwrap_err();
+        let error =
+            request_post_turn_extractor_json(&provider, "model", "extract".to_owned(), None)
+                .await
+                .unwrap_err();
         assert_eq!(metadata(&error, "failure_class"), "unexpected_tool_calls");
         assert!(!error.retryable);
         assert!(!format!("{error:?}").contains("PRIVATE_TOOL_CANARY"));
@@ -164,9 +171,10 @@ async fn extractor_unexpected_tools_and_byte_limit_fail_closed() {
                 StreamChunk::final_chunk_with(ProviderTermination::Complete),
             ],
         };
-        let error = request_post_turn_extractor_json(&provider, "model", "extract".to_owned())
-            .await
-            .unwrap_err();
+        let error =
+            request_post_turn_extractor_json(&provider, "model", "extract".to_owned(), None)
+                .await
+                .unwrap_err();
         assert_eq!(metadata(&error, "failure_class"), "response_too_large");
         assert!(!error.retryable);
     }
@@ -228,5 +236,61 @@ async fn stream_errors_require_typed_proof_for_completion_retry_policy() {
         );
         assert_eq!(metadata(&error, "failure_stage"), "transport_completion");
         assert!(error.retryable);
+    }
+}
+
+#[tokio::test]
+async fn extractor_uses_result_projection_and_drains_after_phased_terminal() {
+    use pioneer_provider::{
+        ProviderMessage, ProviderMessageBoundary as Boundary, ProviderMessageId,
+        ProviderMessageMetadata,
+    };
+    for streaming in [false, true] {
+        let messages = vec![
+            ProviderMessage {
+                id: ProviderMessageId(0),
+                phase: Some(pioneer_protocol::AgentMessagePhase::Commentary),
+                text: "not JSON: preparing facts".into(),
+            },
+            ProviderMessage {
+                id: ProviderMessageId(1),
+                phase: None,
+                text: r#"{"facts":[]}"#.into(),
+            },
+        ];
+        let mut completed = response(ProviderTermination::Complete);
+        completed.messages = messages.clone();
+        let mut chunks = Vec::new();
+        for msg in messages {
+            for boundary in [Boundary::Start, Boundary::Delta, Boundary::End] {
+                let mut chunk = StreamChunk::delta(if boundary == Boundary::Delta {
+                    msg.text.as_str()
+                } else {
+                    ""
+                });
+                chunk.message = Some(ProviderMessageMetadata {
+                    id: msg.id,
+                    phase: msg.phase,
+                    boundary,
+                });
+                chunks.push(chunk);
+            }
+        }
+        chunks.push(StreamChunk::final_chunk_with(ProviderTermination::Complete));
+        chunks.push(StreamChunk::usage(pioneer_provider::TokenUsage {
+            output_tokens: Some(10),
+            ..Default::default()
+        }));
+        let provider = CompletionProvider {
+            streaming,
+            response: completed,
+            chunks,
+        };
+        assert_eq!(
+            request_post_turn_extractor_json(&provider, "selected-model", "extract".into(), None)
+                .await
+                .unwrap(),
+            r#"{"facts":[]}"#
+        );
     }
 }

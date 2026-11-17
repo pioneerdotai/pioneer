@@ -43,6 +43,25 @@ pub fn project_tool_result(input: ToolProjectionInput<'_>) -> ToolResultEnvelope
     }
 }
 
+/// Measure a successful built-in JSON result using its complete LLM projection.
+pub fn builtin_json_llm_payload_size(
+    tool_name: &str,
+    value: &JsonValue,
+) -> serde_json::Result<usize> {
+    let projection = project_tool_result(ToolProjectionInput {
+        call_id: "",
+        tool_name,
+        arguments: &JsonValue::Null,
+        raw_output_text: "",
+        raw_output_json: value,
+        success: true,
+        outcome: &ToolOutcome::ok(),
+        output_policy: &ToolOutputPolicySnapshot::for_tool_name(tool_name),
+        output_projection: &ToolOutputProjectionKind::Builtin,
+    });
+    Ok(serde_json::to_vec(&projection.llm_payload())?.len())
+}
+
 fn project_builtin(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     match input.tool_name {
         "exec_command" | "write_stdin" => project_shell(input),
@@ -54,7 +73,7 @@ fn project_builtin(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         "read_skill" => project_read_skill(input),
         "list_dir" => project_list_dir(input),
         "grep_files" => project_grep_files(input),
-        "computer_use" => project_computer_use(input),
+        name if crate::is_computer_use_tool(name) => project_computer_use(input),
         _ => project_dynamic_generic(input),
     }
 }
@@ -94,32 +113,69 @@ fn project_shell(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         .and_then(JsonValue::as_bool);
     let truncated = shell_truncated(input.raw_output_json);
 
-    let display = ToolDisplayPayload::Shell {
-        stdout: stdout.clone(),
-        stderr: stderr.clone(),
-        aggregated_output: aggregated_output.clone(),
-        exit_code,
-        duration_ms,
-        timed_out,
+    let shell_summary = summary(
+        format!("{} completed", input.tool_name),
+        Vec::new(),
+        safe_shell_metadata(&input),
         truncated,
+    );
+    let display = if matches!(
+        input.output_policy.timeline,
+        TimelineOutputPolicy::Full { .. }
+    ) {
+        ToolDisplayPayload::Shell {
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+            aggregated_output: aggregated_output.clone(),
+            exit_code,
+            duration_ms,
+            timed_out,
+            truncated,
+        }
+    } else {
+        display_for_policy(input.output_policy, shell_summary.clone())
     };
-    let storage = ToolStoragePayload::Shell {
-        stdout,
-        stderr,
-        aggregated_output,
-        exit_code,
-        duration_ms,
-        timed_out,
-        truncated,
-    };
+    let storage = shell_storage_for_policy(
+        input.output_policy,
+        ToolStoragePayload::Shell {
+            stdout,
+            stderr,
+            aggregated_output,
+            exit_code,
+            duration_ms,
+            timed_out,
+            truncated,
+        },
+        shell_summary,
+    );
 
     envelope(
         &input,
-        llm_view_for_policy(&input),
+        shell_llm_view_for_policy(&input),
         display,
         storage,
         recovery_view(&input),
     )
+}
+
+fn shell_storage_for_policy(
+    policy: &ToolOutputPolicySnapshot,
+    shell: ToolStoragePayload,
+    summary: ToolOutputSummary,
+) -> ToolStoragePayload {
+    if let StorageOutputPolicy::Full { max_bytes } = policy.storage {
+        let value = serde_json::to_value(&shell).expect("shell storage is JSON");
+        // Keep the raw shape when it fits; only bound text if storage itself is capped.
+        return crate::bound_shell_output(&value, |value| {
+            serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= max_bytes)
+        })
+        .and_then(|mut value| {
+            value.as_object_mut()?.remove("model_output_truncated");
+            serde_json::from_value(value).ok()
+        })
+        .unwrap_or(ToolStoragePayload::None);
+    }
+    storage_for_policy(policy, summary.clone(), summary.metadata.to_json())
 }
 
 fn shell_truncated(raw_output_json: &JsonValue) -> bool {
@@ -565,19 +621,43 @@ fn project_read_file(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
 }
 
 fn read_file_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
-    let raw = input.raw_output_json;
     bounded_model_json(
         input,
-        serde_json::json!({
-            "path": raw.get("path").cloned().unwrap_or(JsonValue::Null),
-            "text": raw.get("text").or_else(|| raw.get("output")).cloned().unwrap_or_else(|| JsonValue::String(input.raw_output_text.to_owned())),
-            "start_line": raw.get("start_line").cloned().unwrap_or(JsonValue::Null),
-            "end_line": raw.get("end_line").cloned().unwrap_or(JsonValue::Null),
-            "truncated": raw.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
-            "continuation": raw.get("continuation").cloned().unwrap_or(JsonValue::Null),
-            "next_line": raw.get("next_line").cloned().unwrap_or(JsonValue::Null),
-        }),
+        read_file_model_json(input.raw_output_json, input.raw_output_text),
     )
+}
+
+/// Shared by the producer budget check and model projection: pagination must
+/// account for precisely the JSON that enters the working tool message.
+pub(crate) fn read_file_model_json(raw: &JsonValue, fallback: &str) -> JsonValue {
+    let mut view = serde_json::Map::new();
+    for key in [
+        "path",
+        "start_line",
+        "end_line",
+        "start_byte",
+        "range",
+        "partial_line",
+        "truncated",
+        "continuation",
+        "next_line",
+    ] {
+        view.insert(key.into(), raw.get(key).cloned().unwrap_or(JsonValue::Null));
+    }
+    view.insert(
+        "truncated".into(),
+        raw.get("truncated")
+            .cloned()
+            .unwrap_or(JsonValue::Bool(false)),
+    );
+    view.insert(
+        "text".into(),
+        raw.get("text")
+            .or_else(|| raw.get("output"))
+            .cloned()
+            .unwrap_or_else(|| JsonValue::String(fallback.into())),
+    );
+    JsonValue::Object(view)
 }
 
 fn project_read_skill(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
@@ -781,113 +861,40 @@ fn project_grep_files(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     )
 }
 
-fn project_computer_use(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
-    let metadata = compact_computer_use_metadata(input.raw_output_json);
-    let lines = computer_use_summary_lines(input.raw_output_json);
+pub(crate) fn project_computer_use(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
+    // Native payloads remain in the model view. Technical surfaces receive only content-free facts.
+    let metadata =
+        serde_json::json!({"success": input.success, "incomplete": input.outcome.incomplete});
     let summary = summary(
-        input
-            .raw_output_json
-            .get("action")
-            .and_then(JsonValue::as_str)
-            .map(|action| format!("computer_use {action}"))
-            .unwrap_or_else(|| "computer_use completed".to_owned()),
-        lines,
+        format!(
+            "{} {}",
+            input.tool_name,
+            if !input.success {
+                "failed"
+            } else if input.outcome.incomplete {
+                "outcome unconfirmed"
+            } else {
+                "returned"
+            }
+        ),
+        Vec::new(),
         metadata.clone(),
         input.outcome.incomplete,
     );
+    let mut recovery = recovery_view(&input);
+    if let Some(recovery) = &mut recovery {
+        // A proxy's more permissive generic policy cannot persist screen/tree
+        // excerpts or structured payloads from the trusted CUA result.
+        recovery.diagnostic_excerpt = None;
+        recovery.continuation = None;
+    }
     envelope(
         &input,
         llm_view_for_policy(&input),
-        display_for_policy(input.output_policy, summary),
-        ToolStoragePayload::Metadata {
-            metadata: ToolMetadata::from_json(metadata),
-        },
-        recovery_view(&input),
+        display_for_policy(input.output_policy, summary.clone()),
+        storage_for_policy(input.output_policy, summary, metadata),
+        recovery,
     )
-}
-
-fn computer_use_summary_lines(value: &JsonValue) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(coordinate) = value.pointer("/result/coordinate_observability") {
-        lines.extend(computer_use_coordinate_lines(coordinate));
-    } else if let Some(coordinate) = value.get("coordinate_observability") {
-        lines.extend(computer_use_coordinate_lines(coordinate));
-    }
-    lines
-}
-
-fn computer_use_coordinate_lines(coordinate: &JsonValue) -> Vec<String> {
-    let Some(slots) = coordinate.get("slots").and_then(JsonValue::as_object) else {
-        return Vec::new();
-    };
-    slots
-        .iter()
-        .filter_map(|(name, slot)| {
-            let requested = slot.get("requested_point")?;
-            let converted = slot.get("converted_point")?;
-            let requested_space = slot
-                .get("requested_space")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("unknown");
-            let converted_space = slot
-                .get("converted_space")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("unknown");
-            let requested_x = requested.get("x").and_then(JsonValue::as_i64)?;
-            let requested_y = requested.get("y").and_then(JsonValue::as_i64)?;
-            let converted_x = converted.get("x").and_then(JsonValue::as_i64)?;
-            let converted_y = converted.get("y").and_then(JsonValue::as_i64)?;
-            let status = slot
-                .get("validation_status")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("unknown");
-            Some(format!(
-                "coordinate {name}: {requested_space}({requested_x},{requested_y}) -> {converted_space}({converted_x},{converted_y}), validation={status}"
-            ))
-        })
-        .collect()
-}
-
-fn compact_computer_use_metadata(value: &JsonValue) -> JsonValue {
-    let mut metadata = remove_raw_like_fields(value);
-    compact_accessibility_payload(&mut metadata);
-    metadata
-}
-
-fn compact_accessibility_payload(value: &mut JsonValue) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    if let Some(tree) = object.get_mut("accessibility_tree") {
-        compact_accessibility_tree_nodes(tree);
-    }
-    if let Some(accessibility) = object.get_mut("accessibility") {
-        compact_accessibility_tree_nodes(accessibility);
-    }
-    if let Some(llm_context) = object
-        .get_mut("llm_context")
-        .and_then(JsonValue::as_object_mut)
-    {
-        if let Some(tree) = llm_context.get_mut("accessibility_tree") {
-            compact_accessibility_tree_nodes(tree);
-        }
-        if let Some(accessibility) = llm_context.get_mut("accessibility") {
-            compact_accessibility_tree_nodes(accessibility);
-        }
-    }
-}
-
-fn compact_accessibility_tree_nodes(value: &mut JsonValue) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    if let Some(nodes) = object.remove("nodes") {
-        let node_count = nodes.as_array().map_or(0, Vec::len);
-        object.insert(
-            "node_count".to_owned(),
-            JsonValue::Number(serde_json::Number::from(node_count)),
-        );
-    }
 }
 
 fn project_dynamic_generic(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
@@ -953,27 +960,28 @@ fn project_dynamic_http(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
 }
 
 fn project_dynamic_shell(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
-    if shell_full_projection_allowed(input.output_policy) {
-        return project_shell(input);
+    // Storage permission is independent of timeline visibility. Preserve the
+    // existing dynamic display policy while retaining a Full shell source.
+    let display = if shell_full_projection_allowed(input.output_policy) {
+        None
+    } else {
+        let metadata = safe_shell_metadata(&input);
+        let summary = summary(
+            format!("{} completed", input.tool_name),
+            shell_summary_lines(&metadata),
+            metadata.clone(),
+            metadata
+                .get("truncated")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(input.outcome.incomplete),
+        );
+        Some(display_for_policy(input.output_policy, summary))
+    };
+    let mut projected = project_shell(input);
+    if let Some(display) = display {
+        projected.display = display;
     }
-
-    let metadata = safe_shell_metadata(&input);
-    let summary = summary(
-        format!("{} completed", input.tool_name),
-        shell_summary_lines(&metadata),
-        metadata.clone(),
-        metadata
-            .get("truncated")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(input.outcome.incomplete),
-    );
-    envelope(
-        &input,
-        llm_view_for_policy(&input),
-        display_for_policy(input.output_policy, summary.clone()),
-        storage_for_policy(input.output_policy, summary, metadata),
-        recovery_view(&input),
-    )
+    projected
 }
 
 fn project_dynamic_mcp(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
@@ -1118,10 +1126,12 @@ fn project_dynamic_function_proxy(
     } else {
         display_for_policy(input.output_policy, summary.clone())
     };
-    let storage = if shell_full_projection_allowed(input.output_policy)
-        && let ToolStoragePayload::Shell { .. } = &target.storage
+    let storage = if matches!(
+        input.output_policy.storage,
+        StorageOutputPolicy::Full { .. }
+    ) && let ToolStoragePayload::Shell { .. } = &target.storage
     {
-        target.storage.clone()
+        shell_storage_for_policy(input.output_policy, target.storage.clone(), summary.clone())
     } else if matches!(&target.storage, ToolStoragePayload::Summary(_))
         && matches!(
             input.output_policy.storage,
@@ -1134,7 +1144,13 @@ fn project_dynamic_function_proxy(
     };
 
     ToolResultEnvelope {
-        llm_view: target.llm_view,
+        llm_view: if target_projection_kind.is_shell(target_tool_name)
+            && matches!(input.output_policy.llm, LlmOutputPolicy::SummaryOnly)
+        {
+            llm_view_for_policy(&input)
+        } else {
+            target.llm_view
+        },
         display,
         storage,
         recovery: recovery_view(&input),
@@ -1159,6 +1175,76 @@ fn envelope(
         outcome: input.outcome.clone(),
         success: input.success,
         output_policy: input.output_policy.clone(),
+    }
+}
+
+// Compact only the model copy, before byte bounding. Stream identity and all
+// other metadata stay intact; unfamiliar aggregates are deliberately retained.
+fn shell_llm_view_for_policy(input: &ToolProjectionInput<'_>) -> ToolResultView {
+    match input.output_policy.llm {
+        LlmOutputPolicy::Full { max_bytes } | LlmOutputPolicy::Structured { max_bytes } => {
+            if input.raw_output_json.is_null() && !input.raw_output_text.is_empty() {
+                return ToolResultView::Text {
+                    text: input.raw_output_text.to_owned(),
+                    truncated: false,
+                }
+                .bounded_to_bytes(max_bytes);
+            }
+            let mut value = input.raw_output_json.clone();
+            if let (Some(stdout), Some(stderr), Some(aggregate)) = (
+                value.get("stdout").and_then(JsonValue::as_str),
+                value.get("stderr").and_then(JsonValue::as_str),
+                value.get("aggregated_output").and_then(JsonValue::as_str),
+            ) {
+                let combined = if stdout.is_empty() {
+                    stderr.to_owned()
+                } else if stderr.is_empty() {
+                    stdout.to_owned()
+                } else {
+                    format!("{stdout}\n{stderr}")
+                };
+                if aggregate == combined {
+                    let object = value
+                        .as_object_mut()
+                        .expect("shell fields require an object");
+                    object.remove("aggregated_output");
+                    if let Some(flags) = object
+                        .get_mut("truncated")
+                        .and_then(JsonValue::as_object_mut)
+                    {
+                        flags.remove("aggregated_output");
+                    }
+                }
+            }
+            if let Some(object) = value.as_object_mut() {
+                object.insert("shell_model_output".into(), 1.into());
+            }
+            crate::bound_shell_output(&value, |candidate| {
+                let view = ToolResultView::Json {
+                    value: candidate.clone(),
+                    truncated: false,
+                };
+                let projected = envelope(
+                    input,
+                    view.clone(),
+                    ToolDisplayPayload::Hidden,
+                    ToolStoragePayload::None,
+                    None,
+                );
+                view.serialized_size_bytes() <= max_bytes
+                    && serde_json::to_vec(&projected.llm_payload())
+                        .is_ok_and(|bytes| bytes.len() <= max_bytes)
+            })
+            .map(|value| ToolResultView::Json {
+                truncated: value
+                    .get("model_output_truncated")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                value,
+            })
+            .unwrap_or(ToolResultView::Empty)
+        }
+        LlmOutputPolicy::SummaryOnly => llm_view_for_policy(input),
     }
 }
 
@@ -1355,10 +1441,6 @@ fn safe_metadata_from_unknown(input: &ToolProjectionInput<'_>) -> JsonValue {
         "jsonHash": sha256_hex(input.raw_output_json.to_string().as_bytes()),
         "sanitizedResult": sanitize_dynamic_value(input.raw_output_json, None),
     })
-}
-
-fn remove_raw_like_fields(value: &JsonValue) -> JsonValue {
-    sanitize_known_metadata_value(value, None)
 }
 
 fn safe_metadata_from_projection(
@@ -1653,6 +1735,412 @@ mod tests {
 
     fn ok_outcome() -> ToolOutcome {
         ToolOutcome::ok()
+    }
+
+    #[test]
+    fn shell_model_projection_removes_only_exact_structural_aggregates() {
+        for (stdout, stderr, aggregate, keep) in [
+            ("OUT", "", "OUT", false),
+            ("", "ERR", "ERR", false),
+            ("OUT", "ERR", "OUT\nERR", false),
+            ("", "", "", false),
+            ("same", "same", "same\nsame", false),
+            ("日本語\nline\nline", "", "日本語\nline\nline", false),
+            ("OUT", "ERR", "ERR\nOUT", true),
+            ("OUT", "", "OUT\nextra diagnostics", true),
+            ("OUT", "ERR", "O... [output truncated]", true),
+        ] {
+            for tool_name in ["exec_command", "write_stdin"] {
+                let raw = serde_json::json!({
+                    "stdout": stdout, "stderr": stderr, "aggregated_output": aggregate,
+                    "exit_code": 124, "timed_out": true, "duration_ms": 15,
+                    "session_id": 7, "command": ["sh"],
+                    "truncated": {"stdout": false, "stderr": false, "aggregated_output": keep},
+                    "output_stats": {"full_output_available": false}
+                });
+                let envelope = project_tool_result(ToolProjectionInput {
+                    call_id: "call",
+                    tool_name,
+                    arguments: &JsonValue::Null,
+                    raw_output_text: aggregate,
+                    raw_output_json: &raw,
+                    success: false,
+                    outcome: &ToolOutcome::recoverable(
+                        ToolErrorClass::Timeout,
+                        "retry",
+                        true,
+                        Some("timeout".into()),
+                    ),
+                    output_policy: &ToolOutputPolicySnapshot::for_tool_name(tool_name),
+                    output_projection: &ToolOutputProjectionKind::Builtin,
+                });
+                let message = envelope
+                    .to_model_input_item("call", tool_name)
+                    .into_chat_message();
+                let model: JsonValue = serde_json::from_str(&message.content).unwrap();
+                assert_eq!(model["stdout"], stdout);
+                assert_eq!(model["stderr"], stderr);
+                assert_eq!(model.get("aggregated_output").is_some(), keep);
+                assert_eq!(model["truncated"].get("aggregated_output").is_some(), keep);
+                for key in [
+                    "exit_code",
+                    "timed_out",
+                    "duration_ms",
+                    "session_id",
+                    "command",
+                    "output_stats",
+                ] {
+                    assert_eq!(model[key], raw[key], "{key}");
+                }
+                assert_eq!(message.tool_call_id.as_deref(), Some("call"));
+                assert!(
+                    matches!(&envelope.storage, ToolStoragePayload::Shell { aggregated_output, .. }
+                    if aggregated_output.as_deref() == (!aggregate.is_empty()).then_some(aggregate))
+                );
+                assert!(matches!(
+                    &envelope.display,
+                    ToolDisplayPayload::Shell { .. }
+                ));
+                assert!(envelope.recovery.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn producer_shell_payload_preserves_status_and_continuation_in_model_view() {
+        use crate::shell_format::{ExecPayloadInput, build_exec_model_payload};
+        for (exit_code, timed_out, session_id, outcome) in [
+            (Some(0), false, None, ToolOutcome::ok()),
+            (
+                Some(1),
+                false,
+                None,
+                ToolOutcome::fatal(ToolErrorClass::ExecutionFailed, None),
+            ),
+            (
+                None,
+                true,
+                None,
+                ToolOutcome::recoverable(ToolErrorClass::Timeout, "retry", true, None),
+            ),
+            (
+                None,
+                false,
+                Some(7),
+                ToolOutcome::partial("running", "write_stdin"),
+            ),
+        ] {
+            let raw = serde_json::to_value(build_exec_model_payload(ExecPayloadInput {
+                exit_code,
+                timed_out,
+                session_id,
+                duration_ms: 12,
+                stdout: "unique output".into(),
+                stderr: String::new(),
+                command: vec!["sh".into()],
+                max_output_tokens: Some(1),
+                force_truncated_stdout: false,
+                force_truncated_stderr: false,
+            }))
+            .unwrap();
+            for kind in [
+                ToolOutputProjectionKind::Builtin,
+                ToolOutputProjectionKind::DynamicShell,
+            ] {
+                let envelope = project_tool_result(ToolProjectionInput {
+                    call_id: "call",
+                    tool_name: "exec_command",
+                    arguments: &JsonValue::Null,
+                    raw_output_text: "UI",
+                    raw_output_json: &raw,
+                    success: exit_code == Some(0),
+                    outcome: &outcome,
+                    output_policy: &ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                    output_projection: &kind,
+                });
+                let model = envelope.llm_payload();
+                assert_eq!(model["stdout"], "uniq\n... [output truncated]");
+                assert!(model.get("aggregated_output").is_none());
+                assert_eq!(model["truncated"]["stdout"], true);
+                assert_eq!(model.get("exit_code"), raw.get("exit_code"));
+                assert_eq!(model.get("session_id"), raw.get("session_id"));
+                assert_eq!(model["timed_out"], timed_out);
+                assert_eq!(
+                    serde_json::to_value(&envelope.outcome).unwrap(),
+                    serde_json::to_value(&outcome).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shell_model_projection_preserves_legacy_and_policy_boundaries() {
+        let cases = [
+            serde_json::json!({"aggregated_output":"legacy output"}),
+            serde_json::json!({"stdout":"partial", "aggregated_output":"partial"}),
+            serde_json::json!({"error":"cancelled"}),
+            serde_json::json!({"stdout":"abcdefgh\n... [output truncated]", "stderr":"",
+                "aggregated_output":"abcdefgh\n... [output truncated]",
+                "truncated":{"stdout":true,"stderr":false,"aggregated_output":true}}),
+        ];
+        for raw in cases {
+            let policy = ToolOutputPolicySnapshot::for_tool_name("exec_command");
+            let input = ToolProjectionInput {
+                call_id: "call",
+                tool_name: "exec_command",
+                arguments: &JsonValue::Null,
+                raw_output_text: "hidden raw text",
+                raw_output_json: &raw,
+                success: true,
+                outcome: &ToolOutcome::ok(),
+                output_policy: &policy,
+                output_projection: &ToolOutputProjectionKind::Builtin,
+            };
+            let view = shell_llm_view_for_policy(&input);
+            if raw.get("stderr").is_none() {
+                assert_eq!(
+                    view,
+                    ToolResultView::Json {
+                        value: {
+                            let mut expected = raw.clone();
+                            expected["shell_model_output"] = 1.into();
+                            expected
+                        },
+                        truncated: false
+                    }
+                );
+            } else {
+                let ToolResultView::Json { value, .. } = view else {
+                    panic!("JSON view");
+                };
+                assert_eq!(value["truncated"]["stdout"], true);
+                assert!(value.get("aggregated_output").is_none());
+            }
+        }
+        let policy = ToolOutputPolicySnapshot::for_tool_name("exec_command");
+        let fallback = shell_llm_view_for_policy(&ToolProjectionInput {
+            call_id: "legacy",
+            tool_name: "exec_command",
+            arguments: &JsonValue::Null,
+            raw_output_text: "legacy text",
+            raw_output_json: &JsonValue::Null,
+            success: true,
+            outcome: &ToolOutcome::ok(),
+            output_policy: &policy,
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        assert_eq!(
+            fallback,
+            ToolResultView::Text {
+                text: "legacy text".into(),
+                truncated: false
+            }
+        );
+        let raw = serde_json::json!({"stdout":"SECRET".repeat(1000), "stderr":"",
+            "aggregated_output":"SECRET".repeat(1000)});
+        for llm in [
+            LlmOutputPolicy::Full { max_bytes: 256 },
+            LlmOutputPolicy::Structured { max_bytes: 256 },
+            LlmOutputPolicy::SummaryOnly,
+        ] {
+            let mut policy = ToolOutputPolicySnapshot::for_tool_name("exec_command");
+            policy.llm = llm.clone();
+            let envelope = project_tool_result(ToolProjectionInput {
+                call_id: "call",
+                tool_name: "exec_command",
+                arguments: &JsonValue::Null,
+                raw_output_text: "HIDDEN",
+                raw_output_json: &raw,
+                success: true,
+                outcome: &ToolOutcome::ok(),
+                output_policy: &policy,
+                output_projection: &ToolOutputProjectionKind::Builtin,
+            });
+            if matches!(llm, LlmOutputPolicy::SummaryOnly) {
+                assert!(!envelope.llm_text().contains("SECRET"));
+            } else {
+                assert!(envelope.llm_view.serialized_size_bytes() <= 256);
+            }
+            assert!(!envelope.llm_text().contains("HIDDEN"));
+        }
+    }
+
+    #[test]
+    fn shell_storage_and_retention_do_not_widen_model_or_timeline_policy() {
+        let raw = serde_json::json!({"stdout":"PRIVATE_SHELL_SENTINEL", "stderr":"", "aggregated_output":"PRIVATE_SHELL_SENTINEL", "session_id":23});
+        for storage in [
+            StorageOutputPolicy::Full { max_bytes: 4096 },
+            StorageOutputPolicy::Summary { max_chars: 200 },
+            StorageOutputPolicy::MetadataOnly,
+            StorageOutputPolicy::None,
+        ] {
+            for retention in [
+                LlmRetentionPolicy::DoNotRetain,
+                LlmRetentionPolicy::UntilTurnTerminal { max_bytes: 1024 },
+            ] {
+                for proxy in [false, true] {
+                    let mut policy = ToolOutputPolicySnapshot::for_tool_name("exec_command");
+                    policy.timeline = TimelineOutputPolicy::Summary { max_chars: 200 };
+                    policy.storage = storage.clone();
+                    policy.llm_retention = retention.clone();
+                    let kind = if proxy {
+                        ToolOutputProjectionKind::DynamicFunctionProxy {
+                            target_tool_name: "exec_command".into(),
+                            target_policy: policy.clone(),
+                            target_projection_kind: Box::new(ToolOutputProjectionKind::Builtin),
+                        }
+                    } else {
+                        ToolOutputProjectionKind::DynamicShell
+                    };
+                    let projected = project_tool_result(ToolProjectionInput {
+                        call_id: "call",
+                        tool_name: "skill.shell",
+                        arguments: &JsonValue::Null,
+                        raw_output_text: "PRIVATE_SHELL_SENTINEL",
+                        raw_output_json: &raw,
+                        success: true,
+                        outcome: &ToolOutcome::ok(),
+                        output_policy: &policy,
+                        output_projection: &kind,
+                    });
+                    assert!(
+                        !serde_json::to_string(&projected.display)
+                            .unwrap()
+                            .contains("PRIVATE_SHELL_SENTINEL")
+                    );
+                    assert_eq!(
+                        serde_json::to_string(&projected.storage)
+                            .unwrap()
+                            .contains("PRIVATE_SHELL_SENTINEL"),
+                        matches!(storage, StorageOutputPolicy::Full { .. })
+                    );
+                    assert_eq!(projected.output_policy.llm_retention, retention);
+                    assert!(projected.llm_payload().get("aggregated_output").is_none());
+                }
+            }
+        }
+        let mut outer = ToolOutputPolicySnapshot::for_tool_name("exec_command");
+        outer.llm = LlmOutputPolicy::SummaryOnly;
+        let projected = project_tool_result(ToolProjectionInput {
+            call_id: "proxy",
+            tool_name: "skill.shell",
+            arguments: &JsonValue::Null,
+            raw_output_text: "PRIVATE_SHELL_SENTINEL",
+            raw_output_json: &raw,
+            success: true,
+            outcome: &ToolOutcome::ok(),
+            output_policy: &outer,
+            output_projection: &ToolOutputProjectionKind::DynamicFunctionProxy {
+                target_tool_name: "exec_command".into(),
+                target_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                target_projection_kind: Box::new(ToolOutputProjectionKind::Builtin),
+            },
+        });
+        assert!(!projected.llm_text().contains("PRIVATE_SHELL_SENTINEL"));
+    }
+
+    #[test]
+    fn shell_policy_bounds_keep_control_fields_and_block_impossible_metadata() {
+        let raw = serde_json::json!({"stdout":"日本語\n".repeat(10000), "stderr":"warning",
+            "aggregated_output":"different aggregate", "session_id":19, "exit_code":124,
+            "timed_out":true, "duration_ms":100, "command":["sh"],
+            "truncated":{"stdout":false,"stderr":false,"aggregated_output":false},
+            "output_stats":{"full_output_available":false}});
+        for llm in [
+            LlmOutputPolicy::Full { max_bytes: 1024 },
+            LlmOutputPolicy::Structured { max_bytes: 2048 },
+        ] {
+            let max_bytes = match llm {
+                LlmOutputPolicy::Full { max_bytes } | LlmOutputPolicy::Structured { max_bytes } => {
+                    max_bytes
+                }
+                _ => unreachable!(),
+            };
+            let mut policy = ToolOutputPolicySnapshot::for_tool_name("write_stdin");
+            policy.llm = llm;
+            let envelope = project_tool_result(ToolProjectionInput {
+                call_id: "call",
+                tool_name: "write_stdin",
+                arguments: &JsonValue::Null,
+                raw_output_text: "UI",
+                raw_output_json: &raw,
+                success: false,
+                outcome: &ToolOutcome::recoverable(ToolErrorClass::Timeout, "continue", true, None),
+                output_policy: &policy,
+                output_projection: &ToolOutputProjectionKind::Builtin,
+            });
+            let message = envelope
+                .to_model_input_item("call", "write_stdin")
+                .into_chat_message();
+            let value: JsonValue = serde_json::from_str(&message.content).unwrap();
+            assert!(envelope.llm_view.serialized_size_bytes() <= max_bytes);
+            assert!(message.content.len() <= max_bytes);
+            for field in [
+                "session_id",
+                "exit_code",
+                "timed_out",
+                "duration_ms",
+                "command",
+                "output_stats",
+            ] {
+                assert_eq!(value[field], raw[field]);
+            }
+            assert_eq!(value["truncated"]["stdout"], true);
+            assert_eq!(value["truncated"]["stderr"], false);
+            assert_eq!(value["stderr"], "warning");
+            assert_eq!(value["model_output_truncated"], true);
+            assert!(value.get("preview").is_none());
+        }
+        let mut policy = ToolOutputPolicySnapshot::for_tool_name("write_stdin");
+        policy.llm = LlmOutputPolicy::Full { max_bytes: 8 };
+        let input = ToolProjectionInput {
+            call_id: "call",
+            tool_name: "write_stdin",
+            arguments: &JsonValue::Null,
+            raw_output_text: "",
+            raw_output_json: &raw,
+            success: true,
+            outcome: &ToolOutcome::ok(),
+            output_policy: &policy,
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        };
+        assert!(matches!(
+            shell_llm_view_for_policy(&input),
+            ToolResultView::Empty
+        ));
+    }
+
+    #[test]
+    fn thread_page_projection_preserves_large_content_and_cli_continuation() {
+        let payload = serde_json::json!({"events":[{"text":"漢字🌍\"\n".repeat(50_000)}],"nextCursor":"sealed-cursor","eof":false});
+        assert!(crate::thread_read_page_fits(&payload));
+        let policy = ToolOutputPolicySnapshot::for_tool_name("threads_history_read");
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "page",
+            tool_name: "threads_history_read",
+            arguments: &serde_json::json!({}),
+            raw_output_text: "",
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &policy,
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let cli = envelope.llm_payload();
+        assert_eq!(cli["events"], payload["events"]);
+        assert_eq!(cli["nextCursor"], "sealed-cursor");
+        assert_eq!(cli["truncated"], false);
+        assert!(
+            serde_json::to_vec(&cli).unwrap().len() <= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+        );
+        let native = envelope
+            .to_model_input_item("page", "threads_history_read")
+            .into_chat_message();
+        let native: serde_json::Value = serde_json::from_str(&native.content).unwrap();
+        assert_eq!(native, cli);
+        assert!(!crate::thread_read_page_fits(
+            &serde_json::json!({"text":"x".repeat(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES),"nextCursor":"cursor","eof":false})
+        ));
     }
 
     #[test]
@@ -2056,213 +2544,6 @@ mod tests {
     }
 
     #[test]
-    fn computer_use_projection_compacts_accessibility_nodes_outside_llm_view() {
-        let payload = serde_json::json!({
-            "action": "snapshot",
-            "session_id": 1,
-            "snapshot": {
-                "path": "/tmp/snap.png"
-            },
-            "accessibility_tree": {
-                "status": "ok",
-                "nodes": [
-                    { "id": "n1", "role": "button", "name": "SECRET_TREE_NODE" }
-                ],
-                "truncated": false
-            },
-            "llm_context": {
-                "attachment": {
-                    "path": "/tmp/snap.png",
-                    "mime_type": "image/png"
-                },
-                "accessibility_tree": {
-                    "status": "ok",
-                    "nodes": [
-                        { "id": "n1", "role": "button", "name": "SECRET_TREE_NODE" }
-                    ],
-                    "truncated": false
-                }
-            }
-        });
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_computer_use",
-            tool_name: "computer_use",
-            arguments: &serde_json::json!({"action": "snapshot"}),
-            raw_output_text: "",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &ToolOutputPolicySnapshot::for_tool_name("computer_use"),
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-
-        assert!(
-            serde_json::to_string(&envelope.llm_view)
-                .unwrap()
-                .contains("SECRET_TREE_NODE")
-        );
-        assert!(
-            !serde_json::to_string(&envelope.display)
-                .unwrap()
-                .contains("SECRET_TREE_NODE")
-        );
-        assert!(
-            serde_json::to_string(&envelope.display)
-                .unwrap()
-                .contains("node_count")
-        );
-        assert!(
-            !serde_json::to_string(&envelope.storage)
-                .unwrap()
-                .contains("SECRET_TREE_NODE")
-        );
-    }
-
-    #[test]
-    fn computer_use_projection_bounds_display_summary_to_timeline_policy() {
-        let slots = (0..80)
-            .map(|index| {
-                (
-                    format!("slot_{index}"),
-                    serde_json::json!({
-                        "requested_point": { "x": 10, "y": 20 },
-                        "converted_point": { "x": 10, "y": 20 },
-                        "requested_space": "snapshot",
-                        "converted_space": "screen",
-                        "validation_status": "ok"
-                    }),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>();
-        let payload = serde_json::json!({
-            "action": "act",
-            "result": {
-                "coordinate_observability": {
-                    "slots": slots
-                }
-            }
-        });
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_computer_use",
-            tool_name: "computer_use",
-            arguments: &serde_json::json!({"action": "act"}),
-            raw_output_text: "",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &ToolOutputPolicySnapshot::for_tool_name("computer_use"),
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-
-        let ToolDisplayPayload::Summary(summary) = envelope.display else {
-            panic!("computer_use should use summary display");
-        };
-        let visible_chars = summary.title.chars().count()
-            + summary
-                .lines
-                .iter()
-                .map(|line| line.chars().count())
-                .sum::<usize>();
-        assert!(visible_chars <= 2_000, "visible_chars={visible_chars}");
-        assert!(summary.truncated);
-    }
-
-    #[test]
-    fn computer_use_coordinate_observability_projection_is_compact() {
-        let payload = serde_json::json!({
-            "action": "act",
-            "session_id": 1,
-            "result": {
-                "coordinate_observability": {
-                    "validation_status": "ok",
-                    "slots": {
-                        "target": {
-                            "requested_point": {
-                                "x": 100,
-                                "y": 50,
-                                "coordinate_space": "transport_pixels"
-                            },
-                            "requested_space": "transport_pixels",
-                            "converted_point": {
-                                "x": 100,
-                                "y": 50,
-                                "coordinate_space": "native_input"
-                            },
-                            "converted_space": "native_input",
-                            "validation_status": "ok"
-                        }
-                    },
-                    "display_bounds": {
-                        "native_input": { "width": 320, "height": 180 }
-                    }
-                }
-            }
-        });
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_computer_use",
-            tool_name: "computer_use",
-            arguments: &serde_json::json!({"action": "act"}),
-            raw_output_text: "",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &ToolOutputPolicySnapshot::for_tool_name("computer_use"),
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-
-        let display = serde_json::to_string(&envelope.display).expect("display serializes");
-        assert!(display.contains("transport_pixels(100,50)"));
-        assert!(display.contains("native_input(100,50)"));
-        assert!(display.contains("validation=ok"));
-        assert!(
-            serde_json::to_string(&envelope.storage)
-                .unwrap()
-                .contains("coordinate_observability")
-        );
-    }
-
-    #[test]
-    fn output_projection_preserves_computer_use_trace_metadata() {
-        let payload = serde_json::json!({
-            "action": "act",
-            "session_id": 7,
-            "trace": {
-                "session_id": 7,
-                "snapshot_id": "s7-1",
-                "action_kind": "semantic",
-                "action_type": "press",
-                "execution_status": "failed",
-                "failure_class": "element_stale",
-                "suggested_fallbacks": [{ "type": "snapshot" }]
-            },
-            "result": {
-                "trace": {
-                    "session_id": 7,
-                    "action_kind": "semantic",
-                    "action_type": "press",
-                    "failure_class": "element_stale"
-                }
-            }
-        });
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_computer_use",
-            tool_name: "computer_use",
-            arguments: &serde_json::json!({"action": "act"}),
-            raw_output_text: "",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &ToolOutputPolicySnapshot::for_tool_name("computer_use"),
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-
-        let storage = serde_json::to_string(&envelope.storage).expect("storage serializes");
-        assert!(storage.contains("\"trace\""));
-        assert!(storage.contains("element_stale"));
-        assert!(storage.contains("suggested_fallbacks"));
-    }
-
-    #[test]
     fn dynamic_unknown_projection_is_metadata_only_for_storage() {
         let payload = serde_json::json!({
             "content": "SECRET_DYNAMIC_SENTINEL",
@@ -2496,103 +2777,6 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_shell_full_policy_persists_bounded_shell_output() {
-        let payload = serde_json::json!({
-            "command": ["/bin/sh", "-c", "printf VISIBLE_DYNAMIC_SHELL_SENTINEL"],
-            "exit_code": 0,
-            "stdout": "VISIBLE_DYNAMIC_SHELL_SENTINEL",
-            "stderr": "",
-            "timed_out": false,
-            "duration_ms": 4,
-            "truncated": false
-        });
-        let policy = ToolOutputPolicySnapshot {
-            llm: LlmOutputPolicy::Full {
-                max_bytes: 2 * 1024 * 1024,
-            },
-            llm_retention: LlmRetentionPolicy::UntilTurnTerminal {
-                max_bytes: 2 * 1024 * 1024,
-            },
-            timeline: TimelineOutputPolicy::Full {
-                max_bytes: 1024 * 1024,
-            },
-            storage: StorageOutputPolicy::Full {
-                max_bytes: 1024 * 1024,
-            },
-            recovery: RecoveryOutputPolicy::MetadataOnly,
-            deltas: DeltaOutputPolicy::PersistAndDisplay {
-                max_chunk_bytes: 64 * 1024,
-                max_total_bytes: 1024 * 1024,
-            },
-        };
-
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_dynamic_shell",
-            tool_name: "skill.tests-my-skill.echo-shell",
-            arguments: &serde_json::json!({}),
-            raw_output_text: "VISIBLE_DYNAMIC_SHELL_SENTINEL",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &policy,
-            output_projection: &ToolOutputProjectionKind::DynamicShell,
-        });
-
-        assert!(
-            serde_json::to_string(&envelope.display)
-                .unwrap()
-                .contains("VISIBLE_DYNAMIC_SHELL_SENTINEL")
-        );
-        assert!(
-            serde_json::to_string(&envelope.storage)
-                .unwrap()
-                .contains("VISIBLE_DYNAMIC_SHELL_SENTINEL")
-        );
-    }
-
-    #[test]
-    fn dynamic_shell_without_full_policy_hashes_shell_output_for_storage() {
-        let payload = serde_json::json!({
-            "command": ["/bin/sh", "-c", "printf hidden-output"],
-            "exit_code": 0,
-            "stdout": "SECRET_DYNAMIC_SHELL_SENTINEL",
-            "stderr": "",
-            "timed_out": false,
-            "duration_ms": 4,
-            "truncated": false
-        });
-        let policy = ToolOutputPolicySnapshot::for_tool_name("dynamic_tool");
-
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_dynamic_shell",
-            tool_name: "skill.tests-my-skill.echo-shell",
-            arguments: &serde_json::json!({}),
-            raw_output_text: "SECRET_DYNAMIC_SHELL_SENTINEL",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &policy,
-            output_projection: &ToolOutputProjectionKind::DynamicShell,
-        });
-
-        assert!(
-            serde_json::to_string(&envelope.llm_view)
-                .unwrap()
-                .contains("SECRET_DYNAMIC_SHELL_SENTINEL")
-        );
-        assert!(
-            !serde_json::to_string(&envelope.display)
-                .unwrap()
-                .contains("SECRET_DYNAMIC_SHELL_SENTINEL")
-        );
-        assert!(
-            !serde_json::to_string(&envelope.storage)
-                .unwrap()
-                .contains("SECRET_DYNAMIC_SHELL_SENTINEL")
-        );
-    }
-
-    #[test]
     fn dynamic_function_proxy_to_model_only_target_does_not_persist_raw_output() {
         let payload = serde_json::json!({
             "path": "/tmp/secret.txt",
@@ -2680,6 +2864,9 @@ mod tests {
             },
         });
 
+        let model = envelope.llm_payload();
+        assert_eq!(model["stdout"], "PROXY_SHELL_SENTINEL");
+        assert!(model.get("aggregated_output").is_none());
         assert!(
             matches!(envelope.storage, ToolStoragePayload::Shell { stdout: Some(stdout), .. } if stdout.contains("PROXY_SHELL_SENTINEL"))
         );
@@ -2802,6 +2989,84 @@ mod tests {
                     .contains("SECRET_MODEL_ONLY_SENTINEL"),
                 "{tool_name} storage leaked raw content"
             );
+        }
+    }
+
+    #[test]
+    fn dynamic_shell_projection_visibility_matrix() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "command": ["/bin/sh", "-c", "printf VISIBLE_DYNAMIC_SHELL_SENTINEL"],
+                    "exit_code": 0,
+                    "stdout": "VISIBLE_DYNAMIC_SHELL_SENTINEL",
+                    "stderr": "",
+                    "timed_out": false,
+                    "duration_ms": 4,
+                    "truncated": false
+                }),
+                ToolOutputPolicySnapshot {
+                    llm: LlmOutputPolicy::Full {
+                        max_bytes: 2 * 1024 * 1024,
+                    },
+                    llm_retention: LlmRetentionPolicy::UntilTurnTerminal {
+                        max_bytes: 2 * 1024 * 1024,
+                    },
+                    timeline: TimelineOutputPolicy::Full {
+                        max_bytes: 1024 * 1024,
+                    },
+                    storage: StorageOutputPolicy::Full {
+                        max_bytes: 1024 * 1024,
+                    },
+                    recovery: RecoveryOutputPolicy::MetadataOnly,
+                    deltas: DeltaOutputPolicy::PersistAndDisplay {
+                        max_chunk_bytes: 64 * 1024,
+                        max_total_bytes: 1024 * 1024,
+                    },
+                },
+                "VISIBLE_DYNAMIC_SHELL_SENTINEL",
+                &["display", "storage"][..],
+                &[][..],
+            ),
+            (
+                serde_json::json!({
+                    "command": ["/bin/sh", "-c", "printf hidden-output"],
+                    "exit_code": 0,
+                    "stdout": "SECRET_DYNAMIC_SHELL_SENTINEL",
+                    "stderr": "",
+                    "timed_out": false,
+                    "duration_ms": 4,
+                    "truncated": false
+                }),
+                ToolOutputPolicySnapshot::for_tool_name("dynamic_tool"),
+                "SECRET_DYNAMIC_SHELL_SENTINEL",
+                &["llm"][..],
+                &["display", "storage"][..],
+            ),
+        ];
+        for (payload, policy, sentinel, present_views, absent_views) in cases {
+            let envelope = project_tool_result(ToolProjectionInput {
+                call_id: "call_dynamic_shell",
+                tool_name: "skill.tests-my-skill.echo-shell",
+                arguments: &serde_json::json!({}),
+                raw_output_text: sentinel,
+                raw_output_json: &payload,
+                success: true,
+                outcome: &ok_outcome(),
+                output_policy: &policy,
+                output_projection: &ToolOutputProjectionKind::DynamicShell,
+            });
+            let views = serde_json::json!({
+                "llm": envelope.llm_view,
+                "display": envelope.display,
+                "storage": envelope.storage,
+            });
+            for view in present_views {
+                assert!(views[view].to_string().contains(sentinel), "{view}");
+            }
+            for view in absent_views {
+                assert!(!views[view].to_string().contains(sentinel), "{view}");
+            }
         }
     }
 }

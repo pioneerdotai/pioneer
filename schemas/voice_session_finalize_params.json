@@ -3,6 +3,17 @@
   "title": "VoiceSessionFinalizeParams",
   "type": "object",
   "properties": {
+    "audio_integrity": {
+      "description": "Optional on the wire for decoding legacy clients; servers fail closed\nwhen absent. A new client requires version 1 in the start response.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/VoiceAudioIntegrity"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "context": {
       "$ref": "#/$defs/VoiceTurnContext"
     },
@@ -103,6 +114,23 @@
       "enum": [
         "workspace",
         "user"
+      ]
+    },
+    "NativeServiceModeSelection": {
+      "description": "Explicit choice uses the existing endpoint/credential/model authority proof.\nAbsence means Standard; Inherit belongs to the enclosing model selection.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "authority"
       ]
     },
     "SandboxMode": {
@@ -223,6 +251,50 @@
         {
           "type": "object",
           "properties": {
+            "appId": {
+              "type": "string"
+            },
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "appId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "expectedRevision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "pluginId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "pluginId",
+            "expectedRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "packId": {
               "anyOf": [
                 {
@@ -241,6 +313,7 @@
               "const": "skill"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "skillId"
@@ -257,6 +330,7 @@
               "const": "skillPack"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "packId"
@@ -276,6 +350,7 @@
               "const": "mcpServer"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "name",
@@ -299,6 +374,7 @@
               "const": "mcpTool"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "serverName",
@@ -536,6 +612,27 @@
         }
       ]
     },
+    "VoiceAudioIntegrity": {
+      "description": "Counts normalized mono 16 kHz PCM before VAD, never ASR speech or padding.",
+      "type": "object",
+      "properties": {
+        "next_sequence": {
+          "description": "Number of packets, equivalently the sequence immediately after the tail.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "normalized_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "next_sequence",
+        "normalized_samples"
+      ]
+    },
     "VoiceTurnContext": {
       "description": "Frozen non-audio composer context for voice turn materialization.\n\n`prepared_input` is for existing prepared `UserInput` references such as\nartifacts/local attachment references. It must not contain the future voice\ntranscript; the gateway prepends the transcript as `UserInput::Text` after\nsuccessful transcription.",
       "type": "object",
@@ -556,6 +653,20 @@
               "type": "null"
             }
           ]
+        },
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "execution_backend": {
           "anyOf": [
@@ -621,6 +732,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/SandboxPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "service_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeServiceModeSelection"
             },
             {
               "type": "null"

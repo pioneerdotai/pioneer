@@ -9,6 +9,20 @@
     "loading_models": {
       "type": "boolean"
     },
+    "selected_context_authority": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selected_context_window": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
     "selected_model": {
       "type": [
         "string",
@@ -25,6 +39,29 @@
       "type": [
         "string",
         "null"
+      ]
+    },
+    "selected_service_mode": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "authority": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "authority"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
       ]
     }
   },

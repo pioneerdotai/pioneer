@@ -9,6 +9,7 @@ license.workspace = true
 test-support = []
 
 [dependencies]
+pioneer-observability.workspace = true
 async-trait.workspace = true
 pioneer-mcp.workspace = true
 pioneer-keystore.workspace = true

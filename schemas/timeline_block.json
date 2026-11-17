@@ -486,6 +486,35 @@
         "other"
       ]
     },
+    "CodexRetryNotice": {
+      "description": "Read-only presentation of a canonical Codex retry notice owned by a Task's\nhidden execution. This never becomes a canonical event in the viewing thread.",
+      "type": "object",
+      "properties": {
+        "itemId": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "occurredAtUnixMs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "sourceThreadId": {
+          "type": "string"
+        },
+        "sourceTurnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sourceThreadId",
+        "sourceTurnId",
+        "itemId",
+        "message",
+        "occurredAtUnixMs"
+      ]
+    },
     "CrossThreadSourceVisibility": {
       "type": "string",
       "enum": [
@@ -524,6 +553,22 @@
         "callId",
         "title",
         "artifact"
+      ]
+    },
+    "ImageReference": {
+      "description": "Immutable image reference. Published paths are authenticated Gateway storage links.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision"
       ]
     },
     "MarkdownBlock": {
@@ -1271,6 +1316,12 @@
                 }
               ]
             },
+            "codexRetryNotices": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CodexRetryNotice"
+              }
+            },
             "kind": {
               "type": "string",
               "const": "detached_task_run"
@@ -1476,6 +1527,46 @@
         "turnId"
       ]
     },
+    "TurnAppCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "appId": {
+          "type": "string"
+        },
+        "darkIcon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "appId",
+        "expectedRevision",
+        "label"
+      ]
+    },
     "TurnAuthorSnapshot": {
       "type": "object",
       "properties": {
@@ -1594,6 +1685,36 @@
       "required": [
         "principal_id",
         "nickname"
+      ]
+    },
+    "TurnPluginCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "expectedRevision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "pluginId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pluginId",
+        "expectedRevision",
+        "label"
       ]
     },
     "TurnSkillCapabilitySummary": {
@@ -2175,6 +2296,38 @@
             "type": {
               "type": "string",
               "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnPluginCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "plugin"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnAppCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "app"
             }
           },
           "required": [

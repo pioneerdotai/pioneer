@@ -143,6 +143,9 @@ pub struct SkillPolicyHints {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillDefinition {
+    /// Host runtime constraint; independent of editable workspace policy.
+    #[serde(default)]
+    pub host_explicit_only: bool,
     pub identity: SkillIdentity,
     pub instructions: SkillInstructions,
     pub runtime: SkillRuntime,
@@ -169,6 +172,7 @@ pub enum SkillAvailability {
 #[serde(rename_all = "snake_case")]
 pub enum SkillUnavailableReason {
     ImportPending,
+    HostPolicy,
     MissingPackage,
     InvalidPackage,
 }
@@ -177,6 +181,7 @@ impl SkillUnavailableReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ImportPending => "import_pending",
+            Self::HostPolicy => "host_policy",
             Self::MissingPackage => "missing_package",
             Self::InvalidPackage => "invalid_package",
         }
@@ -230,6 +235,7 @@ pub fn compile_skill_definition(input: CompileSkillInput) -> SkillDefinition {
     let policy_hints = compile_policy_hints(&input.conformance);
 
     SkillDefinition {
+        host_explicit_only: false,
         identity: SkillIdentity {
             skill_id: input.skill_id,
             owner: input.owner,
@@ -453,24 +459,13 @@ fn compile_policy_hints(conformance: &SkillConformanceReport) -> SkillPolicyHint
 mod tests {
     use super::{
         CompileSkillInput, SkillDependencySet, SkillIdentity, SkillImplicitInvocationPolicy,
-        SkillSourceKind, compact_skill_label, compile_skill_definition, normalize_string_list,
+        SkillSourceKind, compact_skill_label, compile_skill_definition,
     };
     use crate::contract::{SkillDependencies, SkillTrustLevel, default_skill_conformance};
     use pioneer_protocol::SkillId;
 
     fn skill_id(value: &str) -> SkillId {
         SkillId::new(value).expect("valid test skill id")
-    }
-
-    #[test]
-    fn normalize_string_list_deduplicates_and_sorts() {
-        let normalized = normalize_string_list(vec![
-            " node ".to_owned(),
-            "cargo".to_owned(),
-            "node".to_owned(),
-            String::new(),
-        ]);
-        assert_eq!(normalized, vec!["cargo".to_owned(), "node".to_owned()]);
     }
 
     #[test]
@@ -497,7 +492,12 @@ mod tests {
             trust_level: SkillTrustLevel::Community,
             dependencies: SkillDependencies {
                 env: vec!["OPENAI_API_KEY".to_owned()],
-                bins: vec!["node".to_owned()],
+                bins: vec![
+                    " npm ".to_owned(),
+                    "node".to_owned(),
+                    String::new(),
+                    "node".to_owned(),
+                ],
                 commands: Vec::new(),
                 config: Vec::new(),
                 mcp: Vec::new(),

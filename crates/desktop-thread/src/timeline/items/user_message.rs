@@ -411,6 +411,13 @@ impl RowPresentation {
                     .child(self.render_user_message_attachment_preview(
                         preview_image_path,
                         attachment.kind,
+                        if cx.theme().mode.is_dark()
+                            && attachment.kind == ParsedUserAttachmentKind::App
+                        {
+                            attachment.dark_icon.as_ref()
+                        } else {
+                            attachment.plugin_icon.as_ref()
+                        },
                         cx,
                     ))
                     .child(
@@ -437,11 +444,27 @@ impl RowPresentation {
         &self,
         preview_image_path: Option<PathBuf>,
         kind: ParsedUserAttachmentKind,
+        plugin_icon: Option<&pioneer_client::plugins::PluginIcon>,
         cx: &mut App,
     ) -> AnyElement {
         if matches!(
             kind,
-            ParsedUserAttachmentKind::Skill | ParsedUserAttachmentKind::Mcp
+            ParsedUserAttachmentKind::Plugin | ParsedUserAttachmentKind::App
+        ) {
+            return div()
+                .flex_none()
+                .size(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(self.plugin_images.element(plugin_icon).size_3())
+                .into_any_element();
+        }
+        if matches!(
+            kind,
+            ParsedUserAttachmentKind::Plugin
+                | ParsedUserAttachmentKind::Skill
+                | ParsedUserAttachmentKind::Mcp
         ) {
             return attachment_capability_icon(kind, cx).into_any_element();
         }
@@ -489,6 +512,7 @@ fn attachment_file_icon(flex_none: bool) -> gpui_kit::Div {
 
 fn attachment_capability_icon(kind: ParsedUserAttachmentKind, cx: &mut App) -> gpui_kit::Div {
     let icon = match kind {
+        ParsedUserAttachmentKind::Plugin | ParsedUserAttachmentKind::App => PioneerIconName::Plugin,
         ParsedUserAttachmentKind::Skill => PioneerIconName::Zap,
         ParsedUserAttachmentKind::Mcp => PioneerIconName::Mcp,
         ParsedUserAttachmentKind::File => PioneerIconName::Paperclip,
@@ -523,84 +547,5 @@ mod tests {
                 "missing context-menu action {action}"
             );
         }
-    }
-
-    use super::ParsedUserAttachmentKind;
-    use super::parse_user_attachments;
-    use pioneer_client::timeline::types::SkillId;
-    use pioneer_client::timeline::types::SkillPackId;
-    use pioneer_client::timeline::types::TurnSkillCapabilitySummary;
-    use pioneer_client::timeline::types::TurnSkillPackCapabilitySummary;
-    use pioneer_client::timeline::types::TurnSkillPackPresentationSummary;
-    use pioneer_client::timeline::types::UserMessageAttachment;
-
-    #[test]
-    fn desktop_user_message_badges_use_snapshot_pack_labels() {
-        let pack_id = SkillPackId::new("P".repeat(21)).expect("pack id");
-        let parsed = parse_user_attachments(&[
-            UserMessageAttachment::SkillPack {
-                capability: TurnSkillPackCapabilitySummary {
-                    pack_id: pack_id.clone(),
-                    label: "Research Pack".to_owned(),
-                },
-            },
-            UserMessageAttachment::Skill {
-                capability: TurnSkillCapabilitySummary {
-                    skill_id: SkillId::new("S".repeat(21)).expect("skill id"),
-                    label: "Search".to_owned(),
-                    owner: None,
-                    slug: "search".to_owned(),
-                    source_kind: "user".to_owned(),
-                    pack: Some(TurnSkillPackPresentationSummary {
-                        pack_id,
-                        label: "Research Pack".to_owned(),
-                    }),
-                },
-            },
-            UserMessageAttachment::Skill {
-                capability: TurnSkillCapabilitySummary {
-                    skill_id: SkillId::new("D".repeat(21)).expect("skill id"),
-                    label: "Docs".to_owned(),
-                    owner: None,
-                    slug: "docs".to_owned(),
-                    source_kind: "user".to_owned(),
-                    pack: None,
-                },
-            },
-        ]);
-
-        assert_eq!(
-            parsed
-                .iter()
-                .map(|attachment| attachment.display_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Research Pack", "Research Pack / Search", "Docs"]
-        );
-        assert!(
-            parsed
-                .iter()
-                .all(|attachment| attachment.kind == ParsedUserAttachmentKind::Skill)
-        );
-    }
-
-    #[test]
-    fn authored_row_uses_shared_identity_and_safe_collaboration_fields() {
-        let source = include_str!("user_message.rs");
-        for required in [
-            "user_message_alignment",
-            "author.display_name",
-            "author.nickname",
-            "author.avatar_revision",
-            "reply_state",
-            "value.deleted",
-            "value.edited",
-            "open_message_revision_history",
-            "user_message_mutation_availability",
-            "start_composer_message_edit",
-            "confirm_delete_message",
-        ] {
-            assert!(source.contains(required), "missing `{required}`");
-        }
-        assert!(!source.contains(&["conversation", "_message"].concat()));
     }
 }

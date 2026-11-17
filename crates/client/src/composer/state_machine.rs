@@ -88,6 +88,12 @@ pub struct ComposerDomainState {
     pub selected_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_authority: Option<String>,
     #[serde(default = "default_composer_permission_mode")]
     pub selected_permission_mode: TurnPermissionMode,
     #[serde(default)]
@@ -110,6 +116,9 @@ impl Default for ComposerDomainState {
             capability_target: ComposerCapabilityTarget::native(),
             selected_model: None,
             selected_reasoning_effort: None,
+            selected_context_window: None,
+            selected_service_mode: None,
+            selected_context_authority: None,
             selected_permission_mode: default_composer_permission_mode(),
             model_manually_selected: false,
             reply_target: None,
@@ -120,15 +129,22 @@ impl Default for ComposerDomainState {
 
 impl ComposerDomainState {
     pub fn model_selection_state(&self) -> ComposerModelSelectionState {
-        ComposerModelSelectionState::new_with_reasoning_effort(
+        let mut selection = ComposerModelSelectionState::new_with_reasoning_effort(
             self.selected_provider.clone(),
             self.selected_model.clone(),
             self.selected_reasoning_effort.clone(),
             self.model_manually_selected,
-        )
+        );
+        selection.selected_context_window = self.selected_context_window;
+        selection.selected_service_mode = self.selected_service_mode.clone();
+        selection.selected_context_authority = self.selected_context_authority.clone();
+        selection
     }
 
     fn apply_model_selection_state(&mut self, state: ComposerModelSelectionState) {
+        self.selected_context_window = state.selected_context_window;
+        self.selected_service_mode = state.selected_service_mode.clone();
+        self.selected_context_authority = state.selected_context_authority.clone();
         let (provider, model, reasoning_effort, manually_selected) =
             state.into_parts_with_reasoning_effort();
         self.selected_provider = provider;
@@ -494,6 +510,9 @@ pub fn reduce_composer_domain_state(
         || next.selected_mentions != state.selected_mentions;
     let model_selection_changed = next.selected_provider != state.selected_provider
         || next.selected_model != state.selected_model
+        || next.selected_context_window != state.selected_context_window
+        || next.selected_service_mode != state.selected_service_mode
+        || next.selected_context_authority != state.selected_context_authority
         || next.selected_reasoning_effort != state.selected_reasoning_effort
         || next.model_manually_selected != state.model_manually_selected
         || next.capability_target != state.capability_target;
@@ -642,6 +661,9 @@ fn clear_execution_only_state(state: &mut ComposerDomainState) {
     state.selected_provider = None;
     state.selected_model = None;
     state.selected_reasoning_effort = None;
+    state.selected_context_window = None;
+    state.selected_service_mode = None;
+    state.selected_context_authority = None;
     state.selected_permission_mode = default_composer_permission_mode();
     state.model_manually_selected = false;
     state.capability_target = ComposerCapabilityTarget::native();
@@ -852,6 +874,9 @@ mod tests {
                     provider: "cli_runtime:codex".to_owned(),
                     model: "ignored".to_owned(),
                     selected_reasoning_effort: None,
+                    selected_context_window: None,
+                    selected_service_mode: None,
+                    selected_context_authority: None,
                 }),
                 capability_target: Some(ComposerCapabilityTarget::cli(
                     ComposerCapabilityPolicy::unsupported_cli(),
@@ -902,6 +927,9 @@ mod tests {
             selected_provider: Some("openai".to_owned()),
             selected_model: Some("gpt-5".to_owned()),
             selected_reasoning_effort: Some("high".to_owned()),
+            selected_context_window: None,
+            selected_service_mode: None,
+            selected_context_authority: None,
             selected_mode: ThreadMode::Agent,
             ..ComposerDomainState::default()
         };
@@ -941,6 +969,9 @@ mod tests {
             selected_provider: Some("openai".to_owned()),
             selected_model: Some("gpt-5".to_owned()),
             selected_reasoning_effort: Some("high".to_owned()),
+            selected_context_window: None,
+            selected_service_mode: None,
+            selected_context_authority: None,
             selected_permission_mode: TurnPermissionMode::Supervised,
             model_manually_selected: true,
             selected_mode: ThreadMode::Agent,

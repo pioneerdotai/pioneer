@@ -33,7 +33,7 @@ impl GatewayEventRoute {
             InvitationChanged(_) | MemberChanged(_) | WorkspaceMembersChanged(_) => {
                 Self::Administration
             }
-            WorkspaceChanged(_) | ThreadTreeChanged(_) => Self::Workspace,
+            WorkspaceChanged(_) | ThreadTreeChanged(_) | WorkspacePush(_) => Self::Workspace,
             GatewayRemoteAccessStatusChanged(_)
             | GatewayThreadEpisodicVectorRefillStatusChanged(_)
             | GatewayVoiceInputStatusChanged(_) => Self::Settings,
@@ -50,7 +50,9 @@ impl GatewayEventRoute {
             | McpChanged(_)
             | McpServerStatusChanged(_)
             | McpServerCatalogChanged(_) => Self::Mcp,
-            SkillsChanged(_) | SkillsUploadChunkAck(_) => Self::Skills,
+            SkillsChanged(_) | SkillsUploadChunkAck(_) | PluginsChanged(_) | AppsChanged(_) => {
+                Self::Skills
+            }
             TaskCreated(_)
             | TaskScheduled(_)
             | TaskQueued(_)

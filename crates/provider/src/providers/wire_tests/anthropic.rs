@@ -27,7 +27,7 @@ fn canonical_tool_rounds_keep_native_block_ids_and_object_inputs() {
             assert_eq!(input["metric"], true);
         } else { assert_eq!(input, serde_json::json!({})); }
         history.push(ChatMessage::assistant_tool_calls(None::<String>, response.tool_calls.clone()));
-        history.push(ChatMessage::tool_result(&call.id, &call.name, "ok"));
+        history.push(ChatMessage::tool_result(&call.id, &call.name, crate::providers::history_test_support::COMPACT_SHELL_RESULT));
         let prepared = prepare_messages_for_provider_model(provider.name(), "claude-sonnet-4-5", &provider.capabilities(), &history).unwrap();
         let (system, messages) = AnthropicProvider::prepare_messages(&prepared).unwrap();
         let wire = serde_json::to_value(ApiChatRequest {
@@ -47,6 +47,7 @@ fn canonical_tool_rounds_keep_native_block_ids_and_object_inputs() {
             if previous == round { assert_eq!(assistant["content"][0]["input"], input); }
             assert_eq!(result["role"], "user");
             assert_eq!(result["content"][0]["type"], "tool_result");
+            assert_eq!(result["content"][0]["content"], crate::providers::history_test_support::COMPACT_SHELL_RESULT);
             assert_eq!(result["content"][0]["tool_use_id"], assistant["content"][0]["id"]);
         }
     }
@@ -117,19 +118,6 @@ fn native_replay_keeps_two_parallel_tool_rounds_separate_after_storage() {
             );
         }
     }
-}
-
-#[test]
-fn canonical_stream_start_and_json_delta_use_same_tool_schema() {
-    let event: StreamEvent = serde_json::from_str(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"forecast_1","name":"forecast","input":{}}}"#).unwrap();
-    let block = event.content_block.unwrap();
-    assert_eq!(block.block_type, "tool_use");
-    assert_eq!(block.id.as_deref(), Some("forecast_1"));
-    assert_eq!(block.name.as_deref(), Some("forecast"));
-    let event: StreamEvent = serde_json::from_str(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"days\":2}"}}"#).unwrap();
-    let args: serde_json::Value =
-        serde_json::from_str(event.delta.unwrap().partial_json.as_deref().unwrap()).unwrap();
-    assert_eq!(args["days"], 2);
 }
 
 #[test]

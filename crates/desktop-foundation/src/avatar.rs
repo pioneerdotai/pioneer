@@ -1,6 +1,6 @@
 use gpui_kit::{
-    App, ImageSource, IntoElement, RenderOnce, SharedString, Styled, Window,
-    component::avatar::Avatar, prelude::FluentBuilder, transparent_black,
+    App, ImageSource, IntoElement, RenderOnce, SharedString, Window, component::avatar::Avatar,
+    prelude::FluentBuilder,
 };
 
 /// Value adapter that applies authenticated avatar output to a caller-owned
@@ -35,10 +35,10 @@ impl AvatarSurface {
 
 impl RenderOnce for AvatarSurface {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        self.avatar
-            .when_some(self.fallback_name, |avatar, name| avatar.name(name))
-            .when_some(self.source, |avatar, source| {
-                avatar.src(source).bg(transparent_black())
-            })
+        crate::ImageSurface::for_avatar(
+            self.avatar
+                .when_some(self.fallback_name, |avatar, name| avatar.name(name)),
+        )
+        .when_some(self.source, |image, source| image.source(source))
     }
 }

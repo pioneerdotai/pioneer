@@ -4,21 +4,19 @@ use super::{
     AgentMcpAvailability, AgentMcpMaterialization, AgentMcpMaterializationError,
     AgentMcpMaterializationRequest, AgentMcpPersistedProjection, AgentMcpProjectionBinding,
     AgentMcpProjectionPersistenceError, AgentMcpProjectionPersistenceRequest, AgentMcpToolProvider,
-    AgentMemoryProvider, AgentMemoryTurnPolicyProvider, AgentPostTurnHookDispatchPolicy,
-    AgentStartError, AgentTerminalEffectExecutionError, AgentThreadControlPlane, AgentThreadHandle,
+    AgentMemoryProvider, AgentPostTurnHookDispatchPolicy, AgentStartError,
+    AgentTerminalEffectExecutionError, AgentThreadControlPlane, AgentThreadHandle,
     AgentTurnHookRuntimeContext, COMMAND_CHANNEL_CAPACITY, ControlOperationAdmission,
     ControlOperationRegistry, DurableEventReceiver, ExecutionCheckpointContext,
-    ExecutionTurnStatus, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
-    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
-    MemoryTurnPolicyContext, MemoryTurnPolicyRequest, NATIVE_TERMINAL_RUNTIME_HISTORY_LIMIT,
-    PendingAttachedTask, RecoveryAttemptRequest, ResolvedArtifactInput,
-    ReviewRequiredTaskObservation, StoredControlOutcome, TaskFinalizationSnapshot,
-    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
-    TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
+    ExecutionTurnStatus, MemoryToolMaterialization, MemoryTurnContext,
+    NATIVE_TERMINAL_RUNTIME_HISTORY_LIMIT, PendingAttachedTask, RecoveryAttemptRequest,
+    ResolvedArtifactInput, ReviewRequiredTaskObservation, StoredControlOutcome,
+    TaskFinalizationSnapshot, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
+    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
     TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
     WorkspaceSkillPolicy,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use pioneer_hooks::{
     AuditContribution, HookActorKind, HookAuditEventKind, HookAwaitPolicy, HookCapabilities,
     HookCapability, HookContextMode, HookContribution, HookDiagnosticCode, HookDiagnosticMessage,
@@ -33,20 +31,16 @@ use pioneer_hooks::{
     PolicyContribution, PromptContextContribution, PromptManifestDiagnosticContribution,
     PromptSectionContribution, TurnPostTurnStatus, TurnPostTurnToolStatus,
 };
-use pioneer_memory::hooks::{
-    MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG, memory_turn_policy_from_hook_policy_set,
-};
-use pioneer_memory::{MemoryModeRecallParams, MemoryRecallMode};
+use pioneer_memory::hooks::MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG;
 use pioneer_protocol::{
     AgentDurableEvent, ExecutionWindowExhaustionReason, ItemCompletedNotification,
-    ItemStartedNotification, McpScopeKind, McpTurnBindingSummary, MemoryCategory, MemoryScope,
-    MemoryScopeKind, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
-    PromptManifestHookPhase, PromptManifestHookTruncation, ProviderFailureClass, RecoveryAction,
-    RecoveryAttemptContext, StorageOutputPolicy, SystemEventLevel, ThreadMode, ToolCallStatus,
-    ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolRecoveryIdempotencyMode,
-    ToolRecoveryRetryClass, ToolRetryResolution, ToolStoragePayload, TurnCapability,
-    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason, TurnItem,
-    TurnItemType, UserInput,
+    ItemStartedNotification, McpScopeKind, McpTurnBindingSummary, PromptManifestDiagnosticCode,
+    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookTruncation,
+    ProviderFailureClass, RecoveryAction, RecoveryAttemptContext, StorageOutputPolicy,
+    SystemEventLevel, ThreadMode, ToolCallStatus, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
+    ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass, ToolRetryResolution, ToolStoragePayload,
+    TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+    TurnItem, TurnItemType, UserInput,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -63,7 +57,7 @@ use pioneer_skills::{
 use pioneer_tools::{
     ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass, ExecutionWindowsConfig,
     FunctionToolOutput, PayloadKind, ToolError, ToolEventTrace, ToolExtensionBundle, ToolHandler,
-    ToolIdempotencyMode, ToolInvocation, ToolLoopBudgetConfig, ToolPayload, ToolRecoveryMetadata,
+    ToolIdempotencyMode, ToolInvocation, ToolLoopBudgetConfig, ToolRecoveryMetadata,
     ToolRetryBudgetConfig, ToolRetryClass, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
 };
 use serde_json::json;
@@ -76,11 +70,114 @@ use tokio::task::yield_now;
 use tokio::time::{Duration, Instant, advance, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-fn test_tool_loop_config() -> ToolLoopConfig {
-    crate::chat::preflight::load_test_catalog();
+#[derive(Debug)]
+struct VisibilityCuaBackend;
+
+#[async_trait::async_trait]
+impl pioneer_tools::ComputerUseBackend for VisibilityCuaBackend {
+    async fn execute(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _arguments: serde_json::Value,
+        _cancellation: CancellationToken,
+    ) -> Result<serde_json::Value, ToolError> {
+        panic!("visibility fixtures must not execute computer use")
+    }
+
+    fn observation_delivered(&self, _owner: &str, _context: &serde_json::Value) -> bool {
+        false
+    }
+
+    fn release_owner(&self, _owner: &str) {}
+}
+
+fn request_missing_fixture_tools(request: &ChatRequest, names: &[String]) -> Option<ChatResponse> {
+    let missing = names
+        .iter()
+        .filter(|name| {
+            !request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| &tool.name == *name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty()
+        || request.messages.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.name == "request_tools"))
+        })
+    {
+        return None;
+    }
+    let domains = pioneer_tools::BuiltinToolDomain::ALL
+        .into_iter()
+        .filter(|domain| {
+            missing
+                .iter()
+                .any(|name| domain.tool_names().contains(&name.as_str()))
+        })
+        .map(|domain| domain.as_str())
+        .collect::<Vec<_>>();
+    Some(ChatResponse {
+        messages: Vec::new(),
+        text: String::new(),
+        usage: None,
+        reasoning_content: None,
+        tool_calls: vec![ProviderToolCall {
+            id: "fixture_request_tools".to_owned(),
+            name: "request_tools".to_owned(),
+            arguments: json!({
+                "domains": domains,
+                "reason": "Expose the tools needed by this test scenario."
+            })
+            .to_string(),
+        }],
+        provider_replay_state: None,
+        termination: pioneer_provider::ProviderTermination::ToolCalls,
+    })
+}
+
+fn test_tool_loop_config_with_computer_use() -> ToolLoopConfig {
+    let mut config = test_tool_loop_config();
+    config.computer_use.backend = Some(Arc::new(VisibilityCuaBackend));
+    config
+}
+
+fn load_test_catalog() {
+    static READY: std::sync::Once = std::sync::Once::new();
+    READY.call_once(|| {
+        let directory = tempfile::tempdir().unwrap();
+        // The Pi comparison fixture retains legacy negative router prices.
+        // Restore a catalog generated from native source evidence instead.
+        let source: pioneer_provider::catalog::generator::SourceSnapshot =
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../provider/tests/fixtures/catalog/sources.json"
+            )))
+            .unwrap();
+        let catalog = pioneer_provider::catalog::generator::generate(&source, true).unwrap();
+        let saved = serde_json::json!({
+            "version": 1,
+            "updated_at": source.captured_at,
+            "catalog": catalog,
+        });
+        std::fs::write(
+            directory.path().join("catalog.json"),
+            serde_json::to_vec(&saved).unwrap(),
+        )
+        .unwrap();
+        pioneer_provider::catalog::runtime::restore_cached_catalog(directory.path()).unwrap();
+    });
+}
+
+pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
+    load_test_catalog();
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
-        preflight: super::PreflightLoopConfig::default(),
         web: WebToolsConfig {
             default_timeout_ms: 20_000,
             hard_max_timeout_ms: 120_000,
@@ -101,7 +198,7 @@ fn test_tool_loop_config() -> ToolLoopConfig {
         },
         computer_use: ComputerUseToolsConfig {
             runtime_home_dir: std::env::temp_dir().join("pioneer-agent-tests"),
-            artifacts_subdir: "tools/computer_use".to_owned(),
+
             ..ComputerUseToolsConfig::default()
         },
         skills: super::SkillsLoopConfig {
@@ -153,13 +250,7 @@ fn test_tool_loop_config() -> ToolLoopConfig {
                 allow_function_proxy_tools: true,
             },
         },
-        memory: super::MemoryLoopConfig {
-            active_recall: super::MemoryActiveRecallConfig {
-                mode: super::MemoryActiveRecallMode::DeterministicOnly,
-                ..super::MemoryActiveRecallConfig::default()
-            },
-            ..super::MemoryLoopConfig::default()
-        },
+        memory: super::MemoryLoopConfig::default(),
         budget: ToolLoopBudgetConfig::default(),
         execution_windows: ExecutionWindowsConfig::default(),
         retry: ToolRetryBudgetConfig::default(),
@@ -298,7 +389,9 @@ impl AgentManager {
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
         let runtime_snapshot = self.runtime_dependencies.snapshot().await;
-        self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
+        // Box at the fixture boundary so outer async helpers do not embed the
+        // composed production startup future and copy it through their frames.
+        Box::pin(self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
             mode,
@@ -314,7 +407,7 @@ impl AgentManager {
             None,
             pioneer_protocol::default_turn_permission_profile_snapshot(),
             test_full_access_security_snapshot(),
-        )
+        ))
         .await
     }
 
@@ -402,15 +495,6 @@ fn set_execution_window_budget(
     config.budget.max_tool_calls_per_turn = max_tool_calls_per_window;
     config.execution_windows.window.max_agent_rounds_per_window = max_agent_rounds_per_window;
     config.execution_windows.window.max_tool_calls_per_window = max_tool_calls_per_window;
-}
-
-fn test_tools_permission_context(turn_id: &str) -> pioneer_tools::PermissionEvaluationContext {
-    pioneer_tools::PermissionEvaluationContext::for_turn(
-        "workspace_test",
-        "thread_test",
-        turn_id,
-        pioneer_protocol::default_turn_permission_profile_snapshot(),
-    )
 }
 
 fn test_full_access_security_snapshot() -> pioneer_protocol::TurnExecutionSecuritySnapshot {
@@ -521,7 +605,7 @@ impl Provider for PendingProvider {
 struct CaptureAgentProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     response_text: String,
-    preflight_response_text: String,
+    requested_tools: Vec<String>,
 }
 
 struct FirstCallBlockingProvider {
@@ -580,7 +664,7 @@ impl Default for CaptureAgentProvider {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
             response_text: "done".to_owned(),
-            preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
+            requested_tools: Vec::new(),
         }
     }
 }
@@ -590,25 +674,23 @@ impl CaptureAgentProvider {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
             response_text: response_text.into(),
-            preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
+            requested_tools: Vec::new(),
         }
     }
 
-    fn with_preflight_response(preflight_response_text: impl Into<String>) -> Self {
+    fn with_requested_tools(requested_tools: Vec<String>) -> Self {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
             response_text: "done".to_owned(),
-            preflight_response_text: preflight_response_text.into(),
+            requested_tools,
         }
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        visible_test_requests(
-            self.requests
-                .lock()
-                .expect("capture provider lock poisoned")
-                .clone(),
-        )
+        self.requests
+            .lock()
+            .expect("capture provider lock poisoned")
+            .clone()
     }
 
     fn snapshot_all_requests(&self) -> Vec<ChatRequest> {
@@ -642,12 +724,10 @@ impl EmptyNoToolRoundProvider {
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        visible_test_requests(
-            self.requests
-                .lock()
-                .expect("empty no-tool provider lock poisoned")
-                .clone(),
-        )
+        self.requests
+            .lock()
+            .expect("empty no-tool provider lock poisoned")
+            .clone()
     }
 }
 
@@ -661,12 +741,10 @@ impl SequencedTextProvider {
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        visible_test_requests(
-            self.requests
-                .lock()
-                .expect("sequenced text provider lock poisoned")
-                .clone(),
-        )
+        self.requests
+            .lock()
+            .expect("sequenced text provider lock poisoned")
+            .clone()
     }
 }
 
@@ -688,9 +766,9 @@ struct NoToolCaptureProvider {
 }
 
 impl TextOnlyAgentProvider {
-    fn with_preflight_response(preflight_response_text: impl Into<String>) -> Self {
+    fn with_requested_tools(requested_tools: Vec<String>) -> Self {
         Self {
-            inner: CaptureAgentProvider::with_preflight_response(preflight_response_text),
+            inner: CaptureAgentProvider::with_requested_tools(requested_tools),
         }
     }
 
@@ -903,11 +981,10 @@ fn explicit_mcp_tool_materialization(
     }
 }
 
-const PHASE_07_HOOK_PHASES: [HookPhase; 7] = [
+const PHASE_07_HOOK_PHASES: [HookPhase; 6] = [
     HookPhase::TurnPrePolicy,
     HookPhase::TurnPrePromptContext,
     HookPhase::TurnPreToolMaterialization,
-    HookPhase::TurnPostPreflightPromptContext,
     HookPhase::TurnPrePromptCompile,
     HookPhase::TurnPostPromptCompile,
     HookPhase::TurnPostTurn,
@@ -1066,8 +1143,6 @@ async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
         memory_provider,
         memory_write_provider,
         post_turn_extractor_provider,
-        policy_provider,
-        episodic_recall_provider,
         current_runtime,
         memory_config,
     ) = {
@@ -1079,8 +1154,6 @@ async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
                 .expect("memory provider must be configured before installing test memory hooks"),
             state.memory_write_provider.clone(),
             state.memory_post_turn_extractor_provider.clone(),
-            state.memory_turn_policy_provider.clone(),
-            state.memory_episodic_recall_provider.clone(),
             state.hook_runtime.clone(),
             state.tool_loop_config.memory.clone(),
         )
@@ -1094,8 +1167,6 @@ async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
             memory_provider,
             memory_write_provider,
             post_turn_extractor_provider,
-            policy_provider,
-            episodic_recall_provider,
             manager.memory_tool_bundle_artifact_store(),
             memory_config,
         ))
@@ -1561,7 +1632,6 @@ fn phase_07_subscription_id(phase: HookPhase) -> HookSubscriptionId {
     let value = match phase {
         HookPhase::TurnPrePolicy => "test.phase07.pre_policy",
         HookPhase::TurnPrePromptContext => "test.phase07.pre_prompt_context",
-        HookPhase::TurnPostPreflightPromptContext => "test.phase07.post_preflight_prompt_context",
         HookPhase::TurnPreToolMaterialization => "test.phase07.pre_tool_materialization",
         HookPhase::TurnPrePromptCompile => "test.phase07.pre_prompt_compile",
         HookPhase::TurnPostPromptCompile => "test.phase07.post_prompt_compile",
@@ -1660,8 +1730,6 @@ fn assert_stable_requests_eq(left: &ChatRequest, right: &ChatRequest) {
     );
 }
 
-const TEST_PREFLIGHT_RESPONSE: &str = r#"{"tools":{"visibleTools":[]}}"#;
-
 fn test_native_image_input_capabilities() -> ProviderInputCapabilities {
     ProviderInputCapabilities {
         text: true,
@@ -1672,21 +1740,16 @@ fn test_native_image_input_capabilities() -> ProviderInputCapabilities {
     }
 }
 
-fn preflight_response_with_visible_tools(tool_names: &[&str]) -> String {
-    json!({
-        "tools": {
-            "visibleTools": tool_names,
-        }
-    })
-    .to_string()
+fn requested_tool_names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
 }
 
-fn memory_read_preflight_response() -> String {
-    preflight_response_with_visible_tools(&["memory_search", "memory_get"])
+fn memory_read_tools() -> Vec<String> {
+    requested_tool_names(&["memory_search", "memory_get"])
 }
 
-fn memory_all_preflight_response() -> String {
-    preflight_response_with_visible_tools(&[
+fn memory_all_tools() -> Vec<String> {
+    requested_tool_names(&[
         "memory_search",
         "memory_list",
         "memory_get",
@@ -1695,53 +1758,22 @@ fn memory_all_preflight_response() -> String {
     ])
 }
 
-fn memory_remember_preflight_response() -> String {
-    preflight_response_with_visible_tools(&["memory_remember"])
+fn memory_remember_tools() -> Vec<String> {
+    requested_tool_names(&["memory_remember"])
 }
 
-fn memory_forget_preflight_response() -> String {
-    preflight_response_with_visible_tools(&["memory_search", "memory_get", "memory_forget"])
+fn memory_forget_tools() -> Vec<String> {
+    requested_tool_names(&["memory_search", "memory_get", "memory_forget"])
 }
 
-fn optional_domain_preflight_response() -> String {
-    preflight_response_with_visible_tools(&[
+fn optional_domain_tools() -> Vec<String> {
+    requested_tool_names(&[
         "memory_search",
         "task_create",
         "artifact_prepare",
         "artifact_register",
-        "computer_use",
+        "cua_get_window_state",
     ])
-}
-
-fn is_turn_preflight_request(request: &ChatRequest) -> bool {
-    request.compiled_prompt.is_none()
-        && request.tools.is_none()
-        && request.tool_choice.is_none()
-        && request.messages.len() == 1
-        && request.messages[0]
-            .content
-            .contains("internal turn preflight planner")
-        && request.messages[0]
-            .content
-            .contains("Structured input JSON")
-}
-
-fn test_preflight_response() -> ChatResponse {
-    ChatResponse {
-        text: TEST_PREFLIGHT_RESPONSE.to_owned(),
-        usage: None,
-        reasoning_content: None,
-        tool_calls: Vec::new(),
-        provider_replay_state: None,
-        termination: pioneer_provider::ProviderTermination::Complete,
-    }
-}
-
-fn visible_test_requests(requests: Vec<ChatRequest>) -> Vec<ChatRequest> {
-    requests
-        .into_iter()
-        .filter(|request| !is_turn_preflight_request(request))
-        .collect()
 }
 
 #[derive(Default)]
@@ -1751,12 +1783,10 @@ struct CaptureStandardProvider {
 
 impl CaptureStandardProvider {
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        visible_test_requests(
-            self.requests
-                .lock()
-                .expect("capture provider lock poisoned")
-                .clone(),
-        )
+        self.requests
+            .lock()
+            .expect("capture provider lock poisoned")
+            .clone()
     }
 }
 
@@ -1764,7 +1794,7 @@ struct SequencedToolProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     first_tool_calls: Vec<pioneer_provider::ProviderToolCall>,
     second_text: String,
-    preflight_response_text: String,
+    requested_tools: Vec<String>,
     first_response_delay: Duration,
     first_provider_replay_state: Option<ProviderReplayState>,
     fail_after_first: bool,
@@ -1780,7 +1810,7 @@ impl SequencedToolProvider {
             requests: std::sync::Mutex::new(Vec::new()),
             first_tool_calls,
             second_text: second_text.into(),
-            preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
+            requested_tools: Vec::new(),
             first_response_delay: Duration::ZERO,
             first_provider_replay_state: None,
             fail_after_first: false,
@@ -1788,16 +1818,16 @@ impl SequencedToolProvider {
         }
     }
 
-    fn with_preflight_response(
+    fn with_requested_tools(
         first_tool_calls: Vec<pioneer_provider::ProviderToolCall>,
         second_text: impl Into<String>,
-        preflight_response_text: impl Into<String>,
+        requested_tools: Vec<String>,
     ) -> Self {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
             first_tool_calls,
             second_text: second_text.into(),
-            preflight_response_text: preflight_response_text.into(),
+            requested_tools,
             first_response_delay: Duration::ZERO,
             first_provider_replay_state: None,
             fail_after_first: false,
@@ -1816,12 +1846,10 @@ impl SequencedToolProvider {
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        visible_test_requests(
-            self.requests
-                .lock()
-                .expect("capture provider lock poisoned")
-                .clone(),
-        )
+        self.requests
+            .lock()
+            .expect("capture provider lock poisoned")
+            .clone()
     }
 }
 
@@ -1833,12 +1861,10 @@ struct AlwaysTaskCreateProvider {
 
 impl AlwaysTaskCreateProvider {
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        visible_test_requests(
-            self.requests
-                .lock()
-                .expect("always task_create provider lock poisoned")
-                .clone(),
-        )
+        self.requests
+            .lock()
+            .expect("always task_create provider lock poisoned")
+            .clone()
     }
 }
 
@@ -1923,12 +1949,10 @@ impl ReviewGuardProvider {
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        visible_test_requests(
-            self.requests
-                .lock()
-                .expect("review guard provider lock poisoned")
-                .clone(),
-        )
+        self.requests
+            .lock()
+            .expect("review guard provider lock poisoned")
+            .clone()
     }
 }
 
@@ -2390,7 +2414,7 @@ struct LoopBudgetProvider {
     next_index: AtomicUsize,
     mode: LoopBudgetProviderMode,
     tool_calls_per_round: usize,
-    preflight_response_text: String,
+    requested_tools: Vec<String>,
 }
 
 impl LoopBudgetProvider {
@@ -2400,31 +2424,29 @@ impl LoopBudgetProvider {
             next_index: AtomicUsize::new(0),
             mode,
             tool_calls_per_round,
-            preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
+            requested_tools: Vec::new(),
         }
     }
 
-    fn with_preflight_response(
+    fn with_requested_tools(
         mode: LoopBudgetProviderMode,
         tool_calls_per_round: usize,
-        preflight_response_text: impl Into<String>,
+        requested_tools: Vec<String>,
     ) -> Self {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
             next_index: AtomicUsize::new(0),
             mode,
             tool_calls_per_round,
-            preflight_response_text: preflight_response_text.into(),
+            requested_tools,
         }
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        visible_test_requests(
-            self.requests
-                .lock()
-                .expect("loop budget provider lock poisoned")
-                .clone(),
-        )
+        self.requests
+            .lock()
+            .expect("loop budget provider lock poisoned")
+            .clone()
     }
 
     fn tools_available(request: &ChatRequest) -> bool {
@@ -2474,204 +2496,36 @@ struct ProviderRecoveryBoundaryProvider {
 
 impl ProviderRecoveryBoundaryProvider {
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        visible_test_requests(
-            self.requests
-                .lock()
-                .expect("provider boundary lock poisoned")
-                .clone(),
-        )
+        self.requests
+            .lock()
+            .expect("provider boundary lock poisoned")
+            .clone()
     }
 }
 
 struct RecordingMemoryProvider {
-    recall_contexts: std::sync::Mutex<Vec<MemoryTurnContext>>,
-    recall_requests: std::sync::Mutex<Vec<MemoryRecallRequest>>,
-    mode_recall_requests: std::sync::Mutex<Vec<MemoryModeRecallParams>>,
     tool_contexts: std::sync::Mutex<Vec<MemoryTurnContext>>,
-    recall_results: std::sync::Mutex<VecDeque<Result<MemoryRecallSnapshot, String>>>,
     tool_result: Result<MemoryToolMaterialization, String>,
 }
-
 impl RecordingMemoryProvider {
-    fn new(
-        recall_result: Result<MemoryRecallSnapshot, String>,
-        tool_result: Result<MemoryToolMaterialization, String>,
-    ) -> Self {
-        Self::with_recall_sequence(vec![recall_result], tool_result)
-    }
-
-    fn with_recall_sequence(
-        recall_results: Vec<Result<MemoryRecallSnapshot, String>>,
-        tool_result: Result<MemoryToolMaterialization, String>,
-    ) -> Self {
+    fn new(tool_result: Result<MemoryToolMaterialization, String>) -> Self {
         Self {
-            recall_contexts: std::sync::Mutex::new(Vec::new()),
-            recall_requests: std::sync::Mutex::new(Vec::new()),
-            mode_recall_requests: std::sync::Mutex::new(Vec::new()),
             tool_contexts: std::sync::Mutex::new(Vec::new()),
-            recall_results: std::sync::Mutex::new(VecDeque::from(recall_results)),
             tool_result,
         }
     }
-
-    fn ok() -> Self {
-        Self::new(
-            Ok(MemoryRecallSnapshot::empty()),
-            Ok(MemoryToolMaterialization::default()),
-        )
-    }
-
-    fn recall_contexts(&self) -> Vec<MemoryTurnContext> {
-        self.recall_contexts
-            .lock()
-            .expect("memory recall contexts lock poisoned")
-            .clone()
-    }
-
-    fn recall_requests(&self) -> Vec<MemoryRecallRequest> {
-        self.recall_requests
-            .lock()
-            .expect("memory recall requests lock poisoned")
-            .clone()
-    }
-
-    fn mode_recall_requests(&self) -> Vec<MemoryModeRecallParams> {
-        self.mode_recall_requests
-            .lock()
-            .expect("memory mode recall requests lock poisoned")
-            .clone()
-    }
-
     fn tool_contexts(&self) -> Vec<MemoryTurnContext> {
-        self.tool_contexts
-            .lock()
-            .expect("memory tool contexts lock poisoned")
-            .clone()
+        self.tool_contexts.lock().unwrap().clone()
     }
 }
-
 #[async_trait::async_trait]
 impl AgentMemoryProvider for RecordingMemoryProvider {
-    async fn recall_memory(
-        &self,
-        context: MemoryTurnContext,
-        request: MemoryRecallRequest,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        self.recall_contexts
-            .lock()
-            .expect("memory recall contexts lock poisoned")
-            .push(context);
-        self.recall_requests
-            .lock()
-            .expect("memory recall requests lock poisoned")
-            .push(request);
-        let mut results = self
-            .recall_results
-            .lock()
-            .expect("memory recall results lock poisoned");
-        if results.len() > 1 {
-            results.pop_front().expect("result exists")
-        } else {
-            results
-                .front()
-                .cloned()
-                .unwrap_or_else(|| Ok(MemoryRecallSnapshot::empty()))
-        }
-    }
-
-    async fn recall_memory_mode(
-        &self,
-        context: MemoryTurnContext,
-        request: MemoryModeRecallParams,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        self.recall_contexts
-            .lock()
-            .expect("memory recall contexts lock poisoned")
-            .push(context);
-        self.mode_recall_requests
-            .lock()
-            .expect("memory mode recall requests lock poisoned")
-            .push(request);
-        let mut results = self
-            .recall_results
-            .lock()
-            .expect("memory recall results lock poisoned");
-        if results.len() > 1 {
-            results.pop_front().expect("result exists")
-        } else {
-            results
-                .front()
-                .cloned()
-                .unwrap_or_else(|| Ok(MemoryRecallSnapshot::empty()))
-        }
-    }
-
     async fn materialize_memory_tools(
         &self,
         context: MemoryTurnContext,
     ) -> Result<MemoryToolMaterialization, String> {
-        self.tool_contexts
-            .lock()
-            .expect("memory tool contexts lock poisoned")
-            .push(context);
+        self.tool_contexts.lock().unwrap().push(context);
         self.tool_result.clone()
-    }
-}
-
-struct FakeMemoryTurnPolicyProvider {
-    contexts: std::sync::Mutex<Vec<MemoryTurnPolicyContext>>,
-    requests: std::sync::Mutex<Vec<MemoryTurnPolicyRequest>>,
-    result: Result<MemoryTurnPolicy, String>,
-}
-
-impl FakeMemoryTurnPolicyProvider {
-    fn new(policy: MemoryTurnPolicy) -> Self {
-        Self {
-            contexts: std::sync::Mutex::new(Vec::new()),
-            requests: std::sync::Mutex::new(Vec::new()),
-            result: Ok(policy),
-        }
-    }
-
-    fn failing(error: impl Into<String>) -> Self {
-        Self {
-            contexts: std::sync::Mutex::new(Vec::new()),
-            requests: std::sync::Mutex::new(Vec::new()),
-            result: Err(error.into()),
-        }
-    }
-
-    fn contexts(&self) -> Vec<MemoryTurnPolicyContext> {
-        self.contexts
-            .lock()
-            .expect("memory policy contexts lock poisoned")
-            .clone()
-    }
-
-    fn requests(&self) -> Vec<MemoryTurnPolicyRequest> {
-        self.requests
-            .lock()
-            .expect("memory policy requests lock poisoned")
-            .clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl AgentMemoryTurnPolicyProvider for FakeMemoryTurnPolicyProvider {
-    async fn resolve_memory_turn_policy(
-        &self,
-        context: MemoryTurnPolicyContext,
-        request: MemoryTurnPolicyRequest,
-    ) -> Result<MemoryTurnPolicy, String> {
-        self.contexts
-            .lock()
-            .expect("memory policy contexts lock poisoned")
-            .push(context);
-        self.requests
-            .lock()
-            .expect("memory policy requests lock poisoned")
-            .push(request);
-        self.result.clone()
     }
 }
 
@@ -2879,162 +2733,6 @@ fn recording_standard_memory_tool_bundle()
     )
 }
 
-fn memory_recall_item(
-    memory_id: &str,
-    category: MemoryCategory,
-    key: Option<&str>,
-    content: &str,
-) -> MemoryRecallItem {
-    MemoryRecallItem {
-        memory_id: memory_id.to_owned(),
-        scope: MemoryScope {
-            kind: MemoryScopeKind::User,
-            key: "global".to_owned(),
-        },
-        category,
-        key: key.map(str::to_owned),
-        content: content.to_owned(),
-        score: Some(1.0),
-        updated_at: 1_714_867_200,
-    }
-}
-
-#[derive(Default)]
-struct StatefulMemoryProvider {
-    stored_content: Arc<std::sync::Mutex<Option<String>>>,
-}
-
-#[async_trait::async_trait]
-impl AgentMemoryProvider for StatefulMemoryProvider {
-    async fn recall_memory(
-        &self,
-        _context: MemoryTurnContext,
-        _request: MemoryRecallRequest,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        let Some(content) = self
-            .stored_content
-            .lock()
-            .expect("stateful memory lock poisoned")
-            .clone()
-        else {
-            return Ok(MemoryRecallSnapshot::empty());
-        };
-
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_stateful_name",
-                MemoryCategory::Identity,
-                Some("name"),
-                content.as_str(),
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        })
-    }
-
-    async fn recall_memory_mode(
-        &self,
-        _context: MemoryTurnContext,
-        _request: MemoryModeRecallParams,
-    ) -> Result<MemoryRecallSnapshot, String> {
-        let Some(content) = self
-            .stored_content
-            .lock()
-            .expect("stateful memory lock poisoned")
-            .clone()
-        else {
-            return Ok(MemoryRecallSnapshot::empty());
-        };
-
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_stateful_name",
-                MemoryCategory::Identity,
-                Some("name"),
-                content.as_str(),
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        })
-    }
-
-    async fn materialize_memory_tools(
-        &self,
-        _context: MemoryTurnContext,
-    ) -> Result<MemoryToolMaterialization, String> {
-        let handler: Arc<dyn ToolHandler> = Arc::new(StatefulMemoryToolHandler {
-            stored_content: self.stored_content.clone(),
-        });
-        let mut bundle = fake_memory_tool_bundle_for_names(
-            &[
-                "memory_search",
-                "memory_get",
-                "memory_remember",
-                "memory_forget",
-            ],
-            handler,
-        );
-        let remember_spec = bundle
-            .specs
-            .iter_mut()
-            .find(|spec| spec.spec.name == "memory_remember")
-            .expect("stateful memory bundle should include memory_remember");
-        remember_spec.spec.parameters = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "content": {"type": "string"},
-                "category": {"type": "string"},
-                "scope": {"type": "string"},
-                "key": {"type": "string"},
-                "source": {"type": "string"}
-            },
-            "required": ["content"],
-            "additionalProperties": false
-        });
-        Ok(MemoryToolMaterialization {
-            bundles: vec![bundle],
-            diagnostics: Vec::new(),
-        })
-    }
-}
-
-struct StatefulMemoryToolHandler {
-    stored_content: Arc<std::sync::Mutex<Option<String>>>,
-}
-
-#[async_trait::async_trait]
-impl ToolHandler for StatefulMemoryToolHandler {
-    async fn handle(
-        &self,
-        invocation: ToolInvocation,
-        _trace: ToolEventTrace,
-    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
-        match invocation.tool_name.as_str() {
-            "memory_remember" => {
-                let content = match &invocation.payload {
-                    ToolPayload::Function { arguments } => arguments
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("User's name is Alexander."),
-                    _ => "User's name is Alexander.",
-                };
-                *self
-                    .stored_content
-                    .lock()
-                    .expect("stateful memory lock poisoned") = Some(content.to_owned());
-            }
-            "memory_forget" => {
-                *self
-                    .stored_content
-                    .lock()
-                    .expect("stateful memory lock poisoned") = None;
-            }
-            _ => {}
-        }
-        Ok(Box::new(FunctionToolOutput::new("memory-ok", true)))
-    }
-}
-
 #[async_trait::async_trait]
 impl Provider for CaptureStandardProvider {
     fn name(&self) -> &str {
@@ -3053,15 +2751,13 @@ impl Provider for CaptureStandardProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("capture provider lock poisoned")
             .push(request);
-        if preflight {
-            return Ok(test_preflight_response());
-        }
+
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: "done".to_owned(),
             usage: None,
             reasoning_content: None,
@@ -3102,20 +2798,14 @@ impl Provider for SequencedToolProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
+        let tool_request = request_missing_fixture_tools(&request, &self.requested_tools);
+
         self.requests
             .lock()
             .expect("capture provider lock poisoned")
             .push(request);
-        if preflight {
-            return Ok(ChatResponse {
-                text: self.preflight_response_text.clone(),
-                usage: None,
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
-            });
+        if let Some(response) = tool_request {
+            return Ok(response);
         }
 
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
@@ -3124,6 +2814,7 @@ impl Provider for SequencedToolProvider {
                 sleep(self.first_response_delay).await;
             }
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3138,6 +2829,7 @@ impl Provider for SequencedToolProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: self.second_text.clone(),
             usage: None,
             reasoning_content: None,
@@ -3178,21 +2870,15 @@ impl Provider for LoopBudgetProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
+        let tool_request = request_missing_fixture_tools(&request, &self.requested_tools);
+
         let tools_available = Self::tools_available(&request);
         self.requests
             .lock()
             .expect("loop budget provider lock poisoned")
             .push(request);
-        if preflight {
-            return Ok(ChatResponse {
-                text: self.preflight_response_text.clone(),
-                usage: None,
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
-            });
+        if let Some(response) = tool_request {
+            return Ok(response);
         }
 
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
@@ -3231,6 +2917,7 @@ impl Provider for LoopBudgetProvider {
         };
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: if tool_calls.is_empty() {
                 if matches!(
                     self.mode,
@@ -3287,17 +2974,14 @@ impl Provider for AlwaysTaskCreateProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("always task_create provider lock poisoned")
             .push(request);
-        if preflight {
-            return Ok(test_preflight_response());
-        }
 
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: String::new(),
             usage: None,
             reasoning_content: None,
@@ -3347,18 +3031,15 @@ impl Provider for ProviderRecoveryBoundaryProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("provider boundary lock poisoned")
             .push(request);
-        if preflight {
-            return Ok(test_preflight_response());
-        }
 
         match self.next_index.fetch_add(1, Ordering::SeqCst) {
             0 => Err(anyhow::anyhow!("initial provider failure 500")),
             1 => Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3417,22 +3098,18 @@ impl Provider for CaptureAgentProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
+        let tool_request = request_missing_fixture_tools(&request, &self.requested_tools);
+
         self.requests
             .lock()
             .expect("capture provider lock poisoned")
             .push(request);
-        if preflight {
-            return Ok(ChatResponse {
-                text: self.preflight_response_text.clone(),
-                usage: None,
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
-            });
+        if let Some(response) = tool_request {
+            return Ok(response);
         }
+
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: self.response_text.clone(),
             usage: None,
             reasoning_content: None,
@@ -3508,14 +3185,10 @@ impl Provider for ReviewGuardProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("review guard provider lock poisoned")
             .push(request);
-        if preflight {
-            return Ok(test_preflight_response());
-        }
 
         let step = self
             .steps
@@ -3525,6 +3198,7 @@ impl Provider for ReviewGuardProvider {
             .unwrap_or_else(|| ReviewGuardProviderStep::text("done"));
         let response = match step {
             ReviewGuardProviderStep::Text(text) => ChatResponse {
+                messages: Vec::new(),
                 text,
                 usage: None,
                 reasoning_content: None,
@@ -3533,6 +3207,7 @@ impl Provider for ReviewGuardProvider {
                 termination: pioneer_provider::ProviderTermination::Complete,
             },
             ReviewGuardProviderStep::Tool { name, arguments } => ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3583,20 +3258,17 @@ impl Provider for EmptyNoToolRoundProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("empty no-tool provider lock poisoned")
             .push(request);
-        if preflight {
-            return Ok(test_preflight_response());
-        }
 
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
         if index == 0
             && let Some(first_tool_call) = self.first_tool_call.clone()
         {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3609,6 +3281,7 @@ impl Provider for EmptyNoToolRoundProvider {
         let empty_index = index.saturating_sub(usize::from(self.first_tool_call.is_some()));
         if empty_index < self.empty_rounds_before_final {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3619,6 +3292,7 @@ impl Provider for EmptyNoToolRoundProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: "done after empty response recovery".to_owned(),
             usage: None,
             reasoning_content: None,
@@ -3659,14 +3333,10 @@ impl Provider for SequencedTextProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("sequenced text provider lock poisoned")
             .push(request);
-        if preflight {
-            return Ok(test_preflight_response());
-        }
 
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
         let text = self
@@ -3676,6 +3346,7 @@ impl Provider for SequencedTextProvider {
             .cloned()
             .unwrap_or_else(|| "done".to_owned());
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage: None,
             reasoning_content: None,
@@ -3801,6 +3472,7 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 
 fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent> {
     match event {
+        AgentDurableEvent::ProviderUsageSnapshot { .. } => None,
         AgentDurableEvent::ToolOutputRecorded { notification, .. } => {
             Some(AgentEvent::ItemDelta(notification))
         }
@@ -3991,6 +3663,7 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
             turn_id,
             reason,
             recovery,
+            ..
         } => Some(AgentEvent::TurnFailed {
             thread_id,
             turn_id,
@@ -4208,8 +3881,9 @@ async fn start_simple_turn(
         .await
         .expect("thread should be created");
     let mut events = subscribe_agent_events(manager, thread_id).await;
-    manager
-        .start_test_turn_with_default_profile_and_capabilities(
+    // Keep the composed turn-start future out of the test harness stack.
+    Box::pin(
+        manager.start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             mode,
@@ -4222,9 +3896,10 @@ async fn start_simple_turn(
             }],
             Vec::new(),
             Vec::new(),
-        )
-        .await
-        .expect("turn should start");
+        ),
+    )
+    .await
+    .expect("turn should start");
 
     recv_events_until_terminal(&mut events).await
 }
@@ -4329,44 +4004,223 @@ async fn start_simple_turn_with_terminal_effects(
     recv_and_execute_terminal_effects(manager, &mut durable_events, turn_id).await
 }
 
+// Preparation must precede the real agent inventory, not just dispatch.
 #[tokio::test]
-async fn preflight_agent_loop_runs_before_first_main_prompt_compile() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+async fn connection_owned_model_preparation_precedes_agent_tool_inventory() {
+    #[derive(Default)]
+    struct AdmissionBoundary {
+        inner: RecordingContextBoundary,
+        admitted: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::compaction::controller::NativeContextController for AdmissionBoundary {
+        async fn stop(
+            &self,
+            context: &crate::compaction::controller::NativeContext,
+        ) -> anyhow::Result<()> {
+            self.inner.stop(context).await
+        }
+        async fn prepare(
+            &self,
+            context: &crate::compaction::controller::NativeContext,
+            request: ChatRequest,
+            measurement: Option<crate::compaction::controller::NativeUsageMeasurement>,
+            recovery: bool,
+        ) -> anyhow::Result<crate::compaction::controller::NativePreparedRequest> {
+            let prepared = context.provider.prepare_input_budget(request).await?;
+            self.admitted.store(true, Ordering::SeqCst);
+            self.inner
+                .prepare(context, prepared.request, measurement, recovery)
+                .await
+        }
+    }
+    struct PreparedModel {
+        inner: CaptureAgentProvider,
+        prepared: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl Provider for PreparedModel {
+        fn name(&self) -> &str {
+            "connection-facts-provider"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        async fn prepare_model(&self, _: &str) -> anyhow::Result<()> {
+            self.prepared.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn model_catalog_entry(
+            &self,
+            model: &str,
+        ) -> Option<pioneer_provider::catalog::CatalogModel> {
+            Some(pioneer_provider::catalog::CatalogModel {
+                id: model.into(),
+                name: "connection model".into(),
+                provider: self.name().into(),
+                api: "fixture-api".into(),
+                base_url: String::new(),
+                context_window: 32000,
+                max_tokens: 4321,
+                reasoning: false,
+                input: vec!["text".into()],
+                cost: serde_json::json!({}),
+                metadata: Default::default(),
+            })
+        }
+        fn model_tool_calling(&self, _: &str) -> bool {
+            self.prepared.load(Ordering::SeqCst)
+        }
+        fn native_file_tool_capability(
+            &self,
+            model: &str,
+        ) -> pioneer_provider::NativeFileToolCapability {
+            self.inner.native_file_tool_capability(model)
+        }
+        async fn prepare_input_budget(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::attachments::PreparedInputBudget> {
+            assert!(
+                self.prepared.load(Ordering::SeqCst),
+                "model facts must be ready before input admission"
+            );
+            self.inner.prepare_input_budget(request).await
+        }
+        async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+            assert!(
+                self.prepared.load(Ordering::SeqCst),
+                "main dispatch requires prepared model facts"
+            );
+            self.inner.chat(request).await
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            self.inner.stream_chat(request).await
+        }
+    }
+    let provider = Arc::new(PreparedModel {
+        inner: CaptureAgentProvider::default(),
+        prepared: std::sync::atomic::AtomicBool::new(false),
+    });
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "connection-facts-provider",
+        provider.clone(),
+    ));
+    let wrapped = registry.get_or_create("connection-facts-provider").unwrap();
+    assert!(wrapped.capabilities().tool_calling);
+    assert!(!wrapped.model_tool_calling("test-model"));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-
+    let admission = Arc::new(AdmissionBoundary::default());
+    manager
+        .set_context_controller(Some(admission.clone()))
+        .await;
+    assert!(!provider.prepared.load(Ordering::SeqCst));
     let observed = start_simple_turn(
         &manager,
-        "preflight_agent_loop_thread",
+        "prepared_model_inventory_thread",
         "workspace",
-        "preflight_agent_loop_turn",
+        "prepared_model_inventory_turn",
         ThreadMode::Agent,
-        "capture",
+        "connection-facts-provider",
         "hello",
     )
     .await;
     assert_turn_completed(&observed);
+    assert!(admission.admitted.load(Ordering::SeqCst));
+    let requests = provider.inner.snapshot_all_requests();
+    assert_eq!(requests.len(), 1);
+    let main_request = requests
+        .iter()
+        .find(|request| request.compiled_prompt.is_some())
+        .expect("main provider request");
+    let tools = main_request
+        .tools
+        .as_ref()
+        .expect("prepared model must receive the real tool inventory");
+    assert!(tools.iter().any(|tool| tool.name == "read_file"));
+}
 
-    let requests = provider.snapshot_all_requests();
-    assert_eq!(
-        requests.len(),
-        2,
-        "agent turn should make one preflight request before the main provider request"
-    );
-    let preflight_request = &requests[0];
-    assert!(preflight_request.tools.is_none());
-    assert!(preflight_request.tool_choice.is_none());
-    assert_eq!(preflight_request.compiled_prompt, None);
-    assert!(
-        preflight_request.messages[0]
-            .content
-            .contains("Structured input JSON")
-    );
-    assert!(preflight_request.messages[0].content.contains("\"tools\""));
+fn run_composed_agent_startup_test<F, Fut>(name: &'static str, body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    // Exercise composed startup on the original Gateway-sized stack. Construct
+    // the fixture inside the thread so construction obeys the same bound.
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("agent fixture runtime should build")
+                .block_on(Box::pin(body()));
+        })
+        .expect("agent fixture thread should start")
+        .join()
+        .unwrap_or_else(|error| std::panic::resume_unwind(error));
+}
 
-    let main_request = &requests[1];
-    assert!(main_request.compiled_prompt.is_some());
-    assert!(main_request.tools.is_some());
+#[test]
+fn agent_dispatch_starts_with_main_prompt() {
+    run_composed_agent_startup_test("agent_dispatch_starts_with_main_prompt", || async {
+        let provider = Arc::new(CaptureAgentProvider::default());
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+        let manager = AgentManager::new(registry, test_tool_loop_config());
+
+        let memory = Arc::new(RecordingMemoryProvider::new(Ok(
+            MemoryToolMaterialization {
+                bundles: vec![fake_standard_memory_tool_bundle()],
+                diagnostics: Vec::new(),
+            },
+        )));
+        manager.set_memory_provider(Some(memory.clone())).await;
+        install_configured_memory_hooks_for_test(&manager).await;
+
+        let observed = start_simple_turn(
+            &manager,
+            "main_agent_loop_thread",
+            "workspace",
+            "main_agent_loop_turn",
+            ThreadMode::Agent,
+            "capture",
+            "hello",
+        )
+        .await;
+        assert_turn_completed(&observed);
+
+        let requests = provider.snapshot_all_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one main dispatch without a preliminary request"
+        );
+        let main_request = &requests[0];
+        assert!(main_request.compiled_prompt.is_some());
+        assert!(main_request.tools.is_some());
+        assert_eq!(memory.tool_contexts().len(), 1);
+        assert!(
+            main_request
+                .tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|tool| !tool.name.starts_with("memory_"))
+        );
+        assert!(
+            !main_request
+                .compiled_prompt
+                .as_ref()
+                .unwrap()
+                .full_system_text
+                .contains("### Memory Recall")
+        );
+    });
 }
 
 fn agent_skill_delivery_fixture() -> AgentSkillRuntimeEntry {
@@ -4416,6 +4270,7 @@ async fn start_agent_skill_delivery_turn(
             None,
             pioneer_protocol::default_turn_permission_profile_snapshot(),
             test_full_access_security_snapshot(),
+            None,
         )
         .await
         .expect("turn should start");
@@ -4634,119 +4489,95 @@ async fn empty_no_tool_round_after_tool_result_preserves_context() {
     }));
 }
 
-#[tokio::test]
-async fn tool_schema_dump_no_tool_round_retries_without_schema_agent_message() {
-    let provider = Arc::new(SequencedTextProvider::new(vec![
-        TOOL_SCHEMA_DUMP_RESPONSE,
-        "done after schema dump recovery",
-    ]));
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "sequenced-text",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+#[test]
+fn malformed_no_tool_text_retries_without_rejected_agent_message() {
+    for (
+        bad_response,
+        final_text,
+        thread_id,
+        turn_id,
+        expected_instruction,
+        completed_message_diagnostic,
+        request_count_diagnostic,
+        instruction_diagnostic,
+    ) in [
+        (
+            TOOL_SCHEMA_DUMP_RESPONSE,
+            "done after schema dump recovery",
+            "schema_dump_retry_thread",
+            "schema_dump_retry_turn",
+            "reproduced tool schemas or tool definitions",
+            "tool schema dumps must not create completed AgentMessage items",
+            "schema dump should be retried inside the same agent loop before final answer",
+            "retry request should include the schema-dump recovery instruction",
+        ),
+        (
+            RAW_TOOL_CALL_MARKUP_RESPONSE,
+            "done after raw tool-call recovery",
+            "raw_tool_markup_retry_thread",
+            "raw_tool_markup_retry_turn",
+            "raw tool-call markup",
+            "raw tool-call markup must not create completed AgentMessage items",
+            "raw tool-call markup should be retried inside the same agent loop before final answer",
+            "retry request should include the raw tool-call markup recovery instruction",
+        ),
+    ] {
+        let body = async {
+            let provider = Arc::new(SequencedTextProvider::new(vec![bad_response, final_text]));
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "sequenced-text",
+                provider.clone(),
+            ));
+            let manager = AgentManager::new(registry, test_tool_loop_config());
 
-    let observed = start_simple_turn(
-        &manager,
-        "schema_dump_retry_thread",
-        "workspace",
-        "schema_dump_retry_turn",
-        ThreadMode::Agent,
-        "sequenced-text",
-        "hello",
-    )
-    .await;
-    assert_turn_completed(&observed);
+            let observed = start_simple_turn(
+                &manager,
+                thread_id,
+                "workspace",
+                turn_id,
+                ThreadMode::Agent,
+                "sequenced-text",
+                "hello",
+            )
+            .await;
+            assert_turn_completed(&observed);
 
-    let completed_messages = observed
-        .iter()
-        .filter_map(|event| {
-            let AgentEvent::ItemCompleted(notification) = event else {
-                return None;
-            };
-            let TurnItem::AgentMessage { text, .. } = &notification.item else {
-                return None;
-            };
-            Some(text.clone())
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        completed_messages,
-        vec!["done after schema dump recovery".to_owned()],
-        "tool schema dumps must not create completed AgentMessage items"
-    );
+            let completed_messages = observed
+                .iter()
+                .filter_map(|event| {
+                    let AgentEvent::ItemCompleted(notification) = event else {
+                        return None;
+                    };
+                    let TurnItem::AgentMessage { text, .. } = &notification.item else {
+                        return None;
+                    };
+                    Some(text.clone())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                completed_messages,
+                vec![final_text.to_owned()],
+                "{completed_message_diagnostic}"
+            );
 
-    let requests = provider.snapshot_requests();
-    assert_eq!(
-        requests.len(),
-        2,
-        "schema dump should be retried inside the same agent loop before final answer"
-    );
-    assert!(
-        requests[1].messages.iter().any(|message| {
-            message
-                .content
-                .contains("reproduced tool schemas or tool definitions")
-        }),
-        "retry request should include the schema-dump recovery instruction"
-    );
-}
-
-#[tokio::test]
-async fn raw_tool_call_markup_no_tool_round_retries_without_raw_agent_message() {
-    let provider = Arc::new(SequencedTextProvider::new(vec![
-        RAW_TOOL_CALL_MARKUP_RESPONSE,
-        "done after raw tool-call recovery",
-    ]));
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "sequenced-text",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-
-    let observed = start_simple_turn(
-        &manager,
-        "raw_tool_markup_retry_thread",
-        "workspace",
-        "raw_tool_markup_retry_turn",
-        ThreadMode::Agent,
-        "sequenced-text",
-        "hello",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let completed_messages = observed
-        .iter()
-        .filter_map(|event| {
-            let AgentEvent::ItemCompleted(notification) = event else {
-                return None;
-            };
-            let TurnItem::AgentMessage { text, .. } = &notification.item else {
-                return None;
-            };
-            Some(text.clone())
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        completed_messages,
-        vec!["done after raw tool-call recovery".to_owned()],
-        "raw tool-call markup must not create completed AgentMessage items"
-    );
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(
-        requests.len(),
-        2,
-        "raw tool-call markup should be retried inside the same agent loop before final answer"
-    );
-    assert!(
-        requests[1]
-            .messages
-            .iter()
-            .any(|message| message.content.contains("raw tool-call markup")),
-        "retry request should include the raw tool-call markup recovery instruction"
-    );
+            let requests = provider.snapshot_requests();
+            assert_eq!(requests.len(), 2, "{request_count_diagnostic}");
+            assert!(
+                requests[1]
+                    .messages
+                    .iter()
+                    .any(|message| { message.content.contains(expected_instruction) }),
+                "{instruction_diagnostic}"
+            );
+        };
+        tokio::pin!(body);
+        let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed building the Runtime")
+            .block_on(body);
+    }
 }
 
 #[tokio::test]
@@ -4993,6 +4824,481 @@ async fn provider_failure_prepares_cleanup_for_later_recovery_terminalization() 
     ));
 }
 
+// Capture the actual ACKed canonical group at the crash boundary: discovery
+// result committed, next request proposal rejected, no updated checkpoint.
+async fn discovery_history_before_next_snapshot(
+    commit_next_proposal: bool,
+) -> (Vec<crate::RetainedProviderHistoryMessage>, ChatRequest) {
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "discover-before-crash".into(),
+            name: "request_tools".into(),
+            arguments: json!({"domains":["memory"],"reason":"need memory"}).to_string(),
+        }],
+        "must not dispatch",
+    ));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "sequenced-tools",
+            provider.clone(),
+        )),
+        test_tool_loop_config(),
+    );
+    manager
+        .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(Ok(
+            MemoryToolMaterialization {
+                bundles: vec![fake_standard_memory_tool_bundle()],
+                diagnostics: Vec::new(),
+            },
+        )))))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
+    manager
+        .ensure_thread("disclosure-thread", "disclosure-workspace")
+        .await
+        .unwrap();
+    let mut events = manager
+        .take_durable_receiver("disclosure-thread")
+        .await
+        .unwrap();
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            "disclosure-thread",
+            "disclosure-turn",
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "discover once".into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut retained = Vec::new();
+    let mut round: Option<pioneer_provider::CanonicalProviderRoundEnvelope> = None;
+    let mut result_committed = false;
+    let mut rejected = false;
+    let mut terminal = false;
+    for _ in 0..200 {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(&event, AgentDurableEvent::TurnLlmContextAppended { source, .. }
+            if source == "system_snapshot_v1" && result_committed && !commit_next_proposal)
+        {
+            assert_eq!(
+                provider.snapshot_requests().len(),
+                1,
+                "no request B before snapshot ACK"
+            );
+            events.acknowledge_last(Err(
+                pioneer_runtime_events::DurableCommitRejection::permanent(
+                    "fixture_crash_boundary",
+                    "next proposal not committed",
+                ),
+            ));
+            rejected = true;
+            continue;
+        }
+        // Only accepted durable events enter the fixture's retained history.
+        events.acknowledge_last(Ok(()));
+        let message = match event {
+            AgentDurableEvent::TurnLlmContextAppended {
+                source,
+                payload,
+                item_id,
+                ..
+            } if matches!(
+                source.as_str(),
+                "system_snapshot_v1" | "turn_input_projection_v1" | "tool_result_v2"
+            ) =>
+            {
+                let pioneer_protocol::ToolResultView::Json {
+                    value,
+                    truncated: false,
+                } = payload
+                else {
+                    panic!("incomplete source")
+                };
+                let mut message: ChatMessage = serde_json::from_value(value).unwrap();
+                if source == "tool_result_v2" {
+                    let round = round.as_ref().unwrap();
+                    let call = round
+                        .calls
+                        .iter()
+                        .find(|call| call.turn_item_id == item_id)
+                        .unwrap();
+                    assert_eq!(
+                        message.tool_call_id.as_deref(),
+                        Some(call.provider_call_id.as_str())
+                    );
+                    assert!(message.content.contains("memory_get"));
+                    message.provenance = Some(crate::compaction::history::pending_origin(
+                        "disclosure-workspace",
+                        "disclosure-thread",
+                        "disclosure-turn",
+                        &round.round_id,
+                        crate::compaction::history::PendingOriginKind::ToolResult,
+                        &item_id,
+                    ));
+                    result_committed = true;
+                }
+                Some(message)
+            }
+            AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                let mut envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+                    serde_json::from_value(payload).unwrap();
+                envelope.message.provenance = Some(crate::compaction::history::pending_origin(
+                    "disclosure-workspace",
+                    "disclosure-thread",
+                    "disclosure-turn",
+                    &envelope.round_id,
+                    crate::compaction::history::PendingOriginKind::Assistant,
+                    &envelope.round_id,
+                ));
+                let message = envelope.message.clone();
+                round = Some(envelope);
+                Some(message)
+            }
+            AgentDurableEvent::TurnExecutionWindowCheckpointed { .. } => {
+                // Rejecting the next proposal can checkpoint the aborted attempt.
+                // It must never checkpoint before the captured crash boundary.
+                assert!(rejected, "no updated checkpoint before proposal rejection");
+                None
+            }
+            AgentDurableEvent::TurnFailed { .. }
+            | AgentDurableEvent::TurnBlocked { .. }
+            | AgentDurableEvent::TurnInterrupted { .. }
+            | AgentDurableEvent::TurnCompleted { .. } => {
+                terminal = true;
+                break;
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            retained.push(crate::RetainedProviderHistoryMessage {
+                sequence: retained.len() as i64 + 1,
+                message,
+            });
+        }
+    }
+    assert!(result_committed && terminal);
+    assert_eq!(rejected, !commit_next_proposal);
+    let mut requests = provider.snapshot_requests();
+    assert_eq!(
+        requests.len(),
+        if commit_next_proposal { 2 } else { 1 },
+        "rejected proposal must never dispatch"
+    );
+    let original = requests.pop().unwrap();
+    manager.remove_thread("disclosure-thread").await;
+    (retained, original)
+}
+
+async fn restart_disclosure_history(
+    retained: Vec<crate::RetainedProviderHistoryMessage>,
+    provider: Arc<dyn Provider>,
+    model: &str,
+    bundle: ToolExtensionBundle,
+) -> Vec<AgentEvent> {
+    let name = provider.name().to_owned();
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(&name, provider)),
+        test_tool_loop_config(),
+    );
+    manager
+        .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(Ok(
+            MemoryToolMaterialization {
+                bundles: vec![bundle],
+                diagnostics: Vec::new(),
+            },
+        )))))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
+    manager
+        .ensure_thread("disclosure-thread", "disclosure-workspace")
+        .await
+        .unwrap();
+    let mut events = subscribe_agent_events(&manager, "disclosure-thread").await;
+    manager.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
+        "disclosure-thread", "disclosure-turn", ThreadMode::Agent, AgentTurnHookRuntimeContext::default(),
+        model, &name, HashMap::new(), SkillCatalogSnapshot {version:1, generated_at_unix:0, skills:Vec::new()},
+        Vec::new(), vec![UserInput::Text {text:"discover once".into(), text_elements:Vec::new()}],
+        Vec::new(), Vec::new(), HashMap::new(), Vec::new(), retained, None,
+        pioneer_protocol::default_turn_permission_profile_snapshot(), test_full_access_security_snapshot(),
+    ).await.unwrap();
+    let observed = recv_events_until_terminal(&mut events).await;
+    manager.remove_thread("disclosure-thread").await;
+    observed
+}
+
+#[tokio::test]
+async fn committed_discovery_restores_before_next_proposal_and_checkpoint() {
+    let (retained, original) = discovery_history_before_next_snapshot(false).await;
+    let mut previous = None;
+    for _ in 0..2 {
+        let (bundle, calls) = recording_standard_memory_tool_bundle();
+        let provider = Arc::new(SequencedToolProvider::new(
+            vec![ProviderToolCall {
+                id: "use-restored-memory".into(),
+                name: "memory_get".into(),
+                arguments: "{}".into(),
+            }],
+            "restored",
+        ));
+        let observed =
+            restart_disclosure_history(retained.clone(), provider.clone(), "test-model", bundle)
+                .await;
+        assert_turn_completed(&observed);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["memory_get"],
+            "restored callable visibility must allow execution without rediscovery"
+        );
+        let requests = provider.snapshot_requests();
+        let tools = requests[0].tools.as_ref().unwrap();
+        let prefix = original.tools.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_value(&tools[..prefix.len()]).unwrap(),
+            serde_json::to_value(prefix).unwrap()
+        );
+        assert!(tools.iter().any(|tool| tool.name == "memory_get"));
+        let serialized = serde_json::to_value(tools).unwrap();
+        if let Some(previous) = previous {
+            assert_eq!(serialized, previous, "repeat restore is idempotent");
+        }
+        previous = Some(serialized);
+        assert!(
+            requests[0]
+                .messages
+                .iter()
+                .any(|message| message.role == Role::Tool
+                    && message.tool_call_id.as_deref() == Some("discover-before-crash"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn restored_discovery_rejects_failed_incomplete_and_unowned_results() {
+    let (retained, _) = discovery_history_before_next_snapshot(false).await;
+    for invalid in [
+        "failed",
+        "incomplete",
+        "foreign",
+        "workspace",
+        "turn",
+        "inherited",
+        "unbound",
+        "user",
+        "missing-fields",
+    ] {
+        let mut history = retained.clone();
+        let result = history
+            .iter_mut()
+            .find(|entry| entry.message.role == Role::Tool)
+            .unwrap();
+        match invalid {
+            "failed" | "incomplete" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&result.message.content).unwrap();
+                value["tool_outcome"] = serde_json::to_value(if invalid == "failed" {
+                    pioneer_tools::ToolOutcome::fatal(
+                        pioneer_tools::ToolErrorClass::ExecutionFailed,
+                        None,
+                    )
+                } else {
+                    pioneer_tools::ToolOutcome::partial(
+                        "incomplete retained result",
+                        "read the complete retained result",
+                    )
+                })
+                .unwrap();
+                result.message.content = value.to_string();
+            }
+            "foreign" => {
+                result.message.provenance.as_mut().unwrap().thread_id = "another-thread".into()
+            }
+            "workspace" => {
+                result.message.provenance.as_mut().unwrap().workspace_id =
+                    "another-workspace".into()
+            }
+            "turn" => {
+                result.message.provenance.as_mut().unwrap().sources[0].scope =
+                    "context:another-turn".into()
+            }
+            "inherited" => result.message.provenance.as_mut().unwrap().inherited = true,
+            "unbound" => result.message.tool_call_id = Some("another-call".into()),
+            "user" => {
+                result.message.role = Role::User;
+                result.message.provenance = None;
+            }
+            "missing-fields" => {
+                result.message.content = json!({"added":{"memory":["memory_get"]}}).to_string()
+            }
+            _ => unreachable!(),
+        }
+        let capture = Arc::new(CaptureAgentProvider::default());
+        let observed = restart_disclosure_history(
+            history,
+            capture.clone(),
+            "gpt-5",
+            fake_standard_memory_tool_bundle(),
+        )
+        .await;
+        let requests = capture.snapshot_requests();
+        if requests.is_empty() {
+            assert!(
+                matches!(
+                    observed.last(),
+                    Some(AgentEvent::TurnFailed { .. } | AgentEvent::TurnBlocked { .. })
+                ),
+                "invalid canonical history may instead be rejected before dispatch"
+            );
+        }
+        assert!(
+            requests.iter().all(|request| !request
+                .tools
+                .iter()
+                .flatten()
+                .any(|tool| tool.name.starts_with("memory_"))),
+            "{invalid} must not disclose a domain on any dispatched request"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restored_schema_does_not_authorize_removed_tool_calls() {
+    let (retained, _) = discovery_history_before_next_snapshot(true).await;
+    let (mut bundle, calls) = recording_standard_memory_tool_bundle();
+    bundle.specs.retain(|spec| spec.spec.name != "memory_get");
+    bundle.handlers.retain(|(name, _)| name != "memory_get");
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "removed-call".into(),
+            name: "memory_get".into(),
+            arguments: "{}".into(),
+        }],
+        "done",
+    ));
+    let _observed =
+        restart_disclosure_history(retained, provider.clone(), "test-model", bundle).await;
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "saved disclosure cannot dispatch a removed handler"
+    );
+    let requests = provider.snapshot_requests();
+    assert!(
+        !requests[0]
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|tool| tool.name == "memory_get")
+    );
+    let denied = requests
+        .iter()
+        .flat_map(|request| &request.messages)
+        .find(|message| message.tool_call_id.as_deref() == Some("removed-call"))
+        .unwrap();
+    let error: serde_json::Value = serde_json::from_str(&denied.content).unwrap();
+    assert!(error.get("error").is_some());
+    assert_eq!(error["tool_outcome"]["error_class"], "not_found");
+}
+
+#[tokio::test]
+async fn restored_discovery_uses_current_schema_and_removes_unavailable_tools() {
+    let (retained, original) = discovery_history_before_next_snapshot(true).await;
+    for removed in [false, true] {
+        let mut bundle = fake_standard_memory_tool_bundle();
+        let updated = bundle
+            .specs
+            .iter_mut()
+            .find(|spec| spec.spec.name == "memory_get")
+            .unwrap();
+        updated.spec.description = "current schema version two".into();
+        updated.spec.parameters = json!({"type":"object","properties":{"version":{"type":"integer"}},"additionalProperties":false});
+        if removed {
+            bundle.specs.retain(|spec| spec.spec.name != "memory_get");
+            bundle.handlers.retain(|(name, _)| name != "memory_get");
+        }
+        // Text-only first response; use a capture provider so no extra tool group is produced.
+        let capture = Arc::new(CaptureAgentProvider::default());
+        let observed =
+            restart_disclosure_history(retained.clone(), capture.clone(), "gpt-5", bundle).await;
+        assert_turn_completed(&observed);
+        let request = capture.snapshot_requests().remove(0);
+        let tools = request.tools.as_ref().unwrap();
+        let get = tools.iter().find(|tool| tool.name == "memory_get");
+        if removed {
+            assert!(get.is_none());
+        } else {
+            let get = get.unwrap();
+            assert_eq!(get.description, "current schema version two");
+            assert_eq!(
+                get.parameters,
+                json!({"type":"object","properties":{"version":{"type":"integer"}},"additionalProperties":false})
+            );
+        }
+        let original_tools = original.tools.as_ref().unwrap();
+        let old_get = original_tools
+            .iter()
+            .find(|tool| tool.name == "memory_get")
+            .unwrap();
+        assert_ne!(old_get.description, "current schema version two");
+        let expected_survivors = original_tools
+            .iter()
+            .filter(|tool| tool.name != "memory_get")
+            .collect::<Vec<_>>();
+        let survivors = tools
+            .iter()
+            .filter(|tool| expected_survivors.iter().any(|old| old.name == tool.name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(&survivors).unwrap(),
+            serde_json::to_value(&expected_survivors).unwrap(),
+            "unchanged surviving definitions keep exact order and bytes"
+        );
+        assert!(
+            request
+                .messages
+                .iter()
+                .all(|message| message.provider_replay_state.is_none())
+        );
+        assert_eq!(request.model, "gpt-5");
+        assert!(
+            !original
+                .tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "apply_patch")
+        );
+        let patch = tools
+            .iter()
+            .find(|tool| tool.name == "apply_patch")
+            .expect("new provider capability must rebuild file schemas");
+        assert_eq!(patch.parameters["properties"]["patch"]["type"], "string");
+        assert!(patch.description.contains("JSON field"));
+        assert!(request.messages.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == "discover-before-crash"))
+        }));
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some("discover-before-crash"))
+        );
+    }
+}
+
 #[tokio::test]
 async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_window() {
     let mut provider = SequencedToolProvider::new(
@@ -5013,13 +5319,12 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
     ));
     let manager = Arc::new(AgentManager::new(registry, test_tool_loop_config()));
     manager
-        .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(
-            Ok(MemoryRecallSnapshot::empty()),
-            Ok(MemoryToolMaterialization {
+        .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(Ok(
+            MemoryToolMaterialization {
                 bundles: vec![fake_standard_memory_tool_bundle()],
                 diagnostics: Vec::new(),
-            }),
-        ))))
+            },
+        )))))
         .await;
     install_configured_memory_hooks_for_test(&manager).await;
     let workspace_id = "provider_failure_window_workspace";
@@ -5052,6 +5357,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
         .await
         .expect("turn should start");
 
+    let mut retained_history = Vec::new();
     let mut exhausted_window_id = None;
     let mut checkpoint_context = None;
     let mut saw_provider_failure = false;
@@ -5062,6 +5368,28 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
             .expect("durable receiver should stay open");
         durable_events.acknowledge_last(Ok(()));
         match event {
+            AgentDurableEvent::TurnLlmContextAppended {
+                source, payload, ..
+            } if matches!(
+                source.as_str(),
+                "system_snapshot_v1" | "turn_input_projection_v1"
+            ) =>
+            {
+                let pioneer_protocol::ToolResultView::Json {
+                    value,
+                    truncated: false,
+                } = payload
+                else {
+                    panic!("retained input and system snapshots must be durable and complete")
+                };
+                // Recovery requires the acknowledged input projection (governing documents)
+                // alongside the system snapshot and its disclosure metadata.
+                let message = serde_json::from_value(value).unwrap();
+                retained_history.push(crate::RetainedProviderHistoryMessage {
+                    sequence: retained_history.len() as i64 + 1,
+                    message,
+                });
+            }
             AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
                 assert_eq!(notification.window_index, 1);
                 assert_eq!(
@@ -5138,7 +5466,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     compact_history: false,
                     continue_generation: true,
                     model_override: None,
-                    retained_provider_history: Vec::new(),
+                    retained_provider_history: retained_history,
                     execution_checkpoint_context: checkpoint_context,
                 },
             )
@@ -5146,11 +5474,23 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
     });
 
     let mut saw_continued = false;
+    let mut recovery_events = Vec::new();
     for _ in 0..40 {
-        let event = timeout(Duration::from_secs(2), durable_events.recv())
-            .await
-            .expect("recovery window event should arrive")
-            .expect("durable receiver should stay open");
+        let event = match timeout(Duration::from_secs(2), durable_events.recv()).await {
+            Ok(event) => event.expect("durable receiver should stay open"),
+            Err(error) => {
+                if recovery_handle.is_finished() {
+                    let admission = recovery_handle.await;
+                    panic!(
+                        "recovery window event timed out: {error}; admission: {admission:?}; events: {recovery_events:?}"
+                    );
+                }
+                panic!(
+                    "recovery window event timed out while admission is pending: {error}; events: {recovery_events:?}"
+                );
+            }
+        };
+        recovery_events.push(format!("{event:?}"));
         durable_events.acknowledge_last(Ok(()));
         match event {
             AgentDurableEvent::TurnExecutionWindowContinued { notification } => {
@@ -5172,6 +5512,11 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                 recv_terminal_effect_preparation_until_completed(&mut durable_events, turn_id)
                     .await;
                 let requests = provider.snapshot_requests();
+                assert_eq!(
+                    serde_json::to_value(&requests[1].tools).unwrap(),
+                    serde_json::to_value(&requests.last().unwrap().tools).unwrap(),
+                    "same-execution recovery must restore the exact proposed definition order after a failed provider round"
+                );
                 assert!(
                     requests
                         .last()
@@ -5191,13 +5536,12 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     test_tool_loop_config(),
                 );
                 restarted
-                    .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(
-                        Ok(MemoryRecallSnapshot::empty()),
-                        Ok(MemoryToolMaterialization {
+                    .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(Ok(
+                        MemoryToolMaterialization {
                             bundles: vec![fake_standard_memory_tool_bundle()],
                             diagnostics: Vec::new(),
-                        }),
-                    ))))
+                        },
+                    )))))
                     .await;
                 install_configured_memory_hooks_for_test(&restarted).await;
                 restarted
@@ -5225,6 +5569,9 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                         .any(|tool| tool.name == "memory_remember")
                 );
                 return;
+            }
+            AgentDurableEvent::TurnFailed { error, .. } => {
+                panic!("recovery failed before starting execution window 2: {error}");
             }
             _ => {}
         }
@@ -5527,9 +5874,9 @@ async fn phase_07_no_and_empty_hook_runtime_preserve_agent_request() {
 
     let empty_runtime_observed = start_simple_turn(
         &empty_runtime_manager,
-        "thr_phase07_empty_runtime",
+        "thr_phase07_no_runtime",
         "ws_phase07_request",
-        "turn_phase07_empty_runtime",
+        "turn_phase07_no_runtime",
         ThreadMode::Agent,
         "capture",
         "phase 07 request baseline",
@@ -5584,6 +5931,8 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
                 panic!("post-turn call should receive typed post-turn payload");
             };
             assert_eq!(payload.status, TurnPostTurnStatus::Succeeded);
+            assert!(payload.error.is_none());
+            assert!(payload.tool_events.is_empty());
             assert_eq!(
                 payload
                     .user_text
@@ -5613,13 +5962,6 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
         } else if call.phase == HookPhase::TurnPrePromptContext {
             let HookInputPayload::TurnPrePromptContext(payload) = &call.payload else {
                 panic!("pre-prompt-context call should receive typed payload");
-            };
-            assert_eq!(payload.input_text, "phase 07 agent hook phases");
-            assert_eq!(payload.model.as_deref(), Some("test-model"));
-            assert_eq!(payload.model_provider.as_deref(), Some("capture"));
-        } else if call.phase == HookPhase::TurnPostPreflightPromptContext {
-            let HookInputPayload::TurnPostPreflightPromptContext(payload) = &call.payload else {
-                panic!("post-preflight prompt-context call should receive typed payload");
             };
             assert_eq!(payload.input_text, "phase 07 agent hook phases");
             assert_eq!(payload.model.as_deref(), Some("test-model"));
@@ -5680,42 +6022,6 @@ async fn phase_07_agent_mode_without_tool_calling_calls_each_hook_phase_once() {
         PHASE_07_HOOK_PHASES
     );
     assert_eq!(provider.snapshot_requests().len(), 1);
-}
-
-#[tokio::test]
-async fn phase_07_chat_mode_does_not_call_turn_hooks() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureStandardProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "capture-standard",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            calls.clone(),
-            Vec::new(),
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase07_chat_hooks",
-        "ws_phase07_chat_hooks",
-        "turn_phase07_chat_hooks",
-        ThreadMode::Chat,
-        "capture-standard",
-        "phase 07 chat hook phases",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert!(snapshot_hook_calls(&calls).is_empty());
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].compiled_prompt.is_none());
 }
 
 #[tokio::test]
@@ -5931,9 +6237,9 @@ async fn phase_07_non_prompt_section_contributions_do_not_affect_agent_request()
 
     let hook_observed = start_simple_turn(
         &hook_manager,
-        "thr_phase07_contrib_hook",
+        "thr_phase07_contrib_baseline",
         "ws_phase07_contrib",
-        "turn_phase07_contrib_hook",
+        "turn_phase07_contrib_baseline",
         ThreadMode::Agent,
         "capture",
         "phase 07 ignored contributions",
@@ -5970,57 +6276,6 @@ async fn phase_07_non_prompt_section_contributions_do_not_affect_agent_request()
             .iter()
             .any(|event| matches!(event, AgentEvent::SkillAuditEvents { .. }))
     );
-}
-
-#[tokio::test]
-async fn phase_12_post_turn_hook_runs_after_success_with_summary_input() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
-            calls.clone(),
-            HookPhase::TurnPostTurn,
-            HookAwaitPolicy::Blocking,
-            HookFailurePolicy::BestEffort,
-        )))
-        .await;
-
-    let observed = start_simple_turn_with_terminal_effects(
-        &manager,
-        "thr_phase12_success",
-        "ws_phase12_success",
-        "turn_phase12_success",
-        ThreadMode::Agent,
-        "capture",
-        "phase 12 user text",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let call = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
-    let HookInputPayload::TurnPostTurn(payload) = call.payload else {
-        panic!("post-turn hook should receive typed post-turn payload");
-    };
-    assert_eq!(payload.status, TurnPostTurnStatus::Succeeded);
-    assert_eq!(
-        payload
-            .user_text
-            .as_ref()
-            .map(|preview| preview.text.as_str()),
-        Some("phase 12 user text")
-    );
-    assert_eq!(
-        payload
-            .assistant_text
-            .as_ref()
-            .map(|preview| preview.text.as_str()),
-        Some("done")
-    );
-    assert!(payload.error.is_none());
-    assert!(payload.tool_events.is_empty());
-    assert_eq!(provider.snapshot_requests().len(), 1);
 }
 
 #[tokio::test]
@@ -6119,8 +6374,6 @@ async fn memory_hook_builder_inputs_do_not_consume_runtime_generations() {
     manager.set_memory_provider(None).await;
     manager.set_memory_write_provider(None).await;
     manager.set_memory_post_turn_extractor_provider(None).await;
-    manager.set_memory_turn_policy_provider(None).await;
-    manager.set_memory_episodic_recall_provider(None).await;
 
     let after_builder_inputs = manager.runtime_dependencies.snapshot().await;
     assert_eq!(after_builder_inputs.generation, before.generation);
@@ -6291,6 +6544,11 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
         .await
         .expect("thread should expose one durable receiver");
 
+    let source = format!(
+        "  {}middle{}tail\n",
+        "я".repeat(6000),
+        "я".repeat(12_000 - 6000 - "  middletail\n".chars().count())
+    );
     manager
         .start_test_turn_with_default_profile(
             thread_id,
@@ -6300,7 +6558,7 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
             "capture",
             HashMap::new(),
             vec![UserInput::Text {
-                text: "Complete with the origin hook runtime.".to_owned(),
+                text: source.clone(),
                 text_elements: Vec::new(),
             }],
             Vec::new(),
@@ -6319,6 +6577,18 @@ async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
         .into_iter()
         .next()
         .expect("post-turn effect should be prepared");
+
+    let pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook { request, .. } =
+        &effect.payload
+    else {
+        panic!("post-turn payload");
+    };
+    assert_eq!(
+        request
+            .pointer("/input/payload/value/extraction_user_text/text")
+            .and_then(serde_json::Value::as_str),
+        Some(source.as_str())
+    );
 
     manager
         .set_hook_runtime(Some(recording_hook_runtime_for_phase(
@@ -6494,7 +6764,7 @@ async fn thread_removal_fences_a_full_mailbox_without_unbounded_wait() {
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6531,7 +6801,7 @@ async fn thread_removal_does_not_expose_replacement_until_old_actor_has_stopped(
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6602,7 +6872,7 @@ async fn control_timeout_fences_only_the_unresponsive_actor_generation() {
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6688,7 +6958,7 @@ async fn abandoned_enqueued_control_is_generation_fenced_on_reconciliation() {
             control_outcomes: outcomes,
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6749,7 +7019,7 @@ async fn terminal_retirement_fences_generation_before_registry_release() {
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6806,7 +7076,7 @@ async fn terminal_retirement_does_not_publish_replacement_before_old_actor_stops
             control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
             control_plane: AgentThreadControlPlane::default(),
             event_hub: Arc::new(AgentEventHub::new()),
-            loop_handle,
+            loop_handle: crate::NativeTask::new(loop_handle),
         },
     );
 
@@ -6933,7 +7203,7 @@ async fn stale_terminal_retirement_preserves_replacement_generation_ownership() 
     control_outcomes.complete(
         &pending_start,
         replacement_generation,
-        StoredControlOutcome::Start(Ok(())),
+        StoredControlOutcome::Start(Ok(1)),
     );
     retirement.await;
     assert_eq!(
@@ -7051,7 +7321,7 @@ async fn terminal_retirement_preserves_generation_with_accepted_next_turn() {
         takeover_outcomes.complete(
             &operation_id,
             generation,
-            StoredControlOutcome::Start(Ok(())),
+            StoredControlOutcome::Start(Ok(1)),
         );
     });
 
@@ -7697,65 +7967,6 @@ async fn phase_08_policy_hook_contribution_reaches_later_phase_policy_set() {
 }
 
 #[tokio::test]
-async fn phase_08_multiple_policy_contributions_merge_deterministically() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            calls.clone(),
-            vec![
-                policy_contribution("test", "mode", HookValue::Text("weak".to_owned()), 0),
-                policy_contribution("test", "mode", HookValue::Text("strong".to_owned()), 10),
-                policy_contribution("test", "allowed", HookValue::Bool(true), 5),
-            ],
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase08_policy_merge",
-        "ws_phase08_policy_merge",
-        "turn_phase08_policy_merge",
-        ThreadMode::Agent,
-        "capture",
-        "phase 08 policy merge",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let calls = snapshot_hook_calls(&calls);
-    let pre_prompt_context = calls
-        .iter()
-        .find(|call| call.phase == HookPhase::TurnPrePromptContext)
-        .expect("pre-prompt-context hook called");
-    assert_eq!(
-        policy_value(&pre_prompt_context.policy_set, "test", "mode"),
-        Some(HookValue::Text("strong".to_owned()))
-    );
-    assert_eq!(
-        policy_value(&pre_prompt_context.policy_set, "test", "allowed"),
-        Some(HookValue::Bool(true))
-    );
-    let ordered_keys = pre_prompt_context
-        .policy_set
-        .entries
-        .keys()
-        .map(|key| (key.domain.as_str().to_owned(), key.key.as_str().to_owned()))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        ordered_keys,
-        vec![
-            ("test".to_owned(), "allowed".to_owned()),
-            ("test".to_owned(), "mode".to_owned())
-        ]
-    );
-    assert_eq!(provider.snapshot_requests().len(), 1);
-}
-
-#[tokio::test]
 async fn phase_08_best_effort_policy_hook_failure_does_not_mark_turn_failed() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = Arc::new(CaptureAgentProvider::default());
@@ -7837,72 +8048,22 @@ async fn phase_08_fallback_policy_hook_failure_returns_fallback_policy_and_conti
 }
 
 #[tokio::test]
-async fn phase_08_fail_closed_policy_hook_failure_fails_turn() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            calls.clone(),
-            Vec::new(),
-            HookFailurePolicy::FailClosed,
-            true,
-        )))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase08_fail_closed_policy_failure",
-        "ws_phase08_fail_closed_policy_failure",
-        "turn_phase08_fail_closed_policy_failure",
-        ThreadMode::Agent,
-        "capture",
-        "phase 08 fail closed policy failure",
-    )
-    .await;
-    assert_turn_failed(&observed, "turn policy hook failed");
-
-    assert!(provider.snapshot_requests().is_empty());
-    let calls = snapshot_hook_calls(&calls);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].phase, HookPhase::TurnPrePolicy);
-}
-
-#[tokio::test]
 async fn phase_08_policy_contributions_do_not_change_memory_policy_yet() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_all_preflight_response(),
+    let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
+        memory_all_tools(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_phase08_policy_isolation",
-                MemoryCategory::Preference,
-                Some("city"),
-                "User likes Porto.",
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        }),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![fake_standard_memory_tool_bundle()],
             diagnostics: Vec::new(),
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::explicit_remember(),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
     manager
         .set_hook_runtime(Some(recording_hook_runtime(
@@ -7931,17 +8092,15 @@ async fn phase_08_policy_contributions_do_not_change_memory_policy_yet() {
     .await;
     assert_turn_completed(&observed);
 
-    assert_eq!(policy_provider.contexts().len(), 1);
     assert_eq!(memory_provider.tool_contexts().len(), 1);
-    assert_eq!(memory_provider.recall_contexts().len(), 1);
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let prompt = requests[0]
+    assert_eq!(requests.len(), 2);
+    let prompt = requests[1]
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
-    assert!(prompt.full_system_text.contains("User likes Porto."));
+    assert!(prompt.full_system_text.contains("### Memory Recall"));
+    assert!(!prompt.full_system_text.contains("User likes Porto."));
     let calls = snapshot_hook_calls(&calls);
     let pre_prompt_context = calls
         .iter()
@@ -8207,9 +8366,9 @@ async fn phase_09_context_contribution_does_not_change_provider_prompt_yet() {
 
     let hook_observed = start_simple_turn(
         &hook_manager,
-        "thr_phase09_prompt_hook",
+        "thr_phase09_prompt_baseline",
         "ws_phase09_prompt",
-        "turn_phase09_prompt_hook",
+        "turn_phase09_prompt_baseline",
         ThreadMode::Agent,
         "capture",
         "phase 09 prompt stability",
@@ -8231,56 +8390,6 @@ async fn phase_09_context_contribution_does_not_change_provider_prompt_yet() {
             .full_system_text
             .contains("HOOK PROMPT CONTEXT MUST NOT APPEAR")
     );
-}
-
-#[tokio::test]
-async fn phase_09_no_context_hooks_preserve_agent_request() {
-    let baseline_provider = Arc::new(CaptureAgentProvider::default());
-    let baseline_registry = Arc::new(ProviderRegistry::with_provider(
-        "capture",
-        baseline_provider.clone(),
-    ));
-    let baseline_manager = AgentManager::new(baseline_registry, test_tool_loop_config());
-
-    let baseline_observed = start_simple_turn(
-        &baseline_manager,
-        "thr_phase09_no_context_baseline",
-        "ws_phase09_no_context",
-        "turn_phase09_no_context_baseline",
-        ThreadMode::Agent,
-        "capture",
-        "phase 09 no context hooks",
-    )
-    .await;
-    assert_turn_completed(&baseline_observed);
-
-    let empty_provider = Arc::new(CaptureAgentProvider::default());
-    let empty_registry = Arc::new(ProviderRegistry::with_provider(
-        "capture",
-        empty_provider.clone(),
-    ));
-    let empty_manager = AgentManager::new(empty_registry, test_tool_loop_config());
-    empty_manager
-        .set_hook_runtime(Some(empty_hook_runtime()))
-        .await;
-
-    let empty_observed = start_simple_turn(
-        &empty_manager,
-        "thr_phase09_no_context_empty",
-        "ws_phase09_no_context",
-        "turn_phase09_no_context_empty",
-        ThreadMode::Agent,
-        "capture",
-        "phase 09 no context hooks",
-    )
-    .await;
-    assert_turn_completed(&empty_observed);
-
-    let baseline_requests = baseline_provider.snapshot_requests();
-    let empty_requests = empty_provider.snapshot_requests();
-    assert_eq!(baseline_requests.len(), 1);
-    assert_eq!(empty_requests.len(), 1);
-    assert_stable_requests_eq(&baseline_requests[0], &empty_requests[0]);
 }
 
 #[tokio::test]
@@ -8322,52 +8431,46 @@ async fn phase_09_chat_mode_still_does_not_call_turn_hooks() {
     let requests = provider.snapshot_requests();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].compiled_prompt.is_none());
+
+    assert!(requests[0].tools.is_none());
 }
 
 #[tokio::test]
-async fn phase_09_memory_path_remains_unchanged() {
+async fn phase_09_memory_tool_materialization_preserves_hook_context() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_all_preflight_response(),
+    let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
+        memory_all_tools(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_phase09_context_isolation",
-                MemoryCategory::Preference,
-                Some("city"),
-                "User likes Porto.",
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        }),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![fake_standard_memory_tool_bundle()],
             diagnostics: Vec::new(),
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::explicit_remember(),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
-        .await;
     manager
         .set_hook_runtime(Some(recording_hook_runtime(
             calls.clone(),
-            vec![prompt_context_contribution(
-                "test.context.memory",
-                "test",
-                10,
-                "HOOK MEMORY CONTEXT MUST NOT APPEAR",
-            )],
+            vec![
+                prompt_context_contribution(
+                    "test.context.memory",
+                    "test",
+                    10,
+                    "HOOK MEMORY CONTEXT MUST NOT APPEAR",
+                ),
+                prompt_section_contribution(
+                    "test.memory.discovery",
+                    "Discovery Companion",
+                    "test",
+                    10,
+                    "PRESERVED COMPILE CONTRIBUTION",
+                ),
+            ],
             HookFailurePolicy::BestEffort,
             false,
         )))
@@ -8386,17 +8489,42 @@ async fn phase_09_memory_path_remains_unchanged() {
     .await;
     assert_turn_completed(&observed);
 
-    assert_eq!(policy_provider.contexts().len(), 1);
     assert_eq!(memory_provider.tool_contexts().len(), 1);
-    assert_eq!(memory_provider.recall_contexts().len(), 1);
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let prompt = requests[0]
+    assert_eq!(requests.len(), 2);
+    let prompt = requests[1]
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
-    assert!(prompt.full_system_text.contains("User likes Porto."));
+    assert!(prompt.full_system_text.contains("### Memory Recall"));
+    assert!(
+        prompt
+            .full_system_text
+            .contains("PRESERVED COMPILE CONTRIBUTION")
+    );
+    let refreshed_manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .last()
+        .expect("refreshed manifest");
+    for section in ["memory_recall", "test.memory.discovery"] {
+        assert!(
+            refreshed_manifest
+                .section_ids
+                .iter()
+                .any(|id| id == section)
+        );
+        assert!(
+            refreshed_manifest
+                .hook_sources
+                .iter()
+                .any(|source| source.section_id.as_deref() == Some(section))
+        );
+    }
+    assert!(!prompt.full_system_text.contains("User likes Porto."));
     assert!(
         !prompt
             .full_system_text
@@ -8456,13 +8584,12 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![fake_standard_memory_tool_bundle()],
             diagnostics: Vec::new(),
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
@@ -8553,7 +8680,17 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
     assert!(
         prompt
             .full_system_text
-            .contains("Some tool domains and their tools are hidden until requested.")
+            .contains("When request_tools is available, open hidden tools by domain")
+    );
+    let user_input = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .expect("prepared user input");
+    assert!(
+        user_input
+            .content
+            .contains("For hidden tools, call request_tools to open a domain.")
     );
     assert!(
         !prompt.full_system_text.contains("Available memory tools:"),
@@ -8613,7 +8750,7 @@ async fn phase_10_prompt_manifest_and_tool_schemas_exclude_discovery_tools() {
 }
 
 #[tokio::test]
-async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized() {
+async fn phase_10_request_tools_opens_optional_domain_schemas() {
     let registered_optional_tools = [
         "memory_search",
         "memory_get",
@@ -8623,11 +8760,11 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
         "artifact_register",
     ];
     let handler: Arc<dyn ToolHandler> = Arc::new(MemoryFakeHandler);
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        optional_domain_preflight_response(),
+    let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
+        optional_domain_tools(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
     manager
         .set_task_tool_provider(Some(Arc::new(StaticTaskToolProvider {
             bundle: fake_memory_tool_bundle_for_names(&registered_optional_tools, handler),
@@ -8648,25 +8785,14 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
     assert_turn_completed(&observed);
 
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let request_tool_names = requests[0]
+    assert_eq!(requests.len(), 2);
+    let request_tool_names = requests[1]
         .tools
         .as_ref()
         .expect("main request should include provider tools")
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
-        ".",
-        "turn_phase10_computer_use_probe",
-        test_tools_permission_context("turn_phase10_computer_use_probe"),
-        probe_tool_loop_config.web,
-        probe_tool_loop_config.computer_use,
-        Some(test_full_access_security_snapshot()),
-    )
-    .router
-    .has_handler("computer_use");
 
     for selected in [
         "memory_search",
@@ -8679,22 +8805,24 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
             "selected optional tool `{selected}` should be serialized"
         );
     }
-    if computer_use_available {
-        assert!(
-            request_tool_names.contains(&"computer_use"),
-            "selected optional tool `computer_use` should be serialized when registered"
-        );
-    } else {
-        assert!(
-            !request_tool_names.contains(&"computer_use"),
-            "unregistered optional tool `computer_use` must stay hidden"
-        );
+    assert_eq!(
+        request_tool_names.contains(&"cua_get_window_state"),
+        !pioneer_tools::computer_use_tool_specs().is_empty(),
+        "selected optional tool `computer_use` should be serialized when registered"
+    );
+    let initial_names = requests[0]
+        .tools
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    for hidden in &registered_optional_tools {
+        assert!(!initial_names.contains(hidden));
     }
-    for hidden in ["memory_get", "task_wait"] {
-        assert!(
-            !request_tool_names.contains(&hidden),
-            "registered but unselected optional tool `{hidden}` must stay hidden"
-        );
+    assert!(requests[0].compiled_prompt.is_some());
+    for opened in ["memory_get", "task_wait"] {
+        assert!(request_tool_names.contains(&opened));
     }
     assert!(!request_tool_names.contains(&"tool_search"));
     assert!(!request_tool_names.contains(&"tool_suggest"));
@@ -8898,9 +9026,16 @@ async fn phase_11_review_guard_revise_waits_for_revision_candidate_then_accepts(
     assert!(visible_tool_names.contains(&"task_cancel"));
     assert!(visible_tool_names.contains(&"task_wait"));
     assert!(
-        !visible_tool_names.contains(&"task_revise"),
-        "task_revise must stay hidden when the candidate no longer allows revisions"
+        visible_tool_names.contains(&"task_revise"),
+        "an already disclosed schema remains stable when candidate readiness changes"
     );
+    for pair in requests.windows(2) {
+        assert_eq!(
+            serde_json::to_value(&pair[0].tools).unwrap(),
+            serde_json::to_value(&pair[1].tools).unwrap(),
+            "revise/pending/review/accept must retain the same definitions; router and task authority enforce calls"
+        );
+    }
 }
 
 #[tokio::test]
@@ -8956,210 +9091,88 @@ async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
     assert!(completed_agent_message_text(&observed).is_none());
 }
 
-#[tokio::test]
-async fn computer_use_text_only_model_does_not_gate_computer_use() {
-    let provider = Arc::new(TextOnlyAgentProvider::with_preflight_response(
-        preflight_response_with_visible_tools(&["computer_use"]),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "text-only",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+#[test]
+fn computer_use_text_only_model_does_not_gate_computer_use() {
+    run_composed_agent_startup_test(
+        "computer_use_text_only_model_does_not_gate_computer_use",
+        || async {
+            let provider = Arc::new(TextOnlyAgentProvider::with_requested_tools(
+                requested_tool_names(&["cua_get_window_state"]),
+            ));
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "text-only",
+                provider.clone(),
+            ));
+            let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
-    let observed = start_simple_turn(
-        &manager,
-        "thr_computer_use_text_only_no_gate",
-        "ws_computer_use_text_only_no_gate",
-        "turn_computer_use_text_only_no_gate",
-        ThreadMode::Agent,
-        "text-only",
-        "Open the requested desktop location.",
-    )
-    .await;
-    assert_turn_completed(&observed);
+            let observed = start_simple_turn(
+                &manager,
+                "thr_computer_use_text_only_no_gate",
+                "ws_computer_use_text_only_no_gate",
+                "turn_computer_use_text_only_no_gate",
+                ThreadMode::Agent,
+                "text-only",
+                "Open the requested desktop location.",
+            )
+            .await;
+            assert_turn_completed(&observed);
 
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let request_tool_names = requests[0]
-        .tools
-        .as_ref()
-        .expect("main request should still include available provider tools")
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
-        ".",
-        "turn_computer_use_text_only_no_gate_probe",
-        test_tools_permission_context("turn_computer_use_text_only_no_gate_probe"),
-        probe_tool_loop_config.web,
-        probe_tool_loop_config.computer_use,
-        Some(test_full_access_security_snapshot()),
-    )
-    .router
-    .has_handler("computer_use");
-    if computer_use_available {
-        assert!(
-            request_tool_names.contains(&"computer_use"),
-            "computer_use must not be provider-gated by image capability"
-        );
-    } else {
-        assert!(
-            !request_tool_names.contains(&"computer_use"),
-            "unregistered computer_use must stay hidden"
-        );
-    }
+            let requests = provider.snapshot_requests();
+            assert_eq!(requests.len(), 2);
+            let request_tool_names = requests[1]
+                .tools
+                .as_ref()
+                .expect("main request should still include available provider tools")
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                request_tool_names.contains(&"cua_get_window_state"),
+                !pioneer_tools::computer_use_tool_specs().is_empty(),
+                "computer_use must not be provider-gated by image capability"
+            );
+        },
+    );
 }
 
-#[tokio::test]
-async fn computer_use_registered_tool_exposes_when_preflight_selects_it() {
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        preflight_response_with_visible_tools(&["computer_use"]),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+#[test]
+fn computer_use_registered_tool_exposes_after_request_tools() {
+    run_composed_agent_startup_test(
+        "computer_use_registered_tool_exposes_after_request_tools",
+        || async {
+            let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
+                requested_tool_names(&["cua_get_window_state"]),
+            ));
+            let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+            let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
-    let observed = start_simple_turn(
-        &manager,
-        "thr_computer_use_registered_tool",
-        "ws_computer_use_registered_tool",
-        "turn_computer_use_registered_tool",
-        ThreadMode::Agent,
-        "capture",
-        "Open the requested desktop location.",
-    )
-    .await;
-    assert_turn_completed(&observed);
+            let observed = start_simple_turn(
+                &manager,
+                "thr_computer_use_registered_tool",
+                "ws_computer_use_registered_tool",
+                "turn_computer_use_registered_tool",
+                ThreadMode::Agent,
+                "capture",
+                "Open the requested desktop location.",
+            )
+            .await;
+            assert_turn_completed(&observed);
 
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let request_tool_names = requests[0]
-        .tools
-        .as_ref()
-        .expect("main request should include provider tools")
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
-        ".",
-        "turn_computer_use_registered_tool_probe",
-        test_tools_permission_context("turn_computer_use_registered_tool_probe"),
-        probe_tool_loop_config.web,
-        probe_tool_loop_config.computer_use,
-        Some(test_full_access_security_snapshot()),
-    )
-    .router
-    .has_handler("computer_use");
-    if computer_use_available {
-        assert!(
-            request_tool_names.contains(&"computer_use"),
-            "image-capable providers may expose computer_use when preflight selects it"
-        );
-    } else {
-        assert!(
-            !request_tool_names.contains(&"computer_use"),
-            "unregistered computer_use must stay hidden even for image-capable providers"
-        );
-    }
-}
-
-#[tokio::test]
-async fn phase_10_prompt_compile_receives_preflight_selected_memory_tools() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let preflight_response = json!({
-        "tools": {
-            "visibleTools": ["memory_search", "memory_get"]
-        }
-    });
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        preflight_response.to_string(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_phase10_visible_name",
-                MemoryCategory::Identity,
-                Some("name"),
-                "User's name is Alexander.",
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        }),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            calls.clone(),
-            Vec::new(),
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase10_visible_tools_memory",
-        "ws_phase10_visible_tools_memory",
-        "turn_phase10_visible_tools_memory",
-        ThreadMode::Agent,
-        "capture",
-        "what is my name?",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let calls = snapshot_hook_calls(&calls);
-    let pre_prompt_compile = calls
-        .iter()
-        .find(|call| call.phase == HookPhase::TurnPrePromptCompile)
-        .expect("pre-prompt-compile hook called");
-    let HookInputPayload::TurnPrePromptCompile(payload) = &pre_prompt_compile.payload else {
-        panic!("pre-prompt-compile call should receive typed payload");
-    };
-    let hook_tool_names = payload
-        .available_tool_names
-        .iter()
-        .map(|name| name.as_str().to_owned())
-        .collect::<Vec<_>>();
-    assert!(hook_tool_names.contains(&"memory_search".to_owned()));
-    assert!(hook_tool_names.contains(&"memory_get".to_owned()));
-    assert!(!hook_tool_names.contains(&"memory_remember".to_owned()));
-    assert!(!hook_tool_names.contains(&"memory_forget".to_owned()));
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let request_tool_names = requests[0]
-        .tools
-        .as_ref()
-        .expect("main request should include provider tools")
-        .iter()
-        .map(|tool| tool.name.clone())
-        .collect::<Vec<_>>();
-    assert!(request_tool_names.contains(&"memory_search".to_owned()));
-    assert!(request_tool_names.contains(&"memory_get".to_owned()));
-    assert!(!request_tool_names.contains(&"memory_remember".to_owned()));
-    assert!(!request_tool_names.contains(&"memory_forget".to_owned()));
-
-    let prompt = requests[0]
-        .compiled_prompt
-        .as_ref()
-        .expect("main request should include compiled prompt");
-    assert!(
-        prompt
-            .full_system_text
-            .contains("Available memory tools: memory_search, memory_get.")
+            let requests = provider.snapshot_requests();
+            assert_eq!(requests.len(), 2);
+            let request_tool_names = requests[1]
+                .tools
+                .as_ref()
+                .expect("main request should include provider tools")
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                request_tool_names.contains(&"cua_get_window_state"),
+                !pioneer_tools::computer_use_tool_specs().is_empty(),
+                "image-capable providers may expose computer_use after request_tools"
+            );
+        },
     );
 }
 
@@ -9239,54 +9252,6 @@ async fn phase_10_hook_prompt_section_ordering_is_deterministic() {
 }
 
 #[tokio::test]
-async fn phase_10_hook_prompt_section_id_appears_in_prompt_manifest() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            Arc::new(std::sync::Mutex::new(Vec::new())),
-            vec![prompt_section_contribution(
-                "test.phase10.manifest",
-                "Manifest Hook Section",
-                "test",
-                10,
-                "manifest hook section content",
-            )],
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase10_manifest_id",
-        "ws_phase10_manifest_id",
-        "turn_phase10_manifest_id",
-        ThreadMode::Agent,
-        "capture",
-        "phase 10 manifest id",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let manifest = observed
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
-            _ => None,
-        })
-        .next()
-        .expect("prompt manifest should be emitted");
-    assert!(
-        manifest
-            .section_ids
-            .iter()
-            .any(|section_id| section_id == "test.phase10.manifest")
-    );
-}
-
-#[tokio::test]
 async fn phase_10_hook_prompt_section_truncation_is_recorded_in_prompt_manifest() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -9340,6 +9305,13 @@ async fn phase_10_hook_prompt_section_truncation_is_recorded_in_prompt_manifest(
             && diagnostic.section_id.as_deref() == Some("test.phase10.truncated")
             && !diagnostic.message.contains("0123456789abcdef")
     }));
+
+    let source = manifest
+        .hook_sources
+        .iter()
+        .find(|source| source.section_id.as_deref() == Some("test.phase10.truncated"))
+        .expect("truncated hook source should be recorded");
+    assert_eq!(source.truncation, PromptManifestHookTruncation::Hook);
 }
 
 #[tokio::test]
@@ -9382,6 +9354,12 @@ async fn phase_11_hook_prompt_section_is_manifest_observable() {
         })
         .next()
         .expect("prompt manifest should be emitted");
+    assert!(
+        manifest
+            .section_ids
+            .iter()
+            .any(|id| id == "test.phase11.manifest_source")
+    );
     let source = manifest
         .hook_sources
         .iter()
@@ -9528,56 +9506,6 @@ async fn phase_11_sensitive_diagnostic_content_is_redacted() {
             "manifest must not contain sensitive diagnostic fragment `{secret}`"
         );
     }
-}
-
-#[tokio::test]
-async fn phase_11_hook_prompt_section_truncation_status_is_manifest_observable() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            Arc::new(std::sync::Mutex::new(Vec::new())),
-            vec![prompt_section_contribution_with_max_chars(
-                "test.phase11.truncated_source",
-                "Truncated Source Hook",
-                "test",
-                10,
-                "0123456789abcdef",
-                8,
-            )],
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase11_truncated_source",
-        "ws_phase11_truncated_source",
-        "turn_phase11_truncated_source",
-        ThreadMode::Agent,
-        "capture",
-        "phase 11 truncated source",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let manifest = observed
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
-            _ => None,
-        })
-        .next()
-        .expect("prompt manifest should be emitted");
-    let source = manifest
-        .hook_sources
-        .iter()
-        .find(|source| source.section_id.as_deref() == Some("test.phase11.truncated_source"))
-        .expect("hook source should be recorded for truncated section");
-
-    assert_eq!(source.truncation, PromptManifestHookTruncation::Hook);
 }
 
 #[tokio::test]
@@ -9764,6 +9692,133 @@ async fn phase_10_required_prompt_section_failure_fails_turn() {
 }
 
 #[tokio::test]
+async fn api_dispatch_requires_durable_input_and_exact_system_snapshot_ack() {
+    for rejected_source in ["turn_input_projection_v1", "system_snapshot_v1"] {
+        let provider = Arc::new(CaptureAgentProvider::default());
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+        let manager = AgentManager::new(registry, test_tool_loop_config());
+        let thread = format!("rejected-{rejected_source}");
+        manager
+            .ensure_thread(&thread, "snapshot-workspace")
+            .await
+            .unwrap();
+        let mut receiver = manager.take_durable_receiver(&thread).await.unwrap();
+        manager
+            .start_test_turn_with_default_profile_and_capabilities(
+                &thread,
+                "snapshot-turn",
+                ThreadMode::Agent,
+                "test-model",
+                "capture",
+                HashMap::new(),
+                vec![UserInput::Text {
+                    text: "must not dispatch".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let mut rejected = false;
+        let mut terminal = false;
+        for _ in 0..160 {
+            let event = timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let target = matches!(&event, AgentDurableEvent::TurnLlmContextAppended { source, .. } if source == rejected_source);
+            if target {
+                assert!(
+                    provider.snapshot_requests().is_empty(),
+                    "dispatch must wait for mandatory context ACK"
+                );
+                receiver.acknowledge_last(Err(
+                    pioneer_runtime_events::DurableCommitRejection::permanent(
+                        "fixture_persistence_failed",
+                        "mandatory snapshot rejected",
+                    ),
+                ));
+                rejected = true;
+            } else {
+                terminal = matches!(
+                    event,
+                    AgentDurableEvent::TurnFailed { .. }
+                        | AgentDurableEvent::TurnBlocked { .. }
+                        | AgentDurableEvent::TurnInterrupted { .. }
+                );
+                receiver.acknowledge_last(Ok(()));
+            }
+            if terminal {
+                break;
+            }
+        }
+        assert!(rejected && terminal);
+        assert!(provider.snapshot_requests().is_empty());
+        manager.remove_thread(&thread).await;
+    }
+}
+
+#[tokio::test]
+async fn chat_request_carries_current_context_before_original_user_input() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let observed = start_simple_turn(
+        &manager,
+        "thr_chat_context",
+        "ws_chat_context",
+        "turn_chat_context",
+        ThreadMode::Chat,
+        "capture",
+        "original chat input",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert!(request.tools.is_none());
+    assert!(request.compiled_prompt.is_none());
+    assert_eq!(request.messages.len(), 1);
+    let user = &request.messages[0];
+    assert_eq!(user.role, Role::User);
+    assert!(
+        user.content
+            .starts_with("<pioneer_turn_context>\n## Execution\n\nDate: ")
+    );
+    assert!(user.content.contains("Workspace: ws_chat_context"));
+    assert!(user.content.contains("Thread: thr_chat_context"));
+    assert!(user.content.contains("Turn: turn_chat_context"));
+    assert!(user.content.contains("Explicit selection: []"));
+    assert!(
+        user.content
+            .contains("\nRuntime: API\nModel: test-model\nProvider: capture")
+    );
+    assert!(user.content.contains("\n\n## Environment\n\nCwd: "));
+    assert!(
+        user.content
+            .contains("\nPermission mode: FullAccess\nApproval prompts: unavailable")
+    );
+    assert!(
+        user.content
+            .contains("\n\n## Conversation\n\nWorkspace: ws_chat_context")
+    );
+    assert!(
+        user.content
+            .contains("\nActor: unavailable\n\n## Skills\n\nExplicit selection: []")
+    );
+    assert!(!user.content.contains("Provider instance:"));
+    assert!(!user.content.contains("TurnApprovalScopePolicySnapshot"));
+    assert!(!user.content.contains("## Tools"));
+
+    assert!(
+        user.content
+            .ends_with("</pioneer_turn_context>\n\noriginal chat input")
+    );
+}
+
+#[tokio::test]
 async fn no_memory_provider_keeps_agent_request_unchanged() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -9786,7 +9841,16 @@ async fn no_memory_provider_keeps_agent_request_unchanged() {
     let request = &requests[0];
     assert_eq!(request.messages.len(), 1);
     assert_eq!(request.messages[0].role, Role::User);
-    assert_eq!(request.messages[0].content, "hello without memory");
+    assert!(
+        request.messages[0]
+            .content
+            .starts_with("<pioneer_turn_context>\n")
+    );
+    assert!(
+        request.messages[0]
+            .content
+            .ends_with("</pioneer_turn_context>\n\nhello without memory")
+    );
     let prompt = request
         .compiled_prompt
         .as_ref()
@@ -9801,78 +9865,13 @@ async fn no_memory_provider_keeps_agent_request_unchanged() {
 }
 
 #[tokio::test]
-async fn memory_provider_is_optional_and_agent_turn_completes() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager =
-        AgentManager::new_with_mcp_and_memory(registry, test_tool_loop_config(), None, None);
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_optional",
-        "ws_memory_optional",
-        "turn_memory_optional",
-        ThreadMode::Agent,
-        "capture",
-        "run without a memory provider",
-    )
-    .await;
-    assert_turn_completed(&observed);
-    assert_eq!(provider.snapshot_requests().len(), 1);
-}
-
-#[tokio::test]
-async fn memory_provider_recall_error_degrades_gracefully() {
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_read_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Err("recall unavailable".to_owned()),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_recall_error",
-        "ws_memory_recall_error",
-        "turn_memory_recall_error",
-        ThreadMode::Agent,
-        "capture",
-        "continue even if recall fails",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert_eq!(memory_provider.recall_contexts().len(), 1);
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let prompt = requests[0]
-        .compiled_prompt
-        .as_ref()
-        .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
-    assert!(!prompt.full_system_text.contains("recall unavailable"));
-}
-
-#[tokio::test]
 async fn memory_provider_tool_materialization_error_degrades_gracefully() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Err("memory tools unavailable".to_owned()),
-    ));
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Err(
+        "memory tools unavailable".to_owned(),
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
@@ -9904,7 +9903,7 @@ async fn memory_provider_tool_materialization_error_degrades_gracefully() {
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(!prompt.full_system_text.contains("## Memory Recall"));
+    assert!(!prompt.full_system_text.contains("### Memory Recall"));
 }
 
 #[tokio::test]
@@ -9912,13 +9911,12 @@ async fn memory_provider_receives_turn_context_for_agent_mode() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![fake_standard_memory_tool_bundle()],
             diagnostics: Vec::new(),
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
@@ -9937,23 +9935,15 @@ async fn memory_provider_receives_turn_context_for_agent_mode() {
     .await;
     assert_turn_completed(&observed);
 
-    let recall_contexts = memory_provider.recall_contexts();
-    assert_eq!(recall_contexts.len(), 1);
-    let context = &recall_contexts[0];
-    assert_eq!(context.workspace_id, "ws_memory_context");
-    assert_eq!(context.thread_id, "thr_memory_context");
-    assert_eq!(context.turn_id, "turn_memory_context");
-    assert_eq!(context.mode, ThreadMode::Agent);
-    assert_eq!(context.input_text, "my birthday is May 5");
-    assert_eq!(context.task_id, None);
-    assert_eq!(context.agent_id, None);
-
-    let recall_requests = memory_provider.recall_requests();
-    assert_eq!(recall_requests.len(), 1);
-    assert_eq!(recall_requests[0].query, "my birthday is May 5");
-
     let tool_contexts = memory_provider.tool_contexts();
-    assert_eq!(tool_contexts, recall_contexts);
+    assert_eq!(tool_contexts.len(), 1);
+    assert_eq!(tool_contexts[0].input_text, "my birthday is May 5");
+    assert_eq!(tool_contexts[0].workspace_id, "ws_memory_context");
+    assert_eq!(tool_contexts[0].thread_id, "thr_memory_context");
+    assert_eq!(tool_contexts[0].turn_id, "turn_memory_context");
+    assert_eq!(tool_contexts[0].mode, ThreadMode::Agent);
+    assert_eq!(tool_contexts[0].task_id, None);
+    assert_eq!(tool_contexts[0].agent_id, None);
 }
 
 #[tokio::test]
@@ -9961,13 +9951,12 @@ async fn memory_provider_receives_task_runtime_context_for_task_turn() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![fake_standard_memory_tool_bundle()],
             diagnostics: Vec::new(),
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
@@ -10006,81 +9995,29 @@ async fn memory_provider_receives_task_runtime_context_for_task_turn() {
     let observed = recv_events_until_terminal(&mut events).await;
     assert_turn_completed(&observed);
 
-    let recall_contexts = memory_provider.recall_contexts();
-    assert!(!recall_contexts.is_empty());
-    assert!(recall_contexts.iter().all(|context| {
-        context.task_id.as_deref() == Some("task-runtime-memory-context")
-            && context.thread_id == "thr_memory_task_context"
-            && context.conversation_thread_id.as_deref() == Some("thr_memory_parent_context")
-            && context.effective_conversation_thread_id() == "thr_memory_parent_context"
-    }));
-
     let tool_contexts = memory_provider.tool_contexts();
     assert!(!tool_contexts.is_empty());
     assert!(tool_contexts.iter().all(|context| {
         context.task_id.as_deref() == Some("task-runtime-memory-context")
             && context.thread_id == "thr_memory_task_context"
             && context.conversation_thread_id.as_deref() == Some("thr_memory_parent_context")
+            && context.effective_conversation_thread_id() == "thr_memory_parent_context"
     }));
 }
 
 #[tokio::test]
-async fn chat_mode_does_not_call_memory_provider_by_default() {
-    let provider = Arc::new(CaptureStandardProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "capture-standard",
-        provider.clone(),
-    ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::ok());
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::explicit_remember(),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_chat",
-        "ws_memory_chat",
-        "turn_memory_chat",
-        ThreadMode::Chat,
-        "capture-standard",
-        "plain chat should not touch memory",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert!(memory_provider.recall_contexts().is_empty());
-    assert!(memory_provider.recall_requests().is_empty());
-    assert!(memory_provider.tool_contexts().is_empty());
-    assert!(policy_provider.contexts().is_empty());
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].tools.is_none());
-    assert!(requests[0].compiled_prompt.is_none());
-}
-
-#[tokio::test]
 async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_them() {
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_all_preflight_response(),
+    let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
+        memory_all_tools(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![fake_standard_memory_tool_bundle()],
             diagnostics: vec!["test memory tool diagnostic".to_owned()],
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
@@ -10099,11 +10036,121 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
     .await;
     assert_turn_completed(&observed);
 
-    assert_eq!(memory_provider.recall_contexts().len(), 1);
     assert_eq!(memory_provider.tool_contexts().len(), 1);
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let tools = requests[0]
+    assert_eq!(requests.len(), 2);
+    assert!(
+        !requests[0]
+            .compiled_prompt
+            .as_ref()
+            .unwrap()
+            .full_system_text
+            .contains("### Memory Recall")
+    );
+    for request in &requests {
+        let expected = serde_json::to_value(request.compiled_prompt.as_ref().unwrap()).unwrap();
+        assert!(observed.iter().any(|event| matches!(event,
+            AgentEvent::TurnLlmContextAppended { source, payload: pioneer_tools::ToolResultView::Json { value, truncated: false }, .. }
+                if source == "system_snapshot_v1" && value["application_context"]["system"] == expected
+        )), "every dispatched request must retain exact system bytes, including the post-discovery contract");
+        let system = &request.compiled_prompt.as_ref().unwrap().full_system_text;
+        let mut previous = None;
+        for heading in [
+            "## Safety and authority\n",
+            "## Agent profile\n",
+            "### Tool Usage\n",
+            "### Filesystem Operations\n",
+            "### Tasks\n",
+            "### Subagents\n",
+            "### Threads\n",
+            "### Artifact output contract\n",
+            "### Inline HTML\n",
+            "## Error recovery\n",
+        ] {
+            let position = system
+                .find(heading)
+                .unwrap_or_else(|| panic!("missing {heading}"));
+            assert!(
+                previous.is_none_or(|previous| previous < position),
+                "out of order: {heading}"
+            );
+            previous = Some(position);
+        }
+        assert_eq!(
+            system
+                .matches("call read_skill before specialized actions")
+                .count(),
+            1
+        );
+        assert!(!system.contains("## Extra System"));
+        assert!(!system.contains("Provider filesystem projection:"));
+        assert!(!system.contains("Available memory tools:"));
+    }
+    let initial_user = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .unwrap();
+    let after_discovery_user = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(initial_user).unwrap(),
+        serde_json::to_value(after_discovery_user).unwrap()
+    );
+    assert_eq!(
+        initial_user
+            .content
+            .matches("<pioneer_turn_context>")
+            .count(),
+        1
+    );
+    assert!(initial_user.content.contains("Explicit selection: []"));
+    let mut previous = 0;
+    for heading in [
+        "## Execution",
+        "## Environment",
+        "## Conversation",
+        "## Skills",
+        "## Tools",
+    ] {
+        let position = initial_user
+            .content
+            .find(&format!("\n{heading}\n\n"))
+            .unwrap();
+        assert!(position > previous);
+        previous = position;
+    }
+    assert_eq!(initial_user.content.matches("## Skills\n").count(), 1);
+    assert!(!initial_user.content.contains("Provider instance:"));
+    assert!(
+        !initial_user
+            .content
+            .contains("Actual visibility and authorization are determined")
+    );
+    assert!(
+        !initial_user
+            .content
+            .contains("TurnApprovalScopePolicySnapshot")
+    );
+
+    assert!(initial_user.content.contains("Workspace: ws_memory_bundle"));
+    assert!(
+        initial_user
+            .content
+            .ends_with("</pioneer_turn_context>\n\nshow memory test tool")
+    );
+    assert!(requests.iter().all(|request| {
+        !request
+            .compiled_prompt
+            .as_ref()
+            .unwrap()
+            .full_system_text
+            .contains("Workspace: ws_memory_bundle")
+    }));
+    let tools = requests[1]
         .tools
         .as_ref()
         .expect("agent request should include tools");
@@ -10112,14 +10159,41 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
     assert!(tools.iter().any(|tool| tool.name == "memory_get"));
     assert!(tools.iter().any(|tool| tool.name == "memory_remember"));
     assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
-    let prompt = requests[0]
+    let prompt = requests[1]
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
-    assert!(prompt.full_system_text.contains(
-        "Available memory tools: memory_search, memory_list, memory_get, memory_remember, memory_forget."
-    ));
+    assert!(prompt.full_system_text.contains("### Memory Recall"));
+    let system = &prompt.full_system_text;
+    assert!(system.find("### Tool Usage\n").unwrap() < system.find("### Memory Recall\n").unwrap());
+    assert!(system.find("### Threads\n").unwrap() < system.find("### Memory Recall\n").unwrap());
+    for instruction in [
+        "call `read_skill` with that exact reference",
+        "pioneer/memory",
+        "runtime-derived scope access",
+        "recallEligibility",
+        "active is a storage status, not evidence quality",
+        "Current user instructions override recalled memory",
+    ] {
+        assert!(
+            prompt.full_system_text.contains(instruction),
+            "missing memory instruction: {instruction}"
+        );
+    }
+    assert!(!prompt.full_system_text.contains("User likes Porto."));
+    assert!(
+        !prompt
+            .full_system_text
+            .contains("HOOK MEMORY CONTEXT MUST NOT APPEAR")
+    );
+    assert!(
+        requests[0]
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|tool| !tool.name.starts_with("memory_"))
+    );
     assert!(
         !prompt
             .full_system_text
@@ -10130,18 +10204,17 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
 #[tokio::test]
 async fn pre_tool_materialization_hook_receives_local_non_memory_tool_bundle_names() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_read_preflight_response(),
+    let provider = Arc::new(CaptureAgentProvider::with_requested_tools(
+        memory_read_tools(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![fake_standard_memory_tool_bundle()],
             diagnostics: Vec::new(),
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
@@ -10191,1167 +10264,38 @@ async fn pre_tool_materialization_hook_receives_local_non_memory_tool_bundle_nam
     let request = provider
         .snapshot_requests()
         .into_iter()
-        .next()
+        .last()
         .expect("provider request");
     let tools = request.tools.expect("agent request should include tools");
     assert!(tools.iter().any(|tool| tool.name == "memory_search"));
 }
 
 #[tokio::test]
-async fn phase_13_memory_tool_bundle_visibility_is_driven_by_hook_policy_set() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_all_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            calls.clone(),
-            Vec::new(),
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::no_save(),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase13_tool_policy",
-        "ws_phase13_tool_policy",
-        "turn_phase13_tool_policy",
-        ThreadMode::Agent,
-        "capture",
-        "Speichere das nicht, aber nutze vorhandene Erinnerung.",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let calls = snapshot_hook_calls(&calls);
-    let pre_policy_index = calls
-        .iter()
-        .position(|call| call.phase == HookPhase::TurnPrePolicy)
-        .expect("pre-policy hook call exists");
-    let pre_tool_index = calls
-        .iter()
-        .position(|call| call.phase == HookPhase::TurnPreToolMaterialization)
-        .expect("pre-tool hook call exists");
-    assert!(
-        pre_policy_index < pre_tool_index,
-        "policy must run before tool materialization"
-    );
-    let policy = memory_turn_policy_from_hook_policy_set(&calls[pre_tool_index].policy_set)
-        .expect("memory policy exists at tool materialization")
-        .expect("memory policy decodes at tool materialization");
-    assert_eq!(
-        policy.reason_code,
-        super::MemoryPolicyReasonCode::MemoryNoSave
-    );
-    assert_eq!(
-        policy.remember_tool,
-        super::MemoryMutationToolPolicy::Disabled
-    );
-
-    assert_eq!(memory_provider.tool_contexts().len(), 1);
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let tools = requests[0]
-        .tools
-        .as_ref()
-        .expect("agent request should include tools");
-    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
-    assert!(tools.iter().any(|tool| tool.name == "memory_get"));
-    assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
-    assert!(!tools.iter().any(|tool| tool.name == "memory_remember"));
-}
-
-#[tokio::test]
-async fn phase_13_without_memory_hook_subscription_exposes_no_memory_tools() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
-            calls.clone(),
-            HookPhase::TurnPreToolMaterialization,
-            HookAwaitPolicy::Blocking,
-            HookFailurePolicy::BestEffort,
-        )))
-        .await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase13_no_memory_hook",
-        "ws_phase13_no_memory_hook",
-        "turn_phase13_no_memory_hook",
-        ThreadMode::Agent,
-        "capture",
-        "no memory provider is installed",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let calls = wait_for_hook_calls(&calls, 1).await;
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].phase, HookPhase::TurnPreToolMaterialization);
-    assert!(
-        memory_turn_policy_from_hook_policy_set(&calls[0].policy_set).is_none(),
-        "memory policy should not exist without memory hooks"
-    );
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let tools = requests[0]
-        .tools
-        .as_ref()
-        .expect("agent request should include non-memory built-in tools");
-    assert!(!tools.iter().any(|tool| tool.name.starts_with("memory_")));
-}
-
-#[tokio::test]
-async fn identity_recall_prompt_contains_relevant_memory() {
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_read_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_identity_name",
-                MemoryCategory::Identity,
-                Some("name"),
-                "User's name is Alexander.",
-            )],
-            diagnostics: vec!["internal recall diagnostic".to_owned()],
-            truncated: false,
-        }),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_identity_recall",
-        "ws_memory_identity_recall",
-        "turn_memory_identity_recall",
-        ThreadMode::Agent,
-        "capture",
-        "what is my name?",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    let tools = request
-        .tools
-        .as_ref()
-        .expect("agent request should include memory tools");
-    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
-    let prompt = request
-        .compiled_prompt
-        .as_ref()
-        .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
-    assert!(
-        prompt
-            .full_system_text
-            .contains("User's name is Alexander.")
-    );
-    assert!(!prompt.full_system_text.contains("mem_identity_name"));
-    assert!(
-        !prompt
-            .full_system_text
-            .contains("internal recall diagnostic")
-    );
-
-    let manifest = observed
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
-            _ => None,
-        })
-        .next()
-        .expect("prompt manifest should be emitted");
-    assert!(
-        manifest
-            .section_ids
-            .iter()
-            .any(|section| section == "memory_recall")
-    );
-}
-
-#[tokio::test]
-async fn phase_14_memory_recall_and_prompt_contract_are_manifest_observable() {
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_read_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_phase14_identity",
-                MemoryCategory::Identity,
-                Some("name"),
-                "User's name is Alexander.",
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        }),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase14_memory_manifest",
-        "ws_phase14_memory_manifest",
-        "turn_phase14_memory_manifest",
-        ThreadMode::Agent,
-        "capture",
-        "what is my name?",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert_eq!(memory_provider.recall_contexts().len(), 1);
-    assert_eq!(memory_provider.tool_contexts().len(), 1);
-    let manifest = observed
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
-            _ => None,
-        })
-        .next()
-        .expect("prompt manifest should be emitted");
-
-    let prompt_contract_source = manifest
-        .hook_sources
-        .iter()
-        .find(|source| source.section_id.as_deref() == Some("memory_recall"))
-        .expect("memory prompt contract hook source should be recorded");
-    assert_eq!(
-        prompt_contract_source.contribution_kind,
-        PromptManifestHookContributionKind::PromptSection
-    );
-    assert_eq!(
-        prompt_contract_source.source.phase,
-        PromptManifestHookPhase::TurnPrePromptCompile
-    );
-    assert_eq!(
-        prompt_contract_source.source.hook_id,
-        "memory.prompt_contract"
-    );
-    assert_eq!(
-        prompt_contract_source.source.subscription_id,
-        "memory.prompt_contract.default"
-    );
-    assert_eq!(
-        prompt_contract_source.source.contribution_id.as_deref(),
-        Some("memory.prompt_contract.section")
-    );
-
-    let deterministic_recall_source = manifest
-        .hook_sources
-        .iter()
-        .find(|source| {
-            source.section_id.is_none()
-                && source.contribution_kind == PromptManifestHookContributionKind::PromptContext
-                && source.source.hook_id == "memory.deterministic_recall"
-        })
-        .expect("deterministic recall prompt-context hook source should be recorded");
-    assert_eq!(
-        deterministic_recall_source.source.phase,
-        PromptManifestHookPhase::TurnPrePromptContext
-    );
-    assert_eq!(
-        deterministic_recall_source.source.subscription_id,
-        "memory.deterministic_recall.default"
-    );
-    assert_eq!(
-        deterministic_recall_source
-            .source
-            .contribution_id
-            .as_deref(),
-        Some("memory.deterministic_recall.context")
-    );
-    assert_eq!(deterministic_recall_source.source_count, Some(1));
-}
-
-#[tokio::test]
-async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest() {
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_read_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let mut config = test_tool_loop_config();
-    config.memory.active_recall.mode = super::MemoryActiveRecallMode::StrictDebug;
-    config.memory.active_recall.max_queries = 1;
-    let manager = AgentManager::new(registry, config);
-    let memory_provider = Arc::new(RecordingMemoryProvider::with_recall_sequence(
-        vec![
-            Ok(MemoryRecallSnapshot::empty()),
-            Ok(MemoryRecallSnapshot {
-                items: vec![memory_recall_item(
-                    "mem_phase15_active",
-                    MemoryCategory::ProjectDecision,
-                    Some("hook_runtime"),
-                    "Use the hook runtime for proactive memory recall.",
-                )],
-                diagnostics: Vec::new(),
-                truncated: false,
-            }),
-        ],
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase15_active_memory",
-        "ws_phase15_active_memory",
-        "turn_phase15_active_memory",
-        ThreadMode::Agent,
-        "capture",
-        "continue the previous architecture implementation with the same memory constraints",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert_eq!(memory_provider.recall_contexts().len(), 2);
-    assert_eq!(memory_provider.tool_contexts().len(), 1);
-    assert!(memory_provider.mode_recall_requests().is_empty());
-    let recall_requests = memory_provider.recall_requests();
-    assert_eq!(recall_requests.len(), 2);
-    assert_eq!(recall_requests[1].top_k, Some(5));
-    assert_eq!(recall_requests[1].max_chars, Some(1_500));
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let prompt = requests[0]
-        .compiled_prompt
-        .as_ref()
-        .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
-    assert!(
-        prompt
-            .full_system_text
-            .contains("Additional active memory context for this turn:")
-    );
-    assert!(
-        prompt
-            .full_system_text
-            .contains("Use the hook runtime for proactive memory recall.")
-    );
-
-    let manifest = observed
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
-            _ => None,
-        })
-        .next()
-        .expect("prompt manifest should be emitted");
-    let active_recall_source = manifest
-        .hook_sources
-        .iter()
-        .find(|source| {
-            source.section_id.is_none()
-                && source.contribution_kind == PromptManifestHookContributionKind::PromptContext
-                && source.source.hook_id == "memory.active_recall"
-        })
-        .expect("active recall prompt-context hook source should be recorded");
-    assert_eq!(
-        active_recall_source.source.phase,
-        PromptManifestHookPhase::TurnPostPreflightPromptContext
-    );
-    assert_eq!(
-        active_recall_source.source.subscription_id,
-        "memory.active_recall.default"
-    );
-    assert_eq!(
-        active_recall_source.source.contribution_id.as_deref(),
-        Some("memory.active_recall.context")
-    );
-    assert_eq!(active_recall_source.source_count, Some(1));
-}
-
-#[tokio::test]
-async fn memory_identity_flow_preflight_provider_owned_active_recall_contributes_prompt_context() {
-    let preflight_response = json!({
-        "tools": {
-            "visibleTools": ["memory_search", "memory_get"]
-        },
-        "memory": {
-            "activeRecall": {
-                "durable": {
-                    "status": "run",
-                    "reasonCode": "provider_run",
-                    "confidence": 0.92,
-                    "modes": ["profile"],
-                    "targets": [{
-                        "scopeKind": "user",
-                        "factClass": "user_identity",
-                        "category": "identity",
-                        "subject": "current_user",
-                        "attribute": "name"
-                    }],
-                    "diagnostics": ["preflight provider ok"]
-                },
-                "episodic": {
-                    "status": "skip",
-                    "reasonCode": "provider_skip",
-                    "confidence": 1.0,
-                    "queries": []
-                }
-            }
-        }
-    });
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        preflight_response.to_string(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let mut config = test_tool_loop_config();
-    config.memory.active_recall.mode = super::MemoryActiveRecallMode::Hybrid;
-    config.memory.active_recall.max_queries = 1;
-    let manager = AgentManager::new(registry, config);
-    let memory_provider = Arc::new(RecordingMemoryProvider::with_recall_sequence(
-        vec![
-            Ok(MemoryRecallSnapshot::empty()),
-            Ok(MemoryRecallSnapshot {
-                items: vec![memory_recall_item(
-                    "mem_preflight_memory_name",
-                    MemoryCategory::Identity,
-                    Some("name"),
-                    "User's name is Alexander.",
-                )],
-                diagnostics: Vec::new(),
-                truncated: false,
-            }),
-        ],
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_preflight_memory_provider_owned",
-        "ws_preflight_memory_provider_owned",
-        "turn_preflight_memory_provider_owned",
-        ThreadMode::Agent,
-        "capture",
-        "как меня зовут?",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let mode_requests = memory_provider.mode_recall_requests();
-    assert_eq!(mode_requests.len(), 1);
-    assert_eq!(mode_requests[0].mode, MemoryRecallMode::Profile);
-    assert!(!memory_provider.recall_contexts().is_empty());
-
-    let requests = provider.snapshot_all_requests();
-    assert_eq!(requests.len(), 2);
-    assert!(is_turn_preflight_request(&requests[0]));
-    assert!(requests[0].compiled_prompt.is_none());
-    assert!(requests[0].tools.is_none());
-    assert!(requests[1].compiled_prompt.is_some());
-    let tool_names = requests[1]
-        .tools
-        .as_ref()
-        .expect("main identity request should include final visible tools")
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    for core_tool in pioneer_tools::PREFLIGHT_CORE_TOOL_NAMES {
-        assert!(
-            tool_names.contains(core_tool),
-            "core tool `{core_tool}` should stay visible in identity flow"
-        );
-    }
-    assert!(tool_names.contains(&"memory_search"));
-    assert!(tool_names.contains(&"memory_get"));
-    assert!(!tool_names.contains(&"memory_list"));
-    assert!(!tool_names.contains(&"memory_remember"));
-    assert!(!tool_names.contains(&"memory_forget"));
-    assert!(!tool_names.contains(&"task_create"));
-    assert!(!tool_names.contains(&"artifact_prepare"));
-    let prompt = requests[1]
-        .compiled_prompt
-        .as_ref()
-        .expect("main request should include compiled prompt");
-    assert!(
-        prompt
-            .full_system_text
-            .contains("Additional active memory context for this turn:")
-    );
-    assert!(
-        prompt
-            .full_system_text
-            .contains("User's name is Alexander.")
-    );
-}
-
-#[tokio::test]
-async fn preflight_memory_active_recall_disabled_suppresses_provider_plan() {
-    let preflight_response = json!({
-        "tools": {
-            "visibleTools": []
-        },
-        "memory": {
-            "activeRecall": {
-                "durable": {
-                    "status": "run",
-                    "reasonCode": "provider_run",
-                    "confidence": 0.92,
-                    "modes": ["profile"],
-                    "targets": [{
-                        "scopeKind": "user",
-                        "factClass": "user_identity",
-                        "category": "identity",
-                        "subject": "current_user",
-                        "attribute": "name"
-                    }],
-                    "diagnostics": ["must be ignored"]
-                },
-                "episodic": {
-                    "status": "skip",
-                    "reasonCode": "provider_skip",
-                    "confidence": 1.0,
-                    "queries": []
-                }
-            }
-        }
-    });
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        preflight_response.to_string(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let mut config = test_tool_loop_config();
-    config.memory.active_recall.mode = super::MemoryActiveRecallMode::Disabled;
-    let manager = AgentManager::new(registry, config);
-    let memory_provider = Arc::new(RecordingMemoryProvider::with_recall_sequence(
-        vec![Ok(MemoryRecallSnapshot::empty())],
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_preflight_memory_disabled",
-        "ws_preflight_memory_disabled",
-        "turn_preflight_memory_disabled",
-        ThreadMode::Agent,
-        "capture",
-        "как меня зовут?",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert_eq!(memory_provider.recall_contexts().len(), 1);
-    assert!(memory_provider.mode_recall_requests().is_empty());
-    let requests = provider.snapshot_all_requests();
-    assert_eq!(requests.len(), 2);
-    let prompt = requests[1]
-        .compiled_prompt
-        .as_ref()
-        .expect("main request should include compiled prompt");
-    assert!(
-        !prompt
-            .full_system_text
-            .contains("Additional active memory context for this turn:")
-    );
-    assert!(!prompt.full_system_text.contains("must be ignored"));
-}
-
-#[tokio::test]
-async fn phase_16_active_memory_duplicate_suppression_is_manifest_observable() {
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_read_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let mut config = test_tool_loop_config();
-    config.memory.active_recall.mode = super::MemoryActiveRecallMode::StrictDebug;
-    config.memory.active_recall.max_queries = 1;
-    let manager = AgentManager::new(registry, config);
-    let duplicate_memory = memory_recall_item(
-        "mem_phase16_duplicate",
-        MemoryCategory::Identity,
-        Some("name"),
-        "User's name is Alexander.",
-    );
-    let memory_provider = Arc::new(RecordingMemoryProvider::with_recall_sequence(
-        vec![
-            Ok(MemoryRecallSnapshot {
-                items: vec![duplicate_memory.clone()],
-                diagnostics: Vec::new(),
-                truncated: false,
-            }),
-            Ok(MemoryRecallSnapshot {
-                items: vec![duplicate_memory],
-                diagnostics: Vec::new(),
-                truncated: false,
-            }),
-        ],
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase16_active_memory_dup",
-        "ws_phase16_active_memory_dup",
-        "turn_phase16_active_memory_dup",
-        ThreadMode::Agent,
-        "capture",
-        "continue the previous architecture implementation with the same memory constraints",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let prompt = requests[0]
-        .compiled_prompt
-        .as_ref()
-        .expect("agent request should include compiled prompt");
-    assert!(
-        prompt
-            .full_system_text
-            .contains("Relevant memory context for this turn:")
-    );
-    assert_eq!(
-        prompt
-            .full_system_text
-            .matches("User's name is Alexander.")
-            .count(),
-        1
-    );
-    assert!(
-        !prompt
-            .full_system_text
-            .contains("Additional active memory context for this turn:")
-    );
-
-    let manifest = observed
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
-            _ => None,
-        })
-        .next()
-        .expect("prompt manifest should be emitted");
-    assert!(manifest.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == PromptManifestDiagnosticCode::HookDiagnostic
-            && diagnostic.message.contains("memory active recall dedup")
-            && diagnostic.message.contains("active_duplicate_count=1")
-            && diagnostic.message.contains("active_rendered_count=0")
-            && diagnostic.message.contains("duplicate_only=true")
-            && diagnostic
-                .hook_source
-                .as_ref()
-                .is_some_and(|source| source.hook_id == "memory.active_recall")
-    }));
-}
-
-#[tokio::test]
-async fn memory_provider_without_tools_recalls_but_omits_prompt_contract() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_should_not_render",
-                MemoryCategory::Identity,
-                Some("name"),
-                "User's name is Alexander.",
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        }),
-        Ok(MemoryToolMaterialization::default()),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_no_tools",
-        "ws_memory_no_tools",
-        "turn_memory_no_tools",
-        ThreadMode::Agent,
-        "capture",
-        "what is my name?",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert_eq!(memory_provider.tool_contexts().len(), 1);
-    assert_eq!(memory_provider.recall_contexts().len(), 1);
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    let tools = request
-        .tools
-        .as_ref()
-        .expect("agent request should include built-in tools");
-    assert!(!tools.iter().any(|tool| tool.name.starts_with("memory_")));
-    let prompt = request
-        .compiled_prompt
-        .as_ref()
-        .expect("agent request should include compiled prompt");
-    assert!(!prompt.full_system_text.contains("## Memory Recall"));
-    assert!(
-        !prompt
-            .full_system_text
-            .contains("User's name is Alexander.")
-    );
-}
-
-#[tokio::test]
-async fn memory_policy_classifier_no_use_disables_recall_without_phrase_matching() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_ignore",
-                MemoryCategory::Preference,
-                Some("city"),
-                "User likes Porto.",
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        }),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(MemoryTurnPolicy::no_use()));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_ignore",
-        "ws_memory_ignore",
-        "turn_memory_ignore",
-        ThreadMode::Agent,
-        "capture",
-        "No uses la memoria para esta respuesta; responde directamente.",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert_eq!(policy_provider.contexts().len(), 1);
-    assert!(memory_provider.tool_contexts().is_empty());
-    assert!(memory_provider.recall_contexts().is_empty());
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    let tools = request
-        .tools
-        .as_ref()
-        .expect("agent request should include built-in tools");
-    assert!(!tools.iter().any(|tool| tool.name.starts_with("memory_")));
-    let prompt = request
-        .compiled_prompt
-        .as_ref()
-        .expect("agent request should include compiled prompt");
-    assert!(!prompt.full_system_text.contains("## Memory Recall"));
-    assert!(!prompt.full_system_text.contains("User likes Porto."));
-}
-
-#[tokio::test]
-async fn memory_policy_no_save_keeps_read_recall_but_blocks_remember() {
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_all_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_russian_ignore",
-                MemoryCategory::Preference,
-                Some("city"),
-                "User likes Porto.",
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        }),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::no_save(),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_no_save",
-        "ws_memory_no_save",
-        "turn_memory_no_save",
-        ThreadMode::Agent,
-        "capture",
-        "Speichere das nicht, aber nutze vorhandenen Kontext falls hilfreich.",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert_eq!(policy_provider.contexts().len(), 1);
-    let policy_requests = policy_provider.requests();
-    assert_eq!(policy_requests.len(), 1);
-    assert_eq!(
-        policy_requests[0].default_policy.post_turn_extraction,
-        MemoryExtractionPolicy::Allow
-    );
-    assert_eq!(memory_provider.tool_contexts().len(), 1);
-    assert_eq!(memory_provider.recall_contexts().len(), 1);
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    let tools = request
-        .tools
-        .as_ref()
-        .expect("agent request should include tools");
-    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
-    assert!(tools.iter().any(|tool| tool.name == "memory_get"));
-    assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
-    assert!(!tools.iter().any(|tool| tool.name == "memory_remember"));
-    let prompt = request
-        .compiled_prompt
-        .as_ref()
-        .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
-    assert!(
-        prompt
-            .full_system_text
-            .contains("Memory writes are disabled for this turn")
-    );
-    assert!(prompt.full_system_text.contains("User likes Porto."));
-    assert!(
-        prompt
-            .full_system_text
-            .contains("Do not store, update, infer, or extract new memories")
-    );
-}
-
-#[tokio::test]
-async fn phase_12_memory_policy_classifier_contributes_full_hook_policy() {
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    manager
-        .set_hook_runtime(Some(recording_hook_runtime(
-            calls.clone(),
-            Vec::new(),
-            HookFailurePolicy::BestEffort,
-            false,
-        )))
-        .await;
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::no_save().with_detected_language(Some("de".to_owned())),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_phase12_memory_policy_payload",
-        "ws_phase12_memory_policy_payload",
-        "turn_phase12_memory_policy_payload",
-        ThreadMode::Agent,
-        "capture",
-        "Speichere das nicht.",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let calls = snapshot_hook_calls(&calls);
-    let pre_prompt_context = calls
-        .iter()
-        .find(|call| call.phase == HookPhase::TurnPrePromptContext)
-        .expect("pre-prompt-context hook called");
-    let policy = memory_turn_policy_from_hook_policy_set(&pre_prompt_context.policy_set)
-        .expect("memory policy exists")
-        .expect("memory policy decodes from hook policy set");
-
-    assert_eq!(
-        policy.reason_code,
-        super::MemoryPolicyReasonCode::MemoryNoSave
-    );
-    assert_eq!(policy.detected_language.as_deref(), Some("de"));
-    assert_eq!(
-        policy.remember_tool,
-        super::MemoryMutationToolPolicy::Disabled
-    );
-    assert_eq!(policy.read_tools, super::MemoryReadToolPolicy::Allow);
-}
-
-#[tokio::test]
-async fn memory_policy_invalid_classifier_json_uses_default_allow_fallback() {
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_all_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_fallback",
-                MemoryCategory::Preference,
-                Some("city"),
-                "User likes Porto.",
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        }),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::failing(
-        "classifier_invalid_json",
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_policy_fallback",
-        "ws_memory_policy_fallback",
-        "turn_memory_policy_fallback",
-        ThreadMode::Agent,
-        "capture",
-        "Ayudame con el proyecto.",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    assert_eq!(policy_provider.contexts().len(), 1);
-    assert_eq!(memory_provider.tool_contexts().len(), 1);
-    assert_eq!(memory_provider.recall_contexts().len(), 1);
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    let tools = request
-        .tools
-        .as_ref()
-        .expect("agent request should include memory tools");
-    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
-    assert!(tools.iter().any(|tool| tool.name == "memory_get"));
-    assert!(tools.iter().any(|tool| tool.name == "memory_remember"));
-    assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
-    let prompt = request
-        .compiled_prompt
-        .as_ref()
-        .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("## Memory Recall"));
-    assert!(prompt.full_system_text.contains("User likes Porto."));
-    assert!(
-        prompt
-            .full_system_text
-            .contains("Call memory_remember proactively")
-    );
-}
-
-#[tokio::test]
-async fn recall_sensitive_policy_mentions_memory_search_when_recall_is_insufficient() {
-    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_read_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
-            bundles: vec![fake_standard_memory_tool_bundle()],
-            diagnostics: Vec::new(),
-        }),
-    ));
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_memory_search_policy",
-        "ws_memory_search_policy",
-        "turn_memory_search_policy",
-        ThreadMode::Agent,
-        "capture",
-        "do you remember my birthday?",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    let tools = request
-        .tools
-        .as_ref()
-        .expect("agent request should include memory tools");
-    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
-    let prompt = request
-        .compiled_prompt
-        .as_ref()
-        .expect("agent request should include compiled prompt");
-    assert!(
-        prompt
-            .full_system_text
-            .contains("If unsure whether injected memory is enough for a non-trivial task")
-    );
-    assert!(!prompt.full_system_text.contains("Relevant memories:"));
-}
-
-#[tokio::test]
 async fn memory_policy_default_allows_proactive_remember_tool() {
     let (memory_bundle, calls) = recording_standard_memory_tool_bundle();
-    let provider = Arc::new(SequencedToolProvider::with_preflight_response(
+    let provider = Arc::new(SequencedToolProvider::with_requested_tools(
         vec![ProviderToolCall {
             id: "call_memory_remember_proactive".to_owned(),
             name: "memory_remember".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "remembered",
-        memory_remember_preflight_response(),
+        memory_remember_tools(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-tools",
         provider.clone(),
     ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![memory_bundle],
             diagnostics: Vec::new(),
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::proactive_write_allowed(),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
     install_configured_memory_hooks_for_test(&manager).await;
 
@@ -11374,60 +10318,59 @@ async fn memory_policy_default_allows_proactive_remember_tool() {
             .as_slice(),
         &["memory_remember".to_owned()]
     );
-    assert_eq!(policy_provider.contexts().len(), 1);
     let requests = provider.snapshot_requests();
     assert!(requests.len() >= 2);
-    let first_request = &requests[0];
+    let first_request = &requests[1];
     let tools = first_request
         .tools
         .as_ref()
         .expect("first request should include memory tools");
     assert!(tools.iter().any(|tool| tool.name == "memory_remember"));
-    let first_prompt = first_request
-        .compiled_prompt
-        .as_ref()
-        .expect("first request should include prompt");
+    assert!(requests[0].compiled_prompt.is_some());
     assert!(
-        first_prompt
-            .full_system_text
-            .contains("Call memory_remember proactively")
+        requests[0]
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|tool| !tool.name.starts_with("memory_"))
+    );
+    assert!(
+        requests
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Tool)
     );
 }
 
 #[tokio::test]
 async fn explicit_remember_request_can_trigger_memory_remember() {
     let (memory_bundle, calls) = recording_standard_memory_tool_bundle();
-    let provider = Arc::new(SequencedToolProvider::with_preflight_response(
+    let provider = Arc::new(SequencedToolProvider::with_requested_tools(
         vec![ProviderToolCall {
             id: "call_memory_remember".to_owned(),
             name: "memory_remember".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "remembered",
-        memory_remember_preflight_response(),
+        memory_remember_tools(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-tools",
         provider.clone(),
     ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![memory_bundle],
             diagnostics: Vec::new(),
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::explicit_remember(),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
     install_configured_memory_hooks_for_test(&manager).await;
 
@@ -11450,54 +10393,53 @@ async fn explicit_remember_request_can_trigger_memory_remember() {
             .as_slice(),
         &["memory_remember".to_owned()]
     );
-    assert_eq!(policy_provider.contexts().len(), 1);
     let requests = provider.snapshot_requests();
     assert!(requests.len() >= 2);
-    let first_prompt = requests[0]
-        .compiled_prompt
-        .as_ref()
-        .expect("first request should include prompt");
+    assert!(requests[0].compiled_prompt.is_some());
     assert!(
-        first_prompt
-            .full_system_text
-            .contains("Call memory_remember proactively")
+        requests[0]
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|tool| !tool.name.starts_with("memory_"))
+    );
+    assert!(
+        requests
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Tool)
     );
 }
 
 #[tokio::test]
 async fn explicit_forget_request_can_trigger_memory_forget() {
     let (memory_bundle, calls) = recording_standard_memory_tool_bundle();
-    let provider = Arc::new(SequencedToolProvider::with_preflight_response(
+    let provider = Arc::new(SequencedToolProvider::with_requested_tools(
         vec![ProviderToolCall {
             id: "call_memory_forget".to_owned(),
             name: "memory_forget".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "forgotten",
-        memory_forget_preflight_response(),
+        memory_forget_tools(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-tools",
         provider.clone(),
     ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot::empty()),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![memory_bundle],
             diagnostics: Vec::new(),
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
-        MemoryTurnPolicy::explicit_forget(Some("birthday".to_owned())),
-    ));
-    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
-    manager
-        .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
     install_configured_memory_hooks_for_test(&manager).await;
 
@@ -11520,11 +10462,9 @@ async fn explicit_forget_request_can_trigger_memory_forget() {
             .as_slice(),
         &["memory_forget".to_owned()]
     );
-    assert_eq!(policy_provider.contexts().len(), 1);
-    assert!(memory_provider.recall_contexts().is_empty());
     let requests = provider.snapshot_requests();
     assert!(requests.len() >= 2);
-    let first_request = &requests[0];
+    let first_request = &requests[1];
     let tools = first_request
         .tools
         .as_ref()
@@ -11532,165 +10472,23 @@ async fn explicit_forget_request_can_trigger_memory_forget() {
     assert!(tools.iter().any(|tool| tool.name == "memory_search"));
     assert!(tools.iter().any(|tool| tool.name == "memory_get"));
     assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
-    assert!(!tools.iter().any(|tool| tool.name == "memory_remember"));
-    let first_prompt = first_request
-        .compiled_prompt
-        .as_ref()
-        .expect("first request should include prompt");
+    assert!(tools.iter().any(|tool| tool.name == "memory_remember"));
+    assert!(requests[0].compiled_prompt.is_some());
     assert!(
-        first_prompt
-            .full_system_text
-            .contains("If the user asks you to forget something, call memory_forget.")
+        requests[0]
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|tool| !tool.name.starts_with("memory_"))
     );
     assert!(
-        first_prompt
-            .full_system_text
-            .contains("only to identify and forget")
-    );
-    assert!(!first_prompt.full_system_text.contains("Relevant memories:"));
-}
-
-#[tokio::test]
-async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() {
-    let remember_provider = Arc::new(SequencedToolProvider::with_preflight_response(
-        vec![ProviderToolCall {
-            id: "call_stateful_memory_remember".to_owned(),
-            name: "memory_remember".to_owned(),
-            arguments: serde_json::json!({
-                "content": "User's name is Alexander.",
-                "category": "identity",
-                "scope": "user",
-                "key": "name",
-                "source": "explicit_user_request"
-            })
-            .to_string(),
-        }],
-        "remembered",
-        memory_remember_preflight_response(),
-    ));
-    let registry = Arc::new(ProviderRegistry::with_provider(
-        "sequenced-remember",
-        remember_provider.clone(),
-    ));
-    let manager = AgentManager::new(registry.clone(), test_tool_loop_config());
-    let memory_provider = Arc::new(StatefulMemoryProvider::default());
-    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
-    manager
-        .set_memory_provider(Some(memory_trait_provider))
-        .await;
-    install_configured_memory_hooks_for_test(&manager).await;
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_stateful_memory_remember",
-        "ws_stateful_memory",
-        "turn_stateful_memory_remember",
-        ThreadMode::Agent,
-        "sequenced-remember",
-        concat!("remember ", "that my name is Alexander"),
-    )
-    .await;
-    assert_turn_completed(&observed);
-    assert_eq!(
-        memory_provider
-            .stored_content
-            .lock()
-            .expect("stateful memory lock poisoned")
-            .as_deref(),
-        Some("User's name is Alexander.")
-    );
-
-    let recall_provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_read_preflight_response(),
-    ));
-    registry
-        .insert("capture-recall", recall_provider.clone())
-        .expect("test provider should fit registry bounds");
-    let observed = start_simple_turn(
-        &manager,
-        "thr_stateful_memory_recall_new",
-        "ws_stateful_memory",
-        "turn_stateful_memory_recall_new",
-        ThreadMode::Agent,
-        "capture-recall",
-        "what is my name?",
-    )
-    .await;
-    assert_turn_completed(&observed);
-    let recall_requests = recall_provider.snapshot_requests();
-    assert_eq!(recall_requests.len(), 1);
-    let recall_prompt = recall_requests[0]
-        .compiled_prompt
-        .as_ref()
-        .expect("recall turn should include prompt");
-    assert!(recall_prompt.full_system_text.contains("## Memory Recall"));
-    assert!(
-        recall_prompt
-            .full_system_text
-            .contains("User's name is Alexander.")
-    );
-
-    let forget_provider = Arc::new(SequencedToolProvider::with_preflight_response(
-        vec![ProviderToolCall {
-            id: "call_stateful_memory_forget".to_owned(),
-            name: "memory_forget".to_owned(),
-            arguments: "{}".to_owned(),
-        }],
-        "forgotten",
-        memory_forget_preflight_response(),
-    ));
-    registry
-        .insert("sequenced-forget", forget_provider)
-        .expect("test provider should fit registry bounds");
-    let observed = start_simple_turn(
-        &manager,
-        "thr_stateful_memory_forget",
-        "ws_stateful_memory",
-        "turn_stateful_memory_forget",
-        ThreadMode::Agent,
-        "sequenced-forget",
-        "forget my name",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let after_forget_provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        memory_read_preflight_response(),
-    ));
-    registry
-        .insert("capture-after-forget", after_forget_provider.clone())
-        .expect("test provider should fit registry bounds");
-    let observed = start_simple_turn(
-        &manager,
-        "thr_stateful_memory_after_forget",
-        "ws_stateful_memory",
-        "turn_stateful_memory_after_forget",
-        ThreadMode::Agent,
-        "capture-after-forget",
-        "what is my name?",
-    )
-    .await;
-    assert_turn_completed(&observed);
-    let after_forget_requests = after_forget_provider.snapshot_requests();
-    assert_eq!(after_forget_requests.len(), 1);
-    let after_forget_prompt = after_forget_requests[0]
-        .compiled_prompt
-        .as_ref()
-        .expect("after-forget turn should include prompt");
-    assert!(
-        after_forget_prompt
-            .full_system_text
-            .contains("## Memory Recall")
-    );
-    assert!(
-        !after_forget_prompt
-            .full_system_text
-            .contains("User's name is Alexander.")
-    );
-    assert!(
-        !after_forget_prompt
-            .full_system_text
-            .contains("Relevant memories:")
+        requests
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Tool)
     );
 }
 
@@ -11738,69 +10536,6 @@ async fn start_loop_budget_turn(
         .await
         .expect("turn should start");
     events
-}
-
-#[tokio::test]
-async fn tool_loop_provider_round_budget_requests_continuation_without_final_no_tools_round() {
-    let provider = Arc::new(LoopBudgetProvider::new(
-        LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
-        1,
-    ));
-    let mut config = test_tool_loop_config();
-    set_execution_window_budget(&mut config, 2, 16);
-    config.retry.max_recoverable_retry_rounds_per_episode = 16;
-    config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
-    let mut events = start_loop_budget_turn(
-        &manager,
-        "thr_loop_budget_rounds",
-        "turn_loop_budget_rounds",
-    )
-    .await;
-
-    let observed_events = recv_events_until_loop_budget_action(
-        &mut events,
-        ToolLoopBudgetLimitKind::AgentRounds,
-        ToolLoopBudgetAction::ContinueInNextWindow,
-    )
-    .await;
-    assert!(observed_events.iter().any(|event| matches!(
-        event,
-        AgentEvent::TurnToolLoopBudgetExceeded(notification)
-            if notification.limit_kind == ToolLoopBudgetLimitKind::AgentRounds
-                && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
-                && notification.turn_id == "turn_loop_budget_rounds"
-    )));
-    assert!(
-        !observed_events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
-        "agent-round window exhaustion must not fail the turn"
-    );
-
-    let requests = provider.snapshot_requests();
-    assert!(
-        requests.len() >= 2,
-        "provider should receive the initial window requests before continuation"
-    );
-    assert!(
-        requests[0]
-            .tools
-            .as_ref()
-            .map(|tools| !tools.is_empty())
-            .unwrap_or(false)
-    );
-    assert!(
-        requests[1]
-            .tools
-            .as_ref()
-            .map(|tools| !tools.is_empty())
-            .unwrap_or(false)
-    );
-    assert!(
-        requests.iter().all(|request| request.tools.is_some()),
-        "window budget exhaustion must not send a fake final no-tools provider round"
-    );
 }
 
 #[tokio::test]
@@ -11879,13 +10614,12 @@ async fn request_tools_selection_survives_execution_window_and_not_next_turn() {
     set_execution_window_budget(&mut config, 1, 8);
     let manager = AgentManager::new(registry, config);
     manager
-        .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(
-            Ok(MemoryRecallSnapshot::empty()),
-            Ok(MemoryToolMaterialization {
+        .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(Ok(
+            MemoryToolMaterialization {
                 bundles: vec![fake_standard_memory_tool_bundle()],
                 diagnostics: Vec::new(),
-            }),
-        ))))
+            },
+        )))))
         .await;
     install_configured_memory_hooks_for_test(&manager).await;
     manager
@@ -11978,7 +10712,10 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
         ],
         "final after parallel batch",
     ));
-    let registry = Arc::new(ProviderRegistry::with_provider("sequenced-tools", provider));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     manager
         .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
@@ -12083,6 +10820,428 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
         AgentEvent::TurnLlmContextAppended { tool_name, .. }
             if tool_name == "batch_slow"
     )));
+
+    // This owner's small-result lifecycle proof complements the Gateway's
+    // actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wires,
+    // which owns full input/order, bounded results, restoration and HTTP proof.
+    let requests = provider.snapshot_requests();
+    let next = requests.last().unwrap();
+    let mut checked_calls = Vec::new();
+    for event in &observed {
+        if let AgentEvent::TurnLlmContextAppended {
+            source, payload, ..
+        } = event
+            && source == "tool_result_v2"
+        {
+            let saved = serde_json::to_value(payload).unwrap();
+            let saved = saved.get("value").expect("exact result envelope");
+            let next_result = next
+                .messages
+                .iter()
+                .find(|message| {
+                    message.role == Role::Tool
+                        && serde_json::to_value(&message.tool_call_id).unwrap()
+                            == saved["tool_call_id"]
+                })
+                .expect("acknowledged result must reach the next request");
+            assert_eq!(serde_json::to_value(next_result).unwrap(), *saved);
+            checked_calls.push(next_result.tool_call_id.as_deref().unwrap());
+        }
+    }
+    assert_eq!(checked_calls, ["call_batch_fast", "call_batch_slow"]);
+
+    // Same parallel-result owner, now with a real CUA handler/receipt. The
+    // lifecycle ItemCompleted ACK is deliberately distinct from exact history.
+    // The generic fast/slow proof above runs in every build. Keep the complete
+    // receipt matrix when the real tools feature is enabled (including via
+    // workspace unification), without introducing an agent-only CU feature.
+    if !pioneer_tools::computer_use_tool_specs().is_empty() {
+        for delivery in [
+            "success",
+            "rejected",
+            "receiver_dropped",
+            "cancelled",
+            "caller_dropped",
+            "bounded_rejected",
+        ] {
+            cua_parallel_result_history_delivery(delivery).await;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct JournalCuaBackend {
+    inputs: AtomicUsize,
+    delivered: AtomicUsize,
+    released: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tools::ComputerUseBackend for JournalCuaBackend {
+    async fn execute(
+        &self,
+        _owner: &str,
+        name: &str,
+        _arguments: serde_json::Value,
+        _cancellation: CancellationToken,
+    ) -> Result<serde_json::Value, ToolError> {
+        if name == "get_window_state" {
+            return Ok(json!({
+                "content": [{"type":"image", "mimeType":"image/png", "data":"AAECAw==", "width":320, "height":240}],
+                "structuredContent": {"generation":7, "elementToken":"opaque", "origin":{"x":-8,"y":3}, "scale":2},
+                "pioneer_cua_context":{"generation":7,"delivery_nonce":"private"},
+                "isError":false
+            }));
+        }
+        assert_eq!(name, "type_text");
+        self.inputs.fetch_add(1, Ordering::SeqCst);
+        // Transport fixture only: no successful GUI action or OS grant claim.
+        Ok(json!({"content":[{"type":"text","text":"input delivery unverified"}], "isError":false}))
+    }
+
+    fn observation_delivered(&self, _owner: &str, context: &serde_json::Value) -> bool {
+        assert_eq!(context, &json!({"generation":7,"delivery_nonce":"private"}));
+        self.delivered.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn release_owner(&self, _owner: &str) {
+        self.released.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+struct JournalCuaAdmission {
+    capture_entered: tokio::sync::Semaphore,
+    input_requested: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tools::PermissionApprovalBroker for JournalCuaAdmission {
+    async fn revalidate_permission_context(
+        &self,
+        context: &pioneer_tools::PermissionEvaluationContext,
+        invocation: &ToolInvocation,
+    ) -> Result<pioneer_tools::PermissionEvaluationContext, String> {
+        if invocation.tool_name == "cua_type_text" {
+            // Revalidation always precedes dispatch, including profiles that
+            // need no approval. The real image sink signals with capture's
+            // actual CUA gate held, so input can never win that gate first.
+            let permit = tokio::select! {
+                biased;
+                _ = invocation.cancellation.cancelled() => return Err("fixture input cancelled".into()),
+                permit = self.capture_entered.acquire() => permit.map_err(|error| error.to_string())?,
+            };
+            drop(permit); // A latch: repeated revalidation must not consume it.
+            self.input_requested.add_permits(1);
+        }
+        Ok(context.clone())
+    }
+
+    async fn request_approval(
+        &self,
+        _context: &pioneer_tools::PermissionEvaluationContext,
+        _invocation: &ToolInvocation,
+        _intent: &pioneer_tools::PermissionIntent,
+        _key: &pioneer_tools::PermissionRequestKey,
+        _reason: pioneer_tools::PermissionDecisionReason,
+    ) -> pioneer_tools::PermissionApprovalResolution {
+        pioneer_tools::PermissionApprovalResolution::AllowOnce
+    }
+}
+
+#[derive(Debug)]
+struct JournalCuaImageSink {
+    oversized: bool,
+    admission: Arc<JournalCuaAdmission>,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tools::handlers::computer_use::ComputerUseImageSink for JournalCuaImageSink {
+    async fn admit(
+        &self,
+        _owner: &str,
+        _call_id: &str,
+        _index: usize,
+        bytes: Vec<u8>,
+        mime: &str,
+        cancellation: CancellationToken,
+    ) -> Result<pioneer_provider::MessageAttachment, ToolError> {
+        assert_eq!(bytes, [0, 1, 2, 3]);
+        assert_eq!(mime, "image/png");
+        self.admission.capture_entered.add_permits(1);
+        // Hold real capture admission until the parallel input has requested
+        // permission; this is scheduling only, never observation authority.
+        let permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(ToolError::cancelled("fixture capture cancelled")),
+            permit = self.admission.input_requested.acquire() => permit.map_err(|error| ToolError::execution_failed(error.to_string()))?,
+        };
+        drop(permit);
+        let path = if self.oversized {
+            format!(
+                "/artifacts/{}",
+                "x".repeat(pioneer_compaction::RESULT_BYTES + 1)
+            )
+        } else {
+            "/artifacts/journal-capture.png".into()
+        };
+        let mut image = pioneer_provider::MessageAttachment::from_path(path, mime);
+        image.artifact = Some(pioneer_provider::AttachmentArtifactContext {
+            workspace_id: "ws_parallel_cua_journal".into(),
+            artifact_id: "journal-capture".into(),
+            artifact_version_id: Some("v1".into()),
+        });
+        Ok(image)
+    }
+}
+
+async fn cua_parallel_result_history_delivery(delivery: &str) {
+    let backend = Arc::new(JournalCuaBackend::default());
+    let admission = Arc::new(JournalCuaAdmission {
+        capture_entered: tokio::sync::Semaphore::new(0),
+        input_requested: tokio::sync::Semaphore::new(0),
+    });
+    let mut config = test_tool_loop_config();
+    config.computer_use.backend = Some(backend.clone());
+    config
+        .computer_use
+        .image_admission
+        .set(Arc::new(JournalCuaImageSink {
+            oversized: delivery == "bounded_rejected",
+            admission: admission.clone(),
+        }));
+    let provider = Arc::new(SequencedToolProvider::with_requested_tools(
+        vec![
+            ProviderToolCall {
+                id: "capture".into(),
+                name: "cua_get_window_state".into(),
+                arguments: json!({"pid":7,"window_id":9,"include_screenshot":true}).to_string(),
+            },
+            ProviderToolCall {
+                id: "input".into(),
+                name: "cua_type_text".into(),
+                arguments:
+                    json!({"text":"private input","target":{"kind":"window","pid":7,"window_id":9}})
+                        .to_string(),
+            },
+        ],
+        "final after CUA batch",
+        requested_tool_names(&["cua_get_window_state", "cua_type_text"]),
+    ));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "sequenced-tools",
+            provider.clone(),
+        )),
+        config,
+    );
+    manager
+        .set_permission_approval_broker(admission.clone())
+        .await;
+    let thread = "thr_parallel_cua_journal";
+    let turn = "turn_parallel_cua_journal";
+    manager
+        .ensure_thread(thread, "ws_parallel_cua_journal")
+        .await
+        .unwrap();
+    let mut events = manager.take_durable_receiver(thread).await.unwrap();
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread,
+            turn,
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "observe the window, then enter text".into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut early_completion = false;
+    let history = loop {
+        let event = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("exact CUA history must arrive before the parallel batch finishes")
+            .unwrap();
+        if let AgentDurableEvent::TurnLlmContextAppended {
+            tool_name, payload, ..
+        } = &event
+            && tool_name == "cua_get_window_state"
+        {
+            let pioneer_protocol::ToolResultView::Json { value, .. } = payload else {
+                panic!("exact ChatMessage retained");
+            };
+            break serde_json::from_value::<ChatMessage>(value.clone()).unwrap();
+        }
+        if let AgentDurableEvent::ItemCompleted { notification } = &event {
+            if let TurnItem::DynamicToolCall { tool_name, .. } = &notification.item
+                && tool_name == "cua_get_window_state"
+            {
+                early_completion = true;
+            }
+        }
+        events.acknowledge_last(Ok(()));
+    };
+    assert!(
+        early_completion,
+        "early lifecycle accepted before exact typed history"
+    );
+    assert!(
+        admission.input_requested.available_permits() > 0,
+        "parallel input requested permission before capture reached the held exact history ACK"
+    );
+    let image = history
+        .content_parts
+        .iter()
+        .find_map(|part| match part {
+            MessageContentPart::Image { image } => Some(image),
+            _ => None,
+        })
+        .expect("typed image survives into exact history");
+    assert_eq!(
+        image.artifact.as_ref().unwrap().artifact_id,
+        "journal-capture"
+    );
+    let metadata = history
+        .content_parts
+        .iter()
+        .find_map(|part| match part {
+            MessageContentPart::Text { text } => {
+                serde_json::from_str::<serde_json::Value>(text).ok()
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        metadata["structuredContent"],
+        json!({"generation":7,"elementToken":"opaque","origin":{"x":-8,"y":3},"scale":2})
+    );
+    assert_eq!(metadata["content"][0]["width"], 320);
+    assert!(
+        metadata["pioneer_cua_context"]
+            .get("delivery_nonce")
+            .is_none()
+    );
+    assert_eq!(
+        backend.delivered.load(Ordering::SeqCst),
+        0,
+        "ItemCompleted ACK cannot commit observation"
+    );
+    assert_eq!(
+        backend.inputs.load(Ordering::SeqCst),
+        0,
+        "parallel input cannot reach backend while exact history ACK is held"
+    );
+    match delivery {
+        "success" | "bounded_rejected" => events.acknowledge_last(Ok(())),
+        "rejected" => events.acknowledge_last(Err(
+            pioneer_runtime_events::DurableCommitRejection::permanent(
+                "fixture_history_rejected",
+                "exact history append rejected",
+            ),
+        )),
+        "receiver_dropped" => {
+            drop(events);
+            timeout(Duration::from_secs(5), async {
+                while backend.released.load(Ordering::SeqCst) == 0 {
+                    yield_now().await;
+                }
+            })
+            .await
+            .expect("lost history ACK revokes receipt");
+            assert_eq!(backend.delivered.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.inputs.load(Ordering::SeqCst), 0);
+            manager.remove_thread(thread).await;
+            return;
+        }
+        "caller_dropped" => {
+            // Abrupt loss of the actor drops its owned native turn future;
+            // do not simulate this by rejecting the early lifecycle event.
+            manager
+                .state
+                .read()
+                .await
+                .threads
+                .get(thread)
+                .unwrap()
+                .loop_handle
+                .abort();
+            timeout(Duration::from_secs(5), async {
+                while backend.released.load(Ordering::SeqCst) == 0 {
+                    yield_now().await;
+                }
+            })
+            .await
+            .expect("lost native caller revokes pending receipt");
+            drop(events);
+            assert_eq!(backend.delivered.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.inputs.load(Ordering::SeqCst), 0);
+            manager.remove_thread(thread).await;
+            return;
+        }
+        "cancelled" => {
+            timeout(
+                Duration::from_secs(5),
+                manager.cancel_turn(thread, turn, "cancel during exact result append"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            // A late successful storage ACK cannot revive cancelled authority.
+            events.acknowledge_last(Ok(()));
+        }
+        _ => unreachable!(),
+    }
+    let mut observed = Vec::new();
+    loop {
+        let event = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("parallel batch must finish after delivery resolution")
+            .unwrap();
+        let terminal = matches!(
+            &event,
+            AgentDurableEvent::TurnCompleted { .. }
+                | AgentDurableEvent::TurnFailed { .. }
+                | AgentDurableEvent::TurnBlocked { .. }
+                | AgentDurableEvent::TurnInterrupted { .. }
+        );
+        events.acknowledge_last(Ok(()));
+        if let Some(event) = test_agent_event_from_durable(event) {
+            observed.push(event);
+        }
+        if terminal {
+            break;
+        }
+    }
+    if delivery == "success" {
+        assert_turn_completed(&observed);
+        assert_eq!(backend.delivered.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.inputs.load(Ordering::SeqCst),
+            1,
+            "input blocked by capture receipt must resume before batch gather"
+        );
+        let requests = provider.snapshot_requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].messages.iter().any(|message| message.role == Role::Tool && message.content_parts.iter().any(|part| matches!(part, MessageContentPart::Image { image: delivered } if delivered == image))), "next provider request retains the original typed image");
+    } else {
+        assert_eq!(backend.delivered.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.inputs.load(Ordering::SeqCst), 0);
+        assert!(backend.released.load(Ordering::SeqCst) > 0);
+        if delivery == "bounded_rejected" {
+            assert!(observed.iter().any(|event| matches!(event,
+                AgentEvent::TurnBlocked { reason, .. }
+                    if reason.contains("tool result attachment references exceed available context")
+            )), "negative control must reach the bounded provider-message guard");
+        }
+    }
+    manager.remove_thread(thread).await;
 }
 
 #[tokio::test]
@@ -12162,6 +11321,20 @@ async fn production_regression_repeated_failed_tools_continue_without_final_no_t
         "fixture should reach repeated provider rounds before continuation: {requests:?}"
     );
     assert!(
+        requests[0]
+            .tools
+            .as_ref()
+            .map(|tools| !tools.is_empty())
+            .unwrap_or(false)
+    );
+    assert!(
+        requests[1]
+            .tools
+            .as_ref()
+            .map(|tools| !tools.is_empty())
+            .unwrap_or(false)
+    );
+    assert!(
         requests.iter().all(|request| request.tools.is_some()),
         "budget continuation must not switch into final no-tools mode"
     );
@@ -12169,21 +11342,155 @@ async fn production_regression_repeated_failed_tools_continue_without_final_no_t
 
 #[tokio::test]
 async fn execution_window_continuation_restarts_same_turn_and_completes_next_window() {
+    // Exercise the real collector and agent_loop window transfer. The controller
+    // removes only a historical v2 announcer, never filters restoration events.
+    struct DropAnnouncer {
+        inputs: std::sync::Mutex<Vec<ChatRequest>>,
+        unit_id: String,
+    }
+    #[async_trait::async_trait]
+    impl crate::compaction::controller::NativeContextController for DropAnnouncer {
+        async fn stop(
+            &self,
+            _: &crate::compaction::controller::NativeContext,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn prepare(
+            &self,
+            context: &crate::compaction::controller::NativeContext,
+            mut request: ChatRequest,
+            _: Option<crate::compaction::controller::NativeUsageMeasurement>,
+            _: bool,
+        ) -> anyhow::Result<crate::compaction::controller::NativePreparedRequest> {
+            self.inputs.lock().unwrap().push(request.clone());
+            request.messages.retain(|message| {
+                message
+                    .provenance
+                    .as_ref()
+                    .is_none_or(|origin| origin.unit_id != self.unit_id)
+            });
+            let receipt = crate::compaction::controller::NativeInputReceipt::for_request(
+                &request,
+                &context.provider_instance,
+                "fixture",
+                1,
+                None,
+            )?;
+            Ok(crate::compaction::controller::NativePreparedRequest {
+                request,
+                receipt,
+                history_check: crate::compaction::controller::NativeHistoryCheckMetadata {
+                    target_output_cap: 100,
+                    fixed_input_tokens: 1,
+                },
+            })
+        }
+    }
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::TwoToolRoundsThenFinal,
         1,
     ));
+    let skill_root = unique_temp_dir("continuation_inventory");
+    fs::create_dir_all(&skill_root).unwrap();
+    fs::write(
+        skill_root.join("SKILL.md"),
+        "---\nname: Inventory\nslug: inventory\ndescription: Inventory v2\n---\nBody.",
+    )
+    .unwrap();
     let mut config = test_tool_loop_config();
+    config.skills.user_roots = vec![skill_root.display().to_string()];
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config);
-    let mut events = start_loop_budget_turn(
+    // Obtain a real saved v2 input from the compiler rather than fabricating
+    // current inventory requirements in the controller.
+    provider.next_index.store(2, Ordering::SeqCst);
+    let mut seed_events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_multi_window",
-        "turn_loop_budget_multi_window",
+        "turn_inventory_seed",
     )
     .await;
+    assert_turn_completed(&recv_events_until_terminal(&mut seed_events).await);
+    let seed_requests = provider.snapshot_requests();
+    let announcer = seed_requests[0]
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .application_context
+                .as_ref()
+                .and_then(|m| m.get("kind"))
+                .and_then(|v| v.as_str())
+                == Some("turn_input")
+        })
+        .unwrap()
+        .clone();
+    let inventory_v2 = announcer.application_context.as_ref().unwrap()["inventory"].clone();
+    assert!(!inventory_v2.as_array().unwrap().is_empty());
+    let mut v1: Vec<pioneer_promt::PromptSection> =
+        serde_json::from_value(inventory_v2.clone()).unwrap();
+    for section in &mut v1 {
+        section.content = "Previous inventory v1".into();
+    }
+    let text = v1
+        .iter()
+        .map(pioneer_promt::PromptSection::as_rendered_text)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut historical = ChatMessage::user(text.clone());
+    historical.application_context = Some(json!({
+        "version":1, "kind":"inventory_baseline", "context":text,
+        "inventory":v1, "diagnostics":[],
+        "announced":v1.iter().map(|s| s.id.manifest_id()).collect::<Vec<_>>()
+    }));
+    historical.provenance = Some(crate::compaction::history::pending_origin(
+        "ws_loop_budget",
+        "thr_loop_budget_multi_window",
+        "turn_A",
+        "baseline_A",
+        crate::compaction::history::PendingOriginKind::RuntimeContext,
+        "baseline_A",
+    ));
+    historical.application_context.as_mut().unwrap()["origin"] =
+        serde_json::to_value(&historical.provenance).unwrap();
+    let original_historical = serde_json::to_value(&historical).unwrap();
+    let announcer_unit = announcer.provenance.as_ref().unwrap().unit_id.clone();
+    let original_announcer = serde_json::to_value(&announcer).unwrap();
+    provider.requests.lock().unwrap().clear();
+    provider.next_index.store(0, Ordering::SeqCst);
+    let controller = Arc::new(DropAnnouncer {
+        inputs: std::sync::Mutex::new(Vec::new()),
+        unit_id: announcer_unit.clone(),
+    });
+    manager
+        .set_context_controller(Some(controller.clone()))
+        .await;
+    let thread = "thr_loop_budget_multi_window";
+    manager
+        .ensure_thread(thread, "ws_loop_budget")
+        .await
+        .unwrap();
+    let mut events = seed_events;
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread,
+            "turn_loop_budget_multi_window",
+            ThreadMode::Agent,
+            "test-model",
+            "loop-budget",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "run loop budget test".into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            vec![historical.clone(), announcer],
+        )
+        .await
+        .unwrap();
 
     let observed_events = recv_events_until_terminal(&mut events).await;
     assert!(matches!(
@@ -12281,6 +11588,161 @@ async fn execution_window_continuation_restarts_same_turn_and_completes_next_win
 
     let requests = provider.snapshot_requests();
     assert_eq!(requests.len(), 3);
+    let prepared_inputs = controller.inputs.lock().unwrap();
+    let original_current = prepared_inputs[0]
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .application_context
+                .as_ref()
+                .and_then(|m| m.get("kind"))
+                .and_then(|v| v.as_str())
+                == Some("turn_input")
+                && message
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|p| p.unit_id != announcer_unit)
+        })
+        .unwrap();
+    assert_eq!(
+        original_current.application_context.as_ref().unwrap()["inventory"],
+        inventory_v2
+    );
+    assert_eq!(
+        serde_json::to_value(
+            prepared_inputs[0]
+                .messages
+                .iter()
+                .find(|m| {
+                    m.provenance
+                        .as_ref()
+                        .is_some_and(|p| p.unit_id == announcer_unit)
+                })
+                .unwrap()
+        )
+        .unwrap(),
+        original_announcer
+    );
+    let restorations: Vec<ChatMessage> = observed_events
+        .iter()
+        .filter_map(|event| {
+            if let AgentEvent::TurnLlmContextAppended {
+                payload: pioneer_tools::ToolResultView::Json { value, .. },
+                ..
+            } = event
+            {
+                let message: ChatMessage = serde_json::from_value(value.clone()).unwrap();
+                if message
+                    .application_context
+                    .as_ref()
+                    .and_then(|m| m.get("kind"))
+                    .and_then(|v| v.as_str())
+                    == Some("inventory_baseline")
+                {
+                    return Some(message);
+                }
+            }
+            None
+        })
+        .collect();
+    assert_eq!(
+        restorations.len(),
+        1,
+        "B must persist its own v2 restoration exactly once"
+    );
+    let restored = &restorations[0];
+    let restored_origin: pioneer_provider::MessageProvenance =
+        serde_json::from_value(restored.application_context.as_ref().unwrap()["origin"].clone())
+            .unwrap();
+    assert_eq!(restored_origin.workspace_id, "ws_loop_budget");
+    assert_eq!(restored_origin.thread_id, "thr_loop_budget_multi_window");
+    assert!(
+        restored_origin.sources.iter().any(|source| {
+            source.scope == "pending-runtime-context:turn_loop_budget_multi_window"
+        })
+    );
+    // Observe the resumed request before any controller refresh can repair it.
+    for request in prepared_inputs.iter() {
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|m| { m.application_context == historical.application_context })
+                .count(),
+            1,
+            "foreign A must never be appended to B retained history"
+        );
+    }
+    assert_eq!(
+        restored.application_context.as_ref().unwrap()["inventory"],
+        inventory_v2
+    );
+    for request in &requests {
+        let historical_positions: Vec<_> = request
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.application_context == historical.application_context)
+            .collect();
+        assert_eq!(
+            historical_positions.len(),
+            1,
+            "A must not be copied into B continuation"
+        );
+        assert_eq!(
+            historical_positions[0].0,
+            requests[0]
+                .messages
+                .iter()
+                .position(|m| m.application_context == historical.application_context)
+                .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(historical_positions[0].1).unwrap(),
+            original_historical
+        );
+        let current = request
+            .messages
+            .iter()
+            .find(|m| m.application_context == original_current.application_context)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(current).unwrap(),
+            serde_json::to_value(original_current).unwrap()
+        );
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|m| m.application_context == restored.application_context)
+                .count(),
+            1
+        );
+    }
+    for id in ["call_loop_budget_0", "call_loop_budget_1"] {
+        let call = requests[2]
+            .messages
+            .iter()
+            .position(|m| {
+                m.tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|c| c.id == id))
+            })
+            .unwrap();
+        let result = requests[2]
+            .messages
+            .iter()
+            .position(|m| m.tool_call_id.as_deref() == Some(id))
+            .unwrap();
+        assert_eq!(
+            result,
+            call + 1,
+            "completed tool groups retain call/result order"
+        );
+    }
+    fs::remove_dir_all(skill_root).unwrap();
+
     assert!(
         requests[2]
             .tools
@@ -12700,33 +12162,23 @@ async fn failed_tool_results_with_durable_progress_do_not_trip_no_progress_break
 }
 
 #[tokio::test]
-async fn memory_recall_tools_remain_available_for_budget_continuation() {
-    let provider = Arc::new(LoopBudgetProvider::with_preflight_response(
+async fn requested_memory_tools_remain_available_for_budget_continuation() {
+    let provider = Arc::new(LoopBudgetProvider::with_requested_tools(
         LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
         1,
-        memory_read_preflight_response(),
+        memory_read_tools(),
     ));
     let mut config = test_tool_loop_config();
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config);
-    let memory_provider = Arc::new(RecordingMemoryProvider::new(
-        Ok(MemoryRecallSnapshot {
-            items: vec![memory_recall_item(
-                "mem_loop_budget",
-                MemoryCategory::Identity,
-                Some("name"),
-                "User's name is Alexander.",
-            )],
-            diagnostics: Vec::new(),
-            truncated: false,
-        }),
-        Ok(MemoryToolMaterialization {
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(Ok(
+        MemoryToolMaterialization {
             bundles: vec![fake_standard_memory_tool_bundle()],
             diagnostics: Vec::new(),
-        }),
-    ));
+        },
+    )));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
@@ -12753,7 +12205,7 @@ async fn memory_recall_tools_remain_available_for_budget_continuation() {
         "provider should receive initial window requests before continuation"
     );
     assert!(
-        requests[0]
+        requests[1]
             .tools
             .as_ref()
             .expect("first round should include tools")
@@ -12761,12 +12213,12 @@ async fn memory_recall_tools_remain_available_for_budget_continuation() {
             .any(|tool| tool.name == "memory_search")
     );
     assert!(
-        requests[0]
+        requests[1]
             .compiled_prompt
             .as_ref()
             .expect("first round should include prompt")
             .full_system_text
-            .contains("## Memory Recall")
+            .contains("### Memory Recall")
     );
     assert!(
         requests.iter().all(|request| request.tools.is_some()),
@@ -13609,6 +13061,18 @@ async fn cancel_turn_returns_without_waiting_for_actor_terminal_event() {
         .await
         .expect("turn should start");
 
+    let owner = manager
+        .capture_turn_stop_owner(thread_id, turn_id)
+        .await
+        .unwrap();
+    let (release, released) = tokio::sync::oneshot::channel();
+    owner
+        .control
+        .completion
+        .retain_tool(super::NativeTask::new(tokio::spawn(async move {
+            let _ = released.await;
+        })));
+
     // Gateway commits the durable Interrupted lifecycle before invoking this
     // process control. The runtime must therefore stop independently without
     // waiting for the actor to publish a second terminal event.
@@ -13619,6 +13083,29 @@ async fn cancel_turn_returns_without_waiting_for_actor_terminal_event() {
     .await
     .expect("turn cancellation must not wait for the actor mailbox")
     .expect("turn cancellation should succeed");
+    assert!(
+        timeout(
+            Duration::from_millis(10),
+            manager.cancel_captured_turn_and_wait(
+                &owner,
+                "wait",
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+        )
+        .await
+        .is_err()
+    );
+    assert!(owner.control.completion.outcome().is_none());
+    release.send(()).unwrap();
+    manager
+        .cancel_captured_turn_and_wait(
+            &owner,
+            "retry",
+            tokio::time::Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    manager.remove_thread(thread_id).await;
 }
 
 #[tokio::test]
@@ -13720,7 +13207,7 @@ async fn non_tool_recovery_request_restarts_turn_without_failing() {
 }
 
 #[tokio::test]
-async fn continue_generation_recovery_is_compiled_into_system_prompt() {
+async fn continue_generation_recovery_reuses_saved_system_and_adds_context_at_tail() {
     let provider = Arc::new(CaptureStandardProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider(
         "capture-standard",
@@ -13755,12 +13242,33 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
         .await
         .expect("turn should start");
 
+    let mut retained = Vec::new();
     for _ in 0..40 {
         let event = timeout(Duration::from_secs(2), events.recv())
             .await
             .expect("must receive agent event in time")
             .expect("broadcast should remain open");
 
+        if let AgentEvent::TurnLlmContextAppended {
+            source,
+            payload:
+                pioneer_tools::ToolResultView::Json {
+                    value,
+                    truncated: false,
+                },
+            ..
+        } = &event
+        {
+            if matches!(
+                source.as_str(),
+                "turn_input_projection_v1" | "runtime_context_v1" | "system_snapshot_v1"
+            ) {
+                retained.push(super::RetainedProviderHistoryMessage {
+                    sequence: retained.len() as i64,
+                    message: serde_json::from_value(value.clone()).unwrap(),
+                });
+            }
+        }
         if matches!(event, AgentEvent::TurnCompleted { .. }) {
             break;
         }
@@ -13785,7 +13293,7 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
                 compact_history: false,
                 continue_generation: true,
                 model_override: None,
-                retained_provider_history: Vec::new(),
+                retained_provider_history: retained,
                 execution_checkpoint_context: None,
             },
         )
@@ -13825,22 +13333,37 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
         .compiled_prompt
         .as_ref()
         .expect("recovery request should include compiled prompt payload");
-    assert!(
-        continuation_prompt
-            .full_system_text
-            .contains("Continue from where it stopped without repeating prior text.")
+    assert_eq!(
+        serde_json::to_value(requests[0].compiled_prompt.as_ref().unwrap()).unwrap(),
+        serde_json::to_value(continuation_prompt).unwrap()
+    );
+    let initial_user = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .unwrap();
+    let recovered_user = recovery_request
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(initial_user).unwrap(),
+        serde_json::to_value(recovered_user).unwrap()
     );
     assert!(
-        continuation_prompt
+        !continuation_prompt
             .full_system_text
             .contains("Recovery Continuation")
     );
+    let tail = recovery_request.messages.last().unwrap();
+    assert_eq!(tail.role, Role::User);
     assert!(
-        continuation_prompt
-            .full_system_text
-            .contains("Current date/time:")
+        tail.content
+            .contains("Continue from where it stopped without repeating prior text.")
     );
-    assert!(continuation_prompt.full_system_text.contains("OS:"));
+    assert!(tail.content.contains("Recovery Continuation"));
+    assert!(!tail.content.contains("<pioneer_turn_context>"));
 }
 
 #[tokio::test]
@@ -14079,8 +13602,19 @@ async fn explicit_skill_input_injects_compact_skill_prompt_and_binding() {
         .compiled_prompt
         .as_ref()
         .expect("compiled prompt should be attached to provider request");
+    assert!(
+        !compiled_prompt
+            .full_system_text
+            .contains(test_skill_ref("my-skill").as_str())
+    );
     assert_compact_skill_prompt(
-        compiled_prompt.full_system_text.as_str(),
+        requests[0]
+            .messages
+            .iter()
+            .find(|message| message.role == Role::User)
+            .unwrap()
+            .content
+            .as_str(),
         &test_skill_ref("my-skill"),
         "My Skill",
         "Follow the skill.",
@@ -14301,8 +13835,19 @@ async fn explicit_skill_input_injects_compact_prompt_for_non_tool_calling_provid
         .compiled_prompt
         .as_ref()
         .expect("compiled prompt should be attached to provider request");
+    assert!(
+        !compiled_prompt
+            .full_system_text
+            .contains(test_skill_ref("my-skill").as_str())
+    );
     assert_compact_skill_prompt(
-        compiled_prompt.full_system_text.as_str(),
+        requests[0]
+            .messages
+            .iter()
+            .find(|message| message.role == Role::User)
+            .unwrap()
+            .content
+            .as_str(),
         &test_skill_ref("my-skill"),
         "My Skill",
         "Follow the skill.",
@@ -14728,7 +14273,12 @@ async fn mixed_skill_mcp_text_file_capabilities_use_exact_projected_dependency()
         .iter()
         .find(|message| message.role == Role::User)
         .expect("request should include user message");
-    assert_eq!(user_message.content, "use the file, skill, and resend");
+    assert!(user_message.content.starts_with("<pioneer_turn_context>\n"));
+    assert!(
+        user_message
+            .content
+            .ends_with("</pioneer_turn_context>\n\nuse the file, skill, and resend")
+    );
     assert_eq!(user_message.content_parts.len(), 1);
     match &user_message.content_parts[0] {
         MessageContentPart::File { file } => {
@@ -14748,7 +14298,7 @@ async fn mixed_skill_mcp_text_file_capabilities_use_exact_projected_dependency()
         .as_ref()
         .expect("agent request should include compiled prompt");
     assert_compact_skill_prompt(
-        prompt.full_system_text.as_str(),
+        user_message.content.as_str(),
         &test_skill_ref("my-skill"),
         "My Skill",
         "Follow the skill.",
@@ -16074,6 +15624,8 @@ impl crate::compaction::controller::NativeContextController for PendingContextBo
 async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
     use crate::compaction::controller::{NativeContext, NativeContextSession};
     let request = || ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: "fixture".into(),
         messages: vec![ChatMessage::user("request")],
         temperature: None,
@@ -16084,7 +15636,16 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         reasoning: None,
         compiled_prompt: None,
     };
+    let events = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
+    let mut receiver = events.take_durable_receiver().await.unwrap();
+    let acknowledgements = tokio::spawn(async move {
+        while receiver.recv().await.is_some() {
+            receiver.acknowledge_last(Ok(()));
+        }
+    });
     let context = || NativeContext {
+        context_budget: None,
+        summary_context: None,
         overflow_recovery: true,
         recovery_deadline_ms: Some(
             std::time::SystemTime::now()
@@ -16099,7 +15660,7 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         conversation_thread_id: None,
         provider_instance: "fixture".into(),
         provider: Arc::new(CaptureStandardProvider::default()),
-        events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
+        events: events.clone(),
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
     let live = Arc::new(AtomicUsize::new(0));
@@ -16121,10 +15682,16 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
         NativeContextSession::new(context(), Arc::new(PendingContextBoundary(live.clone())));
     let preparing = session.prepare(request(), false);
     tokio::pin!(preparing);
-    tokio::select! { biased;
-        _ = &mut preparing => panic!("fixture preparation must wait"),
-        _ = tokio::task::yield_now() => {}
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while live.load(Ordering::SeqCst) == 0 {
+            tokio::select! { biased;
+                _ = &mut preparing => panic!("fixture preparation must wait"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("preparation must enter the context boundary");
     assert_eq!(live.load(Ordering::SeqCst), 1);
     session.context.cancellation.cancel();
     assert!(
@@ -16136,6 +15703,7 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
             .contains("cancelled")
     );
     assert_eq!(live.load(Ordering::SeqCst), 0);
+    acknowledgements.abort();
 }
 
 #[tokio::test]
@@ -16194,6 +15762,9 @@ async fn compaction_boundary_prepares_each_follow_up_before_provider() {
         "new input reached the provider once"
     );
 }
+
+#[path = "manager_tests_stop_admission.rs"]
+mod stop_admission;
 
 #[tokio::test(start_paused = true)]
 async fn durable_gateway_cancellation_cleans_actor_and_allows_next_turn_without_preparation() {
@@ -16448,4 +16019,428 @@ async fn cancellation_context_freezes_interrupted_policy_request_handlers_and_cl
         receiver.acknowledge_last(Ok(()));
         manager.remove_thread(thread).await;
     }
+}
+
+// Actual manager command -> actor -> fresh native task contract. The fake
+// provider blocks at the first main dispatch; it never starts native tools.
+#[derive(Clone, Copy, Debug)]
+enum ObservedTurnFinish {
+    Completed,
+    RootlessCompleted,
+    Failed,
+    Panicked,
+    Cancelled,
+    Aborted,
+    Revoked,
+}
+
+struct ObservedTurnProvider {
+    first: std::sync::Mutex<
+        Option<
+            tokio::sync::oneshot::Sender<(Option<pioneer_observability::work::WorkContext>, bool)>,
+        >,
+    >,
+    release: tokio::sync::Semaphore,
+    finish: ObservedTurnFinish,
+    inner: CaptureAgentProvider,
+}
+#[async_trait::async_trait]
+impl Provider for ObservedTurnProvider {
+    fn name(&self) -> &str {
+        "observed-turn"
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let first = self.first.lock().unwrap().take();
+        if let Some(first) = first {
+            let _ = first.send((
+                pioneer_observability::work::current(),
+                request.compiled_prompt.is_some(),
+            ));
+            self.release.acquire().await.unwrap().forget();
+        }
+        if matches!(self.finish, ObservedTurnFinish::Panicked) {
+            panic!("observed turn fixture panic");
+        }
+        if matches!(self.finish, ObservedTurnFinish::Failed) {
+            anyhow::bail!("HTTP 400 Bad Request: fixture rejection");
+        }
+        self.inner.chat(request).await
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
+        ])
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn native_turn_command_handoff_is_live_during_dispatch_and_retires_real_outcome() {
+    use pioneer_observability::{
+        live::{self, JournalPayload, WorkState},
+        work::{self, Boundary, ExecutorRole, Outcome, Trigger, WorkCarrier, WorkKind},
+    };
+    let _lock = crate::TURN_OBSERVATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            pioneer_observability::set_telemetry_enabled(self.0);
+        }
+    }
+    let _restore = Restore(pioneer_observability::telemetry_enabled());
+    for finish in [
+        ObservedTurnFinish::Completed,
+        ObservedTurnFinish::RootlessCompleted,
+        ObservedTurnFinish::Failed,
+        ObservedTurnFinish::Panicked,
+        ObservedTurnFinish::Cancelled,
+        ObservedTurnFinish::Aborted,
+        ObservedTurnFinish::Revoked,
+    ] {
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let provider = Arc::new(ObservedTurnProvider {
+            first: std::sync::Mutex::new(Some(started_tx)),
+            release: tokio::sync::Semaphore::new(0),
+            finish,
+            inner: CaptureAgentProvider::default(),
+        });
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::with_provider(
+                "observed-turn",
+                provider.clone(),
+            )),
+            test_tool_loop_config(),
+        );
+        let thread = "observed-native-turn";
+        manager
+            .ensure_thread(thread, "observed-workspace")
+            .await
+            .unwrap();
+        let mut receiver = manager.take_durable_receiver(thread).await.unwrap();
+        let terminal_context = Arc::new(std::sync::Mutex::new(None));
+        let terminal_started = Arc::new(tokio::sync::Notify::new());
+        let terminal_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let drain = {
+            let observed = terminal_context.clone();
+            let started = terminal_started.clone();
+            let release = terminal_release.clone();
+            tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    if matches!(finish, ObservedTurnFinish::Completed)
+                        && matches!(event, AgentDurableEvent::TurnCompleted { .. })
+                    {
+                        *observed.lock().unwrap() = receiver.pending_work().context();
+                        started.notify_one();
+                        release.acquire().await.unwrap().forget();
+                    }
+                    receiver.acknowledge_last(Ok(()));
+                }
+            })
+        };
+        // Always run owner cleanup before propagating a fixture assertion panic.
+        let checked = std::panic::AssertUnwindSafe(async {
+            let parent = WorkCarrier::independent(Boundary::Rpc, WorkKind::RpcTurn, Trigger::Rpc, ExecutorRole::Gateway);
+            let parent_context = parent.context().unwrap();
+            let start = manager.start_test_turn_with_default_profile(thread, "observed-turn", ThreadMode::Agent, "test-model", "observed-turn", HashMap::new(), vec![UserInput::Text { text: "fixture".into(), text_elements: Vec::new() }], Vec::new());
+            if matches!(finish, ObservedTurnFinish::RootlessCompleted) { start.await.unwrap(); }
+            else { parent.scope(start).await.unwrap(); }
+            assert!(work::current().is_none(), "ACK scope restores the poll-local parent");
+            let (context, compiled) = timeout(Duration::from_secs(5), started_rx).await.expect("main dispatch reached").unwrap();
+            assert!(compiled, "the main dispatch is independently blocked");
+            let context = context.expect("fresh task receives the command carrier");
+            assert_eq!(context.parent, if matches!(finish, ObservedTurnFinish::RootlessCompleted) { None } else { Some(parent_context.token) });
+            if matches!(finish, ObservedTurnFinish::RootlessCompleted) { assert_eq!(context.origin, work::ContextOrigin::MissingLocalParent); }
+            assert_eq!(context.consent_generation, parent_context.consent_generation);
+            let snapshot = live::snapshot().unwrap();
+            let own = snapshot.active.iter().find(|a| a.context.token == context.token).expect("turn remains active after RPC ACK");
+            assert!(!own.worker_lifetime);
+            assert_ne!(own.state, WorkState::Queued, "queued lease handed to the fresh execution");
+            assert_eq!(snapshot.active.iter().filter(|a| a.context.token == context.token).count(),1,"one native execution owner");
+            match finish {
+                ObservedTurnFinish::Cancelled => manager.cancel_turn(thread, "observed-turn", "fixture cancellation").await.unwrap(),
+                ObservedTurnFinish::Aborted => manager.state.read().await.threads.get(thread).unwrap().loop_handle.abort(),
+                ObservedTurnFinish::Revoked => {
+                    pioneer_observability::set_telemetry_enabled(false);
+                    pioneer_observability::set_telemetry_enabled(true);
+                    provider.release.add_permits(1);
+                }
+                _ => provider.release.add_permits(1),
+            }
+            if matches!(finish, ObservedTurnFinish::Completed) {
+                timeout(Duration::from_secs(5),terminal_started.notified()).await.expect("real durable terminal is waiting for its ACK");
+                let terminal_context = terminal_context.lock().unwrap().expect("actual durable terminal carries context");
+                assert_eq!(terminal_context.parent, Some(context.token), "actor terminal publication retains turn lineage");
+                assert_eq!(terminal_context.consent_generation, context.consent_generation);
+                let pending_terminal=live::snapshot().unwrap();
+                assert!(pending_terminal.active.iter().any(|entry|entry.context.token==context.token),"provider completion is not the durable turn terminal");
+                assert!(!pending_terminal.journal.iter().any(|r|matches!(&r.payload,JournalPayload::Work(entry) if entry.context.token==context.token && matches!(entry.state,WorkState::Terminal(_)))));
+                terminal_release.add_permits(1);
+            }
+            if matches!(finish, ObservedTurnFinish::Revoked) {
+                // Drive cleanup after the old in-flight future resumes in E2.
+                manager.remove_thread(thread).await;
+                let next = live::snapshot().unwrap();
+                assert_ne!(next.consent_generation, context.consent_generation);
+                assert!(next.active.iter().all(|a| a.context.token != context.token));
+                assert!(next.journal.iter().all(|r| !matches!(&r.payload, JournalPayload::Work(a) if a.context.token == context.token)));
+            } else {
+                let expected = match finish {
+                    ObservedTurnFinish::Completed | ObservedTurnFinish::RootlessCompleted => Outcome::Completed,
+                    ObservedTurnFinish::Failed => Outcome::Failed,
+                    ObservedTurnFinish::Panicked => Outcome::Panicked,
+                    ObservedTurnFinish::Cancelled | ObservedTurnFinish::Aborted => Outcome::Cancelled,
+                    ObservedTurnFinish::Revoked => unreachable!(),
+                };
+                timeout(Duration::from_secs(5), async {
+                    loop {
+                        let snapshot = live::snapshot().unwrap();
+                        if !snapshot.active.iter().any(|a| a.context.token == context.token) {
+                            let terminals: Vec<_> = snapshot.journal.iter().filter_map(|r| match &r.payload { JournalPayload::Work(a) if a.context.token == context.token => match a.state { WorkState::Terminal(o) => Some(o), _ => None }, _ => None }).collect();
+                            assert_eq!(terminals, vec![expected], "exactly one actual terminal for {finish:?}");
+                            break;
+                        }
+                        yield_now().await;
+                    }
+                }).await.expect("native execution retires after real completion/cancellation");
+            }
+            assert!(work::current().is_none());
+        }).catch_unwind().await;
+        terminal_release.add_permits(1);
+        manager.remove_thread(thread).await;
+        drain.abort();
+        let _ = drain.await;
+        if let Err(panic) = checked {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
+async fn phased_rejected_final_keeps_native_candidate_and_commentary_before_retry() {
+    struct PhasedSequence {
+        inner: SequencedTextProvider,
+    }
+    #[async_trait::async_trait]
+    impl Provider for PhasedSequence {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+            let model = request.model.clone();
+            let mut response = self.inner.chat(request).await?;
+            {
+                response.messages = vec![
+                    pioneer_provider::ProviderMessage {
+                        id: pioneer_provider::ProviderMessageId(0),
+                        phase: Some(pioneer_protocol::AgentMessagePhase::Commentary),
+                        text: format!("progress for {}", response.text),
+                    },
+                    pioneer_provider::ProviderMessage {
+                        id: pioneer_provider::ProviderMessageId(1),
+                        phase: Some(pioneer_protocol::AgentMessagePhase::FinalAnswer),
+                        text: response.text.clone(),
+                    },
+                ];
+                response.provider_replay_state = Some(
+                    pioneer_provider::ProviderReplayState::for_model(
+                        self.name(),
+                        model,
+                        json!({"schema_version":1,"assistant_message":{"content":response.text,"reasoning_content":null,"tool_calls":[]}}),
+                    ),
+                );
+            }
+            Ok(response)
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            anyhow::bail!("non-stream fixture")
+        }
+    }
+    let provider = Arc::new(PhasedSequence {
+        inner: SequencedTextProvider::new(vec!["premature final answer", "accepted final answer"]),
+    });
+    let finalization = Arc::new(RetryOnceFinalizationProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-text",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_turn_finalization_provider(Some(finalization.clone()))
+        .await;
+    let observed = start_simple_turn(
+        &manager,
+        "phased_retry_thread",
+        "workspace",
+        "phased_retry_turn",
+        ThreadMode::Agent,
+        "sequenced-text",
+        "finish with artifact",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    let items = observed
+        .iter()
+        .filter_map(|event| {
+            if let AgentEvent::ItemCompleted(notification) = event {
+                Some(&notification.item)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let finals = items
+        .iter()
+        .filter_map(|item| {
+            if let TurnItem::AgentMessage {
+                text,
+                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                ..
+            } = item
+            {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(finals, vec!["accepted final answer"]);
+    let commentary = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                TurnItem::AgentMessage {
+                    phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(commentary, 2);
+    assert_eq!(
+        finalization.snapshot_contexts()[0].final_text,
+        "premature final answer"
+    );
+    let requests = provider.inner.snapshot_requests();
+    assert_eq!(requests.len(), 2);
+    let native = requests[1]
+        .messages
+        .iter()
+        .filter(|m| m.provider_replay_state.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        native.len(),
+        1,
+        "rejected candidate must survive before next dispatch"
+    );
+    assert!(
+        native[0]
+            .content
+            .contains("progress for premature final answer")
+    );
+    assert!(native[0].provenance.is_some());
+    assert!(requests[1].temperature.is_none());
+}
+
+#[tokio::test]
+async fn initial_start_receipt_cannot_cancel_a_later_run_in_the_same_actor() {
+    use super::AgentStartReceipt;
+
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::new(|_| String::new())),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_start_receipt_run_fence";
+    let turn_id = "turn_start_receipt_run_fence";
+    manager
+        .ensure_thread(thread_id, "workspace_start_receipt")
+        .await
+        .unwrap();
+    let (generation, current_control) = {
+        let state = manager.state.read().await;
+        let thread = state.threads.get(thread_id).unwrap();
+        let current_control = TurnExecutionControl::new(thread.command_tx.clone(), 2);
+        thread
+            .control_plane
+            .activate(turn_id.into(), 2, current_control.clone());
+        (thread.generation, current_control)
+    };
+    let original = AgentStartReceipt {
+        turn_id: turn_id.into(),
+        actor_generation: generation,
+        run_id: 1,
+    };
+    assert!(!manager.start_receipt_is_current(thread_id, &original).await);
+    assert!(matches!(
+        manager
+            .cancel_started_turn(thread_id, &original, "stale initial dispatch", None)
+            .await,
+        Err(AgentControlError::TurnMismatch)
+    ));
+    assert!(!current_control.turn_cancellation_token.is_cancelled());
+    manager.remove_thread(thread_id).await;
+}
+
+#[tokio::test]
+async fn initial_start_ack_timeout_keeps_generation_evidence_and_retires_the_actor() {
+    let manager = Arc::new(AgentManager::new_with_mcp_memory_and_control_config(
+        Arc::new(ProviderRegistry::new(|_| String::new())),
+        test_tool_loop_config(),
+        None,
+        None,
+        AgentControlPlaneConfig {
+            enqueue_timeout: Duration::from_millis(5),
+            acknowledgement_timeout: Duration::from_millis(5),
+            outcome_capacity_per_thread: 4,
+        },
+    ));
+    let thread = "thread_start_ack_timeout";
+    manager
+        .ensure_thread(thread, "workspace_start_ack_timeout")
+        .await
+        .unwrap();
+    let generation = manager.thread_generation(thread).await.unwrap();
+    // Block actual actor preparation, after mailbox admission is available.
+    let held_dependencies = manager.runtime_dependencies.state.write().await;
+    let start = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+                thread, "turn_start_ack_timeout", ThreadMode::Agent, "test-model", "openai",
+                HashMap::new(), SkillCatalogSnapshot { version: 0, generated_at_unix: 0, skills: Vec::new() },
+                Vec::new(), Vec::new(), Vec::new(), Vec::new(), HashMap::new(), Vec::new(), None,
+                pioneer_protocol::default_turn_permission_profile_snapshot(), test_full_access_security_snapshot(),
+                None,
+            ).await
+        })
+    };
+    let error = timeout(Duration::from_secs(5), start)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("no actor acceptance may be invented after the ACK deadline");
+    assert!(
+        matches!(error, AgentStartError::AcknowledgementTimeout { actor_generation, .. } if actor_generation == generation)
+    );
+    assert_eq!(manager.thread_generation(thread).await, None);
+    drop(held_dependencies);
 }

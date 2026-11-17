@@ -49,12 +49,12 @@ impl SettingsConfig {
         let revision = auth.principal.avatar_revision.as_deref()?;
         let publication = self
             .client
-            .snapshot(&ClientScope::Avatar {
-                principal_id: avatar_identity_key(principal, revision),
+            .snapshot(&ClientScope::Image {
+                key: avatar_identity_key(principal, revision),
             })?
             .typed::<AvatarPublication>()?;
         let avatar = publication.payload();
-        if avatar.principal_id() != principal || avatar.avatar_revision() != revision {
+        if avatar.resource_id() != principal || avatar.revision() != revision {
             return None;
         }
         avatar.local_path().map(|path| path.as_path().to_path_buf())
@@ -421,7 +421,8 @@ impl SettingsScreenView {
                 if p.payload().value.is_none() {
                     self.gateway.settings = None;
                 }
-                self.gateway.settings_loading = p.payload().loading;
+                self.gateway.settings_loading =
+                    p.payload().loading || (page == SettingsPage::Voice && p.payload().pending);
                 self.gateway.settings_error = p.payload().error.clone();
                 if page == SettingsPage::Voice {
                     self.voice_input_action_error = p.payload().error.clone();
@@ -684,7 +685,7 @@ mod render_tests {
 
     #[gpui_kit::test]
     fn settings_pages_scroll_within_the_screen_above_the_footer(cx: &mut TestAppContext) {
-        use gpui_kit::{ScrollDelta, ScrollWheelEvent, point, px};
+        use gpui_kit::{ScrollDelta, ScrollEvent, point, px};
         cx.update(gpui_kit::init);
         for route in [
             SettingsContentView::General,
@@ -737,7 +738,7 @@ mod render_tests {
                 let viewport = window_cx.debug_bounds("settings-test-viewport").unwrap();
                 let footer = window_cx.debug_bounds("settings-test-footer").unwrap();
                 let scroll = |window_cx: &mut gpui_kit::VisualTestContext, delta| {
-                    window_cx.simulate_event(ScrollWheelEvent {
+                    window_cx.simulate_event(ScrollEvent {
                         position: viewport.center(),
                         delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
                         ..Default::default()
@@ -1182,6 +1183,19 @@ mod render_tests {
                 window_cx.debug_bounds(marker).is_some(),
                 "missing rendered {marker}"
             );
+            if page == Some(SettingsPage::Voice) {
+                let model = window_cx
+                    .debug_bounds("settings-voice-input-model-row")
+                    .expect("Voice Input model row");
+                let mode = window_cx
+                    .debug_bounds("settings-voice-input-transcription-mode-row")
+                    .expect("Voice Input transcription mode row");
+                let progress = window_cx.debug_bounds(marker).unwrap();
+                assert!(model.bottom() <= mode.top());
+                assert!(mode.bottom() <= progress.top());
+                assert_eq!(model.left(), mode.left());
+                assert_eq!(model.right(), mode.right());
+            }
         }
     }
 }

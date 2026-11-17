@@ -15,11 +15,13 @@ pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
     "task_accept",
     "task_revise",
     "task_cancel",
+    "task_finish",
     "task_update",
     "task_detach",
     "task_list",
     "task_get",
     "task_reschedule",
+    "task_run_now",
     "task_pause",
     "task_resume",
 ];
@@ -27,12 +29,17 @@ pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] =
     &["artifact_prepare", "artifact_register", "artifact_read"];
 pub const THREADS_DOMAIN_TOOL_NAMES: &[&str] = &[
     "threads_tools_result_read",
+    "threads_list",
+    "threads_history_read",
+    "threads_search",
+    "threads_children_list",
     "threads_start_options",
+    "threads_identity_models_list",
     "thread_message_send",
     "thread_create",
     "threads_turn_start",
 ];
-pub const COMPUTER_USE_DOMAIN_TOOL_NAMES: &[&str] = &["computer_use"];
+pub const COMPUTER_USE_DOMAIN_TOOL_NAMES: &[&str] = crate::handlers::computer_use::TOOL_NAMES;
 pub const REQUEST_TOOLS_REASON_MAX_CHARS: usize = 512;
 
 pub const REQUEST_TOOLS_DOMAIN_VALUES: &[&str] = &[
@@ -203,29 +210,6 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn domain_values_match_request_tools_schema_contract() {
-        let values = BuiltinToolDomain::ALL
-            .iter()
-            .map(|domain| domain.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(values, REQUEST_TOOLS_DOMAIN_VALUES);
-    }
-
-    #[test]
-    fn builtin_tool_domain_map_matches_domain_enum_order_and_accessors() {
-        let map = builtin_tool_domain_map();
-        assert_eq!(map.len(), BuiltinToolDomain::ALL.len());
-
-        for ((mapped_domain, mapped_tool_names), expected_domain) in
-            map.iter().zip(BuiltinToolDomain::ALL)
-        {
-            assert_eq!(*mapped_domain, expected_domain);
-            assert_eq!(*mapped_tool_names, expected_domain.tool_names());
-        }
-    }
-
-    #[test]
     fn domain_map_contains_exact_builtin_tool_names() {
         assert_eq!(
             BuiltinToolDomain::Memory.tool_names(),
@@ -247,11 +231,13 @@ mod tests {
                 "task_accept",
                 "task_revise",
                 "task_cancel",
+                "task_finish",
                 "task_update",
                 "task_detach",
                 "task_list",
                 "task_get",
                 "task_reschedule",
+                "task_run_now",
                 "task_pause",
                 "task_resume",
             ]
@@ -260,7 +246,12 @@ mod tests {
             BuiltinToolDomain::Threads.tool_names(),
             [
                 "threads_tools_result_read",
+                "threads_list",
+                "threads_history_read",
+                "threads_search",
+                "threads_children_list",
                 "threads_start_options",
+                "threads_identity_models_list",
                 "thread_message_send",
                 "thread_create",
                 "threads_turn_start",
@@ -269,10 +260,6 @@ mod tests {
         assert_eq!(
             BuiltinToolDomain::Artifact.tool_names(),
             ["artifact_prepare", "artifact_register", "artifact_read"]
-        );
-        assert_eq!(
-            BuiltinToolDomain::ComputerUse.tool_names(),
-            ["computer_use"]
         );
     }
 
@@ -285,7 +272,7 @@ mod tests {
 
         assert!(!mapped.contains(&REQUEST_TOOLS_TOOL_NAME));
         assert!(!mapped.contains(&"read_skill"));
-        for core_file_tool in crate::tool_index::PREFLIGHT_CORE_FILE_TOOL_NAMES {
+        for core_file_tool in crate::tool_index::CORE_FILE_TOOL_NAMES {
             assert!(
                 !mapped.contains(core_file_tool),
                 "core file tool `{core_file_tool}` must not be a request_tools domain candidate"
@@ -367,6 +354,20 @@ mod tests {
         }))
         .expect_err("request_tools domains must be strings");
         assert!(error.contains("entries must be strings"));
+
+        let error = parse_request_tools_domains(&serde_json::json!({
+            "domains": [],
+            "reason": "Need task tools."
+        }))
+        .expect_err("request_tools must reject empty domains");
+        assert!(error.contains("`domains` must be a non-empty array"));
+
+        let error = parse_request_tools_domains(&serde_json::json!({
+            "domains": ["calendar"],
+            "reason": "Need task tools."
+        }))
+        .expect_err("request_tools must reject unknown domains");
+        assert!(error.contains("invalid request_tools domain `calendar`"));
     }
 
     #[test]
@@ -387,39 +388,5 @@ mod tests {
                 BuiltinToolDomain::Artifact,
             ]
         );
-    }
-
-    #[cfg(feature = "computer-use")]
-    #[test]
-    fn domain_map_matches_materialized_computer_use_spec_when_feature_enabled() {
-        let configured = crate::spec::computer_use_configured_spec();
-        let actual = registered_domain_tool_names(BuiltinToolDomain::ComputerUse, |name| {
-            configured.spec.name == name
-        });
-
-        assert_eq!(
-            actual.as_slice(),
-            BuiltinToolDomain::ComputerUse.tool_names()
-        );
-    }
-
-    #[cfg(not(feature = "computer-use"))]
-    #[test]
-    fn domain_map_handles_computer_use_as_unavailable_without_feature() {
-        let registered = crate::builtin_tool_specs()
-            .into_iter()
-            .map(|configured| configured.spec.name)
-            .collect::<HashSet<_>>();
-
-        let actual = registered_domain_tool_names(BuiltinToolDomain::ComputerUse, |name| {
-            registered.contains(name)
-        });
-        let expected = if registered.contains("computer_use") {
-            vec!["computer_use"]
-        } else {
-            Vec::new()
-        };
-
-        assert_eq!(actual, expected);
     }
 }

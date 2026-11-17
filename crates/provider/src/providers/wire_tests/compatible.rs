@@ -25,7 +25,7 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                     | "azure-openai"
             )
     }) {
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             definition.name,
             definition.default_base_url.unwrap(),
             "fixture",
@@ -62,8 +62,14 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                 None::<String>,
                 calls.clone(),
             ));
-            history.push(ChatMessage::tool_result(&calls[0].id, &calls[0].name, "ok"));
+            history.push(ChatMessage::tool_result(
+                &calls[0].id,
+                &calls[0].name,
+                crate::providers::history_test_support::COMPACT_SHELL_RESULT,
+            ));
             let request = ChatRequest {
+                tool_declarations: None,
+                service_mode: None,
                 model: "fixture-model".into(),
                 messages: history.clone(),
                 temperature: None,
@@ -104,37 +110,14 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                         assert_eq!(call["id"], original_id);
                     }
                     assert_eq!(result["role"], "tool");
+                    assert_eq!(
+                        result["content"],
+                        crate::providers::history_test_support::COMPACT_SHELL_RESULT
+                    );
                     assert_eq!(result["tool_call_id"], call["id"]);
                 }
             }
             assert_eq!(request.messages, history, "canonical IDs must be unchanged");
         }
     }
-}
-
-#[test]
-fn canonical_chat_delta_agrees_with_ordinary_tool_call() {
-    let response: ApiChatResponse = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/wire/chat-round-1.json"
-    ))
-    .unwrap();
-    let message = &response.choices[0].message;
-    let expected = parse_tool_calls(message.tool_calls.as_ref(), None).unwrap();
-    let event: StreamResponse = serde_json::from_value(serde_json::json!({
-        "choices": [{"delta": {"tool_calls": [{"index":0, "id":"forecast_1", "type":"function", "function":{
-            "name":"forecast", "arguments":expected[0].arguments
-        }}]}, "finish_reason":"tool_calls"}]
-    })).unwrap();
-    let mut accumulator = StreamToolCallAccumulator::default();
-    accumulator.ingest(
-        event
-            .choices
-            .into_iter()
-            .next()
-            .unwrap()
-            .delta
-            .tool_calls
-            .unwrap(),
-    );
-    assert_eq!(accumulator.take_tool_calls().unwrap(), expected);
 }

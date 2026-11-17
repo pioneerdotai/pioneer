@@ -12,6 +12,7 @@ pub enum ClientContractDomain {
     Providers,
     Skills,
     Mcp,
+    Apps,
     Settings,
     Tasks,
 }
@@ -181,6 +182,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Domain::Skills,
             Kind::Snapshot,
             Stability::Stable
+        ),
+        contract_type!(
+            "app_view_publication.json",
+            crate::apps::AppViewPublication,
+            Domain::Apps,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "plugin_operation_publication.json",
+            crate::packages::runtime::PluginOperationPublication,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "plugin_publication.json",
+            crate::packages::runtime::PluginPublication,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Provisional
         ),
         contract_type!(
             "skill_upload_publication.json",
@@ -2398,6 +2420,20 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "task_finish_params.json",
+            pioneer_protocol::TaskFinishParams,
+            Domain::Tasks,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_finish_response.json",
+            pioneer_protocol::TaskFinishResponse,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
             "task_completion_inbox_entry.json",
             pioneer_protocol::TaskCompletionInboxEntry,
             Domain::Tasks,
@@ -3228,6 +3264,7 @@ mod tests {
             ClientContractDomain::Providers,
             ClientContractDomain::Skills,
             ClientContractDomain::Mcp,
+            ClientContractDomain::Apps,
             ClientContractDomain::Settings,
             ClientContractDomain::Tasks,
         ] {

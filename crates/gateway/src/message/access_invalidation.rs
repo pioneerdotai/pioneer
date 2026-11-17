@@ -20,6 +20,40 @@ impl MessageProcessor {
         &self,
         signal: &AccessChangeSignal,
     ) {
+        if let Some(views) = self.view_grant_service() {
+            views.invalidate_app_views(
+                signal.workspace_id.as_str(),
+                None,
+                signal.affected_principal_id.as_ref(),
+            );
+        }
+        let workspace_active = if signal.affected_principal_id.is_none() {
+            pioneer_crud::resolve_workspace_authorization_scope(
+                &self.crud_store.database_connection(),
+                signal.workspace_id.as_str(),
+            )
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|workspace| workspace.is_active)
+        } else {
+            true
+        };
+        if !workspace_active {
+            for app in self.host_api.revoke_workspace(signal.workspace_id.as_str()) {
+                if self.stop_app_runtime(&app).await.is_err() {
+                    warn!("App cleanup remains fenced after workspace invalidation");
+                }
+            }
+        }
+        self.crud_store
+            .database_connection()
+            .work_signal("apps.lifecycle")
+            .notify();
+        self.retire_push_workspace(
+            signal.workspace_id.as_str(),
+            signal.affected_principal_id.as_ref(),
+        );
         let lease_reprojection = self
             .execution_leases
             .reproject_scope(self.crud_store.as_ref(), signal)

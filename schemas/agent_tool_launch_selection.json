@@ -4,7 +4,10 @@
   "type": "object",
   "properties": {
     "identity": {
-      "$ref": "#/$defs/AgentToolIdentityChoice"
+      "$ref": "#/$defs/AgentToolIdentityChoice",
+      "default": {
+        "kind": "inherit_parent"
+      }
     },
     "mcpServerIds": {
       "type": "array",
@@ -23,7 +26,10 @@
       ]
     },
     "profile": {
-      "$ref": "#/$defs/AgentToolProfileChoice"
+      "$ref": "#/$defs/AgentToolProfileChoice",
+      "default": {
+        "kind": "inherit_parent"
+      }
     },
     "reasoning": {
       "anyOf": [
@@ -40,13 +46,13 @@
       "items": {
         "$ref": "#/$defs/SkillId"
       }
+    },
+    "useDefaultReasoning": {
+      "description": "Use the selected model's native default, without inheriting an effort.\nMutually exclusive with reasoning. Omitted/false retains inheritance;\nlegacy reasoning:null also retains inheritance.",
+      "type": "boolean"
     }
   },
   "additionalProperties": false,
-  "required": [
-    "identity",
-    "profile"
-  ],
   "$defs": {
     "AgentExecutionProfileId": {
       "type": "string",
@@ -162,6 +168,30 @@
           "required": [
             "kind",
             "id"
+          ]
+        },
+        {
+          "description": "Direct, catalog-validated selection. Omitting providerId inherits the\ncurrent executor when compatible; otherwise selection must be unique.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "model"
+            },
+            "modelId": {
+              "type": "string"
+            },
+            "providerId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "modelId"
           ]
         }
       ]

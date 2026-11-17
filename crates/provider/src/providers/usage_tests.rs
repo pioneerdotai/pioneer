@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn fixture(body: String) -> (String, tokio::task::JoinHandle<serde_json::Value>) {
     fixture_with_headers(body, String::new(), "200 OK").await
 }
-async fn fixture_with_headers(
+pub(super) async fn fixture_with_headers(
     body: String,
     headers: String,
     status: &'static str,
@@ -57,6 +57,8 @@ async fn fixture_with_headers(
 }
 fn request(model: &str) -> ChatRequest {
     ChatRequest {
+        tool_declarations: None,
+        service_mode: None,
         model: model.into(),
         messages: vec![ChatMessage::user("test")],
         temperature: None,
@@ -70,7 +72,7 @@ fn request(model: &str) -> ChatRequest {
 }
 
 #[tokio::test]
-async fn openai_usage_after_finish_is_read_before_terminal_without_cache_double_count() {
+async fn openai_audio_chat_usage_after_finish_preserves_legacy_usage_contract() {
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"Привет\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
@@ -81,7 +83,7 @@ async fn openai_usage_after_finish_is_read_before_terminal_without_cache_double_
     let provider = OpenAiProvider::with_base_url("fixture-key", url);
     let mut stream = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request("gpt-4o")),
+        provider.stream_chat(request("gpt-audio")),
     )
     .await
     .unwrap();
@@ -149,7 +151,7 @@ async fn openrouter_ignores_repeated_empty_terminal_choice_and_preserves_usage()
 }
 
 #[tokio::test]
-async fn openai_rejects_real_payload_after_finish_reason() {
+async fn openai_audio_chat_rejects_real_payload_after_finish_reason() {
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"content\":\"late\"},\"finish_reason\":null}]}\n\n",
@@ -160,7 +162,7 @@ async fn openai_rejects_real_payload_after_finish_reason() {
     let provider = OpenAiProvider::with_base_url("fixture-key", url);
     let chunks: Vec<_> = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request("gpt-4o")),
+        provider.stream_chat(request("gpt-audio")),
     )
     .await
     .unwrap()
@@ -204,11 +206,14 @@ async fn anthropic_stream_merges_start_cache_input_and_cumulative_output() {
     assert!(terminal);
     assert_eq!(usage.input_tokens, Some(130));
     assert_eq!(usage.output_tokens, Some(8));
-    server.await.unwrap();
+    let sent = server.await.unwrap();
+    assert_eq!(sent["stream"], true);
+    assert!(sent.get("temperature").is_none());
+    assert!(sent.get("system").is_none());
 }
 
 #[tokio::test]
-async fn missing_usage_stays_unknown_and_missing_finish_is_error() {
+async fn audio_chat_missing_usage_stays_unknown_and_missing_finish_is_error() {
     for (body, succeeds) in [
         (
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
@@ -217,25 +222,39 @@ async fn missing_usage_stays_unknown_and_missing_finish_is_error() {
         ("data: [DONE]\n\n", false),
     ] {
         let (url, server) = fixture(body.to_owned()).await;
+        // Route facts do not imply measured token counts.
+        let expected_usage = TokenUsage {
+            api: Some("chat_completions".into()),
+            route: crate::usage::route(&url, "/chat/completions"),
+            ..Default::default()
+        };
         let provider = OpenAiProvider::with_base_url("fixture-key", url);
         let chunks: Vec<_> = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
-            provider.stream_chat(request("gpt-4o")),
+            provider.stream_chat(request("gpt-audio")),
         )
         .await
         .unwrap()
         .collect()
         .await;
         assert_eq!(chunks.iter().all(Result::is_ok), succeeds);
+        let mut usage_snapshots = 0;
+        let mut terminal_chunks = 0;
         for chunk in chunks.into_iter().flatten() {
-            assert!(chunk.usage.is_none());
+            terminal_chunks += usize::from(chunk.is_final);
+            if let Some(usage) = chunk.usage {
+                usage_snapshots += 1;
+                assert_eq!(usage, expected_usage);
+            }
         }
+        assert_eq!(usage_snapshots, usize::from(succeeds));
+        assert_eq!(terminal_chunks, usize::from(succeeds));
         server.await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn dropping_stream_closes_pending_http_transport() {
+async fn dropping_audio_chat_stream_closes_pending_http_transport() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -272,7 +291,7 @@ async fn dropping_stream_closes_pending_http_transport() {
     let provider = OpenAiProvider::with_base_url("fixture-key", format!("http://{address}"));
     let mut stream = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request("gpt-4o")),
+        provider.stream_chat(request("gpt-audio")),
     )
     .await
     .unwrap();
@@ -283,7 +302,7 @@ async fn dropping_stream_closes_pending_http_transport() {
 
 #[tokio::test]
 async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumulative() {
-    use super::compatible::{AuthStyle, OpenAiCompatibleProvider};
+    use super::chat_completions_api_compatible::{AuthStyle, ChatCompletionsApiCompatibleProvider};
     for (profile, opt_in) in [
         ("groq", true),
         ("deepseek", true),
@@ -298,8 +317,12 @@ async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumu
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":140,\"completion_tokens\":19}}\n\n",
             "data: [DONE]\n\n").to_owned();
         let (url, server) = fixture(body).await;
-        let provider =
-            OpenAiCompatibleProvider::new(profile, url, "fixture-key", AuthStyle::Bearer);
+        let provider = ChatCompletionsApiCompatibleProvider::new(
+            profile,
+            url,
+            "fixture-key",
+            AuthStyle::Bearer,
+        );
         let mut stream = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
             provider.stream_chat(request("fixture")),
@@ -307,17 +330,30 @@ async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumu
         .await
         .unwrap();
         let mut usage = TokenUsage::default();
+        let mut detailed_usage_observed = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.unwrap();
             if let Some(snapshot) = chunk.usage {
+                if snapshot.reasoning_tokens.is_some() {
+                    detailed_usage_observed = true;
+                    assert_eq!(snapshot.input_tokens, Some(140));
+                    assert_eq!(snapshot.output_tokens, Some(19));
+                    assert_eq!(snapshot.reasoning_tokens, Some(10));
+                    assert_eq!(snapshot.uncached_input_tokens, Some(20));
+                }
                 usage.update(&snapshot);
             }
         }
+        assert!(
+            detailed_usage_observed,
+            "missing detailed usage for {profile}"
+        );
         assert_eq!(usage.input_tokens, Some(140));
         assert_eq!(usage.output_tokens, Some(19));
         assert_eq!(usage.cache_read_input_tokens, Some(100));
         assert_eq!(usage.cache_write_input_tokens, Some(20));
         assert_eq!(usage.reasoning_tokens, Some(10));
+        assert_eq!(usage.uncached_input_tokens, Some(20));
         assert_eq!(usage.generation_id.as_deref(), Some("chat-native-1"));
         assert_eq!(usage.reported_model.as_deref(), Some("reported-model"));
         let request = server.await.unwrap();
@@ -327,17 +363,19 @@ async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumu
 
 #[tokio::test]
 async fn groq_request_id_is_distinct_and_profile_specific() {
-    use super::compatible::{AuthStyle, OpenAiCompatibleProvider};
+    use super::chat_completions_api_compatible::{AuthStyle, ChatCompletionsApiCompatibleProvider};
     for profile in ["groq", "custom"] {
         let body = r#"{"id":"chatcmpl-completion","model":"actual","x_groq":{"id":"req-native","secret":"SECRET"},"choices":[{"message":{"content":"answer"},"finish_reason":"stop"}]}"#;
         let (url, server) = fixture(body.into()).await;
-        let provider = OpenAiCompatibleProvider::new(profile, url, "fixture", AuthStyle::Bearer);
+        let provider =
+            ChatCompletionsApiCompatibleProvider::new(profile, url, "fixture", AuthStyle::Bearer);
         let response = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
             provider.chat(request("fixture")),
         )
         .await
         .unwrap();
+        assert_eq!(response.text, "answer");
         let usage = response.usage.unwrap();
         assert_eq!(usage.generation_id.as_deref(), Some("chatcmpl-completion"));
         assert_eq!(
@@ -496,6 +534,7 @@ async fn anthropic_returned_model_survives_nonstream_and_message_start_without_u
         assert_eq!(usage.reported_model.as_deref(), Some("claude-returned"));
         assert_eq!(usage.generation_id.as_deref(), Some("msg-native"));
         assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
         server.await.unwrap();
     }
 }

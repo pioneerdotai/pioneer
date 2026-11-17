@@ -6,7 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-libc.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +19,7 @@ pioneer-protocol.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+rustix.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

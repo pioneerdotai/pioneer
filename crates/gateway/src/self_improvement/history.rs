@@ -1537,6 +1537,9 @@ mod tests {
         sidebar_visibility: ThreadSidebarVisibility,
     ) -> Thread {
         Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws_history".to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -1571,6 +1574,7 @@ mod tests {
         Turn {
             id: turn_id.to_owned(),
             status,
+            work_owner: Default::default(),
             turn_kind,
             origin,
             mode: Default::default(),

@@ -7,7 +7,8 @@ use crate::executor::{
 };
 use crate::policy::{
     TaskCreateContext, TaskExecutionAdmissionSeed, TaskMutationContext, TaskWaitContext,
-    default_delivery_policy, default_lifecycle_policy, default_retry_policy,
+    default_delivery_policy_for_trigger, default_lifecycle_policy,
+    default_lifecycle_policy_for_trigger, default_retry_policy, is_webhook_spec,
 };
 use crate::projector::TaskProjector;
 use crate::reconciliation::TaskStartupReconciler;
@@ -26,6 +27,7 @@ use pioneer_crud::{
     AppendedTaskEvent, ArtifactBindingTargetRecord, CrudStore, NewTaskRunConversationSnapshot,
     TaskDeliveryTransition, TaskDeliveryTransitionOutcome, TaskRootAccessFilter,
 };
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, TASK_COMPOSER_WORK_VERSION, Task,
     TaskAcceptParams, TaskAcceptResponse, TaskAgendaParams, TaskAgendaResponse, TaskAgentPrompt,
@@ -65,8 +67,6 @@ const DEFAULT_MAX_TASK_DEPTH: i64 = 3;
 const MAX_ROOT_TASK_DEPTH_LIMIT: i64 = 10;
 const WAIT_RESCAN_INTERVAL: Duration = Duration::from_millis(250);
 const WAIT_LIVENESS_SCAN_INTERVAL: Duration = Duration::from_secs(5);
-const LIVE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
-const REVIEW_AUTO_ACCEPT_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const REVIEW_AUTO_ACCEPT_SCAN_LIMIT: u64 = 1024;
 const DELIVERY_RECOVERY_BATCH_LIMIT: u64 = pioneer_crud::DELIVERY_RECOVERY_BUDGET;
 const MAX_REVISION_FEEDBACK_CHARS: usize = 16_000;
@@ -105,6 +105,25 @@ struct TaskReviseValidationContext {
     additional_instructions: Vec<String>,
 }
 
+struct PreparedTaskContract {
+    task: Task,
+    trigger: TaskTrigger,
+    agent_spec: Option<TaskAgentSpec>,
+}
+
+/// Immutable, size-checked request and normalized durable Composer contract.
+/// This is preparation only, not an authorization or a durable creation receipt.
+pub struct PreparedComposerTask {
+    params: TaskCreateParams,
+    contract: PreparedTaskContract,
+}
+
+impl PreparedComposerTask {
+    pub fn params(&self) -> &TaskCreateParams {
+        &self.params
+    }
+}
+
 pub struct TaskRuntime {
     service: Arc<TaskService>,
     critical_service: Arc<TaskService>,
@@ -121,6 +140,7 @@ pub struct TaskRuntime {
 
 impl Drop for TaskRuntime {
     fn drop(&mut self) {
+        self.event_bus.retire_closing();
         // Worker tasks own Arcs of the scheduler/reconciler/service rather than
         // the runtime itself, so dropping the runtime does not cancel them by
         // reference-counting alone.  Abort every task synchronously to keep
@@ -146,6 +166,7 @@ impl Drop for TaskRuntime {
 
 impl TaskRuntime {
     pub async fn shutdown(&self) {
+        self.event_bus.retire_closing();
         for worker in [
             &self.scheduler_task,
             &self.live_reconciliation_task,
@@ -176,7 +197,6 @@ impl Default for TaskRuntimeConfig {
 pub struct TaskReviewRuntimeConfig {
     pub enabled: bool,
     pub allow_task_create_review_policy: bool,
-    pub default_parent_review_for_immediate_attached_agent_tasks: bool,
     pub default_max_revision_rounds: u32,
     pub auto_accept_after_seconds: u64,
 }
@@ -186,7 +206,6 @@ impl Default for TaskReviewRuntimeConfig {
         Self {
             enabled: false,
             allow_task_create_review_policy: false,
-            default_parent_review_for_immediate_attached_agent_tasks: false,
             default_max_revision_rounds: 5,
             auto_accept_after_seconds: 300,
         }
@@ -287,7 +306,18 @@ impl TaskRuntime {
 
     pub async fn start(&self) -> TaskRuntimeResult<()> {
         let now = now_timestamp_secs();
-        self.reconciler.reconcile(now).await?;
+        let mut partial_failures = Vec::new();
+        match self.reconciler.reconcile(now).await {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<crate::reconciliation::PartialRecoveryError>()
+                    .is_some() =>
+            {
+                partial_failures.push(error)
+            }
+            Err(error) => return Err(error),
+        }
         self.maintenance_service
             .recover_retry_and_lock_state(now)
             .await?;
@@ -305,7 +335,17 @@ impl TaskRuntime {
         self.maintenance_service
             .auto_accept_expired_review_candidates(now, REVIEW_AUTO_ACCEPT_SCAN_LIMIT)
             .await?;
-        self.scheduler.process_due_once(now).await?;
+        match self.scheduler.process_due_once(now).await {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<crate::scheduler::PartialDiscoveryError>()
+                    .is_some() =>
+            {
+                partial_failures.push(error)
+            }
+            Err(error) => return Err(error),
+        }
         let mut guard = self.scheduler_task.lock().await;
         if guard.is_none() {
             let scheduler = self.scheduler.clone();
@@ -317,17 +357,41 @@ impl TaskRuntime {
         if reconciliation_guard.is_none() {
             let reconciler = self.reconciler.clone();
             *reconciliation_guard = Some(tokio::spawn(async move {
-                let mut ticks = interval(LIVE_RECONCILIATION_INTERVAL);
-                ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                ticks.tick().await;
+                let database = reconciler.database();
+                let mut changes = database.work_signal("tasks.lifecycle").subscribe();
+                let mut capacity = reconciler.capacity_signal().subscribe();
+                let mut begin = true;
                 loop {
-                    ticks.tick().await;
-                    if let Err(_error) = reconciler.reconcile(now_timestamp_secs()).await {
-                        warn!(
-                            failure_class = "task_live_reconciliation_failed",
-                            "live task terminal reconciliation pass failed"
-                        );
+                    let result: TaskRuntimeResult<Option<i64>> = async {
+                        if begin {
+                            changes.begin_pass(&database).await?;
+                        }
+                        begin = false;
+                        reconciler.reconcile(now_timestamp_secs()).await?;
+                        reconciler.next_wake_deadline(now_timestamp_secs()).await
                     }
+                    .await;
+                    let deadline = match result {
+                        Ok(deadline) => deadline,
+                        Err(_) => {
+                            warn!(
+                                failure_class = "task_live_reconciliation_failed",
+                                "live task terminal reconciliation pass failed"
+                            );
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+                    };
+                    if reconciler.has_discovery_continuation().await {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    tokio::select! {
+                        _ = changes.wait(deadline) => {},
+                        _ = capacity.changed() => {},
+                    }
+                    begin = true;
+                    tokio::task::yield_now().await;
                 }
             }));
         }
@@ -340,23 +404,111 @@ impl TaskRuntime {
         {
             let service = self.maintenance_service.clone();
             *review_timeout_guard = Some(tokio::spawn(async move {
-                let mut interval = interval(REVIEW_AUTO_ACCEPT_SCAN_INTERVAL);
-                interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                interval.tick().await;
+                let database = service.store.database_connection();
+                let mut changes = database.work_signal("tasks.review").subscribe();
                 loop {
-                    interval.tick().await;
-                    let now = now_timestamp_secs();
-                    if let Err(_error) = service
-                        .auto_accept_expired_review_candidates(now, REVIEW_AUTO_ACCEPT_SCAN_LIMIT)
-                        .await
-                    {
-                        warn!(
-                            failure_class = "task_review_auto_accept_scan_failed",
-                            "task review timeout auto-accept scan failed"
-                        );
+                    let result: TaskRuntimeResult<Option<i64>> = async {
+                        changes.begin_pass(&database).await?;
+                        let timeout = service
+                            .review_auto_accept_timeout_seconds()
+                            .map(|seconds| i64::try_from(seconds).unwrap_or(i64::MAX))
+                            .unwrap_or(i64::MAX);
+                        let mut after = None;
+                        let mut upper = None;
+                        let mut deadline: Option<i64> = None;
+                        let mut scan_failed = false;
+                        loop {
+                            let (page, captured_upper) = service
+                                .store
+                                .list_task_recovery_runs_finite(
+                                    TaskRunStatus::WaitingReview,
+                                    after.as_deref(),
+                                    upper.as_deref(),
+                                    64,
+                                )
+                                .await?;
+                            let more = page.scanned == 64 && page.last != captured_upper;
+                            scan_failed |= !page.failures.is_empty();
+                            for run in page.records {
+                                let row_result: TaskRuntimeResult<Option<i64>> = async {
+                                    let response = service
+                                        .store
+                                        .get_task(&run.task_id)
+                                        .await?
+                                        .ok_or_else(|| anyhow!("review task missing"))?;
+                                    if wait_review_policy(&response, &run).is_some_and(|policy| {
+                                        policy.disable_timeout_acceptance
+                                            && policy.require_explicit_acceptance
+                                    }) {
+                                        return Ok(None);
+                                    }
+                                    if let Some(candidate) =
+                                        service.active_review_candidate_for_run(&run.id).await?
+                                    {
+                                        service.event_bus.observe_closing_review(&candidate, &run);
+                                        if candidate.status
+                                            == TaskResultCandidateStatus::PendingReview
+                                            && candidate.result.is_some()
+                                        {
+                                            let at = candidate.created_at.saturating_add(timeout);
+                                            let now = now_timestamp_secs();
+                                            if at <= now {
+                                                service
+                                                    .auto_accept_expired_review_candidate_for_run(
+                                                        run, now, timeout,
+                                                    )
+                                                    .await?;
+                                            } else {
+                                                return Ok(Some(at));
+                                            }
+                                        }
+                                    }
+                                    Ok(None)
+                                }
+                                .await;
+                                match row_result {
+                                    Ok(Some(at)) => {
+                                        deadline = Some(deadline.map_or(at, |old| old.min(at)))
+                                    }
+                                    Ok(None) => {}
+                                    Err(_) => {
+                                        scan_failed = true;
+                                        let retry = now_timestamp_secs().saturating_add(30);
+                                        deadline =
+                                            Some(deadline.map_or(retry, |old| old.min(retry)));
+                                    }
+                                }
+                            }
+                            if !more {
+                                break;
+                            }
+                            after = page.last;
+                            upper = captured_upper;
+                            tokio::task::yield_now().await;
+                        }
+                        if scan_failed {
+                            bail!("review timeout scan had row-local failures");
+                        }
+                        Ok(deadline)
                     }
+                    .await;
+                    let deadline = match result {
+                        Ok(deadline) => deadline,
+                        Err(_) => {
+                            warn!(
+                                failure_class = "task_review_auto_accept_scan_failed",
+                                "task review timeout auto-accept scan failed"
+                            );
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            continue;
+                        }
+                    };
+                    changes.wait(deadline).await;
                 }
             }));
+        }
+        if !partial_failures.is_empty() {
+            return Err(crate::PartialTaskStartup(partial_failures).into());
         }
         Ok(())
     }
@@ -466,6 +618,7 @@ impl TaskService {
         params: RecordTaskResultReviewEventParams,
         agent_action: Option<pioneer_crud::AgentCommitInput>,
     ) -> TaskRuntimeResult<TaskResultReviewRecordResponse> {
+        let mut preparation = Closing::current(Phase::ReviewPreparation);
         let created_at = params.created_at.unwrap_or_else(now_timestamp_secs);
         let candidate = self
             .store
@@ -477,6 +630,23 @@ impl TaskService {
             .get_task(candidate.task_id.as_str())
             .await?
             .ok_or_else(|| anyhow!("task `{}` not found", candidate.task_id))?;
+        if let Some(run) = response.runs.iter().find(|run| run.id == candidate.run_id) {
+            self.event_bus.observe_closing_review(&candidate, run);
+        }
+        preparation.finish(Fact::Returned);
+        let (links, link_count) = self.event_bus.closing_review_links(
+            &candidate.run_id,
+            &candidate.id,
+            Closing::capture(),
+        );
+        let mut closing = Closing::start_linked(
+            Phase::ReviewDecision,
+            &self
+                .event_bus
+                .closing_candidate_parent(&candidate.run_id, &candidate.id),
+            &links[..link_count],
+        );
+        let correlation = closing.correlation();
         let policy = wait_review_policy(
             &response,
             response
@@ -485,8 +655,15 @@ impl TaskService {
                 .find(|run| run.id == candidate.run_id)
                 .ok_or_else(|| anyhow!("task run `{}` not found", candidate.run_id))?,
         );
-        self.validate_review_actor_contract(&response, &candidate, &params.actor)
+        self.validate_review_actor_contract(&response, &candidate, &params.actor, false)
             .await?;
+        if params.event_kind == TaskResultReviewEventKind::SystemAuto
+            && policy.is_some_and(|policy| {
+                policy.disable_timeout_acceptance && policy.require_explicit_acceptance
+            })
+        {
+            bail!("explicit review cannot be auto-accepted");
+        }
         let mut review_event = build_task_result_review_event(&candidate, params, created_at);
         validate_review_event_for_candidate(&candidate, &review_event)?;
 
@@ -526,10 +703,13 @@ impl TaskService {
             ));
         }
 
-        let appended = self
-            .append_events_with_optional_agent_action(events, created_at, agent_action)
+        let appended = correlation
+            .scope(self.append_events_with_optional_agent_action(events, created_at, agent_action))
             .await?;
-        self.event_bus.publish_many(appended).await;
+        closing.finish(Fact::Confirmed); // committed decision, not accepted run or delivery
+        correlation
+            .scope(self.event_bus.publish_many(appended))
+            .await;
         let candidate = self
             .store
             .get_task_result_candidate(candidate.id.as_str())
@@ -713,9 +893,14 @@ impl TaskService {
             .find(|candidate_run| candidate_run.id == run.id)
             .cloned()
             .unwrap_or(run);
-        if response.task.status != TaskStatus::WaitingReview
-            || current_run.status != TaskRunStatus::WaitingReview
+        if response.task.status.is_terminal() || current_run.status != TaskRunStatus::WaitingReview
         {
+            return Ok(false);
+        }
+
+        if wait_review_policy(&response, &current_run).is_some_and(|policy| {
+            policy.disable_timeout_acceptance && policy.require_explicit_acceptance
+        }) {
             return Ok(false);
         }
 
@@ -725,6 +910,8 @@ impl TaskService {
         else {
             return Ok(false);
         };
+        self.event_bus
+            .observe_closing_review(&candidate, &current_run);
         if candidate.status != TaskResultCandidateStatus::PendingReview {
             return Ok(false);
         }
@@ -820,7 +1007,9 @@ impl TaskService {
                 params.run_id
             );
         }
-        if response.task.status != TaskStatus::WaitingReview {
+        // A sibling run can change the aggregate Task status while this exact
+        // run still awaits review. Terminal Task state remains authoritative.
+        if response.task.status.is_terminal() {
             bail!("task `{}` is not waiting for review", response.task.id);
         }
         if run.status != TaskRunStatus::WaitingReview {
@@ -850,8 +1039,8 @@ impl TaskService {
         })?;
 
         validate_no_active_candidate_child_turn(&response, &run, "accept")?;
-        let actor = resolve_parent_or_user_review_actor(&context, &response, &candidate, "accept")?;
-        self.validate_review_actor_contract(&response, &candidate, &actor)
+        let actor = resolve_parent_or_user_review_actor(&context, &candidate, "accept")?;
+        self.validate_review_actor_contract(&response, &candidate, &actor, false)
             .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
@@ -870,8 +1059,8 @@ impl TaskService {
         })
     }
 
-    /// Return one immutable candidate only after validating the same exact
-    /// reviewer identity and durable review policy used by accept/revise.
+    /// Read an immutable candidate with an authentic actor in the task capsule.
+    /// Final-review policy governs decisions, not observation.
     /// Observation capability checks remain the caller's responsibility.
     pub async fn get_task_result_candidate_for_reviewer(
         &self,
@@ -888,27 +1077,18 @@ impl TaskService {
             .get_task(candidate.task_id.as_str())
             .await?
             .ok_or_else(|| anyhow!("task `{}` not found", candidate.task_id))?;
-        let run = response
-            .runs
-            .iter()
-            .find(|run| run.id == candidate.run_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "task run `{}` not found for task `{}`",
-                    candidate.run_id,
-                    candidate.task_id
-                )
-            })?;
-        let actor = resolve_parent_or_user_review_actor(&context, &response, &candidate, "read")?;
-        self.validate_review_actor_contract(&response, &candidate, &actor)
+        if !response.runs.iter().any(|run| run.id == candidate.run_id) {
+            bail!("candidate run not found for task");
+        }
+        let actor = resolve_parent_or_user_review_actor(&context, &candidate, "read")?;
+        self.validate_review_actor_contract(&response, &candidate, &actor, true)
             .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
         {
             validate_user_can_review_task(user_id, &response.task)?;
         }
-        self.validate_final_review_actor_allowed_by_policy(&response, run, &candidate, &actor)
-            .await?;
+
         Ok(candidate)
     }
 
@@ -921,6 +1101,47 @@ impl TaskService {
         self.validate_task_result_candidate_accept(context, &params)
             .await
             .map(|_| ())
+    }
+
+    /// Resolve current decision eligibility without mutating the candidate.
+    pub async fn candidate_review_actions(
+        &self,
+        context: TaskMutationContext,
+        candidate: &TaskResultCandidate,
+    ) -> Vec<TaskWaitReviewAction> {
+        let mut actions = Vec::new();
+        if self
+            .validate_task_result_candidate_accept(
+                context.clone(),
+                &TaskAcceptParams {
+                    task_id: candidate.task_id.clone(),
+                    run_id: candidate.run_id.clone(),
+                    candidate_id: candidate.id.clone(),
+                    reason: None,
+                },
+            )
+            .await
+            .is_ok()
+        {
+            actions.push(TaskWaitReviewAction::TaskAccept);
+        }
+        if self
+            .validate_task_result_candidate_revise(
+                context,
+                &TaskReviseParams {
+                    task_id: candidate.task_id.clone(),
+                    run_id: candidate.run_id.clone(),
+                    candidate_id: candidate.id.clone(),
+                    feedback: "Review eligibility".to_owned(),
+                    additional_instructions: Vec::new(),
+                },
+            )
+            .await
+            .is_ok()
+        {
+            actions.push(TaskWaitReviewAction::TaskRevise);
+        }
+        actions
     }
 
     pub async fn accept_task_result_candidate(
@@ -1037,7 +1258,7 @@ impl TaskService {
                 params.run_id
             );
         }
-        if response.task.status.is_terminal() || response.task.status != TaskStatus::WaitingReview {
+        if response.task.status.is_terminal() {
             bail!("task `{}` is not waiting for review", response.task.id);
         }
         if run.status.is_terminal() || run.status != TaskRunStatus::WaitingReview {
@@ -1069,8 +1290,8 @@ impl TaskService {
         }
 
         validate_no_active_candidate_child_turn(&response, &run, "revise")?;
-        let actor = resolve_parent_or_user_review_actor(&context, &response, &candidate, "revise")?;
-        self.validate_review_actor_contract(&response, &candidate, &actor)
+        let actor = resolve_parent_or_user_review_actor(&context, &candidate, "revise")?;
+        self.validate_review_actor_contract(&response, &candidate, &actor, false)
             .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
@@ -1326,8 +1547,8 @@ impl TaskService {
                     params.task_id
                 )
             })?;
-        let actor = resolve_parent_or_user_review_actor(context, &response, &candidate, "revise")?;
-        self.validate_review_actor_contract(&response, &candidate, &actor)
+        let actor = resolve_parent_or_user_review_actor(context, &candidate, "revise")?;
+        self.validate_review_actor_contract(&response, &candidate, &actor, false)
             .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
@@ -1411,8 +1632,8 @@ impl TaskService {
                     params.task_id
                 )
             })?;
-        let actor = resolve_parent_or_user_review_actor(context, &response, &candidate, "accept")?;
-        self.validate_review_actor_contract(&response, &candidate, &actor)
+        let actor = resolve_parent_or_user_review_actor(context, &candidate, "accept")?;
+        self.validate_review_actor_contract(&response, &candidate, &actor, false)
             .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
@@ -1633,6 +1854,7 @@ impl TaskService {
         response: &TaskGetResponse,
         candidate: &TaskResultCandidate,
         actor: &TaskResultReviewActor,
+        reading: bool,
     ) -> TaskRuntimeResult<()> {
         let contract = self
             .store
@@ -1648,28 +1870,6 @@ impl TaskService {
                 TaskResultReviewerKind::ParentAgent,
                 TaskResultReviewerRef::AgentExecution(reviewer_execution_id),
             ) => {
-                let intended_execution_id = match &contract.reviewer {
-                    TaskReviewerIntent::Parent => match &contract.creator {
-                        pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) => {
-                            execution_id.as_str()
-                        }
-                        _ => bail!(
-                            "task `{}` has parent review intent without an exact agent creator",
-                            response.task.id
-                        ),
-                    },
-                    TaskReviewerIntent::Agent { execution_id } => execution_id.as_str(),
-                    _ => bail!(
-                        "task `{}` does not admit a parent-agent reviewer",
-                        response.task.id
-                    ),
-                };
-                if reviewer_execution_id.as_str() != intended_execution_id {
-                    return Err(anyhow::Error::new(crate::TaskOperationError::AccessDenied).context(format!(
-                        "parent reviewer execution does not match task `{}` immutable reviewer intent",
-                        response.task.id
-                    )));
-                }
                 let turn_id = actor
                     .reviewer_turn_id
                     .as_deref()
@@ -1688,6 +1888,30 @@ impl TaskService {
                 .ok_or_else(|| anyhow!("parent reviewer turn has no exact AgentExecution"))?;
                 if turn_response.execution_id != reviewer_execution_id.as_str() {
                     bail!("parent reviewer turn belongs to a different AgentExecution");
+                }
+                let thread_id = actor.reviewer_thread_id.as_deref().unwrap();
+                let (actual_thread, workspace) = self
+                    .store
+                    .get_turn_location(turn_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("reviewer turn has no location"))?;
+                if actual_thread != thread_id || workspace != response.task.workspace_id {
+                    bail!("reviewer turn does not match its thread/workspace");
+                }
+                if !reading && thread_id == candidate.thread_id {
+                    bail!("candidate source thread cannot review its own result");
+                }
+                let root = self.collaboration_root_thread_id(thread_id).await?;
+                if pioneer_crud::resolve_task_authorization_scope(
+                    &self.store.database_connection(),
+                    &response.task.id,
+                    Some(&workspace),
+                    Some(&root),
+                )
+                .await?
+                .is_none()
+                {
+                    return Err(crate::TaskOperationError::AccessDenied.into());
                 }
             }
             (
@@ -1752,10 +1976,11 @@ impl TaskService {
                 }
             }
             (TaskResultReviewerKind::User, TaskResultReviewerRef::Principal(principal_id)) => {
-                if contract.reviewer
-                    != (TaskReviewerIntent::Human {
-                        principal_id: principal_id.as_str().to_owned(),
-                    })
+                if (!reading
+                    && contract.reviewer
+                        != (TaskReviewerIntent::Human {
+                            principal_id: principal_id.as_str().to_owned(),
+                        }))
                     || actor.reviewer_user_id.as_deref() != Some(principal_id.as_str())
                     || actor.reviewer_thread_id.is_some()
                     || actor.reviewer_turn_id.is_some()
@@ -1935,12 +2160,189 @@ impl TaskService {
             .saturating_add(1))
     }
 
+    fn prepare_task_contract(
+        &self,
+        params: &TaskCreateParams,
+        webhook_secret_ref: Option<String>,
+        parent: ParentContext,
+        now: i64,
+    ) -> TaskRuntimeResult<PreparedTaskContract> {
+        TaskTriggerCalculator::validate(&params.trigger.spec)?;
+
+        let depth = parent.depth;
+        let max_depth = normalize_max_depth(depth, parent.max_depth, params.agent_spec.as_ref())?;
+        if depth > max_depth {
+            bail!("task depth {depth} exceeds max depth {max_depth}");
+        }
+
+        let task_id = generate_id(ID_LEN);
+        let trigger_id = generate_id(ID_LEN);
+        let next_fire_at = TaskTriggerCalculator::initial_next_fire_at(&params.trigger.spec, now)?;
+        let lifecycle_policy = params.lifecycle_policy.clone().unwrap_or_else(|| {
+            default_lifecycle_policy_for_trigger(
+                &params.trigger.spec,
+                params.created_by_turn_id.is_some(),
+            )
+        });
+        let attachment = lifecycle_policy.attachment;
+        let agent_review_policy = params
+            .agent_spec
+            .as_ref()
+            .and_then(|spec| spec.review_policy.clone());
+        let task = Task {
+            id: task_id.clone(),
+            workspace_id: params.workspace_id.clone(),
+            owner_kind: params.owner_kind,
+            owner_id: params.owner_id.clone(),
+            created_by_thread_id: params.created_by_thread_id.clone(),
+            created_by_turn_id: params.created_by_turn_id.clone(),
+            root_task_id: parent.root_task_id.clone(),
+            parent_task_id: params.parent_task_id.clone(),
+            executor_kind: params.executor_kind,
+            status: if is_webhook_spec(&params.trigger.spec) {
+                TaskStatus::Waiting
+            } else {
+                TaskStatus::Draft
+            },
+            title: required_trimmed(&params.title, "title")?,
+            goal: required_trimmed(&params.goal, "goal")?,
+            priority: params.priority,
+            lifecycle_policy: Some(lifecycle_policy),
+            delivery_policy: Some(params.delivery_policy.clone().unwrap_or_else(|| {
+                default_delivery_policy_for_trigger(
+                    &params.trigger.spec,
+                    attachment,
+                    params.owner_kind,
+                    params.owner_id.as_deref(),
+                    params.created_by_thread_id.as_deref(),
+                )
+            })),
+            retry_policy: Some(
+                params
+                    .retry_policy
+                    .clone()
+                    .unwrap_or_else(default_retry_policy),
+            ),
+            timeout_policy: params.timeout_policy.clone(),
+            concurrency_policy: params.concurrency_policy.clone(),
+            metadata: params.metadata.clone(),
+            result: None,
+            error: None,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        let trigger = TaskTrigger {
+            webhook_secret_ref,
+            id: trigger_id.clone(),
+            task_id: task_id.clone(),
+            status: TaskTriggerStatus::Active,
+            spec: params.trigger.spec.clone(),
+            next_fire_at,
+            last_fire_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let agent_spec = params.agent_spec.clone().map(|input| TaskAgentSpec {
+            id: generate_id(ID_LEN),
+            task_id: task_id.clone(),
+            run_id: None,
+            agent_role: input.agent_role,
+            agent_nickname: input.agent_nickname,
+            model: input.model,
+            model_provider: input.model_provider,
+            prompt: input.prompt,
+            context_policy: input.context_policy,
+            tool_policy: input.tool_policy,
+            permission_cap: input.permission_cap,
+            security_cap: input.security_cap,
+            result_contract: input.result_contract,
+            review_policy: agent_review_policy,
+            depth,
+            max_depth,
+            created_at: now,
+            updated_at: now,
+        });
+        TaskAdmissionNormalizer::new().validate_durable(
+            &task,
+            Some(&trigger),
+            agent_spec.as_ref(),
+        )?;
+
+        Ok(PreparedTaskContract {
+            task,
+            trigger,
+            agent_spec,
+        })
+    }
+
+    /// Prepare both byte-budgeted contracts without writing or starting work.
+    /// This intentionally accepts only root, immediate Composer tasks: their
+    /// depth/defaults are independent of mutable parent Task state. Keep the
+    /// generated IDs and timestamps through creation so the durable byte count
+    /// cannot drift after the source message is accepted.
+    pub fn prepare_composer_task(
+        &self,
+        params: TaskCreateParams,
+    ) -> TaskRuntimeResult<PreparedComposerTask> {
+        validate_create_params(&params)?;
+        if params.parent_task_id.is_some()
+            || params.executor_kind != TaskExecutorKind::Agent
+            || params.trigger.spec.kind() != TaskTriggerKind::Immediate
+            || params
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.composer_work.as_ref())
+                .is_none()
+        {
+            bail!("prepared creation requires a root immediate Composer task");
+        }
+        let contract =
+            self.prepare_task_contract(&params, None, ParentContext::root(), now_timestamp_secs())?;
+        Ok(PreparedComposerTask { params, contract })
+    }
+
+    /// Consume the prevalidated Composer contracts while retaining the ordinary
+    /// creation path's live authorization/admission checks and atomic commit.
+    pub async fn create_prepared_composer_task(
+        &self,
+        context: TaskCreateContext,
+        prepared: PreparedComposerTask,
+    ) -> TaskRuntimeResult<TaskCreateResponse> {
+        self.create_task_inner(context, prepared.params, Some(prepared.contract))
+            .await
+    }
+
     pub async fn create_task(
+        &self,
+        context: TaskCreateContext,
+        params: TaskCreateParams,
+    ) -> TaskRuntimeResult<TaskCreateResponse> {
+        self.create_task_inner(context, params, None).await
+    }
+
+    async fn create_task_inner(
         &self,
         mut context: TaskCreateContext,
         params: TaskCreateParams,
+        prepared_contract: Option<PreparedTaskContract>,
     ) -> TaskRuntimeResult<TaskCreateResponse> {
+        if params
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.finish_request.is_some())
+        {
+            bail!("finishRequest is server-owned; use task_finish");
+        }
         validate_create_params(&params)?;
+        if is_webhook_spec(&params.trigger.spec) != context.webhook_secret_ref.is_some() {
+            bail!("webhook trigger requires a provisioned keystore reference");
+        }
+        if is_webhook_spec(&params.trigger.spec) && params.executor_kind != TaskExecutorKind::Agent
+        {
+            bail!("webhook tasks require the ordinary agent executor");
+        }
         self.validate_review_policy_create_gate(&params)?;
         match (
             params.executor_kind == TaskExecutorKind::Agent,
@@ -1986,7 +2388,10 @@ impl TaskService {
                 }
             }
         }
-        let now = now_timestamp_secs();
+        let now = prepared_contract
+            .as_ref()
+            .map(|contract| contract.task.created_at)
+            .unwrap_or_else(now_timestamp_secs);
         let parent = self
             .parent_context(
                 params.parent_task_id.as_deref(),
@@ -1994,75 +2399,25 @@ impl TaskService {
                 params.created_by_thread_id.as_deref(),
             )
             .await?;
-        let trigger_kind = params.trigger.spec.kind();
-        TaskTriggerCalculator::validate(&params.trigger.spec)?;
-
-        let depth = parent.depth;
-        let max_depth = normalize_max_depth(depth, parent.max_depth, params.agent_spec.as_ref())?;
-        if depth > max_depth {
-            bail!("task depth {depth} exceeds max depth {max_depth}");
-        }
-
-        let task_id = generate_id(ID_LEN);
-        let trigger_id = generate_id(ID_LEN);
-        let next_fire_at = TaskTriggerCalculator::initial_next_fire_at(&params.trigger.spec, now)?;
-        let lifecycle_policy = params.lifecycle_policy.clone().unwrap_or_else(|| {
-            default_lifecycle_policy(trigger_kind, params.created_by_turn_id.is_some())
-        });
-        let attachment = lifecycle_policy.attachment;
-        let agent_review_policy =
-            self.effective_agent_review_policy_for_create(&params, trigger_kind, &lifecycle_policy);
-        let task = Task {
-            id: task_id.clone(),
-            workspace_id: params.workspace_id.clone(),
-            owner_kind: params.owner_kind,
-            owner_id: params.owner_id.clone(),
-            created_by_thread_id: params.created_by_thread_id.clone(),
-            created_by_turn_id: params.created_by_turn_id.clone(),
-            root_task_id: parent.root_task_id.clone(),
-            parent_task_id: params.parent_task_id.clone(),
-            executor_kind: params.executor_kind,
-            status: TaskStatus::Draft,
-            title: required_trimmed(&params.title, "title")?,
-            goal: required_trimmed(&params.goal, "goal")?,
-            priority: params.priority,
-            lifecycle_policy: Some(lifecycle_policy),
-            delivery_policy: Some(params.delivery_policy.clone().unwrap_or_else(|| {
-                default_delivery_policy(
-                    trigger_kind,
-                    attachment,
-                    params.owner_kind,
-                    params.owner_id.as_deref(),
-                    params.created_by_thread_id.as_deref(),
-                )
-            })),
-            retry_policy: Some(
-                params
-                    .retry_policy
-                    .clone()
-                    .unwrap_or_else(default_retry_policy),
-            ),
-            timeout_policy: params.timeout_policy.clone(),
-            concurrency_policy: params.concurrency_policy.clone(),
-            metadata: params.metadata.clone(),
-            result: None,
-            error: None,
-            revision: 1,
-            created_at: now,
-            updated_at: now,
-            completed_at: None,
+        let PreparedTaskContract {
+            task,
+            trigger,
+            agent_spec,
+        } = match prepared_contract {
+            Some(contract) => contract,
+            None => self.prepare_task_contract(
+                &params,
+                context.webhook_secret_ref.clone(),
+                parent,
+                now,
+            )?,
         };
-        let trigger = TaskTrigger {
-            id: trigger_id.clone(),
-            task_id: task_id.clone(),
-            status: TaskTriggerStatus::Active,
-            spec: params.trigger.spec.clone(),
-            next_fire_at,
-            last_fire_at: None,
-            created_at: now,
-            updated_at: now,
-        };
+        let task_id = task.id.clone();
+        let trigger_id = trigger.id.clone();
+        let trigger_kind = trigger.spec.kind();
+        let next_fire_at = trigger.next_fire_at;
         let immediate_run = (trigger_kind == TaskTriggerKind::Immediate).then(|| TaskRun {
+            trigger_input: None,
             id: generate_id(ID_LEN),
             task_id: task_id.clone(),
             trigger_id: Some(trigger_id.clone()),
@@ -2084,32 +2439,8 @@ impl TaskService {
             created_at: now,
             updated_at: now,
         });
-        let agent_spec = params.agent_spec.clone().map(|input| TaskAgentSpec {
-            id: generate_id(ID_LEN),
-            task_id: task_id.clone(),
-            run_id: None,
-            agent_role: input.agent_role,
-            agent_nickname: input.agent_nickname,
-            model: input.model,
-            model_provider: input.model_provider,
-            prompt: input.prompt,
-            context_policy: input.context_policy,
-            tool_policy: input.tool_policy,
-            permission_cap: input.permission_cap,
-            security_cap: input.security_cap,
-            result_contract: input.result_contract,
-            review_policy: agent_review_policy,
-            depth,
-            max_depth,
-            created_at: now,
-            updated_at: now,
-        });
-        TaskAdmissionNormalizer::new().validate_durable(
-            &task,
-            Some(&trigger),
-            agent_spec.as_ref(),
-        )?;
-
+        // Prepared Composer creation consumes the same tuple checked before
+        // parent admission; its IDs, timestamps and defaults remain unchanged.
         let mut events = vec![
             TaskEventPayload::TaskCreated { task: task.clone() },
             TaskEventPayload::TriggerCreated {
@@ -2137,6 +2468,7 @@ impl TaskService {
             events.push(TaskEventPayload::RunCreated {
                 run: run.clone(),
                 agent_spec: agent_spec.clone().map(|mut spec| {
+                    spec.id = generate_id(ID_LEN);
                     spec.run_id = Some(run.id.clone());
                     spec.updated_at = now;
                     spec
@@ -2207,13 +2539,26 @@ impl TaskService {
         if let Some(action) = context.agent_action_commit.as_mut() {
             let mut response: serde_json::Value =
                 serde_json::from_str(action.receipt_response_json.as_deref().unwrap_or("{}"))?;
-            if response.get("pioneerTaskToolCall").is_some() {
+            let mut outbox: serde_json::Value = serde_json::from_str(&action.outbox_payload_json)?;
+            let detached_start = action.action.action_kind == "start_agent"
+                && outbox
+                    .get("execution_mode")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("detached_task");
+            if response.get("pioneerTaskToolCall").is_some() || detached_start {
                 response["taskCreation"] = serde_json::json!({
                     "taskId": task_id, "triggerId": trigger_id, "runId": immediate_run.as_ref().map(|run| &run.id),
                 });
+                if detached_start && response.get("threadResult").is_some() {
+                    response["threadResult"]["taskId"] = serde_json::json!(task_id);
+                }
                 let response = serde_json::to_string(&response)?;
                 action.action_response_json = Some(response.clone());
                 action.receipt_response_json = Some(response);
+            }
+            if detached_start {
+                outbox["task_id"] = serde_json::json!(task_id);
+                action.outbox_payload_json = outbox.to_string();
             }
         }
         let appended = self
@@ -2242,6 +2587,8 @@ impl TaskService {
             .await?
             .ok_or_else(|| anyhow!("task disappeared after creation"))?;
         Ok(TaskCreateResponse {
+            webhook_url: None,
+            webhook_scope: None,
             task: response.task,
             trigger: response
                 .triggers
@@ -2255,6 +2602,259 @@ impl TaskService {
                 .find(|spec| spec.run_id.is_none())
                 .or(agent_spec),
         })
+    }
+
+    /// Resolves only the endpoint metadata. Possession of an entity id never
+    /// authorizes a run; Gateway must authenticate its keystore bearer first.
+    pub async fn webhook_trigger(
+        &self,
+        trigger_id: &str,
+    ) -> TaskRuntimeResult<Option<TaskTrigger>> {
+        Ok(self
+            .store
+            .get_webhook_task_trigger(trigger_id)
+            .await?
+            .filter(|trigger| is_webhook_spec(&trigger.spec)))
+    }
+
+    pub async fn accept_webhook(
+        &self,
+        trigger_id: &str,
+        expected_secret_ref: &str,
+        input: pioneer_protocol::TaskRunTriggerInput,
+    ) -> TaskRuntimeResult<TaskRun> {
+        // Each POST owns its identity, even for identical bytes. Optimistic
+        // preparation is repeated only when a concurrent aggregate write wins.
+        let run_id = generate_id(ID_LEN);
+        let group_id = generate_id(ID_LEN);
+        for _ in 0..32 {
+            let snapshot = self
+                .store
+                .get_task_webhook_admission_snapshot(trigger_id)
+                .await?
+                .ok_or(crate::TaskOperationError::AccessDenied)?;
+            let trigger = snapshot.trigger;
+            if !is_webhook_spec(&trigger.spec) {
+                return Err(crate::TaskOperationError::AccessDenied.into());
+            }
+            if trigger.webhook_secret_ref.as_deref() != Some(expected_secret_ref) {
+                return Err(crate::TaskOperationError::AccessDenied.into());
+            }
+            if trigger.status != TaskTriggerStatus::Active {
+                return Err(crate::TaskOperationError::StateConflict.into());
+            }
+            if !matches!(
+                snapshot.task.status,
+                TaskStatus::Waiting
+                    | TaskStatus::Scheduled
+                    | TaskStatus::Queued
+                    | TaskStatus::Running
+                    | TaskStatus::WaitingReview
+            ) || snapshot.task.finish_request().is_some()
+            {
+                return Err(crate::TaskOperationError::StateConflict.into());
+            }
+            let now = now_timestamp_secs();
+            let run = TaskRun {
+                trigger_input: Some(input.clone()),
+                id: run_id.clone(),
+                task_id: snapshot.task.id.clone(),
+                trigger_id: Some(trigger.id.clone()),
+                parent_run_id: None,
+                run_group_id: group_id.clone(),
+                attempt_number: 1,
+                retry_of_run_id: None,
+                ready_at: Some(now),
+                run_number: snapshot.next_run_number,
+                status: TaskRunStatus::Queued,
+                executor_kind: snapshot.task.executor_kind,
+                started_at: None,
+                completed_at: None,
+                heartbeat_at: None,
+                locked_by: None,
+                lock_expires_at: None,
+                result: None,
+                error: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let occurrence = build_occurrence_contract(
+                &snapshot.task,
+                &snapshot.actor,
+                &run.id,
+                Some(&trigger.id),
+                format!("webhook:{}", run.id),
+                snapshot.execution_generation,
+                now,
+            )?;
+            let spec = snapshot.agent_spec.map(|mut spec| {
+                spec.id = generate_id(ID_LEN);
+                spec.run_id = Some(run.id.clone());
+                spec.updated_at = now;
+                spec
+            });
+            let mut fired = trigger.clone();
+            fired.last_fire_at = Some(now);
+            fired.updated_at = now;
+            let events = vec![
+                TaskEventPayload::RunCreated {
+                    run: run.clone(),
+                    agent_spec: spec,
+                },
+                TaskEventPayload::TaskQueued {
+                    task_id: run.task_id.clone(),
+                    run_id: Some(run.id.clone()),
+                },
+                TaskEventPayload::TaskRescheduled {
+                    task_id: run.task_id.clone(),
+                    trigger: fired,
+                    rescheduled_at: now,
+                    reason: pioneer_protocol::TaskRescheduleReason::TriggerFired,
+                },
+            ];
+            if let Some(appended) = self
+                .store
+                .accept_task_webhook(&snapshot.task, &trigger, &run, occurrence, events)
+                .await?
+            {
+                self.publish_and_wake(appended).await;
+                return Ok(run);
+            }
+        }
+        bail!("webhook admission busy")
+    }
+
+    /// Enqueue an additional occurrence without consuming a schedule fire.
+    /// The caller must supply the canonical durable Agent action identity.
+    pub async fn run_task_now(
+        &self,
+        context: TaskMutationContext,
+        params: pioneer_protocol::TaskRunNowParams,
+    ) -> TaskRuntimeResult<pioneer_protocol::TaskRunNowResponse> {
+        let mut action = context
+            .agent_action_commit
+            .context("task_run_now requires a durable action identity")?;
+        if let Some(existing) =
+            pioneer_crud::load_agent_action(&self.store.database_connection(), &action.action.id)
+                .await?
+            && existing.status == "committed"
+        {
+            anyhow::ensure!(
+                existing.execution_id == action.action.execution_id
+                    && existing.request_fingerprint == action.request_fingerprint,
+                "manual run action identity conflict"
+            );
+            let receipt: serde_json::Value = serde_json::from_str(
+                existing
+                    .response_json
+                    .as_deref()
+                    .context("manual run receipt missing")?,
+            )?;
+            let run_id = receipt["taskRunNow"]["runId"]
+                .as_str()
+                .context("manual run reference missing")?;
+            let run = self
+                .store
+                .get_task_run(run_id)
+                .await?
+                .context("manual run missing")?;
+            anyhow::ensure!(run.task_id == params.task_id, "manual run task mismatch");
+            return Ok(pioneer_protocol::TaskRunNowResponse {
+                task_id: params.task_id,
+                run_id: run.id,
+            });
+        }
+        let run_id = generate_id(ID_LEN);
+        let group_id = generate_id(ID_LEN);
+        for _ in 0..32 {
+            let snapshot = self
+                .store
+                .get_task_queue_admission_snapshot(&params.task_id)
+                .await?
+                .context("task admission unavailable")?;
+            if !matches!(
+                snapshot.trigger.status,
+                TaskTriggerStatus::Active | TaskTriggerStatus::Exhausted
+            ) || is_terminal_task(snapshot.task.status)
+                || snapshot.task.status == TaskStatus::Blocked
+                || snapshot.task.finish_request().is_some()
+            {
+                return Err(crate::TaskOperationError::StateConflict.into());
+            }
+            let now = now_timestamp_secs();
+            let run = TaskRun {
+                trigger_input: None,
+                id: run_id.clone(),
+                task_id: params.task_id.clone(),
+                trigger_id: None,
+                parent_run_id: None,
+                run_group_id: group_id.clone(),
+                attempt_number: 1,
+                retry_of_run_id: None,
+                ready_at: Some(now),
+                run_number: snapshot.next_run_number,
+                status: TaskRunStatus::Queued,
+                executor_kind: snapshot.task.executor_kind,
+                started_at: None,
+                completed_at: None,
+                heartbeat_at: None,
+                locked_by: None,
+                lock_expires_at: None,
+                result: None,
+                error: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let occurrence = build_occurrence_contract(
+                &snapshot.task,
+                &snapshot.actor,
+                &run.id,
+                None,
+                format!("manual:{}", action.action.id),
+                snapshot.execution_generation,
+                now,
+            )?;
+            let spec = snapshot.agent_spec.map(|mut spec| {
+                spec.id = generate_id(ID_LEN);
+                spec.run_id = Some(run.id.clone());
+                spec.updated_at = now;
+                spec
+            });
+            let mut receipt: serde_json::Value =
+                serde_json::from_str(action.receipt_response_json.as_deref().unwrap_or("{}"))?;
+            receipt["taskRunNow"] = serde_json::json!({"taskId": params.task_id, "runId": run.id});
+            action.receipt_response_json = Some(serde_json::to_string(&receipt)?);
+            action.action_response_json = action.receipt_response_json.clone();
+            let events = vec![
+                TaskEventPayload::RunCreated {
+                    run: run.clone(),
+                    agent_spec: spec,
+                },
+                TaskEventPayload::TaskQueued {
+                    task_id: params.task_id.clone(),
+                    run_id: Some(run.id.clone()),
+                },
+            ];
+            if let Some((run_id, appended)) = self
+                .store
+                .accept_task_queued_occurrence(
+                    &snapshot.task,
+                    &snapshot.trigger,
+                    &run,
+                    occurrence,
+                    events,
+                    Some(action.clone()),
+                )
+                .await?
+            {
+                self.publish_and_wake(appended).await;
+                return Ok(pioneer_protocol::TaskRunNowResponse {
+                    task_id: params.task_id,
+                    run_id,
+                });
+            }
+        }
+        bail!("task_run_now admission busy")
     }
 
     pub async fn wait_tasks(
@@ -2456,7 +3056,92 @@ impl TaskService {
         self.collect_wait_state_for_plan(&plan).await
     }
 
+    pub async fn finish_task(
+        &self,
+        context: TaskMutationContext,
+        params: pioneer_protocol::TaskFinishParams,
+    ) -> TaskRuntimeResult<pioneer_protocol::TaskFinishResponse> {
+        self.ensure_execution_can_finish_task(&context, &params.task_id)
+            .await?;
+        let now = now_timestamp_secs();
+        let (already_finished, events) = self
+            .store
+            .request_task_finish(
+                &params.task_id,
+                params.reason,
+                now,
+                context.agent_action_commit,
+            )
+            .await?;
+        self.publish_and_wake(events).await;
+        loop {
+            let events = self
+                .store
+                .discard_finished_task_queue(&params.task_id, now)
+                .await?;
+            if events.is_empty() {
+                break;
+            }
+            self.publish_and_wake(events).await;
+        }
+        let task = self
+            .store
+            .get_task(&params.task_id)
+            .await?
+            .context("Task disappeared after finish")?
+            .task;
+        Ok(pioneer_protocol::TaskFinishResponse {
+            task,
+            already_finished,
+        })
+    }
+
+    async fn ensure_execution_can_finish_task(
+        &self,
+        context: &TaskMutationContext,
+        target_task_id: &str,
+    ) -> TaskRuntimeResult<()> {
+        if let (Some(thread_id), Some(turn_id)) =
+            (context.thread_id.as_deref(), context.turn_id.as_deref())
+            && let Some(turn) = self
+                .store
+                .get_task_run_turn_by_turn(thread_id, turn_id)
+                .await?
+            && turn.task_id == target_task_id
+        {
+            return Ok(());
+        }
+        // Preserve the complete ancestor guard; only exact self-finish gets
+        // an exception. Capsule/action/current-user authorization is upstream.
+        self.ensure_execution_can_cancel_task(context, target_task_id)
+            .await
+    }
+
     pub async fn cancel_task(
+        &self,
+        context: TaskMutationContext,
+        params: TaskCancelParams,
+    ) -> TaskRuntimeResult<TaskCancelResponse> {
+        for attempt in 0..8 {
+            match self.cancel_task_once(context.clone(), params.clone()).await {
+                Err(error)
+                    if attempt < 7
+                        && error
+                            .downcast_ref::<pioneer_crud::TaskCancellationRunsChanged>()
+                            .is_some() =>
+                {
+                    // Only this pre-commit run-set conflict permits rebuilding.
+                    // Generic errors, especially post-commit cleanup failures,
+                    // must retain their ordinary unconfirmed-operation meaning.
+                    continue;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("bounded cancellation retry always returns its last outcome")
+    }
+
+    async fn cancel_task_once(
         &self,
         context: TaskMutationContext,
         params: TaskCancelParams,
@@ -2748,6 +3433,11 @@ impl TaskService {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
+        if response.task.finish_request().is_some() {
+            return Err(anyhow::Error::new(crate::TaskOperationError::StateConflict)
+                .context("task_finish_requested: final stop cannot be reopened or updated"));
+        }
+
         if is_terminal_task(response.task.status) {
             return Err(
                 anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
@@ -2767,6 +3457,13 @@ impl TaskService {
             );
         }
 
+        if params
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.finish_request.is_some())
+        {
+            bail!("finishRequest is server-owned; use task_finish");
+        }
         let now = now_timestamp_secs();
         let wants_agent_update = update_has_agent_patch(&params);
         let mut task = response.task.clone();
@@ -2858,7 +3555,15 @@ impl TaskService {
         let mut updated_trigger = None;
         if let Some(trigger_input) = params.trigger {
             TaskTriggerCalculator::validate(&trigger_input.spec)?;
+            if is_webhook_spec(&trigger_input.spec)
+                && !current_trigger.as_ref().is_some_and(|trigger| {
+                    is_webhook_spec(&trigger.spec) && trigger.webhook_secret_ref.is_some()
+                })
+            {
+                bail!("a webhook endpoint must be provisioned by task_create");
+            }
             let mut trigger = current_trigger.clone().unwrap_or_else(|| TaskTrigger {
+                webhook_secret_ref: None,
                 id: generate_id(ID_LEN),
                 task_id: task.id.clone(),
                 status: TaskTriggerStatus::Active,
@@ -2874,6 +3579,10 @@ impl TaskService {
                 || trigger.status != TaskTriggerStatus::Active
                 || trigger.next_fire_at != next_fire_at;
             if changed {
+                if !is_webhook_spec(&trigger_input.spec) {
+                    trigger.webhook_secret_ref = None;
+                }
+                trigger.last_fire_at = None;
                 trigger.spec = trigger_input.spec;
                 trigger.status = TaskTriggerStatus::Active;
                 trigger.next_fire_at = next_fire_at;
@@ -2888,6 +3597,10 @@ impl TaskService {
             .or(current_trigger.as_ref())
             .map(TaskTrigger::kind)
             .unwrap_or(TaskTriggerKind::Immediate);
+        let final_trigger_is_webhook = updated_trigger
+            .as_ref()
+            .or(current_trigger.as_ref())
+            .is_some_and(|trigger| is_webhook_spec(&trigger.spec));
         let mut updated_agent_spec = None;
         let task_goal_changed = changed_fields.iter().any(|field| field == "goal");
         let existing_base_agent_spec = response
@@ -3044,7 +3757,11 @@ impl TaskService {
                         &mut changed_fields,
                     );
                 }
-                validate_agent_prompt_for_trigger(final_trigger_kind, &spec.prompt)?;
+                validate_agent_prompt_for_trigger(
+                    final_trigger_kind,
+                    final_trigger_is_webhook,
+                    &spec.prompt,
+                )?;
                 if materialized_base_agent_spec {
                     push_changed(&mut changed_fields, "agentSpec");
                 }
@@ -3053,7 +3770,11 @@ impl TaskService {
                     updated_agent_spec = Some(spec);
                 }
             } else if let Some(agent_spec) = base_agent_spec.as_ref() {
-                validate_agent_prompt_for_trigger(final_trigger_kind, &agent_spec.prompt)?;
+                validate_agent_prompt_for_trigger(
+                    final_trigger_kind,
+                    final_trigger_is_webhook,
+                    &agent_spec.prompt,
+                )?;
             } else if matches!(
                 final_trigger_kind,
                 TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
@@ -3123,6 +3844,11 @@ impl TaskService {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
+        if response.task.finish_request().is_some() {
+            return Err(anyhow::Error::new(crate::TaskOperationError::StateConflict)
+                .context("task_finish_requested: final stop cannot be reopened or updated"));
+        }
+
         if is_terminal_task(response.task.status) {
             return Err(
                 anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
@@ -3132,6 +3858,13 @@ impl TaskService {
             );
         }
         TaskTriggerCalculator::validate(&params.trigger.spec)?;
+        if is_webhook_spec(&params.trigger.spec)
+            && !response.triggers.last().is_some_and(|trigger| {
+                is_webhook_spec(&trigger.spec) && trigger.webhook_secret_ref.is_some()
+            })
+        {
+            bail!("a webhook endpoint must be provisioned by task_create");
+        }
         let now = now_timestamp_secs();
         let trigger_id = response
             .triggers
@@ -3140,15 +3873,21 @@ impl TaskService {
             .unwrap_or_else(|| generate_id(ID_LEN));
         let next_fire_at = TaskTriggerCalculator::initial_next_fire_at(&params.trigger.spec, now)?;
         let trigger = TaskTrigger {
+            webhook_secret_ref: if is_webhook_spec(&params.trigger.spec) {
+                response
+                    .triggers
+                    .last()
+                    .and_then(|trigger| trigger.webhook_secret_ref.clone())
+            } else {
+                None
+            },
             id: trigger_id,
             task_id: params.task_id.clone(),
             status: TaskTriggerStatus::Active,
             spec: params.trigger.spec,
             next_fire_at,
-            last_fire_at: response
-                .triggers
-                .last()
-                .and_then(|trigger| trigger.last_fire_at),
+            // A user replacement starts a fresh assignment on the same endpoint.
+            last_fire_at: None,
             created_at: response
                 .triggers
                 .last()
@@ -3197,6 +3936,7 @@ impl TaskService {
             return Ok(TaskPauseResponse {
                 task: response.task,
                 triggers: response.triggers,
+                schedule_outcome: Some(pioneer_protocol::TaskPauseScheduleOutcome::NotApplied),
             });
         }
         let now = now_timestamp_secs();
@@ -3226,7 +3966,21 @@ impl TaskService {
         ))
         .await?;
         self.publish_and_wake(appended).await;
-        Ok(TaskPauseResponse { task, triggers })
+        let schedule_outcome = Some(
+            if triggers
+                .iter()
+                .any(|trigger| trigger.status == TaskTriggerStatus::Paused)
+            {
+                pioneer_protocol::TaskPauseScheduleOutcome::Paused
+            } else {
+                pioneer_protocol::TaskPauseScheduleOutcome::NoFutureFirings
+            },
+        );
+        Ok(TaskPauseResponse {
+            task,
+            triggers,
+            schedule_outcome,
+        })
     }
 
     pub async fn resume_task(
@@ -3238,6 +3992,11 @@ impl TaskService {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
+        if response.task.finish_request().is_some() {
+            return Err(anyhow::Error::new(crate::TaskOperationError::StateConflict)
+                .context("task_finish_requested: final stop cannot be reopened or updated"));
+        }
+
         let was_blocked = response.task.status == TaskStatus::Blocked;
         if is_terminal_task(response.task.status) && !was_blocked {
             return Err(
@@ -3997,7 +4756,13 @@ impl TaskService {
         }) else {
             return Ok(());
         };
-        if !self.config.review.enabled || !self.config.review.allow_task_create_review_policy {
+        // The fixed built-in choice is available without advanced policy admission.
+        // Compare the whole policy, including the configured revision budget;
+        // the timeout opt-in alone must not admit arbitrary reviewer policies.
+        if !self.config.review.enabled
+            || (!self.config.review.allow_task_create_review_policy
+                && review_policy != &self.explicit_review_policy())
+        {
             bail!(
                 "task review policy `{}` is not enabled for task_create",
                 serde_json::to_value(review_policy.mode)
@@ -4009,34 +4774,13 @@ impl TaskService {
         Ok(())
     }
 
-    fn effective_agent_review_policy_for_create(
-        &self,
-        params: &TaskCreateParams,
-        trigger_kind: TaskTriggerKind,
-        lifecycle_policy: &TaskLifecyclePolicy,
-    ) -> Option<TaskAgentReviewPolicy> {
-        let explicit_policy = params
-            .agent_spec
-            .as_ref()
-            .and_then(|spec| spec.review_policy.clone());
-        if explicit_policy.is_some() {
-            return explicit_policy;
-        }
-        if params.agent_spec.is_none()
-            || params.executor_kind != TaskExecutorKind::Agent
-            || trigger_kind != TaskTriggerKind::Immediate
-            || lifecycle_policy.attachment != TaskAttachmentMode::Attached
-            || !self.config.review.enabled
-            || !self
-                .config
-                .review
-                .default_parent_review_for_immediate_attached_agent_tasks
-        {
-            return None;
-        }
-        Some(TaskAgentReviewPolicy::parent_agent_default(
+    /// Model-facing explicit review uses the configured revision budget.
+    pub fn explicit_review_policy(&self) -> TaskAgentReviewPolicy {
+        let mut policy = TaskAgentReviewPolicy::parent_agent_default(
             self.config.review.default_max_revision_rounds,
-        ))
+        );
+        policy.disable_timeout_acceptance = true;
+        policy
     }
 
     pub async fn acquire_write_locks_for_run(
@@ -4364,11 +5108,7 @@ impl TaskService {
             }
             bail!("parent task `{parent_task_id}` not found");
         }
-        Ok(ParentContext {
-            root_task_id: None,
-            depth: 1,
-            max_depth: DEFAULT_MAX_TASK_DEPTH,
-        })
+        Ok(ParentContext::root())
     }
 
     async fn collaboration_root_thread_id(&self, thread_id: &str) -> TaskRuntimeResult<String> {
@@ -4517,26 +5257,7 @@ impl TaskService {
         else {
             return Ok(None);
         };
-        let review_policy = wait_review_policy(response, run).cloned();
-        let max_revision_rounds = review_policy
-            .as_ref()
-            .map(|policy| policy.max_revision_rounds)
-            .unwrap_or_default();
-        let remaining_revision_rounds = max_revision_rounds.saturating_sub(candidate.round);
-        let allowed_actions =
-            wait_review_allowed_actions(candidate.status, remaining_revision_rounds);
-        let revision_blocked_reason =
-            wait_review_revision_blocked_reason(candidate.status, remaining_revision_rounds);
-
-        Ok(Some(TaskWaitReviewItem {
-            item,
-            candidate,
-            review_policy,
-            max_revision_rounds,
-            remaining_revision_rounds,
-            allowed_actions,
-            revision_blocked_reason,
-        }))
+        Ok(Some(task_review_wait_item(response, item, candidate)))
     }
 
     async fn build_wait_target_plan(
@@ -4952,6 +5673,16 @@ struct ParentContext {
     max_depth: i64,
 }
 
+impl ParentContext {
+    fn root() -> Self {
+        Self {
+            root_task_id: None,
+            depth: 1,
+            max_depth: DEFAULT_MAX_TASK_DEPTH,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteLockDecision {
     NoLocksRequired,
@@ -5154,7 +5885,7 @@ fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
             bail!("agent executor requires agent_spec.security_cap");
         }
         if !has_composer_work {
-            validate_agent_spec_for_trigger(params.trigger.spec.kind(), agent_spec)?;
+            validate_agent_spec_for_trigger(&params.trigger.spec, agent_spec)?;
         }
     }
     if params.owner_kind == TaskOwnerKind::Thread && params.owner_id.is_none() {
@@ -5278,20 +6009,23 @@ fn update_has_agent_patch(params: &TaskUpdateParams) -> bool {
 }
 
 fn validate_agent_spec_for_trigger(
-    trigger_kind: TaskTriggerKind,
+    trigger: &pioneer_protocol::TaskTriggerSpec,
     agent_spec: &pioneer_protocol::TaskAgentSpecInput,
 ) -> TaskRuntimeResult<()> {
-    validate_agent_prompt_for_trigger(trigger_kind, &agent_spec.prompt)
+    validate_agent_prompt_for_trigger(trigger.kind(), is_webhook_spec(trigger), &agent_spec.prompt)
 }
 
 fn validate_agent_prompt_for_trigger(
     trigger_kind: TaskTriggerKind,
+    webhook: bool,
     prompt: &TaskAgentPrompt,
 ) -> TaskRuntimeResult<()> {
-    if !matches!(
-        trigger_kind,
-        TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
-    ) {
+    if !webhook
+        && !matches!(
+            trigger_kind,
+            TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+        )
+    {
         return Ok(());
     }
 
@@ -5710,23 +6444,16 @@ fn validate_no_active_candidate_child_turn(
 
 fn resolve_parent_or_user_review_actor(
     context: &TaskMutationContext,
-    response: &TaskGetResponse,
     candidate: &TaskResultCandidate,
     action: &str,
 ) -> TaskRuntimeResult<TaskResultReviewActor> {
     if let (Some(thread_id), Some(turn_id)) =
         (context.thread_id.as_deref(), context.turn_id.as_deref())
     {
-        if thread_id == candidate.thread_id {
+        if action != "read" && thread_id == candidate.thread_id {
             bail!(
                 "candidate source thread `{}` cannot accept its own result",
                 candidate.thread_id
-            );
-        }
-        if !parent_agent_can_review_candidate(thread_id, turn_id, response, candidate) {
-            bail!(
-                "parent agent thread `{thread_id}` turn `{turn_id}` cannot {action} candidate `{}`",
-                candidate.id
             );
         }
         return Ok(TaskResultReviewActor {
@@ -5769,38 +6496,6 @@ fn resolve_parent_or_user_review_actor(
         reviewer_turn_id: None,
         reviewer_user_id: Some(user_id.to_owned()),
         reviewer_agent_spec_id: None,
-    })
-}
-
-fn parent_agent_can_review_candidate(
-    thread_id: &str,
-    turn_id: &str,
-    response: &TaskGetResponse,
-    candidate: &TaskResultCandidate,
-) -> bool {
-    if response.task.created_by_thread_id.as_deref() == Some(thread_id) {
-        return response
-            .task
-            .created_by_turn_id
-            .as_deref()
-            .map_or(true, |created_by_turn_id| created_by_turn_id == turn_id);
-    }
-
-    if response.task.owner_kind == TaskOwnerKind::Thread
-        && response.task.owner_id.as_deref() == Some(thread_id)
-        && response.task.created_by_turn_id.is_none()
-    {
-        return true;
-    }
-
-    response.thread_lineage.iter().any(|lineage| {
-        lineage.child_thread_id == candidate.thread_id
-            && lineage
-                .created_by_thread_id
-                .as_deref()
-                .unwrap_or(lineage.parent_thread_id.as_str())
-                == thread_id
-            && lineage.created_by_turn_id.as_deref() == Some(turn_id)
     })
 }
 
@@ -5979,7 +6674,7 @@ fn new_task_execution_admission(
         matches!(
             trigger.kind(),
             TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
-        )
+        ) || is_webhook_spec(&trigger.spec)
     });
     Ok(pioneer_crud::NewTaskExecutionAdmission {
         task_id: task.id.clone(),
@@ -6155,6 +6850,33 @@ fn wait_item_state(item: &TaskWaitItem) -> WaitItemState {
     }
 }
 
+/// Shared lifecycle projection for wait and ordinary task observation.
+pub fn task_review_wait_item(
+    response: &TaskGetResponse,
+    item: TaskWaitItem,
+    candidate: TaskResultCandidate,
+) -> TaskWaitReviewItem {
+    let run = item.run.as_ref().expect("review item has a run");
+    let review_policy = wait_review_policy(response, run).cloned();
+    let max_revision_rounds = review_policy
+        .as_ref()
+        .map(|policy| policy.max_revision_rounds)
+        .unwrap_or_default();
+    let remaining_revision_rounds = max_revision_rounds.saturating_sub(candidate.round);
+    let allowed_actions = wait_review_allowed_actions(candidate.status, remaining_revision_rounds);
+    let revision_blocked_reason =
+        wait_review_revision_blocked_reason(candidate.status, remaining_revision_rounds);
+
+    TaskWaitReviewItem {
+        item,
+        candidate,
+        review_policy,
+        max_revision_rounds,
+        remaining_revision_rounds,
+        allowed_actions,
+        revision_blocked_reason,
+    }
+}
 fn wait_review_policy<'a>(
     response: &'a TaskGetResponse,
     run: &TaskRun,

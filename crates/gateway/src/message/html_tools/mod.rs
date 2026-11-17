@@ -1,6 +1,8 @@
 //! First-party HTML execution. Context and canonical call identity are supplied
 //! by the Gateway, while both provider paths use the same implementation.
 mod browser;
+mod publications;
+mod theme;
 use super::MessageProcessor;
 use async_trait::async_trait;
 use pioneer_agent::TurnToolContext;
@@ -9,9 +11,7 @@ use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
     ArtifactRole, ArtifactSummary,
 };
-use pioneer_tools::html::{
-    self, Appearance, HTML_PREVIEW, HTML_RENDER, PreviewParams, RenderParams,
-};
+use pioneer_tools::html::{self, HTML_PREVIEW, HTML_RENDER, PreviewParams, RenderParams};
 use pioneer_tools::{
     FunctionToolOutput, ToolError, ToolExtensionBundle, ToolHandler, ToolInvocation, ToolOutput,
     ToolPayload,
@@ -81,6 +81,7 @@ impl MessageProcessor {
                             ArtifactKind::File,
                             "text/html",
                             true,
+                            1,
                             Value::Null,
                             cancel,
                         )
@@ -119,10 +120,54 @@ impl MessageProcessor {
                         .map_err(|e| ToolError::invalid_arguments(e.to_string()))?;
                     html::validate_html(&params.html)?;
                     self.html_preview_vision(context).await?;
-                    let input = self.html_ingest(context, call, "input", params.html.as_bytes().to_vec(), "HTML preview source", ArtifactKind::File, "text/html", false, json!({"appearance":if matches!(params.appearance,Appearance::Dark) {"dark"} else {"light"}}), cancel).await?;
+                    // A recorded v1 call can recover its exact stored source and frames;
+                    // metadata is never upgraded in place or used to synthesize images.
+                    let source_id = html_identity(context, call, "input");
+                    let legacy = match self
+                        .artifact_service
+                        .get_artifact(&context.workspace_id, &source_id, None)
+                        .await
+                    {
+                        Ok(source) => source.metadata["htmlTool"]["version"] == 1,
+                        Err(pioneer_artifacts::ArtifactError::NotFound { .. }) => false,
+                        Err(error) => return Err(ToolError::execution_failed(error.to_string())),
+                    };
+                    let details = if legacy {
+                        json!({"appearance":if matches!(params.appearance, html::Appearance::Dark) {"dark"} else {"light"}})
+                    } else {
+                        json!({"formatVersion":2})
+                    };
+                    let input = self
+                        .html_ingest(
+                            context,
+                            call,
+                            "input",
+                            params.html.as_bytes().to_vec(),
+                            "HTML preview source",
+                            ArtifactKind::File,
+                            "text/html",
+                            false,
+                            if legacy { 1 } else { 2 },
+                            details,
+                            cancel,
+                        )
+                        .await?;
+                    let frames: Vec<(Option<&str>, u32, String)> = if legacy {
+                        html::PREVIEW_WIDTHS
+                            .iter()
+                            .map(|&width| (None, width, width.to_string()))
+                            .collect()
+                    } else {
+                        html::PREVIEW_FRAMES
+                            .iter()
+                            .map(|&(appearance, width)| {
+                                (Some(appearance), width, format!("{appearance}-{width}"))
+                            })
+                            .collect()
+                    };
                     let mut stored = std::collections::HashMap::new();
-                    for width in html::PREVIEW_WIDTHS {
-                        let id = html_identity(context, call, &width.to_string());
+                    for (_, _, index) in &frames {
+                        let id = html_identity(context, call, index);
                         match self
                             .artifact_service
                             .get_artifact(&context.workspace_id, &id, None)
@@ -132,9 +177,27 @@ impl MessageProcessor {
                                 if summary.artifact.status
                                     == pioneer_protocol::ArtifactStatus::Ready
                                     && summary.created_by_actor_id.as_deref()
-                                        == Some(HTML_PREVIEW) =>
+                                        == Some(HTML_PREVIEW)
+                                    && summary.metadata["htmlTool"]["version"]
+                                        == (if legacy { 1 } else { 2 })
+                                    && summary.metadata["htmlTool"]["index"] == index.as_str()
+                                    && summary.metadata["htmlTool"]["turnId"]
+                                        == context.turn_id
+                                    && summary.metadata["htmlTool"]["callId"] == call
+                                    && summary.bindings.iter().any(|binding| {
+                                        binding.thread_id.as_deref()
+                                            == Some(context.thread_id.as_str())
+                                            && binding.turn_id.as_deref()
+                                                == Some(context.turn_id.as_str())
+                                            && binding.tool_call_id.as_deref() == Some(call)
+                                            && binding.version_id == summary.artifact.version_id
+                                            && binding.binding_kind
+                                                == ArtifactBindingKind::ToolOutput
+                                            && binding.direction == ArtifactBindingDirection::Output
+                                            && binding.role == Some(ArtifactRole::Tool)
+                                    }) =>
                             {
-                                stored.insert(width, summary);
+                                stored.insert(index.clone(), summary);
                             }
                             Ok(_) => {
                                 return Err(ToolError::execution_failed(
@@ -147,12 +210,15 @@ impl MessageProcessor {
                     }
                     // Recover committed screenshots after a crash without changing
                     // their bytes or diagnostics. Missing presets use fresh contexts.
-                    let captures = if stored.len() == 3 {
+                    let captures = if stored.len() == frames.len() {
                         Vec::new()
+                    } else if legacy {
+                        return Err(ToolError::execution_failed(
+                            "legacy preview is incomplete; saved screenshots cannot be regenerated",
+                        ));
                     } else {
                         browser::capture(
                             &params.html,
-                            matches!(params.appearance, Appearance::Dark),
                             &self.artifact_runtime_home.join("html-preview"),
                             cancel,
                         )
@@ -169,39 +235,43 @@ impl MessageProcessor {
                         if cancel.is_cancelled() {
                             return Err(ToolError::cancelled("HTML preview cancelled"));
                         }
-                        if stored.contains_key(&capture.width) {
+                        let index = format!("{}-{}", capture.appearance, capture.width);
+                        if stored.contains_key(&index) {
                             continue;
                         }
-                        let details = json!({"width":capture.width,"contentHeight":capture.content_height,"capturedHeight":capture.captured_height,"diagnostics":capture.diagnostics});
+                        let details = json!({"appearance":capture.appearance,"width":capture.width,"contentHeight":capture.content_height,"capturedHeight":capture.captured_height,"diagnostics":capture.diagnostics});
                         let summary = self
                             .html_ingest(
                                 context,
                                 call,
-                                &capture.width.to_string(),
+                                &index,
                                 capture.png,
-                                &format!("HTML preview {}px", capture.width),
+                                &format!("HTML preview {} {}px", capture.appearance, capture.width),
                                 ArtifactKind::Screenshot,
                                 "image/png",
                                 false,
+                                2,
                                 details,
                                 cancel,
                             )
                             .await?;
-                        stored.insert(capture.width, summary);
+                        stored.insert(index, summary);
                     }
-                    let mut previews = Vec::with_capacity(3);
-                    let mut images = Vec::with_capacity(3);
-                    let mut media = Vec::with_capacity(6);
+                    let mut previews = Vec::with_capacity(frames.len());
+                    let mut images = Vec::with_capacity(frames.len());
+                    let mut media = Vec::with_capacity(frames.len() * 2);
                     let mut bytes = 0u64;
-                    for width in html::PREVIEW_WIDTHS {
-                        let summary = stored.remove(&width).ok_or_else(|| {
-                            ToolError::execution_failed("preview must contain all three presets")
+                    for (appearance, width, index) in frames {
+                        let summary = stored.remove(&index).ok_or_else(|| {
+                            ToolError::execution_failed(
+                                "preview must contain the complete ordered preset set",
+                            )
                         })?;
                         bytes =
                             bytes.saturating_add(summary.artifact.size_bytes.unwrap_or(u64::MAX));
                         if bytes > browser::SCREENSHOT_BUDGET as u64 {
                             return Err(ToolError::execution_failed(
-                                "three preview images exceed the shared transport budget",
+                                "preview images exceed the shared transport budget",
                             ));
                         }
                         let resolved = self
@@ -216,7 +286,10 @@ impl MessageProcessor {
                                 ToolError::execution_failed("exact preview screenshot unavailable")
                             })?;
                         let details = summary.metadata["htmlTool"]["details"].clone();
-                        if details["width"] != width {
+                        if details["width"] != width
+                            || appearance
+                                .is_some_and(|appearance| details["appearance"] != appearance)
+                        {
                             return Err(ToolError::execution_failed(
                                 "preview screenshot diagnostics are missing",
                             ));
@@ -224,15 +297,26 @@ impl MessageProcessor {
                         let mut preview = details;
                         preview["artifact"] = json!(summary.artifact);
                         previews.push(preview);
-                        media.push(pioneer_provider::MessageContentPart::text(format!(
-                            "HTML preview — {width} CSS px"
-                        )));
+                        let caption = match appearance {
+                            Some(appearance) => {
+                                format!("HTML preview — {appearance} {width} CSS px")
+                            }
+                            None => format!("HTML preview — {width} CSS px"),
+                        };
+                        media.push(pioneer_provider::MessageContentPart::text(caption));
                         media.push(pioneer_provider::MessageContentPart::image(
                             resolved.attachment.clone(),
                         ));
-                        images.push(json!({"width":width,"attachment":resolved.attachment}));
+                        let mut image = json!({"width":width,"attachment":resolved.attachment});
+                        if let Some(appearance) = appearance {
+                            image["appearance"] = appearance.into();
+                        }
+                        images.push(image);
                     }
-                    let value = json!({"source":input.artifact,"previews":previews,"llm_context":{"images":images}});
+                    let mut value = json!({"source":input.artifact,"previews":previews,"llm_context":{"images":images}});
+                    if !legacy {
+                        value["formatVersion"] = 2.into();
+                    }
                     let pioneer_tools::LlmOutputPolicy::Structured { max_bytes } =
                         pioneer_tools::ToolOutputPolicySnapshot::for_tool_name(HTML_PREVIEW).llm
                     else {
@@ -423,6 +507,8 @@ impl MessageProcessor {
         );
         result.content_parts = parts;
         let request = pioneer_provider::ChatRequest {
+            tool_declarations: None,
+            service_mode: None,
             model: model_id.into(),
             messages: vec![
                 pioneer_provider::ChatMessage::assistant_tool_calls(
@@ -547,13 +633,14 @@ impl MessageProcessor {
         kind: ArtifactKind,
         mime: &str,
         publication: bool,
+        format_version: u32,
         details: Value,
         cancel: &CancellationToken,
     ) -> Result<ArtifactSummary, ToolError> {
         let generation = self.html_authorize(context).await?;
         let identity = html_identity(context, call, index);
         let mut metadata = BTreeMap::new();
-        metadata.insert("htmlTool".into(), json!({"version":1,"publication":publication,"turnId":context.turn_id,"callId":call,"index":index,"title":title,"details":details}));
+        metadata.insert("htmlTool".into(), json!({"version":format_version,"publication":publication,"turnId":context.turn_id,"callId":call,"index":index,"title":title,"details":details}));
         self.artifact_service
             .ingest_tool_bytes(
                 IngestArtifactBytesRequest {
@@ -620,7 +707,7 @@ impl ToolHandler for HtmlHandler {
         };
         let activity = tokio::select! { biased;
             _ = invocation.cancellation.cancelled() => return Err(ToolError::cancelled("HTML invocation cancelled")),
-            guard = self.processor.artifact_service.html_preview_activity() => guard,
+            guard = self.processor.artifact_service.html_preview_activity_signaled() => guard,
         };
         let value = self
             .processor
@@ -643,7 +730,7 @@ impl ToolHandler for HtmlHandler {
 // context/snapshots then protect the subsequent provider request and recovery.
 struct HtmlOutput {
     inner: FunctionToolOutput,
-    _activity: tokio::sync::OwnedRwLockReadGuard<()>,
+    _activity: pioneer_artifacts::HtmlPreviewActivityGuard,
 }
 impl ToolOutput for HtmlOutput {
     fn success(&self) -> bool {
@@ -667,14 +754,9 @@ impl ToolOutput for HtmlOutput {
 /// Theme appears before authored scripts and content. No credentials, source URL,
 /// filesystem access or Gateway/native RPC is injected into the document.
 fn prepared_document(html: &str, dark: bool) -> String {
-    let (background, foreground, muted, border, accent) = if dark {
-        ("#18181b", "#fafafa", "#a1a1aa", "#3f3f46", "#60a5fa")
-    } else {
-        ("#ffffff", "#18181b", "#71717a", "#d4d4d8", "#2563eb")
-    };
+    let theme = theme::standard_theme_css(dark);
     format!(
-        "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>:root{{color-scheme:{};--pioneer-background:{background};--pioneer-foreground:{foreground};--pioneer-muted:{muted};--pioneer-border:{border};--pioneer-accent:{accent}}}html,body{{margin:0;background:var(--pioneer-background);color:var(--pioneer-foreground)}}</style>{html}",
-        if dark { "dark" } else { "light" }
+        "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>{theme}html,body{{margin:0;background:var(--pioneer-background);color:var(--pioneer-foreground)}}</style>{html}"
     )
 }
 
@@ -695,240 +777,4 @@ fn html_identity(context: &TurnToolContext, call: &str, index: &str) -> String {
     hex::encode(Sha256::digest(identity))
 }
 
-impl super::MessageProcessor {
-    pub(super) async fn html_publications_for_response_turn(
-        &self,
-        workspace: &str,
-        thread: &str,
-        turn: &str,
-    ) -> anyhow::Result<Vec<pioneer_protocol::HtmlPublication>> {
-        let page = self
-            .artifact_service
-            .list_artifacts(
-                workspace,
-                pioneer_artifacts::ArtifactListFilter {
-                    thread_id: Some(thread.to_owned()),
-                    turn_id: Some(turn.to_owned()),
-                    include_deleted: true,
-                    created_by_actor_id: Some(pioneer_tools::html::HTML_RENDER.into()),
-                    limit: Some(200),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        if page.next_cursor.is_some() {
-            return Err(anyhow::anyhow!(
-                "turn artifact publication page exceeds timeline delivery budget"
-            ));
-        }
-        let mut publications = Vec::new();
-        for mut summary in page.items {
-            let exact = summary
-                .bindings
-                .iter()
-                .find(|binding| {
-                    binding.thread_id.as_deref() == Some(thread)
-                        && binding.turn_id.as_deref() == Some(turn)
-                        && binding.binding_kind == pioneer_protocol::ArtifactBindingKind::ToolOutput
-                        && binding.direction == pioneer_protocol::ArtifactBindingDirection::Output
-                        && binding.role == Some(pioneer_protocol::ArtifactRole::Tool)
-                })
-                .and_then(|binding| binding.version_id.clone());
-            if exact != summary.artifact.version_id {
-                summary = self
-                    .artifact_service
-                    .get_artifact(workspace, &summary.artifact.artifact_id, exact.as_deref())
-                    .await?;
-            }
-            let publication =
-                pioneer_protocol::HtmlPublication::from_summary(&summary, thread, turn);
-            let Some(publication) = publication else {
-                continue;
-            };
-            let order = summary
-                .bindings
-                .iter()
-                .filter(|b| {
-                    b.thread_id.as_deref() == Some(thread)
-                        && b.turn_id.as_deref() == Some(turn)
-                        && b.tool_call_id.as_deref() == Some(publication.call_id.as_str())
-                        && b.version_id == publication.artifact.version_id
-                        && b.binding_kind == pioneer_protocol::ArtifactBindingKind::ToolOutput
-                        && b.direction == pioneer_protocol::ArtifactBindingDirection::Output
-                        && b.role == Some(pioneer_protocol::ArtifactRole::Tool)
-                })
-                .filter_map(|b| b.item_index)
-                .min()
-                .unwrap_or(i64::MAX);
-            // The original binding is immutable; CLI echoes/projection rebuilds
-            // must not move documents already attached to an agent response.
-            publications.push((
-                (
-                    order,
-                    summary.created_at,
-                    publication.call_id.clone(),
-                    publication.artifact.artifact_id.clone(),
-                ),
-                publication,
-            ));
-        }
-        publications.sort_by(|(left, _), (right, _)| left.cmp(right));
-        Ok(publications
-            .into_iter()
-            .map(|(_, publication)| publication)
-            .collect())
-    }
-}
-
-impl MessageProcessor {
-    /// Called only for an existing canonical final response block. Delivery
-    /// supplies the destination; immutable source ownership is never rewritten.
-    pub(super) async fn html_publications_for_agent_response(
-        &self,
-        workspace: &str,
-        thread: &str,
-        turn: &str,
-        item: &str,
-    ) -> anyhow::Result<Vec<pioneer_protocol::HtmlPublication>> {
-        let Some(delivery_id) = pioneer_protocol::task_delivery_id_from_result_item_id(item) else {
-            return self
-                .html_publications_for_response_turn(workspace, thread, turn)
-                .await;
-        };
-        // The same committed response item that renders final text is required.
-        // Delivery preparation alone must not expose pending or cancelled content.
-        if !self
-            .crud_store
-            .get_turn_item(turn, item)
-            .await?
-            .is_some_and(|item| {
-                matches!(
-                    item,
-                    pioneer_protocol::TurnItem::AgentMessage {
-                        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
-                        ..
-                    }
-                )
-            })
-        {
-            return Ok(Vec::new());
-        }
-        let Some(delivery) = self.crud_store.get_task_delivery(delivery_id).await? else {
-            return Ok(Vec::new());
-        };
-        if delivery.workspace_id != workspace
-            || delivery.target_thread_id.as_deref() != Some(thread)
-            || delivery.error_snapshot.is_some()
-            || delivery
-                .delivered_turn_id
-                .as_deref()
-                .is_some_and(|id| id != turn)
-        {
-            return Ok(Vec::new());
-        }
-        let Some(result) = &delivery.result_snapshot else {
-            return Ok(Vec::new());
-        };
-        let mut sources = Vec::new();
-        for artifact in &result.artifacts {
-            if let Some(pioneer_protocol::TaskValue::Object(metadata)) = &artifact.metadata {
-                if let (
-                    Some(pioneer_protocol::TaskValue::String(source_thread)),
-                    Some(pioneer_protocol::TaskValue::String(source_turn)),
-                ) = (
-                    metadata.get("htmlSourceThreadId"),
-                    metadata.get("htmlSourceTurnId"),
-                ) {
-                    sources.push((source_thread.clone(), source_turn.clone()));
-                }
-            }
-        }
-        // Durable pre-integration deliveries already pin their source item in
-        // the fallback result. Recover on bounded reads, without rewriting DB.
-        let legacy = result.artifacts.is_empty();
-        if legacy {
-            if let Some(pioneer_protocol::TaskValue::Object(data)) = &result.data {
-                if data.get("fallbackUsed") != Some(&pioneer_protocol::TaskValue::Bool(true))
-                    || data.get("schemaValid") != Some(&pioneer_protocol::TaskValue::Bool(false))
-                {
-                    return Ok(Vec::new());
-                }
-                if let (
-                    Some(pioneer_protocol::TaskValue::String(source_thread)),
-                    Some(pioneer_protocol::TaskValue::String(source_turn)),
-                    Some(pioneer_protocol::TaskValue::String(source_item)),
-                ) = (
-                    data.get("sourceThreadId"),
-                    data.get("sourceTurnId"),
-                    data.get("sourceItemId"),
-                ) {
-                    if self
-                        .crud_store
-                        .get_turn_item(source_turn, source_item)
-                        .await?
-                        .is_some_and(|item| {
-                            matches!(
-                                item,
-                                pioneer_protocol::TurnItem::AgentMessage {
-                                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
-                                    ..
-                                }
-                            )
-                        })
-                    {
-                        sources.push((source_thread.clone(), source_turn.clone()));
-                    }
-                }
-            }
-        }
-        sources.sort();
-        sources.dedup();
-        let mut publications = Vec::new();
-        for (source_thread, source_turn) in sources {
-            let Some(execution) = self
-                .crud_store
-                .get_task_run_turn_by_turn(&source_thread, &source_turn)
-                .await?
-            else {
-                continue;
-            };
-            if execution.run_id != delivery.run_id
-                || execution.task_id != delivery.task_id
-                || execution.kind == pioneer_protocol::TaskRunTurnKind::Review
-            {
-                continue;
-            }
-            if legacy
-                && !self
-                    .crud_store
-                    .get_task_result_candidate_by_turn(&execution.id)
-                    .await?
-                    .is_some_and(|candidate| {
-                        candidate.task_id == delivery.task_id
-                            && candidate.run_id == delivery.run_id
-                            && candidate.thread_id == source_thread
-                            && candidate.turn_id == source_turn
-                            && candidate.result.as_ref() == Some(result)
-                    })
-            {
-                continue;
-            }
-            // Approval/cancellation visibility belongs to the committed delivery
-            // response, not mutable candidate status after that response exists.
-            for publication in self
-                .html_publications_for_response_turn(workspace, &source_thread, &source_turn)
-                .await?
-            {
-                if legacy
-                    || result.artifacts.iter().any(|artifact| {
-                        artifact.artifact_id.as_ref() == Some(&publication.artifact.artifact_id)
-                            && artifact.version_id == publication.artifact.version_id
-                    })
-                {
-                    publications.push(publication);
-                }
-            }
-        }
-        Ok(publications)
-    }
-}
+impl super::MessageProcessor {}

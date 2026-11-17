@@ -3,10 +3,9 @@ use sha2::{Digest, Sha256};
 
 const MEMORY_POST_TURN_RUNTIME_FINGERPRINT_KEY: &str = "runtime_config_sha256";
 
-pub(super) fn memory_policy_classifier_capabilities() -> HookCapabilities {
+pub(super) fn memory_policy_capabilities() -> HookCapabilities {
     HookCapabilities::new([
         HookCapability::new("memory").expect("static capability is valid"),
-        HookCapability::new("call_provider").expect("static capability is valid"),
         HookCapability::new("contribute_policy").expect("static capability is valid"),
     ])
 }
@@ -17,24 +16,6 @@ pub(super) fn memory_tool_bundle_capabilities() -> HookCapabilities {
         HookCapability::new("read_domain_context").expect("static capability is valid"),
         HookCapability::new("write_domain_context").expect("static capability is valid"),
         HookCapability::new("contribute_tool_bundle").expect("static capability is valid"),
-    ])
-}
-
-pub(super) fn memory_deterministic_recall_capabilities() -> HookCapabilities {
-    HookCapabilities::new([
-        HookCapability::new("memory").expect("static capability is valid"),
-        HookCapability::new("read_domain_context").expect("static capability is valid"),
-        HookCapability::new("contribute_prompt_context").expect("static capability is valid"),
-        HookCapability::new("emit_audit").expect("static capability is valid"),
-    ])
-}
-
-pub(super) fn memory_active_recall_capabilities() -> HookCapabilities {
-    HookCapabilities::new([
-        HookCapability::new("memory").expect("static capability is valid"),
-        HookCapability::new("read_domain_context").expect("static capability is valid"),
-        HookCapability::new("contribute_prompt_context").expect("static capability is valid"),
-        HookCapability::new("emit_audit").expect("static capability is valid"),
     ])
 }
 

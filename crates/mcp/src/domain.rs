@@ -79,6 +79,10 @@ impl McpServerInstallation {
     pub fn transport_kind(&self) -> &'static str {
         self.transport.kind()
     }
+
+    pub fn explicit_authorization_overrides_oauth(&self) -> bool {
+        self.transport.has_authorization_header()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

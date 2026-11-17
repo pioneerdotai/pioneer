@@ -1,0 +1,11 @@
+--- a/llvm/tools/dsymutil/MachODebugMapParser.cpp
++++ b/llvm/tools/dsymutil/MachODebugMapParser.cpp
+@@ -792,7 +792,7 @@
+     } else if (Flags & SymbolRef::SF_Common) {
+       CurrentObjectAddresses[*Name] = std::nullopt;
+       CommonSymbols.push_back(std::string(*Name));
+-    } else {
++    } else if (!(Flags & SymbolRef::SF_Undefined)) {
+       CurrentObjectAddresses[*Name] = Addr;
+     }
+   }

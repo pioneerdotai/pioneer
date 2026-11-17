@@ -69,6 +69,7 @@ pub(crate) fn reconcile_composer_policy(
     let mut mcp_server_ids = Vec::new();
     for capability in &domain.capabilities {
         match &capability.kind {
+            ComposerCapabilityKind::Plugin { .. } | ComposerCapabilityKind::App { .. } => {}
             ComposerCapabilityKind::Skill { skill_id, .. } => {
                 skill_ids.push(skill_id.as_str().to_owned());
             }
@@ -122,6 +123,7 @@ pub(crate) fn reconcile_composer_policy(
     domain
         .capabilities
         .retain(|capability| match &capability.kind {
+            ComposerCapabilityKind::Plugin { .. } | ComposerCapabilityKind::App { .. } => true,
             ComposerCapabilityKind::Skill { skill_id, .. } => {
                 allowed_skills.contains(skill_id.as_str())
             }
@@ -144,6 +146,9 @@ pub(crate) fn reconcile_composer_policy(
     domain.selected_model = reconciliation.draft.model.clone();
     if domain.selected_provider.is_none() || domain.selected_model.is_none() {
         domain.selected_reasoning_effort = None;
+        domain.selected_context_window = None;
+        domain.selected_service_mode = None;
+        domain.selected_context_authority = None;
     }
     *fingerprint = reconciliation.draft.policy_fingerprint.clone();
     if let Some(mode) = reconciliation.draft.permission_mode {

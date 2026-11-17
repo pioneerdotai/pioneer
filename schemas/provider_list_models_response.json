@@ -18,6 +18,80 @@
     "models"
   ],
   "$defs": {
+    "OpenAiTier": {
+      "type": "string",
+      "enum": [
+        "priority",
+        "flex",
+        "ultrafast"
+      ]
+    },
+    "ProviderContextTiers": {
+      "description": "Authority-scoped, normalized context choices. Absence on a discovery DTO\nmeans unavailable metadata, distinct from a confirmed model without tiers.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "no_tiers"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "excluded"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "invalid"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "price_order_confirmed": {
+              "type": "boolean"
+            },
+            "status": {
+              "type": "string",
+              "const": "tiered"
+            },
+            "windows": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              }
+            }
+          },
+          "required": [
+            "status",
+            "windows",
+            "price_order_confirmed"
+          ]
+        }
+      ]
+    },
     "ProviderModelCapabilities": {
       "type": "object",
       "properties": {
@@ -111,6 +185,22 @@
         "capabilities": {
           "$ref": "#/$defs/ProviderModelCapabilities"
         },
+        "context_authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_tiers": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderContextTiers"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "created": {
           "type": [
             "integer",
@@ -166,6 +256,16 @@
         },
         "provider": {
           "type": "string"
+        },
+        "service_modes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceServiceModes"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "transcription": {
           "anyOf": [
@@ -347,9 +447,258 @@
       "enum": [
         "provider_metadata",
         "cli_metadata",
-        "static_registry",
         "config_override",
         "unknown"
+      ]
+    },
+    "ServiceModeDescriptor": {
+      "description": "Retains conditional/partial source prices without flattening context bands\nor treating absent prices as Standard. Pricing must prove applicability\nbefore passing these rates to the existing estimator.",
+      "type": "object",
+      "properties": {
+        "cost": true,
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "parameters": {
+          "$ref": "#/$defs/ServiceModeParameters"
+        },
+        "source_api": {
+          "type": "string"
+        },
+        "source_model": {
+          "type": "string"
+        },
+        "source_provider": {
+          "type": "string"
+        },
+        "source_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "parameters",
+        "source_provider",
+        "source_model",
+        "source_api"
+      ]
+    },
+    "ServiceModeParameters": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "neutral"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "open_ai_standard"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "anthropic_standard"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bedrock_standard"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "open_ai_tier"
+            },
+            "tier": {
+              "$ref": "#/$defs/OpenAiTier"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "tier"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "open_ai_pro"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "beta": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "anthropic_fast"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bedrock_nested_ultrafast"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "SourceServiceMode": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "descriptor": {
+              "$ref": "#/$defs/ServiceModeDescriptor"
+            },
+            "status": {
+              "type": "string",
+              "const": "parsed"
+            }
+          },
+          "required": [
+            "status",
+            "descriptor"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "malformed"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "description": "Preserve the source ID so a saved choice cannot silently become Standard.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "unmapped"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        }
+      ]
+    },
+    "SourceServiceModes": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "malformed"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "description": "An explicitly empty map is distinct from unknown metadata.",
+          "type": "object",
+          "properties": {
+            "modes": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/SourceServiceMode"
+              }
+            },
+            "status": {
+              "type": "string",
+              "const": "known"
+            }
+          },
+          "required": [
+            "status",
+            "modes"
+          ]
+        }
       ]
     }
   }

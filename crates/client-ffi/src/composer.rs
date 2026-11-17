@@ -592,10 +592,15 @@ mod publication_tests {
         let ffi = crate::ClientFfiRuntime::default();
         ffi.initialize(r#"{"platform":"ios"}"#).unwrap();
         let dispatch = |intent: ComposerIntent| {
-            let expected = direct.composer_intent(intent.clone());
+            let expected = crate::client_binding::intent_transition_dto(
+                &ClientIntent::Composer {
+                    intent: intent.clone(),
+                },
+                direct.composer_intent(intent.clone()),
+            );
             let actual = ffi.client_intent_dispatch(&serde_json::json!({"schema_version": 1, "intent": {"kind": "composer", "intent": intent}}).to_string()).unwrap();
             assert_eq!(
-                serde_json::to_value(crate::client_binding::transition_dto(expected)).unwrap(),
+                serde_json::to_value(expected).unwrap(),
                 serde_json::to_value(actual).unwrap()
             );
             let scope = ClientScope::Composer {
@@ -743,7 +748,10 @@ mod publication_tests {
         ffi.initialize(r#"{"platform":"ios"}"#).unwrap();
         let dispatch = |intent: ComposerIntent| {
             let intent = ClientIntent::Composer { intent };
-            let expected = crate::client_binding::transition_dto(direct.dispatch(intent.clone()));
+            let expected = crate::client_binding::intent_transition_dto(
+                &intent,
+                direct.dispatch(intent.clone()),
+            );
             let actual = ffi
                 .client_intent_dispatch(
                     &serde_json::json!({ "schema_version": 1, "intent": intent }).to_string(),
@@ -982,6 +990,9 @@ mod publication_tests {
                 .accept_identity_for_test(core, auth.clone())
                 .unwrap();
             core.upsert_thread(Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
                 workspace_id: "ws".into(),
                 id: "a".into(),
                 name: None,

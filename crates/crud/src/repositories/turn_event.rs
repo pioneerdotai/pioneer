@@ -1,14 +1,68 @@
 use anyhow::{Context, Result};
-use pioneer_entity::turn_event;
+use pioneer_entity::{compaction_event_revision, turn_event};
 use pioneer_protocol::TurnItem;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+};
 
 use crate::events::{AppendedTurnEvent, TurnEventPayload};
 use pioneer_protocol::generate_id;
 
 const DB_ID_LEN: usize = 21;
+
+/// The existing canonical item index is written in the acceptance transaction,
+/// independently of the projection watermark. No payload decoding is needed.
+fn accepted_item_completions(
+    turn_id: &str,
+    item_id: &str,
+    before_sequence: Option<i64>,
+) -> sea_orm::Select<turn_event::Entity> {
+    let ids = compaction_event_revision::Entity::find()
+        .select_only()
+        .column(compaction_event_revision::Column::SourceId)
+        .filter(compaction_event_revision::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(compaction_event_revision::Column::ItemId.eq(item_id.to_owned()))
+        .filter(compaction_event_revision::Column::Present.eq(1))
+        .into_query();
+    let mut query = turn_event::Entity::find()
+        .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(
+            turn_event::Column::EventType.eq(pioneer_protocol::constants::events::ITEM_COMPLETED),
+        )
+        .filter(turn_event::Column::Id.in_subquery(ids));
+    if let Some(sequence) = before_sequence {
+        query = query.filter(turn_event::Column::Sequence.lt(sequence));
+    }
+    query
+}
+
+pub(crate) async fn has_accepted_item_completion<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+    before_sequence: Option<i64>,
+) -> Result<bool> {
+    Ok(accepted_item_completions(turn_id, item_id, before_sequence)
+        .select_only()
+        .column(turn_event::Column::Id)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some())
+}
+
+pub(crate) async fn find_accepted_item_completion<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<Option<turn_event::Model>> {
+    Ok(accepted_item_completions(turn_id, item_id, None)
+        .order_by_desc(turn_event::Column::Sequence)
+        .one(db)
+        .await?)
+}
 
 /// CPU-only representation of an append. Serialization, idempotency-key
 /// derivation and ID generation happen before a caller begins a write
@@ -23,15 +77,22 @@ pub struct PreparedTurnEvent {
     context_item_id: Option<String>,
     context_projection_kind: &'static str,
     idempotency_key: String,
+    legacy_idempotency_key: String,
     payload: TurnEventPayload,
     semantically_matching_existing_id: Option<String>,
+    execution_observation: Option<super::execution_observability::PreparedExecutionObservation>,
 }
 
 impl PreparedTurnEvent {
-    pub fn prepare(payload: TurnEventPayload) -> Result<Self> {
+    pub fn prepare(mut payload: TurnEventPayload) -> Result<Self> {
         let thread_id = payload.thread_id().to_owned();
         let turn_id = payload.turn_id().to_owned();
         let event_type = payload.event_type().to_owned();
+        let legacy_idempotency_key = payload.idempotency_key()?;
+        let execution_observation = super::execution_observability::prepare_event(&payload)?;
+        if let Some(observation) = &execution_observation {
+            super::execution_observability::reference_event_tariff(&mut payload, observation);
+        }
         let payload_json =
             serde_json::to_string(&payload).context("failed to serialize turn event payload")?;
         let idempotency_key = payload
@@ -40,6 +101,7 @@ impl PreparedTurnEvent {
         let (context_item_id, context_projection_kind) =
             crate::compaction::history::event_projection_metadata(&payload);
         Ok(Self {
+            execution_observation,
             context_item_id,
             context_projection_kind,
             id: generate_id(DB_ID_LEN),
@@ -48,6 +110,7 @@ impl PreparedTurnEvent {
             event_type,
             payload_json,
             idempotency_key,
+            legacy_idempotency_key,
             payload,
             semantically_matching_existing_id: None,
         })
@@ -70,13 +133,27 @@ impl PreparedTurnEvent {
     pub async fn preflight_idempotency<C: ConnectionTrait>(mut self, db: &C) -> Result<Self> {
         if let Some(existing) = turn_event::Entity::find()
             .filter(turn_event::Column::TurnId.eq(self.turn_id.clone()))
-            .filter(turn_event::Column::IdempotencyKey.eq(self.idempotency_key.clone()))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(turn_event::Column::IdempotencyKey.eq(self.idempotency_key.clone()))
+                    .add(
+                        turn_event::Column::IdempotencyKey.eq(self.legacy_idempotency_key.clone()),
+                    ),
+            )
             .one(db)
             .await
             .context("failed to preflight idempotent turn event")?
         {
             let existing_id = existing.id.clone();
-            let existing = appended_event_from_model(existing)?;
+            let mut existing = appended_event_from_model(existing)?;
+            if let Some(observation) =
+                super::execution_observability::prepare_event(&existing.payload)?
+            {
+                super::execution_observability::reference_event_tariff(
+                    &mut existing.payload,
+                    &observation,
+                );
+            }
             if existing.payload != self.payload {
                 anyhow::bail!(
                     "turn event idempotency key collision for turn `{}`",
@@ -114,7 +191,13 @@ pub async fn prepared_event_already_exists<C: ConnectionTrait>(
 ) -> Result<bool> {
     let existing = turn_event::Entity::find()
         .filter(turn_event::Column::TurnId.eq(prepared.turn_id.clone()))
-        .filter(turn_event::Column::IdempotencyKey.eq(prepared.idempotency_key.clone()))
+        .filter(
+            sea_orm::Condition::any()
+                .add(turn_event::Column::IdempotencyKey.eq(prepared.idempotency_key.clone()))
+                .add(
+                    turn_event::Column::IdempotencyKey.eq(prepared.legacy_idempotency_key.clone()),
+                ),
+        )
         .one(db)
         .await
         .context("failed to query idempotent turn event")?;
@@ -144,7 +227,13 @@ pub async fn append_prepared_event<C: ConnectionTrait>(
 ) -> Result<AppendedTurnEvent> {
     if let Some(existing) = turn_event::Entity::find()
         .filter(turn_event::Column::TurnId.eq(prepared.turn_id.clone()))
-        .filter(turn_event::Column::IdempotencyKey.eq(prepared.idempotency_key.clone()))
+        .filter(
+            sea_orm::Condition::any()
+                .add(turn_event::Column::IdempotencyKey.eq(prepared.idempotency_key.clone()))
+                .add(
+                    turn_event::Column::IdempotencyKey.eq(prepared.legacy_idempotency_key.clone()),
+                ),
+        )
         .one(db)
         .await
         .context("failed to query idempotent turn event")?
@@ -211,6 +300,9 @@ pub async fn append_prepared_event<C: ConnectionTrait>(
     .await
     .context("failed to record canonical event projection metadata")?;
 
+    if let Some(observation) = &prepared.execution_observation {
+        super::execution_observability::commit_event(db, observation, sequence).await?;
+    }
     Ok(AppendedTurnEvent {
         id: prepared.id,
         thread_id: prepared.thread_id,
@@ -249,6 +341,26 @@ pub async fn find_event_by_id<C: ConnectionTrait>(
         .context("failed to query turn_event by id")?
         .map(appended_event_from_model)
         .transpose()
+}
+
+/// Read finite rows after the claim commit. The caller decodes each body
+/// independently so one corrupt legacy body cannot suppress healthy deliveries.
+pub async fn find_event_models_by_ids<C: ConnectionTrait>(
+    db: &C,
+    ids: &[String],
+) -> Result<Vec<turn_event::Model>> {
+    anyhow::ensure!(
+        ids.len() <= super::turn_event_delivery::DELIVERY_BATCH_LIMIT,
+        "event body batch exceeds bound"
+    );
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    turn_event::Entity::find()
+        .filter(turn_event::Column::Id.is_in(ids.iter().cloned()))
+        .all(db)
+        .await
+        .context("failed to read delivery event batch")
 }
 
 /// Repairs a legacy final agent-diff snapshot whose denormalized thread owner

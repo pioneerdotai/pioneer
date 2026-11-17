@@ -14,6 +14,7 @@ mod contracts;
 mod diagnostics;
 mod gateway;
 mod invitation;
+mod package_shell;
 mod pending_requests;
 mod presentation;
 #[cfg(feature = "schema")]
@@ -22,6 +23,8 @@ mod skills;
 mod telemetry;
 mod thread_files;
 mod threads;
+mod voice_capture;
+pub use voice_capture::VoiceCaptureAction;
 mod workspaces;
 
 use active_thread::{
@@ -64,8 +67,7 @@ use pioneer_client::{
 };
 
 use pioneer_protocol::{
-    VoiceAudioFormat, VoiceSessionCancelResponse, VoiceSessionFinalizeResponse,
-    VoiceSessionStartResponse,
+    VoiceSessionCancelResponse, VoiceSessionFinalizeResponse, VoiceSessionStartResponse,
 };
 use presentation::{
     ClientArtifactPresentationPolicyRequest, ClientCurrentPrincipalPresentationRequest,
@@ -99,10 +101,6 @@ use workspaces::{
 use zeroize::Zeroizing;
 
 const FFI_VERSION: &str = env!("CARGO_PKG_VERSION");
-#[cfg(test)]
-const MAX_OUTSTANDING_INVITATION_COMMITS: usize =
-    pioneer_client::gateway::invitation_commits::MAX_OUTSTANDING_INVITATION_COMMITS;
-
 pub struct PioneerClientFfi {
     runtime: ClientFfiRuntime,
 }
@@ -110,11 +108,20 @@ pub struct PioneerClientFfi {
 struct ClientFfiRuntime {
     config: Mutex<Option<ClientFfiConfig>>,
     core: Arc<ClientCore>,
+    native_oauth: Arc<package_shell::NativeOAuthShell>,
+    plugin_uploads: Mutex<
+        std::collections::BTreeMap<
+            (String, u64),
+            pioneer_client::skills::operations::SkillUploadOperation,
+        >,
+    >,
     client_subscriptions: Mutex<HashMap<ClientScope, ClientSubscription>>,
     observed_scopes: Mutex<std::collections::HashSet<ClientScope>>,
 
     diagnostics: ClientFfiDiagnostics,
     avatar_cache: ClientFfiAvatarCache,
+    // Exactly one physical mobile capture; keyed by operation/session, never a handle registry.
+    voice_capture: Mutex<Option<voice_capture::MobileVoiceCapture>>,
 }
 
 fn mobile_process_core() -> Arc<ClientCore> {
@@ -131,6 +138,8 @@ impl Default for ClientFfiRuntime {
     fn default() -> Self {
         let core = mobile_process_core();
         Self {
+            native_oauth: Arc::new(package_shell::NativeOAuthShell::new(&core)),
+            plugin_uploads: Mutex::default(),
             core,
             config: Default::default(),
             client_subscriptions: Default::default(),
@@ -138,6 +147,7 @@ impl Default for ClientFfiRuntime {
 
             diagnostics: Default::default(),
             avatar_cache: Default::default(),
+            voice_capture: Default::default(),
         }
     }
 }
@@ -161,20 +171,22 @@ pub struct ClientFfiGatewayDisconnectResult {
     pub disconnected: bool,
 }
 
+/// Metadata only: the binary argument contains native-endian IEEE f32 samples.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientFfiVoiceAudioChunkParams {
     pub operation: pioneer_client::composer::store::ComposerOperationIdentity,
     pub session_id: String,
-    pub sequence: u64,
-    pub audio_format: VoiceAudioFormat,
+    pub action: VoiceCaptureAction,
+    pub input_sample_rate_hz: Option<u32>,
     pub captured_at_unix_ms: Option<u64>,
-    pub duration_ms: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ClientFfiVoiceAudioChunkResult {
+    /// Admission only; worker completion is reported separately.
     pub sent: bool,
+    pub drained: bool,
 }
 
 #[derive(Serialize)]
@@ -257,8 +269,19 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<client_binding::ClientIntentDispatchDto>(input_json)
             .map_err(|_| "invalid Client intent request".to_owned())?;
         client_binding::validate_schema_version(request.schema_version)?;
+        let begin = matches!(
+            &request.intent,
+            pioneer_client::core::ClientIntent::Composer {
+                intent: pioneer_client::composer::store::ComposerIntent::BeginOperation { .. }
+            }
+        )
+        .then(|| request.intent.clone());
         let transition = self.core.dispatch(request.intent);
-        Ok(client_binding::transition_dto(transition))
+        Ok(if let Some(begin) = begin {
+            client_binding::intent_transition_dto(&begin, transition)
+        } else {
+            client_binding::transition_dto(transition)
+        })
     }
 
     fn observe_client_scope(&self, scope: ClientScope) -> Result<(), String> {
@@ -393,6 +416,10 @@ impl ClientFfiRuntime {
         if input_json != "{}" {
             return Err("invalid Client shutdown request".into());
         }
+        self.voice_capture
+            .lock()
+            .map_err(|_| "voice capture poisoned")?
+            .take();
         self.core.shutdown();
         self.observed_scopes
             .lock()
@@ -866,32 +893,78 @@ impl ClientFfiRuntime {
             pioneer_client::composer::voice::ComposerVoiceStartRequest,
         >(input_json)
         .map_err(|_| "invalid voice session start params".to_owned())?;
-        self.core
+        let operation = request.operation.clone();
+        let response = self
+            .core
             .start_composer_voice_session(request)
-            .map_err(|error| format!("{error:#}"))
+            .map_err(|error| format!("{error:#}"))?;
+        let mut capture = self
+            .voice_capture
+            .lock()
+            .map_err(|_| "voice capture poisoned")?;
+        // A late start must not replace a newer operation's physical stream.
+        if self.core.composer_operation_plan(&operation).is_none() {
+            return Err("Voice operation cancelled".into());
+        }
+        if capture
+            .as_ref()
+            .is_some_and(|current| current.operation.generation > operation.generation)
+        {
+            self.core.complete_composer_operation(
+                operation,
+                pioneer_client::composer::store::ComposerOperationCompletion::Failed {
+                    message: "Voice capture superseded".into(),
+                },
+            );
+            return Err("Voice capture superseded".into());
+        }
+        let worker = match voice_capture::MobileVoiceCapture::new(
+            operation.clone(),
+            response.session_id.clone(),
+            self.core.clone(),
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                drop(capture);
+                self.core.complete_composer_operation(
+                    operation,
+                    pioneer_client::composer::store::ComposerOperationCompletion::Failed {
+                        message: error.clone(),
+                    },
+                );
+                return Err(error);
+            }
+        };
+        *capture = Some(worker);
+        Ok(response)
     }
 
     fn voice_audio_chunk(
         &self,
         input_json: &str,
-        pcm_chunk: &[u8],
+        source_bytes: &[u8],
     ) -> Result<ClientFfiVoiceAudioChunkResult, String> {
         let params = serde_json::from_str::<ClientFfiVoiceAudioChunkParams>(input_json)
-            .map_err(|_| "invalid voice audio chunk params".to_owned())?;
-
-        self.core
-            .send_composer_voice_audio_chunk(
-                &params.operation,
-                params.session_id,
-                params.sequence,
-                params.audio_format,
-                params.captured_at_unix_ms,
-                params.duration_ms,
-                pcm_chunk.to_vec(),
-            )
-            .map_err(|error| format!("{error:#}"))?;
-
-        Ok(ClientFfiVoiceAudioChunkResult { sent: true })
+            .map_err(|_| "invalid voice capture params".to_owned())?;
+        let mut capture = self
+            .voice_capture
+            .lock()
+            .map_err(|_| "voice capture poisoned")?;
+        let capture = capture
+            .as_mut()
+            .filter(|capture| capture.matches(&params.operation, &params.session_id))
+            .ok_or("Voice capture retired")?;
+        if !self
+            .core
+            .composer_voice_session_matches(&params.operation, &params.session_id)
+        {
+            return Err("Voice operation cancelled".into());
+        }
+        let drained = capture.enqueue(params, source_bytes)?;
+        Ok(ClientFfiVoiceAudioChunkResult {
+            sent: true,
+            drained,
+        })
     }
 
     fn voice_session_finalize(
@@ -902,6 +975,18 @@ impl ClientFfiRuntime {
             pioneer_client::composer::voice::ComposerVoiceFinalizeRequest,
         >(input_json)
         .map_err(|_| "invalid voice session finalize params".to_owned())?;
+        {
+            let mut capture = self
+                .voice_capture
+                .lock()
+                .map_err(|_| "voice capture poisoned")?;
+            let current = capture
+                .as_ref()
+                .filter(|capture| capture.operation == request.operation)
+                .ok_or("Voice capture retired")?;
+            current.ensure_finished()?;
+            capture.take();
+        }
         self.core
             .finalize_composer_voice_session(request)
             .map_err(|error| format!("{error:#}"))
@@ -912,6 +997,19 @@ impl ClientFfiRuntime {
             pioneer_client::composer::voice::ComposerVoiceCancelRequest,
         >(input_json)
         .map_err(|_| "invalid voice session cancel params".to_owned())?;
+        {
+            let mut capture = self
+                .voice_capture
+                .lock()
+                .map_err(|_| "voice capture poisoned")?;
+            if capture
+                .as_ref()
+                .is_some_and(|capture| capture.matches(&request.operation, &request.session_id))
+            {
+                // Cancel discards filter history; it never invokes finish.
+                capture.take();
+            }
+        }
         self.core
             .cancel_composer_voice_session(request)
             .map_err(|error| format!("{error:#}"))
@@ -1016,6 +1114,11 @@ impl ClientFfiRuntime {
         composer_attachment_from_path_request(request).map_err(|error| format!("{error:#}"))
     }
 
+    fn plugin_shell(&self, input_json: &str) -> Result<package_shell::PluginShellResponse, String> {
+        let request = serde_json::from_str(input_json)
+            .map_err(|_| "invalid_plugin_shell_request".to_owned())?;
+        package_shell::execute(self, request)
+    }
     fn composer_skill_pack_picker(
         &self,
         input_json: &str,
@@ -1110,16 +1213,14 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<ClientActiveThreadOpenRequest>(input_json)
             .map_err(|_| "invalid active thread open request".to_owned())?;
 
-        active_thread::open_thread(&self.core, self.core.transport_runtime(), request)
-            .map_err(|error| format!("{error:#}"))
+        active_thread::open_thread(&self.core, request).map_err(|error| format!("{error:#}"))
     }
 
     fn active_thread_open_by_id(&self, input_json: &str) -> Result<(), String> {
         let request = serde_json::from_str::<ClientActiveThreadOpenByIdRequest>(input_json)
             .map_err(|_| "invalid active thread open by id request".to_owned())?;
 
-        active_thread::open_thread_by_id(&self.core, self.core.transport_runtime(), request)
-            .map_err(|error| format!("{error:#}"))
+        active_thread::open_thread_by_id(&self.core, request).map_err(|error| format!("{error:#}"))
     }
 
     fn active_thread_open_or_create_new(&self, input_json: &str) -> Result<String, String> {
@@ -1191,11 +1292,6 @@ where
             INVALID_ADMINISTRATION_REQUEST_CODE,
         )
     })
-}
-
-#[cfg(test)]
-fn invitation_commit_capacity_available(current: usize) -> bool {
-    current < MAX_OUTSTANDING_INVITATION_COMMITS
 }
 
 fn administration_rpc_error(error: anyhow::Error) -> ClientFfiError {
@@ -1466,7 +1562,8 @@ ffi_client_json_method!(
 );
 /// # Safety
 /// `ptr` must be a live Client handle; `input_json` must be a valid NUL-terminated
-/// UTF-8 allocation. `pcm_ptr` must be readable for `pcm_len` bytes until return.
+/// UTF-8 allocation. The binary argument is native-endian f32 capture samples
+/// (or empty for control); `pcm_ptr` must be readable for `pcm_len` bytes until return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pioneer_client_ffi_voice_audio_chunk(
     ptr: *mut PioneerClientFfi,
@@ -2411,16 +2508,6 @@ mod tests {
     }
 
     #[test]
-    fn outstanding_invitation_commit_ownership_is_bounded() {
-        assert!(invitation_commit_capacity_available(
-            MAX_OUTSTANDING_INVITATION_COMMITS - 1
-        ));
-        assert!(!invitation_commit_capacity_available(
-            MAX_OUTSTANDING_INVITATION_COMMITS
-        ));
-    }
-
-    #[test]
     fn malformed_normal_administration_request_has_a_domain_neutral_code() {
         let error = parse_normal_params::<pioneer_protocol::MemberListParams>(
             r#"{"unknown":true}"#,
@@ -2456,6 +2543,7 @@ mod tests {
         );
         let response: serde_json::Value =
             serde_json::from_str(response.as_str()).expect("typed auth response");
+        assert_eq!(response["status"], "error");
         assert_eq!(response["code"], "session_compromised");
 
         let events = diagnostics.drain().expect("diagnostics drain");
@@ -2485,19 +2573,6 @@ mod tests {
             .unwrap_err();
         assert!(!error.contains("synthetic-secret"));
         runtime.client_shutdown("{}").unwrap();
-    }
-
-    #[test]
-    fn gateway_settings_ffi_preserves_voice_conflict_error_code() {
-        let response = to_json_typed_response::<()>(Err(ClientFfiError::new(
-            "voice input cannot be reconfigured while a voice session is active",
-            gateway::VOICE_RECONFIGURATION_BUSY_CODE,
-        )));
-        let response: serde_json::Value =
-            serde_json::from_str(response.as_str()).expect("typed FFI response");
-
-        assert_eq!(response["status"], "error");
-        assert_eq!(response["code"], gateway::VOICE_RECONFIGURATION_BUSY_CODE);
     }
 
     #[test]
@@ -2573,3 +2648,5 @@ mod onboarding_binding_tests;
 
 #[cfg(test)]
 mod settings_binding_tests;
+
+ffi_client_json_method!(pioneer_client_ffi_plugin_shell, plugin_shell);

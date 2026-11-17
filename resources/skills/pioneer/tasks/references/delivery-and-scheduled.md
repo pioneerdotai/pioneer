@@ -7,8 +7,11 @@ Use this reference when creating future work, recurring tasks, interval tasks, c
 - Product Meaning
 - Delivery Modes
 - Choosing Summary Vs Full Result
+- Schedule Changes And Extra Runs
+- Pausing And Resuming Schedules
 - Scheduled Task Instructions
 - No-Op Runs
+- Permanently Stopping Scheduled Work
 - Updating Delivery
 - Existing Results Are Not Retroactive
 - Confirmation Message
@@ -38,7 +41,7 @@ Post the report in this conversation.
 Every morning, check this and tell me here.
 ```
 
-`origin_thread` targets the visible thread where the work originated. It is the default for scheduled tasks created from a thread.
+`origin_thread` targets the visible thread where the work originated. It is the default for scheduled tasks and inbound webhook tasks created from a thread. A webhook trigger waits without an active agent between requests; each completed request run uses the ordinary delivery policy.
 
 ```json
 {
@@ -89,7 +92,7 @@ Use when the result belongs in an external system.
 
 ### none
 
-Use for background state, task chains, or internal bookkeeping where no user-facing delivery is needed.
+Use for background state, task chains, or internal bookkeeping where no user-facing delivery is needed. This is the default for `background:true` plus `requireReview:true` when deliveryPolicy is omitted; an explicit permitted policy overrides it. Results and terminal errors follow the selected policy. Task status/history and result reading remain available. Background without review (requireReview:false by default) and scheduled tasks keep their existing delivery defaults.
 
 ## Choosing Summary Vs Full Result
 
@@ -100,6 +103,35 @@ Use `format:"full_result"` when markdown structure, sections, citations, or arti
 Use `format:"summary"` for compact notifications, dashboards, or routine status where a short preview is enough.
 
 If `includeResult:false`, the delivered thread message may only say that the task completed. Do not use it for "send me the answer."
+
+## Schedule Changes And Extra Runs
+
+`task_run_now` requests an additional run using the saved task configuration,
+without changing recurrence or the next planned fire. Current work continues;
+normal concurrency and admission limits apply. It cannot resume paused or blocked
+work, reopen terminal tasks, or override a finish request.
+
+`task_reschedule` replaces the schedule; `task_update` can replace its trigger
+while changing other fields. Replacing an interval/cron trigger with `immediate`
+or `scheduled_at` removes recurrence. For an early first check followed by
+recurring checks, save an interval/cron trigger and request the extra run with
+`task_run_now`. Future-run instructions alone cannot establish recurrence.
+When copying an existing monitor, inspect its configuration and explicitly
+preserve the settings the user wants to retain.
+
+See [tool-schemas.md](tool-schemas.md#task_run_now) for arguments, admission
+confirmation and retry identity.
+
+## Pausing And Resuming Schedules
+
+Pause stops future schedule firings and leaves current runs running. It does not
+cancel queued work or prohibit later rescheduling. An exhausted one-shot already
+has no future firings; it need not acquire the literal trigger status `paused`.
+See [the pause response](tool-schemas.md#task_pause-and-task_resume) to interpret
+`scheduleOutcome`.
+
+Resume preserves the configured interval/cron trigger. After either operation,
+use the response or `task_get` to verify the schedule and next fire time.
 
 ## Scheduled Task Instructions
 
@@ -157,6 +189,18 @@ For monitors, users often want:
 - optional task state showing that the check ran.
 
 If the system cannot suppress no-op delivery, instruct the task to return a very compact no-op result and choose delivery accordingly. For high-noise recurring checks, prefer notification/dashboard surfaces over thread delivery unless the user explicitly wants every run in the thread.
+
+## Permanently Stopping Scheduled Work
+
+Use `task_pause` when future runs should stop temporarily with the option to resume. Use `task_cancel` when the user wants cancellation under its existing interruption rules. Use `task_finish` when the user asks to stop permanently and let current work finish, or when a stop condition explicitly set by the user has been reached.
+
+A successful recurring check or ordinary run result does not imply finish. Include a permanent stop condition in future-run instructions only if the user requested one.
+
+Finish durably disables future schedule firings and stops queued work that has not started. It allows all already admitted runs, their review and necessary revisions to finish, preserving results and the existing delivery policy. Disabled schedules may be `cancelled` while a normally finished task is `completed`. With no active work, finish does not start an agent or fabricate a result to deliver.
+
+The finish response acknowledges the stop decision; it does not confirm delivery. Check task, run and delivery state independently. Delivery errors stay delivery errors, do not restart the task, and do not keep computation running. Repeating finish does not republish results. The agent should return its normal result and let the configured delivery mechanism publish it rather than posting independently to the destination thread.
+
+After an accepted finish, resume, update and reschedule cannot revive the task or change its delivery policy. Explicit cancel remains available under its existing restrictions if the user needs to interrupt remaining work.
 
 ## Updating Delivery
 

@@ -60,4 +60,6 @@ pub use tools::{
     PreparedArtifactOutput, PreparedArtifactOutputStatus, artifact_tool_specs,
 };
 
-pub use service::HtmlPreviewMaintenanceProgress;
+pub use service::{
+    HtmlPreviewActivityGuard, HtmlPreviewMaintenanceOutcome, HtmlPreviewMaintenanceProgress,
+};

@@ -105,6 +105,9 @@ impl SourceSnapshot {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GeneratedCatalog {
     pub models: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Financial contracts for existing non-chat operations; never picker entries.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub billing_models: BTreeMap<String, BTreeMap<String, Value>>,
     pub provenance: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_capabilities: Option<super::ToolCapabilities>,
@@ -126,7 +129,8 @@ impl GeneratedCatalog {
             &serde_json::to_string(&self.models)?,
             &serde_json::to_string(&self.provenance)?,
             self.tool_capabilities.clone(),
-        )?;
+        )?
+        .with_billing_models(self.billing_models.clone())?;
         for (provider, models) in &self.models {
             ensure!(
                 !provider.is_empty()
@@ -308,6 +312,23 @@ fn base(
     }
 }
 
+/// Authority discovery and public refresh share these exact source facts.
+/// This function does not establish authentication, availability or eligibility.
+pub(crate) fn vercel_model(raw: &Value) -> Option<super::CatalogModel> {
+    let mut candidate = sources::vercel_model(raw)?;
+    compatibility::apply(&mut candidate);
+    serde_json::from_value(candidate.model).ok()
+}
+pub(crate) fn vercel_chat_eligible(raw: &Value) -> bool {
+    sources::vercel_chat_eligible(raw)
+}
+pub(crate) fn vercel_embedding_eligible(raw: &Value) -> bool {
+    raw["type"] == "embedding"
+        && raw["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && !id.ends_with("-batch"))
+}
+
 /// Full pinned-reference transformation, including dynamic entries not present
 /// in the saved fixture. First source wins identity collisions, as in Pi.
 pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCatalog> {
@@ -343,6 +364,7 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
     compatibility::fallbacks(&mut candidates);
     let mut output = GeneratedCatalog {
         models: BTreeMap::new(),
+        billing_models: sources::billing_models(snapshot),
         provenance: BTreeMap::new(),
         tool_capabilities: Some(sources::tool_capabilities(snapshot)),
         diagnostics: SOURCE_URLS
@@ -386,6 +408,7 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
         // for persisted catalogs. One malformed remote record cannot poison
         // unrelated models, while strict fixture validation still fails closed.
         let record = GeneratedCatalog {
+            billing_models: BTreeMap::new(),
             models: BTreeMap::from([(
                 provider.clone(),
                 BTreeMap::from([(id.clone(), candidate.model.clone())]),
@@ -559,7 +582,9 @@ mod tests {
         reference["deepseek"] = deepseek["provenance"].clone();
         let mut origins = Vec::new();
         for (p, models) in &generated.provenance {
-            if reference.get(p).is_none() {
+            // The independent Vercel contract tests below replace this old
+            // Anthropic-profile golden, including its obsolete limit override.
+            if p == "vercel-ai-gateway" || reference.get(p).is_none() {
                 continue;
             }
             for (id, fields) in models {
@@ -605,6 +630,11 @@ mod tests {
         // known price under exact comparison; allow unknown only when the
         // source omitted that exact category.
         let captured_at = snapshot().captured_at;
+        actual.as_object_mut().unwrap().remove("vercel-ai-gateway");
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("vercel-ai-gateway");
         let providers = actual.as_object_mut().unwrap();
         providers.retain(|provider, _| !expected[provider].is_null());
         for (provider, models) in providers {
@@ -992,36 +1022,7 @@ mod dynamic_pricing_regressions {
     fn pinned() -> SourceSnapshot {
         serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json")).unwrap()
     }
-    #[test]
-    fn jev_router_unknown_tariff_does_not_poison_other_providers() {
-        let mut source = pinned();
-        let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
-            .as_array_mut()
-            .unwrap();
-        let mut router = entries
-            .iter()
-            .find(|model| model["id"] == "openrouter/auto")
-            .unwrap()
-            .clone();
-        router["id"] = json!("typesafe/jev-router");
-        router["name"] = json!("Jev Router");
-        // Actual outage shape: a new router with -1 input/output tariffs.
-        entries.push(router);
-        let output = generate(&source, false).unwrap();
-        output.validate().unwrap();
-        assert!(output.models["openai"].contains_key("gpt-5-nano"));
-        assert!(!output.models["deepseek"].is_empty());
-        assert!(output.models["openrouter"].contains_key("openrouter/auto"));
-        assert!(!output.models["openrouter"].contains_key("typesafe/jev-router"));
-        assert!(
-            output
-                .diagnostics
-                .iter()
-                .any(|d| d.model.as_deref() == Some("typesafe/jev-router")
-                    && d.code == "invalid_model_record")
-        );
-        assert!(generate(&source, true).is_err());
-    }
+
     #[test]
     fn full_pinned_generation_accepts_documented_auto_unknown_at_both_strictness_levels() {
         let strict_output = generate(&pinned(), true).unwrap();
@@ -1091,12 +1092,16 @@ mod dynamic_pricing_regressions {
                 assert!(generate(&source, true).is_err());
             } else {
                 let output = generate(&source, false).unwrap();
+                assert!(output.models["openai"].contains_key("gpt-5-nano"));
+                assert!(!output.models["deepseek"].is_empty());
+                assert!(output.models["openrouter"].contains_key("openrouter/auto"));
                 assert!(!output.models["openrouter"].contains_key("fixture/unknown-sentinel"));
                 assert!(
                     output
                         .diagnostics
                         .iter()
-                        .any(|d| d.model.as_deref() == Some("fixture/unknown-sentinel"))
+                        .any(|d| d.model.as_deref() == Some("fixture/unknown-sentinel")
+                            && d.code == "invalid_model_record")
                 );
             }
         }
@@ -1192,7 +1197,7 @@ mod media_propagation_tests {
         snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body["groq"]["models"]["fixture-unknown"] =
             json!({"tool_call":true});
         snapshot.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","name":"media fixture","supported_parameters":["tools"],"architecture":{"input_modalities":input,"output_modalities":["text","audio"]}}));
-        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","tags":["tool-use"],"input_modalities":input,"output_modalities":["text","audio"]}));
+        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/media","type":"language","tags":["tool-use"],"input_modalities":input,"output_modalities":["text","audio"]}));
         let generated = generate(&snapshot, true).unwrap();
         generated.validate().unwrap();
         for (provider, id) in [
@@ -1242,8 +1247,8 @@ mod partial_source_tests {
         snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"id":"fixture/vision-tag","tags":["tool-use","vision"]}));
-        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/vision-array","tags":["tool-use","vision"],"input_modalities":["text","image"]}));
+            .push(json!({"id":"fixture/vision-tag","type":"language","output_modalities":["text"],"tags":["tool-use","vision"]}));
+        snapshot.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"].as_array_mut().unwrap().push(json!({"id":"fixture/vision-array","type":"language","output_modalities":["text"],"tags":["tool-use","vision"],"input_modalities":["text","image"]}));
         let generated = generate(&snapshot, true).unwrap();
         let catalog = ModelCatalog::parse(
             &serde_json::to_string(&generated.models).unwrap(),
@@ -1439,5 +1444,176 @@ mod specialized_zero_regressions {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod vercel_contract_tests {
+    use super::*;
+
+    // Hand-authored API-contract cases, not recorded inference responses.
+    #[test]
+    fn vercel_route_modalities_controls_and_price_preserve_source_facts() {
+        for (options, off, high) in [
+            (
+                json!([{"type":"effort","values":["low","high"]}]),
+                None,
+                Some("high"),
+            ),
+            (
+                json!([{"type":"toggle"},{"type":"effort","values":["none","medium"]}]),
+                Some("none"),
+                None,
+            ),
+            (json!([{"type":"effort","values":["low"]}]), None, None),
+            (json!([{"type":"toggle"}]), Some("none"), None),
+            (Value::Null, None, None),
+        ] {
+            let raw = json!({"id":"private/gpt-6-astra-claude-opus-5","type":"language","tags":["tool-use"],
+                "modalities":{"input":["text","image","pdf"],"output":["text"]},
+                "input_modalities":["text"],"context_window":123456,"max_tokens":5432,
+                "temperature":false,"reasoning_options":options,"pricing":{"input":"0.000002","output":"0.000006"}});
+            let model = vercel_model(&raw).unwrap();
+            assert!(vercel_chat_eligible(&raw));
+            assert_eq!(model.id, "private/gpt-6-astra-claude-opus-5");
+            assert_eq!(model.api, "openai-responses");
+            assert_eq!(model.base_url, "https://ai-gateway.vercel.sh/v1");
+            assert_eq!(model.input, ["text", "image", "pdf"]);
+            assert_eq!(model.context_window, 123456);
+            assert_eq!(model.max_tokens, 5432);
+            assert_eq!(
+                model.metadata["vercelLimitOrigins"]["contextWindow"]["kind"],
+                "source"
+            );
+            assert_eq!(model.cost["input"], 2.0);
+            assert_eq!(model.cost["output"], 6.0);
+            assert!(model.cost["cacheRead"].is_null());
+            assert_eq!(
+                model.metadata["sourceGeneration"]["reasoningOptions"],
+                options
+            );
+            assert_eq!(model.metadata["compat"]["supportsTemperature"], false);
+            let map = model
+                .metadata
+                .get("thinkingLevelMap")
+                .unwrap_or(&Value::Null);
+            assert_eq!(map["off"].as_str(), off);
+            assert_eq!(map["high"].as_str(), high);
+            assert!(map["max"].is_null());
+        }
+    }
+
+    #[test]
+    fn vercel_legacy_unknown_and_sync_eligibility_are_distinct() {
+        let mut raw = json!({"id":"creator/model","type":"language","tags":["tool-use"],
+            "input_modalities":["text","image"],"output_modalities":["text"]});
+        assert!(vercel_chat_eligible(&raw));
+        let legacy = vercel_model(&raw).unwrap();
+        assert!(legacy.input_is_known());
+        assert_eq!(
+            legacy.metadata["vercelLimitOrigins"]["contextWindow"]["kind"],
+            "fallback"
+        );
+        assert_eq!(
+            legacy.metadata["vercelLimitOrigins"]["maxTokens"]["kind"],
+            "fallback"
+        );
+        assert!(
+            legacy.metadata["inputOrigin"]["expression"]
+                .as_str()
+                .unwrap()
+                .contains("legacy")
+        );
+        raw["modalities"] = json!({"input":[],"output":["text"]});
+        assert!(vercel_model(&raw).unwrap().input.is_empty());
+        for (id, kind, tags, expected) in [
+            (
+                "creator/model-batch",
+                "language",
+                json!(["tool-use"]),
+                false,
+            ),
+            (
+                "creator/realtime-model",
+                "realtime",
+                json!(["tool-use"]),
+                false,
+            ),
+            (
+                "private/realtime-analysis",
+                "language",
+                json!(["tool-use"]),
+                true,
+            ),
+            ("creator/model", "realtime", json!(["tool-use"]), false),
+            ("creator/model", "language", json!([]), false),
+            ("creator/embed", "embedding", json!([]), false),
+        ] {
+            raw["id"] = json!(id);
+            raw["type"] = json!(kind);
+            raw["tags"] = tags;
+            assert_eq!(vercel_chat_eligible(&raw), expected);
+            assert_eq!(vercel_embedding_eligible(&raw), kind == "embedding");
+        }
+        // Registering the provider must not let generic models.dev supplements
+        // refill native entries excluded from the synchronous Vercel route.
+        let mut source: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        source.sources.get_mut(SOURCE_URLS[0]).unwrap().body["vercel-ai-gateway"]["models"]["creator/model-batch"] = json!({
+            "tool_call":true,"modalities":{"input":["text"]},"limit":{"context":32000,"output":4000}
+        });
+        source.sources.get_mut(SOURCE_URLS[2]).unwrap().body = json!({"data":[{
+            "id":"creator/model-batch","type":"language","tags":["tool-use"],
+            "modalities":{"input":["text"],"output":["text"]}
+        }]});
+        let generated = generate(&source, true).unwrap();
+        assert!(
+            generated
+                .models
+                .get("vercel-ai-gateway")
+                .is_none_or(|models| !models.contains_key("creator/model-batch"))
+        );
+    }
+
+    #[test]
+    fn private_discovery_reasoning_survives_public_enrichment_without_model_entry() {
+        let catalog = super::super::tool_tests::generated_catalog();
+        let mut model = super::super::tool_tests::discovered("private/opaque", Some(true));
+        model.provider = "vercel-ai-gateway".into();
+        let reasoning = pioneer_protocol::ProviderModelReasoningCapabilities {
+            supported: Some(true),
+            effort_options: vec!["low".into()],
+            source: Some(pioneer_protocol::ReasoningCapabilitySource::ProviderMetadata),
+            ..Default::default()
+        };
+        model.capabilities.reasoning = Some(reasoning.clone());
+        catalog.enrich("vercel-ai-gateway", std::slice::from_mut(&mut model));
+        assert_eq!(model.capabilities.reasoning, Some(reasoning));
+    }
+
+    #[test]
+    fn stale_vercel_snapshot_does_not_discard_other_providers() {
+        let generated = generate(
+            &serde_json::from_str::<SourceSnapshot>(include_str!(
+                "../../tests/fixtures/catalog/sources.json"
+            ))
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+        let mut models = generated.models;
+        let vercel = models.get_mut("vercel-ai-gateway").unwrap();
+        let (id, model) = vercel.iter_mut().next().unwrap();
+        let id = id.clone();
+        model["api"] = json!("anthropic-messages");
+        model["baseUrl"] = json!("https://ai-gateway.vercel.sh");
+        let catalog = ModelCatalog::parse(
+            &serde_json::to_string(&models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        assert!(catalog.model("vercel-ai-gateway", &id).is_none());
+        assert!(catalog.model("openai", "gpt-5-nano").is_some());
     }
 }

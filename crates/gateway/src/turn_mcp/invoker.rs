@@ -35,6 +35,14 @@ impl TurnMcpInvocationOrigin {
     }
 }
 
+/// Native identity captured by the managed CLI adapter, never from model input.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct NativeMcpCallIdentity {
+    pub(crate) native_thread_id: String,
+    pub(crate) native_turn_id: String,
+    pub(crate) native_item_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TurnMcpInvocation {
     pub(crate) workspace_id: String,
@@ -43,6 +51,9 @@ pub(crate) struct TurnMcpInvocation {
     pub(crate) runtime_id: Option<String>,
     pub(crate) session_generation: Option<u64>,
     pub(crate) provider_call_id: String,
+    pub(crate) native_call: Option<NativeMcpCallIdentity>,
+    /// Admission only, not the lifetime of an admitted tool execution.
+    pub(crate) admission_deadline: Option<tokio::time::Instant>,
     pub(crate) canonical_callable_name: String,
     pub(crate) arguments: JsonValue,
     pub(crate) origin: TurnMcpInvocationOrigin,
@@ -227,7 +238,7 @@ impl McpInvocationGovernor {
 
         state
             .queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 (queued < limits.max_queued_calls).then_some(queued + 1)
             })
             .map_err(|_| {
@@ -298,6 +309,15 @@ pub(crate) struct GatewayTurnMcpInvoker {
     invocation_governor: Arc<McpInvocationGovernor>,
 }
 
+// Invocation-local evidence, captured only after the frozen binding and managed
+// session are verified. Rejections use the same fenced canonical write as results.
+struct CliMcpOutcomeContext {
+    invocation: TurnMcpInvocation,
+    binding: TurnMcpBindingRecord,
+    manifest_hash: String,
+    identity: pioneer_crud::CliMcpCallIdentity,
+}
+
 impl GatewayTurnMcpInvoker {
     pub(crate) fn new(
         crud_store: Arc<CrudStore>,
@@ -321,6 +341,7 @@ impl GatewayTurnMcpInvoker {
         &self,
         invocation: TurnMcpInvocation,
         cancellation: &CancellationToken,
+        outcome_context: &mut Option<CliMcpOutcomeContext>,
     ) -> Result<ValidatedTurnMcpInvocation, TurnMcpInvocationError> {
         validate_required_identity(&invocation)?;
         let turn = self
@@ -392,6 +413,47 @@ impl GatewayTurnMcpInvoker {
                 "frozen MCP projection contains duplicate callable bindings",
             ));
         }
+        if invocation.origin == TurnMcpInvocationOrigin::CliFacade
+            && let Some(native) = &invocation.native_call
+        {
+            self.validate_origin_session(&invocation, &projection.manifest_hash, &binding)
+                .await?;
+            if native.native_item_id != invocation.provider_call_id {
+                return Err(invocation_error(
+                    TurnMcpInvocationErrorCode::InvalidRequest,
+                    "CLI MCP invocation has no verified native item identity",
+                ));
+            }
+            let execution_owner = self
+                .crud_store
+                .get_turn_execution(&invocation.turn_id)
+                .await
+                .map_err(|_| internal_error("failed to verify CLI MCP execution owner"))?
+                .map(|execution| (execution.owner_id, execution.owner_generation));
+            *outcome_context = Some(CliMcpOutcomeContext {
+                invocation: invocation.clone(),
+                binding: binding.clone(),
+                manifest_hash: projection.manifest_hash.clone(),
+                identity: pioneer_crud::CliMcpCallIdentity {
+                    runtime_id: invocation
+                        .runtime_id
+                        .clone()
+                        .ok_or_else(|| internal_error("CLI MCP runtime identity is missing"))?,
+                    session_generation: i64::try_from(
+                        invocation
+                            .session_generation
+                            .ok_or_else(|| internal_error("CLI MCP generation is missing"))?,
+                    )
+                    .map_err(|_| internal_error("invalid CLI MCP generation"))?,
+                    native_thread_id: native.native_thread_id.clone(),
+                    native_turn_id: native.native_turn_id.clone(),
+                    native_item_id: native.native_item_id.clone(),
+                    manifest_hash: projection.manifest_hash.clone(),
+                    projection_activation_generation: binding.projection_activation_generation,
+                    execution_owner,
+                },
+            });
+        }
         if binding.server_installation_id == FIRST_PARTY_FILE_SERVER_ID
             && (!matches!(invocation.origin, TurnMcpInvocationOrigin::CliFacade)
                 || !invocation
@@ -408,8 +470,11 @@ impl GatewayTurnMcpInvoker {
         let invocation_limits = self
             .revalidate_execution_authorization(&invocation, &projection, &binding)
             .await?;
-        self.validate_origin_session(&invocation, &projection.manifest_hash, &binding)
-            .await?;
+        if outcome_context.is_none() {
+            // Preserve validation order for native API and legacy callers.
+            self.validate_origin_session(&invocation, &projection.manifest_hash, &binding)
+                .await?;
+        }
         let current_tool = self
             .runtime_view
             .current_tool_identity(invocation.workspace_id.as_str(), &binding)
@@ -467,8 +532,8 @@ impl GatewayTurnMcpInvoker {
             })?;
         let native_family =
             super::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id);
-        let action = native_family
-            .map(|family| family.action(&binding.raw_tool_name))
+        let actions = native_family
+            .map(|family| family.actions(&binding.raw_tool_name))
             .transpose()
             .map_err(|_| {
                 invocation_error(
@@ -477,39 +542,49 @@ impl GatewayTurnMcpInvoker {
                 )
             })?
             .unwrap_or_else(|| {
-                if binding.server_installation_id == crate::cli_runtime::acp_skills::SKILL_SERVER_ID
+                vec![if binding.server_installation_id
+                    == crate::cli_runtime::acp_skills::SKILL_SERVER_ID
                 {
                     ResourceAction::SkillUse
                 } else {
                     ResourceAction::McpUse
-                }
+                }]
             });
-        let revalidated = self
-            .execution_leases
-            .revalidate_for_turn(
-                self.crud_store.as_ref(),
-                &context,
-                invocation.workspace_id.as_str(),
-                invocation.thread_id.as_str(),
-                invocation.turn_id.as_str(),
-                action,
-                self.authorization_invalidation_hub
-                    .current_revision()
-                    .await
-                    .map_err(|_| {
-                        invocation_error(
-                            TurnMcpInvocationErrorCode::ProjectionUnavailable,
-                            "MCP authorization policy generation is unavailable",
-                        )
-                    })?,
-            )
+        let revision = self
+            .authorization_invalidation_hub
+            .current_revision()
             .await
             .map_err(|_| {
                 invocation_error(
-                    TurnMcpInvocationErrorCode::PermissionDenied,
-                    "current execution authorization no longer permits MCP use",
+                    TurnMcpInvocationErrorCode::ProjectionUnavailable,
+                    "MCP authorization policy generation is unavailable",
                 )
             })?;
+        let mut revalidated = None;
+        for action in actions {
+            if let Ok(proof) = self
+                .execution_leases
+                .revalidate_for_turn(
+                    self.crud_store.as_ref(),
+                    &context,
+                    invocation.workspace_id.as_str(),
+                    invocation.thread_id.as_str(),
+                    invocation.turn_id.as_str(),
+                    action,
+                    revision,
+                )
+                .await
+            {
+                revalidated = Some(proof);
+                break;
+            }
+        }
+        let revalidated = revalidated.ok_or_else(|| {
+            invocation_error(
+                TurnMcpInvocationErrorCode::PermissionDenied,
+                "current execution authorization no longer permits MCP use",
+            )
+        })?;
 
         if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID
             && native_family.is_none()
@@ -598,7 +673,7 @@ impl GatewayTurnMcpInvoker {
                 })?;
                 let turn_binding = self
                     .crud_store
-                    .get_cli_runtime_turn_binding(invocation.turn_id.as_str())
+                    .get_cli_runtime_turn_binding_control(invocation.turn_id.as_str())
                     .await
                     .map_err(|_| internal_error("failed to verify CLI MCP session binding"))?
                     .ok_or_else(|| {
@@ -658,8 +733,38 @@ impl TurnMcpInvoker for GatewayTurnMcpInvoker {
         invocation: TurnMcpInvocation,
         cancellation: CancellationToken,
     ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
-        let validated = self.validate(invocation, &cancellation).await?;
-        self.execution.execute(validated, cancellation).await
+        let mut context = None;
+        let validated = self.validate(invocation, &cancellation, &mut context).await;
+        let rejected_before_execution = validated.is_err();
+        let result = match validated {
+            Ok(validated) => self.execution.execute(validated, cancellation).await,
+            Err(error) => Err(error),
+        };
+        // Uncorrelated callers and identities rejected before verification cannot
+        // finalize a managed item. Never infer an outcome from native completion.
+        let Some(context) = context else {
+            return result;
+        };
+        let notification = crate::cli_runtime::projector::confirmed_mcp_call_completed(
+            &context.invocation,
+            &context.binding,
+            &context.manifest_hash,
+            &result,
+            rejected_before_execution,
+        );
+        self.crud_store
+            .materialize_cli_mcp_call_completed(
+                notification,
+                context.identity,
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .map_err(|_| {
+                internal_error(
+                    "MCP outcome could not be committed to history; do not repeat the operation",
+                )
+            })?;
+        result
     }
 }
 

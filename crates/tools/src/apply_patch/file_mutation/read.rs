@@ -27,7 +27,7 @@ impl Default for ReadRequest {
             start_line: 0,
             start_byte: None,
             max_lines: 2000,
-            max_bytes: 256 * 1024,
+            max_bytes: 50 * 1024,
         }
     }
 }
@@ -97,6 +97,9 @@ pub struct ReadPage {
     /// covers the original raw bytes).
     pub start_byte: u64,
     pub end_byte: u64,
+    /// The page starts or ends inside a logical line; use cursor/byte continuation.
+    #[serde(default)]
+    pub partial_line: bool,
 }
 
 pub trait ReadAccess: Send + Sync {
@@ -233,6 +236,10 @@ impl<A: ReadAccess> PaginatedReader<A> {
             .next_line
             .map(|next| ReadCursor::new(target, token, next, selection.next_byte).encode())
             .transpose()?;
+        let partial_line = selection.starts_mid_line
+            || (selection.next_byte == Some(selection.end_byte)
+                && selection.next_line.is_some()
+                && !selection.content.ends_with(['\n', '\r']));
         Ok(ReadPage {
             path: target.relative().to_string_lossy().into_owned(),
             content: selection.content,
@@ -244,6 +251,7 @@ impl<A: ReadAccess> PaginatedReader<A> {
             line_endings: snapshot.line_endings,
             start_byte: selection.start_byte,
             end_byte: selection.end_byte,
+            partial_line,
         })
     }
 }
@@ -263,6 +271,7 @@ fn snapshot_from_file(file: &File, limits: SnapshotLimits) -> Result<TextSnapsho
 }
 
 struct PageSelection {
+    starts_mid_line: bool,
     content: String,
     start_line: u64,
     next_line: Option<u64>,
@@ -372,6 +381,23 @@ fn read_page_streaming<R: BufRead>(
                         line.push(byte);
                     }
                     line_len = line_len.saturating_add(1);
+                    if line_index >= start_line && line_len > max_bytes.saturating_sub(page_bytes) {
+                        if line_index == start_line {
+                            return partial_line_selection(
+                                line,
+                                start_line,
+                                text_offset,
+                                max_bytes,
+                            );
+                        }
+                        return page_selection(
+                            selected,
+                            start_line,
+                            start_byte,
+                            end_byte,
+                            Some(line_index),
+                        );
+                    }
                     if finish_stream_line(
                         &mut line_index,
                         &mut text_offset,
@@ -426,7 +452,7 @@ fn read_page_streaming<R: BufRead>(
                 && line_len > max_bytes.saturating_sub(page_bytes)
             {
                 if line_index == start_line {
-                    return Err(ReadError::new(ReadErrorCode::TooLarge));
+                    return partial_line_selection(line, start_line, text_offset, max_bytes);
                 }
                 return page_selection(
                     selected,
@@ -488,6 +514,7 @@ fn read_page_streaming<R: BufRead>(
         end_byte
     };
     Ok(PageSelection {
+        starts_mid_line: false,
         content: String::from_utf8(selected)
             .map_err(|_| ReadError::new(ReadErrorCode::InvalidUtf8))?,
         start_line,
@@ -497,6 +524,33 @@ fn read_page_streaming<R: BufRead>(
         start_byte: start_byte.unwrap_or(text_offset),
         end_byte,
     })
+}
+
+/// Retain a strict UTF-8 prefix and resume at its first unreturned raw byte.
+fn partial_line_selection(
+    bytes: Vec<u8>,
+    start_line: u64,
+    start_byte: u64,
+    max_bytes: u64,
+) -> Result<PageSelection, ReadError> {
+    let mut end = bytes.len().min(max_bytes as usize);
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b'\r' {
+        end -= 1;
+    }
+    if end == 0 {
+        return Err(ReadError::new(ReadErrorCode::TooLarge));
+    }
+    page_selection_from_byte(
+        bytes[..end].to_vec(),
+        start_line,
+        Some(start_byte),
+        start_byte + end as u64,
+        Some(start_line),
+        Some(start_byte + end as u64),
+    )
 }
 
 fn consume_prefix<R: BufRead>(reader: &mut R, length: usize) -> Result<(), ReadError> {
@@ -529,6 +583,7 @@ fn read_page_streaming_from_byte<R: BufRead>(
     let mut line_index = 0u64;
     let mut line_start_byte = 0u64;
     let mut selected_start_line = None;
+    let mut starts_mid_line = false;
     let mut selected = Vec::new();
     let mut selected_lines = 0u64;
     let mut page_bytes = 0u64;
@@ -543,6 +598,7 @@ fn read_page_streaming_from_byte<R: BufRead>(
                 // An empty file has no logical line, and a BOM-only file is
                 // represented as an empty model-visible range after its BOM.
                 return Ok(PageSelection {
+                    starts_mid_line,
                     content: String::new(),
                     start_line: line_index,
                     next_line: None,
@@ -557,6 +613,7 @@ fn read_page_streaming_from_byte<R: BufRead>(
             }
             let selected_empty = selected.is_empty();
             return Ok(PageSelection {
+                starts_mid_line,
                 content: String::from_utf8(selected)
                     .map_err(|_| ReadError::new(ReadErrorCode::InvalidUtf8))?,
                 start_line: selected_start_line.unwrap_or(line_index),
@@ -590,6 +647,7 @@ fn read_page_streaming_from_byte<R: BufRead>(
             if effective_start_byte == line_end_byte && line.is_empty() {
                 // A BOM-only file reaches this branch; it has no model line.
                 return Ok(PageSelection {
+                    starts_mid_line,
                     content: String::new(),
                     start_line: line_index,
                     next_line: None,
@@ -612,7 +670,11 @@ fn read_page_streaming_from_byte<R: BufRead>(
                 end_byte,
                 Some(line_index),
                 Some(line_start_byte),
-            );
+            )
+            .map(|mut page| {
+                page.starts_mid_line = starts_mid_line;
+                page
+            });
         }
 
         let skip = usize::try_from(effective_start_byte.saturating_sub(line_start_byte))
@@ -624,13 +686,19 @@ fn read_page_streaming_from_byte<R: BufRead>(
             return Err(ReadError::new(ReadErrorCode::InvalidRequest));
         }
         if selected_start_line.is_none() {
+            starts_mid_line = skip > 0;
             selected_start_line = Some(line_index);
             first_selected_byte = Some(effective_start_byte.max(line_start_byte));
         }
         let visible_len = visible.len() as u64;
         if visible_len > max_bytes.saturating_sub(page_bytes) {
             if selected.is_empty() {
-                return Err(ReadError::new(ReadErrorCode::TooLarge));
+                return partial_line_selection(
+                    visible.to_vec(),
+                    line_index,
+                    effective_start_byte.max(line_start_byte),
+                    max_bytes,
+                );
             }
             return page_selection_from_byte(
                 selected,
@@ -639,7 +707,11 @@ fn read_page_streaming_from_byte<R: BufRead>(
                 end_byte,
                 Some(line_index),
                 Some(line_start_byte),
-            );
+            )
+            .map(|mut page| {
+                page.starts_mid_line = starts_mid_line;
+                page
+            });
         }
         selected.extend_from_slice(visible);
         page_bytes = page_bytes.saturating_add(visible_len);
@@ -702,6 +774,7 @@ fn page_selection_from_byte(
     next_byte: Option<u64>,
 ) -> Result<PageSelection, ReadError> {
     Ok(PageSelection {
+        starts_mid_line: false,
         content: String::from_utf8(selected)
             .map_err(|_| ReadError::new(ReadErrorCode::InvalidUtf8))?,
         start_line,
@@ -756,6 +829,7 @@ fn page_selection(
     next_line: Option<u64>,
 ) -> Result<PageSelection, ReadError> {
     Ok(PageSelection {
+        starts_mid_line: false,
         content: String::from_utf8(selected)
             .map_err(|_| ReadError::new(ReadErrorCode::InvalidUtf8))?,
         start_line,
@@ -1000,6 +1074,55 @@ mod tests {
     }
 
     #[test]
+    fn minimum_fragment_rejects_impossible_budget_and_preserves_crlf_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file.txt"), "🌍\r\n").unwrap();
+        let resolver = TargetResolver::new(root.path()).unwrap();
+        let reader = PaginatedReader::default();
+        for start_byte in [None, Some(0)] {
+            let request = ReadRequest {
+                start_line: 0,
+                start_byte,
+                max_lines: 1,
+                max_bytes: 1,
+            };
+            assert_eq!(
+                reader
+                    .read_path(&resolver, "file.txt", request, None)
+                    .unwrap_err()
+                    .code,
+                ReadErrorCode::TooLarge
+            );
+            let request = ReadRequest {
+                max_bytes: 4,
+                ..request
+            };
+            let first = reader
+                .read_path(&resolver, "file.txt", request, None)
+                .unwrap();
+            assert_eq!(first.content, "🌍");
+            assert_eq!(first.end_byte, 4);
+            assert!(first.partial_line);
+            let last = reader
+                .read_path(
+                    &resolver,
+                    "file.txt",
+                    ReadRequest {
+                        start_byte: None,
+                        ..request
+                    },
+                    first.cursor.as_deref(),
+                )
+                .unwrap();
+            assert_eq!(last.content, "\r\n");
+            assert_eq!(last.start_byte, first.end_byte);
+            assert_eq!(last.end_byte, 6);
+            assert!(last.partial_line);
+            assert!(last.cursor.is_none());
+        }
+    }
+
+    #[test]
     fn byte_offset_can_start_inside_utf8_line_and_cursor_continues_by_byte() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("file.txt"), "zero\nαβ\nend\n").unwrap();
@@ -1019,6 +1142,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first.content, "β\n");
+        assert!(
+            first.partial_line,
+            "a suffix is also a partial logical line"
+        );
         assert_eq!(first.start_line, 1);
         assert_eq!(first.start_byte, 7);
         assert_eq!(first.end_byte, 10);

@@ -13,7 +13,6 @@ use pioneer_compaction::{
     summary::{
         CompletionKind, INSTRUCTIONS, Summarizer, SummaryCompletion, SummaryFailure, SummaryRequest,
     },
-    text_tokens,
 };
 use pioneer_config::GatewayCliAgentRuntimeKindConfig;
 use pioneer_protocol::ProviderFailureClass;
@@ -25,24 +24,67 @@ pub(super) async fn make_summarizer(
     store: &pioneer_crud::CrudStore,
     processor: Option<&crate::message::MessageProcessor>,
     workspace: &str,
+    thread: &str,
     selection: ModelSelection,
+    native_context: bool,
+    saved: Option<&pioneer_protocol::NativeContextBudget>,
 ) -> Result<Arc<dyn Summarizer>> {
     if selection.transport == Transport::Api {
         let provider = providers.get_or_create_for_workspace(workspace, &selection.instance)?;
-        let provider =
-            crate::usage_journal::observe(provider, store, workspace, "summary", workspace);
-        let limits =
-            pioneer_provider::catalog::model_catalog()?.limits(provider.name(), &selection.model);
-        return Ok(Arc::new(NativeSummarizer::new(
-            provider,
-            selection,
+        let provider = crate::usage_journal::observe(provider, store, workspace, "summary", thread);
+        let budget = if native_context {
+            if saved.is_none() {
+                super::native_budget::validate_manual_authority(
+                    provider.as_ref(),
+                    &selection.model,
+                    selection.context_window,
+                    selection.context_authority.as_deref(),
+                )?;
+            }
+            super::native_budget::effective(
+                provider.as_ref(),
+                &selection.instance,
+                &selection.model,
+                saved,
+                selection.context_window,
+            )
+            .await?
+        } else {
+            let limits = provider.model_limits(&selection.model).await?;
             ModelBudget::new(
                 Some(limits.context_window),
                 limits.max_input,
                 limits.max_output,
-            ),
-        )?));
+            )
+        };
+        let plan = if native_context {
+            match saved.and_then(|budget| budget.service_mode.clone()) {
+                Some(plan) => {
+                    pioneer_provider::catalog::service::validate_plan(
+                        provider.as_ref(),
+                        &selection.model,
+                        &plan,
+                    )
+                    .await?;
+                    Some(plan)
+                }
+                None => Some(
+                    pioneer_provider::catalog::service::capture_plan(
+                        provider.as_ref(),
+                        &selection.model,
+                        None, // missing admitted summary plan is legacy Standard, not current settings
+                    )
+                    .await?,
+                ),
+            }
+        } else {
+            None
+        };
+        return Ok(Arc::new(
+            NativeSummarizer::new(provider, selection, budget)?.with_service_mode(plan),
+        ));
     }
+
     let processor =
         processor.ok_or_else(|| anyhow::anyhow!("CLI service instance catalog is unavailable"))?;
     let instance = processor
@@ -59,7 +101,7 @@ pub(super) async fn make_summarizer(
         instance,
         selection,
         crate::cli_runtime::config::proxy_env(proxy.as_deref()),
-        Some((store.clone(), workspace.into())),
+        Some((store.clone(), workspace.into(), thread.into())),
         opencode_data_home,
     )
 }
@@ -68,7 +110,7 @@ fn make_cli_summarizer(
     instance: pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
     selection: ModelSelection,
     environment: pioneer_cli_agent_runtime::process::SensitiveEnvironment,
-    usage_scope: Option<(pioneer_crud::CrudStore, String)>,
+    usage_scope: Option<(pioneer_crud::CrudStore, String, String)>,
     opencode_data_home: Option<std::path::PathBuf>,
 ) -> Result<Arc<dyn Summarizer>> {
     ensure!(
@@ -91,11 +133,12 @@ fn make_cli_summarizer(
         kind == selection.transport,
         "selected CLI service instance changed kind"
     );
+    let home = crate::cli_runtime::config::service_home(&instance)?;
     let (service, catalog) = match kind {
         Transport::Codex => (
             CliService::Codex(CodexService::new(CodexServiceConfig {
                 executable: instance.binary_path,
-                home_path: instance.home_path,
+                home_path: home,
                 environment,
             })),
             "openai-codex",
@@ -103,7 +146,7 @@ fn make_cli_summarizer(
         Transport::Claude => (
             CliService::Claude(ClaudeService::new(ClaudeServiceConfig {
                 executable: instance.binary_path,
-                config_dir: instance.home_path,
+                config_dir: home,
                 environment,
             })),
             "anthropic",
@@ -150,7 +193,7 @@ enum CliService {
     OpenCode(crate::cli_runtime::opencode_session::OpenCodeSummaryService),
 }
 struct CliSummarizer {
-    usage_scope: Option<(pioneer_crud::CrudStore, String)>,
+    usage_scope: Option<(pioneer_crud::CrudStore, String, String)>,
     selection: ModelSelection,
     budget: ModelBudget,
     service: CliService,
@@ -166,6 +209,25 @@ impl CliSummarizer {
             "invalid service output cap"
         );
         request.data_json()
+    }
+    fn framed_tokens(&self, request: &SummaryRequest, input: &str) -> Result<u64> {
+        #[derive(serde::Serialize)]
+        struct Frame<'a> {
+            model: &'a str,
+            effort: &'a Option<String>,
+            instructions: &'a str,
+            input: &'a str,
+            output_cap: u64,
+        }
+        Ok(pioneer_compaction::estimator::json_size(&Frame {
+            model: &request.selection.model,
+            effort: &request.selection.effort,
+            instructions: INSTRUCTIONS,
+            input,
+            output_cap: request.output_cap,
+        })?
+        .tokens()
+        .saturating_add(32))
     }
 }
 fn service_diagnostic(error: &anyhow::Error) -> pioneer_compaction::runner::FailureDiagnostic {
@@ -233,13 +295,20 @@ fn service_diagnostic(error: &anyhow::Error) -> pioneer_compaction::runner::Fail
                 "cli_working_action_rejected",
                 "Codex exec attempted an action outside the summary service",
             )),
-            "unsupported Claude service capability version" => Some((
-                "cli_version_unsupported",
-                "Installed Claude version does not match the supported service protocol",
-            )),
             _ => None,
         });
-    let mut diagnostic = if let Some((code, explanation)) = known {
+    let mut diagnostic = if let Some(process) =
+        error.downcast_ref::<pioneer_cli_agent_runtime::service::ServiceProcessFailure>()
+    {
+        FailureDiagnostic::new(
+            stage,
+            "cli_process_failed",
+            &format!(
+                "CLI process class={}, exit={:?}, signal={:?}",
+                process.class, process.exit_code, process.signal,
+            ),
+        )
+    } else if let Some((code, explanation)) = known {
         FailureDiagnostic::new(stage, code, explanation)
     } else if let Some(failure) = error.downcast_ref::<ServiceFailure>() {
         FailureDiagnostic::new(
@@ -291,15 +360,25 @@ fn failure(error: anyhow::Error) -> SummaryFailure {
                 | ProviderFailureClass::Provider5xx
         )
     });
+    let overflow = typed.is_some_and(|failure| {
+        matches!(
+            failure.class,
+            ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge
+        )
+    });
     SummaryFailure {
         diagnostic: Some(service_diagnostic(&error)),
-        kind: if transient {
+        kind: if overflow {
+            FailureKind::InputOverflow
+        } else if transient {
             FailureKind::Transient
         } else {
             FailureKind::Permanent
         },
         retry_after_ms: typed.and_then(|failure| failure.retry_after_ms),
-        code: if transient {
+        code: if overflow {
+            "summary_cli_input_overflow"
+        } else if transient {
             "summary_cli_transient"
         } else {
             "summary_cli_rejected"
@@ -313,15 +392,14 @@ impl Summarizer for CliSummarizer {
     }
     fn input_tokens(&self, request: &SummaryRequest) -> Result<u64> {
         let input = self.input(request)?;
-        let framed = serde_json::json!({"model":request.selection.model,"effort":request.selection.effort,
-            "instructions":INSTRUCTIONS,"input":input,"output_cap":request.output_cap});
-        Ok(text_tokens(&framed.to_string()).saturating_add(32))
+        self.framed_tokens(request, &input)
     }
     async fn summarize(
         &self,
         request: SummaryRequest,
     ) -> Result<SummaryCompletion, SummaryFailure> {
-        let input_tokens = self.input_tokens(&request).map_err(failure)?;
+        let input = self.input(&request).map_err(failure)?;
+        let input_tokens = self.framed_tokens(&request, &input).map_err(failure)?;
         if !self.budget.fits(input_tokens, request.output_cap, false) {
             return Err(SummaryFailure {
                 diagnostic: None,
@@ -330,7 +408,6 @@ impl Summarizer for CliSummarizer {
                 code: "summary_cli_input_overflow",
             });
         }
-        let input = self.input(&request).map_err(failure)?;
         // Runner owns the tighter remaining operation/attempt deadline and drops
         // this call on Stop. The service retains its owner for awaitable cleanup.
         let timeout = Duration::from_millis(pioneer_compaction::ATTEMPT_MILLIS);
@@ -354,13 +431,11 @@ impl Summarizer for CliSummarizer {
             ),
             ..Default::default()
         };
-        let call = if let Some((store, workspace)) = &self.usage_scope {
+        let call = if let Some((store, workspace, thread)) = &self.usage_scope {
             Some(
-                crate::usage_journal::Call::start(
-                    store, workspace, "summary", workspace, &observed,
-                )
-                .await
-                .map_err(failure)?,
+                crate::usage_journal::Call::start(store, workspace, "summary", thread, &observed)
+                    .await
+                    .map_err(failure)?,
             )
         } else {
             None
@@ -412,16 +487,20 @@ impl Summarizer for CliSummarizer {
         Ok(finish_cli_summary(&mut observed, text, input_tokens, output_tokens, &raw))
         }.await;
         if let Some(call) = call {
-            call.record(
-                if completion.is_ok() {
-                    "completed"
-                } else {
-                    "failed"
-                },
-                &observed,
-            )
-            .await
-            .map_err(failure)?;
+            if call
+                .record(
+                    if completion.is_ok() {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    &observed,
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!("external summary usage settlement commit unconfirmed");
+            }
         }
         completion
     }
@@ -445,7 +524,10 @@ pub(crate) fn finish_cli_summary(
     raw: &serde_json::Value,
 ) -> SummaryCompletion {
     apply_cli_usage(observed, raw);
-    if observed.provider.as_deref() != Some("opencode-cli") {
+    if !matches!(
+        observed.provider.as_deref(),
+        Some("opencode-cli" | "claude-cli")
+    ) {
         observed.input_tokens = input_tokens;
         observed.output_tokens = output_tokens;
     }
@@ -461,6 +543,14 @@ pub(crate) fn apply_cli_usage(
     observed: &mut pioneer_provider::TokenUsage,
     raw: &serde_json::Value,
 ) {
+    // An error/final envelope may be partial. Enrich the previous observation;
+    // missing counters must not erase usage already reported by this attempt.
+    let previous = observed;
+    let mut snapshot = pioneer_provider::TokenUsage {
+        provider: previous.provider.clone(),
+        ..Default::default()
+    };
+    let observed = &mut snapshot;
     let opencode = observed.provider.as_deref() == Some("opencode-cli");
     observed.uncached_input_tokens = if opencode {
         raw["uncached_input_tokens"].as_u64()
@@ -470,13 +560,15 @@ pub(crate) fn apply_cli_usage(
     observed.cache_read_input_tokens = raw["cache_read_input_tokens"]
         .as_u64()
         .or_else(|| raw["cached_input_tokens"].as_u64());
-    observed.cache_write_input_tokens = raw["cache_creation_input_tokens"].as_u64();
+    observed.cache_write_input_tokens = raw["cache_creation_input_tokens"]
+        .as_u64()
+        .or_else(|| raw["cache_write_input_tokens"].as_u64());
     let claude = observed.provider.as_deref() == Some("claude-cli");
     observed.input_tokens = if claude {
         observed.uncached_input_tokens.and_then(|input| {
             input
-                .checked_add(observed.cache_read_input_tokens.unwrap_or(0))?
-                .checked_add(observed.cache_write_input_tokens.unwrap_or(0))
+                .checked_add(observed.cache_read_input_tokens?)?
+                .checked_add(observed.cache_write_input_tokens?)
         })
     } else {
         raw["input_tokens"].as_u64()
@@ -503,7 +595,7 @@ pub(crate) fn apply_cli_usage(
         .into(),
     );
     observed.accounting = Some(
-        serde_json::json!({"reported_cost":null,"sdk_estimated_cost":raw["total_cost_usd"].as_f64().filter(|_|claude).map(|amount|serde_json::json!({"amount":amount,"currency":"USD","provenance":"cli_sdk_price_table_estimate","source":"https://code.claude.com/docs/en/agent-sdk/cost-tracking","scope":"isolated_cli_summary_result","sdk_version":null})),"estimated_cost":null,"price_status":"external_cli_route_not_attested"}),
+        serde_json::json!({"reported_cost":null,"sdk_estimated_cost":raw["total_cost_usd"].as_f64().filter(|amount|claude && amount.is_finite() && *amount >= 0.).map(|amount|serde_json::json!({"amount":amount,"currency":"USD","provenance":"cli_sdk_price_table_estimate","source":"https://code.claude.com/docs/en/agent-sdk/cost-tracking","scope":"isolated_cli_summary_result","sdk_version":null})),"estimated_cost":null,"price_status":"external_cli_route_not_attested"}),
     );
     if observed.provider.as_deref() == Some("codex-cli") {
         let accounting = observed.accounting.as_mut().unwrap();
@@ -520,11 +612,116 @@ pub(crate) fn apply_cli_usage(
                 _ => serde_json::Value::Null,
             };
     }
-    observed.raw_usage = Some(raw.clone());
+    let mut bounded = pioneer_provider::usage::bounded_usage(raw);
+    bounded["cli_statistics"] = pioneer_provider::usage::bounded_cli_statistics(raw);
+    observed.raw_usage = Some(bounded);
+    if let (Some(accounting), Some(prior)) =
+        (observed.accounting.as_mut(), previous.accounting.as_ref())
+    {
+        for key in [
+            "sdk_estimated_cost",
+            "reasoning_source",
+            "reasoning_alias_conflict",
+        ] {
+            if accounting[key].is_null() && !prior[key].is_null() {
+                accounting[key] = prior[key].clone();
+            }
+        }
+    }
+    previous.update(&snapshot);
+    // TokenUsage.update recomputes exclusive-cache input from the merged
+    // native categories (including zero and checked overflow).
 }
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn process_status_survives_missing_completion_in_stored_diagnostic() {
+        let error = anyhow::anyhow!("Codex service ended without completion").context(
+            pioneer_cli_agent_runtime::service::ServiceProcessFailure {
+                exit_code: Some(23),
+                signal: None,
+                class: "authentication",
+            },
+        );
+        let diagnostic = super::service_diagnostic(&error);
+        assert_eq!(diagnostic.code, "cli_process_failed");
+        let stored = serde_json::to_string(&diagnostic).unwrap();
+        assert!(stored.contains("authentication"));
+        assert!(stored.contains("23"));
+    }
+
+    #[test]
+    fn cli_service_usage_preserves_partial_counters_and_cost_provenance() {
+        let mut codex = pioneer_provider::TokenUsage {
+            provider: Some("codex-cli".into()),
+            ..Default::default()
+        };
+        super::apply_cli_usage(
+            &mut codex,
+            &serde_json::json!({"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":4,"output_tokens":10,"reasoning_output_tokens":3}),
+        );
+        super::apply_cli_usage(&mut codex, &serde_json::json!({"output_tokens":12}));
+        assert_eq!(codex.input_tokens, Some(100));
+        assert_eq!(codex.cache_write_input_tokens, Some(4));
+        assert_eq!(codex.output_tokens, Some(12));
+        assert_eq!(codex.reasoning_tokens, Some(3));
+        let mut claude = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        super::apply_cli_usage(
+            &mut claude,
+            &serde_json::json!({"input_tokens":1,"cache_read_input_tokens":2,"cache_creation_input_tokens":3,"output_tokens":0,"total_cost_usd":0.1}),
+        );
+        super::apply_cli_usage(&mut claude, &serde_json::json!({"duration_ms":20}));
+        assert_eq!(claude.input_tokens, Some(6));
+        assert_eq!(claude.output_tokens, Some(0));
+        super::apply_cli_usage(
+            &mut claude,
+            &serde_json::json!({"cache_read_input_tokens":4}),
+        );
+        assert_eq!(claude.input_tokens, Some(8));
+        let completion = super::finish_cli_summary(
+            &mut claude,
+            "summary".into(),
+            None,
+            None,
+            &serde_json::json!({"duration_ms":21}),
+        );
+        assert_eq!(completion.input_tokens, Some(8));
+        assert_eq!(completion.output_tokens, Some(0));
+        // A new isolated call cannot borrow missing categories from another call.
+        let mut partial = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        for (fragment, expected) in [
+            (serde_json::json!({"input_tokens":1}), None),
+            (serde_json::json!({"cache_read_input_tokens":0}), None),
+            (
+                serde_json::json!({"cache_creation_input_tokens":3}),
+                Some(4),
+            ),
+            (serde_json::json!({"cache_read_input_tokens":4}), Some(8)),
+            (serde_json::json!({"input_tokens":u64::MAX}), None),
+            (
+                serde_json::json!({"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}),
+                Some(0),
+            ),
+        ] {
+            super::apply_cli_usage(&mut partial, &fragment);
+            assert_eq!(partial.input_tokens, expected);
+        }
+        let accounting = claude.accounting.unwrap();
+        assert_eq!(accounting["sdk_estimated_cost"]["amount"], 0.1);
+        assert_eq!(
+            accounting["sdk_estimated_cost"]["provenance"],
+            "cli_sdk_price_table_estimate"
+        );
+        assert!(accounting["reported_cost"].is_null());
+    }
+
     #[test]
     fn nonzero_terminal_usage_preserves_gateway_failure_contract() {
         use pioneer_cli_agent_runtime::{
@@ -621,7 +818,9 @@ mod tests {
             &mut usage,
             &serde_json::json!({"input_tokens":10,"cache_read_input_tokens":20,"output_tokens":0,"total_cost_usd":0.02}),
         );
-        assert_eq!(usage.input_tokens, Some(30));
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.uncached_input_tokens, Some(10));
+        assert_eq!(usage.cache_read_input_tokens, Some(20));
         assert_eq!(usage.cache_write_input_tokens, None);
         assert!(usage.accounting.as_ref().unwrap()["reported_cost"].is_null());
         assert_eq!(
@@ -636,6 +835,36 @@ mod tests {
         summary::{HEADINGS, SummaryInput, SummaryPart, validate_summary},
     };
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn cli_shrinking_requires_a_confirmed_input_failure() {
+        for (class, expected) in [
+            (
+                ProviderFailureClass::PromptTooLong,
+                FailureKind::InputOverflow,
+            ),
+            (
+                ProviderFailureClass::ContextTooLarge,
+                FailureKind::InputOverflow,
+            ),
+            (
+                ProviderFailureClass::AuthOrPermission,
+                FailureKind::Permanent,
+            ),
+            (ProviderFailureClass::InvalidRequest, FailureKind::Permanent),
+            (ProviderFailureClass::RateLimit, FailureKind::Transient),
+        ] {
+            let failure = super::failure(anyhow::Error::new(ServiceFailure {
+                class,
+                retry_after_ms: None,
+            }));
+            assert_eq!(failure.kind, expected);
+        }
+        assert_eq!(
+            super::failure(anyhow::anyhow!("context too large")).kind,
+            FailureKind::Permanent
+        );
+    }
 
     #[test]
     fn cli_failure_diagnostic_preserves_stage_and_rpc_code_without_raw_payloads() {
@@ -687,8 +916,42 @@ mod tests {
     }
 
     #[test]
+    fn cli_owned_api_summary_retains_legacy_selection_identity() {
+        let api: ModelSelection = serde_json::from_value(serde_json::json!({
+            "transport":"api", "instance":"fixture", "model":"fixture-model", "effort":"high"
+        }))
+        .unwrap();
+        let legacy_identity = serde_json::to_vec(&api).unwrap();
+        let mut settings = pioneer_compaction::CompactionSettings {
+            selection: Some(api.clone()),
+        };
+        settings.selection.as_mut().unwrap().service_mode =
+            Some(pioneer_protocol::NativeServiceModeSelection {
+                id: "pro".into(),
+                authority: "native-scope".into(),
+            });
+        let mut current = api;
+        current.transport = Transport::Codex;
+        let mut cli_override = None;
+        crate::compaction::isolate_cli_summary_service_modes(
+            &mut current,
+            &mut settings,
+            &mut cli_override,
+        );
+        let admission = settings.admit(&current, None, 0).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&admission.selection).unwrap(),
+            legacy_identity
+        );
+        assert!(current.service_mode.is_none());
+    }
+
+    #[test]
     fn cli_summary_input_keeps_projected_command_output_once() {
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Claude,
             instance: "fixture".into(),
             model: "fixture-model".into(),
@@ -704,7 +967,7 @@ mod tests {
                 environment: SensitiveEnvironment::new(),
             })),
         };
-        let marker = "cli-summary-command-output ".repeat(32);
+        let marker = "cli-summary-command-output \"\\\n🌍\u{0}".repeat(32);
         let request = SummaryRequest {
             selection,
             output_cap: 512,
@@ -728,8 +991,16 @@ mod tests {
             },
         };
         let input = summarizer.input(&request).unwrap();
-        assert_eq!(input.matches(&marker).count(), 1);
-        assert!(summarizer.input_tokens(&request).unwrap() > 0);
+        let decoded: SummaryInput = serde_json::from_str(&input).unwrap();
+        assert_eq!(decoded.compact_units.len(), 1);
+        assert_eq!(decoded.compact_units[0].text, marker);
+        let actual = summarizer.input_tokens(&request).unwrap();
+        let mut fixed = request.clone();
+        fixed.input.compact_units.clear();
+        let sizing = super::super::PortionSizing::new(summarizer.input_tokens(&fixed).unwrap());
+        let estimate = sizing
+            .with(super::super::summary_component_units(&request.input.compact_units[0]).unwrap());
+        assert!(actual <= estimate && estimate <= actual + 1);
     }
 
     #[tokio::test]
@@ -780,6 +1051,9 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
             debug_native_events: false,
         };
         let selection = ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Claude,
             instance: "selected-cli".into(),
             model: "claude-sonnet-4-6".into(),

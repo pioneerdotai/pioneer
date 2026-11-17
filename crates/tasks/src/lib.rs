@@ -1,5 +1,6 @@
 mod actor_contract;
 mod admission;
+mod closing_observer;
 mod error;
 mod event_bus;
 mod executor;
@@ -21,7 +22,7 @@ mod wait;
 mod tests;
 
 pub use actor_contract::{build_occurrence_contract, build_task_actor_contract};
-pub use error::{TaskOperationError, TaskRuntimeError, TaskRuntimeResult};
+pub use error::{PartialTaskStartup, TaskOperationError, TaskRuntimeError, TaskRuntimeResult};
 pub use event_bus::{
     TaskEventBus, TaskEventFilter, TaskEventSubscription, TaskEventWake, TaskEventWakeDelivery,
 };
@@ -37,7 +38,8 @@ pub use notifications::TaskNotificationMapper;
 pub use policy::{
     TaskAgentAuthorizationGrantSeed, TaskCreateContext, TaskExecutionAdmissionSeed,
     TaskMutationContext, TaskRunConversationSnapshotSeed, TaskWaitActivityObserver,
-    TaskWaitContext, default_delivery_policy, default_lifecycle_policy,
+    TaskWaitContext, default_delivery_policy, default_delivery_policy_for_trigger,
+    default_lifecycle_policy, default_lifecycle_policy_for_trigger,
 };
 pub use projector::TaskProjector;
 pub use reconciliation::{ReconciliationReport, TaskStartupReconciler};
@@ -51,8 +53,8 @@ pub use review::{
 };
 pub use scheduler::{TASK_EXECUTION_LEASE_SECONDS, TaskScheduler, TaskSchedulerHandle};
 pub use service::{
-    TaskDeliveryRecoveryResult, TaskReviewRuntimeConfig, TaskRuntime, TaskRuntimeConfig,
-    TaskService, WriteLockDecision,
+    PreparedComposerTask, TaskDeliveryRecoveryResult, TaskReviewRuntimeConfig, TaskRuntime,
+    TaskRuntimeConfig, TaskService, WriteLockDecision, task_review_wait_item,
 };
 pub use trigger::TaskTriggerCalculator;
 

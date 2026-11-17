@@ -1,6 +1,7 @@
+use gpui_kit::component::input::{Copy, Cut, Paste, SelectAll};
 use gpui_kit::{
-    App, ClipboardItem, KeyBinding, Menu, MenuItem, PromptButton, PromptLevel, SystemMenuType,
-    actions,
+    App, ClipboardItem, KeyBinding, Menu, MenuItem, OsAction, PromptButton, PromptLevel,
+    SystemMenuType, actions,
 };
 
 actions!(
@@ -15,24 +16,47 @@ pub(crate) fn init_system_menus(cx: &mut App) {
     cx.on_action(hide_other_apps);
     cx.on_action(show_all_apps);
     cx.on_action(quit_app);
-    cx.bind_keys([KeyBinding::new("secondary-h", HideApp, None)]);
-    cx.bind_keys([KeyBinding::new("secondary-alt-h", HideOtherApps, None)]);
-    cx.bind_keys([KeyBinding::new("secondary-q", QuitApp, None)]);
-    cx.set_menus(vec![Menu {
-        name: t!("menu.app.name").into(),
-        disabled: false,
-        items: vec![
-            MenuItem::action(t!("menu.app.about"), ShowAbout),
-            MenuItem::separator(),
-            MenuItem::os_submenu(t!("menu.app.services"), SystemMenuType::Services),
-            MenuItem::separator(),
-            MenuItem::action(t!("menu.app.hide"), HideApp),
-            MenuItem::action(t!("menu.app.hide_others"), HideOtherApps),
-            MenuItem::action(t!("menu.app.show_all"), ShowAllApps),
-            MenuItem::separator(),
-            MenuItem::action(t!("menu.app.quit"), QuitApp),
-        ],
-    }]);
+    // Static keybindings require explicit modifiers, rather than the secondary alias.
+    let (hide_key, hide_others_key, quit_key) = if cx.platform_info().is_mac() {
+        ("cmd-h", "cmd-alt-h", "cmd-q")
+    } else {
+        ("ctrl-h", "ctrl-alt-h", "ctrl-q")
+    };
+    cx.bind_keys([
+        KeyBinding::new(hide_key, HideApp, None),
+        KeyBinding::new(hide_others_key, HideOtherApps, None),
+        KeyBinding::new(quit_key, QuitApp, None),
+    ]);
+    cx.set_menus(vec![
+        Menu {
+            name: t!("menu.app.name").into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action(t!("menu.app.about"), ShowAbout),
+                MenuItem::separator(),
+                MenuItem::os_submenu(t!("menu.app.services"), SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action(t!("menu.app.hide"), HideApp),
+                MenuItem::action(t!("menu.app.hide_others"), HideOtherApps),
+                MenuItem::action(t!("menu.app.show_all"), ShowAllApps),
+                MenuItem::separator(),
+                MenuItem::action(t!("menu.app.quit"), QuitApp),
+            ],
+        },
+        Menu {
+            name: t!("menu.edit.name").into(),
+            disabled: false,
+            items: vec![
+                // Native selectors let AppKit route editing to the focused WKWebView;
+                // the same actions still belong to the existing GPUI input controls.
+                MenuItem::os_action(t!("menu.edit.cut"), Cut, OsAction::Cut),
+                MenuItem::os_action(t!("menu.edit.copy"), Copy, OsAction::Copy),
+                MenuItem::os_action(t!("menu.edit.paste"), Paste, OsAction::Paste),
+                MenuItem::separator(),
+                MenuItem::os_action(t!("menu.edit.select_all"), SelectAll, OsAction::SelectAll),
+            ],
+        },
+    ]);
 }
 
 fn show_about(_: &ShowAbout, cx: &mut App) {
@@ -87,4 +111,44 @@ fn show_all_apps(_: &ShowAllApps, cx: &mut App) {
 
 fn quit_app(_: &QuitApp, cx: &mut App) {
     crate::client_runtime::DesktopRuntimeCoordinator::request_quit(cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::{
+        Action, Keystroke, OperatingSystem, PlatformInfo, PlatformTarget, TestAppContext,
+    };
+
+    #[gpui_kit::test]
+    fn system_menus_initialize_with_host_shortcuts(cx: &mut TestAppContext) {
+        for (os, shortcuts) in [
+            (OperatingSystem::Mac, ["cmd-h", "cmd-alt-h", "cmd-q"]),
+            (OperatingSystem::Windows, ["ctrl-h", "ctrl-alt-h", "ctrl-q"]),
+            (OperatingSystem::Linux, ["ctrl-h", "ctrl-alt-h", "ctrl-q"]),
+        ] {
+            let mut app = cx.new_app();
+            app.set_platform_info(PlatformInfo {
+                os,
+                target: PlatformTarget::Native,
+            });
+            app.update(|cx| {
+                init_system_menus(cx);
+
+                let keymap = cx.key_bindings();
+                let keymap = keymap.borrow();
+                let actions: [&dyn Action; 3] = [&HideApp, &HideOtherApps, &QuitApp];
+                for (action, shortcut) in actions.into_iter().zip(shortcuts) {
+                    let keystroke = Keystroke::parse(shortcut).unwrap();
+                    assert!(
+                        keymap.bindings_for_action(action).any(|binding| {
+                            binding.match_keystrokes(&[keystroke.clone()]) == Some(false)
+                        }),
+                        "missing {shortcut} for {} on {os:?}",
+                        action.name()
+                    );
+                }
+            });
+        }
+    }
 }

@@ -95,7 +95,7 @@ struct ActiveStream {
     session_id: String,
     principal_id: String,
     workspace_id: String,
-    artifact_id: String,
+    artifact_id: Option<String>,
     cancellation: CancellationToken,
 }
 
@@ -222,6 +222,24 @@ impl HttpStreamRegistry {
         workspace_id: &str,
         artifact_id: &str,
     ) -> Result<HttpStreamLease, StreamAdmissionError> {
+        self.acquire_scoped(session_id, principal_id, workspace_id, Some(artifact_id))
+    }
+    /// Shared capacity and auth-session lifetime for non-artifact resources.
+    pub(super) fn acquire_app(
+        self: &Arc<Self>,
+        session_id: &AuthSessionId,
+        principal_id: &str,
+        workspace_id: &str,
+    ) -> Result<HttpStreamLease, StreamAdmissionError> {
+        self.acquire_scoped(session_id, principal_id, workspace_id, None)
+    }
+    fn acquire_scoped(
+        self: &Arc<Self>,
+        session_id: &AuthSessionId,
+        principal_id: &str,
+        workspace_id: &str,
+        artifact_id: Option<&str>,
+    ) -> Result<HttpStreamLease, StreamAdmissionError> {
         let global_permit = self
             .global
             .clone()
@@ -265,7 +283,7 @@ impl HttpStreamRegistry {
                 session_id: session_key.clone(),
                 principal_id: principal_key.clone(),
                 workspace_id: workspace_id.to_owned(),
-                artifact_id: artifact_id.to_owned(),
+                artifact_id: artifact_id.map(str::to_owned),
                 cancellation: cancellation.clone(),
             },
         );
@@ -310,7 +328,8 @@ impl HttpStreamRegistry {
 
     pub(crate) fn cancel_artifact(&self, workspace_id: &str, artifact_id: &str) -> usize {
         self.cancel_matching(|stream| {
-            stream.workspace_id == workspace_id && stream.artifact_id == artifact_id
+            stream.workspace_id == workspace_id
+                && stream.artifact_id.as_deref() == Some(artifact_id)
         })
     }
 
@@ -424,7 +443,7 @@ impl crate::message::ArtifactStreamInvalidation for HttpStreamRegistry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamOutcome {
+pub(super) enum StreamOutcome {
     Completed,
     Cancelled,
     IdleTimeout,
@@ -467,15 +486,18 @@ impl std::fmt::Debug for HttpStreamLease {
 }
 
 impl HttpStreamLease {
+    pub(super) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
     fn cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
     }
 
-    fn record_bytes(&mut self, bytes: usize) {
+    pub(super) fn record_bytes(&mut self, bytes: usize) {
         self.bytes = self.bytes.saturating_add(bytes as u64);
     }
 
-    fn set_outcome(&mut self, outcome: StreamOutcome) {
+    pub(super) fn set_outcome(&mut self, outcome: StreamOutcome) {
         self.outcome = outcome;
     }
 }
@@ -555,8 +577,10 @@ where
         }
         if this.lease.cancelled() || this.lease.cancellation_wait.as_mut().poll(cx).is_ready() {
             this.lease.set_outcome(StreamOutcome::Cancelled);
+            // Revocation is terminal. AsyncReadExt retries Interrupted, which
+            // would spin forever because this lease stays cancelled.
             return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Interrupted,
+                io::ErrorKind::ConnectionAborted,
                 "artifact stream authority was revoked",
             )));
         }
@@ -921,12 +945,28 @@ mod tests {
 
         assert_eq!(registry.cancel_session(&first_session), 1);
         assert_eq!(registry.cancel_session(&first_session), 1);
+        // Inspect repeated polls before using an adapter that retries Interrupted:
+        // a regression must fail here rather than trap the test in a loop.
+        for _ in 0..2 {
+            let mut bytes = [0_u8; 1];
+            let mut buffer = ReadBuf::new(&mut bytes);
+            let mut context = Context::from_waker(std::task::Waker::noop());
+            let Poll::Ready(Err(error)) = Pin::new(&mut first).poll_read(&mut context, &mut buffer)
+            else {
+                panic!("cancelled stream must immediately return a terminal error");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+            assert!(buffer.filled().is_empty());
+        }
         let error = first.read_u8().await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         drop(first);
         assert_eq!(registry.active_count(), 1);
+        assert_eq!(registry.metrics_observation().1, 1);
+        assert_eq!(registry.metrics_observation().3, 0);
         drop(second);
         assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.metrics_observation().1, 1);
     }
 
     #[tokio::test]
@@ -1035,6 +1075,32 @@ mod tests {
             )
             .unwrap();
         drop(replacement);
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn app_resources_share_global_capacity_and_session_revocation_without_artifact_aliasing() {
+        let mut config = GatewayArtifactsConfig::default();
+        config.http_streams_global = 1;
+        config.http_streams_per_principal = 1;
+        config.http_streams_per_session = 1;
+        config.http_open_handles = 1;
+        let registry = HttpStreamRegistry::new(&config).unwrap();
+        let session = AuthSessionId::new("S00000000000000000001").unwrap();
+        let artifact = registry
+            .acquire(&session, "principal", "ws", "app-a")
+            .unwrap();
+        assert!(matches!(
+            registry.acquire_app(&session, "principal", "ws"),
+            Err(StreamAdmissionError::GlobalCapacity)
+        ));
+        drop(artifact);
+        let app = registry.acquire_app(&session, "principal", "ws").unwrap();
+        assert_eq!(registry.cancel_artifact("ws", "app-a"), 0);
+        assert!(!app.cancellation_token().is_cancelled());
+        assert_eq!(registry.cancel_session(&session), 1);
+        assert!(app.cancellation_token().is_cancelled());
+        drop(app);
         assert_eq!(registry.active_count(), 0);
     }
 }

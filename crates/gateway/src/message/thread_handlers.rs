@@ -5,6 +5,9 @@ use crate::authorization::{
 };
 use crate::thread::{RuntimeDraftAccess, ThreadSubscriptionIdentity};
 use pioneer_crud::{PersistedThreadAccessClass, PrivateThreadParticipantMutation};
+use pioneer_observability::opening::{
+    Measure as OpeningMeasure, Phase as OpeningPhase, Result as OpeningResult,
+};
 use pioneer_protocol::{
     PrincipalId, Thread, ThreadParticipantChangeKind, ThreadParticipantSummary,
     ThreadParticipantsChangedNotification, ThreadParticipantsResponse,
@@ -89,9 +92,16 @@ impl MessageProcessor {
 }
 
 fn open_only_thread_start_params(thread: &Thread) -> ThreadStartParams {
+    open_only_thread_start_params_for_id(thread.id.clone(), thread.workspace_id.clone())
+}
+
+pub(super) fn open_only_thread_start_params_for_id(
+    thread_id: String,
+    workspace_id: String,
+) -> ThreadStartParams {
     ThreadStartParams {
-        thread_id: thread.id.clone(),
-        workspace_id: thread.workspace_id.clone(),
+        thread_id,
+        workspace_id,
         name: None,
         model: None,
         model_provider: None,
@@ -393,6 +403,33 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn thread_open_runtime_draft(
+        &self,
+        context: &RequestContext,
+        access: &RuntimeDraftAccess,
+        request_id: RequestId,
+    ) {
+        match self.thread_manager.open_runtime_draft(access).await {
+            Some(outcome) => {
+                self.session_manager
+                    .set_connection_workspace(
+                        context.connection_id(),
+                        Some(access.workspace_id().to_owned()),
+                    )
+                    .await;
+                self.finish_thread_start(context.connection_id(), request_id, outcome, None)
+                    .await;
+            }
+            None => {
+                self.send_error(
+                    context.connection_id(),
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await
+            }
+        }
+    }
+
     async fn finish_thread_start(
         &self,
         connection_id: ConnectionId,
@@ -403,6 +440,63 @@ impl MessageProcessor {
         let replay_workspace_id = outcome.response.thread.workspace_id.clone();
         let replay_thread_id = outcome.response.thread.id.clone();
 
+        // Captured with membership creation under ThreadManager's lock. A
+        // later same-socket re-subscribe must never substitute its new token.
+        let Some(incarnation) = outcome
+            .subscription_incarnations
+            .iter()
+            .find(|token| token.connection == connection_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let started_recipients = outcome.subscription_incarnations.clone();
+        let parent = pioneer_observability::scenario::Correlation::capture();
+        let mut reservation_observation =
+            trace.map(|_| OpeningMeasure::start(OpeningPhase::ReplayReservation, &parent, &[]));
+        if let Some(observation) = &mut reservation_observation {
+            observation.wait_for(pioneer_observability::live::WaitKind::ChannelCapacity);
+        }
+        let mut replay = match self
+            .session_manager
+            .reserve_thread_replay(
+                connection_id,
+                incarnation.clone(),
+                &self.pending_delivery_order,
+            )
+            .await
+        {
+            Ok(replay) => replay,
+            Err(error) => {
+                if let Some(observation) = &mut reservation_observation {
+                    observation.finish(OpeningResult::Failed);
+                }
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("post-open replay admission failed: {error}"),
+                    ),
+                )
+                .await;
+                return false;
+            }
+        };
+        if let Some(observation) = &mut reservation_observation {
+            observation.finish(OpeningResult::Confirmed);
+        }
+        let mut snapshot_observation =
+            trace.map(|_| OpeningMeasure::start(OpeningPhase::SnapshotFence, &parent, &[]));
+        if let Some(observation) = &mut snapshot_observation {
+            observation.wait_for(pioneer_observability::live::WaitKind::Child);
+        }
+        self.foreground_starts
+            .before_thread_snapshot(&replay_thread_id)
+            .await;
+        if let Some(observation) = &mut snapshot_observation {
+            observation.finish(OpeningResult::Confirmed);
+        }
         let response_encode_stage = trace.map(|trace| {
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenResponseEncode)
         });
@@ -431,7 +525,23 @@ impl MessageProcessor {
         let response_send_stage = trace.map(|trace| {
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenResponseSend)
         });
-        if let Err(error) = self.send_json(connection_id, &response).await {
+        let encoded = match serde_json::to_string(&response) {
+            Ok(encoded) => encoded,
+            Err(_) => return false,
+        };
+        let mut admission_observation =
+            trace.map(|_| OpeningMeasure::start(OpeningPhase::ReplyAdmission, &parent, &[]));
+        if let Some(observation) = &mut admission_observation {
+            observation.wait_for(pioneer_observability::live::WaitKind::Lock);
+        }
+        if let Err(error) = self
+            .session_manager
+            .try_send_thread_open_reply(connection_id, &incarnation, encoded)
+            .await
+        {
+            if let Some(observation) = &mut admission_observation {
+                observation.finish(OpeningResult::Failed);
+            }
             drop(response_send_stage);
             warn!(
                 connection_id,
@@ -440,35 +550,73 @@ impl MessageProcessor {
             );
             return false;
         }
+        if let Some(observation) = &mut admission_observation {
+            observation.finish(OpeningResult::Confirmed);
+        }
+        let mut acknowledgement_observation =
+            trace.map(|_| OpeningMeasure::start(OpeningPhase::Acknowledge, &parent, &[]));
+        replay.acknowledge();
+        if let Some(observation) = &mut acknowledgement_observation {
+            observation.finish(OpeningResult::Confirmed);
+        }
         if let Some(stage) = response_send_stage {
             stage.succeed();
         }
 
-        let post_response_replay_stage = trace.map(|trace| {
-            trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenPostResponseReplay)
-        });
-        self.send_notification_to_authorized_thread_connections(
-            replay_thread_id.as_str(),
-            events::THREAD_STARTED,
-            &outcome.started_notification,
-            outcome.started_notification_connection_ids,
-        )
-        .await;
-
-        self.replay_native_permission_requests_for_thread(
-            connection_id,
-            replay_workspace_id.as_str(),
-            replay_thread_id.as_str(),
-        )
-        .await;
-        self.replay_cli_runtime_pending_requests_for_thread(
-            connection_id,
-            replay_workspace_id.as_str(),
-            replay_thread_id.as_str(),
-        )
-        .await;
-        if let Some(stage) = post_response_replay_stage {
-            stage.succeed();
+        // Reply admission confirms the authorized subscription, not physical
+        // receipt. The reserved connection owner now owns the entire tail.
+        {
+            let includes_pending = replay.includes_pending();
+            let processor = self.clone();
+            let mut tail_observation =
+                trace.map(|_| OpeningMeasure::start(OpeningPhase::ReplayTail, &parent, &[]));
+            let tail_context = tail_observation
+                .as_ref()
+                .map(OpeningMeasure::correlation)
+                .unwrap_or_else(|| parent.clone());
+            replay.start(async move {
+                tail_context
+                    .scope(async move {
+                        for token in started_recipients {
+                            token
+                                .run(
+                                    processor.send_notification_to_authorized_thread_connections(
+                                        &replay_thread_id,
+                                        events::THREAD_STARTED,
+                                        &outcome.started_notification,
+                                        vec![token.connection],
+                                    ),
+                                )
+                                .await;
+                        }
+                        // Each successful open keeps its THREAD_STARTED notification;
+                        // the durable pending replay itself has one owner/incarnation.
+                        if !includes_pending {
+                            if let Some(observation) = &mut tail_observation {
+                                observation.finish(OpeningResult::Returned);
+                            }
+                            return;
+                        }
+                        processor
+                            .replay_native_permission_requests_for_thread(
+                                connection_id,
+                                &replay_workspace_id,
+                                &replay_thread_id,
+                            )
+                            .await;
+                        processor
+                            .replay_cli_runtime_pending_requests_for_thread(
+                                connection_id,
+                                &replay_workspace_id,
+                                &replay_thread_id,
+                            )
+                            .await;
+                        if let Some(observation) = &mut tail_observation {
+                            observation.finish(OpeningResult::Returned);
+                        }
+                    })
+                    .await;
+            });
         }
         true
     }
@@ -501,13 +649,6 @@ impl MessageProcessor {
             pioneer_observability::GatewayOperationVariant::ThreadTreePrincipalScoped
         });
         let workspace_id = authorization.workspace_id().to_owned();
-        let connection_workspace_stage = trace
-            .stage(pioneer_observability::GatewayOperationStage::ThreadTreeConnectionWorkspaceSet);
-        self.session_manager
-            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-            .await;
-        connection_workspace_stage.succeed();
-
         let threads = match self
             .list_threads_snapshot_for_authorization(
                 authorization,
@@ -733,6 +874,12 @@ impl MessageProcessor {
         }
         .into_directory_summary();
 
+        for thread in &response_payload.threads {
+            self.foreground_starts
+                .before_thread_snapshot(&thread.id)
+                .await;
+        }
+
         let response_encode_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeResponseEncode);
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
@@ -904,6 +1051,9 @@ impl MessageProcessor {
             unread_count,
         };
 
+        self.foreground_starts
+            .before_thread_snapshot(&response_payload.thread.id)
+            .await;
         let response_encode_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadGetResponseEncode);
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
@@ -1248,6 +1398,9 @@ impl MessageProcessor {
         let response_payload = ThreadUpdateResponse {
             thread: thread.clone(),
         };
+        self.foreground_starts
+            .before_thread_snapshot(&response_payload.thread.id)
+            .await;
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
             Ok(response) => response,
             Err(error) => {
@@ -2168,6 +2321,7 @@ impl MessageProcessor {
     }
 
     pub(super) async fn notify_thread_tree_changed(&self, workspace_id: String) {
+        self.dirty_push(&workspace_id, None, None, None, true, None);
         let notification = ThreadTreeChangedNotification { workspace_id };
         self.send_notification_to_workspace_connections(
             notification.workspace_id.as_str(),

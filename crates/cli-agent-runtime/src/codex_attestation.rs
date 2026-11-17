@@ -92,25 +92,11 @@ pub fn codex_executable_cache_identity(
 pub fn attest_codex_executable_identity(
     cache_identity: CodexExecutableCacheIdentity,
 ) -> Result<CodexExecutableAttestation> {
-    let metadata = fs::metadata(cache_identity.realpath.as_path()).with_context(|| {
-        format!(
-            "failed to re-inspect Codex executable `{}`",
-            cache_identity.realpath.display()
-        )
-    })?;
-    let modified = metadata
-        .modified()
-        .context("failed to re-read Codex executable modification time")?
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| anyhow!("Codex executable modification time predates Unix epoch"))?;
-    let modified_unix_nanos = modified.as_nanos().min(u64::MAX as u128) as u64;
-    if !metadata.is_file()
-        || metadata.len() != cache_identity.size
-        || modified_unix_nanos != cache_identity.modified_unix_nanos
-    {
-        bail!("Codex executable changed while it was being attested");
-    }
-    let binary_sha256 = sha256_file_contents(cache_identity.realpath.as_path())?;
+    let binary_sha256 = crate::executable_digest::executable_sha256(
+        cache_identity.realpath.as_path(),
+        cache_identity.size,
+        cache_identity.modified_unix_nanos,
+    )?;
     let platform = env::consts::OS.to_owned();
     let architecture = env::consts::ARCH.to_owned();
     let fingerprint_payload = serde_json::json!({

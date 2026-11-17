@@ -1267,6 +1267,9 @@ mod tests {
     #[test]
     fn security_resolver_input_builds_from_api_provider_turn_start_params() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -1319,6 +1322,9 @@ mod tests {
     #[test]
     fn security_resolver_input_rejects_missing_cwd() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -1350,6 +1356,9 @@ mod tests {
     #[test]
     fn security_resolver_input_maps_cli_backend_without_provider_knobs() {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -1418,6 +1427,9 @@ mod tests {
             ),
         ] {
             let params = TurnStartParams {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
                 agent_delegation_routes: Vec::new(),
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
@@ -1720,30 +1732,6 @@ mod tests {
     }
 
     #[test]
-    fn network_policy_full_access_resolves_enabled_network() {
-        let input = resolver_input_for_mode_and_backend(TurnPermissionMode::FullAccess, None);
-        let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
-
-        assert_eq!(snapshot.network.mode, TurnNetworkMode::Enabled);
-        assert_eq!(snapshot.sandbox.network.mode, TurnNetworkMode::Enabled);
-    }
-
-    #[test]
-    fn network_policy_restricted_product_modes_resolve_disabled_network() {
-        for mode in [
-            TurnPermissionMode::Supervised,
-            TurnPermissionMode::AutoAcceptEdits,
-        ] {
-            let input = resolver_input_for_mode_and_backend(mode, None);
-            let snapshot =
-                resolve_turn_execution_security(&input).expect("snapshot should resolve");
-
-            assert_eq!(snapshot.network.mode, TurnNetworkMode::Disabled);
-            assert_eq!(snapshot.sandbox.network.mode, TurnNetworkMode::Disabled);
-        }
-    }
-
-    #[test]
     fn mcp_policy_does_not_trust_server_read_only_hint() {
         let invocation = mcp_invocation(
             Some(true),
@@ -1816,31 +1804,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_capability_native_tool_uses_unknown_action_default() {
-        let invocation = unknown_tool_invocation("mystery_tool");
-        let intent = extract_permission_intent(&invocation);
-        let context = PermissionEvaluationContext::for_turn(
-            "workspace_1",
-            "thread_1",
-            "turn_1",
-            TurnPermissionProfileSnapshot::from_mode(
-                TurnPermissionMode::Supervised,
-                TurnPermissionProfileSource::Composer,
-            ),
-        );
-
-        assert_eq!(intent.action, PermissionActionKind::Unknown);
-        assert!(intent.is_unknown_capability());
-        assert!(matches!(
-            ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-            PermissionDecision::Ask {
-                reason: pioneer_tools::PermissionDecisionReason::UnknownActionDefault,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn unknown_capability_deny_policy_stops_native_tool() {
         let invocation = unknown_tool_invocation("mystery_tool");
         let intent = extract_permission_intent(&invocation);
@@ -1865,31 +1828,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_capability_skill_action_uses_unknown_action_default() {
-        let invocation = unknown_skill_invocation();
-        let intent = extract_permission_intent(&invocation);
-        let context = PermissionEvaluationContext::for_turn(
-            "workspace_1",
-            "thread_1",
-            "turn_1",
-            TurnPermissionProfileSnapshot::from_mode(
-                TurnPermissionMode::Supervised,
-                TurnPermissionProfileSource::Composer,
-            ),
-        );
-
-        assert_eq!(intent.action, PermissionActionKind::DynamicSkillTool);
-        assert!(intent.is_unknown_capability());
-        assert!(matches!(
-            ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-            PermissionDecision::Ask {
-                reason: pioneer_tools::PermissionDecisionReason::UnknownActionDefault,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn shell_security_full_access_resolves_unrestricted_process_execution() {
         let input = resolver_input_for_mode_and_backend(TurnPermissionMode::FullAccess, None);
         let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
@@ -1898,6 +1836,12 @@ mod tests {
         assert_eq!(snapshot.backend.sandbox_backend, None);
         assert!(snapshot.process.shell.enabled);
         assert!(snapshot.process.environment.inherit);
+
+        assert_eq!(
+            snapshot.sandbox.backend_requirement,
+            SandboxBackendRequirement::Optional
+        );
+        assert_eq!(snapshot.enforcement, TurnSecurityEnforcementStatus::Active);
     }
 
     #[test]
@@ -1916,6 +1860,44 @@ mod tests {
         ));
         assert!(snapshot.process.shell.enabled);
         assert!(snapshot.backend.capabilities.can_enforce_process);
+
+        assert_eq!(
+            snapshot.backend.execution_backend,
+            TurnSecurityExecutionBackendKind::Native
+        );
+        assert_eq!(snapshot.enforcement, TurnSecurityEnforcementStatus::Active);
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert_eq!(
+                snapshot.backend.sandbox_backend,
+                Some(SandboxBackendKind::Nono)
+            );
+            assert_eq!(
+                snapshot.sandbox.backend_preference,
+                vec![SandboxBackendKind::Nono]
+            );
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                snapshot.backend.sandbox_backend,
+                Some(SandboxBackendKind::WindowsRestrictedToken)
+            );
+            assert_eq!(
+                snapshot.sandbox.backend_preference,
+                vec![SandboxBackendKind::WindowsRestrictedToken]
+            );
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_ne!(
+                snapshot.backend.sandbox_backend,
+                Some(SandboxBackendKind::WindowsRestrictedToken)
+            );
+        }
     }
 
     fn resolver_input_for_mode_and_backend(
@@ -1923,6 +1905,9 @@ mod tests {
         execution_backend: Option<AgentExecutionBackend>,
     ) -> TurnSecurityResolverInput {
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -2020,22 +2005,6 @@ mod tests {
     }
 
     #[test]
-    fn security_backend_capabilities_native_restricted_snapshot_is_active() {
-        let input = resolver_input_for_mode_and_backend(TurnPermissionMode::AutoAcceptEdits, None);
-        let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
-
-        assert_eq!(
-            snapshot.backend.execution_backend,
-            TurnSecurityExecutionBackendKind::Native
-        );
-        assert!(matches!(
-            snapshot.backend.sandbox_backend,
-            Some(SandboxBackendKind::Nono) | Some(SandboxBackendKind::WindowsRestrictedToken)
-        ));
-        assert_eq!(snapshot.enforcement, TurnSecurityEnforcementStatus::Active);
-    }
-
-    #[test]
     fn sandbox_backend_resolver_selects_required_native_backend_only() {
         let input = resolver_input_for_mode_and_backend(TurnPermissionMode::Supervised, None);
         let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
@@ -2054,71 +2023,6 @@ mod tests {
         );
         assert!(snapshot.backend.capabilities.can_enforce_filesystem);
         assert!(snapshot.backend.capabilities.can_enforce_process);
-    }
-
-    #[test]
-    fn sandbox_backend_resolver_keeps_full_access_optional_and_unrestricted() {
-        let input = resolver_input_for_mode_and_backend(TurnPermissionMode::FullAccess, None);
-        let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
-
-        assert_eq!(
-            snapshot.sandbox.backend_requirement,
-            SandboxBackendRequirement::Optional
-        );
-        assert_eq!(snapshot.backend.sandbox_backend, None);
-        assert_eq!(snapshot.enforcement, TurnSecurityEnforcementStatus::Active);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn nono_resolver_selects_nono_for_unix_native_restricted_snapshots() {
-        let input = resolver_input_for_mode_and_backend(TurnPermissionMode::AutoAcceptEdits, None);
-        let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
-
-        assert_eq!(
-            snapshot.backend.sandbox_backend,
-            Some(SandboxBackendKind::Nono)
-        );
-        assert_eq!(
-            snapshot.sandbox.backend_preference,
-            vec![SandboxBackendKind::Nono]
-        );
-        assert_eq!(
-            snapshot.sandbox.backend_requirement,
-            SandboxBackendRequirement::Required
-        );
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_sandbox_resolver_selects_restricted_token_for_native_restricted_snapshots() {
-        let input = resolver_input_for_mode_and_backend(TurnPermissionMode::AutoAcceptEdits, None);
-        let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
-
-        assert_eq!(
-            snapshot.backend.sandbox_backend,
-            Some(SandboxBackendKind::WindowsRestrictedToken)
-        );
-        assert_eq!(
-            snapshot.sandbox.backend_preference,
-            vec![SandboxBackendKind::WindowsRestrictedToken]
-        );
-        assert_eq!(
-            snapshot.sandbox.backend_requirement,
-            SandboxBackendRequirement::Required
-        );
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn windows_sandbox_resolver_does_not_select_restricted_token_on_non_windows() {
-        let input = resolver_input_for_mode_and_backend(TurnPermissionMode::AutoAcceptEdits, None);
-        let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
-
-        assert_ne!(
-            snapshot.backend.sandbox_backend,
-            Some(SandboxBackendKind::WindowsRestrictedToken)
-        );
     }
 
     #[test]
@@ -2179,29 +2083,6 @@ mod tests {
     }
 
     #[test]
-    fn security_backend_capabilities_claude_restricted_snapshot_is_active() {
-        let input = resolver_input_for_mode_and_backend(
-            TurnPermissionMode::Supervised,
-            Some(AgentExecutionBackend::CLIAgentRuntime {
-                runtime_id: "claude_personal".to_owned(),
-                runtime_kind: CLIAgentRuntimeKind::Claude,
-            }),
-        );
-        let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
-
-        assert_eq!(snapshot.sandbox.mode, TurnSandboxMode::ReadOnly);
-        assert_eq!(
-            snapshot.backend.execution_backend,
-            TurnSecurityExecutionBackendKind::ClaudeCli
-        );
-        assert_eq!(
-            snapshot.backend.sandbox_backend,
-            Some(SandboxBackendKind::ProviderNative)
-        );
-        assert_eq!(snapshot.enforcement, TurnSecurityEnforcementStatus::Active);
-    }
-
-    #[test]
     fn cli_capabilities_claude_provider_descriptor_marks_managed_sandbox_active() {
         let input = resolver_input_for_mode_and_backend(
             TurnPermissionMode::AutoAcceptEdits,
@@ -2238,6 +2119,18 @@ mod tests {
             }),
         );
         let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
+
+        assert_eq!(snapshot.sandbox.mode, TurnSandboxMode::ReadOnly);
+        assert_eq!(
+            snapshot.backend.execution_backend,
+            TurnSecurityExecutionBackendKind::ClaudeCli
+        );
+        assert_eq!(
+            snapshot.backend.sandbox_backend,
+            Some(SandboxBackendKind::ProviderNative)
+        );
+        assert_eq!(snapshot.enforcement, TurnSecurityEnforcementStatus::Active);
+
         let diagnostic = turn_security_diagnostic_summary(&snapshot);
 
         assert_eq!(diagnostic.enforcement_status, "active");
@@ -2704,6 +2597,9 @@ mod tests {
             TurnPermissionProfileSource::Composer,
         );
         let params = TurnStartParams {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -2739,5 +2635,39 @@ mod tests {
                 .reason,
             FilePolicyDenyReason::OutsideAllowedRoots
         );
+    }
+
+    #[test]
+    fn unknown_native_and_skill_capabilities_require_the_default_approval() {
+        for (invocation, expected_action) in [
+            (
+                unknown_tool_invocation("mystery_tool"),
+                PermissionActionKind::Unknown,
+            ),
+            (
+                unknown_skill_invocation(),
+                PermissionActionKind::DynamicSkillTool,
+            ),
+        ] {
+            let intent = extract_permission_intent(&invocation);
+            let context = PermissionEvaluationContext::for_turn(
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                TurnPermissionProfileSnapshot::from_mode(
+                    TurnPermissionMode::Supervised,
+                    TurnPermissionProfileSource::Composer,
+                ),
+            );
+            assert_eq!(intent.action, expected_action);
+            assert!(intent.is_unknown_capability());
+            assert!(matches!(
+                ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
+                PermissionDecision::Ask {
+                    reason: pioneer_tools::PermissionDecisionReason::UnknownActionDefault,
+                    ..
+                }
+            ));
+        }
     }
 }

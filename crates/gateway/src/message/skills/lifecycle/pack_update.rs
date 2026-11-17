@@ -389,10 +389,9 @@ impl MessageProcessor {
             };
             let (materialized, validated) = match self
                 .materialize_uploaded_skill_pack_source(
-                    connection_id,
+                    &authenticated_owner,
                     workspace_id.as_str(),
                     upload_id.as_str(),
-                    &context,
                     &request_id,
                 )
                 .await
@@ -411,7 +410,6 @@ impl MessageProcessor {
             let diff = match build_pack_member_diff(&expected_children, member_keys.as_slice()) {
                 Ok(diff) => diff,
                 Err(error) => {
-                    let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
                     self.send_error(
                         connection_id,
                         skills_error(
@@ -438,7 +436,6 @@ impl MessageProcessor {
             {
                 Ok(candidates) => candidates,
                 Err(error) => {
-                    let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
                     self.send_error(
                         connection_id,
                         skills_error(
@@ -466,7 +463,7 @@ impl MessageProcessor {
                     let mapped = map_lifecycle_error(&error, methods::SKILLS_PACK_UPDATE);
                     let (message, details) =
                         lifecycle_error_payload(&error, &mapped, None, &context.validation_policy);
-                    let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+
                     self.send_error(
                         connection_id,
                         skills_error(
@@ -496,7 +493,6 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
                     drop(write_guard);
                     drop(upload_guard);
                     self.send_error(connection_id, error).await;
@@ -510,7 +506,6 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
                     self.send_error(
                         connection_id,
                         skills_error(
@@ -555,7 +550,7 @@ impl MessageProcessor {
                 if stale {
                     drop(write_guard);
                     drop(upload_guard);
-                    let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+
                     self.send_error(
                         connection_id,
                         skills_error(
@@ -591,7 +586,6 @@ impl MessageProcessor {
                             )
                             .await
                         {
-                            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
                             self.send_error(
                                 connection_id,
                                 skills_error(
@@ -621,7 +615,7 @@ impl MessageProcessor {
                                 None,
                                 &context.validation_policy,
                             );
-                            let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+
                             self.send_error(
                                 connection_id,
                                 skills_error(
@@ -639,7 +633,7 @@ impl MessageProcessor {
                     Err(error) => {
                         drop(write_guard);
                         drop(upload_guard);
-                        let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+
                         self.send_error(
                             connection_id,
                             skills_error(
@@ -686,7 +680,7 @@ impl MessageProcessor {
                     );
                     drop(write_guard);
                     drop(upload_guard);
-                    let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+
                     self.send_error(
                         connection_id,
                         skills_error(
@@ -742,7 +736,7 @@ impl MessageProcessor {
                         );
                         drop(write_guard);
                         drop(upload_guard);
-                        let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+
                         self.send_error(
                             connection_id,
                             skills_error(
@@ -801,7 +795,7 @@ impl MessageProcessor {
                     );
                     drop(write_guard);
                     drop(upload_guard);
-                    let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+
                     self.send_error(
                         connection_id,
                         skills_error(
@@ -836,7 +830,7 @@ impl MessageProcessor {
                     );
                     drop(write_guard);
                     drop(upload_guard);
-                    let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+
                     self.send_error(
                         connection_id,
                         skills_error(
@@ -982,7 +976,7 @@ impl MessageProcessor {
                 );
                 drop(write_guard);
                 drop(upload_guard);
-                let _ = std::fs::remove_dir_all(materialized.cleanup_root.as_path());
+
                 self.send_error(
                     connection_id,
                     skills_error(
@@ -1012,10 +1006,7 @@ impl MessageProcessor {
                     let _ = std::fs::remove_dir(parent);
                 }
             }
-            self.cleanup_upload_artifacts(
-                &materialized.upload,
-                materialized.cleanup_root.as_path(),
-            );
+            let _ = self.cleanup_upload_artifacts(&materialized.upload).await;
             drop(write_guard);
             drop(upload_guard);
 

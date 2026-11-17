@@ -18,8 +18,12 @@ use std::{
 const LIMIT: usize = 1024;
 const STAGE_LIMIT: usize = 128;
 mod diagnostics;
+mod history_sql;
+#[cfg(test)]
+mod history_sql_integration_tests;
 use diagnostics::Diagnostics;
 pub use diagnostics::Work;
+pub use history_sql::{HistorySqlContext, record_history_sql};
 const TTL: Duration = Duration::from_secs(15 * 60);
 const BOUNDS: &[f64] = &[
     5., 10., 25., 50., 100., 250., 500., 1000., 2000., 3000., 5000., 8000., 10000., 15000., 30000.,
@@ -102,12 +106,11 @@ stages! {
  TaskCliPrepare=>"task.cli.prepare",
  CliTurnPrepare=>"cli.turn.prepare",
  CliMaterialize=>"cli.materialize",
- PreflightProvider=>"native.preflight.provider",
  ClientPrepare=>"client.prepare", ClientSessionWait=>"client.session.wait", ClientUpload=>"client.attachments.upload", ClientQueue=>"client.transport.queue", ClientWrite=>"client.transport.write", ClientBridge=>"client.bridge", ClientApply=>"client.apply", ClientEventQueue=>"client.events.queue", ClientWorkerWait=>"client.worker.wait",
  VoiceFinish=>"voice.capture.finish", VoiceFinalize=>"voice.finalize", VoiceVad=>"voice.vad", VoiceWorkerWait=>"voice.worker.wait", VoiceTranscriberWait=>"voice.transcriber.wait", VoiceTranscribe=>"voice.transcribe", VoiceInput=>"voice.transcript_to_input",
  DelegationCreate=>"task.create", DelegationWait=>"task.handoff.wait", ChildPrepare=>"task.child.prepare",
  GatewayDispatch=>"gateway.dispatch", Admission=>"turn.admission", Persist=>"turn.persist", History=>"turn.history", Artifacts=>"turn.artifacts", Skills=>"turn.skills", Security=>"turn.security", Environment=>"turn.environment",
- NativePrepare=>"native.prepare", ContextPrepare=>"native.context.prepare", Preflight=>"native.preflight", Hooks=>"native.hooks", HookPolicy=>"native.hooks.policy", HookContext=>"native.hooks.context", HookPostPreflight=>"native.hooks.post_preflight", HookCompile=>"native.hooks.compile", HookTools=>"native.hooks.tools", CompactionWait=>"native.compaction.wait", CompactionWork=>"native.compaction.work", ProviderConnect=>"native.provider.connect", RuntimeFirstOutput=>"runtime.wait_first_output",
+ NativePrepare=>"native.prepare", ContextPrepare=>"native.context.prepare", Hooks=>"native.hooks", HookPolicy=>"native.hooks.policy", HookContext=>"native.hooks.context", HookCompile=>"native.hooks.compile", HookTools=>"native.hooks.tools", CompactionWait=>"native.compaction.wait", CompactionWork=>"native.compaction.work", ProviderConnect=>"native.provider.connect", RuntimeFirstOutput=>"runtime.wait_first_output",
  CliSessionWait=>"cli.session.wait", CliAcquire=>"cli.session.acquire", CliInitialize=>"cli.session.start", CliSpawn=>"cli.process.spawn", CliHandshake=>"cli.initialize", CliThread=>"cli.thread.start_resume", CliMcp=>"cli.mcp.prepare", CliDispatch=>"cli.dispatch", ReadinessWait=>"runtime.readiness.wait",
  ChildAuthority=>"task.child.authority",
  ChildReserve=>"task.child.reserve",
@@ -1122,11 +1125,13 @@ pub struct StageGuard {
     consent_epoch: u64,
     db: Option<(Stage, Instant, Diagnostics)>,
     completion: Option<bool>,
+    history_sql: Option<HistorySqlContext>,
 }
 pub fn stage(key: &str, stage: Stage) -> StageGuard {
     let mut coverage = None;
     let mut consent_epoch = crate::telemetry_consent_snapshot().1;
     let mut db = None;
+    let mut history_sql = None;
     let inherits = shares_observation(current_key().as_deref(), Some(key));
     let inner = (|| {
         let e = get(key)?;
@@ -1174,17 +1179,26 @@ pub fn stage(key: &str, stage: Stage) -> StageGuard {
             &parent,
         );
         let diagnostics = Diagnostics::new(parent.get::<Diagnostics>().cloned());
-        Some((
-            parent.with_span(span).with_value(diagnostics),
-            Instant::now(),
-            attrs,
-        ))
+        let mut context = parent.with_span(span).with_value(diagnostics);
+        if matches!(stage, Stage::HistoryCapture) && context.span().is_recording() {
+            let sql = HistorySqlContext::start(
+                consent_epoch,
+                context
+                    .get::<HistorySqlContext>()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            context = context.with_value(sql.clone());
+            history_sql = Some(sql);
+        }
+        Some((context, Instant::now(), attrs))
     })();
     StageGuard {
         inner,
         coverage,
         consent_epoch,
         db,
+        history_sql,
         completion: None,
     }
 }
@@ -1205,6 +1219,7 @@ impl Drop for StageGuard {
             }
         }
         if let Some((cx, start, attrs)) = self.inner.take() {
+            let sql_attrs = self.history_sql.take().map(|sql| sql.finish());
             if let Some(diagnostics) = cx.get::<Diagnostics>() {
                 cx.span().set_attributes(diagnostics.finish());
             }
@@ -1224,6 +1239,11 @@ impl Drop for StageGuard {
                 "stage.duration_ms",
                 start.elapsed().as_secs_f64() * 1000.,
             ));
+            // Preserve existing diagnostic slots before appending the bounded
+            // SQL summary, including when operators lower SDK attribute limits.
+            if let Some(attrs) = sql_attrs {
+                cx.span().set_attributes(attrs);
+            }
             cx.span().end();
         }
     }
@@ -1391,6 +1411,7 @@ pub fn current_stage(stage_name: Stage) -> StageGuard {
             coverage: None,
             consent_epoch: crate::telemetry_consent_snapshot().1,
             db: None,
+            history_sql: None,
             completion: None,
         })
 }
@@ -2036,15 +2057,22 @@ mod regression_tests {
     ) -> StageGuard {
         let span = tracer.build_with_context(SpanBuilder::from_name(name.name()), parent);
         let diagnostics = Diagnostics::new(parent.get::<Diagnostics>().cloned());
+        let sql = matches!(name, Stage::HistoryCapture).then(|| {
+            HistorySqlContext::start(
+                crate::telemetry_consent_snapshot().1,
+                HistorySqlContext::default(),
+            )
+        });
+        let mut context = parent.with_span(span).with_value(diagnostics);
+        if let Some(sql) = &sql {
+            context = context.with_value(sql.clone());
+        }
         StageGuard {
-            inner: Some((
-                parent.with_span(span).with_value(diagnostics),
-                Instant::now(),
-                vec![],
-            )),
+            inner: Some((context, Instant::now(), vec![])),
             coverage: None,
             consent_epoch: crate::telemetry_consent_snapshot().1,
             db: None,
+            history_sql: sql,
             completion: None,
         }
     }
@@ -2174,12 +2202,17 @@ mod regression_tests {
         let tracer = provider.tracer("startup-db-cap-test");
         for stages in [24, STAGE_LIMIT] {
             let diagnostics = Diagnostics::default();
+            let sql = HistorySqlContext::start(
+                crate::telemetry_consent_snapshot().1,
+                HistorySqlContext::default(),
+            );
             let mut o = observation();
             o.stages = stages;
             o.db_stages = 24;
             o.cx = Context::new()
                 .with_span(tracer.start("phase"))
-                .with_value(diagnostics.clone());
+                .with_value(diagnostics.clone())
+                .with_value(sql.clone());
             let entry = Arc::new(Mutex::new(o));
             registry()
                 .lock()
@@ -2189,10 +2222,14 @@ mod regression_tests {
                 for _ in 0..40 {
                     let guard = current_stage(Stage::DbExecute);
                     assert!(guard.inner.is_none());
+                    record_history_sql(Some(u64::MAX), Duration::from_millis(3));
                     drop(guard);
                     record_current_duration(Stage::DbAcquire, Duration::from_millis(2));
                 }
             });
+            let sql_attrs = sql.finish();
+            assert!(sql_attrs.contains(&KeyValue::new("history.sql.observed.count", 40_i64)));
+            assert!(sql_attrs.contains(&KeyValue::new("history.sql.exported.elapsed_ms", 120.)));
             let attrs = diagnostics.finish();
             assert!(attrs.contains(&KeyValue::new("stage.db.execute.count", 40_i64)));
             assert!(attrs.contains(&KeyValue::new("stage.db.pool.count", 40_i64)));
@@ -2257,6 +2294,7 @@ mod regression_tests {
     fn dropping_a_pending_phase_closes_its_span_and_restores_the_callers_context() {
         use opentelemetry::trace::TracerProvider;
         use std::future::Future;
+        let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
         let capture = Capture::default();
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(capture.clone())
@@ -2271,13 +2309,17 @@ mod regression_tests {
             .get::<Diagnostics>()
             .unwrap()
             .clone();
-        struct PendingDb(Diagnostics);
+        let sql = phase.history_sql.as_ref().unwrap().clone();
+        struct PendingDb(Diagnostics, HistorySqlContext);
         impl Drop for PendingDb {
             fn drop(&mut self) {
                 self.0.record_db(Stage::DbExecute, Duration::from_millis(7));
+                // Mirrors the saved poll/drop SQL adapter context on cancellation.
+                let _saved = self.1.enter();
+                record_history_sql(Some(7), Duration::from_millis(7));
             }
         }
-        let work = PendingDb(diagnostics.clone());
+        let work = PendingDb(diagnostics.clone(), sql.clone());
         let mut future = Box::pin(run_stage(
             Some("cancel-phase".into()),
             Some(phase),
@@ -2300,9 +2342,23 @@ mod regression_tests {
                 .finish()
                 .contains(&KeyValue::new("stage.db.execute.count", 1_i64))
         );
+        {
+            let _late = sql.enter();
+            record_history_sql(Some(7), Duration::from_secs(1));
+        }
         provider.force_flush().unwrap();
         let spans = capture.0.lock().unwrap();
         assert_eq!(spans.len(), 1);
+        assert!(
+            spans[0]
+                .attributes
+                .contains(&KeyValue::new("history.sql.observed.count", 1_i64))
+        );
+        assert!(
+            spans[0]
+                .attributes
+                .contains(&KeyValue::new("history.sql.observed.elapsed_ms", 7.))
+        );
         assert!(
             spans[0]
                 .attributes
@@ -2711,6 +2767,7 @@ pub fn client_apply(key: &str) -> Option<StageGuard> {
         coverage: None,
         consent_epoch: o.consent_epoch,
         db: None,
+        history_sql: None,
         completion: None,
     })
 }

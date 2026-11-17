@@ -161,14 +161,9 @@ description = "ゲートウェイの実行中、アイドル状態によるシ�
 label = "テレメトリを送信"
 description = "診断データとパフォーマンスデータの収集を許可します。"
 
-[settings.general.preflight_model]
-label = "Preflight モデル"
-description = "ターン前の内部計画に使うプロバイダーとモデルを選択します。デフォルトは現在のスレッドのモデルを使います。"
-default = "デフォルト"
-select_model = "モデルを選択"
-dialog_title = "Preflight モデルを選択"
-
 [settings.voice_input]
+transcribe_while_recording = "録音中に文字起こし"
+transcribe_while_recording_description = "オフにすると、録音終了後に文字起こしを開始します。"
 label = "音声入力"
 description = "音声メッセージにローカル文字起こしモデルを使用します。"
 no_model_selected = "モデルが選択されていません"
@@ -222,10 +217,6 @@ description = "Pioneer が永続メモリをどのように使うかを制御し
 [settings.memory.enabled]
 label = "メモリ"
 description = "役立つ場合に、保存済みの事実やプロジェクトの決定を Pioneer が使用できるようにします。"
-
-[settings.memory.active_recall]
-label = "能動的な呼び出し"
-description = "文脈の多いタスク向けに、読み取り専用の追加メモリ呼び出し計画を実行します。"
 
 [settings.memory.proactive_writes]
 label = "能動的な書き込み"
@@ -364,6 +355,13 @@ reason_cancelled = "実行がキャンセルされました。"
 reason_unknown = "処理が正常に完了しませんでした。Gateway のログを確認してください。"
 
 [chat.composer.model]
+service_label = "サービス階層"
+service_standard = "標準"
+service_invalid = "保存されたサービス階層は利用できません。標準または別のモードを選択してください。"
+context_label = "コンテキストウィンドウ"
+context_auto = "自動 — 最大 %{tokens} トークン"
+context_up_to = "最大 %{tokens} トークン"
+context_invalid = "保存された選択は利用できません。自動または別のウィンドウを選択してください。"
 select_label = "モデルを選択"
 dialog_title = "モデルを選択"
 provider_label = "プロバイダー"

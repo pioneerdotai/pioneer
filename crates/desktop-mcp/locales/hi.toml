@@ -15,6 +15,7 @@ title = "कोई MCP सर्वर इंस्टॉल नहीं है
 description = "नए MCP सर्वर इंस्टॉल करें और अपने एजेंटों की क्षमताएं बढ़ाएं।"
 
 [mcp.dialog]
+replace_owned = "इस सर्वर का कॉन्फ़िगरेशन बदलें"
 install_title = "MCP सर्वर इंस्टॉल करें"
 install = "इंस्टॉल"
 uninstall_title = "%{name} अनइंस्टॉल करें?"
@@ -134,6 +135,9 @@ items_count = "आइटम: %{count}"
 keys_count = "कुंजियां: %{count}"
 
 [mcp.error]
+plugin_submitted = "बदलाव भेज दिया गया। फिर प्रयास से पहले सर्वर की स्थिति जाँचें।"
+plugin_uncertain = "परिणाम अज्ञात है। अगली कार्रवाई से पहले रीफ़्रेश करें।"
+plugin_change_failed = "बदलाव की पुष्टि नहीं हुई। फिर प्रयास से पहले रीफ़्रेश करें।"
 server_name_required = "MCP सर्वर नाम आवश्यक है"
 gateway_not_connected = "गेटवे कनेक्ट नहीं है"
 workspace_not_selected = "कार्यक्षेत्र चयनित नहीं है"

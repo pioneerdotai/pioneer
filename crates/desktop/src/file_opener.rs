@@ -501,12 +501,18 @@ fn spawn_executable(executable: &Path, args: &[OsString], action: &str) -> Resul
     }
 
     let mut command = command_for_executable(executable, args);
-    command
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("failed to {action} with `{}`", executable.display()))?;
+    let _observation = pioneer_observability::resources::ChildRegistration::register(
+        Some(child.id()),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+        None,
+    );
+    // Fire-and-forget shell ownership is unchanged; final usage is unavailable.
     Ok(())
 }
 

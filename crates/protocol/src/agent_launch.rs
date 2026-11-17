@@ -145,67 +145,222 @@ pub struct AgentExecutionProfileProjection {
     pub fingerprint: String,
 }
 
-/// Canonical exact reasoning selections that remain delegable by an admitted
-/// execution. Effort labels are backend-owned opaque values, so ordering them
-/// by presumed strength would be unsafe; the ceiling is an allow-set.
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReasoningCeiling {
-    pub allowed: Vec<TurnReasoningSelection>,
+/// Compare durable source membership, not a particular configuration snapshot.
+/// Workspace/source-id ownership is additionally checked against the identity
+/// repository at admission. CLI role_label records the runtime kind, so a
+/// different engine cannot be smuggled through an existing runtime instance.
+pub fn agent_identity_has_same_launch_source(
+    candidate: &AgentIdentityProjection,
+    ceiling: &AgentIdentityProjection,
+) -> bool {
+    candidate.id == ceiling.id
+        && candidate.source_kind == ceiling.source_kind
+        && match candidate.source_kind {
+            crate::AgentIdentitySourceKind::Ephemeral => candidate == ceiling,
+            crate::AgentIdentitySourceKind::CliRuntimeInstance => {
+                candidate.role_label == ceiling.role_label
+            }
+            crate::AgentIdentitySourceKind::NativeAgent => true,
+        }
 }
 
-/// Immutable upper bound for identities and execution profiles that an
-/// admitted AgentExecution may delegate to. Current source/policy state may
-/// narrow this set, but a later workspace catalog addition can never widen it.
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+/// Real launch capabilities may only narrow across catalog generations. Profile
+/// ids, generations, labels and fingerprints identify snapshots, not authority.
+pub fn agent_execution_profile_is_no_wider(
+    candidate: &AgentExecutionProfileProjection,
+    ceiling: &AgentExecutionProfileProjection,
+) -> bool {
+    candidate.backend == ceiling.backend
+        && candidate.provider_id == ceiling.provider_id
+        && candidate.model_id == ceiling.model_id
+        && !candidate.compatible_agent_identity_ids.is_empty()
+        && candidate
+            .compatible_agent_identity_ids
+            .iter()
+            .all(|id| ceiling.compatible_agent_identity_ids.contains(id))
+        && candidate
+            .allowed_reasoning
+            .iter()
+            .all(|reasoning| ceiling.allowed_reasoning.contains(reasoning))
+        && candidate
+            .allowed_permission_profiles
+            .iter()
+            .all(|mode| ceiling.allowed_permission_profiles.contains(mode))
+}
+
+/// Immutable delegation boundary for identities and capabilities. Model catalogs
+/// are current metadata, not durable authority; each launch stores its exact
+/// execution profile separately.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChildAgentLaunchGrantSet {
     pub version: u32,
     pub identities: Vec<AgentIdentityProjection>,
     pub allow_inherit_parent_identity: bool,
     pub allow_server_derived_ephemeral: bool,
-    pub profiles: Vec<AgentExecutionProfileProjection>,
     pub allow_inherit_parent_profile: bool,
     #[serde(default)]
     pub skill_ids: Vec<SkillId>,
     #[serde(default)]
     pub mcp_server_ids: Vec<String>,
     pub max_permission_profile: TurnPermissionProfileCap,
-    pub max_reasoning: ReasoningCeiling,
+    pub fingerprint: String,
+    #[schemars(skip)]
+    original: Option<serde_json::Value>,
+}
+
+// Only the behavioral projection follows the current DTO. Authentication uses
+// the original Value and the frozen wire types below, before projection.
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CurrentChildLaunchGrantFields {
+    pub version: u32,
+    pub identities: Vec<AgentIdentityProjection>,
+    pub allow_inherit_parent_identity: bool,
+    pub allow_server_derived_ephemeral: bool,
+    pub allow_inherit_parent_profile: bool,
+    #[serde(default)]
+    pub skill_ids: Vec<SkillId>,
+    #[serde(default)]
+    pub mcp_server_ids: Vec<String>,
+    pub max_permission_profile: TurnPermissionProfileCap,
     pub fingerprint: String,
 }
 
 impl ChildAgentLaunchGrantSet {
+    fn fields(&self) -> CurrentChildLaunchGrantFields {
+        CurrentChildLaunchGrantFields {
+            version: self.version,
+            identities: self.identities.clone(),
+            allow_inherit_parent_identity: self.allow_inherit_parent_identity,
+            allow_server_derived_ephemeral: self.allow_server_derived_ephemeral,
+            allow_inherit_parent_profile: self.allow_inherit_parent_profile,
+            skill_ids: self.skill_ids.clone(),
+            mcp_server_ids: self.mcp_server_ids.clone(),
+            max_permission_profile: self.max_permission_profile.clone(),
+            fingerprint: self.fingerprint.clone(),
+        }
+    }
+
+    fn seal(&mut self) -> Result<(), ChildAgentLaunchGrantSetError> {
+        let mut value = serde_json::to_value(self.fields())
+            .map_err(|_| ChildAgentLaunchGrantSetError::Serialization)?;
+        self.fingerprint = full_json_child_grant_fingerprint(&value)
+            .map_err(|_| ChildAgentLaunchGrantSetError::Serialization)?;
+        value["fingerprint"] = self.fingerprint.clone().into();
+        let mut sealed = project_verified_child_grant(&value)
+            .map_err(|_| ChildAgentLaunchGrantSetError::Serialization)?;
+        sealed.original = Some(value);
+        *self = sealed;
+        Ok(())
+    }
+
+    /// The selected snapshot must fit both the current identity boundary and
+    /// any authenticated historical catalog ceiling. This check is also safe
+    /// for history readers; it does not authorize resuming an execution.
+    pub fn validate_selected_profile(
+        &self,
+        identity: &AgentIdentityProjection,
+        profile: &AgentExecutionProfileProjection,
+    ) -> Result<(), ChildAgentLaunchGrantSetError> {
+        self.validate()?;
+        if let Some(profiles) = self
+            .original
+            .as_ref()
+            .and_then(|value| value.get("profiles"))
+        {
+            let profiles: Vec<AgentExecutionProfileProjection> =
+                serde_json::from_value(profiles.clone())
+                    .map_err(|_| ChildAgentLaunchGrantSetError::InvalidProfile)?;
+            // Released enclosing documents pinned the selected snapshot by
+            // equality. Preserve that historical rule, including backends that
+            // the current executor no longer supports, for history reads.
+            if !self.identities.contains(identity)
+                || !profiles.contains(profile)
+                || (identity.source_kind != crate::AgentIdentitySourceKind::Ephemeral
+                    && !profile.compatible_agent_identity_ids.contains(&identity.id))
+            {
+                return Err(ChildAgentLaunchGrantSetError::ProfileOutsideIdentitySet);
+            }
+            let allowed = self
+                .original
+                .as_ref()
+                .and_then(|value| value.pointer("/maxReasoning/allowed"))
+                .ok_or(ChildAgentLaunchGrantSetError::InvalidProfile)?;
+            let allowed: Vec<TurnReasoningSelection> = serde_json::from_value(allowed.clone())
+                .map_err(|_| ChildAgentLaunchGrantSetError::InvalidProfile)?;
+            if profile
+                .allowed_reasoning
+                .iter()
+                .any(|reasoning| !allowed.contains(reasoning))
+            {
+                return Err(ChildAgentLaunchGrantSetError::InvalidProfile);
+            }
+        } else {
+            validate_selected_agent_launch_profile(identity, profile, &self.identities)?;
+        }
+        Ok(())
+    }
+
+    /// Historical catalog ceilings remain readable, but the current executor
+    /// cannot enforce them. Never turn their projection into broader authority.
+    pub fn validate_for_execution(&self) -> Result<(), ChildAgentLaunchGrantSetError> {
+        self.validate()?;
+        if self.original.as_ref().is_some_and(|value| {
+            value.get("profiles").is_some() || value.get("maxReasoning").is_some()
+        }) {
+            return Err(ChildAgentLaunchGrantSetError::InvalidProfile);
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for ChildAgentLaunchGrantSet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate()
+            .map_err(|error| <S::Error as serde::ser::Error>::custom(format!("{error:?}")))?;
+        self.original
+            .as_ref()
+            .ok_or_else(|| <S::Error as serde::ser::Error>::custom("unsealed child grant"))?
+            .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ChildAgentLaunchGrantSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let mut grant =
+            project_verified_child_grant(&value).map_err(<D::Error as serde::de::Error>::custom)?;
+        grant.original = Some(value);
+        Ok(grant)
+    }
+}
+
+impl ChildAgentLaunchGrantSet {
     pub const VERSION: u32 = CHILD_LAUNCH_GRANT_VERSION_V2;
-    pub const MAX_IDENTITIES: usize = 128;
-    pub const MAX_PROFILES: usize = 256;
     pub const MAX_SKILLS: usize = 256;
     pub const MAX_MCP_SERVERS: usize = 256;
 
     pub fn new(
         mut identities: Vec<AgentIdentityProjection>,
-        mut profiles: Vec<AgentExecutionProfileProjection>,
     ) -> Result<Self, ChildAgentLaunchGrantSetError> {
         identities.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        profiles.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        validate_child_launch_grant_entries(&identities, &profiles)?;
-        let max_reasoning = reasoning_ceiling_for_profiles(&profiles);
+        validate_child_launch_grant_entries(&identities)?;
         let mut grant = Self {
             version: Self::VERSION,
             identities,
             allow_inherit_parent_identity: false,
             allow_server_derived_ephemeral: false,
-            profiles,
             allow_inherit_parent_profile: false,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
             max_permission_profile: crate::task_permission_cap_for_mode(
                 TurnPermissionMode::Supervised,
             ),
-            max_reasoning,
             fingerprint: String::new(),
+            original: None,
         };
-        grant.fingerprint = child_launch_grant_fingerprint(&grant)?;
+        grant.seal()?;
         Ok(grant)
     }
 
@@ -218,6 +373,7 @@ impl ChildAgentLaunchGrantSet {
         mut mcp_server_ids: Vec<String>,
         max_permission_profile: TurnPermissionProfileCap,
     ) -> Result<Self, ChildAgentLaunchGrantSetError> {
+        self.validate_for_execution()?;
         skill_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         mcp_server_ids.sort();
         self.allow_inherit_parent_identity = allow_inherit_parent_identity;
@@ -227,12 +383,22 @@ impl ChildAgentLaunchGrantSet {
         self.mcp_server_ids = mcp_server_ids;
         self.max_permission_profile = max_permission_profile;
         validate_child_launch_grant(&self)?;
-        self.fingerprint = child_launch_grant_fingerprint(&self)?;
+        self.seal()?;
         Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), ChildAgentLaunchGrantSetError> {
-        validate_child_launch_grant_v2(self)
+        validate_child_launch_grant(self)?;
+        let original = self
+            .original
+            .as_ref()
+            .ok_or(ChildAgentLaunchGrantSetError::FingerprintMismatch)?;
+        let expected = project_verified_child_grant(original)
+            .map_err(|_| ChildAgentLaunchGrantSetError::FingerprintMismatch)?;
+        if self.fields() != expected.fields() {
+            return Err(ChildAgentLaunchGrantSetError::FingerprintMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -265,7 +431,7 @@ fn validate_child_launch_grant(
 fn validate_child_launch_grant_shape(
     grant: &ChildAgentLaunchGrantSet,
 ) -> Result<(), ChildAgentLaunchGrantSetError> {
-    validate_child_launch_grant_entries(&grant.identities, &grant.profiles)?;
+    validate_child_launch_grant_entries(&grant.identities)?;
     if grant.skill_ids.len() > ChildAgentLaunchGrantSet::MAX_SKILLS
         || grant.mcp_server_ids.len() > ChildAgentLaunchGrantSet::MAX_MCP_SERVERS
     {
@@ -289,60 +455,20 @@ fn validate_child_launch_grant_shape(
     {
         return Err(ChildAgentLaunchGrantSetError::InvalidCapability);
     }
-    if grant.max_reasoning != reasoning_ceiling_for_profiles(&grant.profiles) {
-        return Err(ChildAgentLaunchGrantSetError::InvalidProfile);
-    }
     Ok(())
-}
-
-fn validate_child_launch_grant_v2(
-    grant: &ChildAgentLaunchGrantSet,
-) -> Result<(), ChildAgentLaunchGrantSetError> {
-    if grant.version != CHILD_LAUNCH_GRANT_VERSION_V2 {
-        return Err(ChildAgentLaunchGrantSetError::UnsupportedVersion);
-    }
-    validate_child_launch_grant_shape(grant)?;
-    if grant.fingerprint != child_launch_grant_v2_fingerprint(grant)? {
-        return Err(ChildAgentLaunchGrantSetError::FingerprintMismatch);
-    }
-    Ok(())
-}
-
-fn reasoning_ceiling_for_profiles(
-    profiles: &[AgentExecutionProfileProjection],
-) -> ReasoningCeiling {
-    let mut allowed = profiles
-        .iter()
-        .flat_map(|profile| profile.allowed_reasoning.iter().cloned())
-        .collect::<Vec<_>>();
-    allowed.sort_by(|left, right| left.effort.cmp(&right.effort));
-    allowed.dedup_by(|left, right| left.effort == right.effort);
-    ReasoningCeiling { allowed }
 }
 
 fn validate_child_launch_grant_entries(
     identities: &[AgentIdentityProjection],
-    profiles: &[AgentExecutionProfileProjection],
 ) -> Result<(), ChildAgentLaunchGrantSetError> {
     if identities.is_empty() {
         return Err(ChildAgentLaunchGrantSetError::EmptyIdentitySet);
-    }
-    if identities.len() > ChildAgentLaunchGrantSet::MAX_IDENTITIES
-        || profiles.len() > ChildAgentLaunchGrantSet::MAX_PROFILES
-    {
-        return Err(ChildAgentLaunchGrantSetError::CapacityExceeded);
     }
     if identities
         .windows(2)
         .any(|pair| pair[0].id.as_str() >= pair[1].id.as_str())
     {
         return Err(ChildAgentLaunchGrantSetError::DuplicateIdentity);
-    }
-    if profiles
-        .windows(2)
-        .any(|pair| pair[0].id.as_str() >= pair[1].id.as_str())
-    {
-        return Err(ChildAgentLaunchGrantSetError::DuplicateProfile);
     }
     if identities.iter().any(|identity| {
         identity.source_revision == 0
@@ -352,69 +478,269 @@ fn validate_child_launch_grant_entries(
     }) {
         return Err(ChildAgentLaunchGrantSetError::InvalidIdentity);
     }
-    let identity_ids = identities
-        .iter()
-        .map(|identity| &identity.id)
-        .collect::<std::collections::BTreeSet<_>>();
-    for profile in profiles {
-        if profile.catalog_generation == 0
-            || profile.policy_generation == 0
-            || profile.fingerprint.trim().is_empty()
-            || profile.provider_id.trim().is_empty()
-            || profile.model_id.trim().is_empty()
-            || profile.compatible_agent_identity_ids.is_empty()
-            || profile
-                .compatible_agent_identity_ids
-                .windows(2)
-                .any(|pair| pair[0].as_str() >= pair[1].as_str())
-        {
-            return Err(ChildAgentLaunchGrantSetError::InvalidProfile);
-        }
-        if profile
+    Ok(())
+}
+
+/// Validate the exact selected snapshot independently of the delegation boundary.
+/// Every compatible source must still belong to that boundary, including the
+/// registered backing identity of a server-derived CLI identity.
+pub fn validate_selected_agent_launch_profile(
+    identity: &AgentIdentityProjection,
+    profile: &AgentExecutionProfileProjection,
+    identities: &[AgentIdentityProjection],
+) -> Result<(), ChildAgentLaunchGrantSetError> {
+    if profile.catalog_generation == 0
+        || profile.policy_generation == 0
+        || profile.fingerprint.trim().is_empty()
+        || profile.provider_id.trim().is_empty()
+        || profile.model_id.trim().is_empty()
+        || profile.compatible_agent_identity_ids.is_empty()
+        || profile
+            .compatible_agent_identity_ids
+            .windows(2)
+            .any(|pair| pair[0].as_str() >= pair[1].as_str())
+    {
+        return Err(ChildAgentLaunchGrantSetError::InvalidProfile);
+    }
+    if !identities.contains(identity)
+        || !profile.compatible_agent_identity_ids.contains(&identity.id)
+        || profile
             .compatible_agent_identity_ids
             .iter()
-            .any(|identity_id| !identity_ids.contains(identity_id))
-        {
-            return Err(ChildAgentLaunchGrantSetError::ProfileOutsideIdentitySet);
+            .any(|id| !identities.iter().any(|candidate| &candidate.id == id))
+    {
+        return Err(ChildAgentLaunchGrantSetError::ProfileOutsideIdentitySet);
+    }
+    use crate::AgentIdentitySourceKind;
+    let compatible = match (&identity.source_kind, &profile.backend) {
+        (AgentIdentitySourceKind::NativeAgent, AgentExecutionProfileBackend::ApiProvider) => true,
+        (AgentIdentitySourceKind::Ephemeral, AgentExecutionProfileBackend::ApiProvider) => true,
+        (
+            AgentIdentitySourceKind::CliRuntimeInstance | AgentIdentitySourceKind::Ephemeral,
+            AgentExecutionProfileBackend::CliRuntime {
+                runtime_instance_id,
+            }
+            | AgentExecutionProfileBackend::AcpAgentRuntime {
+                runtime_id: runtime_instance_id,
+            },
+        ) => {
+            !runtime_instance_id.trim().is_empty()
+                && profile.provider_id == format!("cli_runtime:{runtime_instance_id}")
+                && identities.iter().any(|source| {
+                    source.source_kind == AgentIdentitySourceKind::CliRuntimeInstance
+                        && profile.compatible_agent_identity_ids.contains(&source.id)
+                })
         }
+        _ => false,
+    };
+    if !compatible {
+        return Err(ChildAgentLaunchGrantSetError::InvalidProfile);
     }
     Ok(())
 }
 
-fn child_launch_grant_fingerprint(
-    grant: &ChildAgentLaunchGrantSet,
-) -> Result<String, ChildAgentLaunchGrantSetError> {
-    child_launch_grant_v2_fingerprint(grant)
-}
-
 const CHILD_LAUNCH_GRANT_VERSION_V1: u32 = 1;
 const CHILD_LAUNCH_GRANT_VERSION_V2: u32 = 2;
+const FULL_JSON_CHILD_GRANT_PREFIX: &str = "json-sha256-v1:";
 
-// Versioned fingerprint projections are immutable. A semantic field addition
-// requires a new version, canonicalizer and adjacent migration step; editing a
-// released projection would invalidate durable grants again.
-fn child_launch_grant_v2_fingerprint(
-    grant: &ChildAgentLaunchGrantSet,
-) -> Result<String, ChildAgentLaunchGrantSetError> {
-    let value =
-        serde_json::to_value(grant).map_err(|_| ChildAgentLaunchGrantSetError::Serialization)?;
-    // Decode through the frozen V2 wire schema before hashing. Any future
-    // field added to the moving runtime type is rejected here and therefore
-    // requires V3 instead of silently changing the V2 fingerprint contract.
-    let wire = serde_json::from_value::<ChildLaunchGrantWire<PermissionPolicyV2Wire>>(value)
-        .map_err(|_| ChildAgentLaunchGrantSetError::Serialization)?;
-    child_launch_grant_wire_fingerprint(&wire, b"pioneer:agent-runtime:child-launch-grant:v2\0")
-        .map_err(|_| ChildAgentLaunchGrantSetError::Serialization)
+/// Full parsed JSON, recursively lexicographically sorted object keys; array
+/// order is significant. Scalars use serde_json's compact UTF-8 encoding (no
+/// Unicode normalization). Exclude ONLY the root `fingerprint` member. Nested
+/// fingerprints and every unknown field are covered. The prefix selects this
+/// algorithm unambiguously; it is not a grant/application version.
+fn full_json_child_grant_fingerprint(value: &serde_json::Value) -> Result<String, String> {
+    fn canonical(value: &serde_json::Value, bytes: &mut Vec<u8>) -> Result<(), String> {
+        match value {
+            serde_json::Value::Object(object) => {
+                bytes.push(b'{');
+                let mut keys = object.keys().collect::<Vec<_>>();
+                keys.sort();
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index > 0 {
+                        bytes.push(b',');
+                    }
+                    bytes.extend(serde_json::to_vec(key).map_err(|e| e.to_string())?);
+                    bytes.push(b':');
+                    canonical(&object[key], bytes)?;
+                }
+                bytes.push(b'}');
+            }
+            serde_json::Value::Array(array) => {
+                bytes.push(b'[');
+                for (index, item) in array.iter().enumerate() {
+                    if index > 0 {
+                        bytes.push(b',');
+                    }
+                    canonical(item, bytes)?;
+                }
+                bytes.push(b']');
+            }
+            scalar => bytes.extend(serde_json::to_vec(scalar).map_err(|e| e.to_string())?),
+        }
+        Ok(())
+    }
+    let mut value = value.clone();
+    value
+        .as_object_mut()
+        .ok_or("child grant must be an object")?
+        .remove("fingerprint");
+    let mut bytes = Vec::new();
+    canonical(&value, &mut bytes)?;
+    let mut digest = Sha256::new();
+    digest.update(b"pioneer:agent-runtime:child-launch-grant:full-json:v1\0");
+    digest.update(bytes);
+    Ok(format!(
+        "{FULL_JSON_CHILD_GRANT_PREFIX}{}",
+        hex::encode(digest.finalize())
+    ))
+}
+
+// Compact v2 was also released. These wire fields and tuple order are frozen,
+// including the nested identity and permission serializers; never use the DTO.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompactChildLaunchGrantWire {
+    version: u32,
+    identities: Vec<IdentityWire>,
+    allow_inherit_parent_identity: bool,
+    allow_server_derived_ephemeral: bool,
+    allow_inherit_parent_profile: bool,
+    #[serde(default)]
+    skill_ids: Vec<String>,
+    #[serde(default)]
+    mcp_server_ids: Vec<String>,
+    max_permission_profile: PermissionCapWire<PermissionPolicyV2Wire>,
+    fingerprint: String,
+}
+
+fn verify_compact_child_grant(value: &serde_json::Value) -> Result<(), String> {
+    let grant: CompactChildLaunchGrantWire =
+        serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(&(
+        grant.version,
+        &grant.identities,
+        grant.allow_inherit_parent_identity,
+        grant.allow_server_derived_ephemeral,
+        grant.allow_inherit_parent_profile,
+        &grant.skill_ids,
+        &grant.mcp_server_ids,
+        &grant.max_permission_profile,
+    ))
+    .map_err(|error| error.to_string())?;
+    let mut digest = Sha256::new();
+    digest.update(b"pioneer:agent-runtime:child-launch-grant:v2\0");
+    digest.update(bytes);
+    if grant.fingerprint != hex::encode(digest.finalize()) {
+        return Err("compact v2 child grant fingerprint mismatch".into());
+    }
+    Ok(())
+}
+
+fn project_verified_child_grant(
+    value: &serde_json::Value,
+) -> Result<ChildAgentLaunchGrantSet, String> {
+    let version = child_launch_grant_version(value)?;
+    let fingerprint = value
+        .get("fingerprint")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing child grant fingerprint")?;
+    let mut projection = value.clone();
+    if fingerprint.starts_with(FULL_JSON_CHILD_GRANT_PREFIX) {
+        if version != CHILD_LAUNCH_GRANT_VERSION_V2 {
+            return Err("unsupported full JSON child grant version".into());
+        }
+        if fingerprint != full_json_child_grant_fingerprint(value)? {
+            return Err("full JSON child grant fingerprint mismatch".into());
+        }
+        // Only these fields influence current behavior. Everything else remains
+        // in the authenticated original, including future reference metadata.
+        let object = projection
+            .as_object_mut()
+            .ok_or("child grant must be an object")?;
+        object.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "version"
+                    | "identities"
+                    | "allowInheritParentIdentity"
+                    | "allowServerDerivedEphemeral"
+                    | "allowInheritParentProfile"
+                    | "skillIds"
+                    | "mcpServerIds"
+                    | "maxPermissionProfile"
+                    | "fingerprint"
+            )
+        });
+    } else {
+        if fingerprint.len() != 64
+            || !fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("unknown child grant fingerprint algorithm".into());
+        }
+        match version {
+            CHILD_LAUNCH_GRANT_VERSION_V1 => {
+                let wire: ChildLaunchGrantWire<PermissionPolicyV1Wire> =
+                    serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+                verify_child_launch_grant_v1_wire(&wire)?;
+                let mut wire = wire.try_map_permission_policy(
+                    PermissionCapWire::<PermissionPolicyV2Wire>::try_from,
+                )?;
+                wire.max_permission_profile
+                    .effective_policy
+                    .normalize_version_one_restrictions();
+                projection = serde_json::to_value(wire).map_err(|e| e.to_string())?;
+                projection["version"] = CHILD_LAUNCH_GRANT_VERSION_V2.into();
+            }
+            CHILD_LAUNCH_GRANT_VERSION_V2 => {
+                if value.get("profiles").is_some() || value.get("maxReasoning").is_some() {
+                    let wire: ChildLaunchGrantWire<PermissionPolicyV2Wire> =
+                        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+                    let expected = child_launch_grant_wire_fingerprint(
+                        &wire,
+                        b"pioneer:agent-runtime:child-launch-grant:v2\0",
+                    )?;
+                    if fingerprint != expected {
+                        return Err("historical v2 child grant fingerprint mismatch".into());
+                    }
+                } else {
+                    verify_compact_child_grant(value)?;
+                }
+            }
+            _ => return Err("unsupported child grant version".into()),
+        }
+        let object = projection
+            .as_object_mut()
+            .ok_or("child grant must be an object")?;
+        object.remove("profiles");
+        object.remove("maxReasoning");
+    }
+    let fields: CurrentChildLaunchGrantFields =
+        serde_json::from_value(projection).map_err(|e| e.to_string())?;
+    let grant = ChildAgentLaunchGrantSet {
+        version: fields.version,
+        identities: fields.identities,
+        allow_inherit_parent_identity: fields.allow_inherit_parent_identity,
+        allow_server_derived_ephemeral: fields.allow_server_derived_ephemeral,
+        allow_inherit_parent_profile: fields.allow_inherit_parent_profile,
+        skill_ids: fields.skill_ids,
+        mcp_server_ids: fields.mcp_server_ids,
+        max_permission_profile: fields.max_permission_profile,
+        fingerprint: fields.fingerprint,
+        original: None,
+    };
+    validate_child_launch_grant(&grant).map_err(|e| format!("{e:?}"))?;
+    Ok(grant)
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
-// Released migration steps decode their own immutable wire schema. They must
-// never deserialize through `ChildAgentLaunchGrantSet`, because that type is
-// the moving current schema and a future V3 field must not change how V1 is
-// authenticated or transformed into V2.
+// Historical authentication uses immutable wire schemas. Never serialize the
+// moving runtime DTO to verify an old checksum: the field order, defaults and
+// omission rules below are part of the released hash algorithms.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ChildLaunchGrantWire<P> {
@@ -665,68 +991,20 @@ fn verify_child_launch_grant_v1_wire<P: Serialize>(
     Ok(())
 }
 
-fn promote_child_launch_grant_v1_wire(
-    mut grant: ChildLaunchGrantWire<PermissionPolicyV2Wire>,
-) -> Result<serde_json::Value, String> {
-    grant
-        .max_permission_profile
-        .effective_policy
-        .normalize_version_one_restrictions();
-    grant.version = CHILD_LAUNCH_GRANT_VERSION_V2;
-    grant.fingerprint = child_launch_grant_wire_fingerprint(
-        &grant,
-        b"pioneer:agent-runtime:child-launch-grant:v2\0",
-    )?;
-    serde_json::to_value(grant)
-        .map_err(|error| format!("could not encode migrated child launch grant: {error}"))
-}
-
-const CHILD_LAUNCH_GRANT_MIGRATIONS: [crate::versioned_contract::JsonContractMigration; 1] =
-    [crate::versioned_contract::JsonContractMigration {
-        from_version: CHILD_LAUNCH_GRANT_VERSION_V1,
-        to_version: CHILD_LAUNCH_GRANT_VERSION_V2,
-        migrate: migrate_child_launch_grant_v1_to_v2,
-    }];
-
-/// Upcasts the `child_launch_grant` member of any durable outer contract.
-///
-/// The outer document is deliberately opaque here: Task actor contracts and
-/// AgentExecution grants share the same versioned child ceiling. Persistence
-/// adapters validate their own outer contract after this function returns.
-/// Current documents are returned byte-for-byte so an on-read compatibility
-/// path does not disturb an enclosing fingerprint.
+/// Compatibility entry point retained for persistence callers. Verify the
+/// nested original, but return the outer bytes unchanged. Projection belongs
+/// to ChildAgentLaunchGrantSet's durable deserializer, never to a DB rewrite.
 pub fn migrate_embedded_child_launch_grant_json_to_current(
     json: &str,
 ) -> Result<String, ChildAgentLaunchGrantMigrationError> {
-    let mut outer = serde_json::from_str::<serde_json::Value>(json)
-        .map_err(|error| ChildAgentLaunchGrantMigrationError::InvalidJson(error.to_string()))?;
+    let outer: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| ChildAgentLaunchGrantMigrationError::InvalidJson(e.to_string()))?;
     let child = outer
-        .get_mut("child_launch_grant")
+        .get("child_launch_grant")
         .ok_or(ChildAgentLaunchGrantMigrationError::MissingChildGrant)?;
-    let source_version = child_launch_grant_version(child)
-        .map_err(ChildAgentLaunchGrantMigrationError::InvalidPayload)?;
-    let migrator = crate::versioned_contract::JsonContractMigrator::new(
-        ChildAgentLaunchGrantSet::VERSION,
-        child_launch_grant_version,
-        &CHILD_LAUNCH_GRANT_MIGRATIONS,
-    );
-    *child = migrator
-        .migrate_to_current(child.take())
-        .map_err(|error| ChildAgentLaunchGrantMigrationError::Migration(error.to_string()))?;
-
-    let current =
-        serde_json::from_value::<ChildAgentLaunchGrantSet>(child.clone()).map_err(|error| {
-            ChildAgentLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
-        })?;
-    current.validate().map_err(|error| {
-        ChildAgentLaunchGrantMigrationError::InvalidCurrentContract(format!("{error:?}"))
-    })?;
-
-    if source_version == ChildAgentLaunchGrantSet::VERSION {
-        return Ok(json.to_owned());
-    }
-    serde_json::to_string(&outer)
-        .map_err(|error| ChildAgentLaunchGrantMigrationError::InvalidJson(error.to_string()))
+    project_verified_child_grant(child)
+        .map_err(ChildAgentLaunchGrantMigrationError::InvalidCurrentContract)?;
+    Ok(json.to_owned())
 }
 
 fn child_launch_grant_version(value: &serde_json::Value) -> Result<u32, String> {
@@ -764,28 +1042,18 @@ impl fmt::Display for ChildAgentLaunchGrantMigrationError {
 
 impl std::error::Error for ChildAgentLaunchGrantMigrationError {}
 
-pub(crate) fn migrate_child_launch_grant_v1_to_v2(
-    value: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    // V1 was released both before and after optional permission fields were
-    // appended without a version bump. The frozen V1 wire schema represents
-    // that one public version directly; it is not split into invented
-    // pseudo-versions. Serialization preserves the exact historical shape, so
-    // the stored V1 fingerprint is still verified before any defaults apply.
-    let grant = serde_json::from_value::<ChildLaunchGrantWire<PermissionPolicyV1Wire>>(value)
-        .map_err(|error| format!("version 1 child launch grant is invalid: {error}"))?;
-    verify_child_launch_grant_v1_wire(&grant)?;
-    let grant = grant.try_map_permission_policy(|cap| {
-        PermissionCapWire::<PermissionPolicyV2Wire>::try_from(cap)
-    })?;
-    promote_child_launch_grant_v1_wire(grant)
-}
-
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentExecutionProfileSelection {
     InheritParent,
-    Exact { profile_id: AgentExecutionProfileId },
+    Exact {
+        profile_id: AgentExecutionProfileId,
+    },
+    Model {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        model_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -930,23 +1198,7 @@ mod tests {
             3,
             "generation-a",
         );
-        let profile = AgentExecutionProfileProjection {
-            id: profile_id("P00000000000000000003"),
-            compatible_agent_identity_ids: vec![identity.id.clone()],
-            backend: AgentExecutionProfileBackend::ApiProvider,
-            provider_id: "provider-opaque".to_owned(),
-            model_id: "model-opaque".to_owned(),
-            provider_display_name: "Provider".to_owned(),
-            model_display_name: "Model".to_owned(),
-            allowed_reasoning: vec![TurnReasoningSelection {
-                effort: "medium".to_owned(),
-            }],
-            allowed_permission_profiles: vec![TurnPermissionMode::FullAccess],
-            catalog_generation: 4,
-            policy_generation: 5,
-            fingerprint: "profile-fingerprint".to_owned(),
-        };
-        ChildAgentLaunchGrantSet::new(vec![identity], vec![profile]).unwrap()
+        ChildAgentLaunchGrantSet::new(vec![identity]).unwrap()
     }
 
     fn launch(profile: AgentExecutionProfileSelection) -> AgentLaunchSelection {
@@ -1179,30 +1431,135 @@ mod tests {
     fn child_launch_grant_is_canonical_and_detects_tampering() {
         let grant = child_grant();
         assert!(grant.validate().is_ok());
-        assert_eq!(
-            grant.fingerprint,
-            "1620c8eca0ca3eace03dc7d614e3af348b2f77224cde1064bcf7f492c3177047"
-        );
-        assert_eq!(
-            grant.max_reasoning.allowed,
-            vec![TurnReasoningSelection {
-                effort: "medium".to_owned(),
-            }]
-        );
-
-        let mut tampered_reasoning = grant.clone();
-        tampered_reasoning.max_reasoning.allowed = vec![TurnReasoningSelection {
-            effort: "high".to_owned(),
-        }];
-        assert_eq!(
-            tampered_reasoning.validate(),
-            Err(ChildAgentLaunchGrantSetError::InvalidProfile)
-        );
-
+        assert!(grant.fingerprint.starts_with(FULL_JSON_CHILD_GRANT_PREFIX));
+        let encoded = serde_json::to_value(&grant).unwrap();
+        assert!(encoded.get("profiles").is_none());
+        assert!(encoded.get("maxReasoning").is_none());
         let mut tampered = grant;
-        tampered.profiles[0].model_id = "other-model".to_owned();
+        tampered.identities[0].source_fingerprint = "other-source".to_owned();
         assert_eq!(
             tampered.validate(),
+            Err(ChildAgentLaunchGrantSetError::FingerprintMismatch)
+        );
+    }
+
+    #[test]
+    fn acp_and_native_cli_profiles_require_exact_provider_and_source_identity() {
+        let identity = AgentIdentityProjection::new(
+            identity_id("A00000000000000000001"),
+            crate::AgentIdentitySourceKind::CliRuntimeInstance,
+            "Runtime",
+            "runtime",
+            None,
+            None,
+            1,
+            "runtime-source",
+        )
+        .unwrap();
+        let grant = ChildAgentLaunchGrantSet::new(vec![identity.clone()]).unwrap();
+        for backend in [
+            AgentExecutionProfileBackend::CliRuntime {
+                runtime_instance_id: "runtime".into(),
+            },
+            AgentExecutionProfileBackend::AcpAgentRuntime {
+                runtime_id: "runtime".into(),
+            },
+        ] {
+            let profile = AgentExecutionProfileProjection {
+                id: profile_id("P00000000000000000001"),
+                compatible_agent_identity_ids: vec![identity.id.clone()],
+                backend,
+                provider_id: "cli_runtime:runtime".into(),
+                model_id: "selected-model".into(),
+                provider_display_name: "Runtime".into(),
+                model_display_name: "Selected model".into(),
+                allowed_reasoning: vec![],
+                allowed_permission_profiles: vec![TurnPermissionMode::Supervised],
+                catalog_generation: 1,
+                policy_generation: 1,
+                fingerprint: "selected-profile".into(),
+            };
+            grant
+                .validate_selected_profile(&identity, &profile)
+                .unwrap();
+            let mut wrong_provider = profile.clone();
+            wrong_provider.provider_id = "cli_runtime:other".into();
+            assert!(
+                grant
+                    .validate_selected_profile(&identity, &wrong_provider)
+                    .is_err()
+            );
+            let native = AgentIdentityProjection::pioneer(identity.id.clone(), 1, "native-source");
+            let native_grant = ChildAgentLaunchGrantSet::new(vec![native.clone()]).unwrap();
+            assert!(
+                native_grant
+                    .validate_selected_profile(&native, &profile)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn task_grant_validates_its_exact_profile_without_a_model_catalog() {
+        let seed = version_one_grant(true);
+        let grant = json!({
+            "kind": "resolved_task_launch",
+            "identity": seed["identities"][0],
+            "profile": seed["profiles"][0],
+            "role_key": "member", "agent_policy_generation": 1,
+            "allowed_actions": ["create_task"],
+            "agent_authorization_fingerprint": "a".repeat(64),
+            "child_launch_grant": child_grant(),
+        });
+        crate::migrate_task_derived_child_launch_grant_json_to_current(&grant.to_string()).unwrap();
+        for change in 0..7 {
+            let mut invalid = grant.clone();
+            match change {
+                0 => invalid["profile"]["catalogGeneration"] = json!(0),
+                1 => invalid["profile"]["policyGeneration"] = json!(0),
+                2 => invalid["profile"]["fingerprint"] = json!(""),
+                3 => invalid["profile"]["compatibleAgentIdentityIds"] = json!([]),
+                4 => {
+                    invalid["profile"]["compatibleAgentIdentityIds"] =
+                        json!(["A00000000000000000001", "A00000000000000000001"])
+                }
+                5 => {
+                    invalid["profile"]["compatibleAgentIdentityIds"] =
+                        json!(["A00000000000000000002"])
+                }
+                _ => {
+                    invalid["profile"]["backend"] =
+                        json!({"cli_runtime":{"runtime_instance_id":"codex"}});
+                    invalid["profile"]["providerId"] = json!("cli_runtime:codex");
+                }
+            }
+            assert!(
+                crate::migrate_task_derived_child_launch_grant_json_to_current(
+                    &invalid.to_string()
+                )
+                .is_err(),
+                "invalid exact profile {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_admitted_grants_round_trip_without_capacity_loss_or_widening() {
+        let identities = (0..140)
+            .map(|n| {
+                AgentIdentityProjection::pioneer(identity_id(&format!("A{n:020}")), 3, "source")
+            })
+            .collect::<Vec<_>>();
+        let admitted = ChildAgentLaunchGrantSet::new(identities).unwrap();
+        let stored = serde_json::to_string(&admitted).unwrap();
+        let restored: ChildAgentLaunchGrantSet = serde_json::from_str(&stored).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, admitted);
+        assert_eq!(restored.identities.len(), 140);
+        let mut widened = restored;
+        widened.identities.last_mut().unwrap().source_fingerprint = "not-admitted".into();
+        assert_eq!(
+            widened.validate(),
             Err(ChildAgentLaunchGrantSetError::FingerprintMismatch)
         );
     }
@@ -1269,36 +1626,6 @@ mod tests {
     }
 
     #[test]
-    fn child_launch_grant_migrates_original_version_one_to_version_two() {
-        let source = version_one_grant(true);
-        assert_eq!(
-            source["fingerprint"],
-            json!("fc747ed91c91bd27b7ed9378961fedb2c57de5eba831ae5bfd5e3745e29e0af3")
-        );
-        let migrated = migrate_child_launch_grant_v1_to_v2(source)
-            .expect("original version 1 grant should migrate");
-        let migrated: ChildAgentLaunchGrantSet =
-            serde_json::from_value(migrated).expect("migrated grant should decode");
-        assert_eq!(migrated.version, 2);
-        assert!(migrated.validate().is_ok());
-    }
-
-    #[test]
-    fn child_launch_grant_migrates_version_one_with_optional_permission_fields() {
-        let source = version_one_grant(false);
-        assert_eq!(
-            source["fingerprint"],
-            json!("3ea9513e6206d823b6988c7f258869b425c3249a5b76c8672c86454c19615c24")
-        );
-        let migrated = migrate_child_launch_grant_v1_to_v2(source)
-            .expect("version 1 grant with optional permission fields should migrate");
-        let migrated: ChildAgentLaunchGrantSet =
-            serde_json::from_value(migrated).expect("migrated grant should decode");
-        assert_eq!(migrated.version, 2);
-        assert!(migrated.validate().is_ok());
-    }
-
-    #[test]
     fn child_launch_grant_migration_preserves_version_one_implicit_allow_list_restrictions() {
         let mut source = version_one_grant(false);
         source["maxPermissionProfile"]["effective_policy"]["allowed_tools"] = json!(["read_file"]);
@@ -1306,10 +1633,8 @@ mod tests {
         source["fingerprint"] =
             json!("f71fe2e275437c5ac4a01850a4c0f132ca725e26499d268fef19e98757f06c7d");
 
-        let migrated = migrate_child_launch_grant_v1_to_v2(source)
-            .expect("version 1 implicit restrictions should migrate");
-        let migrated: ChildAgentLaunchGrantSet =
-            serde_json::from_value(migrated).expect("migrated grant should decode");
+        let migrated: ChildAgentLaunchGrantSet = serde_json::from_value(source)
+            .expect("version 1 implicit restrictions should project safely");
 
         assert!(
             migrated
@@ -1330,7 +1655,7 @@ mod tests {
     fn child_launch_grant_migration_rejects_tampered_version_one() {
         let mut value = version_one_grant(true);
         value["profiles"][0]["modelId"] = json!("tampered-model");
-        assert!(migrate_child_launch_grant_v1_to_v2(value).is_err());
+        assert!(serde_json::from_value::<ChildAgentLaunchGrantSet>(value).is_err());
     }
 
     #[test]
@@ -1388,10 +1713,8 @@ mod tests {
             "fingerprint": "f8f6969b263e02a18e6ccb6ef813a1c0f003cd32293d4d138970a9f939b44aba"
         });
 
-        let migrated = migrate_child_launch_grant_v1_to_v2(source)
-            .expect("CLI runtime version 1 grant should migrate");
-        let migrated: ChildAgentLaunchGrantSet =
-            serde_json::from_value(migrated).expect("migrated CLI grant should decode");
+        let migrated: ChildAgentLaunchGrantSet = serde_json::from_value(source)
+            .expect("CLI runtime version 1 grant should project safely");
         assert_eq!(migrated.version, 2);
         assert!(migrated.validate().is_ok());
     }
@@ -1414,12 +1737,33 @@ mod tests {
                 .expect("task child launch should migrate");
         let migrated_value: Value =
             serde_json::from_str(&migrated).expect("migrated task launch should decode");
-        assert_eq!(migrated_value["child_launch_grant"]["version"], json!(2));
+        assert_eq!(migrated_value["child_launch_grant"]["version"], json!(1));
+        assert_eq!(
+            migrated,
+            outer.to_string(),
+            "read must preserve the complete original"
+        );
 
         let migrated_again =
             crate::migrate_task_derived_child_launch_grant_json_to_current(&migrated)
                 .expect("current task child launch should be accepted");
         assert_eq!(migrated_again, migrated);
+        let crate::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+            identity,
+            profile,
+            child_launch_grant,
+            ..
+        } = serde_json::from_str(&migrated).unwrap();
+        let mut current = identity.clone();
+        current.source_revision += 1;
+        current.source_fingerprint = "updated-connection".to_owned();
+        assert!(agent_identity_has_same_launch_source(&current, &identity));
+        validate_selected_agent_launch_profile(&identity, &profile, &child_launch_grant.identities)
+            .unwrap();
+        assert!(
+            child_launch_grant.validate().is_ok(),
+            "reading legacy allowances never rewrites their authenticated snapshot"
+        );
     }
 
     #[test]
@@ -1460,5 +1804,187 @@ mod tests {
         ] {
             assert!(names.contains(required), "schema missing {required}");
         }
+    }
+
+    #[test]
+    fn released_grant_formats_authenticate_before_projection_and_preserve_originals() {
+        // 1620... is pinned in d907644f's released V2 writer regression;
+        // cdafe... is pinned in the compact writer at our base SHA. Neither
+        // expected checksum is generated by the verifier under test.
+        let mut historical_v2 = version_one_grant(false);
+        historical_v2["version"] = json!(2);
+        historical_v2["fingerprint"] =
+            json!("1620c8eca0ca3eace03dc7d614e3af348b2f77224cde1064bcf7f492c3177047");
+        let mut compact_v2 = historical_v2.clone();
+        compact_v2.as_object_mut().unwrap().remove("profiles");
+        compact_v2.as_object_mut().unwrap().remove("maxReasoning");
+        compact_v2["fingerprint"] =
+            json!("cdafe1ec7b698b312a327d4d7907f2c0c346cd8d859bcf54076f40a920c25953");
+        for original in [
+            version_one_grant(true),
+            version_one_grant(false),
+            historical_v2,
+            compact_v2,
+        ] {
+            let grant: ChildAgentLaunchGrantSet = serde_json::from_value(original.clone()).unwrap();
+            grant.validate().unwrap();
+            assert_eq!(serde_json::to_value(&grant).unwrap(), original);
+            assert_eq!(grant.fingerprint, original["fingerprint"].as_str().unwrap());
+            assert_eq!(
+                grant.validate_for_execution().is_ok(),
+                original.get("profiles").is_none()
+            );
+            if original.get("profiles").is_some() {
+                let identity = grant.identities[0].clone();
+                let profile: AgentExecutionProfileProjection =
+                    serde_json::from_value(original["profiles"][0].clone()).unwrap();
+                grant
+                    .validate_selected_profile(&identity, &profile)
+                    .unwrap();
+                let mut wider = profile.clone();
+                wider.model_id = "outside-saved-profile".into();
+                assert!(grant.validate_selected_profile(&identity, &wider).is_err());
+                let mut wider = profile;
+                wider.allowed_reasoning.push(TurnReasoningSelection {
+                    effort: "high".into(),
+                });
+                assert!(grant.validate_selected_profile(&identity, &wider).is_err());
+                assert!(
+                    grant
+                        .clone()
+                        .with_policy(
+                            false,
+                            false,
+                            false,
+                            vec![],
+                            vec![],
+                            crate::task_permission_cap_for_mode(TurnPermissionMode::FullAccess)
+                        )
+                        .is_err()
+                );
+                let mut tampered_reference = original.clone();
+                tampered_reference["profiles"][0]["modelDisplayName"] = json!("changed");
+                assert!(
+                    serde_json::from_value::<ChildAgentLaunchGrantSet>(tampered_reference).is_err()
+                );
+                let mut tampered_reasoning = original.clone();
+                tampered_reasoning["maxReasoning"]["allowed"] = json!([]);
+                assert!(
+                    serde_json::from_value::<ChildAgentLaunchGrantSet>(tampered_reasoning).is_err()
+                );
+            }
+            let mut tampered = original;
+            tampered["allowServerDerivedEphemeral"] = json!(true);
+            assert!(serde_json::from_value::<ChildAgentLaunchGrantSet>(tampered).is_err());
+        }
+    }
+
+    // Independently specified canonical bytes are the checksum oracle. This
+    // fixture deliberately includes metadata absent from the Rust DTO, a nested
+    // fingerprint, ordered arrays, and non-ASCII text. No production serializer
+    // or verifier constructs these bytes.
+    const NEW_JSON_CANONICAL: &str = r#"{"allowInheritParentIdentity":false,"allowInheritParentProfile":false,"allowServerDerivedEphemeral":false,"futureCatalog":{"labels":["я","a"],"nested":{"fingerprint":"reference"}},"identities":[{"display_name":"Pioneer","id":"A00000000000000000001","nickname":"pioneer","source_fingerprint":"generation-a","source_kind":"native_agent","source_revision":3}],"maxPermissionProfile":{"effective_policy":{"agent_action":"ask","computer_use":"ask","default_behavior":"ask","dynamic_skill_tool":"ask","file_read":"allow","file_write":"ask","mcp_read":"allow","mcp_write_or_unknown":"ask","memory_write":"ask","network":"ask","shell_command":"ask","task_subagent":"ask"},"mode":"supervised"},"mcpServerIds":[],"skillIds":[],"version":2}"#;
+
+    fn full_json_fixture(canonical: &str) -> Value {
+        let mut value: Value = serde_json::from_str(canonical).unwrap();
+        let mut digest = Sha256::new();
+        digest.update(b"pioneer:agent-runtime:child-launch-grant:full-json:v1\0");
+        digest.update(canonical.as_bytes());
+        value["fingerprint"] = json!(format!("json-sha256-v1:{}", hex::encode(digest.finalize())));
+        value
+    }
+
+    #[test]
+    fn full_json_checksum_survives_projection_and_covers_all_original_fields() {
+        let original = full_json_fixture(NEW_JSON_CANONICAL);
+        let grant: ChildAgentLaunchGrantSet = serde_json::from_value(original.clone()).unwrap();
+        grant.validate_for_execution().unwrap();
+        assert_eq!(serde_json::to_value(&grant).unwrap(), original);
+        assert_eq!(grant.fingerprint, original["fingerprint"].as_str().unwrap());
+        // The writer must agree with independently specified complete JSON;
+        // the extra catalog is absent from today's DTO but retained on reads.
+        let current_canonical = NEW_JSON_CANONICAL.replace(
+            r#""futureCatalog":{"labels":["я","a"],"nested":{"fingerprint":"reference"}},"#,
+            "",
+        );
+        assert_eq!(
+            serde_json::to_value(child_grant()).unwrap(),
+            full_json_fixture(&current_canonical)
+        );
+        for pointer in [
+            "/allowInheritParentIdentity",
+            "/identities/0/source_fingerprint",
+            "/maxPermissionProfile/effective_policy/network",
+            "/futureCatalog/nested/fingerprint",
+            "/futureCatalog/labels/0",
+        ] {
+            let mut tampered = original.clone();
+            let target = tampered.pointer_mut(pointer).unwrap();
+            *target = if pointer.ends_with("/network") {
+                json!("allow")
+            } else {
+                match target.as_bool() {
+                    Some(value) => json!(!value),
+                    None => json!("changed"),
+                }
+            };
+            assert!(
+                serde_json::from_value::<ChildAgentLaunchGrantSet>(tampered).is_err(),
+                "{pointer}"
+            );
+        }
+        for (field, value) in [
+            ("version", json!(3)),
+            ("fingerprint", json!("json-sha256-v9:unknown")),
+            ("fingerprint", json!("0".repeat(64))),
+        ] {
+            let mut unknown = original.clone();
+            unknown[field] = value;
+            assert!(serde_json::from_value::<ChildAgentLaunchGrantSet>(unknown).is_err());
+        }
+        let mut lost_reference = original.clone();
+        lost_reference
+            .as_object_mut()
+            .unwrap()
+            .remove("futureCatalog");
+        assert!(serde_json::from_value::<ChildAgentLaunchGrantSet>(lost_reference).is_err());
+        let wrong_version =
+            full_json_fixture(&NEW_JSON_CANONICAL.replace("\"version\":2", "\"version\":3"));
+        assert!(serde_json::from_value::<ChildAgentLaunchGrantSet>(wrong_version).is_err());
+        let missing_field = full_json_fixture(
+            &NEW_JSON_CANONICAL.replace("\"allowInheritParentIdentity\":false,", ""),
+        );
+        assert!(serde_json::from_value::<ChildAgentLaunchGrantSet>(missing_field).is_err());
+        let mut mutated_projection = grant;
+        mutated_projection.allow_inherit_parent_profile = true;
+        assert!(mutated_projection.validate().is_err());
+        assert!(serde_json::to_value(mutated_projection).is_err());
+    }
+
+    #[test]
+    fn full_json_canonicalization_sorts_nested_keys_but_preserves_array_order() {
+        let original = full_json_fixture(NEW_JSON_CANONICAL);
+        let checksum = original["fingerprint"].as_str().unwrap();
+        // Move the root fingerprint first and add insignificant
+        // whitespace. Also reverse the nested identity's member order.
+        let reordered = format!(
+            "{{ \"fingerprint\":{}, {} }}",
+            serde_json::to_string(checksum).unwrap(),
+            NEW_JSON_CANONICAL
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .replace(
+                    "\"display_name\":\"Pioneer\",\"id\":\"A00000000000000000001\"",
+                    "\"id\":\"A00000000000000000001\",\"display_name\":\"Pioneer\""
+                )
+        );
+        let restored: ChildAgentLaunchGrantSet = serde_json::from_str(&reordered).unwrap();
+        assert_eq!(restored.fingerprint, checksum);
+        let mut changed_order = original;
+        changed_order["futureCatalog"]["labels"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert!(serde_json::from_value::<ChildAgentLaunchGrantSet>(changed_order).is_err());
     }
 }

@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppMetadata",
+  "description": "Verified presentation snapshot only; native authority remains in components.",
+  "type": "object",
+  "properties": {
+    "categories": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "composer_icon": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AppThemedIcon"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "default_locale": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "developer_logo": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AppThemedIcon"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "developer_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "has_ui": {
+      "type": "boolean",
+      "default": false
+    },
+    "icon": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AppThemedIcon"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "localizations": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/AppLocalization"
+      }
+    }
+  },
+  "required": [
+    "categories",
+    "localizations"
+  ],
+  "$defs": {
+    "AppLocalization": {
+      "type": "object",
+      "properties": {
+        "longDescription": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shortDescription": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "AppThemedIcon": {
+      "type": "object",
+      "properties": {
+        "dark": {
+          "$ref": "#/$defs/ImageReference"
+        },
+        "light": {
+          "$ref": "#/$defs/ImageReference"
+        }
+      },
+      "required": [
+        "light",
+        "dark"
+      ]
+    },
+    "ImageReference": {
+      "description": "Immutable image reference. Published paths are authenticated Gateway storage links.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "revision"
+      ]
+    }
+  }
+}

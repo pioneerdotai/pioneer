@@ -34,22 +34,24 @@ pub(crate) async fn acquire(
     let directory = root.join("workspaces").join(workspace_segment(workspace)?);
     loop {
         let directory = directory.clone();
-        let file = tokio::task::spawn_blocking(move || -> std::io::Result<Option<File>> {
-            std::fs::create_dir_all(&directory)?;
-            // This file is permanent coordination metadata. Unlinking a lock
-            // file would let another process lock a different inode.
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(directory.join(".blob-mutations.lock"))?;
-            match file.try_lock() {
-                Ok(()) => Ok(Some(file)),
-                Err(TryLockError::WouldBlock) => Ok(None),
-                Err(TryLockError::Error(error)) => Err(error),
-            }
-        })
+        let file = pioneer_observability::work::spawn_blocking(
+            move || -> std::io::Result<Option<File>> {
+                std::fs::create_dir_all(&directory)?;
+                // This file is permanent coordination metadata. Unlinking a lock
+                // file would let another process lock a different inode.
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(directory.join(".blob-mutations.lock"))?;
+                match file.try_lock() {
+                    Ok(()) => Ok(Some(file)),
+                    Err(TryLockError::WouldBlock) => Ok(None),
+                    Err(TryLockError::Error(error)) => Err(error),
+                }
+            },
+        )
         .await
         .map_err(|_| ArtifactError::ContentInvariant {
             reason: "artifact mutation lock worker failed",

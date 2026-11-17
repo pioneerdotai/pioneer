@@ -77,6 +77,7 @@ pub enum GatewayNotification {
     ThreadUpdated(ThreadUpdatedNotification),
     ThreadParticipantsChanged(ThreadParticipantsChangedNotification),
     ThreadTreeChanged(ThreadTreeChangedNotification),
+    WorkspacePush(crate::WorkspacePushNotification),
     ThreadAgentsDocChanged(ThreadAgentsDocChangedNotification),
     ThreadTimelineBlocksChanged(ThreadTimelineBlocksChangedNotification),
     ThreadReadCursorChanged(ThreadReadCursorChangedNotification),
@@ -111,6 +112,8 @@ pub enum GatewayNotification {
     ContextCompressing(ContextCompressingNotification),
     ContextCompressed(ContextCompressedNotification),
     SkillsChanged(SkillsChangedNotification),
+    PluginsChanged(crate::PluginsChangedNotification),
+    AppsChanged(crate::AppsChangedNotification),
     SkillsUploadChunkAck(SkillsUploadChunkAckNotification),
     McpOAuthChanged(crate::McpOAuthNotification),
     McpChanged(McpChangedNotification),
@@ -180,9 +183,26 @@ impl GatewayNotification {
     pub fn from_jsonrpc(notification: JsonRpcNotification) -> Option<Self> {
         let method = notification.method;
 
-        let params = notification.params?;
+        let params = match notification.params {
+            Some(params) => params,
+            // Losing even an empty/omitted scoped frame requires reconciliation;
+            // do not silently discard it before the shared recovery owner sees it.
+            None if method == events::WORKSPACE_PUSH_CHANGED => {
+                return Some(Self::Unknown(unknown_notification(
+                    method,
+                    serde_json::Value::Null,
+                )));
+            }
+            None => return None,
+        };
 
         match method.as_str() {
+            events::WORKSPACE_PUSH_CHANGED => {
+                match serde_json::from_value::<crate::WorkspacePushNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::WorkspacePush(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
             events::ACCESS_CHANGED => {
                 match serde_json::from_value::<AccessChangedNotification>(params.clone()) {
                     Ok(notification) => Some(Self::AccessChanged(notification)),
@@ -451,6 +471,16 @@ impl GatewayNotification {
                 serde_json::from_value::<ContextCompressedNotification>(params)
                     .ok()
                     .map(Self::ContextCompressed)
+            }
+            crate::constants::methods::APPS_CHANGED => {
+                serde_json::from_value::<crate::AppsChangedNotification>(params)
+                    .ok()
+                    .map(Self::AppsChanged)
+            }
+            crate::constants::methods::PLUGINS_CHANGED => {
+                serde_json::from_value::<crate::PluginsChangedNotification>(params)
+                    .ok()
+                    .map(Self::PluginsChanged)
             }
             events::SKILLS_CHANGED => serde_json::from_value::<SkillsChangedNotification>(params)
                 .ok()
@@ -1312,27 +1342,6 @@ mod tests {
     }
 
     #[test]
-    fn maps_future_cli_runtime_notification_to_unknown() {
-        let notification = JsonRpcNotification::from_params(
-            "cli_runtime/generated_schema_probe",
-            &json!({
-                "workspace_id": "ws_1",
-                "runtime_id": "codex_personal",
-                "payload": { "future": true }
-            }),
-        )
-        .expect("future notification should encode");
-
-        match GatewayNotification::from_jsonrpc(notification).expect("future event should map") {
-            GatewayNotification::Unknown(notification) => {
-                assert_eq!(notification.method, "cli_runtime/generated_schema_probe");
-                assert_eq!(notification.workspace_id.as_deref(), Some("ws_1"));
-            }
-            other => panic!("expected unknown cli runtime notification, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn maps_thread_updated_notification() {
         let notification: JsonRpcNotification = serde_json::from_value(json!({
             "jsonrpc": "2.0",
@@ -1413,24 +1422,6 @@ mod tests {
         );
         assert!(serialized["params"].get("actions").is_none());
         assert!(serialized["params"].get("policy").is_none());
-    }
-
-    #[test]
-    fn maps_malformed_item_notification_to_unknown() {
-        let notification: JsonRpcNotification = serde_json::from_value(json!({
-            "jsonrpc": "2.0",
-            "method": "item/completed",
-            "params": {
-                "workspace_id": "ws_123",
-                "thread_id": "thr_123",
-                "turn_id": "turn_123"
-            }
-        }))
-        .expect("notification should decode");
-
-        let mapped =
-            GatewayNotification::from_jsonrpc(notification).expect("malformed item should map");
-        assert!(matches!(mapped, GatewayNotification::Unknown(_)));
     }
 
     #[test]
@@ -1792,41 +1783,6 @@ mod tests {
     }
 
     #[test]
-    fn maps_malformed_execution_window_notification_to_unknown() {
-        let notification = JsonRpcNotification::from_params(
-            "turn/execution_window/exhausted",
-            &json!({
-                "workspace_id": "ws_123",
-                "thread_id": "thr_123",
-                "turn_id": "turn_123"
-            }),
-        )
-        .expect("malformed window notification should encode");
-
-        let mapped =
-            GatewayNotification::from_jsonrpc(notification).expect("malformed window should map");
-        assert!(matches!(mapped, GatewayNotification::Unknown(_)));
-    }
-
-    #[test]
-    fn maps_malformed_tool_retry_notification_to_unknown() {
-        let notification: JsonRpcNotification = serde_json::from_value(json!({
-            "jsonrpc": "2.0",
-            "method": "item/tool/retry_scheduled",
-            "params": {
-                "workspace_id": "ws_123",
-                "thread_id": "thr_123",
-                "turn_id": "turn_123"
-            }
-        }))
-        .expect("notification should decode");
-
-        let mapped =
-            GatewayNotification::from_jsonrpc(notification).expect("malformed item should map");
-        assert!(matches!(mapped, GatewayNotification::Unknown(_)));
-    }
-
-    #[test]
     fn maps_semantic_timeline_notifications() {
         let blocks_changed = JsonRpcNotification::from_params(
             events::THREAD_TIMELINE_BLOCKS_CHANGED,
@@ -2052,6 +2008,66 @@ mod tests {
                 ),
                 "unexpected Epic 5 notification {mapped:?}"
             );
+        }
+    }
+
+    #[test]
+    fn unknown_notification_fallback_preserves_method_and_workspace() {
+        let future = JsonRpcNotification::from_params(
+            "cli_runtime/generated_schema_probe",
+            &json!({ "workspace_id": "ws_1", "runtime_id": "codex_personal", "payload": { "future": true } }),
+        ).expect("future notification should encode");
+        let window = JsonRpcNotification::from_params(
+            "turn/execution_window/exhausted",
+            &json!({ "workspace_id": "ws_123", "thread_id": "thr_123", "turn_id": "turn_123" }),
+        )
+        .expect("malformed window notification should encode");
+        let mut cases = vec![
+            (
+                future,
+                "cli_runtime/generated_schema_probe",
+                "ws_1",
+                "future event should map",
+            ),
+            (
+                window,
+                "turn/execution_window/exhausted",
+                "ws_123",
+                "malformed window should map",
+            ),
+        ];
+        for (input, expected_method) in [
+            (
+                json!({ "jsonrpc": "2.0", "method": "item/completed", "params": { "workspace_id": "ws_123", "thread_id": "thr_123", "turn_id": "turn_123" } }),
+                "item/completed",
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "method": "item/tool/retry_scheduled", "params": { "workspace_id": "ws_123", "thread_id": "thr_123", "turn_id": "turn_123" } }),
+                "item/tool/retry_scheduled",
+            ),
+        ] {
+            let notification: JsonRpcNotification =
+                serde_json::from_value(input).expect("notification should decode");
+            cases.push((
+                notification,
+                expected_method,
+                "ws_123",
+                "malformed item should map",
+            ));
+        }
+        for (notification, expected_method, expected_workspace, map_message) in cases {
+            match GatewayNotification::from_jsonrpc(notification).expect(map_message) {
+                GatewayNotification::Unknown(notification) => {
+                    assert_eq!(notification.method, expected_method);
+                    assert_eq!(
+                        notification.workspace_id.as_deref(),
+                        Some(expected_workspace)
+                    );
+                }
+                other => {
+                    panic!("expected unknown notification for {expected_method}, got {other:?}")
+                }
+            }
         }
     }
 }

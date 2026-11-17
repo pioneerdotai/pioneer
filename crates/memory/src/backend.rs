@@ -4,11 +4,22 @@ use pioneer_protocol::{
     MemoryActorKind, MemoryCategory, MemoryScope, MemorySensitivity, MemoryStatus,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[async_trait]
 pub trait MemoryBackend: Send + Sync {
+    /// A scoped view of the same storage; stateless/test backends need no view.
+    fn with_maintenance_access(&self) -> Option<Arc<dyn MemoryBackend>> {
+        None
+    }
+
     async fn put(&self, request: BackendPutRequest) -> Result<BackendPutResult>;
+    /// Prepare a payload for owner publication. Durable implementations may
+    /// defer storage to the existing atomic control-plane transaction.
+    async fn prepare_put(&self, request: BackendPutRequest) -> Result<BackendPutResult> {
+        self.put(request).await
+    }
     async fn get(&self, request: BackendGetRequest) -> Result<Option<BackendPayload>>;
     async fn search(&self, request: BackendSearchRequest) -> Result<Vec<BackendSearchHit>>;
     async fn delete(&self, request: BackendDeleteRequest) -> Result<BackendDeleteResult>;
@@ -36,11 +47,10 @@ pub struct BackendPutRequest {
 
 #[derive(Debug, Clone)]
 pub struct BackendPutResult {
-    pub capsule_id: Option<String>,
-    pub capsule_ref: Option<String>,
-    pub frame_id: Option<i64>,
-    pub frame_uri: Option<String>,
-    pub frame_version: i64,
+    /// Durable revision to revalidate atomically with owner publication.
+    pub publication_guard: Option<i64>,
+    pub publication_content: Option<String>,
+    pub payload_version: i64,
     pub backend_metadata_json: Option<String>,
 }
 
@@ -49,14 +59,12 @@ pub struct BackendGetRequest {
     pub memory_id: String,
     pub scope: MemoryScope,
     pub scope_key_hash: Option<String>,
-    pub capsule_id: Option<String>,
-    pub capsule_ref: Option<String>,
-    pub frame_id: Option<i64>,
-    pub frame_uri: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BackendPayload {
+    /// Revision guarded by the shared durable store, when available.
+    pub durable_revision: Option<i64>,
     pub memory_id: String,
     pub content: String,
     pub snippet: Option<String>,
@@ -68,11 +76,13 @@ pub struct BackendSearchScope {
     pub scope: MemoryScope,
     pub scope_key_hash: String,
     pub workspace_id: Option<String>,
-    pub capsule_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BackendSearchRequest {
+    pub filter: pioneer_crud::AgentMemoryListFilter,
+    pub allowed_sensitivities: Vec<MemorySensitivity>,
+    pub now_unix: i64,
     pub query: String,
     pub scopes: Vec<MemoryScope>,
     pub resolved_scopes: Vec<BackendSearchScope>,
@@ -92,10 +102,6 @@ pub struct BackendDeleteRequest {
     pub memory_id: String,
     pub scope: MemoryScope,
     pub scope_key_hash: Option<String>,
-    pub capsule_id: Option<String>,
-    pub capsule_ref: Option<String>,
-    pub frame_id: Option<i64>,
-    pub frame_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -147,7 +153,7 @@ struct StoredMemoryPayload {
     content: String,
     sensitivity: MemorySensitivity,
     metadata_json: Option<String>,
-    frame_version: i64,
+    payload_version: i64,
 }
 
 impl InMemoryMemoryBackend {
@@ -164,13 +170,13 @@ impl InMemoryMemoryBackend {
     }
 
     pub async fn insert_stale_payload(&self, request: BackendPutRequest) {
-        let frame_version = self
+        let payload_version = self
             .inner
             .read()
             .await
             .records
             .get(request.memory_id.as_str())
-            .map(|record| record.frame_version + 1)
+            .map(|record| record.payload_version + 1)
             .unwrap_or(1);
         self.inner.write().await.records.insert(
             request.memory_id.clone(),
@@ -183,7 +189,7 @@ impl InMemoryMemoryBackend {
                 content: request.content,
                 sensitivity: request.sensitivity,
                 metadata_json: request.metadata_json,
-                frame_version,
+                payload_version: payload_version,
             },
         );
     }
@@ -197,10 +203,10 @@ impl InMemoryMemoryBackend {
 impl MemoryBackend for InMemoryMemoryBackend {
     async fn put(&self, request: BackendPutRequest) -> Result<BackendPutResult> {
         let mut state = self.inner.write().await;
-        let frame_version = state
+        let payload_version = state
             .records
             .get(request.memory_id.as_str())
-            .map(|record| record.frame_version + 1)
+            .map(|record| record.payload_version + 1)
             .unwrap_or(1);
         let memory_id = request.memory_id.clone();
         state.records.insert(
@@ -214,18 +220,14 @@ impl MemoryBackend for InMemoryMemoryBackend {
                 content: request.content,
                 sensitivity: request.sensitivity,
                 metadata_json: request.metadata_json,
-                frame_version,
+                payload_version: payload_version,
             },
         );
 
         Ok(BackendPutResult {
-            capsule_id: None,
-            capsule_ref: Some(format!("memory://in-memory/{memory_id}")),
-            frame_id: None,
-            frame_uri: Some(format!(
-                "memory://in-memory/{memory_id}#frame-{frame_version}"
-            )),
-            frame_version,
+            publication_guard: None,
+            publication_content: None,
+            payload_version: payload_version,
             backend_metadata_json: None,
         })
     }
@@ -238,6 +240,7 @@ impl MemoryBackend for InMemoryMemoryBackend {
             .records
             .get(request.memory_id.as_str())
             .map(|record| BackendPayload {
+                durable_revision: None,
                 memory_id: record.memory_id.clone(),
                 content: record.content.clone(),
                 snippet: None,

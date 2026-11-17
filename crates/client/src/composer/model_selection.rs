@@ -9,6 +9,12 @@ pub struct ComposerModelSelection {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_authority: Option<String>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -28,6 +34,12 @@ pub struct ComposerModelSelectionState {
     pub selected_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_authority: Option<String>,
     pub manually_selected: bool,
 }
 
@@ -38,6 +50,12 @@ pub struct ModelSelectorSelection {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_authority: Option<String>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -47,17 +65,27 @@ pub struct ModelProviderSelectionUpdate {
     pub selected_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_context_authority: Option<String>,
     pub clear_models: bool,
     pub loading_models: bool,
 }
 
 impl ComposerModelSelection {
     pub fn from_thread(thread: &Thread) -> Option<Self> {
-        composer_model_selection_from_parts_with_reasoning_effort(
+        let mut selection = composer_model_selection_from_parts_with_reasoning_effort(
             Some(thread.model_provider.as_str()),
             Some(thread.model.as_str()),
             thread.reasoning_effort.as_deref(),
-        )
+        )?;
+        selection.selected_context_window = thread.context_window;
+        selection.selected_service_mode = thread.service_mode.clone();
+        selection.selected_context_authority = thread.context_authority.clone();
+        Some(selection)
     }
 
     pub fn into_parts(self) -> (Option<String>, Option<String>) {
@@ -94,6 +122,9 @@ impl ComposerModelSelectionState {
             selected_provider,
             selected_model,
             selected_reasoning_effort,
+            selected_context_window: None,
+            selected_service_mode: None,
+            selected_context_authority: None,
             manually_selected,
         }
     }
@@ -120,6 +151,9 @@ impl ComposerModelSelectionState {
         self.selected_model = selected_model;
         if selection_changed {
             self.selected_reasoning_effort = None;
+            self.selected_context_window = None;
+            self.selected_service_mode = None;
+            self.selected_context_authority = None;
         }
         self.manually_selected = true;
         changed
@@ -160,15 +194,28 @@ impl ComposerModelSelectionState {
     }
 
     pub fn apply_resolved_selection(&mut self, selection: Option<ComposerModelSelection>) -> bool {
+        let selected_context_window = selection.as_ref().and_then(|s| s.selected_context_window);
+        let selected_service_mode = selection
+            .as_ref()
+            .and_then(|s| s.selected_service_mode.clone());
+        let selected_context_authority = selection
+            .as_ref()
+            .and_then(|s| s.selected_context_authority.clone());
         let (selected_provider, selected_model, selected_reasoning_effort) = selection
             .map(ComposerModelSelection::into_parts_with_reasoning_effort)
             .unwrap_or((None, None, None));
         let changed = self.selected_provider != selected_provider
             || self.selected_model != selected_model
-            || self.selected_reasoning_effort != selected_reasoning_effort;
+            || self.selected_reasoning_effort != selected_reasoning_effort
+            || self.selected_context_window != selected_context_window
+            || self.selected_service_mode != selected_service_mode
+            || self.selected_context_authority != selected_context_authority;
         self.selected_provider = selected_provider;
         self.selected_model = selected_model;
         self.selected_reasoning_effort = selected_reasoning_effort;
+        self.selected_context_window = selected_context_window;
+        self.selected_service_mode = selected_service_mode;
+        self.selected_context_authority = selected_context_authority;
         changed
     }
 
@@ -226,6 +273,9 @@ pub fn composer_model_selection_from_parts_with_reasoning_effort(
         provider: provider.to_owned(),
         model: model.to_owned(),
         selected_reasoning_effort,
+        selected_context_window: None,
+        selected_service_mode: None,
+        selected_context_authority: None,
     })
 }
 
@@ -271,7 +321,13 @@ pub fn resolve_composer_model_selection(
                 .cmp(&rhs.updated_at)
                 .then_with(|| lhs.thread_id.cmp(&rhs.thread_id))
         })
-        .map(|(_, selection)| selection)
+        .map(|(_, mut selection)| {
+            // Following a model from a different thread never follows its financial permission.
+            selection.selected_context_window = None;
+            selection.selected_service_mode = None;
+            selection.selected_context_authority = None;
+            selection
+        })
 }
 
 pub fn default_composer_turn_mode() -> ThreadMode {
@@ -296,6 +352,9 @@ pub fn select_model_provider(provider_name: String) -> ModelProviderSelectionUpd
         selected_provider: Some(provider_name),
         selected_model: None,
         selected_reasoning_effort: None,
+        selected_context_window: None,
+        selected_service_mode: None,
+        selected_context_authority: None,
         clear_models: true,
         loading_models: true,
     }
@@ -319,6 +378,9 @@ mod tests {
             provider: provider.to_owned(),
             model: model.to_owned(),
             selected_reasoning_effort: selected_reasoning_effort.map(str::to_owned),
+            selected_context_window: None,
+            selected_service_mode: None,
+            selected_context_authority: None,
         })
     }
 
@@ -365,6 +427,9 @@ mod tests {
         selected_reasoning_effort: Option<&str>,
     ) -> Thread {
         Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: "ws".to_owned(),
             id: "thread".to_owned(),
             name: None,
@@ -388,6 +453,7 @@ mod tests {
 
     fn with_turn(mut thread: Thread) -> Thread {
         thread.turns.push(pioneer_protocol::Turn {
+            work_owner: Default::default(),
             id: "turn".into(),
             status: pioneer_protocol::TurnStatus::Completed,
             turn_kind: Default::default(),
@@ -473,13 +539,10 @@ mod tests {
     }
 
     #[test]
-    fn task_turn_defaults_survive_sidebar_navigation() {
-        check_task_turn_navigation(false);
-    }
-
-    #[test]
-    fn task_turn_defaults_survive_navigation_publication_first() {
-        check_task_turn_navigation(true);
+    fn task_turn_defaults_survive_both_navigation_publication_orders() {
+        for publication_first in [false, true] {
+            check_task_turn_navigation(publication_first);
+        }
     }
 
     #[test]
@@ -586,175 +649,149 @@ mod tests {
     }
 
     #[test]
-    fn active_thread_with_turns_wins_over_newer_workspace_turn() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_a"),
-            Some("ws"),
-            vec![
-                candidate("thread_a", "ws", 10, true, "openai", "gpt-5.4"),
-                candidate("thread_b", "ws", 20, true, "anthropic", "claude-sonnet-4.5"),
-            ],
-        );
-
-        assert_eq!(resolved, selection("openai", "gpt-5.4"));
-    }
-
-    #[test]
-    fn active_thread_with_turns_restores_reasoning_effort() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_a"),
-            Some("ws"),
-            vec![
-                candidate_with_effort(
-                    "thread_a",
+    fn resolver_preserves_active_and_workspace_fallback_cases() {
+        for (case, active_thread, workspace, candidates, expected) in [
+            (
+                "active_thread_with_turns_wins_over_newer_workspace_turn",
+                Some("thread_a"),
+                Some("ws"),
+                vec![
+                    candidate("thread_a", "ws", 10, true, "openai", "gpt-5.4"),
+                    candidate("thread_b", "ws", 20, true, "anthropic", "claude-sonnet-4.5"),
+                ],
+                selection("openai", "gpt-5.4"),
+            ),
+            (
+                "active_thread_with_turns_restores_reasoning_effort",
+                Some("thread_a"),
+                Some("ws"),
+                vec![
+                    candidate_with_effort(
+                        "thread_a",
+                        "ws",
+                        10,
+                        true,
+                        "openai",
+                        "gpt-5.4",
+                        Some("high"),
+                    ),
+                    candidate("thread_b", "ws", 20, true, "anthropic", "claude-sonnet-4.5"),
+                ],
+                selection_with_effort("openai", "gpt-5.4", Some("high")),
+            ),
+            (
+                "empty_active_thread_uses_latest_workspace_turn",
+                Some("thread_empty"),
+                Some("ws"),
+                vec![
+                    candidate("thread_empty", "ws", 30, false, "openai", "default"),
+                    candidate("thread_old", "ws", 10, true, "openai", "gpt-5.4"),
+                    candidate(
+                        "thread_new",
+                        "ws",
+                        20,
+                        true,
+                        "openrouter",
+                        "anthropic/claude",
+                    ),
+                ],
+                selection("openrouter", "anthropic/claude"),
+            ),
+            (
+                "empty_active_thread_restores_latest_workspace_turn_reasoning_effort",
+                Some("thread_empty"),
+                Some("ws"),
+                vec![
+                    candidate("thread_empty", "ws", 30, false, "openai", "default"),
+                    candidate_with_effort(
+                        "thread_old",
+                        "ws",
+                        10,
+                        true,
+                        "openai",
+                        "gpt-5.4",
+                        Some("low"),
+                    ),
+                    candidate_with_effort(
+                        "thread_new",
+                        "ws",
+                        20,
+                        true,
+                        "openrouter",
+                        "anthropic/claude",
+                        Some("high"),
+                    ),
+                ],
+                selection_with_effort("openrouter", "anthropic/claude", Some("high")),
+            ),
+            (
+                "workspace_without_active_thread_uses_latest_workspace_turn",
+                None,
+                Some("ws"),
+                vec![
+                    candidate("thread_empty", "ws", 30, false, "openai", "default"),
+                    candidate("thread_old", "ws", 10, true, "openai", "gpt-5.4"),
+                    candidate(
+                        "thread_new",
+                        "ws",
+                        20,
+                        true,
+                        "openrouter",
+                        "anthropic/claude",
+                    ),
+                    candidate("thread_other", "other", 40, true, "anthropic", "claude"),
+                ],
+                selection("openrouter", "anthropic/claude"),
+            ),
+            (
+                "empty_workspace_keeps_model_selection_blank",
+                Some("thread_empty"),
+                Some("ws"),
+                vec![candidate(
+                    "thread_empty",
                     "ws",
-                    10,
-                    true,
+                    30,
+                    false,
                     "openai",
-                    "gpt-5.4",
-                    Some("high"),
-                ),
-                candidate("thread_b", "ws", 20, true, "anthropic", "claude-sonnet-4.5"),
-            ],
-        );
-
-        assert_eq!(
-            resolved,
-            selection_with_effort("openai", "gpt-5.4", Some("high"))
-        );
-    }
-
-    #[test]
-    fn empty_active_thread_uses_latest_workspace_turn() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_empty"),
-            Some("ws"),
-            vec![
-                candidate("thread_empty", "ws", 30, false, "openai", "default"),
-                candidate("thread_old", "ws", 10, true, "openai", "gpt-5.4"),
-                candidate(
-                    "thread_new",
-                    "ws",
-                    20,
-                    true,
-                    "openrouter",
-                    "anthropic/claude",
-                ),
-            ],
-        );
-
-        assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
-    }
-
-    #[test]
-    fn empty_active_thread_restores_latest_workspace_turn_reasoning_effort() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_empty"),
-            Some("ws"),
-            vec![
-                candidate("thread_empty", "ws", 30, false, "openai", "default"),
-                candidate_with_effort(
-                    "thread_old",
-                    "ws",
-                    10,
-                    true,
-                    "openai",
-                    "gpt-5.4",
-                    Some("low"),
-                ),
-                candidate_with_effort(
-                    "thread_new",
-                    "ws",
-                    20,
-                    true,
-                    "openrouter",
-                    "anthropic/claude",
-                    Some("high"),
-                ),
-            ],
-        );
-
-        assert_eq!(
-            resolved,
-            selection_with_effort("openrouter", "anthropic/claude", Some("high"))
-        );
-    }
-
-    #[test]
-    fn workspace_without_active_thread_uses_latest_workspace_turn() {
-        let resolved = resolve_composer_model_selection(
-            None,
-            Some("ws"),
-            vec![
-                candidate("thread_empty", "ws", 30, false, "openai", "default"),
-                candidate("thread_old", "ws", 10, true, "openai", "gpt-5.4"),
-                candidate(
-                    "thread_new",
-                    "ws",
-                    20,
-                    true,
-                    "openrouter",
-                    "anthropic/claude",
-                ),
-                candidate("thread_other", "other", 40, true, "anthropic", "claude"),
-            ],
-        );
-
-        assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
-    }
-
-    #[test]
-    fn empty_workspace_keeps_model_selection_blank() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_empty"),
-            Some("ws"),
-            vec![candidate(
-                "thread_empty",
-                "ws",
-                30,
-                false,
-                "openai",
-                "default",
-            )],
-        );
-
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    fn fallback_ignores_other_workspaces() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_empty"),
-            Some("ws_a"),
-            vec![
-                candidate("thread_empty", "ws_a", 30, false, "openai", "default"),
-                candidate("thread_b", "ws_b", 40, true, "anthropic", "claude"),
-                candidate("thread_a", "ws_a", 20, true, "openai", "gpt-5.4"),
-            ],
-        );
-
-        assert_eq!(resolved, selection("openai", "gpt-5.4"));
-    }
-
-    #[test]
-    fn active_thread_from_other_workspace_does_not_win_when_workspace_is_explicit() {
-        let resolved = resolve_composer_model_selection(
-            Some("thread_old_active"),
-            Some("ws_b"),
-            vec![
-                candidate("thread_old_active", "ws_a", 30, true, "openai", "gpt-5.4"),
-                candidate(
-                    "thread_b",
-                    "ws_b",
-                    20,
-                    true,
-                    "openrouter",
-                    "anthropic/claude",
-                ),
-            ],
-        );
-
-        assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
+                    "default",
+                )],
+                None,
+            ),
+            (
+                "fallback_ignores_other_workspaces",
+                Some("thread_empty"),
+                Some("ws_a"),
+                vec![
+                    candidate("thread_empty", "ws_a", 30, false, "openai", "default"),
+                    candidate("thread_b", "ws_b", 40, true, "anthropic", "claude"),
+                    candidate("thread_a", "ws_a", 20, true, "openai", "gpt-5.4"),
+                ],
+                selection("openai", "gpt-5.4"),
+            ),
+            (
+                "active_thread_from_other_workspace_does_not_win_when_workspace_is_explicit",
+                Some("thread_old_active"),
+                Some("ws_b"),
+                vec![
+                    candidate("thread_old_active", "ws_a", 30, true, "openai", "gpt-5.4"),
+                    candidate(
+                        "thread_b",
+                        "ws_b",
+                        20,
+                        true,
+                        "openrouter",
+                        "anthropic/claude",
+                    ),
+                ],
+                selection("openrouter", "anthropic/claude"),
+            ),
+        ] {
+            assert_eq!(
+                resolve_composer_model_selection(active_thread, workspace, candidates),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]

@@ -75,6 +75,7 @@ pub(crate) struct McpService {
 }
 
 pub(crate) struct McpServiceInner {
+    cua_turn_tools: std::sync::Mutex<HashMap<String, Arc<pioneer_tools::BuiltinTools>>>,
     pub(crate) native_tool_processor: RwLock<std::sync::Weak<crate::message::MessageProcessor>>,
     pub(crate) crud_store: Arc<CrudStore>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
@@ -129,8 +130,61 @@ struct McpServerTaskHandle {
     call_tx: mpsc::Sender<McpServerCommand>,
     oauth_failure_revision: Arc<std::sync::atomic::AtomicU64>,
     recovery: Arc<OAuthRecoveryMailbox>,
-    shutdown_tx: oneshot::Sender<McpShutdownRequest>,
-    join: JoinHandle<()>,
+    shutdown_tx: Option<oneshot::Sender<McpShutdownRequest>>,
+    completed: Arc<tokio_util::sync::CancellationToken>,
+    join: Arc<McpTaskJoin>,
+    session: Arc<Mutex<Option<Box<dyn pioneer_mcp::McpRuntimeSession>>>>,
+}
+
+// Completion is distinct from the shutdown request. It remains in the native
+// task map until observed, even when the stop caller is cancelled.
+struct McpTaskCompletion(Arc<tokio_util::sync::CancellationToken>);
+impl Drop for McpTaskCompletion {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+struct McpTaskJoin {
+    state: Mutex<McpTaskJoinState>,
+    finished: tokio::task::AbortHandle,
+}
+struct McpTaskJoinState {
+    handle: Option<JoinHandle<Result<()>>>,
+    outcome: Option<Result<(), String>>,
+}
+impl McpTaskJoin {
+    fn new(handle: JoinHandle<Result<()>>) -> Arc<Self> {
+        Arc::new(Self {
+            finished: handle.abort_handle(),
+            state: Mutex::new(McpTaskJoinState {
+                handle: Some(handle),
+                outcome: None,
+            }),
+        })
+    }
+    fn is_finished(&self) -> bool {
+        self.finished.is_finished()
+    }
+    async fn wait(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if let Some(outcome) = &state.outcome {
+            return outcome.clone().map_err(anyhow::Error::msg);
+        }
+        let outcome = match state
+            .handle
+            .as_mut()
+            .context("MCP task join owner is unknown")?
+            .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err("MCP runtime cleanup failed".to_owned()),
+            Err(_) => Err("MCP runtime task join failed; cleanup unknown".to_owned()),
+        };
+        state.outcome = Some(outcome.clone());
+        state.handle = None;
+        outcome.map_err(anyhow::Error::msg)
+    }
 }
 
 struct McpShutdownRequest {
@@ -299,6 +353,7 @@ impl McpService {
             .lock()
             .await
             .get(installation_id)
+            .filter(|task| task.shutdown_tx.is_some())
             .map(|task| {
                 (
                     task.call_tx.clone(),
@@ -394,6 +449,7 @@ impl McpService {
             )
             .expect("OAuth HTTP client");
             McpServiceInner {
+                cua_turn_tools: std::sync::Mutex::new(HashMap::new()),
                 native_tool_processor: RwLock::new(std::sync::Weak::new()),
                 oauth: oauth.clone(),
                 oauth_events: std::sync::Mutex::new(None),
@@ -462,6 +518,16 @@ impl McpService {
             .connector
             .write()
             .expect("MCP connector lock poisoned") = connector;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn task_stop_requested_for_tests(&self, id: &str) -> bool {
+        self.inner
+            .tasks
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|task| task.shutdown_tx.is_none())
     }
 
     #[cfg(test)]
@@ -642,7 +708,28 @@ impl McpService {
     }
 
     pub(crate) fn cancel_turn_mcp_invocations(&self, turn_id: &str) -> usize {
-        self.cancel_active_mcp_invocations(|invocation| invocation.turn_id == turn_id)
+        // Turn lifecycle, never client connection lifecycle, owns CUA sessions.
+        // Serialize cancellation with CUA cache admission: a registered waiter
+        // either inserts before this cleanup or observes cancellation under the
+        // same lock. No finished-turn tombstones are retained.
+        let cancelled = {
+            let mut cache = self.inner.cua_turn_tools.lock().unwrap();
+            let cancelled =
+                self.cancel_active_mcp_invocations(|invocation| invocation.turn_id == turn_id);
+            cache.remove(turn_id);
+            cancelled
+        };
+        if let Some(processor) = self
+            .inner
+            .native_tool_processor
+            .read()
+            .expect("native processor lock")
+            .upgrade()
+            && let Some(backend) = processor.computer_use_config().backend
+        {
+            backend.release_owner(turn_id);
+        }
+        cancelled
     }
 
     fn cancel_installation_mcp_invocations(&self, installation_id: &str) -> usize {
@@ -740,6 +827,7 @@ impl McpService {
             worker.abort();
         }
         self.cancel_all_mcp_invocations();
+        self.inner.cua_turn_tools.lock().unwrap().clear();
         let installation_ids = self
             .inner
             .tasks
@@ -756,19 +844,68 @@ impl McpService {
     }
 
     pub(crate) async fn reload_workspace(&self, workspace_id: &str) -> Result<()> {
-        self.reload_workspace_with_store(self.inner.crud_store.as_ref(), workspace_id)
+        self.reload_workspace_with_store(self.inner.crud_store.as_ref(), workspace_id, None)
             .await
     }
 
     pub(crate) async fn reload_workspace_for_maintenance(&self, workspace_id: &str) -> Result<()> {
         let store = self.inner.crud_store.with_maintenance_access();
-        self.reload_workspace_with_store(&store, workspace_id).await
+        self.reload_workspace_with_store(&store, workspace_id, None)
+            .await
     }
 
+    /// Only the foreground owner can reload its own prepared parent while the
+    /// pending plan still fences execution. Startup and OAuth launch cannot.
+    pub(crate) async fn reload_after_plugin_change(
+        &self,
+        guard: &crate::message::packages::PluginMutationGuard,
+    ) -> Result<()> {
+        self.reload_workspace_with_store(
+            self.runtime_store(),
+            &guard.parent().workspace_id,
+            Some(guard),
+        )
+        .await
+    }
+    async fn plugin_start_available(
+        &self,
+        store: &CrudStore,
+        row: &McpServerInstallationRecord,
+        admitted: Option<&crate::message::packages::PluginMutationGuard>,
+    ) -> Result<bool> {
+        if row.scope_kind != "workspace" {
+            return Ok(true);
+        }
+        let id = row.id.as_deref().context("MCP installation ID missing")?;
+        if let Some(guard) = admitted {
+            if store
+                .find_mcp_plugin_owner(id)
+                .await?
+                .is_some_and(|owner| owner.package_id == guard.parent().id)
+            {
+                let current = store
+                    .find_package_installation(&guard.parent().id)
+                    .await?
+                    .context("plugin owner missing")?;
+                anyhow::ensure!(
+                    current.workspace_id == row.scope_key
+                        && current.revision == guard.parent().revision,
+                    "plugin reload admission changed"
+                );
+                return store
+                    .plugin_child_runtime_available(id, &row.scope_key)
+                    .await;
+            }
+        }
+        store
+            .plugin_child_available("mcp", id, &row.scope_key)
+            .await
+    }
     async fn reload_workspace_with_store(
         &self,
         store: &CrudStore,
         workspace_id: &str,
+        admitted: Option<&crate::message::packages::PluginMutationGuard>,
     ) -> Result<()> {
         let rows = store
             .list_mcp_server_installations("workspace", workspace_id)
@@ -804,7 +941,8 @@ impl McpService {
                 .oauth
                 .synchronize(&installation_id, &installation)
                 .await?;
-            if !row.enabled {
+            let parent_available = self.plugin_start_available(store, &row, admitted).await?;
+            if !row.enabled || !parent_available {
                 self.inner.oauth.suspend(&installation_id).await?;
                 self.stop_task(&installation_id, DomainRuntimeState::Disabled)
                     .await;
@@ -857,16 +995,12 @@ impl McpService {
                 }
             };
             let (should_start, secret_material_changed) = {
-                let mut tasks = self.inner.tasks.lock().await;
-                if tasks
-                    .get(&installation_id)
-                    .is_some_and(|handle| handle.join.is_finished())
-                {
-                    tasks.remove(&installation_id);
-                }
+                let tasks = self.inner.tasks.lock().await;
                 match tasks.get(&installation_id) {
                     Some(handle)
-                        if handle.fingerprint == row.fingerprint
+                        if handle.shutdown_tx.is_some()
+                            && !handle.join.is_finished()
+                            && handle.fingerprint == row.fingerprint
                             && handle.effective_secret_fingerprint
                                 == effective_secret_fingerprint =>
                     {
@@ -897,10 +1031,11 @@ impl McpService {
                         None,
                     )
                     .await;
-                    self.stop_task(&installation_id, DomainRuntimeState::Stopped)
-                        .await;
+                    self.stop_task_result(&installation_id, DomainRuntimeState::Stopped)
+                        .await?;
                 }
-                self.start_task(row, effective_secret_fingerprint).await?;
+                self.start_task(row, effective_secret_fingerprint, store, admitted)
+                    .await?;
             }
         }
 
@@ -928,10 +1063,50 @@ impl McpService {
             {
                 continue;
             }
-            self.stop_task(&installation_id, DomainRuntimeState::Stopped)
-                .await;
+            if self
+                .stop_task_result(&installation_id, DomainRuntimeState::Stopped)
+                .await
+                .is_ok()
+            {
+                self.inner.tasks.lock().await.remove(&installation_id);
+                // Release admission only after observing the actual successful
+                // join. Absence then means no retained runtime was left behind.
+                self.inner
+                    .runtime_generations
+                    .lock()
+                    .await
+                    .remove(&installation_id);
+            }
         }
 
+        Ok(())
+    }
+
+    /// Caller owns the installation lifecycle guard and a revalidated native
+    /// row. A missing task is proof only when this lifecycle has never started
+    /// it (or released it after a confirmed join), not merely an empty task map.
+    pub(crate) async fn stop_admitted_installation(
+        &self,
+        row: &McpServerInstallationRecord,
+    ) -> Result<()> {
+        let id = row
+            .id
+            .as_deref()
+            .context("MCP installation identity missing")?;
+        if self.task_exists(id).await {
+            return self.stop_task_result(id, DomainRuntimeState::Stopped).await;
+        }
+        if self.inner.runtime_generations.lock().await.contains_key(id) {
+            anyhow::bail!("MCP runtime stop owner is unknown");
+        }
+        let current = self
+            .runtime_store()
+            .find_mcp_server_installation(&row.scope_kind, &row.scope_key, &row.name)
+            .await?
+            .context("MCP installation missing during stop")?;
+        if current.id != row.id {
+            anyhow::bail!("MCP installation changed during stop");
+        }
         Ok(())
     }
 
@@ -986,13 +1161,19 @@ impl McpService {
         }
         match event.state {
             pioneer_mcp_oauth::OAuthState::Authorized => {
-                self.stop_task(&event.installation_id, DomainRuntimeState::Stopped)
-                    .await;
+                // A never-started installation has no predecessor obligation.
+                // Once present, retain its exact owner and sticky failure: a
+                // failed/cancelled drain must not be hidden by a new generation.
+                if self.task_exists(&event.installation_id).await {
+                    self.stop_task_result(&event.installation_id, DomainRuntimeState::Stopped)
+                        .await?;
+                }
                 // Recheck operation generation after joining the retired actor.
                 // The admission guard excludes durable resource/UUID replacement.
                 if row.enabled && self.oauth().event_is_current(event, &installation).await {
                     let fingerprint = self.effective_secret_fingerprint_for_row(&row)?;
-                    self.start_task(row, fingerprint).await?;
+                    self.start_task(row, fingerprint, self.runtime_store(), None)
+                        .await?;
                 }
             }
             pioneer_mcp_oauth::OAuthState::Recovered => {
@@ -1066,14 +1247,42 @@ impl McpService {
                 None,
             )
             .await;
-            self.stop_task(installation_id, DomainRuntimeState::Stopped)
-                .await;
+            if self
+                .runtime_store()
+                .find_mcp_plugin_owner(installation_id)
+                .await?
+                .is_some()
+            {
+                // Owned restart cannot reinterpret an absent retained owner as
+                // confirmation. Standalone keeps its prior native branch.
+                self.stop_admitted_installation(row).await?;
+            } else if self.task_exists(installation_id).await {
+                self.stop_task_result(installation_id, DomainRuntimeState::Stopped)
+                    .await?;
+            }
         }
-        if row.enabled {
+        let parent_available = if row.scope_kind == "workspace" {
+            match row.id.as_deref() {
+                Some(id) => {
+                    self.runtime_store()
+                        .plugin_child_available("mcp", id, &row.scope_key)
+                        .await?
+                }
+                None => false,
+            }
+        } else {
+            true
+        };
+        if row.enabled && parent_available {
             match self.effective_secret_fingerprint_for_row(&row) {
                 Ok(effective_secret_fingerprint) => {
-                    self.start_task(row.clone(), effective_secret_fingerprint)
-                        .await?;
+                    self.start_task(
+                        row.clone(),
+                        effective_secret_fingerprint,
+                        self.runtime_store(),
+                        None,
+                    )
+                    .await?;
                 }
                 Err(error) => {
                     self.publish_status(
@@ -1128,12 +1337,30 @@ impl McpService {
         explicit_tools: &[AgentMcpToolRef],
     ) -> Result<WorkspaceMcpToolState> {
         self.reload_workspace(workspace_id).await?;
-        let rows = self
+        let mut rows = self
             .inner
             .crud_store
             .list_mcp_server_installations("workspace", workspace_id)
             .await
             .context("failed to load MCP workspace installations for tool materialization")?;
+        for row in &mut rows {
+            if let Some(id) = &row.id {
+                if self
+                    .inner
+                    .crud_store
+                    .find_mcp_plugin_owner(id)
+                    .await?
+                    .is_some()
+                {
+                    row.allow_implicit_invocation = false;
+                    row.enabled &= self
+                        .inner
+                        .crud_store
+                        .plugin_child_available("mcp", id, workspace_id)
+                        .await?;
+                }
+            }
+        }
         let runtime = self.runtime_snapshot("workspace", workspace_id).await;
         let mut state = WorkspaceMcpToolState::default();
         let mut explicit_servers_by_name = HashMap::<String, Vec<&AgentMcpServerRef>>::new();
@@ -1655,6 +1882,24 @@ impl McpService {
                 ))
             })?;
 
+        if !self
+            .inner
+            .crud_store
+            .plugin_turn_child_available(
+                &request.turn_id,
+                "mcp",
+                &request.server_id,
+                &request.workspace_id,
+            )
+            .await
+            .map_err(|_| {
+                pioneer_tools::ToolError::Rejected("plugin ownership unavailable".into())
+            })?
+        {
+            return Err(pioneer_tools::ToolError::Rejected(
+                "plugin selection is unavailable for this turn".into(),
+            ));
+        }
         if !row.enabled {
             self.audit_tool_call(
                 &row,
@@ -1748,6 +1993,7 @@ impl McpService {
             .lock()
             .await
             .get(request.server_id.as_str())
+            .filter(|handle| handle.shutdown_tx.is_some())
             .map(|handle| handle.call_tx.clone())
             .ok_or_else(|| {
                 pioneer_tools::ToolError::NotFound(format!(
@@ -1933,12 +2179,30 @@ impl McpService {
         &self,
         row: McpServerInstallationRecord,
         effective_secret_fingerprint: String,
+        store: &CrudStore,
+        admitted: Option<&crate::message::packages::PluginMutationGuard>,
     ) -> Result<()> {
         let installation = installation_from_record(&row)?;
         let installation_id = row
             .id
             .clone()
             .context("MCP installation row is missing id")?;
+        // All callers retain the existing installation lifecycle admission.
+        // Include OAuth Authorized, which starts directly without reload. A
+        // closed parent cannot recreate a process after lifecycle stop ACK.
+        if !self.plugin_start_available(store, &row, admitted).await? {
+            self.publish_status(
+                &row,
+                DomainRuntimeState::Disabled,
+                Some("Plugin operation is unfinished or disabled".into()),
+                None,
+                0,
+                None,
+                None,
+            )
+            .await;
+            return Ok(());
+        }
         let connector = self
             .inner
             .connector
@@ -1954,6 +2218,14 @@ impl McpService {
         let scope_key = row.scope_key.clone();
         let task_installation_id = installation_id.clone();
         let runtime_generation = self.next_runtime_generation();
+        // Publish the actor and its admission together, so a completed legacy
+        // stop cannot remove a replacement actor's runtime generation.
+        let mut tasks = self.inner.tasks.lock().await;
+        anyhow::ensure!(
+            !self.inner.stopping.load(Ordering::SeqCst),
+            "MCP service is shutting down"
+        );
+
         self.inner
             .runtime_generations
             .lock()
@@ -1963,12 +2235,12 @@ impl McpService {
         let actor_failure_revision = oauth_failure_revision.clone();
         let recovery = Arc::new(OAuthRecoveryMailbox::default());
         let actor_recovery = recovery.clone();
-        let mut tasks = self.inner.tasks.lock().await;
-        anyhow::ensure!(
-            !self.inner.stopping.load(Ordering::SeqCst),
-            "MCP service is shutting down"
-        );
+        let session = Arc::new(Mutex::new(None));
+        let actor_session = session.clone();
+        let completed = Arc::new(tokio_util::sync::CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
         let join = tokio::spawn(async move {
+            let _completion = completion;
             service
                 .run_server_task(
                     row,
@@ -1979,9 +2251,11 @@ impl McpService {
                     call_rx,
                     actor_failure_revision,
                     actor_recovery,
+                    actor_session,
                 )
-                .await;
+                .await
         });
+        let join = McpTaskJoin::new(join);
 
         tasks.insert(
             installation_id,
@@ -1994,8 +2268,10 @@ impl McpService {
                 call_tx,
                 oauth_failure_revision,
                 recovery,
-                shutdown_tx,
+                shutdown_tx: Some(shutdown_tx),
+                completed,
                 join,
+                session,
             },
         );
 
@@ -2020,30 +2296,96 @@ impl McpService {
     }
 
     async fn stop_task(&self, installation_id: &str, final_state: DomainRuntimeState) {
-        self.cancel_installation_mcp_invocations(installation_id);
-        let handle = self.inner.tasks.lock().await.remove(installation_id);
-        if let Some(handle) = handle {
+        // Preserve the legacy best-effort wrapper. An absent task is never an
+        // acknowledgement through the Result-returning business entrypoint.
+        if !self.task_exists(installation_id).await {
+            return;
+        }
+        match self.stop_task_owner(installation_id, final_state).await {
+            Ok(completion) => {
+                // Legacy stop releases a successfully joined actor. Lifecycle
+                // stop_task_result retains the outcome for repair/idempotence.
+                // Match the exact owner under the same lock as start publication.
+                let mut tasks = self.inner.tasks.lock().await;
+                if tasks
+                    .get(installation_id)
+                    .is_some_and(|task| Arc::ptr_eq(&task.completed, &completion))
+                {
+                    tasks.remove(installation_id);
+                    self.inner
+                        .runtime_generations
+                        .lock()
+                        .await
+                        .remove(installation_id);
+                }
+            }
+            Err(error) => warn!(error = %error, "MCP server task join failed"),
+        }
+    }
+
+    // Caller owns the existing installation lifecycle guard. The actor owns
+    // cleanup independently of this waiter and the task map keeps its outcome.
+    pub(crate) async fn stop_task_result(
+        &self,
+        installation_id: &str,
+        final_state: DomainRuntimeState,
+    ) -> Result<()> {
+        self.stop_task_owner(installation_id, final_state)
+            .await
+            .map(|_| ())
+    }
+
+    async fn stop_task_owner(
+        &self,
+        installation_id: &str,
+        final_state: DomainRuntimeState,
+    ) -> Result<Arc<tokio_util::sync::CancellationToken>> {
+        let (completion, join, session) = {
+            let mut tasks = self.inner.tasks.lock().await;
+            let handle = tasks
+                .get_mut(installation_id)
+                .context("MCP runtime stop owner is unknown")?;
             handle
                 .recovery
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            let _ = handle.shutdown_tx.send(McpShutdownRequest {
-                final_state,
-                crud_store: self
-                    .runtime_store
-                    .clone()
-                    .unwrap_or_else(|| self.inner.crud_store.clone()),
-            });
-            if let Err(error) = handle.join.await {
-                warn!(
-                    installation_id,
-                    error = %format!("{error:#}"),
-                    "MCP server task join failed"
-                );
+            if let Some(shutdown) = handle.shutdown_tx.take() {
+                let _ = shutdown.send(McpShutdownRequest {
+                    final_state,
+                    crud_store: self
+                        .runtime_store
+                        .clone()
+                        .unwrap_or_else(|| self.inner.crud_store.clone()),
+                });
+            }
+            (
+                handle.completed.clone(),
+                handle.join.clone(),
+                handle.session.clone(),
+            )
+        };
+        self.cancel_installation_mcp_invocations(installation_id);
+        // Token means future ended, not success: always inspect retained join.
+        completion.cancelled().await;
+        let outcome = join.wait().await;
+        if outcome.is_err() {
+            // A panicked/failed actor does not discard its native session.
+            // Retry actual cleanup, while preserving the failed join outcome.
+            if let Some(session) = session.lock().await.as_mut() {
+                let _ = session.shutdown_result().await;
             }
         }
+        outcome?;
+        let tasks = self.inner.tasks.lock().await;
+        if tasks
+            .get(installation_id)
+            .is_some_and(|handle| !Arc::ptr_eq(&handle.completed, &completion))
+        {
+            anyhow::bail!("MCP runtime changed during shutdown");
+        }
+        Ok(completion)
     }
 
     async fn run_server_task(
@@ -2056,7 +2398,8 @@ impl McpService {
         mut call_rx: mpsc::Receiver<McpServerCommand>,
         oauth_failure_revision: Arc<std::sync::atomic::AtomicU64>,
         recovery: Arc<OAuthRecoveryMailbox>,
-    ) {
+        retained_session: Arc<Mutex<Option<Box<dyn pioneer_mcp::McpRuntimeSession>>>>,
+    ) -> Result<()> {
         let resolver = Arc::new(GatewayMcpSecretResolver {
             gateway_secrets: self.inner.gateway_secrets.clone(),
         });
@@ -2077,15 +2420,46 @@ impl McpService {
             )
             .await;
 
-            let connect = tokio::select! {
-                final_state=&mut shutdown_rx => {
-                    if let Ok(final_state)=final_state{self.publish_scoped_shutdown(&row, final_state).await;}
-                    return;
-                }
-                result=connector.connect(installation.clone(),installation_id.clone(),resolver.clone(),now)=>result,
-            };
+            // Do not drop a connector which already owns a spawned child.
+            // The existing connector startup budget applies; a stop observer's
+            // deadline can expire without disposing this actual owner.
+            if let Ok(final_state) = shutdown_rx.try_recv() {
+                self.publish_scoped_shutdown(&row, final_state).await;
+                return Ok(());
+            }
+            let connect = connector
+                .connect(
+                    installation.clone(),
+                    installation_id.clone(),
+                    resolver.clone(),
+                    now,
+                )
+                .await;
 
-            let mut session = match connect {
+            // Startup retains the connector until its real owner completes.
+            // If stop arrived meanwhile, clean that owner and use the stop
+            // caller's scoped store before publishing any startup outcome.
+            if let Ok(request) = shutdown_rx.try_recv() {
+                if let Ok(session) = connect {
+                    let mut owner = retained_session.lock().await;
+                    *owner = Some(session);
+                    let session = owner.as_mut().expect("native startup cleanup owner");
+                    let startup_cleanup_failed = session.startup_failure().is_some();
+                    session
+                        .shutdown_result()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("MCP startup cleanup unconfirmed"))?;
+                    if startup_cleanup_failed {
+                        anyhow::bail!(
+                            "MCP startup cleanup previously failed; native stop outcome unknown"
+                        );
+                    }
+                }
+                self.publish_scoped_shutdown(&row, request).await;
+                return Ok(());
+            }
+
+            let session = match connect {
                 Ok(session) => session,
                 Err(error) => {
                     let next_retry_at = if error.state == DomainRuntimeState::Failed {
@@ -2119,7 +2493,7 @@ impl McpService {
                         if let Ok(final_state) = shutdown_rx.await {
                             self.publish_scoped_shutdown(&row, final_state).await;
                         }
-                        return;
+                        return Ok(());
                     }
 
                     let delay = self.inner.retry_policy.delay_secs(retry_attempt);
@@ -2129,7 +2503,7 @@ impl McpService {
                             if let Ok(final_state) = final_state {
                                 self.publish_scoped_shutdown(&row, final_state).await;
                             }
-                            return;
+                            return Ok(());
                         }
                         _ = sleep(Duration::from_secs(delay)) => {}
                     }
@@ -2137,6 +2511,29 @@ impl McpService {
                 }
             };
 
+            let mut session_owner = retained_session.lock().await;
+            *session_owner = Some(session);
+            let session = session_owner.as_mut().expect("native MCP session owner");
+            if let Some(error) = session.startup_failure().cloned() {
+                self.publish_status(
+                    &row,
+                    DomainRuntimeState::Failed,
+                    Some(error.message.clone()),
+                    Some(error.message),
+                    0,
+                    None,
+                    None,
+                )
+                .await;
+                if let Ok(state) = shutdown_rx.await {
+                    self.publish_scoped_shutdown(&row, state).await;
+                }
+                session
+                    .shutdown_result()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("MCP startup cleanup unconfirmed"))?;
+                anyhow::bail!("MCP startup cleanup previously failed; native stop outcome unknown");
+            }
             let catalog = session.initial_catalog().clone();
             self.persist_catalog_and_notify(&row, &catalog).await;
             let ready_state = if session.degraded_reason().is_some() {
@@ -2185,12 +2582,12 @@ impl McpService {
                         )
                         .await;
                         shutdown_service.audit(&row, "stop", Some(catalog.catalog_version.as_str()), json!({})).await;
-                        session.shutdown().await;
+                        session.shutdown_result().await.map_err(|_| anyhow::anyhow!("MCP session cleanup failed"))?;
                         if let Ok(final_state) = final_state {
                             self.publish_scoped_shutdown(&row, final_state).await;
                         }
                         shutdown_service.audit(&row, "stopped", Some(catalog.catalog_version.as_str()), json!({})).await;
-                        return;
+                        return Ok(());
                     }
                     event = session.wait_for_event() => {
                         match event {
@@ -2255,10 +2652,10 @@ impl McpService {
                                     None,
                                 )
                                 .await;
-                                session.shutdown().await;
+                                session.shutdown_result().await.map_err(|_| anyhow::anyhow!("MCP session cleanup failed"))?;
                                 let delay=self.inner.retry_policy.delay_secs(retry_attempt);
                                 retry_attempt=retry_attempt.saturating_add(1);
-                                tokio::select!{final_state=&mut shutdown_rx=>{if let Ok(state)=final_state{self.publish_scoped_shutdown(&row, state).await;}return;},_=sleep(Duration::from_secs(delay))=>{}}
+                                tokio::select!{final_state=&mut shutdown_rx=>{if let Ok(state)=final_state{self.publish_scoped_shutdown(&row, state).await;}return Ok(());},_=sleep(Duration::from_secs(delay))=>{}}
                                 continue 'connection;
                             }
                         }
@@ -2284,7 +2681,7 @@ impl McpService {
                                 // shutdown can interrupt acquisition (no stop/join deadlock).
                                 let _retry_admission = if _admission.is_none() {
                                     tokio::select! {
-                                        state=&mut shutdown_rx=>{ if let Ok(state)=state { self.publish_scoped_shutdown(&row,state).await; } session.shutdown().await; return; },
+                                        state=&mut shutdown_rx=>{ if let Ok(state)=state { self.publish_scoped_shutdown(&row,state).await; } session.shutdown_result().await.map_err(|_| anyhow::anyhow!("MCP session cleanup failed"))?; return Ok(()); },
                                         guard=self.installation_lifecycle_guard(&row.scope_kind,&row.scope_key,&row.name)=>Some(guard),
                                     }
                                 } else { None };
@@ -2464,6 +2861,8 @@ impl McpService {
                 status: McpServerStatus::from(protocol_runtime_state(snapshot.state)),
             },
         };
+        self.notify_plugin_runtime_changed(&notification.workspace_id, &notification.server.id)
+            .await;
         self.send_management_notification(events::MCP_SERVER_STATUS_CHANGED, &notification)
             .await;
     }
@@ -2624,6 +3023,22 @@ impl McpService {
             .saturating_add(1)
     }
 
+    /// Reuse the processor's authorized, locator-only Plugins invalidation.
+    /// Runtime/OAuth administrative payloads remain on their original stream.
+    pub(crate) async fn notify_plugin_runtime_changed(&self, workspace: &str, installation: &str) {
+        let processor = self
+            .inner
+            .native_tool_processor
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade();
+        if let Some(processor) = processor {
+            processor
+                .notify_plugin_mcp_runtime_changed(workspace, installation)
+                .await;
+        }
+    }
+
     pub(crate) async fn send_management_notification<T: Serialize>(
         &self,
         method: &str,
@@ -2663,7 +3078,7 @@ impl McpService {
             if let Err(error) = self
                 .inner
                 .session_manager
-                .send_text(connection_id, serialized.clone())
+                .try_send_notification_text(connection_id, serialized.clone())
                 .await
             {
                 warn!(
@@ -3083,6 +3498,26 @@ impl TurnMcpValidatedExecution for McpService {
             cancellation.clone(),
         );
         let result = async {
+            // Validation may have waited before active registration. Re-read
+            // authoritative CUA turn liveness after registration, so terminal
+            // cleanup either cancels this token or is already visible here.
+            if crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+                &validated.binding.server_installation_id,
+            ) == Some(crate::turn_mcp::native_tools::NativeToolFamily::ComputerUse)
+            {
+                let live = self.inner.crud_store.get_turn(
+                    &validated.invocation.thread_id, &validated.invocation.turn_id,
+                ).await.map_err(|_| TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::Internal, "cannot revalidate computer-use turn liveness",
+                ))?;
+                if !live.is_some_and(|(workspace, turn)| workspace == validated.invocation.workspace_id
+                    && turn.status == pioneer_protocol::TurnStatus::InProgress)
+                {
+                    return Err(TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::TurnNotActive, "computer-use turn is no longer active",
+                    ));
+                }
+            }
             let security = self
                 .inner
                 .crud_store
@@ -3135,10 +3570,27 @@ impl TurnMcpValidatedExecution for McpService {
                     .execute_first_party_file_tool(&validated, &security, cancellation.clone())
                     .await;
             }
-            let native_tasks = crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+            if crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&validated.binding.server_installation_id)
+                == Some(crate::turn_mcp::native_tools::NativeToolFamily::ComputerUse) {
+                return match self.execute_cua_tool(&validated, &security.snapshot, cancellation.clone()).await {
+                    Ok(result) => Ok(result),
+                    Err(error) => Ok(CanonicalMcpToolResult {
+                        content: json!([{"type":"text","text":format!("{}. Do not replay the operation; obtain a fresh observation before any new action.", bounded_invocation_diagnostic(&error.message))}]),
+                        structured_content: None,
+                        is_error: true,
+                        duration_ms: 0,
+                        meta: Some(json!({"pioneer":{"reasonCode":error.reason_code(),"outcome":"unknown","noReplay":true,"retryable":false}})),
+                    }),
+                };
+            }
+            let native_family = crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
                 &validated.binding.server_installation_id,
-            ) == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks);
-            let bundles = if native_tasks {
+            );
+            let native_tasks = native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks);
+            let native_shared = native_tasks || native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Threads);
+            let native_stable_call = native_shared
+                && native_family.is_some_and(|family| !family.is_thread_reader(&validated.binding.raw_tool_name));
+            let bundles = if native_shared {
                 self.materialize_cli_task_tools(&validated).await?
             } else {
                 let annotations = serde_json::from_str::<pioneer_tools::McpDynamicToolAnnotations>(
@@ -3217,7 +3669,7 @@ impl TurnMcpValidatedExecution for McpService {
             let mut call = tools
                 .router
                 .build_tool_call(pioneer_tools::RawToolCall {
-                    call_id: if native_tasks {
+                    call_id: if native_stable_call {
                         crate::turn_mcp::native_tools::cli_task_call_id(
                             &validated.invocation.turn_id,
                             &validated.binding.raw_tool_name,
@@ -3231,7 +3683,7 @@ impl TurnMcpValidatedExecution for McpService {
                     arguments,
                 })
                 .map_err(map_shared_tool_error)?;
-            if native_tasks && call.idempotency_key.is_none() {
+            if native_stable_call && call.idempotency_key.is_none() {
                 call.idempotency_key = Some(format!("{}:{}", call.tool_name, call.call_id));
             }
             let started = std::time::Instant::now();
@@ -3253,6 +3705,19 @@ impl TurnMcpValidatedExecution for McpService {
             };
             let result = match outcome {
                 Ok(result) => result,
+                Err(error) if native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Threads)
+                    && crate::message::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&validated.binding.raw_tool_name.as_str())
+                    && !matches!(error, pioneer_tools::ToolError::Cancelled(_)) => {
+                    let (message, reason) = crate::message::thread_read_tools::public_read_error(&error);
+                    let payload = json!({"error": message});
+                    return Ok(CanonicalMcpToolResult {
+                        content: json!([{"type":"text", "text":payload.to_string()}]),
+                        structured_content: Some(payload),
+                        is_error: true,
+                        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        meta: Some(json!({"pioneer":{"reasonCode":reason}})),
+                    });
+                }
                 Err(error) if native_tasks && validated.binding.raw_tool_name != "threads_start_options"
                     && !matches!(error, pioneer_tools::ToolError::Cancelled(_)) => {
                     return Ok(canonical_task_error_result(error, started.elapsed()));
@@ -3268,10 +3733,10 @@ impl TurnMcpValidatedExecution for McpService {
                     "shared MCP tool result projection is unavailable",
                 )
             })?;
-            if native_tasks {
+            if native_shared {
                 let payload = projection.llm_payload();
                 let text = serde_json::to_string(&payload).map_err(|_| TurnMcpInvocationError::new(
-                    TurnMcpInvocationErrorCode::ResultInvalid, "task output cannot be serialized",
+                    TurnMcpInvocationErrorCode::ResultInvalid, "native output cannot be serialized",
                 ))?;
                 Ok(CanonicalMcpToolResult {
                     content: json!([{"type":"text", "text": text}]),
@@ -3291,7 +3756,248 @@ impl TurnMcpValidatedExecution for McpService {
     }
 }
 
+// A result that fails CLI artifact/framing preparation must revoke its private
+// turn session just like a dropped backend waiter. Client lifetime does not own
+// the daemon; this guard only covers an individual undelivered invocation.
+pub(crate) struct CuaCliDeliveryGuard {
+    backend: Option<Arc<dyn pioneer_tools::ComputerUseBackend>>,
+    owner: String,
+    delivered: bool,
+    receipt: Option<Arc<dyn pioneer_tools::ToolDeliveryReceipt>>,
+}
+
+impl CuaCliDeliveryGuard {
+    pub(crate) fn new(
+        backend: Option<Arc<dyn pioneer_tools::ComputerUseBackend>>,
+        owner: String,
+    ) -> Self {
+        Self {
+            backend,
+            owner,
+            delivered: false,
+            receipt: None,
+        }
+    }
+
+    pub(crate) fn hold_receipt(
+        &mut self,
+        receipt: Option<Arc<dyn pioneer_tools::ToolDeliveryReceipt>>,
+    ) {
+        self.receipt = receipt;
+    }
+
+    pub(crate) fn commit(&mut self) {
+        if let Some(receipt) = &self.receipt {
+            receipt.commit();
+        }
+        self.delivered = true;
+    }
+}
+
+impl Drop for CuaCliDeliveryGuard {
+    fn drop(&mut self) {
+        if !self.delivered
+            && let Some(backend) = &self.backend
+        {
+            backend.release_owner(&self.owner);
+        }
+    }
+}
+
 impl McpService {
+    fn admit_cua_turn_tools(
+        &self,
+        turn_id: &str,
+        cancellation: &tokio_util::sync::CancellationToken,
+        materialize: impl FnOnce() -> Result<Arc<pioneer_tools::BuiltinTools>, TurnMcpInvocationError>,
+    ) -> Result<Arc<pioneer_tools::BuiltinTools>, TurnMcpInvocationError> {
+        let mut cache = self.inner.cua_turn_tools.lock().unwrap();
+        if cancellation.is_cancelled() || self.inner.stopping.load(Ordering::Acquire) {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "computer-use turn was cancelled before cache admission",
+            ));
+        }
+        if let Some(tools) = cache.get(turn_id) {
+            return Ok(tools.clone());
+        }
+        if cache.len() >= 32 {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResourceExhausted,
+                "Gateway computer-use turn admission is full",
+            ));
+        }
+        let tools = materialize()?;
+        cache.insert(turn_id.to_owned(), tools.clone());
+        Ok(tools)
+    }
+
+    async fn execute_cua_tool(
+        &self,
+        validated: &ValidatedTurnMcpInvocation,
+        security: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
+        use base64::Engine;
+        let processor = self
+            .inner
+            .native_tool_processor
+            .read()
+            .expect("native processor lock")
+            .upgrade()
+            .ok_or_else(|| {
+                TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::RuntimeNotLive,
+                    "Gateway computer-use runtime is unavailable",
+                )
+            })?;
+        let broker = self.inner.permission_approval_broker.read().await.clone();
+        let tools =
+            self.admit_cua_turn_tools(&validated.invocation.turn_id, &cancellation, || {
+                let tools = pioneer_tools::build_tools_with_environment_and_security_snapshot(
+                    std::path::PathBuf::from(&security.sandbox.cwd),
+                    validated.invocation.turn_id.clone(),
+                    pioneer_tools::PermissionEvaluationContext::for_turn(
+                        validated.invocation.workspace_id.clone(),
+                        validated.invocation.thread_id.clone(),
+                        validated.invocation.turn_id.clone(),
+                        security.permission_profile.clone(),
+                    ),
+                    pioneer_tools::WebToolsConfig::default(),
+                    processor.computer_use_config(),
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                    Some(security.clone()),
+                )
+                .map_err(|_| {
+                    TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::Internal,
+                        "cannot materialize Gateway computer-use tools",
+                    )
+                })?
+                .with_permission_approval_broker(broker);
+                let tools = Arc::new(tools);
+                Ok(tools)
+            })?;
+        let mut delivery = CuaCliDeliveryGuard::new(
+            processor.computer_use_config().backend,
+            validated.invocation.turn_id.clone(),
+        );
+        // The binding was verified against the immutable native catalog by the
+        // shared TurnMcpInvoker. Never dispatch external CUA-looking names here.
+        let call = tools
+            .router
+            .build_tool_call(pioneer_tools::RawToolCall {
+                call_id: validated.invocation.provider_call_id.clone(),
+                tool_name: validated.binding.raw_tool_name.clone(),
+                arguments: validated.invocation.arguments.to_string(),
+            })
+            .map_err(map_shared_tool_error)?;
+        let started = std::time::Instant::now();
+        let result = tools
+            .runtime
+            .execute_tool_call_with_deferred_delivery(call, cancellation.clone())
+            .await
+            .map_err(map_shared_tool_error)?;
+        delivery.hold_receipt(result.output.delivery_receipt());
+        let projection = result.projection().ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Internal,
+                "CUA result projection is unavailable",
+            )
+        })?;
+        let payload = projection.llm_payload();
+        let mut content = vec![json!({"type":"text", "text":payload.to_string()})];
+        let media_policy = pioneer_provider::default_attachment_pipeline_config();
+        let mut remaining = media_policy.max_total_bytes_per_request;
+        let parts = result.output.model_content_parts();
+        if parts
+            .iter()
+            .filter(|part| matches!(part, pioneer_provider::MessageContentPart::Image { .. }))
+            .count()
+            > media_policy.max_attachments_per_request
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResourceExhausted,
+                "CUA image count exceeds the delivery budget; do not replay the action",
+            ));
+        }
+        for part in parts {
+            if let pioneer_provider::MessageContentPart::Text { text } = &part {
+                content.push(json!({"type":"text", "text":text}));
+            }
+            let pioneer_provider::MessageContentPart::Image { image } = part else {
+                continue;
+            };
+            let maximum = remaining.min(media_policy.max_bytes_per_attachment);
+            let bytes = if let Some(artifact) = &image.artifact {
+                if artifact.workspace_id != validated.invocation.workspace_id {
+                    return Err(TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::ScopeMismatch,
+                        "CUA media belongs to another workspace",
+                    ));
+                }
+                let read = processor.artifact_service.read_bounded_artifact(
+                    pioneer_artifacts::ArtifactBoundedReadRequest {
+                        workspace_id: artifact.workspace_id.clone(),
+                        artifact_id: artifact.artifact_id.clone(),
+                        version_id: artifact.artifact_version_id.clone(),
+                        projection_kind: None,
+                        offset: None,
+                        max_bytes: Some(maximum as u64),
+                    },
+                    maximum as u64,
+                );
+                let read = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "CUA image delivery cancelled; do not replay the action")),
+                    read = read => read,
+                }.map_err(|_| TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::ResultInvalid, "CUA artifact read failed; do not replay the action"))?;
+                if read.truncated {
+                    return Err(TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::ResourceExhausted,
+                        "CUA image exceeds the delivery budget; do not replay the action",
+                    ));
+                }
+                read.bytes
+            } else {
+                // Native CUA images must have crossed authorized artifact
+                // admission; a raw external JSON/base64 field grants no trust.
+                return Err(TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ResultInvalid,
+                    "CUA image has no admitted artifact identity",
+                ));
+            };
+            remaining = remaining.checked_sub(bytes.len()).ok_or_else(|| {
+                TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ResourceExhausted,
+                    "CUA image delivery budget exhausted",
+                )
+            })?;
+            content.push(json!({"type":"image", "mimeType":image.mime_type, "data":base64::engine::general_purpose::STANDARD.encode(bytes)}));
+        }
+        let result = CanonicalMcpToolResult {
+            content: JsonValue::Array(content),
+            structured_content: Some(payload),
+            is_error: !result.success(),
+            duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            meta: None,
+        };
+        if cancellation.is_cancelled() {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "CUA delivery cancelled; its session was revoked",
+            ));
+        }
+        // The facade owns the final encoded frame boundary. Moving the typed
+        // guard there preserves revocation on oversize, cancellation or drop.
+        match crate::cli_runtime::mcp::facade::defer_cua_delivery(delivery) {
+            Ok(()) => {}
+            Err(mut direct_delivery) => direct_delivery.commit(),
+        }
+        Ok(result)
+    }
+
     async fn materialize_cli_task_tools(
         &self,
         validated: &ValidatedTurnMcpInvocation,
@@ -3313,11 +4019,27 @@ impl McpService {
             thread_id: validated.invocation.thread_id.clone(),
             turn_id: validated.invocation.turn_id.clone(),
         };
-        let bundles = crate::turn_mcp::native_tools::materialize_task_tools(processor, context)
-            .await
-            .map_err(|error| {
-                TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::PermissionDenied, error)
-            })?;
+        let bundles = match crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+            &validated.binding.server_installation_id,
+        ) {
+            Some(family) if family.is_thread_reader(&validated.binding.raw_tool_name) => {
+                crate::turn_mcp::native_tools::materialize_thread_tools(processor, context)
+            }
+            Some(
+                crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                | crate::turn_mcp::native_tools::NativeToolFamily::Threads,
+            ) => crate::turn_mcp::native_tools::materialize_task_tools(processor, context)
+                .await
+                .map_err(|error| {
+                    TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::PermissionDenied, error)
+                })?,
+            _ => {
+                return Err(TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ToolUnbound,
+                    "unknown native tool family",
+                ));
+            }
+        };
         if !bundles.iter().any(|bundle| {
             bundle
                 .specs
@@ -3337,7 +4059,6 @@ impl McpService {
         validated: &ValidatedTurnMcpInvocation,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
-        use base64::Engine;
         let processor = self
             .inner
             .native_tool_processor
@@ -3350,12 +4071,12 @@ impl McpService {
                     "HTML Gateway handler is unavailable",
                 )
             })?;
-        // Includes all three image reads and MCP result construction, even if
+        // Includes all six image reads and MCP result construction, even if
         // terminal cancellation releases the durable runtime in parallel.
         let _activity = tokio::select! { biased;
             _ = cancel.cancelled() => return Err(TurnMcpInvocationError::new(
                 TurnMcpInvocationErrorCode::Cancelled, "HTML image delivery was cancelled")),
-            guard = processor.artifact_service.html_preview_activity() => guard,
+            guard = processor.artifact_service.html_preview_activity_signaled() => guard,
         };
         let context = pioneer_agent::TurnToolContext {
             workspace_id: validated.invocation.workspace_id.clone(),
@@ -3391,72 +4112,18 @@ impl McpService {
                     bounded_invocation_diagnostic(&e.to_string()),
                 )
             })?;
-        let mut content = vec![json!({"type":"text","text":value.to_string()})];
-        if validated.invocation.canonical_callable_name == pioneer_tools::html::HTML_PREVIEW {
-            content.clear();
-            let images = value
-                .pointer("/llm_context/images")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| {
-                    TurnMcpInvocationError::new(
-                        TurnMcpInvocationErrorCode::ResultInvalid,
-                        "three image references missing",
-                    )
-                })?;
-            if images.len() != 3
-                || images
-                    .iter()
-                    .zip(pioneer_tools::html::PREVIEW_WIDTHS)
-                    .any(|(image, width)| image["width"] != width)
-            {
-                return Err(TurnMcpInvocationError::new(
-                    TurnMcpInvocationErrorCode::ResultInvalid,
-                    "three ordered preview image references are required",
-                ));
-            }
-            let mut budget = crate::message::html_tools::screenshot_budget();
-            for image in images {
-                let artifact = &image["attachment"]["artifact"];
-                let reading = processor.artifact_service.read_bounded_artifact(
-                    pioneer_artifacts::ArtifactBoundedReadRequest {
-                        workspace_id: context.workspace_id.clone(),
-                        artifact_id: artifact["artifact_id"].as_str().unwrap_or_default().into(),
-                        version_id: artifact["artifact_version_id"].as_str().map(str::to_owned),
-                        projection_kind: None,
-                        offset: None,
-                        max_bytes: Some(budget as u64),
-                    },
-                    budget as u64,
-                );
-                let read = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(TurnMcpInvocationError::new(
-                        TurnMcpInvocationErrorCode::Cancelled, "HTML image delivery was cancelled")),
-                    read = reading => read,
-                }.map_err(|_| {
-                        TurnMcpInvocationError::new(
-                            TurnMcpInvocationErrorCode::ResultInvalid,
-                            "exact screenshot read failed",
-                        )
-                    })?;
-                if read.truncated {
-                    return Err(TurnMcpInvocationError::new(
-                        TurnMcpInvocationErrorCode::ResourceExhausted,
-                        "preview images exceed transport budget",
-                    ));
-                }
-                budget = budget.saturating_sub(read.bytes.len());
-                content.push(
-                    json!({"type":"text","text":format!("HTML preview: {} CSS px",image["width"])}),
-                );
-                content.push(json!({"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(read.bytes)}));
-            }
-            value
-                .as_object_mut()
-                .expect("HTML result object")
-                .remove("llm_context");
-            content.push(json!({"type":"text","text":value.to_string()}));
-        }
+        let content =
+            if validated.invocation.canonical_callable_name == pioneer_tools::html::HTML_PREVIEW {
+                html_preview_mcp_content(
+                    &processor.artifact_service,
+                    &context.workspace_id,
+                    &mut value,
+                    &cancel,
+                )
+                .await?
+            } else {
+                vec![json!({"type":"text","text":value.to_string()})]
+            };
         if cancel.is_cancelled() {
             return Err(TurnMcpInvocationError::new(
                 TurnMcpInvocationErrorCode::Cancelled,
@@ -4307,8 +4974,96 @@ fn runtime_generation_seed() -> u64 {
         .unwrap_or(0)
 }
 
+/// Assemble the complete MCP media result while the caller holds HTML activity
+/// ownership. No partial content escapes on a failed exact read or cancellation.
+async fn html_preview_mcp_content(
+    artifacts: &pioneer_artifacts::ArtifactService,
+    workspace_id: &str,
+    value: &mut JsonValue,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<JsonValue>, TurnMcpInvocationError> {
+    use base64::Engine;
+    let mut content = Vec::new();
+    let images = value
+        .pointer("/llm_context/images")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResultInvalid,
+                "preview image references missing",
+            )
+        })?;
+    if pioneer_tools::html::preview_image_layout(value).is_none() {
+        return Err(TurnMcpInvocationError::new(
+            TurnMcpInvocationErrorCode::ResultInvalid,
+            "six ordered preview image references are required",
+        ));
+    }
+    let mut identities = std::collections::HashSet::new();
+    let mut budget = crate::message::html_tools::screenshot_budget();
+    for image in images {
+        let artifact = &image["attachment"]["artifact"];
+        if artifact["artifact_version_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+            || !identities.insert((
+                artifact["artifact_id"].to_string(),
+                artifact["artifact_version_id"].to_string(),
+            ))
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResultInvalid,
+                "distinct exact screenshot versions are required",
+            ));
+        }
+        let reading = artifacts.read_bounded_artifact(
+            pioneer_artifacts::ArtifactBoundedReadRequest {
+                workspace_id: workspace_id.to_owned(),
+                artifact_id: artifact["artifact_id"].as_str().unwrap_or_default().into(),
+                version_id: artifact["artifact_version_id"].as_str().map(str::to_owned),
+                projection_kind: None,
+                offset: None,
+                max_bytes: Some(budget as u64),
+            },
+            budget as u64,
+        );
+        let read = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled, "HTML image delivery was cancelled")),
+            read = reading => read,
+        }
+        .map_err(|_| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResultInvalid,
+                "exact screenshot read failed",
+            )
+        })?;
+        if read.truncated {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResourceExhausted,
+                "preview images exceed transport budget",
+            ));
+        }
+        budget = budget.saturating_sub(read.bytes.len());
+        let caption = match image["appearance"].as_str() {
+            Some(appearance) => format!("HTML preview: {appearance} {} CSS px", image["width"]),
+            None => format!("HTML preview: {} CSS px", image["width"]),
+        };
+        content.push(json!({"type":"text","text":caption}));
+        content.push(json!({"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(read.bytes)}));
+    }
+    value
+        .as_object_mut()
+        .expect("HTML result object")
+        .remove("llm_context");
+    content.push(json!({"type":"text","text":value.to_string()}));
+    Ok(content)
+}
+
 #[cfg(test)]
 mod tests {
+    mod cli_mcp_call_finalization_tests;
     use super::*;
     use crate::auth::AuthenticatedSessionPrincipal;
     use crate::authorization::ExecutionAuthorizationContext;
@@ -4342,9 +5097,450 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tokio_util::sync::CancellationToken;
 
+    #[tokio::test]
+    async fn html_mcp_projects_six_exact_pngs_and_diagnostics_atomically() {
+        use base64::Engine;
+        use pioneer_artifacts::{
+            ArtifactService, IngestArtifactBytesRequest, LocalArtifactBlobStore,
+        };
+        let (_mcp, store, workspace, _secrets) = test_mcp_service_with_secrets().await;
+        let root = tempfile::tempdir().unwrap();
+        let artifacts =
+            ArtifactService::new(store, Arc::new(LocalArtifactBlobStore::new(root.path())));
+        // Match the production caller's retention protection across every read.
+        let _activity = artifacts.html_preview_activity_signaled().await;
+        let frames = [
+            ("light", 360u32),
+            ("light", 768),
+            ("light", 1024),
+            ("dark", 360),
+            ("dark", 768),
+            ("dark", 1024),
+        ];
+        let mut images = Vec::new();
+        let mut previews = Vec::new();
+        let mut expected_pngs = Vec::new();
+        for (index, (appearance, width)) in frames.into_iter().enumerate() {
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                width,
+                1,
+                image::Rgba([index as u8 * 30, 10, 200, 255]),
+            ))
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+            let png = encoded.into_inner();
+            let summary = artifacts.ingest_bytes(IngestArtifactBytesRequest {
+                workspace_id: workspace.clone(), primary_thread_id: None,
+                bytes: png.clone(), display_name: format!("{appearance}-{width}.png"),
+                kind: pioneer_protocol::ArtifactKind::Screenshot, mime_type: Some("image/png".into()),
+                created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Tool,
+                created_by_actor_id: Some("html_preview".into()), binding: None,
+                metadata: BTreeMap::from([("htmlTool".into(), json!({"version":2,"publication":false,
+                    "turnId":"fixture-turn","callId":"fixture-call","index":format!("{appearance}-{width}")}))]),
+            }).await.unwrap();
+            let resolved = artifacts
+                .resolve_provider_attachment(
+                    &workspace,
+                    &summary.artifact.artifact_id,
+                    summary.artifact.version_id.as_deref(),
+                )
+                .await
+                .unwrap();
+            images.push(
+                json!({"appearance":appearance,"width":width,"attachment":resolved.attachment}),
+            );
+            previews.push(json!({"appearance":appearance,"width":width,"contentHeight":1,"capturedHeight":1,
+                "diagnostics":[format!("diagnostic-{appearance}-{width}")],"artifact":summary.artifact}));
+            expected_pngs.push(png);
+        }
+        let payload =
+            json!({"formatVersion":2,"previews":previews,"llm_context":{"images":images}});
+        let mut delivered = payload.clone();
+        let content = html_preview_mcp_content(
+            &artifacts,
+            &workspace,
+            &mut delivered,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(content.len(), 13);
+        for (index, (appearance, width)) in frames.into_iter().enumerate() {
+            assert_eq!(
+                content[index * 2],
+                json!({"type":"text","text":format!("HTML preview: {appearance} {width} CSS px")})
+            );
+            assert_eq!(content[index * 2 + 1]["type"], "image");
+            assert_eq!(content[index * 2 + 1]["mimeType"], "image/png");
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(content[index * 2 + 1]["data"].as_str().unwrap())
+                    .unwrap(),
+                expected_pngs[index]
+            );
+        }
+        assert!(delivered.get("llm_context").is_none());
+        assert_eq!(delivered["previews"], payload["previews"]);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(content[12]["text"].as_str().unwrap()).unwrap(),
+            delivered
+        );
+
+        // Recorded legacy wire captions must remain byte-for-byte stable.
+        let mut legacy = payload.clone();
+        legacy.as_object_mut().unwrap().remove("formatVersion");
+        legacy["previews"].as_array_mut().unwrap().truncate(3);
+        for preview in legacy["previews"].as_array_mut().unwrap() {
+            preview.as_object_mut().unwrap().remove("appearance");
+        }
+        legacy["llm_context"]["images"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(3);
+        for entry in legacy["llm_context"]["images"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("appearance");
+        }
+        let legacy_content = html_preview_mcp_content(
+            &artifacts,
+            &workspace,
+            &mut legacy,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        for (index, width) in [360, 768, 1024].into_iter().enumerate() {
+            assert_eq!(
+                legacy_content[index * 2],
+                json!({"type":"text","text":format!("HTML preview: {width} CSS px")})
+            );
+        }
+
+        // Shape failure is rejected, never treated as a legacy or partial result.
+        let mut incomplete = payload.clone();
+        incomplete["llm_context"]["images"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        let original = incomplete.clone();
+        let error = html_preview_mcp_content(
+            &artifacts,
+            &workspace,
+            &mut incomplete,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, TurnMcpInvocationErrorCode::ResultInvalid);
+        assert_eq!(incomplete, original);
+
+        // A real but foreign version id cannot silently fall back to the last
+        // artifact's current bytes after five successful image reads.
+        let mut wrong_version = payload.clone();
+        wrong_version["llm_context"]["images"][5]["attachment"]["artifact"]["artifact_version_id"] =
+            payload["llm_context"]["images"][0]["attachment"]["artifact"]["artifact_version_id"]
+                .clone();
+        let original = wrong_version.clone();
+        let error = html_preview_mcp_content(
+            &artifacts,
+            &workspace,
+            &mut wrong_version,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, TurnMcpInvocationErrorCode::ResultInvalid);
+        assert_eq!(wrong_version, original);
+    }
+
+    #[tokio::test]
+    async fn frozen_legacy_html_session_recovers_and_invokes_retained_three_frame_preview() {
+        use crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection;
+        use crate::cli_runtime::continuation::CliMcpSessionLaunch;
+        use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
+        use crate::cli_runtime::mcp::recovery::restore_cli_mcp_session_launch;
+        use crate::turn_mcp::persistence::TurnMcpProviderBindingIdentity;
+        use crate::turn_mcp::projection::ResolvedMcpTurnTool;
+        use base64::Engine;
+        use pioneer_artifacts::{
+            ArtifactService, IngestArtifactBytesRequest, LocalArtifactBlobStore,
+        };
+        use pioneer_tools::html::{HTML_PREVIEW, HTML_SERVER_ID, HTML_SERVER_NAME};
+
+        // This is the actual pre-six-preview contract copied from the original base,
+        // including description and appearance, not a modification of today's schema.
+        let recorded = pioneer_tools::html::legacy_preview_definition();
+        let limits = McpProjectionLimits::default();
+        let facade_limits = CliMcpFacadeProjectionLimits::transport_bounded(limits.max_tools);
+        for changed_schema in [false, true] {
+            let (service, store, workspace, _secrets) = test_mcp_service_with_secrets().await;
+            let thread = "T00000000000000000001";
+            let turn = "U00000000000000000001";
+            seed_started_turn(&store, &workspace, thread, turn).await;
+            let mut schema = recorded["inputSchema"].clone();
+            if changed_schema {
+                schema["properties"]["html"]["maxLength"] = json!(512001);
+            }
+            let mut projection = ResolvedMcpTurnProjection::empty(&workspace, turn);
+            projection.tools.push(ResolvedMcpTurnTool {
+                canonical_callable_name: String::new(),
+                workspace_id: workspace.clone(),
+                server_installation_id: HTML_SERVER_ID.into(),
+                server_name: HTML_SERVER_NAME.into(),
+                raw_tool_name: HTML_PREVIEW.into(),
+                description: Some(recorded["description"].as_str().unwrap().into()),
+                input_schema: schema,
+                annotations: None,
+                timeout_ms: 120_000,
+                catalog_version: HTML_SERVER_ID.into(),
+                installation_fingerprint: HTML_SERVER_ID.into(),
+                schema_fingerprint: String::new(),
+                runtime_generation: 1,
+                selection_reason: crate::turn_mcp::McpSelectionReason::ImplicitPolicy,
+                capability_id: None,
+            });
+            projection.finalize_identity(limits).unwrap();
+            if !changed_schema {
+                assert_eq!(projection.tools[0].canonical_callable_name, HTML_PREVIEW);
+                let mut forged_description = projection.tools[0].clone();
+                forged_description.description = Some("different first-party contract".into());
+                assert!(
+                    crate::turn_mcp::native_tools::exact_definition(&forged_description).is_none()
+                );
+            }
+            let original =
+                build_codex_mcp_session_launch_projection(projection.clone(), "a".repeat(64))
+                    .unwrap();
+            let facade_fingerprint = original
+                .facade_projection(facade_limits)
+                .unwrap()
+                .fingerprint()
+                .as_str()
+                .to_owned();
+            let provider_bindings = original
+                .preflight
+                .tools
+                .iter()
+                .map(|tool| TurnMcpProviderBindingIdentity {
+                    canonical_callable_name: tool.canonical_callable_name.clone(),
+                    provider_callable_name: format!(
+                        "mcp__pioneer__{}",
+                        tool.canonical_callable_name
+                    ),
+                    provider_schema_fingerprint: tool.transformed_schema_fingerprint.clone(),
+                })
+                .collect::<Vec<_>>();
+            service
+                .persist_cli_resolved_mcp_turn_projection(&projection, &provider_bindings)
+                .await
+                .unwrap();
+            let frozen_bindings = store.list_turn_mcp_bindings(turn).await.unwrap();
+            let now = chrono::Utc::now().fixed_offset();
+            store
+                .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                    turn_id: turn.into(),
+                    thread_id: thread.into(),
+                    continuation_thread_id: thread.into(),
+                    workspace_id: workspace.clone(),
+                    runtime_id: "runtime-codex".into(),
+                    runtime_kind: "codex".into(),
+                    native_thread_id: "native-thread".into(),
+                    native_turn_id: Some("native-turn".into()),
+                    request_id: None,
+                    status: "running".into(),
+                    model: None,
+                    cwd: None,
+                    sandbox_json: None,
+                    approval_policy: None,
+                    input_mapping_json: "{}".into(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
+            store
+                .set_cli_runtime_turn_mcp_metadata(
+                    turn,
+                    Some(CliRuntimeTurnMcpMetadata {
+                        adapter_kind: "codex_synthetic_mcp".into(),
+                        manifest_hash: projection.manifest_hash.clone(),
+                        projection_fingerprint: facade_fingerprint.clone(),
+                        provider_contract_fingerprint: "a".repeat(64),
+                        isolation_contract_fingerprint: original
+                            .semantic_restart_fingerprint()
+                            .into(),
+                        session_generation: 1,
+                        projection_activation_generation: frozen_bindings[0]
+                            .projection_activation_generation,
+                    }),
+                )
+                .await
+                .unwrap();
+            let session = store
+                .get_cli_runtime_turn_binding(turn)
+                .await
+                .unwrap()
+                .unwrap();
+            let restored = restore_cli_mcp_session_launch(
+                &store,
+                &service,
+                &session,
+                pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                limits,
+            )
+            .await;
+            if changed_schema {
+                // Do not let the changed schema's prefixed projection name mask
+                // a permissive fingerprint fallback: the original raw callable
+                // with this unknown fingerprint must also fail identity lookup.
+                let mut unknown = frozen_bindings[0].clone();
+                unknown.canonical_callable_name = HTML_PREVIEW.into();
+                unknown.callable_name = HTML_PREVIEW.into();
+                assert_eq!(
+                    crate::turn_mcp::native_tools::current_identity(&workspace, &unknown)
+                        .unwrap_err()
+                        .code,
+                    TurnMcpInvocationErrorCode::ToolDrift,
+                );
+                assert!(
+                    format!("{:#}", restored.unwrap_err())
+                        .contains(TurnMcpInvocationErrorCode::ToolDrift.as_str())
+                );
+                continue;
+            }
+            let CliMcpSessionLaunch::Codex(restored) = restored.unwrap() else {
+                panic!("Codex expected")
+            };
+            // Includes the original input schema, fingerprint, description and raw
+            // callable. Recovery must not rewrite the durable bindings or manifest.
+            assert_eq!(restored.canonical_projection, projection);
+            assert_eq!(restored.preflight, original.preflight);
+            assert_eq!(
+                restored.semantic_restart_fingerprint(),
+                original.semantic_restart_fingerprint()
+            );
+            assert_eq!(
+                restored
+                    .facade_projection(facade_limits)
+                    .unwrap()
+                    .fingerprint()
+                    .as_str(),
+                facade_fingerprint
+            );
+            assert_eq!(
+                store.list_turn_mcp_bindings(turn).await.unwrap(),
+                frozen_bindings
+            );
+            assert_eq!(
+                store
+                    .get_turn_mcp_projection(turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .manifest_hash,
+                projection.manifest_hash
+            );
+
+            let root = tempfile::tempdir().unwrap();
+            let artifacts = Arc::new(ArtifactService::new(
+                store.clone(),
+                Arc::new(LocalArtifactBlobStore::new(root.path())),
+            ));
+            let mut previews = Vec::new();
+            let mut images = Vec::new();
+            let mut pngs = Vec::new();
+            for (index, width) in [360u32, 768, 1024].into_iter().enumerate() {
+                let mut encoded = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                    width,
+                    1,
+                    image::Rgba([index as u8 * 60, 10, 200, 255]),
+                ))
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .unwrap();
+                let png = encoded.into_inner();
+                let summary = artifacts
+                    .ingest_bytes(IngestArtifactBytesRequest {
+                        workspace_id: workspace.clone(),
+                        primary_thread_id: Some(thread.into()),
+                        bytes: png.clone(),
+                        display_name: format!("legacy-{width}.png"),
+                        kind: pioneer_protocol::ArtifactKind::Screenshot,
+                        mime_type: Some("image/png".into()),
+                        created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Tool,
+                        created_by_actor_id: Some(HTML_PREVIEW.into()),
+                        binding: None,
+                        metadata: BTreeMap::from([(
+                            "htmlTool".into(),
+                            json!({"version":1,"publication":false,
+                        "turnId":turn,"callId":"legacy-preview-call","index":width.to_string()}),
+                        )]),
+                    })
+                    .await
+                    .unwrap();
+                let resolved = artifacts
+                    .resolve_provider_attachment(
+                        &workspace,
+                        &summary.artifact.artifact_id,
+                        summary.artifact.version_id.as_deref(),
+                    )
+                    .await
+                    .unwrap();
+                images.push(json!({"width":width,"attachment":resolved.attachment}));
+                previews.push(json!({"width":width,"contentHeight":1,"capturedHeight":1,
+                    "diagnostics":[format!("legacy-{width}")],"artifact":summary.artifact}));
+                pngs.push(png);
+            }
+            // The existing execution seam supplies retained v1 output. Real invocation
+            // validation and real exact-version MCP image reads run on either side;
+            // this test never captures or regenerates a legacy frame in a browser.
+            let payload = json!({"previews":previews,"llm_context":{"images":images}});
+            let execution = Arc::new(TestValidatedMcpExecution {
+                replay: Some((artifacts, payload.clone())),
+                ..Default::default()
+            });
+            let invoker = GatewayTurnMcpInvoker::new(
+                store.clone(),
+                Arc::new(service.clone()),
+                execution.clone(),
+                service.inner.authorization_invalidation_hub.clone(),
+                service.inner.execution_leases.clone(),
+                service.inner.invocation_governor.clone(),
+            );
+            let result = invoker.invoke(TurnMcpInvocation {
+                workspace_id: workspace.clone(), thread_id: thread.into(), turn_id: turn.into(),
+                runtime_id: Some("runtime-codex".into()), session_generation: Some(1),
+                provider_call_id: "legacy-preview-call".into(), native_call: None, admission_deadline: None,
+                canonical_callable_name: HTML_PREVIEW.into(),
+                arguments: json!({"html":"<!doctype html><html></html>","appearance":"dark"}),
+                origin: TurnMcpInvocationOrigin::CliFacade,
+            }, CancellationToken::new()).await.unwrap();
+            assert_eq!(execution.calls.load(Ordering::SeqCst), 1);
+            assert!(!result.is_error);
+            assert_eq!(result.content.as_array().unwrap().len(), 7);
+            for (index, width) in [360, 768, 1024].into_iter().enumerate() {
+                assert_eq!(
+                    result.content[index * 2]["text"],
+                    format!("HTML preview: {width} CSS px")
+                );
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(result.content[index * 2 + 1]["data"].as_str().unwrap())
+                        .unwrap(),
+                    pngs[index]
+                );
+            }
+            assert_eq!(
+                result.structured_content.unwrap()["previews"],
+                payload["previews"]
+            );
+        }
+    }
+
     #[derive(Default)]
     struct TestValidatedMcpExecution {
         calls: AtomicUsize,
+        replay: Option<(Arc<pioneer_artifacts::ArtifactService>, JsonValue)>,
     }
 
     struct CountingPermissionApprovalBroker {
@@ -4415,6 +5611,24 @@ mod tests {
                 u64::try_from(validated.binding.runtime_generation).unwrap()
             );
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((artifacts, retained)) = &self.replay {
+                let _activity = artifacts.html_preview_activity_signaled().await;
+                let mut value = retained.clone();
+                let content = html_preview_mcp_content(
+                    artifacts,
+                    &validated.invocation.workspace_id,
+                    &mut value,
+                    &cancellation,
+                )
+                .await?;
+                return Ok(CanonicalMcpToolResult {
+                    content: JsonValue::Array(content),
+                    structured_content: Some(value),
+                    is_error: false,
+                    duration_ms: 1,
+                    meta: None,
+                });
+            }
             Ok(CanonicalMcpToolResult {
                 content: json!([{"type": "text", "text": "validated"}]),
                 structured_content: None,
@@ -4435,6 +5649,7 @@ mod tests {
         manifest_hash: String,
         execution: Arc<TestValidatedMcpExecution>,
         invoker: GatewayTurnMcpInvoker,
+        _database_dir: tempfile::TempDir,
     }
 
     struct TestMcpRuntimeConnector {
@@ -4570,6 +5785,10 @@ mod tests {
         }
 
         async fn shutdown(&mut self) {}
+        async fn shutdown_result(&mut self) -> Result<(), pioneer_mcp::McpRuntimeError> {
+            self.shutdown().await;
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
@@ -4623,6 +5842,219 @@ mod tests {
         }
 
         async fn shutdown(&mut self) {}
+        async fn shutdown_result(&mut self) -> Result<(), pioneer_mcp::McpRuntimeError> {
+            self.shutdown().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_retains_native_handle_until_a_retry_observes_completion() {
+        let (service, _, workspace) = test_mcp_service().await;
+        let id = "stopping-native-installation";
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (call_tx, _call_rx) = mpsc::channel(1);
+        let completed = Arc::new(CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
+        let (entered, stopping) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _completion = completion;
+            shutdown_rx.await.expect("native shutdown request");
+            entered.send(()).expect("shutdown observer");
+            released.await.expect("shutdown completion release");
+            Ok(())
+        });
+        let join = McpTaskJoin::new(join);
+        service.inner.tasks.lock().await.insert(
+            id.into(),
+            McpServerTaskHandle {
+                name: "stopping-native".into(),
+                scope_kind: "workspace".into(),
+                scope_key: workspace,
+                fingerprint: "configuration".into(),
+                effective_secret_fingerprint: "material".into(),
+                call_tx,
+                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                shutdown_tx: Some(shutdown_tx),
+                completed,
+                join,
+                session: Arc::new(Mutex::new(None)),
+            },
+        );
+        let native = service.clone();
+        let first = tokio::spawn(async move {
+            native
+                .stop_task_result(id, DomainRuntimeState::Stopped)
+                .await
+        });
+        stopping.await.expect("native stop was requested");
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("caller was cancelled")
+                .is_cancelled()
+        );
+        assert!(
+            service.task_exists(id).await,
+            "unacknowledged native owner remains reachable"
+        );
+        tokio::time::timeout(Duration::from_secs(1), service.oauth_recovered(id))
+            .await
+            .expect("stopping actors must not receive OAuth recovery commands");
+        assert!(
+            service.inner.tasks.lock().await[id]
+                .recovery
+                .pending
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+        let native = service.clone();
+        let retry = tokio::spawn(async move {
+            native
+                .stop_task_result(id, DomainRuntimeState::Stopped)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !retry.is_finished(),
+            "a cancellation signal is not a shutdown acknowledgement"
+        );
+        release.send(()).expect("allow native completion");
+        retry
+            .await
+            .expect("retry join")
+            .expect("native shutdown acknowledged");
+        assert!(service.inner.tasks.lock().await[id].shutdown_tx.is_none());
+        service
+            .stop_task_result(id, DomainRuntimeState::Stopped)
+            .await
+            .expect("same retained result on repeat");
+        service.stop_task(id, DomainRuntimeState::Stopped).await;
+        assert!(
+            !service.task_exists(id).await,
+            "legacy stop releases only the confirmed actor"
+        );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delayed_stop_does_not_remove_a_replacement_runtime_with_the_same_installation_id() {
+        let (service, _, workspace) = test_mcp_service().await;
+        let id = "replacement-native-installation";
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (call_tx, _call_rx) = mpsc::channel(1);
+        let completed = Arc::new(CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
+        let (entered, stopping) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _completion = completion;
+            shutdown_rx.await.expect("original shutdown");
+            entered.send(()).expect("original stop observer");
+            released.await.expect("original completion release");
+            Ok(())
+        });
+        let join = McpTaskJoin::new(join);
+        service.inner.tasks.lock().await.insert(
+            id.into(),
+            McpServerTaskHandle {
+                name: "replacement-native".into(),
+                scope_kind: "workspace".into(),
+                scope_key: workspace.clone(),
+                fingerprint: "original".into(),
+                effective_secret_fingerprint: "material".into(),
+                call_tx,
+                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                shutdown_tx: Some(shutdown_tx),
+                completed,
+                join,
+                session: Arc::new(Mutex::new(None)),
+            },
+        );
+        let native = service.clone();
+        let old_stop = tokio::spawn(async move {
+            native
+                .stop_task_result(id, DomainRuntimeState::Stopped)
+                .await
+        });
+        stopping.await.expect("original stop admitted");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (call_tx, _call_rx) = mpsc::channel(1);
+        let completed = Arc::new(CancellationToken::new());
+        let completion = McpTaskCompletion(completed.clone());
+        let join = tokio::spawn(async move {
+            let _completion = completion;
+            shutdown_rx
+                .await
+                .expect("replacement retains its own shutdown sender");
+            Ok(())
+        });
+        let join = McpTaskJoin::new(join);
+        service.inner.tasks.lock().await.insert(
+            id.into(),
+            McpServerTaskHandle {
+                name: "replacement-native".into(),
+                scope_kind: "workspace".into(),
+                scope_key: workspace,
+                fingerprint: "replacement".into(),
+                effective_secret_fingerprint: "material".into(),
+                call_tx,
+                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                shutdown_tx: Some(shutdown_tx),
+                completed,
+                join,
+                session: Arc::new(Mutex::new(None)),
+            },
+        );
+        release.send(()).expect("finish original runtime");
+        old_stop
+            .await
+            .expect("original stop caller")
+            .expect_err("replacement is not the original owner");
+        assert_eq!(
+            service.inner.tasks.lock().await[id].fingerprint,
+            "replacement"
+        );
+        service
+            .stop_task_result(id, DomainRuntimeState::Stopped)
+            .await
+            .expect("stop exact replacement");
+        assert!(service.inner.tasks.lock().await[id].shutdown_tx.is_none());
+        service
+            .stop_task_result(id, DomainRuntimeState::Stopped)
+            .await
+            .expect("same retained result on repeat");
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn native_mcp_join_error_survives_cancelled_and_concurrent_observers() {
+        let (release, released) = oneshot::channel::<()>();
+        let owner = McpTaskJoin::new(tokio::spawn(async move {
+            let _ = released.await;
+            anyhow::bail!("native cleanup failed")
+        }));
+        let observer = owner.clone();
+        let waiter = tokio::spawn(async move { observer.wait().await });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        let (first, second) = tokio::join!(owner.wait(), owner.wait());
+        assert!(first.is_err());
+        assert!(second.is_err());
+        assert!(owner.wait().await.is_err());
+        let panic = McpTaskJoin::new(tokio::spawn(async {
+            panic!("native actor panic");
+        }));
+        assert!(panic.wait().await.is_err());
+        assert!(panic.wait().await.is_err());
     }
 
     async fn test_mcp_service() -> (McpService, Arc<CrudStore>, String) {
@@ -4639,9 +6071,16 @@ mod tests {
     async fn test_mcp_service_with_store(
         store: Arc<dyn pioneer_keystore::SecretStore>,
     ) -> (McpService, Arc<CrudStore>, String, Arc<GatewaySecrets>) {
-        let connection = Database::connect("sqlite::memory:")
+        test_mcp_service_with_database(store, "sqlite::memory:").await
+    }
+
+    async fn test_mcp_service_with_database(
+        store: Arc<dyn pioneer_keystore::SecretStore>,
+        database_url: &str,
+    ) -> (McpService, Arc<CrudStore>, String, Arc<GatewaySecrets>) {
+        let connection = Database::connect(database_url)
             .await
-            .expect("must connect to sqlite memory");
+            .expect("must connect to test sqlite database");
         Migrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
@@ -4972,11 +6411,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn management_notification_overload_retires_instead_of_using_reply_reserve() {
+        let (service, _, _) = test_mcp_service().await;
+        let sessions = &service.inner.session_manager;
+        let (sender, _receiver) = crate::session::test_support::outbound_channel(2);
+        let id = sessions
+            .register_connection(sender.clone(), authenticated_test_superuser())
+            .await
+            .unwrap();
+        sender
+            .try_send_data(axum::extract::ws::Message::Text("occupied".into()))
+            .unwrap();
+        service
+            .send_management_notification("test/mcp-management", &json!({"name":"private-server"}))
+            .await;
+        assert!(sessions.connection_principal(id).await.is_err());
+        assert!(
+            sender
+                .send(axum::extract::ws::Message::Close(None))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn management_notifications_are_superuser_only() {
         let (service, _, _) = test_mcp_service().await;
         let session_manager = service.inner.session_manager.clone();
 
-        let (superuser_tx, mut superuser_rx) = mpsc::channel(2);
+        let (superuser_tx, mut superuser_rx) = crate::session::test_support::outbound_channel(2);
         session_manager
             .register_connection(superuser_tx, authenticated_test_superuser())
             .await
@@ -4989,7 +6452,7 @@ mod tests {
         member.role_key = Some(RoleKey::member());
         member.device_id = DeviceId::new("D0000000000000000000A").expect("Member device id");
         member.session_id = AuthSessionId::new("S0000000000000000000A").expect("Member session id");
-        let (member_tx, mut member_rx) = mpsc::channel(2);
+        let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(2);
         session_manager
             .register_connection(member_tx, Arc::new(member))
             .await
@@ -5017,6 +6480,9 @@ mod tests {
     ) {
         let timestamp = 1_700_000_000;
         let thread = Thread {
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
             workspace_id: workspace_id.to_owned(),
             id: thread_id.to_owned(),
             name: None,
@@ -5037,6 +6503,7 @@ mod tests {
             turns: Vec::new(),
         };
         let turn = Turn {
+            work_owner: Default::default(),
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
@@ -5146,6 +6613,35 @@ mod tests {
             .expect("test MCP installation lookup should succeed")
             .and_then(|row| row.id)
             .expect("test MCP installation should have id")
+    }
+
+    // Regression source only: NOT_RUN / NOT_COMPILED.
+    #[tokio::test]
+    async fn admitted_stop_distinguishes_never_started_from_lost_native_owner() {
+        let (service, store, workspace) = test_mcp_service().await;
+        let id = seed_mcp_installation(&store, &workspace, "never-started", false, false).await;
+        let row = store
+            .find_mcp_server_installation("workspace", &workspace, "never-started")
+            .await
+            .unwrap()
+            .unwrap();
+        let _guard = service
+            .installation_lifecycle_guard("workspace", &workspace, "never-started")
+            .await;
+        service.stop_admitted_installation(&row).await.unwrap();
+        // A runtime admission with a lost task is not the same proof as an
+        // installation that was never started by this lifecycle.
+        service
+            .inner
+            .runtime_generations
+            .lock()
+            .await
+            .insert(id.clone(), 1);
+        assert!(service.stop_admitted_installation(&row).await.is_err());
+        service.inner.runtime_generations.lock().await.remove(&id);
+        let mut foreign = row.clone();
+        foreign.id = Some("foreign-native-id".into());
+        assert!(service.stop_admitted_installation(&foreign).await.is_err());
     }
 
     async fn configure_mcp_installation_secret(
@@ -5308,7 +6804,15 @@ mod tests {
     async fn turn_mcp_invoker_fixture_with_connector(
         connector: Arc<dyn McpRuntimeConnector>,
     ) -> TestTurnMcpInvokerFixture {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        // Cancellation can retire a pooled connection. Keep the migrated database
+        // alive independently of that connection so audit assertions see its schema.
+        let database_dir = tempfile::tempdir().expect("test database directory should exist");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            database_dir.path().join("mcp.db").display()
+        );
+        let (service, crud_store, workspace_id, _) =
+            test_mcp_service_with_database(Arc::new(MemorySecretStore::new()), &database_url).await;
         let thread_id = "T00000000000000000001".to_owned();
         let turn_id = "U00000000000000000001".to_owned();
         seed_started_turn(
@@ -5389,6 +6893,7 @@ mod tests {
             manifest_hash,
             execution,
             invoker,
+            _database_dir: database_dir,
         }
     }
 
@@ -5526,6 +7031,8 @@ mod tests {
             runtime_id: None,
             session_generation: None,
             provider_call_id: "provider-call-test".to_owned(),
+            native_call: None,
+            admission_deadline: None,
             canonical_callable_name: fixture.callable_name.clone(),
             arguments: json!({"secret": "argument-canary-must-not-enter-errors"}),
             origin: TurnMcpInvocationOrigin::NativeApi,
@@ -5949,6 +7456,7 @@ mod tests {
                     },
                     TaskEventPayload::RunCreated {
                         run: TaskRun {
+                            trigger_input: None,
                             id: run_id.to_owned(),
                             task_id: task_id.to_owned(),
                             trigger_id: None,
@@ -6720,6 +8228,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_cua_cache_admission_closes_both_registered_call_orders() {
+        let (service, _, _) = test_mcp_service().await;
+        let tools = Arc::new(
+            pioneer_tools::build_tools(
+                std::env::temp_dir(),
+                "cache-fixture",
+                pioneer_tools::PermissionEvaluationContext::for_turn(
+                    "workspace",
+                    "thread",
+                    "cache-fixture",
+                    pioneer_protocol::default_turn_permission_profile_snapshot(),
+                ),
+                pioneer_tools::WebToolsConfig::default(),
+                pioneer_tools::ComputerUseToolsConfig::default(),
+                Vec::new(),
+            )
+            .expect("cache owner tools"),
+        );
+        // The call is already registered but has not materialized tools yet
+        // (e.g. it is waiting at the security/approval boundary).
+        for insert_first in [false, true] {
+            for index in 0..32 {
+                let turn = format!("finished-{insert_first}-{index}");
+                let cancellation = CancellationToken::new();
+                let _active = service.register_active_mcp_invocation(
+                    &turn,
+                    "cua-fixture",
+                    "call",
+                    cancellation.clone(),
+                );
+                if insert_first {
+                    service
+                        .admit_cua_turn_tools(&turn, &cancellation, || Ok(tools.clone()))
+                        .expect("insert before terminal");
+                }
+                assert_eq!(service.cancel_turn_mcp_invocations(&turn), 1);
+                assert!(cancellation.is_cancelled());
+                let late = service.admit_cua_turn_tools(&turn, &cancellation, || {
+                    panic!("cancelled registered call must never materialize a cache entry")
+                });
+                assert!(
+                    matches!(late, Err(error) if error.code == TurnMcpInvocationErrorCode::Cancelled)
+                );
+                assert!(
+                    !service
+                        .inner
+                        .cua_turn_tools
+                        .lock()
+                        .unwrap()
+                        .contains_key(&turn)
+                );
+            }
+            let live = format!("live-{insert_first}");
+            let cancellation = CancellationToken::new();
+            let _active = service.register_active_mcp_invocation(
+                &live,
+                "cua-fixture",
+                "call",
+                cancellation.clone(),
+            );
+            service
+                .admit_cua_turn_tools(&live, &cancellation, || Ok(tools.clone()))
+                .expect("finished turns cannot exhaust live admission");
+            assert_eq!(service.inner.cua_turn_tools.lock().unwrap().len(), 1);
+            service.cancel_turn_mcp_invocations(&live);
+        }
+    }
+
+    #[tokio::test]
     async fn poisoned_active_invocation_registry_still_fails_closed_on_revoke() {
         let (service, _, _) = test_mcp_service().await;
         let inner = service.inner.clone();
@@ -6965,6 +8542,11 @@ mod tests {
                 .call_tool(name, args, budget, timeout, cancellation)
                 .await
         }
+        async fn shutdown_result(&mut self) -> Result<(), pioneer_mcp::McpRuntimeError> {
+            self.shutdown().await;
+            Ok(())
+        }
+
         async fn shutdown(&mut self) {
             self.inner.shutdown().await;
         }
@@ -7065,11 +8647,12 @@ mod tests {
             Json, Router,
             routing::{get, post},
         };
-        for unrelated in [false, true] {
+        for (unrelated, failed_predecessor) in [(false, false), (true, false), (false, true)] {
             let (old, store, workspace, secrets) = test_mcp_service_with_secrets().await;
             old.shutdown().await;
             let sessions = Arc::new(SessionManager::new());
-            let (recipient_tx, mut recipient) = mpsc::channel(1024);
+            let (recipient_tx, mut recipient) =
+                crate::session::test_support::outbound_channel(1024);
             let mut principal = (*authenticated_test_superuser()).clone();
             principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
             let client = sessions
@@ -7104,7 +8687,8 @@ mod tests {
                 }
             }
             let _server = Server(server);
-            let id = seed_mcp_installation(&store, &workspace, "real-recovery", true, false).await;
+            let mut id =
+                seed_mcp_installation(&store, &workspace, "real-recovery", true, false).await;
             let mut row = store
                 .find_mcp_server_installation("workspace", &workspace, "real-recovery")
                 .await
@@ -7122,6 +8706,101 @@ mod tests {
                 .upsert_mcp_server_installation(&row, now_timestamp_secs())
                 .await
                 .unwrap();
+            if failed_predecessor {
+                // Publish a fresh reserved child, never adopt the seeded standalone row.
+                id = "S".repeat(21);
+                row.id = Some(id.clone());
+                row.name = "pplugin_retained_failure".into();
+                let now = chrono::Utc::now().fixed_offset();
+                let parent = "P".repeat(21);
+                store
+                    .insert_plugin_installation(&pioneer_crud::PackageRecord {
+                        kind: pioneer_crud::PackageKind::Plugin,
+                        app_manifest_json: None,
+                        app_localizations_json: None,
+                        operation_error_json: None,
+                        id: parent.clone(),
+                        workspace_id: workspace.clone(),
+                        name: "oauth-parent".into(),
+                        version: None,
+                        source_upload_id: "oauth-source".into(),
+                        package_path: "/unused/package".into(),
+                        data_path: "/unused/data".into(),
+                        package_fingerprint: "tree".into(),
+                        enabled: true,
+                        allow_implicit_invocation: false,
+                        state: "installing".into(),
+                        revision: 1,
+                        display_name: None,
+                        short_description: None,
+                        description: None,
+                        long_description: None,
+                        developer_name: None,
+                        author_name: None,
+                        author_email: None,
+                        author_url: None,
+                        homepage: None,
+                        repository: None,
+                        documentation_url: None,
+                        support_url: None,
+                        privacy_policy_url: None,
+                        terms_of_service_url: None,
+                        license: None,
+                        category: None,
+                        brand_color: None,
+                        logo_path: None,
+                        logo_revision: None,
+                        composer_icon_path: None,
+                        composer_icon_revision: None,
+                        pending_json: Some("{}".into()),
+                        last_error: None,
+                        created_at: now,
+                        updated_at: now,
+                    })
+                    .await
+                    .unwrap();
+                let write = pioneer_crud::PluginOwnershipWrite {
+                    kind: pioneer_protocol::PackageKind::Plugin,
+                    plugin_id: parent.clone(),
+                    expected_revision: 1,
+                    member_key: "one".into(),
+                    member_path: None,
+                    package_fingerprint: "tree".into(),
+                    child_id: id.clone(),
+                };
+                let audit = pioneer_crud::McpAuditEventRecord {
+                    turn_id: None,
+                    server_installation_id: Some(id.clone()),
+                    server_name: row.name.clone(),
+                    raw_tool_name: None,
+                    callable_name: None,
+                    catalog_version: None,
+                    action: "install".into(),
+                    decision: "allowed".into(),
+                    reason_code: None,
+                    details_json: "{}".into(),
+                    created_at_unix: 1,
+                };
+                store
+                    .upsert_mcp_server_installation_with_audit_and_ownership(
+                        &row,
+                        &audit,
+                        Some(&write),
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .settle_plugin_installation(&parent, 1, "installed", None)
+                    .await
+                    .unwrap();
+                assert!(
+                    service
+                        .plugin_start_available(&store, &row, None)
+                        .await
+                        .unwrap()
+                );
+            }
             let installation = installation_from_record(&row).unwrap();
             let entered = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Notify::new());
@@ -7173,6 +8852,16 @@ mod tests {
                 .unwrap()
                 .1
                 .into_owned();
+            let effect_entered = Arc::new(tokio::sync::Notify::new());
+            let effect_release = Arc::new(tokio::sync::Notify::new());
+            let effect_completed = Arc::new(tokio::sync::Notify::new());
+            if failed_predecessor {
+                *service.inner.oauth_effect_barrier.lock().unwrap() = Some((
+                    effect_entered.clone(),
+                    effect_release.clone(),
+                    effect_completed.clone(),
+                ));
+            }
             service
                 .oauth()
                 .callback(
@@ -7188,6 +8877,74 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            if failed_predecessor {
+                // The real callback emitted current Authorized. Hold its existing
+                // Gateway effect boundary, then install an actual failed actor join.
+                tokio::time::timeout(Duration::from_secs(5), effect_entered.notified())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    service.oauth().state(&id).await,
+                    Some(pioneer_mcp_oauth::OAuthState::Authorized)
+                );
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                let (call_tx, _call_rx) = mpsc::channel(1);
+                let completed = Arc::new(CancellationToken::new());
+                let completion = McpTaskCompletion(completed.clone());
+                let join = McpTaskJoin::new(tokio::spawn(async move {
+                    let _completion = completion;
+                    shutdown_rx
+                        .await
+                        .expect("Authorized must request predecessor drain");
+                    anyhow::bail!("retained predecessor cleanup failed")
+                }));
+                service.inner.tasks.lock().await.insert(
+                    id.clone(),
+                    McpServerTaskHandle {
+                        name: row.name.clone(),
+                        scope_kind: row.scope_kind.clone(),
+                        scope_key: row.scope_key.clone(),
+                        fingerprint: row.fingerprint.clone(),
+                        effective_secret_fingerprint: "old".into(),
+                        call_tx,
+                        oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                        recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                        shutdown_tx: Some(shutdown_tx),
+                        completed: completed.clone(),
+                        join,
+                        session: Arc::new(Mutex::new(None)),
+                    },
+                );
+                service
+                    .inner
+                    .runtime_generations
+                    .lock()
+                    .await
+                    .insert(id.clone(), 42);
+                effect_release.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), effect_completed.notified())
+                    .await
+                    .unwrap();
+                assert!(
+                    completed.is_cancelled(),
+                    "real actor must have finished its failed drain"
+                );
+                assert!(Arc::ptr_eq(
+                    &service.inner.tasks.lock().await[&id].completed,
+                    &completed
+                ));
+                assert_eq!(service.inner.runtime_generations.lock().await[&id], 42);
+                assert_eq!(connects.load(Ordering::SeqCst), 0);
+                assert!(
+                    service
+                        .stop_task_result(&id, DomainRuntimeState::Stopped)
+                        .await
+                        .is_err()
+                );
+                *service.inner.oauth_effect_barrier.lock().unwrap() = None;
+                service.shutdown().await;
+                continue;
+            }
             let expected = if unrelated {
                 DomainRuntimeState::Degraded
             } else {
@@ -7280,7 +9037,8 @@ mod tests {
             let (old, store, workspace, secrets) = test_mcp_service_with_secrets().await;
             old.shutdown().await;
             let sessions = Arc::new(SessionManager::new());
-            let (recipient_tx, mut recipient) = mpsc::channel(1024);
+            let (recipient_tx, mut recipient) =
+                crate::session::test_support::outbound_channel(1024);
             let mut principal = (*authenticated_test_superuser()).clone();
             principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
             let client = sessions
@@ -7428,7 +9186,7 @@ mod tests {
             .unwrap();
             if deadline {
                 async fn wire_state(
-                    recipient: &mut mpsc::Receiver<axum::extract::ws::Message>,
+                    recipient: &mut crate::session::test_support::OutboundTestReceiver,
                     state: &str,
                 ) -> JsonValue {
                     tokio::time::timeout(Duration::from_secs(3), async {
@@ -7450,7 +9208,8 @@ mod tests {
                 let resolving = wire_state(&mut recipient, "resolving").await;
                 assert_eq!(resolving["flow_id"], browser["flow_id"]);
                 assert!(resolving["authorization_url"].is_null());
-                let (second_tx, mut second_rx) = mpsc::channel(1024);
+                let (second_tx, mut second_rx) =
+                    crate::session::test_support::outbound_channel(1024);
                 let mut second_principal = (*authenticated_test_superuser()).clone();
                 second_principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
                 let second = sessions
@@ -8495,6 +10254,141 @@ mod tests {
         assert_eq!(
             materialization.diagnostics[0].code,
             "mcp.resolution.installation_unavailable"
+        );
+    }
+    // C1 regression source only: NOT_RUN / NOT_COMPILED.
+    #[tokio::test]
+    async fn direct_native_start_cannot_bypass_the_closed_parent_during_oauth_recovery() {
+        let (service, store, workspace) = test_mcp_service().await;
+        seed_mcp_installation(&store, &workspace, "template", false, false).await;
+        let mut row = store
+            .find_mcp_server_installation("workspace", &workspace, "template")
+            .await
+            .unwrap()
+            .unwrap();
+        let parent_id = "P".repeat(21);
+        let child_id = "S".repeat(21);
+        let now = chrono::Utc::now().fixed_offset();
+        store
+            .insert_plugin_installation(&pioneer_crud::PackageRecord {
+                kind: pioneer_crud::PackageKind::Plugin,
+                app_manifest_json: None,
+                app_localizations_json: None,
+                operation_error_json: None,
+                id: parent_id.clone(),
+                workspace_id: workspace.clone(),
+                name: "mixed".into(),
+                version: None,
+                source_upload_id: "source".into(),
+                package_path: "/unused/package".into(),
+                data_path: "/unused/data".into(),
+                package_fingerprint: "tree".into(),
+                enabled: true,
+                allow_implicit_invocation: false,
+                state: "installing".into(),
+                revision: 1,
+                display_name: None,
+                short_description: None,
+                description: None,
+                long_description: None,
+                developer_name: None,
+                author_name: None,
+                author_email: None,
+                author_url: None,
+                homepage: None,
+                repository: None,
+                documentation_url: None,
+                support_url: None,
+                privacy_policy_url: None,
+                terms_of_service_url: None,
+                license: None,
+                category: None,
+                brand_color: None,
+                logo_path: None,
+                logo_revision: None,
+                composer_icon_path: None,
+                composer_icon_revision: None,
+                pending_json: Some("{}".into()),
+                last_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        row.id = Some(child_id.clone());
+        row.name = "pplugin_closed_parent_fixture".into();
+        row.enabled = true;
+        let write = pioneer_crud::PluginOwnershipWrite {
+            kind: pioneer_protocol::PackageKind::Plugin,
+            plugin_id: parent_id.clone(),
+            expected_revision: 1,
+            member_key: "one".into(),
+            member_path: None,
+            package_fingerprint: "tree".into(),
+            child_id: child_id.clone(),
+        };
+        let audit = pioneer_crud::McpAuditEventRecord {
+            turn_id: None,
+            server_installation_id: Some(child_id.clone()),
+            server_name: row.name.clone(),
+            raw_tool_name: None,
+            callable_name: None,
+            catalog_version: None,
+            action: "install".into(),
+            decision: "allowed".into(),
+            reason_code: None,
+            details_json: "{}".into(),
+            created_at_unix: 1,
+        };
+        store
+            .upsert_mcp_server_installation_with_audit_and_ownership(&row, &audit, Some(&write), 1)
+            .await
+            .unwrap();
+        store
+            .settle_plugin_installation(&parent_id, 1, "installed", None)
+            .await
+            .unwrap();
+        store
+            .begin_plugin_mutation(
+                &workspace,
+                &parent_id,
+                1,
+                "updating",
+                true,
+                "{\"kind\":\"set_enabled\",\"enabled\":true}",
+            )
+            .await
+            .unwrap();
+        let _native = service
+            .installation_lifecycle_guard("workspace", &workspace, &row.name)
+            .await;
+        // OAuth Authorized and restart converge on this real native start seam.
+        // The connector must never be reached while the parent gate is closed.
+        service
+            .start_task(
+                row.clone(),
+                "fixture-fingerprint".into(),
+                service.runtime_store(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!service.inner.tasks.lock().await.contains_key(&child_id));
+        assert!(
+            !service
+                .inner
+                .runtime_generations
+                .lock()
+                .await
+                .contains_key(&child_id)
+        );
+        assert!(
+            store
+                .find_mcp_server_installation("workspace", &workspace, &row.name)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
         );
     }
 }

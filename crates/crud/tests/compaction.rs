@@ -638,6 +638,9 @@ async fn candidate_admission_fixture(
     prepare_manifest: bool,
 ) -> Checkpoint {
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "p".into(),
         model: "m".into(),
@@ -1165,6 +1168,179 @@ async fn durable_runner_manifest_candidate_and_state_commit_together() {
     verify_runner_commit_dependency(false).await;
 }
 #[tokio::test]
+async fn durable_runner_admission_preserves_overflow_and_ordinary_allowances() {
+    use pioneer_compaction::runner::{AttemptObservation, FailureKind, RunnerPhase, RunnerState};
+    let store = store().await;
+    pioneer_sqlite::apply_sqlite_pragmas(&store.database_connection())
+        .await
+        .unwrap();
+    let source = source(&store, "retry-source", 1, "retained source").await;
+    candidate_admission_fixture(
+        &store,
+        "retry-runner",
+        None,
+        &source,
+        Default::default(),
+        true,
+    )
+    .await;
+    let deadline = u64::try_from(
+        store
+            .compaction_operation("retry-runner")
+            .await
+            .unwrap()
+            .unwrap()
+            .deadline_ms,
+    )
+    .unwrap();
+    let initial =
+        RunnerState::new(deadline, &ModelBudget::new(None, None, None), 1000, None).unwrap();
+    for (overflow, ceiling) in [(1, None), (0, Some(0)), (0, Some(8500))] {
+        let mut invalid = initial.clone();
+        invalid.overflow_rejections = overflow;
+        invalid.overflow_input_ceiling = ceiling;
+        assert!(
+            store
+                .compaction_activate_runner("retry-runner", &invalid)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid initial runner state")
+        );
+        assert!(
+            store
+                .compaction_runner_state("retry-runner")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    // Decode a pre-estimation JSON shape at the actual activation boundary.
+    let mut legacy = serde_json::to_value(initial).unwrap();
+    for field in [
+        "portion_attempts",
+        "overflow_rejections",
+        "overflow_input_ceiling",
+    ] {
+        legacy.as_object_mut().unwrap().remove(field);
+    }
+    let initial: RunnerState = serde_json::from_value(legacy).unwrap();
+    assert_eq!(initial.portion_attempts, 0);
+    assert_eq!(initial.overflow_rejections, 0);
+    assert_eq!(initial.overflow_input_ceiling, None);
+    store
+        .compaction_activate_runner("retry-runner", &initial)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_runner_state("retry-runner")
+            .await
+            .unwrap()
+            .unwrap(),
+        initial
+    );
+
+    // Independent invalid storage proposals. Total<=7 alone would admit the
+    // first four; no saturating subtraction may accept overflow>portion.
+    for (portion, overflow, retries, corrections) in [
+        (4, 0, 0, 0),
+        (7, 3, 0, 0),
+        (5, 5, 0, 0),
+        (1, 2, 0, 0),
+        (1, 0, 3, 0),
+        (1, 0, 0, 2),
+    ] {
+        let mut invalid = initial.claim(1).unwrap();
+        invalid.portion_attempts = portion;
+        invalid.overflow_rejections = overflow;
+        invalid.retries = retries;
+        invalid.corrections = corrections;
+        assert!(
+            store
+                .compaction_runner_transition("retry-runner", initial.generation, &invalid, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid state transition")
+        );
+        assert_eq!(
+            store
+                .compaction_runner_state("retry-runner")
+                .await
+                .unwrap()
+                .unwrap(),
+            initial
+        );
+    }
+
+    // Exercise one mixed execution through the real persistence owner. The
+    // shrink arithmetic itself is covered by the pure runner; here every claim
+    // and failure must survive a new CrudStore handle and reload, including 4..7.
+    let mut current = initial;
+    let mut now = 1_u64;
+    for kind in [
+        FailureKind::InputOverflow,
+        FailureKind::Transient,
+        FailureKind::InputOverflow,
+        FailureKind::InvalidCompletion,
+        FailureKind::InputOverflow,
+        FailureKind::InputOverflow,
+        FailureKind::Permanent,
+    ] {
+        if let RunnerPhase::Backoff { not_before_ms, .. } = current.phase {
+            now = now.max(not_before_ms);
+        }
+        let mut claim = current.claim(now).unwrap();
+        claim.observation = Some(AttemptObservation {
+            number: claim.attempts,
+            started_ms: now,
+            finished_ms: None,
+            estimated_input_tokens: claim.input_ceiling().unwrap_or(10_000),
+            output_cap: claim.target_tokens,
+            input_tokens: None,
+            output_tokens: None,
+            completion: None,
+            failure: None,
+            diagnostic: None,
+        });
+        assert!(
+            store
+                .compaction_runner_transition("retry-runner", current.generation, &claim, None)
+                .await
+                .unwrap()
+        );
+        let reloaded = CrudStore::new(store.database_connection()).with_maintenance_access();
+        let saved_claim = reloaded
+            .compaction_runner_state("retry-runner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_claim, claim);
+        let failed = saved_claim.attempt_failed(kind, now + 1, None).unwrap();
+        assert!(
+            reloaded
+                .compaction_runner_transition("retry-runner", saved_claim.generation, &failed, None)
+                .await
+                .unwrap()
+        );
+        current = store
+            .compaction_runner_state("retry-runner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current, failed);
+        now += 2;
+    }
+    assert_eq!(current.attempts, 7);
+    assert_eq!(current.portion_attempts, 7);
+    assert_eq!(current.overflow_rejections, 4);
+    assert!(current.overflow_input_ceiling.is_some());
+    assert_eq!(current.retries, 1);
+    assert_eq!(current.cursor, Default::default());
+    assert_eq!(current.previous_checkpoint, None);
+}
+#[tokio::test]
 async fn selected_source_edit_does_not_invalidate_completed_runner_summary() {
     verify_runner_commit_dependency(true).await;
 }
@@ -1204,6 +1380,9 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
         admission: CompactionSettings::default()
             .admit(
                 &ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: Transport::Api,
                     instance: "p".into(),
                     model: "m".into(),
@@ -6073,6 +6252,9 @@ async fn admit_import_operation(
         admission: CompactionSettings::default()
             .admit(
                 &ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport: Transport::Api,
                     instance: "p".into(),
                     model: "m".into(),
@@ -6624,6 +6806,34 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
         )
         .await
         .unwrap();
+    for _ in 0..32 {
+        if store
+            .compaction_prepare_history_quantum("ws", "thread")
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+    assert!(
+        store
+            .compaction_history_prepared("ws", "thread")
+            .await
+            .unwrap()
+    );
+    let database = store.database_connection();
+    let mut prepared_wake = database.work_signal("compaction").subscribe();
+    prepared_wake.begin_pass(&database).await.unwrap();
+    assert!(
+        store
+            .compaction_prepare_history_quantum("ws", "thread")
+            .await
+            .unwrap()
+    );
+    assert!(
+        futures_util::FutureExt::now_or_never(prepared_wake.wait(None)).is_none(),
+        "an already prepared history is a read-only acknowledgement"
+    );
     let reference = store
         .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
@@ -6637,8 +6847,34 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
     ] {
         let op = admit_import_operation(&store, id, "thread", "turn").await;
         let initial = ready_import_operation(&store, &op, "thread", &reference).await;
-        store.compaction_finish(id, status, outcome).await.unwrap();
         let db = store.database_connection();
+        let mut replay = db.work_signal("compaction").subscribe();
+        replay.begin_pass(&db).await.unwrap();
+        store
+            .compaction_bind_execution_turn(id, "turn")
+            .await
+            .unwrap();
+        let budget = ModelBudget::new(None, None, None);
+        store
+            .compaction_prepare_runner(id, &budget, 1, 0)
+            .await
+            .unwrap();
+        let activation = pioneer_compaction::runner::RunnerState::new(
+            op.admission.deadline_ms,
+            &budget,
+            1000,
+            None,
+        )
+        .unwrap();
+        store
+            .compaction_activate_runner(id, &activation)
+            .await
+            .unwrap();
+        assert!(
+            futures_util::FutureExt::now_or_never(replay.wait(None)).is_none(),
+            "idempotent runner admission must not wake discovery"
+        );
+        store.compaction_finish(id, status, outcome).await.unwrap();
         db.execute_unprepared("CREATE TEMP TRIGGER abort_terminal_state BEFORE UPDATE ON compaction_runner_state BEGIN SELECT RAISE(ABORT,'terminal state rollback'); END").await.unwrap();
         assert!(store.compaction_reconcile_runner_state(id).await.is_err());
         assert_eq!(
@@ -6653,6 +6889,11 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
         db.execute_unprepared("DROP TRIGGER abort_terminal_state")
             .await
             .unwrap();
+        let mut consumers = ["compaction", "maintenance.frozen", "maintenance.html"]
+            .map(|domain| db.work_signal(domain).subscribe());
+        for consumer in &mut consumers {
+            consumer.begin_pass(&db).await.unwrap();
+        }
         let (a, b) = tokio::join!(
             store.compaction_reconcile_runner_state(id),
             store.compaction_reconcile_runner_state(id)
@@ -6661,6 +6902,23 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
             assert_eq!(state.generation, initial.generation + 1);
             assert_eq!(state.phase, RunnerPhase::Failed { kind: kind.clone() });
         }
+        for consumer in &mut consumers {
+            assert!(futures_util::FutureExt::now_or_never(consumer.wait(None)).is_some());
+            consumer.begin_pass(&db).await.unwrap();
+        }
+        // A repeated terminal UPDATE and unchanged DTO must not re-enqueue work.
+        store.compaction_finish(id, status, outcome).await.unwrap();
+        store
+            .compaction_finish_execution(id, None, op.admission.deadline_ms, status, outcome)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .compaction_reconcile_runner_state("absent-operation")
+                .await
+                .unwrap()
+                .is_none()
+        );
         let again = store
             .compaction_reconcile_runner_state(id)
             .await
@@ -6678,6 +6936,18 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
                 .await
                 .unwrap()
         );
+        assert!(
+            !store
+                .compaction_claim_attempt(id, 0, 0, false, false)
+                .await
+                .unwrap()
+        );
+        for consumer in &mut consumers {
+            assert!(
+                futures_util::FutureExt::now_or_never(consumer.wait(None)).is_none(),
+                "terminal ACK and rejected CAS must leave independent consumers parked"
+            );
+        }
         let event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
             pioneer_protocol::ItemCompletedNotification {
                 workspace_id: "ws".into(),
@@ -6824,14 +7094,19 @@ async fn compaction_post_terminal_stop_survives_worker_loss_and_fences_new_admis
     db.execute_unprepared("DROP TRIGGER abort_context_stop")
         .await
         .unwrap();
+    let mut stopped = db.work_signal("compaction").subscribe();
+    stopped.begin_pass(&db).await.unwrap();
     store
         .compaction_stop_execution("ws", "thread", &op.owner, "turn")
         .await
         .unwrap();
+    assert!(futures_util::FutureExt::now_or_never(stopped.wait(None)).is_some());
+    stopped.begin_pass(&db).await.unwrap();
     store
         .compaction_stop_execution("ws", "thread", &op.owner, "turn")
         .await
         .unwrap();
+    assert!(futures_util::FutureExt::now_or_never(stopped.wait(None)).is_none());
     // No service reconciliation runs: model a lost worker with a ready candidate.
     assert!(store.compaction_execution_cancelled(&op.id).await.unwrap());
     assert_eq!(
@@ -7005,9 +7280,77 @@ async fn legacy_task_snapshot_reference_is_bounded_scoped_and_revision_guarded()
     );
 }
 
+// These fixtures enter optional preparation through canonical root publication,
+// while retry/deadline tests below continue to own the durable worker contract.
+async fn start_history_check_root(store: &CrudStore) {
+    let mut thread = store.get_thread_model("thread").await.unwrap().unwrap();
+    thread.updated_at = 1;
+    let (_, mut turn) = store.get_turn("thread", "turn").await.unwrap().unwrap();
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn WHERE id='turn'")
+        .await
+        .unwrap();
+    // The serialized writer may have foreign_keys=OFF, as production does.
+    // Retire only this raw fixture's creation key before reusing its Turn id.
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM compaction_turn_creation WHERE turn_id='turn'")
+        .await
+        .unwrap();
+    turn.status = pioneer_protocol::TurnStatus::InProgress;
+    store
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &turn,
+            &[],
+            pioneer_protocol::PersistedActorRef::Principal(
+                pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+}
+
+async fn publish_history_check_root(store: &CrudStore) {
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "root-answer".into(),
+                    text: "ready root answer".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let (_, mut turn) = store.get_turn("thread", "turn").await.unwrap().unwrap();
+    turn.status = pioneer_protocol::TurnStatus::Completed;
+    store
+        .materialize_turn_completed(
+            pioneer_protocol::TurnCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
     let store = store().await;
+    start_history_check_root(&store).await;
     let db = store.database_connection();
     db.execute_unprepared("INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,model,frozen_manifest_id) VALUES('turn','thread','thread','ws','claude','claude','native','running','sonnet',NULL)").await.unwrap();
     assert!(
@@ -7037,9 +7380,7 @@ async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
             .unwrap()
             .is_empty()
     );
-    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
-        .await
-        .unwrap();
+    publish_history_check_root(&store).await;
     let pending = store.compaction_pending_history_checks().await.unwrap();
     assert_eq!(pending.len(), 1);
     assert!(
@@ -7290,6 +7631,9 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
             db.execute_unprepared(sql).await.unwrap();
         }
         let selection = serde_json::to_string(&ModelSelection {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             transport: Transport::Api,
             instance: "upgrade-instance".into(),
             model: "upgrade-model".into(),
@@ -7315,6 +7659,9 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
             admission: CompactionSettings::default()
                 .admit(
                     &ModelSelection {
+                        service_mode: None,
+                        context_authority: None,
+                        context_window: None,
                         transport: Transport::Api,
                         instance: "upgrade-instance".into(),
                         model: "upgrade-model".into(),
@@ -8134,21 +8481,67 @@ async fn history_check_retries_are_durable_bounded_and_cas_protected() {
     use pioneer_entity::compaction_history_check as check;
     use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
-        .await
-        .unwrap();
+    start_history_check_root(&store).await;
     store
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
         .await
         .unwrap();
+    let db = store.database_connection();
+    let mut duplicate = db.work_signal("compaction").subscribe();
+    duplicate.begin_pass(&db).await.unwrap();
     store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
         .await
         .unwrap();
+    assert!(
+        futures_util::FutureExt::now_or_never(duplicate.wait(None)).is_none(),
+        "an unchanged pending descriptor must not wake discovery"
+    );
+    publish_history_check_root(&store).await;
     let mut now = 1000;
+    // Finish the real lifecycle bootstrap/scope obligations first. They have
+    // independent deadlines even while this history root is owned.
+    for _ in 0..16 {
+        let seed = store
+            .compaction_expand_lifecycle_scope(true, &|| 1000)
+            .await
+            .unwrap();
+        let scopes = store
+            .compaction_expand_lifecycle_scope(false, &|| 1000)
+            .await
+            .unwrap();
+        if seed + scopes == 0 {
+            break;
+        }
+    }
+    let owned_root = [("ws".to_owned(), "thread".to_owned())];
+    assert!(
+        store
+            .compaction_due_history_checks_excluding(now, &owned_root)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an older owned check blocks this whole conversation"
+    );
+    assert!(
+        store
+            .next_compaction_background_deadline(&owned_root)
+            .await
+            .unwrap()
+            .is_none(),
+        "completion notification owns capacity release; no due SQL spin while it is held"
+    );
+    assert_eq!(
+        store
+            .compaction_due_history_checks_excluding(
+                now,
+                &[("other-workspace".to_owned(), "thread".to_owned())]
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     for (failure, delay) in [60_000, 300_000, 900_000, 0].into_iter().enumerate() {
         let page = store.compaction_due_history_checks(now).await.unwrap();
         assert_eq!(page.len(), 1);
@@ -8274,20 +8667,12 @@ async fn history_check_waits_do_not_spend_retries_and_stop_wins_over_stale_resul
     use pioneer_entity::compaction_history_check as check;
     use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
-        .await
-        .unwrap();
+    start_history_check_root(&store).await;
     store
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
         .await
         .unwrap();
-    store
-        .database_connection()
-        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
-        .await
-        .unwrap();
+    publish_history_check_root(&store).await;
     let mut now = 0;
     for outcome in [
         O::Preparing,
@@ -8373,109 +8758,78 @@ async fn history_check_waits_do_not_spend_retries_and_stop_wins_over_stale_resul
 }
 
 #[tokio::test]
-async fn history_check_legacy_failures_are_reconciled_once_without_reviving_cancelled_jobs() {
-    use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
+async fn history_check_legacy_failures_remain_retained_without_optional_admission() {
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
     let db = store.database_connection();
     db.execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
         .await
         .unwrap();
     store
-        .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .compaction_enqueue_native_history_check("ws", "thread", "turn", "retained descriptor")
         .await
         .unwrap();
     db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
         .await
         .unwrap();
-    db.execute_unprepared("UPDATE compaction_history_check SET state='finished',outcome='failed' WHERE turn_id='turn'").await.unwrap();
-    let row = store
-        .compaction_due_history_checks(0)
-        .await
-        .unwrap()
-        .remove(0);
-    let claim = store
-        .compaction_claim_history_check("turn", row.revision, 0)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        serde_json::from_str::<D>(claim.diagnostic.as_ref().unwrap())
-            .unwrap()
-            .legacy_reason_unknown,
-        "legacy marker must survive a crash before the result is recorded"
-    );
-    let d = D {
-        legacy_reason_unknown: true,
-        ..D::new("budget", "history_fits", "No summary needed")
-    };
-    store
-        .compaction_record_history_result("turn", claim.revision, 0, O::Fits, &d, 0)
-        .await
-        .unwrap();
-    assert!(
-        store
-            .compaction_due_history_checks(i64::MAX)
+    for outcome in ["failed", "cancelled"] {
+        db.execute_unprepared(&format!("UPDATE compaction_history_check SET managed=0,state='finished',outcome='{outcome}' WHERE turn_id='turn'")).await.unwrap();
+        let before = check::Entity::find_by_id("turn")
+            .one(&db)
             .await
             .unwrap()
-            .is_empty()
-    );
-    db.execute_unprepared("UPDATE compaction_history_check SET managed=0,state='finished',outcome='cancelled' WHERE turn_id='turn'").await.unwrap();
-    assert!(
-        store
-            .compaction_due_history_checks(i64::MAX)
+            .unwrap();
+        assert!(
+            store
+                .compaction_due_history_checks(i64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .compaction_claim_history_check("turn", before.revision, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let after = check::Entity::find_by_id("turn")
+            .one(&db)
             .await
             .unwrap()
-            .is_empty()
-    );
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "policy upgrade must not spend or rewrite the legacy lifecycle budget"
+        );
+    }
 }
 
 #[tokio::test]
-async fn history_check_legacy_pages_discard_superseded_turns_and_make_progress() {
+async fn history_check_legacy_pages_do_not_reenter_optional_discovery() {
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::EntityTrait;
     let store = store().await.with_maintenance_access();
     let db = store.database_connection();
     for n in 0..33 {
         db.execute_unprepared(&format!("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('legacy-{n:02}','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")).await.unwrap();
         db.execute_unprepared(&format!("INSERT INTO compaction_history_check(turn_id,state,outcome) VALUES ('legacy-{n:02}','finished','failed')")).await.unwrap();
     }
-    for expected in [16, 16, 1] {
-        let page = store.compaction_due_history_checks(0).await.unwrap();
-        assert_eq!(page.len(), expected);
-        for row in page {
-            let claim = store
-                .compaction_claim_history_check(&row.turn_id, row.revision, 0)
+    let before = check::Entity::find().all(&db).await.unwrap();
+    for _ in 0..2 {
+        assert!(
+            store
+                .compaction_due_history_checks(i64::MAX)
                 .await
-                .unwrap();
-            if row.turn_id == "legacy-32" {
-                let claim = claim.unwrap();
-                store
-                    .compaction_record_history_result(
-                        &row.turn_id,
-                        claim.revision,
-                        0,
-                        HistoryCheckOutcome::Failed,
-                        &HistoryCheckDiagnostic::new(
-                            "descriptor",
-                            "invalid_descriptor",
-                            "Malformed metadata quarantined",
-                        ),
-                        0,
-                    )
-                    .await
-                    .unwrap();
-            } else {
-                assert!(
-                    claim.is_none(),
-                    "newer turn must invalidate an old failed check"
-                );
-            }
-        }
+                .unwrap()
+                .is_empty()
+        );
     }
-    assert!(
-        store
-            .compaction_due_history_checks(i64::MAX)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        check::Entity::find().all(&db).await.unwrap(),
+        before,
+        "discovery must leave legacy checks available to lifecycle inspection"
     );
 }
 
@@ -8602,6 +8956,9 @@ async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publish
     let a = source(&store, "A", 1, "original A").await;
     let b = source(&store, "B", 2, "original B").await;
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "p".into(),
         model: "m".into(),
@@ -8929,6 +9286,9 @@ async fn raw_assertion_api_saves_permuted_prebuilt_manifest_and_publishes_exactl
     let b1 = source(&store, "B1", 2, "only B").await;
     let a2 = source(&store, "A2", 3, "second A").await;
     let selection = ModelSelection {
+        service_mode: None,
+        context_authority: None,
+        context_window: None,
         transport: Transport::Api,
         instance: "p".into(),
         model: "m".into(),
@@ -9399,6 +9759,8 @@ async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_cha
             attempts: 1,
             retries: 0,
             portion_attempts: 0,
+            overflow_rejections: 0,
+            overflow_input_ceiling: None,
             corrections: 0,
             target_tokens: 10,
             source_text_projection_version: 0,

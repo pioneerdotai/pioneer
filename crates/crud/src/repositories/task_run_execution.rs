@@ -96,6 +96,12 @@ pub async fn insert_execution_if_absent<C: ConnectionTrait>(
     db: &C,
     execution: NewTaskRunExecution,
 ) -> Result<()> {
+    let source_run_id = execution.task_run_id.clone();
+    let old = task_run_execution::Entity::find()
+        .filter(task_run_execution::Column::TaskRunId.eq(&source_run_id))
+        .lock_exclusive()
+        .one(db)
+        .await?;
     task_run_execution::Entity::insert(active_model_from_new_execution(execution)?)
         .on_conflict(
             OnConflict::column(task_run_execution::Column::TaskRunId)
@@ -105,6 +111,12 @@ pub async fn insert_execution_if_absent<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to insert task run execution")?;
+    let new = task_run_execution::Entity::find()
+        .filter(task_run_execution::Column::TaskRunId.eq(&source_run_id))
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::execution_change(db, old.as_ref(), new.as_ref()).await?;
     Ok(())
 }
 
@@ -158,6 +170,10 @@ pub async fn claim_execution<C: ConnectionTrait>(
     now: DateTimeWithTimeZone,
     lease_until: DateTimeWithTimeZone,
 ) -> Result<Option<task_run_execution::Model>> {
+    let old = task_run_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     let terminal_statuses = terminal_status_values();
     let reserved = task_run_execution_status_to_db(TaskRunExecutionStatus::Reserved);
     let result = task_run_execution::Entity::update_many()
@@ -198,7 +214,12 @@ pub async fn claim_execution<C: ConnectionTrait>(
     if result.rows_affected == 0 {
         return Ok(None);
     }
-    find_execution_by_id(db, execution_id).await
+    let new = task_run_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::execution_change(db, old.as_ref(), new.as_ref()).await?;
+    Ok(new)
 }
 
 pub async fn mark_execution_running<C: ConnectionTrait>(
@@ -207,6 +228,10 @@ pub async fn mark_execution_running<C: ConnectionTrait>(
     started_at: DateTimeWithTimeZone,
     lease_until: Option<DateTimeWithTimeZone>,
 ) -> Result<Option<task_run_execution::Model>> {
+    let old = task_run_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     let terminal_statuses = terminal_status_values();
     let mut update = task_run_execution::Entity::update_many()
         .filter(task_run_execution::Column::Id.eq(execution_id.to_owned()))
@@ -242,7 +267,12 @@ pub async fn mark_execution_running<C: ConnectionTrait>(
     if result.rows_affected == 0 {
         return Ok(None);
     }
-    find_execution_by_id(db, execution_id).await
+    let new = task_run_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::execution_change(db, old.as_ref(), new.as_ref()).await?;
+    Ok(new)
 }
 
 pub async fn mark_execution_waiting_review_by_run<C: ConnectionTrait>(
@@ -250,6 +280,11 @@ pub async fn mark_execution_waiting_review_by_run<C: ConnectionTrait>(
     run_id: &str,
     entered_at: DateTimeWithTimeZone,
 ) -> Result<Option<task_run_execution::Model>> {
+    let old = task_run_execution::Entity::find()
+        .filter(task_run_execution::Column::TaskRunId.eq(run_id))
+        .lock_exclusive()
+        .one(db)
+        .await?;
     let terminal_statuses = terminal_status_values();
     let result = task_run_execution::Entity::update_many()
         .filter(task_run_execution::Column::TaskRunId.eq(run_id.to_owned()))
@@ -278,7 +313,13 @@ pub async fn mark_execution_waiting_review_by_run<C: ConnectionTrait>(
     if result.rows_affected == 0 {
         return Ok(None);
     }
-    find_execution_by_run(db, run_id).await
+    let new = task_run_execution::Entity::find()
+        .filter(task_run_execution::Column::TaskRunId.eq(run_id))
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::execution_change(db, old.as_ref(), new.as_ref()).await?;
+    Ok(new)
 }
 
 pub async fn mark_execution_terminal<C: ConnectionTrait>(
@@ -311,6 +352,10 @@ pub(crate) async fn mark_execution_terminal_json<C: ConnectionTrait>(
     result_json: Option<String>,
     error_json: Option<String>,
 ) -> Result<Option<task_run_execution::Model>> {
+    let old = task_run_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
     debug_assert!(is_terminal_task_run_execution_status(status));
     let terminal_statuses = terminal_status_values();
     let update_result = task_run_execution::Entity::update_many()
@@ -346,7 +391,12 @@ pub(crate) async fn mark_execution_terminal_json<C: ConnectionTrait>(
     if update_result.rows_affected == 0 {
         return Ok(None);
     }
-    find_execution_by_id(db, execution_id).await
+    let new = task_run_execution::Entity::find_by_id(execution_id)
+        .lock_exclusive()
+        .one(db)
+        .await?;
+    super::task_occurrence_producers::execution_change(db, old.as_ref(), new.as_ref()).await?;
+    Ok(new)
 }
 
 pub async fn heartbeat_execution<C: ConnectionTrait>(

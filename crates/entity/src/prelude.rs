@@ -14,7 +14,6 @@ pub use super::agent_execution_resource_state::Entity as AgentExecutionResourceS
 pub use super::agent_identity::Entity as AgentIdentity;
 pub use super::agent_memory::Entity as AgentMemory;
 pub use super::agent_memory_candidate::Entity as AgentMemoryCandidate;
-pub use super::agent_memory_capsule::Entity as AgentMemoryCapsule;
 pub use super::agent_memory_event::Entity as AgentMemoryEvent;
 pub use super::agent_memory_identity::Entity as AgentMemoryIdentity;
 pub use super::agent_memory_policy_decision::Entity as AgentMemoryPolicyDecision;
@@ -76,6 +75,7 @@ pub use super::compaction_operation_projection::Entity as CompactionOperationPro
 pub use super::compaction_projection_epoch::Entity as CompactionProjectionEpoch;
 pub use super::compaction_publication_fence::Entity as CompactionPublicationFence;
 pub use super::compaction_publication_source_fence::Entity as CompactionPublicationSourceFence;
+pub use super::compaction_root_activity::Entity as CompactionRootActivity;
 pub use super::compaction_runner_plan::Entity as CompactionRunnerPlan;
 pub use super::compaction_runner_state::Entity as CompactionRunnerState;
 pub use super::compaction_source_revision::Entity as CompactionSourceRevision;
@@ -161,7 +161,6 @@ pub use super::thread::Entity as Thread;
 pub use super::thread_agents_doc::Entity as ThreadAgentsDoc;
 pub use super::thread_agents_doc_revision::Entity as ThreadAgentsDocRevision;
 pub use super::thread_cli_runtime_binding::Entity as ThreadCliRuntimeBinding;
-pub use super::thread_episodic_capsules::Entity as ThreadEpisodicCapsules;
 pub use super::thread_episodic_embedding_artifacts::Entity as ThreadEpisodicEmbeddingArtifacts;
 pub use super::thread_episodic_exclusions::Entity as ThreadEpisodicExclusions;
 pub use super::thread_episodic_index_jobs::Entity as ThreadEpisodicIndexJobs;
@@ -209,3 +208,24 @@ pub use super::unread_message_position::Entity as UnreadMessagePosition;
 pub use super::user_notification_outbox::Entity as UserNotificationOutbox;
 pub use super::workspace::Entity as Workspace;
 pub use super::workspace_membership::Entity as WorkspaceMembership;
+
+pub use super::plugin_installation::Entity as PluginInstallation;
+pub use super::portable_payload_dictionary::Entity as PortablePayloadDictionary;
+
+pub use super::portable_payload::Entity as PortablePayload;
+
+pub use super::html_preview_io_work::Entity as HtmlPreviewIoWork;
+pub use super::portable_payload_block::Entity as PortablePayloadBlock;
+
+pub use super::plugin_default_prompt::Entity as PluginDefaultPrompt;
+pub use super::plugin_keyword::Entity as PluginKeyword;
+pub use super::task_child_reconcile_pending::Entity as TaskChildReconcilePending;
+pub use super::task_child_reconcile_scope::Entity as TaskChildReconcileScope;
+
+pub use super::agent_memory_payloads::Entity as AgentMemoryPayloads;
+pub use super::execution_observation::Entity as ExecutionObservation;
+pub use super::execution_tariff::Entity as ExecutionTariff;
+
+pub use super::app_installation::Entity as AppInstallation;
+pub use super::package_component::Entity as PackageComponent;
+pub use super::package_installation::Entity as PackageInstallation;

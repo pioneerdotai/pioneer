@@ -1,5 +1,9 @@
+use crate::query_scope::{
+    DiagnosticStream, PoolFutureExt, ScopedFuture, observe_control, open_stream,
+};
 use async_trait::async_trait;
 use futures_util::Stream;
+use pioneer_observability::query_cpu::{self, QueryScope};
 use sea_orm::{
     AccessMode, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr,
     ExecResult, IsolationLevel, QueryResult, QueryStream, Statement, StreamTrait, TransactionError,
@@ -15,7 +19,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tracing::{Instrument, Span};
 
 use crate::reader::{SqliteMaintenanceReadPermit, SqliteReadOperation, SqliteReadOutcome};
 
@@ -44,20 +47,14 @@ impl SqliteWriteClass {
     }
 }
 
-fn writer_pool_span(class: SqliteWriteClass) -> Span {
+fn writer_pool_context(
+    class: SqliteWriteClass,
+) -> pioneer_observability::pool_context::PoolContext {
+    use pioneer_observability::pool_context::PoolContext;
     match class {
-        SqliteWriteClass::Critical => tracing::trace_span!(
-            target: "pioneer_sqlite::pool",
-            "pioneer.sqlite.writer.critical"
-        ),
-        SqliteWriteClass::Interactive => tracing::trace_span!(
-            target: "pioneer_sqlite::pool",
-            "pioneer.sqlite.writer.interactive"
-        ),
-        SqliteWriteClass::Maintenance => tracing::trace_span!(
-            target: "pioneer_sqlite::pool",
-            "pioneer.sqlite.writer.maintenance"
-        ),
+        SqliteWriteClass::Critical => PoolContext::WriterCritical,
+        SqliteWriteClass::Interactive => PoolContext::WriterInteractive,
+        SqliteWriteClass::Maintenance => PoolContext::WriterMaintenance,
     }
 }
 
@@ -116,6 +113,16 @@ pub enum SqliteWriteEvent {
 pub trait SqliteWriteObserver: Send + Sync + 'static {
     fn observe(&self, event: SqliteWriteEvent);
 
+    /// Atomic observation adapter. Called after the native state lock is released.
+    fn observe_admission(&self, event: SqliteWriteEvent, snapshot: crate::SqliteAdmissionSnapshot) {
+        self.observe(event);
+        self.observe_queue_snapshot(snapshot);
+    }
+
+    /// Pure current owner snapshot after mutation, including the oldest of
+    /// the three FIFO class heads. No queue scan or readiness query.
+    fn observe_queue_snapshot(&self, _snapshot: crate::SqliteAdmissionSnapshot) {}
+
     /// Test-only pause after `execute_raw` owns its writer permit. The Gateway
     /// enables this feature only for tests; normal builds omit the hook.
     #[cfg(feature = "test-support")]
@@ -159,6 +166,7 @@ struct Waiter {
 
 #[derive(Default)]
 struct AdmissionState {
+    observation_revision: u64,
     active: bool,
     critical: VecDeque<Waiter>,
     interactive: VecDeque<Waiter>,
@@ -210,35 +218,45 @@ struct Reservation {
 impl Reservation {
     fn start(&mut self) {
         self.started = true;
-        self.inner.observer.observe(SqliteWriteEvent::Acquired {
-            class: self.class,
-            reason: self.reason,
-            waited: self.acquired_at.saturating_duration_since(self.enqueued_at),
-            queue: self.queue,
-        });
+        let snapshot = self.inner.queue_observation();
+        self.inner.observer.observe_admission(
+            SqliteWriteEvent::Acquired {
+                class: self.class,
+                reason: self.reason,
+                waited: self.acquired_at.saturating_duration_since(self.enqueued_at),
+                queue: self.queue,
+            },
+            snapshot,
+        );
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         let held = self.acquired_at.elapsed();
-        let (queue, dispatch) = self.inner.release();
+        let (queue, snapshot, dispatch) = self.inner.release();
         if self.started {
-            self.inner.observer.observe(SqliteWriteEvent::Released {
-                class: self.class,
-                held,
-                queue,
-            });
+            self.inner.observer.observe_admission(
+                SqliteWriteEvent::Released {
+                    class: self.class,
+                    held,
+                    queue,
+                },
+                snapshot,
+            );
         } else {
             // The waiter can be cancelled after the scheduler has selected it
             // but before the receiving future constructs its permit. That
             // race still has to close the observer lifecycle; otherwise an
             // `Enqueued` event would have neither `Acquired` nor `Cancelled`.
-            self.inner.observer.observe(SqliteWriteEvent::Cancelled {
-                class: self.class,
-                waited: self.acquired_at.saturating_duration_since(self.enqueued_at),
-                queue,
-            });
+            self.inner.observer.observe_admission(
+                SqliteWriteEvent::Cancelled {
+                    class: self.class,
+                    waited: self.acquired_at.saturating_duration_since(self.enqueued_at),
+                    queue,
+                },
+                snapshot,
+            );
         }
         AdmissionInner::dispatch(dispatch);
     }
@@ -263,14 +281,17 @@ impl Drop for WaitRegistration {
         if !self.armed {
             return;
         }
-        let Some((queue, dispatch)) = self.inner.cancel(self.id, self.class) else {
+        let Some((queue, snapshot, dispatch)) = self.inner.cancel(self.id, self.class) else {
             return;
         };
-        self.inner.observer.observe(SqliteWriteEvent::Cancelled {
-            class: self.class,
-            waited: self.enqueued_at.elapsed(),
-            queue,
-        });
+        self.inner.observer.observe_admission(
+            SqliteWriteEvent::Cancelled {
+                class: self.class,
+                waited: self.enqueued_at.elapsed(),
+                queue,
+            },
+            snapshot,
+        );
         AdmissionInner::dispatch(dispatch);
     }
 }
@@ -297,6 +318,36 @@ impl SqliteWritePermit {
 }
 
 impl AdmissionInner {
+    fn queue_observation(&self) -> crate::SqliteAdmissionSnapshot {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::queue_observation_locked(&mut state)
+    }
+
+    fn queue_observation_locked(state: &mut AdmissionState) -> crate::SqliteAdmissionSnapshot {
+        state.observation_revision = state.observation_revision.saturating_add(1);
+        let oldest = [
+            state.critical.front(),
+            state.interactive.front(),
+            state.maintenance.front(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|waiter| waiter.enqueued_at)
+        .min();
+        let queue = state.snapshot();
+        crate::SqliteAdmissionSnapshot::capture(
+            state.observation_revision,
+            queue
+                .critical
+                .saturating_add(queue.interactive)
+                .saturating_add(queue.maintenance),
+            oldest,
+        )
+    }
+
     fn enqueue(
         self: &Arc<Self>,
         class: SqliteWriteClass,
@@ -309,7 +360,7 @@ impl AdmissionInner {
             enqueued_at,
             sender,
         };
-        let (queue, dispatch) = {
+        let (queue, snapshot, dispatch) = {
             let mut state = self
                 .state
                 .lock()
@@ -319,10 +370,11 @@ impl AdmissionInner {
             let dispatch = (!state.active)
                 .then(|| self.grant_next_locked(&mut state, true))
                 .flatten();
-            (queue, dispatch)
+            let snapshot = Self::queue_observation_locked(&mut state);
+            (queue, snapshot, dispatch)
         };
         self.observer
-            .observe(SqliteWriteEvent::Enqueued { class, queue });
+            .observe_admission(SqliteWriteEvent::Enqueued { class, queue }, snapshot);
         Self::dispatch(dispatch);
         (
             receiver,
@@ -340,7 +392,11 @@ impl AdmissionInner {
         self: &Arc<Self>,
         id: u64,
         class: SqliteWriteClass,
-    ) -> Option<(SqliteWriteQueueSnapshot, Option<Dispatch>)> {
+    ) -> Option<(
+        SqliteWriteQueueSnapshot,
+        crate::SqliteAdmissionSnapshot,
+        Option<Dispatch>,
+    )> {
         let mut state = self
             .state
             .lock()
@@ -354,10 +410,17 @@ impl AdmissionInner {
         let dispatch = (!state.active)
             .then(|| self.grant_next_locked(&mut state, false))
             .flatten();
-        Some((snapshot, dispatch))
+        let current = Self::queue_observation_locked(&mut state);
+        Some((snapshot, current, dispatch))
     }
 
-    fn release(self: &Arc<Self>) -> (SqliteWriteQueueSnapshot, Option<Dispatch>) {
+    fn release(
+        self: &Arc<Self>,
+    ) -> (
+        SqliteWriteQueueSnapshot,
+        crate::SqliteAdmissionSnapshot,
+        Option<Dispatch>,
+    ) {
         let mut state = self
             .state
             .lock()
@@ -366,7 +429,8 @@ impl AdmissionInner {
         state.active = false;
         let queue = state.snapshot();
         let dispatch = self.grant_next_locked(&mut state, false);
-        (queue, dispatch)
+        let current = Self::queue_observation_locked(&mut state);
+        (queue, current, dispatch)
     }
 
     fn grant_next_locked(
@@ -503,6 +567,8 @@ impl AdmissionInner {
 pub struct SqliteWriteExecutor {
     connection: DatabaseConnection,
     admission: Arc<AdmissionInner>,
+    work_signals: Arc<Mutex<std::collections::BTreeMap<&'static str, crate::WorkSignal>>>,
+    ownership: Arc<Mutex<Option<Arc<crate::WriterOwnership>>>>,
 }
 
 impl std::fmt::Debug for SqliteWriteExecutor {
@@ -538,6 +604,8 @@ impl SqliteWriteExecutor {
     ) -> Self {
         Self {
             connection,
+            work_signals: Default::default(),
+            ownership: Default::default(),
             admission: Arc::new(AdmissionInner {
                 state: Mutex::new(AdmissionState::default()),
                 next_waiter_id: AtomicU64::new(1),
@@ -561,17 +629,34 @@ impl SqliteWriteExecutor {
             .get_max_connections()
     }
 
+    pub(crate) fn work_signal(&self, domain: &'static str) -> crate::WorkSignal {
+        self.work_signals
+            .lock()
+            .unwrap()
+            .entry(domain)
+            .or_default()
+            .clone()
+    }
+
+    pub fn retain_ownership(self, ownership: Arc<crate::WriterOwnership>) -> Self {
+        let previous = self.ownership.lock().unwrap().replace(ownership);
+        drop(previous);
+        self
+    }
+
     pub async fn close(self) -> Result<(), DbErr> {
-        self.connection.close().await
+        let result = self.connection.close().await;
+        let ownership = self.ownership.lock().unwrap().take();
+        drop(ownership);
+        result
     }
 
     /// Validates the physical writer connection under the same typed
     /// reservation and pool-attribution contract as every other operation.
     pub async fn ping(&self, class: SqliteWriteClass) -> Result<(), DbErr> {
         let permit = self.acquire(class).await;
-        self.connection
-            .ping()
-            .instrument(writer_pool_span(permit.class()))
+        observe_control(self.connection.ping(), "ping")
+            .in_pool(writer_pool_context(permit.class()))
             .await
     }
 
@@ -580,8 +665,8 @@ impl SqliteWriteExecutor {
     /// API boundary.
     pub async fn apply_pragmas(&self, class: SqliteWriteClass) -> anyhow::Result<()> {
         let permit = self.acquire(class).await;
-        crate::apply_sqlite_pragmas(&self.connection)
-            .instrument(writer_pool_span(permit.class()))
+        observe_control(crate::apply_sqlite_pragmas(&self.connection), "bootstrap")
+            .in_pool(writer_pool_context(permit.class()))
             .await
     }
 
@@ -597,8 +682,8 @@ impl SqliteWriteExecutor {
         M: MigratorTrait,
     {
         let permit = self.acquire(class).await;
-        M::up(&self.connection, steps)
-            .instrument(writer_pool_span(permit.class()))
+        observe_control(M::up(&self.connection, steps), "bootstrap")
+            .in_pool(writer_pool_context(permit.class()))
             .await
     }
 
@@ -643,10 +728,8 @@ impl ConnectionTrait for SqliteWriteConnection {
         let _startup_execute = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::DbExecute,
         );
-        self.executor
-            .connection
-            .execute_raw(statement)
-            .instrument(writer_pool_span(permit.class()))
+        query_cpu::observe(self.executor.connection.execute_raw(statement))
+            .in_pool(writer_pool_context(permit.class()))
             .await
     }
 
@@ -655,10 +738,8 @@ impl ConnectionTrait for SqliteWriteConnection {
         let _startup_execute = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::DbExecute,
         );
-        self.executor
-            .connection
-            .execute_unprepared(sql)
-            .instrument(writer_pool_span(permit.class()))
+        query_cpu::observe(self.executor.connection.execute_unprepared(sql))
+            .in_pool(writer_pool_context(permit.class()))
             .await
     }
 
@@ -667,10 +748,8 @@ impl ConnectionTrait for SqliteWriteConnection {
         let _startup_execute = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::DbExecute,
         );
-        self.executor
-            .connection
-            .query_one_raw(statement)
-            .instrument(writer_pool_span(permit.class()))
+        query_cpu::observe(self.executor.connection.query_one_raw(statement))
+            .in_pool(writer_pool_context(permit.class()))
             .await
     }
 
@@ -679,10 +758,8 @@ impl ConnectionTrait for SqliteWriteConnection {
         let _startup_execute = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::DbExecute,
         );
-        self.executor
-            .connection
-            .query_all_raw(statement)
-            .instrument(writer_pool_span(permit.class()))
+        query_cpu::observe(self.executor.connection.query_all_raw(statement))
+            .in_pool(writer_pool_context(permit.class()))
             .await
     }
 
@@ -699,7 +776,7 @@ impl ConnectionTrait for SqliteWriteConnection {
 /// maintenance-read permit until the returned rows have been consumed or the
 /// stream is dropped.
 pub struct SqliteQueryStream {
-    inner: Pin<Box<QueryStream>>,
+    inner: DiagnosticStream<QueryStream>,
     writer_permit: Option<SqliteWritePermit>,
     maintenance_read_permit: Option<SqliteMaintenanceReadPermit>,
     read_operation: Option<SqliteReadOperation>,
@@ -707,21 +784,21 @@ pub struct SqliteQueryStream {
 
 impl SqliteQueryStream {
     pub(crate) fn read(
-        inner: QueryStream,
+        inner: DiagnosticStream<QueryStream>,
         permit: Option<SqliteMaintenanceReadPermit>,
         operation: SqliteReadOperation,
     ) -> Self {
         Self {
-            inner: Box::pin(inner),
+            inner,
             writer_permit: None,
             maintenance_read_permit: permit,
             read_operation: Some(operation),
         }
     }
 
-    fn write(inner: QueryStream, permit: SqliteWritePermit) -> Self {
+    fn write(inner: DiagnosticStream<QueryStream>, permit: SqliteWritePermit) -> Self {
         Self {
-            inner: Box::pin(inner),
+            inner,
             writer_permit: Some(permit),
             maintenance_read_permit: None,
             read_operation: None,
@@ -733,7 +810,7 @@ impl Stream for SqliteQueryStream {
     type Item = Result<QueryResult, DbErr>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let result = self.inner.as_mut().poll_next(context);
+        let result = Pin::new(&mut self.inner).poll_next(context);
         match &result {
             Poll::Ready(None) => {
                 if let Some(operation) = self.read_operation.as_mut() {
@@ -772,11 +849,8 @@ impl StreamTrait for SqliteWriteConnection {
                 pioneer_observability::turn_startup::Stage::DbExecute,
             );
             let effective_class = permit.class();
-            let stream = self
-                .executor
-                .connection
-                .stream_raw(statement)
-                .instrument(writer_pool_span(effective_class))
+            let stream = open_stream(self.executor.connection.stream_raw(statement))
+                .in_pool(writer_pool_context(effective_class))
                 .await?;
             Ok(SqliteQueryStream::write(stream, permit))
         })
@@ -817,23 +891,40 @@ impl SqliteTransaction {
             .expect("SQLite transaction was already completed")
     }
 
+    fn pool_context(&self) -> pioneer_observability::pool_context::PoolContext {
+        writer_pool_context(
+            self._permit
+                .as_ref()
+                .expect("SQLite transaction must retain a writer permit")
+                .class(),
+        )
+    }
+
     pub async fn commit(mut self) -> Result<(), DbErr> {
         let _startup_commit = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::DbCommit,
         );
-        self.inner
-            .take()
-            .expect("SQLite transaction was already completed")
-            .commit()
-            .await
+        observe_control(
+            self.inner
+                .take()
+                .expect("SQLite transaction was already completed")
+                .commit(),
+            "commit",
+        )
+        .in_pool(self.pool_context())
+        .await
     }
 
     pub async fn rollback(mut self) -> Result<(), DbErr> {
-        self.inner
-            .take()
-            .expect("SQLite transaction was already completed")
-            .rollback()
-            .await
+        observe_control(
+            self.inner
+                .take()
+                .expect("SQLite transaction was already completed")
+                .rollback(),
+            "rollback",
+        )
+        .in_pool(self.pool_context())
+        .await
     }
 }
 
@@ -842,6 +933,18 @@ impl Deref for SqliteTransaction {
 
     fn deref(&self) -> &Self::Target {
         self.inner()
+    }
+}
+
+// Drop-triggered rollback is its own control command, never a successful SQL query.
+impl Drop for SqliteTransaction {
+    fn drop(&mut self) {
+        if self.inner.is_some() {
+            let _pool = self.pool_context().enter();
+            let scope = QueryScope::control("rollback_drop");
+            let _entered = scope.enter();
+            drop(self.inner.take());
+        }
     }
 }
 
@@ -863,19 +966,27 @@ impl ConnectionTrait for SqliteTransaction {
     }
 
     async fn execute_raw(&self, statement: Statement) -> Result<ExecResult, DbErr> {
-        self.inner().execute_raw(statement).await
+        query_cpu::observe(self.inner().execute_raw(statement))
+            .in_pool(self.pool_context())
+            .await
     }
 
     async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
-        self.inner().execute_unprepared(sql).await
+        query_cpu::observe(self.inner().execute_unprepared(sql))
+            .in_pool(self.pool_context())
+            .await
     }
 
     async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
-        self.inner().query_one_raw(statement).await
+        query_cpu::observe(self.inner().query_one_raw(statement))
+            .in_pool(self.pool_context())
+            .await
     }
 
     async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
-        self.inner().query_all_raw(statement).await
+        query_cpu::observe(self.inner().query_all_raw(statement))
+            .in_pool(self.pool_context())
+            .await
     }
 
     fn support_returning(&self) -> bool {
@@ -888,7 +999,7 @@ impl ConnectionTrait for SqliteTransaction {
 }
 
 impl StreamTrait for SqliteTransaction {
-    type Stream<'a> = TransactionStream<'a>;
+    type Stream<'a> = DiagnosticStream<TransactionStream<'a>>;
 
     fn get_database_backend(&self) -> DbBackend {
         StreamTrait::get_database_backend(self.inner())
@@ -898,7 +1009,23 @@ impl StreamTrait for SqliteTransaction {
         &'a self,
         statement: Statement,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
-        self.inner().stream_raw(statement)
+        Box::pin(async move {
+            let scope = QueryScope::new();
+            let result = ScopedFuture::new(self.inner().stream_raw(statement), &scope)
+                .in_pool(self.pool_context())
+                .await;
+            match result {
+                Ok(stream) => Ok(DiagnosticStream::new(
+                    stream,
+                    scope,
+                    Some(self.pool_context()),
+                )),
+                Err(error) => {
+                    scope.finish(false);
+                    Err(error)
+                }
+            }
+        })
     }
 }
 
@@ -937,11 +1064,8 @@ impl TransactionTrait for SqliteWriteConnection {
             pioneer_observability::turn_startup::Stage::DbExecute,
         );
         let effective_class = permit.class();
-        let transaction = self
-            .executor
-            .connection
-            .begin()
-            .instrument(writer_pool_span(effective_class))
+        let transaction = observe_control(self.executor.connection.begin(), "begin")
+            .in_pool(writer_pool_context(effective_class))
             .await?;
         Ok(SqliteTransaction::root(transaction, permit))
     }
@@ -956,12 +1080,14 @@ impl TransactionTrait for SqliteWriteConnection {
             pioneer_observability::turn_startup::Stage::DbExecute,
         );
         let effective_class = permit.class();
-        let transaction = self
-            .executor
-            .connection
-            .begin_with_config(isolation_level, access_mode)
-            .instrument(writer_pool_span(effective_class))
-            .await?;
+        let transaction = observe_control(
+            self.executor
+                .connection
+                .begin_with_config(isolation_level, access_mode),
+            "begin",
+        )
+        .in_pool(writer_pool_context(effective_class))
+        .await?;
         Ok(SqliteTransaction::root(transaction, permit))
     }
 
@@ -974,12 +1100,12 @@ impl TransactionTrait for SqliteWriteConnection {
             pioneer_observability::turn_startup::Stage::DbExecute,
         );
         let effective_class = permit.class();
-        let transaction = self
-            .executor
-            .connection
-            .begin_with_options(options)
-            .instrument(writer_pool_span(effective_class))
-            .await?;
+        let transaction = observe_control(
+            self.executor.connection.begin_with_options(options),
+            "begin",
+        )
+        .in_pool(writer_pool_context(effective_class))
+        .await?;
         Ok(SqliteTransaction::root(transaction, permit))
     }
 
@@ -1026,7 +1152,9 @@ impl TransactionTrait for SqliteTransaction {
 
     async fn begin(&self) -> Result<Self::Transaction, DbErr> {
         Ok(SqliteTransaction::nested(
-            self.inner().begin().await?,
+            observe_control(self.inner().begin(), "begin")
+                .in_pool(self.pool_context())
+                .await?,
             self._permit
                 .as_ref()
                 .expect("SQLite transaction must retain a writer permit")
@@ -1040,9 +1168,12 @@ impl TransactionTrait for SqliteTransaction {
         access_mode: Option<AccessMode>,
     ) -> Result<Self::Transaction, DbErr> {
         Ok(SqliteTransaction::nested(
-            self.inner()
-                .begin_with_config(isolation_level, access_mode)
-                .await?,
+            observe_control(
+                self.inner().begin_with_config(isolation_level, access_mode),
+                "begin",
+            )
+            .in_pool(self.pool_context())
+            .await?,
             self._permit
                 .as_ref()
                 .expect("SQLite transaction must retain a writer permit")
@@ -1055,7 +1186,9 @@ impl TransactionTrait for SqliteTransaction {
         options: TransactionOptions,
     ) -> Result<Self::Transaction, DbErr> {
         Ok(SqliteTransaction::nested(
-            self.inner().begin_with_options(options).await?,
+            observe_control(self.inner().begin_with_options(options), "begin")
+                .in_pool(self.pool_context())
+                .await?,
             self._permit
                 .as_ref()
                 .expect("SQLite transaction must retain a writer permit")
@@ -1116,6 +1249,27 @@ mod tests {
         })
     }
 
+    #[test]
+    fn native_current_snapshot_carries_source_order_and_oldest_without_sql() {
+        let inner = admission(SqliteWritePolicy::default());
+        let (sender, _receiver) = oneshot::channel();
+        inner.state.lock().unwrap().maintenance.push_back(Waiter {
+            id: 1,
+            enqueued_at: Instant::now() - Duration::from_millis(90),
+            sender,
+        });
+        let old = inner.queue_observation();
+        inner.state.lock().unwrap().maintenance.clear();
+        let new = inner.queue_observation();
+        assert_eq!((old.depth, new.depth), (1, 0));
+        assert!(old.oldest_waited_ms.unwrap() >= 90);
+        assert_eq!(new.oldest_waited_ms, None);
+        assert!(new.revision > old.revision);
+        assert!(new.sampled_monotonic_ms >= old.sampled_monotonic_ms);
+        // Existing observers still only implement observe; snapshot callback is optional.
+        NoopSqliteWriteObserver.observe_queue_snapshot(new);
+        NoopSqliteWriteObserver.observe_queue_snapshot(old);
+    }
     async fn acquire(inner: &Arc<AdmissionInner>, class: SqliteWriteClass) -> SqliteWritePermit {
         let (receiver, mut registration) = inner.enqueue(class);
         let reservation = receiver.await.expect("reservation");
@@ -1699,7 +1853,25 @@ mod tests {
     async fn write_stream_holds_executor_until_stream_drop() {
         let mut options = ConnectOptions::new("sqlite::memory:");
         options.max_connections(1);
-        let connection = Database::connect(options).await.expect("connect");
+        let mut connection = Database::connect(options).await.expect("connect");
+        // Exercise the actual SeaORM MetricStream destructor, which reports
+        // failed=false even for an early drop. The wrapper owns the outcome.
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_contexts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        connection.set_metric_callback({
+            let callbacks = callbacks.clone();
+            let callback_contexts = callback_contexts.clone();
+            move |_| {
+                callbacks.fetch_add(1, Ordering::Relaxed);
+                if tracing::Span::current()
+                    .metadata()
+                    .is_some_and(|metadata| metadata.target() == "pioneer_sqlite::query_cpu")
+                {
+                    callback_contexts.fetch_add(1, Ordering::Relaxed);
+                }
+                query_cpu::record_fingerprint(Some(17));
+            }
+        });
         let executor = SqliteWriteExecutor::new(connection);
         let maintenance = executor.connection(SqliteWriteClass::Maintenance);
         let interactive = executor.connection(SqliteWriteClass::Interactive);
@@ -1707,6 +1879,12 @@ mod tests {
             .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
             .await
             .expect("create table");
+
+        pioneer_observability::init_tracing(false);
+        let epoch = pioneer_observability::telemetry_consent_snapshot().1;
+        let session = query_cpu::Session::start(60, epoch).expect("start isolated local capture");
+        callbacks.store(0, Ordering::Relaxed);
+        callback_contexts.store(0, Ordering::Relaxed);
 
         let mut stream = maintenance
             .stream_raw(Statement::from_string(
@@ -1717,7 +1895,10 @@ mod tests {
             .expect("create returning stream");
         let interactive_task = tokio::spawn(async move {
             interactive
-                .execute_unprepared("INSERT INTO probe (id) VALUES (2)")
+                .execute_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "INSERT INTO probe (id) VALUES (2)",
+                ))
                 .await
         });
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1736,5 +1917,122 @@ mod tests {
             .expect("dropped stream must release writer executor")
             .expect("interactive task should join")
             .expect("interactive write should succeed");
+
+        // A borrowed transaction stream must release its connection guard on
+        // cancellation, then transaction Drop must roll back before the next
+        // writer can observe data. Neither operation proves query success.
+        let transaction = maintenance.begin().await.expect("begin transaction");
+        transaction
+            .execute_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "INSERT INTO probe (id) VALUES (3)",
+            ))
+            .await
+            .expect("transaction write");
+        let mut transaction_stream = StreamTrait::stream_raw(
+            &transaction,
+            Statement::from_string(DbBackend::Sqlite, "SELECT id FROM probe ORDER BY id"),
+        )
+        .await
+        .expect("transaction stream");
+        assert!(
+            transaction_stream
+                .next()
+                .await
+                .transpose()
+                .expect("transaction row")
+                .is_some()
+        );
+        drop(transaction_stream);
+        drop(transaction);
+        let row = maintenance
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM probe WHERE id = 3",
+            ))
+            .await
+            .expect("query after rollback")
+            .expect("count row");
+        assert_eq!(row.try_get::<i64>("", "count").unwrap(), 0);
+
+        // MetricStream still reports failed=false on this destructor. The
+        // wrapper must keep the error observed from poll_next instead.
+        let mut invalid = maintenance
+            .stream_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT missing_column FROM probe",
+            ))
+            .await
+            .expect("construct failing stream");
+        assert!(invalid.next().await.expect("one stream error").is_err());
+        drop(invalid);
+
+        let snapshot = session.finish();
+        let errors: u64 = snapshot.groups.iter().map(|g| g.totals.errors).sum::<u64>()
+            + snapshot.group_overflow.errors;
+        assert_eq!(
+            errors, 1,
+            "stream drop callback cannot erase the poll error"
+        );
+        assert!(callbacks.load(Ordering::Relaxed) >= 5);
+        assert_eq!(
+            callbacks.load(Ordering::Relaxed),
+            callback_contexts.load(Ordering::Relaxed),
+            "every real metric callback, including inner stream Drop, must retain its query span"
+        );
+        let cancelled: u64 = snapshot
+            .groups
+            .iter()
+            .map(|group| group.totals.cancelled)
+            .sum::<u64>()
+            + snapshot.group_overflow.cancelled;
+        assert!(
+            cancelled >= 3,
+            "both early stream drops and rollback_drop stay cancelled"
+        );
+        assert_eq!(snapshot.coverage.missing_local_layer, 0);
+
+        // GCPU-F01: retain an exhausted wrapper across capture finalization.
+        // EOF must release its caller scope without waiting for wrapper Drop.
+        let session = query_cpu::Session::start(60, epoch).expect("start EOF capture");
+        callbacks.store(0, Ordering::Relaxed);
+        callback_contexts.store(0, Ordering::Relaxed);
+        let mut exhausted = maintenance
+            .stream_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id FROM probe ORDER BY id",
+            ))
+            .await
+            .expect("create EOF stream");
+        let mut ids = Vec::new();
+        while let Some(row) = exhausted.next().await {
+            ids.push(
+                row.expect("EOF stream row")
+                    .try_get::<i64>("", "id")
+                    .unwrap(),
+            );
+        }
+        assert_eq!(ids, vec![1, 2]);
+        assert!(exhausted.next().await.is_none(), "EOF stays exhausted");
+        // Close acknowledges Shutdown after the preceding Execute has exited
+        // its span on the sole worker. No timing guess or sleep is needed.
+        executor
+            .close()
+            .await
+            .expect("drain writer worker references");
+        let snapshot = session.finish();
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(callback_contexts.load(Ordering::Relaxed), 1);
+        assert_eq!(snapshot.coverage.registered_scopes, 1);
+        assert_eq!(snapshot.coverage.incomplete_scopes, 0);
+        assert_eq!(snapshot.coverage.scopes_without_callback, 0);
+        assert_eq!(snapshot.groups.len(), 1);
+        assert_eq!(snapshot.groups[0].totals.completed_calls, 1);
+        assert_eq!(snapshot.groups[0].totals.incomplete, 0);
+        assert_eq!(snapshot.measured_unknown.completed_calls, 0);
+        // Keep the empty wrapper alive through the snapshot; another poll must
+        // neither recreate a scope nor produce another row/result.
+        assert!(exhausted.next().await.is_none());
+        drop(exhausted);
     }
 }

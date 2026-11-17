@@ -404,43 +404,6 @@ mod tests {
     }
 
     #[test]
-    fn recall_visibility_suppresses_terminal_statuses() {
-        let quality = MemoryRecallQualitySignals::direct_user_default();
-        for (status, expected) in [
-            (
-                MemoryStatus::Deleted,
-                MemoryRecallVisibility::SuppressDeleted,
-            ),
-            (
-                MemoryStatus::Superseded,
-                MemoryRecallVisibility::SuppressSuperseded,
-            ),
-            (
-                MemoryStatus::Expired,
-                MemoryRecallVisibility::SuppressExpired,
-            ),
-        ] {
-            let mut input = visibility_input(&quality);
-            input.status = status;
-            assert_eq!(decide_memory_recall_visibility(&input), expected);
-        }
-    }
-
-    #[test]
-    fn recall_visibility_allows_explicit_admin_statuses() {
-        let quality = MemoryRecallQualitySignals::direct_user_default();
-        let allowed = [MemoryStatus::Deleted];
-        let mut input = visibility_input(&quality);
-        input.status = MemoryStatus::Deleted;
-        input.deleted = true;
-        input.allowed_statuses = &allowed;
-        assert_eq!(
-            decide_memory_recall_visibility(&input),
-            MemoryRecallVisibility::Visible
-        );
-    }
-
-    #[test]
     fn recall_visibility_suppresses_workspace_and_sensitivity() {
         let quality = MemoryRecallQualitySignals::direct_user_default();
         let mut input = visibility_input(&quality);
@@ -459,41 +422,110 @@ mod tests {
     }
 
     #[test]
-    fn recall_visibility_suppresses_quality_terminal_records() {
-        let mut quality = MemoryRecallQualitySignals::direct_user_default();
-        quality.quality_action = Some(MemoryQualityAction::Quarantine);
-        assert_eq!(
-            decide_memory_recall_visibility(&visibility_input(&quality)),
-            MemoryRecallVisibility::SuppressQuarantinedOrAuditOnly
-        );
-
-        let mut quality = MemoryRecallQualitySignals::direct_user_default();
-        quality.write_relation = Some(MemoryWriteRelation::SuppressedByRejection);
-        assert_eq!(
-            decide_memory_recall_visibility(&visibility_input(&quality)),
-            MemoryRecallVisibility::SuppressRejectedRelated
-        );
+    fn recall_visibility_status_matrix() {
+        let cases: &[(MemoryStatus, bool, &[MemoryStatus], MemoryRecallVisibility)] = &[
+            (
+                MemoryStatus::Deleted,
+                false,
+                &[],
+                MemoryRecallVisibility::SuppressDeleted,
+            ),
+            (
+                MemoryStatus::Superseded,
+                false,
+                &[],
+                MemoryRecallVisibility::SuppressSuperseded,
+            ),
+            (
+                MemoryStatus::Expired,
+                false,
+                &[],
+                MemoryRecallVisibility::SuppressExpired,
+            ),
+            (
+                MemoryStatus::Deleted,
+                true,
+                &[MemoryStatus::Deleted],
+                MemoryRecallVisibility::Visible,
+            ),
+        ];
+        for &(status, deleted, allowed_statuses, expected) in cases {
+            let quality = MemoryRecallQualitySignals::direct_user_default();
+            let mut input = visibility_input(&quality);
+            input.status = status;
+            input.deleted = deleted;
+            input.allowed_statuses = allowed_statuses;
+            assert_eq!(
+                decide_memory_recall_visibility(&input),
+                expected,
+                "{status:?}, deleted={deleted}, allowed={allowed_statuses:?}"
+            );
+        }
     }
 
     #[test]
-    fn recall_visibility_suppresses_low_quality_source_context() {
-        let mut quality = MemoryRecallQualitySignals::direct_user_default();
-        quality.source_context_kind = MemorySourceContextKind::Unknown;
-        quality.evidence_class = MemoryEvidenceClass::MissingOrWeak;
-        assert_eq!(
-            decide_memory_recall_visibility(&visibility_input(&quality)),
-            MemoryRecallVisibility::SuppressLowQualitySourceContext
-        );
-    }
-
-    #[test]
-    fn recall_visibility_suppresses_ownership_mismatch() {
-        let mut quality = MemoryRecallQualitySignals::direct_user_default();
-        quality.fact_class = MemoryFactClass::UserIdentity;
-        quality.ownership_class = MemoryOwnershipClass::DurableWorkspaceMemory;
-        assert_eq!(
-            decide_memory_recall_visibility(&visibility_input(&quality)),
-            MemoryRecallVisibility::SuppressOwnershipMismatch
-        );
+    fn recall_visibility_quality_matrix() {
+        let default = MemoryRecallQualitySignals::direct_user_default();
+        let cases = [
+            (
+                "quarantine",
+                MemoryRecallQualitySignals {
+                    quality_action: Some(MemoryQualityAction::Quarantine),
+                    ..default.clone()
+                },
+                MemoryRecallVisibility::SuppressQuarantinedOrAuditOnly,
+            ),
+            (
+                "rejected relation",
+                MemoryRecallQualitySignals {
+                    write_relation: Some(MemoryWriteRelation::SuppressedByRejection),
+                    ..default.clone()
+                },
+                MemoryRecallVisibility::SuppressRejectedRelated,
+            ),
+            (
+                "unknown and weak",
+                MemoryRecallQualitySignals {
+                    source_context_kind: MemorySourceContextKind::Unknown,
+                    evidence_class: MemoryEvidenceClass::MissingOrWeak,
+                    ..default.clone()
+                },
+                MemoryRecallVisibility::SuppressLowQualitySourceContext,
+            ),
+            (
+                "ownership mismatch",
+                MemoryRecallQualitySignals {
+                    fact_class: MemoryFactClass::UserIdentity,
+                    ownership_class: MemoryOwnershipClass::DurableWorkspaceMemory,
+                    ..default.clone()
+                },
+                MemoryRecallVisibility::SuppressOwnershipMismatch,
+            ),
+            (
+                "unknown only",
+                MemoryRecallQualitySignals {
+                    source_context_kind: MemorySourceContextKind::Unknown,
+                    ..default.clone()
+                },
+                MemoryRecallVisibility::SuppressLowQualitySourceContext,
+            ),
+            (
+                "weak only",
+                MemoryRecallQualitySignals {
+                    evidence_class: MemoryEvidenceClass::MissingOrWeak,
+                    ..default.clone()
+                },
+                MemoryRecallVisibility::SuppressLowQualitySourceContext,
+            ),
+            (
+                "valid direct user",
+                default,
+                MemoryRecallVisibility::Visible,
+            ),
+        ];
+        for (label, quality, expected) in cases {
+            let input = visibility_input(&quality);
+            assert_eq!(decide_memory_recall_visibility(&input), expected, "{label}");
+        }
     }
 }

@@ -54,6 +54,9 @@ fn claude_prefix_rule(model: Option<&str>) -> Option<bool> {
 }
 
 pub fn retention(state: &ProviderReplayState) -> Retention {
+    if crate::providers::responses_api_compatible::replay::is_dialect(state) {
+        return crate::providers::responses_api_compatible::replay::retention(state);
+    }
     let p = &state.payload;
     // Older clients stamped configured Messages proxies as unverified relays.
     // An endpoint override alone does not alter the accepted native schema.
@@ -187,6 +190,38 @@ pub fn retention(state: &ProviderReplayState) -> Retention {
             } else {
                 // Malformed or unrecognized representations remain stored;
                 // do not silently discard required continuation data.
+                Retention::Unsupported
+            }
+        }
+        "aihubmix" if p["assistant_message"].get("reasoning_details").is_some() => {
+            // AIHubMix owns the exact native object. Preserve signed thinking
+            // through compaction; compatibility remains the existing scoped
+            // provider/model policy and the producing Chat endpoint authority.
+            if p["schema_version"] == 1
+                && p.as_object().is_some_and(|object| {
+                    object.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "schema_version" | "authority_scope" | "assistant_message"
+                        )
+                    })
+                })
+                && p["assistant_message"].as_object().is_some_and(|object| {
+                    object.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "content" | "reasoning_content" | "reasoning_details" | "tool_calls"
+                        )
+                    })
+                })
+                && p["authority_scope"].as_str().is_some_and(|s| !s.is_empty())
+                && matches!(
+                    p["assistant_message"]["reasoning_details"],
+                    Value::Object(_) | Value::Array(_)
+                )
+            {
+                Retention::Prefix
+            } else {
                 Retention::Unsupported
             }
         }

@@ -29,6 +29,26 @@
           "type": "string",
           "const": "resolved_task_launch"
         },
+        "native_context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeContextBudget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "native_summary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeSummaryContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "profile": {
           "$ref": "#/$defs/AgentExecutionProfileProjection"
         },
@@ -234,7 +254,7 @@
       ]
     },
     "ChildAgentLaunchGrantSet": {
-      "description": "Immutable upper bound for identities and execution profiles that an\nadmitted AgentExecution may delegate to. Current source/policy state may\nnarrow this set, but a later workspace catalog addition can never widen it.",
+      "description": "Immutable delegation boundary for identities and capabilities. Model catalogs\nare current metadata, not durable authority; each launch stores its exact\nexecution profile separately.",
       "type": "object",
       "properties": {
         "allowInheritParentIdentity": {
@@ -258,20 +278,11 @@
         "maxPermissionProfile": {
           "$ref": "#/$defs/TurnPermissionProfileCap"
         },
-        "maxReasoning": {
-          "$ref": "#/$defs/ReasoningCeiling"
-        },
         "mcpServerIds": {
           "type": "array",
           "default": [],
           "items": {
             "type": "string"
-          }
-        },
-        "profiles": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/AgentExecutionProfileProjection"
           }
         },
         "skillIds": {
@@ -293,11 +304,118 @@
         "identities",
         "allowInheritParentIdentity",
         "allowServerDerivedEphemeral",
-        "profiles",
         "allowInheritParentProfile",
         "maxPermissionProfile",
-        "maxReasoning",
         "fingerprint"
+      ]
+    },
+    "NativeContextBudget": {
+      "description": "Durable local authorization and budget for one Native/API provider authority/model.\nNever sent to a provider or accepted as a child tool's requested variant.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "instance": {
+          "type": "string"
+        },
+        "manual_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_input": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_output": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model": {
+          "type": "string"
+        },
+        "service_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeServiceModePlan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "instance",
+        "model",
+        "context_window"
+      ]
+    },
+    "NativeServiceModePlan": {
+      "description": "Frozen semantic contract. Prices are captured separately per physical request.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "parameters": {
+          "$ref": "#/$defs/ServiceModeParameters"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "parameters"
+      ]
+    },
+    "NativeSummaryContext": {
+      "description": "API summarizer selection and its resolved budget, captured with a Native launch.",
+      "type": "object",
+      "properties": {
+        "budget": {
+          "$ref": "#/$defs/NativeContextBudget"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inherits_working": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "budget",
+        "inherits_working"
+      ]
+    },
+    "OpenAiTier": {
+      "type": "string",
+      "enum": [
+        "priority",
+        "flex",
+        "ultrafast"
       ]
     },
     "PermissionBehavior": {
@@ -308,20 +426,122 @@
         "deny"
       ]
     },
-    "ReasoningCeiling": {
-      "description": "Canonical exact reasoning selections that remain delegable by an admitted\nexecution. Effort labels are backend-owned opaque values, so ordering them\nby presumed strength would be unsafe; the ceiling is an allow-set.",
-      "type": "object",
-      "properties": {
-        "allowed": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TurnReasoningSelection"
-          }
+    "ServiceModeParameters": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "neutral"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "open_ai_standard"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "anthropic_standard"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bedrock_standard"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "open_ai_tier"
+            },
+            "tier": {
+              "$ref": "#/$defs/OpenAiTier"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "tier"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "open_ai_pro"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "beta": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "anthropic_fast"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bedrock_nested_ultrafast"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
         }
-      },
-      "additionalProperties": false,
-      "required": [
-        "allowed"
       ]
     },
     "SkillId": {

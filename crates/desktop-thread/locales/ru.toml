@@ -219,6 +219,7 @@
 "timeline.system.capability_kind_skill" = "Скилл"
 "timeline.system.checkpoint_label" = "Чекпоинт"
 "timeline.system.code" = "Код:"
+"timeline.system.codex_request_retried" = "Codex сообщил о повторе запроса после временного сбоя."
 "timeline.system.continued_label" = "Продолжено"
 "timeline.system.detail_agent_rounds" = "Раунды агента"
 "timeline.system.detail_checkpoint" = "Чекпоинт"
@@ -332,8 +333,44 @@
 "timeline.web_search.running" = "Ищу в интернете"
 "timeline.work_group.completed" = "Работал"
 
+"chat.composer.add_menu.plugins" = "Добавить плагины"
+
+"plugins.empty" = "Плагины ещё не установлены"
+"plugins.error" = "Не удалось загрузить плагины. Попробуйте снова."
+"plugins.loading" = "Загрузка плагинов…"
+"plugins.search" = "Поиск плагинов"
+"plugins.select" = "Выбор плагинов"
+"plugins.unavailable" = "Недоступен"
+
 "timeline.html.loading" = "Загрузка страницы…"
 "timeline.html.failed" = "Не удалось показать страницу"
+"chat.composer.preparing_send" = "Подготовка сообщения"
+"plugins.retry" = "Повторить"
+"plugins.stale" = "Выбранная версия больше не актуальна"
+
+"chat.composer.model.context_label" = "Контекстное окно"
+"chat.composer.model.context_auto" = "Авто — до %{tokens} токенов"
+"chat.composer.model.context_up_to" = "До %{tokens} токенов"
+"chat.composer.model.context_invalid" = "Сохранённый вариант контекста недоступен. Выберите Авто или другое окно."
+
+"chat.composer.model.service_label" = "Режим обслуживания"
+
+"chat.composer.model.service_standard" = "Стандартный"
+
+"chat.composer.model.service_invalid" = "Сохранённый режим недоступен. Выберите стандартный или другой режим."
+
+"chat.composer.add_menu.apps" = "Добавить приложения"
+"apps.empty" = "Приложения ещё не установлены"
+"apps.error" = "Не удалось загрузить приложения. Попробуйте снова."
+"apps.loading" = "Загрузка приложений…"
+"apps.search" = "Поиск приложений"
+"apps.select" = "Выбор приложений"
+"apps.unavailable" = "Недоступен"
+"apps.retry" = "Повторить"
+"apps.stale" = "Выбранная версия больше не актуальна"
+
+"apps.view" = "App view"
+
 
 [chat.acp]
 prepare = "Подготовить сессию"

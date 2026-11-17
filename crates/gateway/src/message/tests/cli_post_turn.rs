@@ -27,6 +27,11 @@ async fn cli_post_turn_extracts_user_memory_through_shared_provider_and_durable_
     let harness =
         setup_memory_agent_e2e_harness_with_tool_loop_config("cli_post_turn", registry, config)
             .await;
+    let source = format!(
+        "{}Меня зовут Александр{}tail",
+        "я".repeat(6000),
+        "я".repeat(12_000 - 6000 - "Меня зовут Александр".chars().count() - 4)
+    );
     // Both external adapters enter the same Pioneer turn completion path.
     for (kind, turn_id) in [
         ("codex", "cli-memory-codex"),
@@ -41,7 +46,7 @@ async fn cli_post_turn_extracts_user_memory_through_shared_provider_and_durable_
             &thread_id,
             turn_id,
             &format!("native-{turn_id}"),
-            "Меня зовут Александр",
+            &source,
         )
         .await;
         let binding = harness
@@ -82,20 +87,22 @@ async fn cli_post_turn_extracts_user_memory_through_shared_provider_and_durable_
     assert_eq!(
         records.len(),
         1,
-        "canonical user fact is updated, not duplicated across CLI turns"
+        "direct assertions follow the existing explicit-evidence candidate policy"
     );
     assert_eq!(
         records[0].source_turn_id.as_deref(),
         Some("cli-memory-codex"),
-        "an unchanged duplicate preserves the original evidence, just like native extraction"
+        "an unchanged duplicate preserves its original provenance"
     );
     let requests = provider.snapshot_requests();
-    assert!(
-        requests[0]
-            .messages
-            .iter()
-            .any(|m| m.content.contains("Меня зовут Александр"))
-    );
+    for request in requests {
+        assert!(request.tools.is_none());
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, pioneer_provider::Role::System);
+        assert_eq!(request.messages[1].role, pioneer_provider::Role::User);
+        let data: serde_json::Value = serde_json::from_str(&request.messages[1].content).unwrap();
+        assert_eq!(data["user_text"], source);
+    }
 }
 
 fn final_answer(text: &str) -> TurnItem {
@@ -513,10 +520,15 @@ async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker(
         .await
         .unwrap();
     timeout(Duration::from_secs(10), async {
-        while processor
-            .native_terminal_effect_kick_running
-            .load(Ordering::Acquire)
-        {
+        loop {
+            let row = effect::Entity::find_by_id(poison)
+                .one(&store.database_connection())
+                .await
+                .unwrap()
+                .unwrap();
+            if row.gate_probe_attempts > 0 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
     })
@@ -529,4 +541,180 @@ async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker(
         .unwrap();
     assert_eq!(row.attempt_count, 0);
     assert_eq!(row.status, "waiting_acceptance");
+    assert_eq!(
+        store
+            .next_native_terminal_effect_execution_deadline()
+            .await
+            .unwrap(),
+        Some(row.gate_probe_at)
+    );
+    // The existing owner now retains that real gate clock until cancellation.
+    processor.shutdown_resilience_workers().await;
+    assert!(
+        !processor
+            .native_terminal_effect_kick_running
+            .load(Ordering::Acquire)
+    );
+}
+
+#[tokio::test]
+async fn terminal_effect_single_kick_drains_more_than_one_full_quantum() {
+    for (rotation, first_wave) in [(0_i64, 3_usize), (1, 8), (2, 4)] {
+        let (processor, _, _rx, workspace, store, _) = cli_runtime_approval_processor().await;
+        let processor = Arc::new(processor);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        install_recoverable_test_hook_runtime(
+            &processor,
+            task_post_turn_recording_hook_runtime(calls.clone()),
+        )
+        .await;
+        for index in 0..17 {
+            let turn_id = format!("terminal-drain-{index}");
+            seed_cli_runtime_turn_with_text(
+                &store,
+                &workspace,
+                "codex",
+                "codex",
+                &format!("thread-{turn_id}"),
+                &turn_id,
+                &format!("native-{turn_id}"),
+                "input",
+            )
+            .await;
+            let binding = store
+                .get_cli_runtime_turn_binding(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            processor
+                .prepare_cli_post_turn_hook(&binding, 1, Some(&final_answer("done")))
+                .await
+                .unwrap();
+            commit_turn(&store, &binding).await;
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(&format!("{turn_id}:terminal-effect:post-turn"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "ready"
+            );
+        }
+        // Each rotation gets a fresh ready-only backlog. Fix the discovery clock
+        // after seeding, far enough ahead that every prepared row is due. The
+        // existing cfg(test) claim path also uses this time after writer admission.
+        let discovery_now = (now_timestamp_secs() + 3600).div_euclid(6) * 6 + rotation * 2;
+        let wave_starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_starts = wave_starts.clone();
+        let observed_calls = calls.clone();
+        // No resilience worker is started. This is one kick into the real owner,
+        // with no producer kicks between bounded waves. Observe completed hook
+        // calls at the next discovery to verify the actual first claim quota.
+        processor.spawn_native_terminal_effect_kick(Some(Box::new(move || {
+            observed_starts
+                .lock()
+                .unwrap()
+                .push(observed_calls.lock().unwrap().len());
+            discovery_now
+        })));
+        timeout(Duration::from_secs(10), async {
+            while processor
+                .native_terminal_effect_kick_running
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 17, "rotation {rotation}");
+        let starts = wave_starts.lock().unwrap();
+        assert_eq!(starts[0], 0);
+        assert_eq!(starts[1], first_wave, "rotation {rotation}: {starts:?}");
+        drop(starts);
+        for index in 0..17 {
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(&format!(
+                        "terminal-drain-{index}:terminal-effect:post-turn"
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "succeeded"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_effect_owner_recovers_an_expired_lease_without_another_kick() {
+    let (processor, _, _rx, workspace, store, _) = cli_runtime_approval_processor().await;
+    let processor = Arc::new(processor);
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    install_recoverable_test_hook_runtime(
+        &processor,
+        task_post_turn_recording_hook_runtime(calls.clone()),
+    )
+    .await;
+    let turn_id = "terminal-lease-clock";
+    seed_cli_runtime_turn_with_text(
+        &store,
+        &workspace,
+        "codex",
+        "codex",
+        "thread-terminal-lease",
+        turn_id,
+        "native-terminal-lease",
+        "input",
+    )
+    .await;
+    let binding = store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .prepare_cli_post_turn_hook(&binding, 1, Some(&final_answer("done")))
+        .await
+        .unwrap();
+    commit_turn(&store, &binding).await;
+    let claimed = store
+        .claim_due_native_terminal_effects_at(now_timestamp_secs(), 5, 8)
+        .await
+        .unwrap();
+    assert_eq!(claimed.records.len(), 1);
+    processor.arm_completed_history_preparation_barrier("__terminal_effect_before_timer__");
+    // No resilience loop or further producer kick can rediscover this lease.
+    processor.kick_native_terminal_effects();
+    timeout(
+        Duration::from_secs(3),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "the first wave found only a future lease"
+    );
+    processor.release_completed_history_preparation_barrier();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if store
+                .native_terminal_effect_status(&claimed.records[0].effect_id)
+                .await
+                .unwrap()
+                .is_some_and(|row| row.status == "succeeded")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    processor.shutdown_resilience_workers().await;
 }

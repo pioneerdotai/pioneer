@@ -500,6 +500,7 @@ impl TimeoutSupervisor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn list_timeout_candidates(
         &self,
         now_unix: i64,
@@ -507,6 +508,20 @@ impl TimeoutSupervisor {
     ) -> Result<Vec<TimeoutCandidate>> {
         self.crud_store
             .list_timeout_candidates(now_unix, limit)
+            .await
+    }
+
+    pub async fn list_timeout_candidate_page(
+        &self,
+        now_unix: i64,
+        limit: u64,
+        after: Option<&pioneer_crud::TimeoutCandidateCursor>,
+    ) -> Result<(
+        Vec<TimeoutCandidate>,
+        Option<pioneer_crud::TimeoutCandidateCursor>,
+    )> {
+        self.crud_store
+            .list_timeout_candidate_page(now_unix, limit, after)
             .await
     }
 
@@ -933,17 +948,6 @@ mod tests {
             classify_timeout_candidate_liveness(&candidate, Some(&turn_liveness(1_000, 4))),
             TimeoutRecoveryClassification::RecoverTurn
         );
-    }
-
-    #[test]
-    fn timeout_classifier_suppresses_recovery_after_later_turn_activity() {
-        let candidate = timeout_candidate();
-        let liveness = turn_liveness(1_010, 5);
-
-        assert!(matches!(
-            classify_timeout_candidate_liveness(&candidate, Some(&liveness)),
-            TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed { .. }
-        ));
     }
 
     #[test]

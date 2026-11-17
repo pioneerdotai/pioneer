@@ -51,106 +51,78 @@ impl McpCatalogView {
             .size_full()
             .bg(cx.theme().background)
             .child(
-                v_flex()
-                    .pt_3()
-                    .px_6()
-                    .pb_5()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
+                pioneer_desktop_foundation::CatalogDetailsHeader::new(
+                    mcp_presentation::mcp_display_name(&server),
+                )
+                .status(Self::mcp_status_label(server.status), status_color)
+                .when(can_manage_capabilities, |this| {
+                    this.actions(
                         h_flex()
-                            .justify_between()
-                            .items_start()
-                            .gap_10()
+                            .items_center()
+                            .gap_2()
                             .child(
-                                div()
-                                    .text_base()
-                                    .font_semibold()
-                                    .child(mcp_presentation::mcp_display_name(&server)),
+                                Button::new(self.ui_id(&server.id, "enabled"))
+                                    .xsmall()
+                                    .compact()
+                                    .h_6()
+                                    .px_3()
+                                    .when(server.policy.enabled, |this| this.primary())
+                                    .when(!server.policy.enabled, |this| this.outline())
+                                    .disabled(is_pending)
+                                    .label(t!("mcp.details.enabled").to_string())
+                                    .on_click({
+                                        let desktop_entity = desktop_entity.clone();
+                                        let name = server.id.clone();
+                                        let next_enabled = !server.policy.enabled;
+                                        let implicit = server.policy.allow_implicit_invocation;
+                                        move |_, _, cx| {
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                view.set_mcp_policy(
+                                                    name.clone(),
+                                                    next_enabled,
+                                                    implicit,
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
                             )
                             .child(
-                                div()
-                                    .mt_1p5()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(status_color)
-                                    .text_xs()
-                                    .text_color(status_color)
-                                    .font_medium()
-                                    .child(Self::mcp_status_label(server.status)),
+                                Button::new(self.ui_id(&server.id, "implicit"))
+                                    .xsmall()
+                                    .compact()
+                                    .h_6()
+                                    .px_3()
+                                    .when(server.policy.allow_implicit_invocation, |this| {
+                                        this.primary()
+                                    })
+                                    .when(!server.policy.allow_implicit_invocation, |this| {
+                                        this.outline()
+                                    })
+                                    .disabled(is_pending)
+                                    .label(t!("mcp.details.implicit").to_string())
+                                    .on_click({
+                                        let desktop_entity = desktop_entity.clone();
+                                        let name = server.id.clone();
+                                        let enabled = server.policy.enabled;
+                                        let next_implicit =
+                                            !server.policy.allow_implicit_invocation;
+                                        move |_, _, cx| {
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                view.set_mcp_policy(
+                                                    name.clone(),
+                                                    enabled,
+                                                    next_implicit,
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
                             ),
                     )
-                    .when(can_manage_capabilities, |this| {
-                        this.child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Button::new(self.ui_id(&server.id, "enabled"))
-                                        .xsmall()
-                                        .compact()
-                                        .h_6()
-                                        .px_3()
-                                        .when(server.policy.enabled, |this| this.primary())
-                                        .when(!server.policy.enabled, |this| this.outline())
-                                        .disabled(is_pending)
-                                        .label(t!("mcp.details.enabled").to_string())
-                                        .on_click({
-                                            let desktop_entity = desktop_entity.clone();
-                                            let name = server.id.clone();
-                                            let next_enabled = !server.policy.enabled;
-                                            let implicit = server.policy.allow_implicit_invocation;
-                                            move |_, _, cx| {
-                                                let _ = desktop_entity.update(cx, |view, cx| {
-                                                    view.set_mcp_policy(
-                                                        name.clone(),
-                                                        next_enabled,
-                                                        implicit,
-                                                        cx,
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }),
-                                )
-                                .child(
-                                    Button::new(self.ui_id(&server.id, "implicit"))
-                                        .xsmall()
-                                        .compact()
-                                        .h_6()
-                                        .px_3()
-                                        .when(server.policy.allow_implicit_invocation, |this| {
-                                            this.primary()
-                                        })
-                                        .when(!server.policy.allow_implicit_invocation, |this| {
-                                            this.outline()
-                                        })
-                                        .disabled(is_pending)
-                                        .label(t!("mcp.details.implicit").to_string())
-                                        .on_click({
-                                            let desktop_entity = desktop_entity.clone();
-                                            let name = server.id.clone();
-                                            let enabled = server.policy.enabled;
-                                            let next_implicit =
-                                                !server.policy.allow_implicit_invocation;
-                                            move |_, _, cx| {
-                                                let _ = desktop_entity.update(cx, |view, cx| {
-                                                    view.set_mcp_policy(
-                                                        name.clone(),
-                                                        enabled,
-                                                        next_implicit,
-                                                        cx,
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }),
-                                ),
-                        )
-                    }),
+                }),
             )
             .child(
                 v_flex()

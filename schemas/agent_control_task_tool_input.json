@@ -20,11 +20,13 @@
       "type": "string",
       "enum": [
         "cancel",
+        "finish",
         "resume",
         "detach",
         "pause",
         "update",
-        "reschedule"
+        "reschedule",
+        "run_now"
       ]
     }
   }

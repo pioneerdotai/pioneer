@@ -198,6 +198,13 @@ pub enum ToolDeltaPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallCompletedEvent {
+    /// Trusted runtime projection origin, never copied from a tool's JSON.
+    #[serde(default)]
+    pub shell_output: bool,
+    #[serde(default)]
+    pub retained_output_log: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_output_log_item: Option<String>,
     pub success: bool,
     pub outcome: ToolOutcome,
     pub llm_view: ToolResultView,
@@ -211,6 +218,9 @@ pub struct ToolCallCompletedEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallFailedEvent {
+    /// Trusted native failure path, backed by a positive output-log ACK.
+    #[serde(default)]
+    pub retained_output_log: bool,
     pub error: String,
     pub outcome: ToolOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,6 +234,16 @@ pub struct ToolCallFailedEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_operation_id: Option<String>,
+    #[serde(default)]
+    pub phase_boundaries: Vec<pioneer_protocol::ToolPhaseBoundary>,
+    #[serde(default)]
+    pub omitted_phase_boundaries: u64,
+    #[serde(default)]
+    pub output_sizes: Option<pioneer_protocol::ToolOutputMeasurements>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_run_id: Option<String>,
     pub trace_id: String,
     pub turn_id: String,
     pub tool_call_id: String,
@@ -252,6 +272,7 @@ impl ToolEvent {
 
 #[derive(Debug)]
 pub struct DurableToolEventEnvelope {
+    pub correlation: pioneer_observability::scenario::Correlation,
     pub event: ToolEvent,
     committed_tx: Option<oneshot::Sender<Result<(), String>>>,
 }
@@ -270,8 +291,22 @@ pub struct ToolEventBus {
     durable_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<DurableToolEventEnvelope>>>>,
     durable_installed: Arc<AtomicBool>,
     durable_capacity: usize,
-    trace_sequences: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+    trace_sequences: Arc<Mutex<HashMap<String, Arc<TraceMeasurements>>>>,
     thread_id: Arc<String>,
+}
+
+#[derive(Default)]
+struct TraceMeasurements {
+    output_saved: AtomicBool,
+    parent_operation_id: Option<String>,
+    sequence: AtomicU64,
+    detail: Mutex<TraceDetail>,
+}
+#[derive(Default, Clone)]
+struct TraceDetail {
+    boundaries: Vec<pioneer_protocol::ToolPhaseBoundary>,
+    omitted: u64,
+    output_sizes: Option<pioneer_protocol::ToolOutputMeasurements>,
 }
 
 #[derive(Clone)]
@@ -281,11 +316,25 @@ pub struct ToolEventTrace {
     turn_id: String,
     tool_call_id: String,
     tool_name: String,
-    sequence: Arc<AtomicU64>,
+    measurements: Arc<TraceMeasurements>,
     thread_id: Arc<String>,
 }
 
 impl ToolEventTrace {
+    /// A positive durable ACK for this exact trace, including partial/error logs.
+    pub fn has_saved_output_log(&self) -> bool {
+        self.measurements.output_saved.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn has_durable_consumer(&self) -> bool {
+        self.event_bus.durable_installed.load(Ordering::SeqCst)
+            && self
+                .event_bus
+                .durable_tx
+                .lock()
+                .is_ok_and(|sender| sender.is_some())
+    }
+
     pub fn trace_id(&self) -> &str {
         self.trace_id.as_str()
     }
@@ -330,10 +379,26 @@ impl ToolEventTrace {
     fn next_context(&self, pipeline_stage: &str, attempt_id: u32) -> ObservationContext {
         let ts_unix_ms = now_unix_ms();
         let event_seq = self
+            .measurements
             .sequence
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
+        let detail = self
+            .measurements
+            .detail
+            .lock()
+            .expect("tool detail lock")
+            .clone();
         ObservationContext {
+            parent_operation_id: self.measurements.parent_operation_id.clone(),
+            phase_boundaries: detail.boundaries,
+            omitted_phase_boundaries: detail.omitted,
+            output_sizes: detail.output_sizes,
+            process_run_id: Some(
+                pioneer_observability::identity::run_identity()
+                    .run_id
+                    .clone(),
+            ),
             trace_id: self.trace_id.clone(),
             turn_id: self.turn_id.clone(),
             tool_call_id: self.tool_call_id.clone(),
@@ -352,6 +417,31 @@ impl ToolEventTrace {
         message: Option<String>,
         metadata: Option<JsonValue>,
     ) {
+        // Keep runtime-owned stage identity/timing only. Debug messages and
+        // metadata can contain paths, tool arguments or raw errors.
+        if pipeline_stage.len() <= 96
+            && pipeline_stage
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._".contains(&b))
+        {
+            let local_sequence = self
+                .measurements
+                .sequence
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            let mut detail = self.measurements.detail.lock().expect("tool detail lock");
+            if detail.boundaries.len() < 48 {
+                detail.boundaries.push(pioneer_protocol::ToolPhaseBoundary {
+                    phase: pipeline_stage.into(),
+                    attempt_id,
+                    ts_unix_ms: now_unix_ms(),
+                    mono_ns: monotonic_now_ns(),
+                    local_sequence,
+                });
+            } else {
+                detail.omitted = detail.omitted.saturating_add(1);
+            }
+        }
         debug!(
             target: "pioneer.tools.pipeline",
             trace_id = %self.trace_id,
@@ -465,10 +555,26 @@ impl ToolEventTrace {
             .await
     }
 
+    pub(crate) fn record_output_sizes(
+        &self,
+        captured_text_bytes: usize,
+        prepared_source_bytes: usize,
+        model_projection_text_bytes: usize,
+    ) {
+        self.measurements.detail.lock().expect("tool detail lock").output_sizes=Some(pioneer_protocol::ToolOutputMeasurements {
+            captured_text_bytes:captured_text_bytes as u64,prepared_source_bytes:prepared_source_bytes as u64,
+            model_projection_text_bytes:model_projection_text_bytes as u64,
+            basis:"captured_handler_representation_and_actual_published_projection_not_uncaptured_process_output".into(),
+        });
+    }
+
     pub async fn emit_completed(
         &self,
         attempt_id: u32,
         envelope: &ToolResultEnvelope,
+        shell_output: bool,
+        retained_output_log: bool,
+        retained_output_log_item: Option<String>,
     ) -> Result<(), ToolError> {
         self.event_bus
             .emit_durable(
@@ -476,6 +582,9 @@ impl ToolEventTrace {
                 attempt_id,
                 "runtime.call.completed",
                 ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
+                    shell_output,
+                    retained_output_log,
+                    retained_output_log_item,
                     success: envelope.success,
                     outcome: envelope.outcome.clone(),
                     llm_view: envelope.llm_view.clone(),
@@ -494,6 +603,7 @@ impl ToolEventTrace {
         error: &str,
         outcome: &ToolOutcome,
         output_policy: ToolOutputPolicySnapshot,
+        retained_output_log: bool,
     ) -> Result<(), ToolError> {
         let summary = ToolOutputSummary {
             title: "Tool execution failed".to_owned(),
@@ -504,7 +614,23 @@ impl ToolEventTrace {
             truncated: false,
         };
         let display = display_for_policy(&output_policy, summary.clone());
-        let storage = storage_for_policy(&output_policy, summary);
+        let storage = if retained_output_log
+            && matches!(output_policy.storage, StorageOutputPolicy::Full { .. })
+        {
+            // Preserve the typed shell recovery lane after a native error or
+            // cancellation. Only already acknowledged log chunks are promised.
+            ToolStoragePayload::Shell {
+                stdout: None,
+                stderr: Some(error.to_owned()),
+                aggregated_output: None,
+                exit_code: None,
+                duration_ms: None,
+                timed_out: None,
+                truncated: true,
+            }
+        } else {
+            storage_for_policy(&output_policy, summary)
+        };
         let recovery = ToolRecoveryView {
             error_class: outcome.error_class.map(|class| format!("{class:?}")),
             retry_hint: outcome.retry_hint.clone(),
@@ -522,6 +648,7 @@ impl ToolEventTrace {
                 attempt_id,
                 "runtime.call.failed",
                 ToolEventPayload::CallFailed(ToolCallFailedEvent {
+                    retained_output_log,
                     error: error.to_owned(),
                     outcome: outcome.clone(),
                     llm_view: None,
@@ -625,11 +752,16 @@ impl ToolEventBus {
     ) -> ToolEventTrace {
         let trace_id = trace_id.into();
         let turn_id = turn_id.into();
-        let sequence = {
+        let measurements = {
             let mut guard = self.trace_sequences.lock().expect("trace sequences lock");
             guard
                 .entry(trace_id.clone())
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .or_insert_with(|| {
+                    Arc::new(TraceMeasurements {
+                        parent_operation_id: pioneer_provider::usage::current_causal_parent(),
+                        ..Default::default()
+                    })
+                })
                 .clone()
         };
         ToolEventTrace {
@@ -638,7 +770,7 @@ impl ToolEventBus {
             turn_id,
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
-            sequence,
+            measurements,
             thread_id: self.thread_id.clone(),
         }
     }
@@ -697,54 +829,101 @@ impl ToolEventBus {
         pipeline_stage: &str,
         payload: ToolEventPayload,
     ) -> Result<(), ToolError> {
-        debug_assert_eq!(payload.event_class(), ProtocolEventClass::Durable);
-        let event = self.build_event(trace, attempt_id, pipeline_stage, payload);
-        let durable_tx = self
-            .durable_tx
-            .lock()
-            .map_err(|_| ToolError::execution_failed("tool durable event lane lock poisoned"))?
-            .clone();
-        match (self.durable_installed.load(Ordering::SeqCst), durable_tx) {
-            (true, Some(durable_tx)) => {
-                let (committed_tx, committed_rx) = oneshot::channel();
-                durable_tx
-                    .send(DurableToolEventEnvelope {
-                        event: event.clone(),
-                        committed_tx: Some(committed_tx),
-                    })
-                    .await
+        use pioneer_observability::{
+            scenario::Correlation,
+            tool_call::{Fact, Measurement, Phase},
+        };
+        let installed = self.durable_installed.load(Ordering::SeqCst);
+        let phase = match (pipeline_stage, installed) {
+            ("runtime.call.started", true) => Phase::LifecycleStartAck,
+            ("runtime.call.completed" | "runtime.call.failed", true) => Phase::LifecycleTerminalAck,
+            (_, true) => Phase::LifecycleOtherAck,
+            ("runtime.call.started", false) => Phase::BusStart,
+            ("runtime.call.completed" | "runtime.call.failed", false) => Phase::BusTerminal,
+            (_, false) => Phase::BusOther,
+        };
+        // Streaming deltas already have bounded lane/queue observations. Only
+        // coarse lifecycle/audit boundaries add domain spans, never each chunk.
+        let mut measurement = matches!(
+            pipeline_stage,
+            "runtime.call.started"
+                | "runtime.call.completed"
+                | "runtime.call.failed"
+                | "permission.audit"
+        )
+        .then(|| Measurement::start(phase, &Correlation::capture()));
+        let correlation = measurement
+            .as_ref()
+            .map_or_else(Correlation::capture, Measurement::correlation);
+        let result = correlation
+            .scope(async {
+                debug_assert_eq!(payload.event_class(), ProtocolEventClass::Durable);
+                let event = self.build_event(trace, attempt_id, pipeline_stage, payload);
+                let durable_tx = self
+                    .durable_tx
+                    .lock()
                     .map_err(|_| {
-                        ToolError::execution_failed(
-                            "tool durable event lane closed before lifecycle event commit",
-                        )
-                    })?;
-                committed_rx
-                    .await
-                    .map_err(|_| {
-                        ToolError::execution_failed(
-                            "tool durable event commit acknowledgement was dropped",
-                        )
+                        ToolError::execution_failed("tool durable event lane lock poisoned")
                     })?
-                    .map_err(|reason| {
-                        ToolError::execution_failed(format!(
-                            "tool durable event commit was rejected: {reason}"
-                        ))
-                    })?;
-            }
-            (true, None) => {
-                return Err(ToolError::execution_failed(
-                    "tool durable event emitted after the producer watermark",
-                ));
-            }
-            (false, None) => {}
-            (false, Some(_)) => {
-                return Err(ToolError::execution_failed(
-                    "tool durable event lane entered an invalid installation state",
-                ));
-            }
+                    .clone();
+                match (self.durable_installed.load(Ordering::SeqCst), durable_tx) {
+                    (true, Some(durable_tx)) => {
+                        let (committed_tx, committed_rx) = oneshot::channel();
+                        durable_tx
+                            .send(DurableToolEventEnvelope {
+                                correlation: correlation.clone(),
+                                event: event.clone(),
+                                committed_tx: Some(committed_tx),
+                            })
+                            .await
+                            .map_err(|_| {
+                                ToolError::execution_failed(
+                                    "tool durable event lane closed before lifecycle event commit",
+                                )
+                            })?;
+                        committed_rx
+                            .await
+                            .map_err(|_| {
+                                ToolError::execution_failed(
+                                    "tool durable event commit acknowledgement was dropped",
+                                )
+                            })?
+                            .map_err(|reason| {
+                                ToolError::execution_failed(format!(
+                                    "tool durable event commit was rejected: {reason}"
+                                ))
+                            })?;
+                        if matches!(event.payload, ToolEventPayload::OutputDelta(_)) {
+                            trace
+                                .measurements
+                                .output_saved
+                                .store(true, Ordering::Release);
+                        }
+                    }
+                    (true, None) => {
+                        return Err(ToolError::execution_failed(
+                            "tool durable event emitted after the producer watermark",
+                        ));
+                    }
+                    (false, None) => {}
+                    (false, Some(_)) => {
+                        return Err(ToolError::execution_failed(
+                            "tool durable event lane entered an invalid installation state",
+                        ));
+                    }
+                }
+                let _ = self.tx.send(event);
+                Ok(())
+            })
+            .await;
+        if let Some(measurement) = &mut measurement {
+            measurement.finish(match &result {
+                Ok(()) if installed => Fact::Committed,
+                Ok(()) => Fact::BusOnly,
+                Err(error) => crate::observation::error_fact(error),
+            });
         }
-        let _ = self.tx.send(event);
-        Ok(())
+        result
     }
 
     pub fn finish_trace(&self, trace_id: &str) {
@@ -774,7 +953,7 @@ fn monotonic_now_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_policy::{ToolOutputProjectionKind, ToolResultView};
+    use crate::output_policy::ToolOutputProjectionKind;
     use crate::output_projection::{ToolProjectionInput, project_tool_result};
     use tokio::time::{Duration, timeout};
 
@@ -804,40 +983,61 @@ mod tests {
         let bus = ToolEventBus::new(8);
         let mut receiver = bus.take_durable_receiver().expect("receiver");
         let trace = bus.trace_with_id("trace", "turn", "call", "exec_command");
+        let proof = trace.clone();
         let send = tokio::spawn(async move { trace.emit_delta(1, "must persist".into()).await });
         let envelope = receiver.recv().await.unwrap();
         assert_eq!(envelope.event.kind(), ToolEventKind::OutputDelta);
+        assert_eq!(
+            envelope.event.payload.event_class(),
+            ProtocolEventClass::Durable
+        );
         assert!(!send.is_finished());
         envelope.acknowledge(Err("storage unavailable".into()));
         assert!(send.await.unwrap().is_err());
-    }
-
-    #[test]
-    fn output_delta_events_are_durable() {
-        let event = ToolEventPayload::OutputDelta(ToolOutputDeltaEvent {
-            delta: ToolDeltaPayload::OutputChunk {
-                stream: ItemDeltaStream::Stdout,
-                text: "chunk".to_owned(),
-                truncated: false,
-            },
+        assert!(!proof.has_saved_output_log());
+        let next = proof.clone();
+        let send = tokio::spawn(async move { next.emit_delta(1, "retained prefix".into()).await });
+        let envelope = receiver.recv().await.unwrap();
+        assert!(!proof.has_saved_output_log(), "queued is not committed");
+        envelope.acknowledge(Ok(()));
+        send.await.unwrap().unwrap();
+        assert!(proof.has_saved_output_log());
+        let failed = proof.clone();
+        let send = tokio::spawn(async move {
+            failed
+                .emit_failed_with_outcome(
+                    1,
+                    "cancelled after output",
+                    &ToolOutcome::partial("cancelled", "inspect saved output"),
+                    ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                    true,
+                )
+                .await
         });
-
-        assert_eq!(event.event_class(), ProtocolEventClass::Durable);
-    }
-
-    #[test]
-    fn completed_calls_are_durable() {
-        let event = ToolEventPayload::CallCompleted(ToolCallCompletedEvent {
-            success: true,
-            outcome: ToolOutcome::ok(),
-            llm_view: ToolResultView::Empty,
-            display: ToolDisplayPayload::default(),
-            storage: ToolStoragePayload::default(),
-            recovery: None,
-            output_policy: ToolOutputPolicySnapshot::for_tool_name("test_tool"),
-        });
-
-        assert_eq!(event.event_class(), ProtocolEventClass::Durable);
+        let envelope = receiver.recv().await.unwrap();
+        let ToolEventPayload::CallFailed(failed) = &envelope.event.payload else {
+            panic!("expected native failure");
+        };
+        assert!(failed.retained_output_log);
+        assert!(matches!(
+            &failed.storage,
+            ToolStoragePayload::Shell {
+                truncated: true,
+                stdout: None,
+                ..
+            }
+        ));
+        envelope.acknowledge(Ok(()));
+        send.await.unwrap().unwrap();
+        bus.finish_trace("trace");
+        assert!(
+            proof.has_saved_output_log(),
+            "owner-held proof survives terminal map cleanup"
+        );
+        assert!(
+            !bus.start_trace("turn", "other", "exec_command")
+                .has_saved_output_log()
+        );
     }
 
     #[tokio::test]
@@ -885,8 +1085,11 @@ mod tests {
             trace.emit_heartbeat(1);
         }
         let completion_trace = trace.clone();
-        let completion =
-            tokio::spawn(async move { completion_trace.emit_completed(1, &envelope).await });
+        let completion = tokio::spawn(async move {
+            completion_trace
+                .emit_completed(1, &envelope, false, false, None)
+                .await
+        });
         tokio::pin!(completion);
         assert!(
             timeout(Duration::from_millis(20), &mut completion)
@@ -912,6 +1115,10 @@ mod tests {
         assert_eq!(
             completed_envelope.event.kind(),
             ToolEventKind::CallCompleted
+        );
+        assert_eq!(
+            completed_envelope.event.payload.event_class(),
+            ProtocolEventClass::Durable
         );
         completed_envelope.acknowledge(Ok(()));
         completion

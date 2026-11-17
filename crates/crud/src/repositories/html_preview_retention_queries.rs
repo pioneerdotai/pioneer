@@ -93,7 +93,7 @@ pub(super) fn temporary_preview(a: &'static str) -> Expr {
         .and(col(a, artifact::Column::CreatedByActorId).eq("html_preview"))
         .and(kind("$.htmlTool.version").eq("integer"))
         .and(kind("$.htmlTool.publication").eq("false"))
-        .and(origin("$.htmlTool.version").eq(1))
+        .and(origin("$.htmlTool.version").is_in([1, 2]))
         .and(origin("$.htmlTool.publication").eq(0))
         .and(kind("$.htmlTool.turnId").eq("text"))
         .and(kind("$.htmlTool.callId").eq("text"))
@@ -200,7 +200,7 @@ pub(super) fn unowned(
         .and_where(col("c", turn_llm_context::Column::TurnId).eq(turn_id))
         .and_where(
             col("c", turn_llm_context::Column::Source)
-                .is_not_in(["assistant_round", "tool_result_v2"]),
+                .is_not_in(crate::repositories::compaction::MODEL_HISTORY_CONTEXT_SOURCES),
         )
         .to_owned();
     let recovery = one(recovery_job::Entity, "r")

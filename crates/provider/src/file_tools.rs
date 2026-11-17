@@ -151,6 +151,10 @@ pub fn select_native_file_tool_capability(provider: &str, model: &str) -> Native
         "together-ai",
         "tencent",
         "venice",
+        "vercel-ai-gateway",
+        "vercel",
+        "vercel-gateway",
+        "vercel_ai_gateway",
         "vllm",
         "volcengine",
         "xai",
@@ -257,9 +261,11 @@ mod tests {
 
     #[test]
     fn known_provider_selects_one_json_shape() {
-        let capability = select_native_file_tool_capability("openai", "gpt-5");
-        assert_eq!(capability.patch_shape, NativePatchWireShape::JsonFunction);
-        assert!(capability.is_supported());
+        for (provider, model) in [("openai", "gpt-5"), ("vercel-ai-gateway", "private/agent")] {
+            let capability = select_native_file_tool_capability(provider, model);
+            assert_eq!(capability.patch_shape, NativePatchWireShape::JsonFunction);
+            assert!(capability.is_supported());
+        }
     }
 
     #[test]

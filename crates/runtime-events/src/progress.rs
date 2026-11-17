@@ -1,5 +1,7 @@
+use pioneer_observability::queues::{QueueBytes, QueueKind, QueueObserver, QueueOutcome};
+use pioneer_observability::work::{Boundary, ExecutorRole, WorkCarrier, WorkItem, WorkKind};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use pioneer_protocol::{
@@ -9,6 +11,19 @@ use pioneer_protocol::{
 use serde_json::Value as JsonValue;
 use tokio::sync::broadcast;
 use tracing::debug;
+
+#[derive(Debug, Default)]
+struct ProgressFlushWorker {
+    task: Option<Arc<tokio::sync::Mutex<ProgressFlushCompletion>>>,
+    wake: Arc<tokio::sync::Notify>,
+    failure: Option<String>,
+    closed: bool,
+}
+#[derive(Debug)]
+struct ProgressFlushCompletion {
+    task: Option<tokio::task::JoinHandle<()>>,
+    failure: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ProgressCoalescerConfig {
@@ -50,21 +65,65 @@ impl ProgressMergeBehavior {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingProgress {
+    observation: pioneer_observability::updates::StageObservation,
+    work: WorkCarrier,
+    enqueued_monotonic_ms: Option<u64>,
     notification: ItemDeltaNotification,
     behavior: ProgressMergeBehavior,
 }
 
 impl PendingProgress {
-    fn new(notification: ItemDeltaNotification, behavior: ProgressMergeBehavior) -> Self {
+    fn new(
+        notification: ItemDeltaNotification,
+        behavior: ProgressMergeBehavior,
+        source: Option<pioneer_observability::updates::UpdateContext>,
+    ) -> Self {
         Self {
+            observation: pioneer_observability::updates::StageObservation::start(
+                pioneer_observability::updates::Stage::ProgressPending,
+            ),
+            work: {
+                let capture = || {
+                    WorkCarrier::child(
+                        Boundary::EventLane,
+                        WorkKind::Event,
+                        pioneer_observability::work::Trigger::Event,
+                        ExecutorRole::Event,
+                    )
+                };
+                match source {
+                    Some(context) => context.run(capture),
+                    None => capture(),
+                }
+            },
+            enqueued_monotonic_ms: pioneer_observability::telemetry_enabled()
+                .then(|| pioneer_observability::work::clock_ms()),
             notification,
             behavior,
         }
     }
 
-    fn merge(&mut self, mut next: ItemDeltaNotification, config: &ProgressCoalescerConfig) {
+    fn merge(
+        &mut self,
+        mut next: ItemDeltaNotification,
+        config: &ProgressCoalescerConfig,
+        source: Option<pioneer_observability::updates::UpdateContext>,
+    ) {
+        let capture = || {
+            WorkCarrier::child(
+                Boundary::EventLane,
+                WorkKind::Event,
+                pioneer_observability::work::Trigger::Event,
+                ExecutorRole::Event,
+            )
+        };
+        let work = match source {
+            Some(context) => context.run(capture),
+            None => capture(),
+        };
+        self.work.merge_link(&work);
         match self.behavior {
             ProgressMergeBehavior::Append => {
                 self.notification.delta.push_str(next.delta.as_str());
@@ -81,10 +140,16 @@ impl PendingProgress {
                 if next.payload.is_some() {
                     self.notification.payload = next.payload.take();
                 }
+                if truncated {
+                    self.work.mark_update_incomplete();
+                }
                 annotate_progress_payload(&mut self.notification, true, truncated);
             }
             ProgressMergeBehavior::Snapshot => {
                 let truncated = bound_delta(&mut next.delta, config.max_snapshot_bytes_per_key);
+                if truncated {
+                    self.work.mark_update_incomplete();
+                }
                 annotate_progress_payload(&mut next, true, truncated);
                 self.notification = next;
             }
@@ -101,6 +166,8 @@ struct HeartbeatKey {
 
 #[derive(Debug, Clone)]
 struct PendingHeartbeat {
+    work: WorkCarrier,
+    enqueued_monotonic_ms: Option<u64>,
     workspace_id: String,
     thread_id: String,
     turn_id: String,
@@ -112,15 +179,31 @@ struct PendingHeartbeat {
 #[derive(Debug, Default)]
 struct ProgressCoalescerState {
     pending: HashMap<ProgressCoalescingKey, PendingProgress>,
+    pending_delta_bytes: u64,
     heartbeats: HashMap<HeartbeatKey, PendingHeartbeat>,
     flush_scheduled: bool,
+    closed: bool,
 }
 
 #[derive(Debug)]
 struct ProgressCoalescerInner {
+    observer: QueueObserver,
+    delivery_observer: QueueObserver,
+    delivery_observation: StdMutex<()>,
     state: StdMutex<ProgressCoalescerState>,
-    live_tx: broadcast::Sender<AgentProgressEvent>,
+    live_tx: broadcast::Sender<WorkItem<AgentProgressEvent>>,
     config: ProgressCoalescerConfig,
+    flush_worker: StdMutex<ProgressFlushWorker>,
+}
+
+impl Drop for ProgressCoalescerInner {
+    fn drop(&mut self) {
+        self.flush_worker
+            .get_mut()
+            .expect("progress worker ownership poisoned")
+            .wake
+            .notify_one();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -134,14 +217,70 @@ impl ProgressCoalescer {
         Self {
             inner: Arc::new(ProgressCoalescerInner {
                 state: StdMutex::new(ProgressCoalescerState::default()),
+                delivery_observation: StdMutex::new(()),
                 live_tx,
+                delivery_observer: QueueObserver::new(
+                    QueueKind::EventProgressBroadcast,
+                    Some(live_capacity.max(1).next_power_of_two()),
+                    "unsupported payload bytes; depth=retained broadcast outputs; enqueue=accepted merged outputs, processed=receiver deliveries, delivery_dropped=lagged deliveries; fanout has no FIFO event conservation",
+                ),
+                observer: QueueObserver::new(
+                    QueueKind::EventProgress,
+                    Some(config.max_pending_keys),
+                    "estimate: pending delta UTF-8 bytes only; payload/markdown/envelope excluded",
+                ),
                 config,
+                flush_worker: StdMutex::new(ProgressFlushWorker::default()),
             }),
         }
     }
 
-    pub fn subscribe_live(&self) -> broadcast::Receiver<AgentProgressEvent> {
-        self.inner.live_tx.subscribe()
+    pub async fn shutdown_and_wait(&self) -> Result<(), String> {
+        let workers = &self.inner.flush_worker;
+        let tasks = {
+            let mut workers = workers.lock().expect("progress worker ownership poisoned");
+            workers.closed = true;
+            self.inner
+                .state
+                .lock()
+                .expect("progress coalescer poisoned")
+                .closed = true;
+            workers.wake.notify_one();
+            workers.task.clone()
+        };
+        for completion in tasks.into_iter() {
+            let mut completion = completion.lock().await;
+            if let Some(task) = completion.task.as_mut() {
+                let result = task.await;
+                completion.task.take();
+                if result.is_err() {
+                    completion.failure = Some("progress flush worker failed".into());
+                }
+            }
+            if let Some(error) = &completion.failure {
+                workers
+                    .lock()
+                    .expect("progress ownership poisoned")
+                    .failure
+                    .get_or_insert(error.clone());
+            }
+        }
+        // No recursive worker or offer can register after the closed gate.
+        self.flush_all().await;
+        let mut workers = workers.lock().expect("progress ownership poisoned");
+        workers.task.take();
+        match &workers.failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    pub fn subscribe_live(&self) -> ProgressEventReceiver {
+        ProgressEventReceiver {
+            receiver: Some(self.inner.live_tx.subscribe()),
+            owner: Arc::downgrade(&self.inner),
+            pending_work: Default::default(),
+        }
     }
 
     pub fn offer(&self, event: AgentProgressEvent) {
@@ -203,6 +342,9 @@ impl ProgressCoalescer {
                 .state
                 .lock()
                 .expect("progress coalescer poisoned");
+            if state.closed {
+                return;
+            }
             let key = HeartbeatKey {
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
@@ -210,6 +352,7 @@ impl ProgressCoalescer {
             };
             let is_new = !state.heartbeats.contains_key(&key);
             if is_new && self.total_pending_keys(&state) >= self.inner.config.max_pending_keys {
+                self.inner.observer.outcome(QueueOutcome::Rejected, 1);
                 debug!(
                     thread_id,
                     turn_id, item_id, "dropping redundant heartbeat at coalescer key limit"
@@ -227,9 +370,25 @@ impl ProgressCoalescer {
             } else {
                 ItemHeartbeatSource::OwnerLease
             };
+            if is_new {
+                self.inner.observer.enqueued(QueueBytes::Estimate(0));
+            } else {
+                self.inner.observer.outcome(QueueOutcome::Coalesced, 1);
+            }
+            let mut work = pioneer_observability::work::capture();
+            let mut enqueued_monotonic_ms = pioneer_observability::telemetry_enabled()
+                .then(pioneer_observability::work::clock_ms);
+            if let Some(previous) = state.heartbeats.get(&key) {
+                let mut combined = previous.work.clone();
+                combined.merge_link(&work);
+                work = combined;
+                enqueued_monotonic_ms = previous.enqueued_monotonic_ms;
+            }
             state.heartbeats.insert(
                 key,
                 PendingHeartbeat {
+                    work,
+                    enqueued_monotonic_ms,
                     workspace_id,
                     thread_id,
                     turn_id,
@@ -255,16 +414,19 @@ impl ProgressCoalescer {
                 .state
                 .lock()
                 .expect("progress coalescer poisoned");
-            state
-                .pending
-                .remove(key)
+            remove_progress(&mut state, key)
                 .map(|pending| {
-                    vec![AgentProgressEvent::ItemDelta {
-                        notification: pending.notification,
-                    }]
+                    vec![progress_event(
+                        pending,
+                        pioneer_observability::updates::FlushReason::Key,
+                    )]
                 })
                 .unwrap_or_default()
         };
+        pioneer_observability::updates::flushed_batch(
+            pioneer_observability::updates::FlushReason::Key,
+            events.len(),
+        );
         self.send_live_events(events);
     }
 
@@ -338,10 +500,11 @@ impl ProgressCoalescer {
                 .collect::<Vec<_>>();
             let mut events = Vec::with_capacity(keys.len() + heartbeat_keys.len());
             for key in keys {
-                if let Some(pending) = state.pending.remove(&key) {
-                    events.push(AgentProgressEvent::ItemDelta {
-                        notification: pending.notification,
-                    });
+                if let Some(pending) = remove_progress(&mut state, &key) {
+                    events.push(progress_event(
+                        pending,
+                        pioneer_observability::updates::FlushReason::Item,
+                    ));
                 }
             }
             for key in heartbeat_keys {
@@ -352,6 +515,10 @@ impl ProgressCoalescer {
             update_flush_scheduled(&mut state);
             events
         };
+        pioneer_observability::updates::flushed_batch(
+            pioneer_observability::updates::FlushReason::Item,
+            events.len(),
+        );
         self.send_live_events(events);
     }
 
@@ -376,10 +543,11 @@ impl ProgressCoalescer {
                 .collect::<Vec<_>>();
             let mut events = Vec::with_capacity(keys.len() + heartbeat_keys.len());
             for key in keys {
-                if let Some(pending) = state.pending.remove(&key) {
-                    events.push(AgentProgressEvent::ItemDelta {
-                        notification: pending.notification,
-                    });
+                if let Some(pending) = remove_progress(&mut state, &key) {
+                    events.push(progress_event(
+                        pending,
+                        pioneer_observability::updates::FlushReason::Turn,
+                    ));
                 }
             }
             for key in heartbeat_keys {
@@ -390,6 +558,10 @@ impl ProgressCoalescer {
             update_flush_scheduled(&mut state);
             events
         };
+        pioneer_observability::updates::flushed_batch(
+            pioneer_observability::updates::FlushReason::Turn,
+            events.len(),
+        );
         self.send_live_events(events);
     }
 
@@ -434,7 +606,8 @@ impl ProgressCoalescer {
 
     pub async fn flush_all(&self) {
         loop {
-            let (events, has_more) = self.drain_batch();
+            let (events, has_more) =
+                self.drain_batch(pioneer_observability::updates::FlushReason::Forced);
             if events.is_empty() && !has_more {
                 break;
             }
@@ -446,8 +619,23 @@ impl ProgressCoalescer {
     }
 
     fn offer_notification(&self, notification: ItemDeltaNotification) {
+        let mut offer = pioneer_observability::updates::StageObservation::start(
+            pioneer_observability::updates::Stage::ProgressOffer,
+        );
         let key = progress_key_from_notification(&notification);
         let behavior = ProgressMergeBehavior::for_stream(key.stream);
+        let source = pioneer_observability::updates::UpdateContext::source(
+            pioneer_observability::updates::ContentHint::new(
+                &notification.thread_id,
+                Some(&notification.item_id),
+                if behavior == ProgressMergeBehavior::Append {
+                    pioneer_observability::updates::Change::Append
+                } else {
+                    pioneer_observability::updates::Change::Snapshot
+                },
+                notification.delta.len(),
+            ),
+        );
         let mut should_schedule = false;
         {
             let mut state = self
@@ -455,8 +643,12 @@ impl ProgressCoalescer {
                 .state
                 .lock()
                 .expect("progress coalescer poisoned");
+            if state.closed {
+                return;
+            }
             let is_new = !state.pending.contains_key(&key);
             if is_new && self.total_pending_keys(&state) >= self.inner.config.max_pending_keys {
+                self.inner.observer.outcome(QueueOutcome::Rejected, 1);
                 debug!(
                     workspace_id = notification.workspace_id,
                     thread_id = notification.thread_id,
@@ -465,24 +657,54 @@ impl ProgressCoalescer {
                     ?behavior,
                     "dropping redundant progress at coalescer key limit"
                 );
+                offer.finish(pioneer_observability::updates::Fact::Rejected);
                 return;
             }
             if let Some(pending) = state.pending.get_mut(&key) {
-                pending.merge(notification, &self.inner.config);
+                self.inner.observer.outcome(QueueOutcome::Coalesced, 1);
+                let before = pending.notification.delta.len() as u64;
+                pending.merge(notification, &self.inner.config, source);
+                offer.finish(pioneer_observability::updates::Fact::Coalesced);
+                let after = pending.notification.delta.len() as u64;
+                state.pending_delta_bytes = state
+                    .pending_delta_bytes
+                    .saturating_sub(before)
+                    .saturating_add(after);
             } else {
-                let mut pending = PendingProgress::new(notification, behavior);
+                let mut pending = PendingProgress::new(notification, behavior, source);
                 let limit = match behavior {
                     ProgressMergeBehavior::Append => self.inner.config.max_append_bytes_per_key,
                     ProgressMergeBehavior::Snapshot => self.inner.config.max_snapshot_bytes_per_key,
                 };
                 let truncated = bound_delta(&mut pending.notification.delta, limit);
+                if truncated {
+                    pending.work.mark_update_incomplete();
+                }
                 annotate_progress_payload(&mut pending.notification, true, truncated);
+                state.pending_delta_bytes = state
+                    .pending_delta_bytes
+                    .saturating_add(pending.notification.delta.len() as u64);
+                self.inner
+                    .observer
+                    .enqueued(QueueBytes::Estimate(pending.notification.delta.len() as u64));
                 state.pending.insert(key, pending);
+                offer.finish(pioneer_observability::updates::Fact::Returned);
             }
             if !state.flush_scheduled {
                 state.flush_scheduled = true;
                 should_schedule = true;
             }
+        }
+        {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .expect("progress coalescer poisoned");
+            self.inner.observer.current(
+                state.pending.len().saturating_add(state.heartbeats.len()),
+                QueueBytes::Estimate(state.pending_delta_bytes),
+            );
         }
         if should_schedule {
             self.schedule_flush();
@@ -494,7 +716,7 @@ impl ProgressCoalescer {
     }
 
     fn schedule_flush(&self) {
-        let coalescer = self.clone();
+        let owner = Arc::downgrade(&self.inner);
         if tokio::runtime::Handle::try_current().is_err() {
             if let Ok(mut state) = self.inner.state.lock() {
                 state.flush_scheduled = false;
@@ -502,17 +724,75 @@ impl ProgressCoalescer {
             debug!("progress coalescer could not schedule flush outside a tokio runtime");
             return;
         }
-        tokio::spawn(async move {
-            tokio::time::sleep(coalescer.inner.config.flush_interval).await;
-            let (events, has_more) = coalescer.drain_batch();
-            coalescer.send_live_events(events);
-            if has_more {
-                coalescer.schedule_flush();
+        let timer = WorkCarrier::independent(
+            Boundary::Timer,
+            WorkKind::WorkerLifecycle,
+            pioneer_observability::work::Trigger::Timer,
+            ExecutorRole::Event,
+        );
+        {
+            let workers = &self.inner.flush_worker;
+            let mut workers = workers.lock().expect("progress ownership poisoned");
+            if workers.closed {
+                return;
             }
-        });
+            if workers.task.is_none() {
+                // One actual flush worker for this coalescer. Manual
+                // flushes and new offers only wake it; no recursive task queue.
+                let wake = workers.wake.clone();
+                workers.task = Some(Arc::new(tokio::sync::Mutex::new(ProgressFlushCompletion {
+                    task: Some(tokio::spawn(timer.scope(async move {
+                        loop {
+                            wake.notified().await;
+                            let Some(inner) = owner.upgrade() else {
+                                break;
+                            };
+                            let coalescer = ProgressCoalescer { inner };
+                            if coalescer
+                                .inner
+                                .state
+                                .lock()
+                                .expect("progress coalescer poisoned")
+                                .closed
+                            {
+                                break;
+                            }
+                            loop {
+                                pioneer_observability::live::sleeping(
+                                    coalescer.inner.config.flush_interval,
+                                    tokio::time::sleep(coalescer.inner.config.flush_interval),
+                                )
+                                .await;
+                                let (events, has_more) = coalescer.drain_batch(
+                                    pioneer_observability::updates::FlushReason::Timer,
+                                );
+                                coalescer.send_live_events(events);
+                                if coalescer
+                                    .inner
+                                    .state
+                                    .lock()
+                                    .expect("progress coalescer poisoned")
+                                    .closed
+                                {
+                                    return;
+                                }
+                                if !has_more {
+                                    break;
+                                }
+                            }
+                        }
+                    }))),
+                    failure: None,
+                })));
+            }
+            workers.wake.notify_one();
+        }
     }
 
-    fn drain_batch(&self) -> (Vec<AgentProgressEvent>, bool) {
+    fn drain_batch(
+        &self,
+        reason: pioneer_observability::updates::FlushReason,
+    ) -> (Vec<WorkItem<AgentProgressEvent>>, bool) {
         let mut state = self
             .inner
             .state
@@ -522,10 +802,8 @@ impl ProgressCoalescer {
         let mut events = Vec::new();
         let progress_keys = state.pending.keys().take(max).cloned().collect::<Vec<_>>();
         for key in progress_keys {
-            if let Some(pending) = state.pending.remove(&key) {
-                events.push(AgentProgressEvent::ItemDelta {
-                    notification: pending.notification,
-                });
+            if let Some(pending) = remove_progress(&mut state, &key) {
+                events.push(progress_event(pending, reason));
             }
         }
         if events.len() < max {
@@ -543,13 +821,43 @@ impl ProgressCoalescer {
         }
         let has_more = !(state.pending.is_empty() && state.heartbeats.is_empty());
         state.flush_scheduled = has_more;
+        pioneer_observability::updates::flushed_batch(reason, events.len());
         (events, has_more)
     }
 
-    fn send_live_events(&self, events: Vec<AgentProgressEvent>) {
+    fn send_live_events(&self, events: Vec<WorkItem<AgentProgressEvent>>) {
         for event in events {
-            let _ = self.inner.live_tx.send(event);
+            let delivery_observer = self.inner.delivery_observer.in_current_epoch();
+            self.inner.observer.dequeued(QueueBytes::Unsupported);
+            self.inner.observer.outcome(QueueOutcome::Processed, 1);
+            if self.inner.live_tx.send(event).is_err() {
+                self.inner
+                    .observer
+                    .outcome(QueueOutcome::DeliveryDropped, 1);
+                delivery_observer.outcome(QueueOutcome::Rejected, 1);
+            } else {
+                delivery_observer.enqueued(QueueBytes::Unsupported);
+            }
+            if pioneer_observability::telemetry_enabled() {
+                #[cfg(test)]
+                BEFORE_BROADCAST_DEPTH.with(|hook| {
+                    let callback = hook.borrow_mut().take();
+                    if let Some(callback) = callback {
+                        callback();
+                    }
+                });
+                self.inner.observe_broadcast_depth(&delivery_observer);
+            }
         }
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("progress coalescer poisoned");
+        self.inner.observer.current(
+            state.pending.len().saturating_add(state.heartbeats.len()),
+            QueueBytes::Estimate(state.pending_delta_bytes),
+        );
     }
 }
 
@@ -559,15 +867,21 @@ fn update_flush_scheduled(state: &mut ProgressCoalescerState) {
     }
 }
 
-fn heartbeat_event(heartbeat: PendingHeartbeat) -> AgentProgressEvent {
-    AgentProgressEvent::ItemHeartbeat {
-        workspace_id: heartbeat.workspace_id,
-        thread_id: heartbeat.thread_id,
-        turn_id: heartbeat.turn_id,
-        item_id: heartbeat.item_id,
-        item_type: heartbeat.item_type,
-        source: heartbeat.source,
-    }
+fn heartbeat_event(heartbeat: PendingHeartbeat) -> WorkItem<AgentProgressEvent> {
+    let work = heartbeat.work;
+    let at = heartbeat.enqueued_monotonic_ms;
+    WorkItem::from_carrier(
+        AgentProgressEvent::ItemHeartbeat {
+            workspace_id: heartbeat.workspace_id,
+            thread_id: heartbeat.thread_id,
+            turn_id: heartbeat.turn_id,
+            item_id: heartbeat.item_id,
+            item_type: heartbeat.item_type,
+            source: heartbeat.source,
+        },
+        work,
+        at,
+    )
 }
 
 fn progress_event_to_item_delta(event: AgentProgressEvent) -> Option<ItemDeltaNotification> {
@@ -678,6 +992,42 @@ fn annotate_progress_payload(
 #[cfg(test)]
 mod fanout_tests {
     use super::*;
+    #[test]
+    fn observed_broadcast_preserves_lagged_delivery_and_sender_close() {
+        let coalescer = ProgressCoalescer::new(2, ProgressCoalescerConfig::default());
+        let mut receiver = coalescer.subscribe_live();
+        for index in 0..3 {
+            let event = AgentProgressEvent::TaskProgress {
+                workspace_id: "w".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "task".into(),
+                task_id: "task".into(),
+                run_id: None,
+                summary: index.to_string(),
+            };
+            coalescer.send_live_events(vec![WorkItem::from_carrier(
+                event,
+                WorkCarrier::default(),
+                None,
+            )]);
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(1))
+        ));
+        for expected in ["1", "2"] {
+            match receiver.try_recv().unwrap() {
+                AgentProgressEvent::TaskProgress { summary, .. } => assert_eq!(summary, expected),
+                _ => panic!("unexpected progress event"),
+            }
+        }
+        drop(coalescer);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+    }
     #[tokio::test(start_paused = true)]
     async fn terminal_flush_targets_only_existing_bounded_buffers_and_respects_workspace() {
         let coalescer = ProgressCoalescer::new(16, ProgressCoalescerConfig::default());
@@ -722,5 +1072,227 @@ mod fanout_tests {
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_err());
+    }
+}
+
+fn progress_event(
+    mut pending: PendingProgress,
+    reason: pioneer_observability::updates::FlushReason,
+) -> WorkItem<AgentProgressEvent> {
+    pioneer_observability::updates::flushed(reason, 1);
+    // This is removal from the pending buffer, before broadcast admission.
+    pending
+        .observation
+        .finish(pioneer_observability::updates::Fact::Returned);
+    WorkItem::from_carrier(
+        AgentProgressEvent::ItemDelta {
+            notification: pending.notification,
+        },
+        pending.work,
+        pending.enqueued_monotonic_ms,
+    )
+}
+#[derive(Debug)]
+pub struct ProgressEventReceiver {
+    receiver: Option<broadcast::Receiver<WorkItem<AgentProgressEvent>>>,
+    // A receiver must not keep the sender alive or change channel-close behavior.
+    owner: Weak<ProgressCoalescerInner>,
+    pending_work: WorkCarrier,
+}
+impl ProgressCoalescerInner {
+    fn observe_broadcast_depth(&self, observer: &QueueObserver) {
+        let _observation = self
+            .delivery_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Both send and delivery paths read AFTER taking this lock. A late
+        // caller rereads native unread depth, never publishes a saved len.
+        observer.current(self.live_tx.len(), QueueBytes::Unsupported);
+    }
+}
+impl ProgressEventReceiver {
+    fn observe_delivery(&self, received: bool, lagged: u64) {
+        if !pioneer_observability::telemetry_enabled() {
+            return;
+        }
+        if let Some(owner) = self.owner.upgrade() {
+            let observer = owner.delivery_observer.in_current_epoch();
+            if received {
+                observer.outcome(QueueOutcome::Processed, 1);
+            }
+            if lagged > 0 {
+                observer.outcome(QueueOutcome::DeliveryDropped, lagged);
+            }
+            owner.observe_broadcast_depth(&observer);
+        }
+    }
+    pub async fn recv(&mut self) -> Result<AgentProgressEvent, broadcast::error::RecvError> {
+        self.pending_work = Default::default();
+        let result = self.receiver.as_mut().expect("live receiver").recv().await;
+        self.observe_delivery(
+            result.is_ok(),
+            match &result {
+                Err(broadcast::error::RecvError::Lagged(count)) => *count,
+                _ => 0,
+            },
+        );
+        let item = result?;
+        let (value, work) =
+            item.received(Boundary::EventLane, WorkKind::Event, ExecutorRole::Event);
+        self.pending_work = work.execution_child(WorkKind::Event, ExecutorRole::Event);
+        Ok(value)
+    }
+    pub fn try_recv(&mut self) -> Result<AgentProgressEvent, broadcast::error::TryRecvError> {
+        self.pending_work = Default::default();
+        let result = self.receiver.as_mut().expect("live receiver").try_recv();
+        self.observe_delivery(
+            result.is_ok(),
+            match &result {
+                Err(broadcast::error::TryRecvError::Lagged(count)) => *count,
+                _ => 0,
+            },
+        );
+        let item = result?;
+        let (value, work) =
+            item.received(Boundary::EventLane, WorkKind::Event, ExecutorRole::Event);
+        self.pending_work = work.execution_child(WorkKind::Event, ExecutorRole::Event);
+        Ok(value)
+    }
+    pub fn pending_work(&self) -> WorkCarrier {
+        self.pending_work.clone()
+    }
+}
+
+impl Drop for ProgressEventReceiver {
+    fn drop(&mut self) {
+        // Removing a subscriber releases its native unread slots. Drop it before
+        // the fresh depth read; never create a replacement subscriber/sender.
+        drop(self.receiver.take());
+        if pioneer_observability::telemetry_enabled() {
+            if let Some(owner) = self.owner.upgrade() {
+                owner.observe_broadcast_depth(&owner.delivery_observer.in_current_epoch());
+            }
+        }
+    }
+}
+
+fn remove_progress(
+    state: &mut ProgressCoalescerState,
+    key: &ProgressCoalescingKey,
+) -> Option<PendingProgress> {
+    let pending = state.pending.remove(key)?;
+    state.pending_delta_bytes = state
+        .pending_delta_bytes
+        .saturating_sub(pending.notification.delta.len() as u64);
+    Some(pending)
+}
+
+#[cfg(test)]
+thread_local! { pub(crate) static BEFORE_BROADCAST_DEPTH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None); }
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+    use std::{cell::RefCell, rc::Rc};
+    fn event() -> WorkItem<AgentProgressEvent> {
+        WorkItem::from_carrier(
+            AgentProgressEvent::TaskProgress {
+                workspace_id: "w".into(),
+                thread_id: "t".into(),
+                turn_id: "turn".into(),
+                item_id: "i".into(),
+                task_id: "task".into(),
+                run_id: None,
+                summary: "fixture".into(),
+            },
+            WorkCarrier::default(),
+            None,
+        )
+    }
+    #[test]
+    fn late_sender_rereads_unread_depth_after_real_delivery_and_epoch_change() {
+        let _lock = crate::OBSERVATION_TEST_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        let mut coalescer = ProgressCoalescer::new(2, ProgressCoalescerConfig::default());
+        Arc::get_mut(&mut coalescer.inner)
+            .unwrap()
+            .delivery_observer = QueueObserver::new(
+            QueueKind::EventProgressBroadcast,
+            Some(2),
+            "fixture broadcast current order",
+        );
+        let receiver = Rc::new(RefCell::new(coalescer.subscribe_live()));
+        let during = receiver.clone();
+        BEFORE_BROADCAST_DEPTH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                during.borrow_mut().try_recv().unwrap();
+            }))
+        });
+        coalescer.send_live_events(vec![event()]);
+        let read = || {
+            pioneer_observability::live::snapshot()
+                .unwrap()
+                .queues
+                .into_iter()
+                .find(|q| q.byte_definition == "fixture broadcast current order")
+                .unwrap()
+        };
+        assert_eq!(coalescer.inner.live_tx.len(), 0);
+        let q = read();
+        assert_eq!((q.depth, q.enqueued, q.processed), (0, 1, 1));
+        assert!(q.initial_depth_known && q.last_observed_ms <= q.snapshot_ms);
+        let mut second = coalescer.subscribe_live();
+        for _ in 0..3 {
+            coalescer.send_live_events(vec![event()]);
+        }
+        assert!(matches!(
+            receiver.borrow_mut().try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(1))
+        ));
+        assert!(matches!(
+            second.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(1))
+        ));
+        for _ in 0..2 {
+            receiver.borrow_mut().try_recv().unwrap();
+        }
+        assert_eq!(read().depth, 2); // other subscriber still retains both unread slots
+        for _ in 0..2 {
+            second.try_recv().unwrap();
+        }
+        assert_eq!((read().depth, read().delivery_dropped), (0, 2));
+        BEFORE_BROADCAST_DEPTH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                pioneer_observability::set_telemetry_enabled(false);
+                pioneer_observability::set_telemetry_enabled(true);
+            }))
+        });
+        coalescer.send_live_events(vec![event()]); // old pinned sender cannot publish E2
+        assert!(
+            pioneer_observability::live::snapshot()
+                .unwrap()
+                .queues
+                .iter()
+                .all(|q| q.byte_definition != "fixture broadcast current order")
+        );
+        receiver.borrow_mut().try_recv().unwrap();
+        assert_eq!(read().depth, 1); // exact native unread baseline in new epoch
+        second.try_recv().unwrap();
+        assert_eq!(read().depth, 0);
+        coalescer.send_live_events(vec![event()]);
+        drop(receiver); // second subscriber still retains this slot
+        assert_eq!(read().depth, 1);
+        drop(second); // last native unread reference is released without a recv callback
+        assert_eq!(coalescer.inner.live_tx.len(), 0);
+        assert_eq!(read().depth, 0);
+        let mut closed = coalescer.subscribe_live();
+        drop(coalescer);
+        assert!(matches!(
+            closed.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+        pioneer_observability::set_telemetry_enabled(old);
     }
 }

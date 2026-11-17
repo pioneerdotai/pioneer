@@ -24,8 +24,14 @@ pub(crate) fn spawn_reveal_file(path: &Path) -> Result<()> {
 }
 
 fn spawn_command(command: &mut Command, action: &str) -> Result<()> {
-    command
+    let child = command
         .spawn()
         .with_context(|| format!("failed to {action}"))?;
+    let _observation = pioneer_observability::resources::ChildRegistration::register(
+        Some(child.id()),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+        None,
+    );
+    // Fire-and-forget shell ownership is unchanged; final usage is unavailable.
     Ok(())
 }

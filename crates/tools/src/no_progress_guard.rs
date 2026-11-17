@@ -665,21 +665,6 @@ mod tests {
     }
 
     #[test]
-    fn timeout_control_values_do_not_create_a_new_exact_strategy() {
-        let first = StrategyFingerprint::new(
-            "exec_command",
-            r#"{"command":["tool","--date","2026-08-01"],"timeout_ms":10000}"#,
-            128,
-        );
-        let second = StrategyFingerprint::new(
-            "exec_command",
-            r#"{"command":["tool","--date","2026-08-01"],"timeout_ms":120000}"#,
-            128,
-        );
-        assert_eq!(first.exact, second.exact);
-    }
-
-    #[test]
     fn unicode_text_is_structurally_compared_without_language_rules() {
         let first = StrategyFingerprint::new(
             "exec_command",

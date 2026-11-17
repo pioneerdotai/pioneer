@@ -396,6 +396,12 @@ fn validate_voice_chunk_header_common(
 /// successful transcription.
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct VoiceTurnContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_mode: Option<crate::NativeServiceModeSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_authority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// Workspace active when the voice session starts.
     ///
     /// `TurnStartParams` is still thread-scoped; the gateway keeps the
@@ -447,6 +453,9 @@ impl VoiceTurnContext {
         input.extend(self.prepared_input);
 
         TurnStartParams {
+            service_mode: self.service_mode,
+            context_authority: self.context_authority,
+            context_window: self.context_window,
             agent_delegation_routes: Vec::new(),
             thread_id: self.thread_id,
             turn_id: self.turn_id,
@@ -503,12 +512,27 @@ pub struct VoiceSessionStartParams {
 pub struct VoiceSessionStartResponse {
     pub session_id: String,
     pub status: VoiceStatus,
+    /// Version 1 verifies the ordered PCM ingress at finalize, before publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_integrity_version: Option<u32>,
+}
+
+/// Counts normalized mono 16 kHz PCM before VAD, never ASR speech or padding.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VoiceAudioIntegrity {
+    /// Number of packets, equivalently the sequence immediately after the tail.
+    pub next_sequence: u64,
+    pub normalized_samples: u64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct VoiceSessionFinalizeParams {
     pub session_id: String,
     pub context: VoiceTurnContext,
+    /// Optional on the wire for decoding legacy clients; servers fail closed
+    /// when absent. A new client requires version 1 in the start response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_integrity: Option<VoiceAudioIntegrity>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -686,6 +710,9 @@ mod tests {
     #[test]
     fn voice_control_dtos_round_trip_through_serde() {
         let context = VoiceTurnContext {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -745,6 +772,7 @@ mod tests {
         let finalize = VoiceSessionFinalizeParams {
             session_id: "voice_session_1".to_owned(),
             context,
+            audio_integrity: Some(VoiceAudioIntegrity::default()),
         };
         let finalize_round_trip: VoiceSessionFinalizeParams =
             serde_json::from_value(serde_json::to_value(&finalize).expect("serialize finalize"))
@@ -784,6 +812,9 @@ mod tests {
     #[test]
     fn voice_context_prepends_transcript_without_embedding_it_in_frozen_context() {
         let context = VoiceTurnContext {
+            service_mode: None,
+            context_authority: None,
+            context_window: None,
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),

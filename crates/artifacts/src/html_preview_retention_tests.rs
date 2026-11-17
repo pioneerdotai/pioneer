@@ -35,10 +35,11 @@ async fn preview_maintenance(service: &ArtifactService) {
     for _ in 0..2 {
         let mut idle = false;
         for _ in 0..128 {
-            if !service
-                .html_preview_maintenance_quantum(&mut progress)
+            if service
+                .html_preview_maintenance_outcome(&mut progress)
                 .await
                 .unwrap()
+                != crate::HtmlPreviewMaintenanceOutcome::More
             {
                 idle = true;
                 break;
@@ -212,28 +213,46 @@ async fn html_preview_lists_filter_before_identity_pagination_and_preserve_publi
 }
 
 #[tokio::test]
-async fn html_preview_active_delivery_frozen_context_and_legacy_copies_release_after_owners() {
+async fn html_preview_active_delivery_frozen_context_and_copies_release_both_formats() {
+    preview_release_after_owners(false).await;
+    preview_release_after_owners(true).await;
+}
+
+async fn preview_release_after_owners(six_frames: bool) {
     use pioneer_provider::{ChatMessage, MessageContentPart};
     let mut harness = preview_fixture().await;
     harness.service.gc_policy.grace_secs = 0;
-    let source = harness
-        .service
-        .ingest_bytes(preview_request("input", b"<html>source</html>".to_vec()))
-        .await
-        .unwrap();
+    let mut source_request = preview_request("input", b"<html>source</html>".to_vec());
+    if six_frames {
+        source_request.metadata.get_mut("htmlTool").unwrap()["version"] = json!(2);
+    }
+    let source = harness.service.ingest_bytes(source_request).await.unwrap();
     let mut summaries = Vec::new();
     let mut parts = Vec::new();
     let mut images = Vec::new();
+    let mut previews = Vec::new();
     let mut old_paths = Vec::new();
-    for width in [360, 768, 1024] {
-        let summary = harness
-            .service
-            .ingest_bytes(preview_request(
-                &width.to_string(),
-                test_png_bytes(width, 2),
-            ))
-            .await
-            .unwrap();
+    let frames = if six_frames {
+        vec![
+            ("light-360", 360),
+            ("light-768", 768),
+            ("light-1024", 1024),
+            ("dark-360", 360),
+            ("dark-768", 768),
+            ("dark-1024", 1024),
+        ]
+    } else {
+        vec![("360", 360), ("768", 768), ("1024", 1024)]
+    };
+    for (index, width) in &frames {
+        let mut request = preview_request(index, test_png_bytes(*width, 2));
+        if six_frames {
+            request.metadata.get_mut("htmlTool").unwrap()["version"] = json!(2);
+            request.metadata.get_mut("htmlTool").unwrap()["details"] = json!({
+                "width":width,"appearance":index.split('-').next().unwrap()
+            });
+        }
+        let summary = harness.service.ingest_bytes(request).await.unwrap();
         let original = harness
             .service
             .resolve_provider_attachment(
@@ -267,15 +286,24 @@ async fn html_preview_active_delivery_frozen_context_and_legacy_copies_release_a
         attachment.source = pioneer_provider::AttachmentDataSource::Path {
             path: legacy.to_string_lossy().into_owned(),
         };
-        images.push(json!({"width":width,"attachment":attachment}));
+        let mut image = json!({"width":width,"attachment":attachment});
+        let mut preview = json!({"width":width,"artifact":summary.artifact});
+        if six_frames {
+            let appearance = index.split('-').next().unwrap();
+            image["appearance"] = json!(appearance);
+            preview["appearance"] = json!(appearance);
+        }
+        images.push(image);
+        previews.push(preview);
         parts.push(MessageContentPart::image(attachment));
         summaries.push(summary);
     }
-    let mut message = ChatMessage::tool_result(
-        "provider-call",
-        "html_preview",
-        json!({"source":source.artifact,"previews":[],"llm_context":{"images":images}}).to_string(),
-    );
+    let mut result =
+        json!({"source":source.artifact,"previews":previews,"llm_context":{"images":images}});
+    if six_frames {
+        result["formatVersion"] = json!(2);
+    }
+    let mut message = ChatMessage::tool_result("provider-call", "html_preview", result.to_string());
     message.content_parts = parts;
     let entry = pioneer_crud::NewTurnLlmContextEntry {
         turn_id: "preview-turn".into(),
@@ -354,7 +382,8 @@ async fn html_preview_active_delivery_frozen_context_and_legacy_copies_release_a
     drop(delivery);
     // An abort in the middle of version retirement rolls the canonical archive
     // and every logical owner back together; no file deletion is yet eligible.
-    harness.store.database_connection().execute_unprepared("CREATE TRIGGER fail_preview_release BEFORE DELETE ON artifact_version WHEN EXISTS(SELECT 1 FROM artifact a WHERE a.id=OLD.artifact_id AND a.created_by_actor_id='html_preview' AND json_extract(a.metadata_json,'$.htmlTool.index')='768') BEGIN SELECT RAISE(ABORT,'fixture release rollback'); END").await.unwrap();
+    let failing_index = if six_frames { "dark-768" } else { "768" };
+    harness.store.database_connection().execute_unprepared(&format!("CREATE TRIGGER fail_preview_release BEFORE DELETE ON artifact_version WHEN EXISTS(SELECT 1 FROM artifact a WHERE a.id=OLD.artifact_id AND a.created_by_actor_id='html_preview' AND json_extract(a.metadata_json,'$.htmlTool.index')='{failing_index}') BEGIN SELECT RAISE(ABORT,'fixture release rollback'); END")).await.unwrap();
     let mut rollback_progress = crate::HtmlPreviewMaintenanceProgress::default();
     let mut rolled_back = false;
     for _ in 0..64 {
@@ -369,6 +398,23 @@ async fn html_preview_active_delivery_frozen_context_and_legacy_copies_release_a
         }
     }
     assert!(rolled_back);
+    let copies: i64 = harness
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) n FROM html_preview_io_work WHERE family='copies'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(
+        copies, 0,
+        "release rollback must also roll back copy obligations"
+    );
+
     assert!(old_paths.iter().all(|p| p.exists()));
     let retained = harness
         .store
@@ -378,7 +424,7 @@ async fn html_preview_active_delivery_frozen_context_and_legacy_copies_release_a
     let retained: serde_json::Value = serde_json::from_str(&retained[0].payload).unwrap();
     assert_eq!(
         retained["value"]["content_parts"].as_array().unwrap().len(),
-        3
+        frames.len()
     );
     harness
         .store
@@ -603,7 +649,7 @@ async fn html_preview_shared_blob_concurrent_ingestion_and_failed_deletion_resta
     );
 
     // A second source is orphaned by the production release path. Deletion
-    // failure keeps its blob row, so a fresh maintenance owner can retry it.
+    // failure keeps its blob row; the same owner must retry without a wake.
     let orphan = harness
         .service
         .ingest_bytes({
@@ -641,9 +687,42 @@ async fn html_preview_shared_blob_concurrent_ingestion_and_failed_deletion_resta
             .unwrap()
             .exists()
     );
+    // Finish the captured keysets with the same state. The earlier physical
+    // failure must prevent a successful empty result at EOF, even though the
+    // failed blob is now behind the cursor and the backend would succeed.
+    let mut retry_at_eof = false;
+    for _ in 0..128 {
+        match harness
+            .service
+            .html_preview_maintenance_quantum(&mut progress)
+            .await
+        {
+            Err(_) => {
+                retry_at_eof = true;
+                break;
+            }
+            Ok(false) => panic!("failed blob was forgotten at discovery EOF"),
+            Ok(true) => {}
+        }
+    }
+    assert!(
+        retry_at_eof,
+        "finite pass must reach retry/backoff boundary"
+    );
     storage.pause_once.store(true, Ordering::SeqCst);
-    let restarted = harness.service.clone();
-    let cleanup = tokio::spawn(async move { preview_maintenance(&restarted).await });
+    let resumed = harness.service.clone();
+    let cleanup = tokio::spawn(async move {
+        for _ in 0..128 {
+            if !resumed
+                .html_preview_maintenance_quantum(&mut progress)
+                .await
+                .unwrap()
+            {
+                return;
+            }
+        }
+        panic!("same owner failed to drain its retry pass");
+    });
     storage.entered.notified().await;
     let ingestion_service = harness.service.clone();
     let registration = tokio::spawn(async move {
@@ -911,4 +990,323 @@ async fn html_preview_quiescent_pass_reaches_idle_and_discovers_later_preview() 
         assert!(idle);
     }
     assert!(!path.exists());
+}
+
+// Capture-layout validation is a retention boundary: ambiguous/mixed siblings
+// must keep every exact version instead of retiring a plausible subset.
+#[tokio::test]
+async fn html_preview_retention_preserves_mixed_duplicate_and_oversized_groups() {
+    for indices in [
+        vec!["input", "light-360", "light-360"],
+        vec!["input", "light-360", "360"],
+        vec![
+            "input",
+            "light-360",
+            "light-768",
+            "light-1024",
+            "dark-360",
+            "dark-768",
+            "dark-1024",
+            "unexpected",
+        ],
+    ] {
+        let harness = preview_fixture().await;
+        let mut summaries = Vec::new();
+        for (ordinal, index) in indices.iter().enumerate() {
+            let mut request = preview_request(index, vec![ordinal as u8]);
+            if *index != "360" {
+                request.metadata.get_mut("htmlTool").unwrap()["version"] = json!(2);
+            }
+            summaries.push(harness.service.ingest_bytes(request).await.unwrap());
+        }
+        harness
+            .store
+            .database_connection()
+            .execute_unprepared("UPDATE turn SET status='completed' WHERE id='preview-turn'")
+            .await
+            .unwrap();
+        let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+        let mut rejected = false;
+        for _ in 0..128 {
+            match harness
+                .service
+                .html_preview_maintenance_quantum(&mut progress)
+                .await
+            {
+                Err(_) => {
+                    rejected = true;
+                    break;
+                }
+                Ok(false) => break,
+                Ok(true) => {}
+            }
+        }
+        assert!(rejected, "ambiguous capture group must be preserved");
+        for summary in summaries {
+            assert!(
+                harness
+                    .store
+                    .get_artifact_version_blob(
+                        "ws_a",
+                        &summary.artifact.artifact_id,
+                        summary.artifact.version_id.as_deref(),
+                    )
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+}
+
+// Owns the public service contract: contention cannot become traversal EOF,
+// and a release that happens before the worker waits must remain observable.
+#[tokio::test]
+async fn preview_contention_defers_and_release_is_retained_after_unlock() {
+    let harness = preview_fixture().await;
+    let activity = harness.service.html_preview_activity_signaled().await;
+    let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+    assert_eq!(
+        harness
+            .service
+            .html_preview_maintenance_outcome(&mut progress)
+            .await
+            .unwrap(),
+        crate::HtmlPreviewMaintenanceOutcome::Deferred,
+    );
+    drop(activity);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        harness.service.html_preview_release_notified(),
+    )
+    .await
+    .expect("release hint survives until maintenance waits");
+    // A stale 'finished' flag would skip the retirement traversal on resume.
+    let request = preview_request("input", b"<html>deferred</html>".to_vec());
+    harness.service.ingest_bytes(request).await.unwrap();
+    assert_ne!(
+        harness
+            .service
+            .html_preview_maintenance_outcome(&mut progress)
+            .await
+            .unwrap(),
+        crate::HtmlPreviewMaintenanceOutcome::Deferred,
+    );
+}
+
+#[tokio::test]
+async fn released_copy_cleanup_without_local_root_is_deferred() {
+    let harness = preview_fixture().await;
+    let service = ArtifactService::new(
+        harness.store.clone(),
+        Arc::new(FakeReadBlobStore {
+            storage_key: "unused".into(),
+            mode: FakeReadMode::Missing,
+        }),
+    );
+    let previous =
+        json!({"htmlTool":{"retention":"released","releasedCopies":["/unavailable/copy.html"]}})
+            .to_string();
+    assert!(
+        service
+            .prepare_html_preview_copy_cleanup("ws_a", &previous)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn released_copy_partial_failure_retries_without_losing_remaining_paths() {
+    let harness = preview_fixture().await;
+    let root = harness.service.blob_store.local_artifact_root().unwrap();
+    let directory = crate::artifact_readable_copy_workspace_root(&root, "ws_a")
+        .unwrap()
+        .join("partial");
+    tokio::fs::create_dir_all(&directory).await.unwrap();
+    let first = directory.join("one.html");
+    let second = directory.join("two.html");
+    tokio::fs::write(&first, "one").await.unwrap();
+    // A directory in place of a file causes a real, deterministic partial I/O
+    // failure after the first copy was removed.
+    tokio::fs::create_dir(&second).await.unwrap();
+    let previous =
+        json!({"htmlTool":{"retention":"released","releasedCopies":[first,second]}}).to_string();
+    assert!(
+        harness
+            .service
+            .prepare_html_preview_copy_cleanup("ws_a", &previous)
+            .await
+            .is_err()
+    );
+    assert!(!first.exists());
+    assert!(second.exists());
+    tokio::fs::remove_dir(&second).await.unwrap();
+    tokio::fs::write(&second, "two").await.unwrap();
+    let prepared = harness
+        .service
+        .prepare_html_preview_copy_cleanup("ws_a", &previous)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!second.exists());
+    let metadata: serde_json::Value = serde_json::from_str(&prepared).unwrap();
+    assert_eq!(metadata["htmlTool"]["releasedCopies"], json!([]));
+}
+
+#[tokio::test]
+async fn physical_copy_preparation_succeeds_with_disconnected_database() {
+    let harness = preview_fixture().await;
+    let service = ArtifactService::new(
+        Arc::new(CrudStore::new(sea_orm::DatabaseConnection::default())),
+        harness.service.blob_store.clone(),
+    );
+    let root = service.blob_store.local_artifact_root().unwrap();
+    let directory = crate::artifact_readable_copy_workspace_root(&root, "ws_a")
+        .unwrap()
+        .join("no-database");
+    tokio::fs::create_dir_all(&directory).await.unwrap();
+    let path = directory.join("frame.html");
+    tokio::fs::write(&path, "retired frame").await.unwrap();
+    let previous = json!({"htmlTool":{"retention":"released","releasedCopies":[path]}}).to_string();
+    let prepared = service
+        .prepare_html_preview_copy_cleanup("ws_a", &previous)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!path.exists());
+    let metadata: serde_json::Value = serde_json::from_str(&prepared).unwrap();
+    assert_eq!(metadata["htmlTool"]["releasedCopies"], json!([]));
+}
+
+#[tokio::test]
+async fn retirement_failure_retries_same_owner_after_eof_without_external_wake() {
+    let harness = preview_fixture().await;
+    let preview = harness
+        .service
+        .ingest_bytes(preview_request("input", b"retry retirement".to_vec()))
+        .await
+        .unwrap();
+    let db = harness.store.database_connection();
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='preview-turn'")
+        .await
+        .unwrap();
+    db.execute_unprepared("CREATE TRIGGER fail_single_retirement BEFORE DELETE ON artifact_version BEGIN SELECT RAISE(ABORT,'fixture retirement failure'); END").await.unwrap();
+    let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+    let mut failed = false;
+    for _ in 0..128 {
+        if harness
+            .service
+            .html_preview_maintenance_quantum(&mut progress)
+            .await
+            .is_err()
+        {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    db.execute_unprepared("DROP TRIGGER fail_single_retirement")
+        .await
+        .unwrap();
+    // DDL repair sends no domain wake. Retain the original cursors and drive
+    // only the owner's continuation/retry decisions until successful EOF.
+    let mut idle = false;
+    let mut eof_retry = false;
+    for _ in 0..256 {
+        match harness
+            .service
+            .html_preview_maintenance_quantum(&mut progress)
+            .await
+        {
+            Err(_) => eof_retry = true,
+            Ok(true) => {}
+            Ok(false) => {
+                idle = true;
+                break;
+            }
+        }
+    }
+    assert!(idle);
+    assert!(
+        eof_retry,
+        "uncertainty at EOF must request backoff before retry"
+    );
+    assert!(
+        harness
+            .store
+            .get_artifact_version_blob("ws_a", &preview.artifact.artifact_id, None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn blob_retry_reaches_durable_deletion_while_activity_remains_held() {
+    let mut harness = preview_fixture().await;
+    let storage = Arc::new(PreviewDeletionGate {
+        local: LocalArtifactBlobStore::new(harness._temp.path()),
+        fail_once: AtomicBool::new(false),
+        pause_once: AtomicBool::new(false),
+        entered: Default::default(),
+        late_once: AtomicBool::new(false),
+        late_resume: Default::default(),
+        resume: Default::default(),
+    });
+    harness.service.blob_store = storage.clone();
+    harness.service.gc_policy.grace_secs = 0;
+    let preview = harness
+        .service
+        .ingest_bytes(preview_request("input", b"held retry orphan".to_vec()))
+        .await
+        .unwrap();
+    let blob = harness
+        .store
+        .get_artifact_version_blob("ws_a", &preview.artifact.artifact_id, None)
+        .await
+        .unwrap();
+    let path = storage.local.blob_path("ws_a", &blob.storage_key).unwrap();
+    harness
+        .store
+        .database_connection()
+        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='preview-turn'")
+        .await
+        .unwrap();
+    storage.fail_once.store(true, Ordering::SeqCst);
+    let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+    let mut failed = false;
+    for _ in 0..128 {
+        if harness
+            .service
+            .html_preview_maintenance_quantum(&mut progress)
+            .await
+            .is_err()
+        {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    assert!(path.exists());
+    let activity = harness.service.html_preview_activity().await;
+    let mut retried = false;
+    for _ in 0..128 {
+        let _ = harness
+            .service
+            .html_preview_maintenance_outcome(&mut progress)
+            .await;
+        let count: i64 = harness.store.database_connection().query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite, "SELECT COUNT(*) AS n FROM artifact_blob WHERE workspace_id='ws_a' AND storage_key=?",
+            [blob.storage_key.clone().into()],
+        )).await.unwrap().unwrap().try_get("", "n").unwrap();
+        if count == 0 {
+            retried = true;
+            break;
+        }
+    }
+    assert!(
+        retried,
+        "BlobGC must retry at its own EOF before activity release"
+    );
+    assert!(!path.exists());
+    drop(activity);
 }

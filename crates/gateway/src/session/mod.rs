@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{RwLock, watch};
 
 use crate::auth::AuthenticatedSessionPrincipal;
 use crate::request_context::ConnectionContext;
@@ -16,7 +16,21 @@ use crate::request_context::ConnectionContext;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub(crate) mod outbound;
+pub(crate) use outbound::SessionOutbound;
+
+pub(crate) const OUTBOUND_CLOSE_GRACE: Duration = Duration::from_millis(250);
+
 pub type ConnectionId = u64;
+
+/// `Discarded` means retired scope/lease or superseded terminal/TTL data, never
+/// a principal rotation that leaves a current obligation undelivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationDelivery {
+    Enqueued,
+    Discarded,
+    Reauthorize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionRenewalError {
@@ -55,8 +69,10 @@ const TERMINATED_SESSION_TOMBSTONE_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 struct SessionConnection {
-    sender: mpsc::Sender<Message>,
+    sender: SessionOutbound,
+    replay_tasks: Arc<crate::thread::replay::ReplayTasks>,
     termination_tx: watch::Sender<Option<AuthSessionTerminationReason>>,
+    scope_change_tx: watch::Sender<()>,
     workspace_id: Option<String>,
     principal: Arc<AuthenticatedSessionPrincipal>,
 }
@@ -74,6 +90,8 @@ pub struct SessionManager {
     session_connections: RwLock<HashMap<String, HashSet<ConnectionId>>>,
     device_sessions: RwLock<HashMap<String, HashSet<String>>>,
     terminated_sessions: RwLock<HashMap<String, TerminatedSessionTombstone>>,
+    #[cfg(test)]
+    pub(crate) replay_delivery_pause: std::sync::Mutex<Option<test_support::DeliveryPause>>,
 }
 
 impl SessionManager {
@@ -81,9 +99,17 @@ impl SessionManager {
         Self::default()
     }
 
-    pub async fn register_connection(
+    #[cfg(test)]
+    pub(crate) async fn register_connection(
         &self,
-        sender: mpsc::Sender<Message>,
+        sender: SessionOutbound,
+        principal: Arc<AuthenticatedSessionPrincipal>,
+    ) -> Result<ConnectionId> {
+        self.register_outbound_connection(sender, principal).await
+    }
+    pub(crate) async fn register_outbound_connection(
+        &self,
+        sender: SessionOutbound,
         principal: Arc<AuthenticatedSessionPrincipal>,
     ) -> Result<ConnectionId> {
         // Serialize registration against post-commit revocation. Without this
@@ -103,11 +129,14 @@ impl SessionManager {
         let session_id = principal.session_id.to_string();
         let device_id = principal.device_id.to_string();
         let (termination_tx, _) = watch::channel(None);
+        let (scope_change_tx, _) = watch::channel(());
         self.connections.write().await.insert(
             connection_id,
             SessionConnection {
+                replay_tasks: Arc::default(),
                 sender,
                 termination_tx,
+                scope_change_tx,
                 workspace_id: None,
                 principal,
             },
@@ -128,11 +157,49 @@ impl SessionManager {
         Ok(connection_id)
     }
 
+    pub(crate) async fn reserve_thread_replay(
+        &self,
+        id: ConnectionId,
+        token: Arc<crate::thread::replay::SubscriptionIncarnation>,
+        order: &Arc<crate::thread::replay::PendingDeliveryOrder>,
+    ) -> Result<crate::thread::replay::ReplayReservation> {
+        anyhow::ensure!(token.connection == id, "subscription connection mismatch");
+        let connection = self
+            .connections
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("connection retired"))?;
+        connection
+            .replay_tasks
+            .reserve(token, connection.sender, order)
+    }
+    #[cfg(test)]
+    pub(crate) async fn drain_thread_replays(&self, id: ConnectionId) {
+        let owner = self
+            .connections
+            .read()
+            .await
+            .get(&id)
+            .map(|connection| connection.replay_tasks.clone());
+        if let Some(owner) = owner {
+            owner.drain().await;
+        }
+    }
+
+    pub(crate) async fn stop_thread_replays(&self) {
+        for connection in self.connections.read().await.values() {
+            connection.replay_tasks.stop();
+        }
+    }
+
     pub async fn unregister_connection(&self, connection_id: ConnectionId) {
         let removed = self.connections.write().await.remove(&connection_id);
         let Some(removed) = removed else {
             return;
         };
+        removed.sender.close();
         let session_id = removed.principal.session_id.to_string();
         let device_id = removed.principal.device_id.to_string();
         let mut session_connections = self.session_connections.write().await;
@@ -149,6 +216,9 @@ impl SessionManager {
                 }
             }
         }
+        // A replay can retire its own socket. Abort only after all indexes have
+        // been cleaned, so self-cancellation cannot strand session/device rows.
+        removed.replay_tasks.stop();
     }
 
     pub async fn connection_ids(&self) -> Vec<ConnectionId> {
@@ -226,6 +296,7 @@ impl SessionManager {
         if now >= expected.access_expires_at_unix {
             return Err(ConnectionRenewalError::AccessExpired);
         }
+        connection.scope_change_tx.send_replace(());
         connection.principal = next.clone();
         Ok(ConnectionContext::new(connection_id, next))
     }
@@ -268,6 +339,33 @@ impl SessionManager {
         connection_ids
     }
 
+    /// Revalidate the mutable physical owner after async voice authorization.
+    /// The synchronous effect may take short in-memory locks, but must never
+    /// perform I/O, send, join, or await while the registry read guard is held.
+    pub(crate) async fn with_voice_ingress_connection<T>(
+        &self,
+        connection_id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let connections = self.connections.read().await;
+        let connection = connections.get(&connection_id)?;
+        let current = connection.principal.as_ref();
+        let now = crate::helpers::unix_timestamp_secs().ok()?;
+        if current.gateway_id != expected.gateway_id
+            || current.principal_id != expected.principal_id
+            || current.device_id != expected.device_id
+            || current.session_id != expected.session_id
+            || current.kind != expected.kind
+            || current.role_key != expected.role_key
+            || connection.termination_tx.borrow().is_some()
+            || now >= current.access_expires_at_unix
+        {
+            return None;
+        }
+        Some(effect())
+    }
+
     pub(crate) async fn connection_context(
         &self,
         connection_id: ConnectionId,
@@ -289,6 +387,18 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))
     }
 
+    pub(crate) async fn connection_scope_receiver(
+        &self,
+        id: ConnectionId,
+    ) -> Result<watch::Receiver<()>> {
+        self.connections
+            .read()
+            .await
+            .get(&id)
+            .map(|connection| connection.scope_change_tx.subscribe())
+            .ok_or_else(|| anyhow!("connection is not registered"))
+    }
+
     pub async fn set_connection_workspace(
         &self,
         connection_id: ConnectionId,
@@ -299,10 +409,91 @@ impl SessionManager {
             return;
         };
 
-        connection.workspace_id = workspace_id.and_then(|value| {
+        let workspace_id = workspace_id.and_then(|value| {
             let trimmed = value.trim();
             (!trimmed.is_empty()).then_some(trimmed.to_owned())
         });
+        if workspace_id != connection.workspace_id {
+            connection.scope_change_tx.send_replace(());
+            connection.workspace_id = workspace_id;
+        }
+    }
+
+    pub(crate) async fn send_voice_text(
+        &self,
+        id: ConnectionId,
+        payload: String,
+        terminal: bool,
+    ) -> Result<()> {
+        self.send_voice_text_authorized(id, payload, terminal, || async { true })
+            .await
+    }
+
+    pub(crate) async fn send_voice_text_authorized<F, Fut>(
+        &self,
+        id: ConnectionId,
+        payload: String,
+        terminal: bool,
+        mut authorize: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let original = self.connection_context(id).await?;
+        let sender = {
+            let connections = self.connections.read().await;
+            connections
+                .get(&id)
+                .ok_or_else(|| anyhow!("voice connection retired"))?
+                .sender
+                .clone()
+        };
+        let mut scope = self.connection_scope_receiver(id).await?;
+        let mut termination = self.connection_termination_receiver(id).await?;
+        let mut message = Message::Text(payload.into());
+        loop {
+            let changed = sender.audio_capacity_changed().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            // A capacity wake grants no authority. Recheck the resource before
+            // every enqueue attempt, without holding the connection registry.
+            anyhow::ensure!(authorize().await, "voice delivery resource retired");
+            let admission = self
+                .with_voice_ingress_connection(id, original.principal(), || {
+                    sender.try_send_audio(message, terminal)
+                })
+                .await;
+            match admission {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(tokio::sync::mpsc::error::TrySendError::Full(returned))) => {
+                    message = returned;
+                    #[cfg(test)]
+                    self.pause_delivery(
+                        id,
+                        if terminal {
+                            pioneer_protocol::constants::events::VOICE_SESSION_RESULT
+                        } else {
+                            pioneer_protocol::constants::events::VOICE_CHUNK_ACK
+                        },
+                    )
+                    .await;
+                }
+                _ => anyhow::bail!("voice delivery owner retired"),
+            }
+            let current = self.connection_context(id).await?;
+            let now = crate::helpers::unix_timestamp_secs()?;
+            anyhow::ensure!(
+                now < current.principal().access_expires_at_unix,
+                "voice access expired"
+            );
+            tokio::select! {
+                _ = &mut changed => {},
+                _ = scope.changed() => {},
+                _ = termination.changed() => {},
+                _ = tokio::time::sleep(Duration::from_secs(current.principal().access_expires_at_unix - now)) => {},
+            }
+        }
     }
 
     pub async fn send_text(&self, connection_id: ConnectionId, payload: String) -> Result<()> {
@@ -326,26 +517,212 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Best-effort notification delivery. Unlike request/response writes this
-    /// never waits for outbound capacity: a lagging socket is fenced so it
-    /// cannot apply backpressure to lifecycle persistence or other clients.
+    /// Exact connection gate for a completed local task/wait. Serialization and
+    /// resource policy resolution must finish first; no database capacity or
+    /// queue waiting occurs under this lock. A same-identity renewal can update
+    /// access expiry; it cannot substitute another principal/session/policy.
+    pub(crate) async fn try_send_wait_response(
+        &self,
+        connection_id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        payload: String,
+    ) -> Result<bool> {
+        let connections = self.connections.read().await;
+        let Some(connection) = connections.get(&connection_id) else {
+            return Ok(false);
+        };
+        let now = crate::helpers::unix_timestamp_secs()?;
+        let current = connection.principal.as_ref();
+        if current.gateway_id != expected.gateway_id
+            || current.principal_id != expected.principal_id
+            || current.device_id != expected.device_id
+            || current.session_id != expected.session_id
+            || current.kind != expected.kind
+            || current.role_key != expected.role_key
+            || connection.termination_tx.borrow().is_some()
+            || now >= current.access_expires_at_unix
+        {
+            return Ok(false);
+        }
+        connection
+            .sender
+            .try_send(Message::Text(payload.into()))
+            .map_err(|_| anyhow!("task wait outbound full or closed"))?;
+        Ok(true)
+    }
+
+    /// Run a synchronous final scope/generation gate at the existing outbound
+    /// lane. The callback cannot await or hold database capacity.
+    pub(crate) async fn with_notification_outbound<T>(
+        &self,
+        connection_id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        workspace: &str,
+        enqueue: impl FnOnce(&SessionOutbound) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let connections = self.connections.read().await;
+        let connection = connections
+            .get(&connection_id)
+            .ok_or_else(|| anyhow!("connection is not registered"))?;
+        let now = crate::helpers::unix_timestamp_secs()?;
+        if connection.principal.as_ref() != expected
+            || connection.workspace_id.as_deref() != Some(workspace)
+            || connection.termination_tx.borrow().is_some()
+            || now >= expected.access_expires_at_unix
+        {
+            return Ok(None);
+        }
+        enqueue(&connection.sender).map(Some)
+    }
+
+    pub(crate) async fn try_send_thread_open_reply(
+        &self,
+        id: ConnectionId,
+        token: &crate::thread::replay::SubscriptionIncarnation,
+        payload: String,
+    ) -> Result<()> {
+        anyhow::ensure!(token.connection == id, "subscription connection mismatch");
+        #[cfg(test)]
+        self.pause_delivery(id, pioneer_protocol::constants::methods::THREAD_OPEN)
+            .await;
+        let result = {
+            let connections = self.connections.read().await;
+            let connection = connections
+                .get(&id)
+                .ok_or_else(|| anyhow!("connection retired"))?;
+            if connection.termination_tx.borrow().is_some()
+                || crate::helpers::unix_timestamp_secs()?
+                    >= connection.principal.access_expires_at_unix
+            {
+                return Err(anyhow!("connection lease retired"));
+            }
+            token.admit_reply(&connection.principal, || {
+                let result = connection.sender.try_send(Message::Text(payload.into()));
+                if result.is_err() {
+                    connection.sender.abort();
+                }
+                result
+            })
+        };
+        match result {
+            Some(Ok(())) => Ok(()),
+            _ => Err(anyhow!("thread open reply admission failed")),
+        }
+    }
+
+    /// Exact subject/lease check for collaborator delivery. Selection is not
+    /// authority: ancestor-visible requests may target a different workspace.
+    pub(crate) async fn try_send_execution_notification(
+        &self,
+        id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        payload: String,
+        method: &str,
+    ) -> Result<NotificationDelivery> {
+        #[cfg(test)]
+        self.pause_delivery(id, method).await;
+        let result = {
+            let connections = self.connections.read().await;
+            let Some(connection) = connections.get(&id) else {
+                return Ok(NotificationDelivery::Discarded);
+            };
+            if connection.termination_tx.borrow().is_some()
+                || crate::helpers::unix_timestamp_secs()?
+                    >= connection.principal.access_expires_at_unix
+            {
+                connection.sender.abort();
+                return Ok(NotificationDelivery::Discarded);
+            }
+            if connection.principal.as_ref() != expected {
+                return Ok(if connection.principal.same_subject(expected) {
+                    NotificationDelivery::Reauthorize
+                } else {
+                    NotificationDelivery::Discarded
+                });
+            }
+            crate::thread::replay::admit_delivery(id, method, &connection.principal, || {
+                let result = connection
+                    .sender
+                    .try_send_data(Message::Text(payload.into()));
+                if result.is_err() {
+                    connection.sender.abort();
+                }
+                result
+            })
+        };
+        match result {
+            None => Ok(NotificationDelivery::Discarded),
+            Some(Ok(())) => Ok(NotificationDelivery::Enqueued),
+            Some(Err(_)) => {
+                self.unregister_connection(id).await;
+                Err(anyhow!("execution notification outbound full or closed"))
+            }
+        }
+    }
+
+    /// Exhausted reauthorization cannot be acknowledged as delivered. Abort
+    /// only the still-current subject and (for replay) exact membership token.
+    pub(crate) async fn recover_execution_delivery(
+        &self,
+        id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        method: &str,
+    ) {
+        let connections = self.connections.read().await;
+        if let Some(connection) = connections.get(&id)
+            && connection.principal.same_subject(expected)
+        {
+            let _ =
+                crate::thread::replay::admit_delivery(id, method, &connection.principal, || {
+                    connection.sender.abort()
+                });
+        }
+    }
+
+    /// Best-effort delivery; a saturated socket is retired instead of queued.
     pub async fn try_send_notification_text(
         &self,
         connection_id: ConnectionId,
         payload: String,
     ) -> Result<()> {
-        let sender = {
-            self.connections
-                .read()
-                .await
+        self.try_send_classified_notification_text(connection_id, payload, "")
+            .await
+            .map(|_| ())
+    }
+    pub(crate) async fn try_send_classified_notification_text(
+        &self,
+        connection_id: ConnectionId,
+        payload: String,
+        method: &str,
+    ) -> Result<NotificationDelivery> {
+        let (sender, admitted) = {
+            let connections = self.connections.read().await;
+            let connection = connections
                 .get(&connection_id)
-                .map(|connection| connection.sender.clone())
-                .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))?
+                .ok_or_else(|| anyhow!("connection retired"))?;
+            if connection.termination_tx.borrow().is_some()
+                || crate::helpers::unix_timestamp_secs()?
+                    >= connection.principal.access_expires_at_unix
+            {
+                connection.sender.abort();
+                return Ok(NotificationDelivery::Discarded);
+            }
+            let sender = connection.sender.clone();
+            let admitted = crate::thread::replay::admit_delivery(
+                connection_id,
+                method,
+                &connection.principal,
+                || sender.try_send_data(Message::Text(payload.into())),
+            );
+            (sender, admitted)
         };
-
-        match sender.try_send(Message::Text(payload.into())) {
-            Ok(()) => Ok(()),
+        let Some(admitted) = admitted else {
+            return Ok(NotificationDelivery::Discarded);
+        };
+        match admitted {
+            Ok(()) => Ok(NotificationDelivery::Enqueued),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                sender.abort();
                 record_outbound_queue_saturation("notification_connection_evicted");
                 self.unregister_connection(connection_id).await;
                 Err(anyhow!(
@@ -472,8 +849,10 @@ mod tests {
         TEST_SUPERUSER_PRINCIPAL_ID, authenticated_test_superuser,
         register_authenticated_test_connection,
     };
-    use super::{SessionManager, TERMINATED_SESSION_TOMBSTONE_TTL};
+    use super::{SessionManager, SessionOutbound, TERMINATED_SESSION_TOMBSTONE_TTL};
+    use anyhow::anyhow;
     use axum::extract::ws::Message;
+    use pioneer_protocol::constants::events;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -501,7 +880,7 @@ mod tests {
             ),
         ] {
             let manager = SessionManager::new();
-            let (tx, _rx) = mpsc::channel(4);
+            let (tx, _rx) = crate::session::test_support::outbound_channel(4);
             let mut old = (*authenticated_test_superuser()).clone();
             if case == "expired" {
                 old.access_expires_at_unix = 0;
@@ -549,28 +928,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_text_reaches_registered_connection() {
+    async fn unregister_retires_cloned_producers_and_waiting_reply() {
+        use futures_util::FutureExt;
         let manager = SessionManager::new();
-        let (tx, mut rx) = mpsc::channel(4);
-
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-
-        manager
-            .send_text(connection_id, "ping".to_owned())
-            .await
-            .expect("send_text should succeed");
-
-        assert_eq!(rx.recv().await, Some(Message::Text("ping".into())));
+        let (sender, _receiver) = crate::session::test_support::outbound_channel(2);
+        let connection = register_authenticated_test_connection(&manager, sender.clone()).await;
+        sender.send(Message::Text("first".into())).await.unwrap();
+        sender.send(Message::Text("second".into())).await.unwrap();
+        let mut pending = Box::pin(manager.send_text(connection, "third".to_owned()));
+        assert!(pending.as_mut().now_or_never().is_none());
+        manager.unregister_connection(connection).await;
+        assert!(pending.await.is_err());
+        assert!(
+            sender
+                .try_send_data(Message::Text("late-data".into()))
+                .is_err()
+        );
+        assert!(sender.send(Message::Close(None)).await.is_err());
     }
 
     #[tokio::test]
     async fn notification_send_never_waits_for_a_full_connection_queue() {
         let manager = SessionManager::new();
-        let (sender, _receiver) = mpsc::channel(1);
+        let (sender, _receiver) = crate::session::test_support::outbound_channel(2);
         let connection_id = register_authenticated_test_connection(&manager, sender).await;
 
         manager
-            .send_text(connection_id, "occupy-notification-queue".to_owned())
+            .try_send_notification_text(connection_id, "occupy-notification-queue".to_owned())
             .await
             .expect("first message should occupy the queue");
         let error = manager
@@ -585,8 +969,8 @@ mod tests {
     #[tokio::test]
     async fn connection_ids_for_workspace_prefers_scoped_connections() {
         let manager = SessionManager::new();
-        let (tx_a, _rx_a) = mpsc::channel(2);
-        let (tx_b, _rx_b) = mpsc::channel(2);
+        let (tx_a, _rx_a) = crate::session::test_support::outbound_channel(2);
+        let (tx_b, _rx_b) = crate::session::test_support::outbound_channel(2);
 
         let connection_a = register_authenticated_test_connection(&manager, tx_a).await;
         let connection_b = register_authenticated_test_connection(&manager, tx_b).await;
@@ -605,8 +989,8 @@ mod tests {
     #[tokio::test]
     async fn connection_ids_for_workspace_returns_only_scoped_connections() {
         let manager = SessionManager::new();
-        let (tx_a, _rx_a) = mpsc::channel(2);
-        let (tx_b, _rx_b) = mpsc::channel(2);
+        let (tx_a, _rx_a) = crate::session::test_support::outbound_channel(2);
+        let (tx_b, _rx_b) = crate::session::test_support::outbound_channel(2);
 
         let connection_a = register_authenticated_test_connection(&manager, tx_a).await;
         let _connection_b = register_authenticated_test_connection(&manager, tx_b).await;
@@ -625,8 +1009,8 @@ mod tests {
     #[tokio::test]
     async fn empty_workspace_recipient_selector_never_means_all_connections() {
         let manager = SessionManager::new();
-        let (tx_a, _rx_a) = mpsc::channel(2);
-        let (tx_b, _rx_b) = mpsc::channel(2);
+        let (tx_a, _rx_a) = crate::session::test_support::outbound_channel(2);
+        let (tx_b, _rx_b) = crate::session::test_support::outbound_channel(2);
         let connection_a = register_authenticated_test_connection(&manager, tx_a).await;
         let connection_b = register_authenticated_test_connection(&manager, tx_b).await;
         manager
@@ -644,86 +1028,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_workspace_id_returns_current_workspace() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-
-        assert_eq!(manager.connection_workspace_id(connection_id).await, None);
-
-        manager
-            .set_connection_workspace(connection_id, Some("ws_a".to_owned()))
-            .await;
-
-        assert_eq!(
-            manager
-                .connection_workspace_id(connection_id)
-                .await
-                .as_deref(),
-            Some("ws_a")
-        );
-    }
-
-    #[tokio::test]
-    async fn registration_stores_the_exact_authenticated_principal() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
-        let expected = authenticated_test_superuser();
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-        let stored = manager.connection_principal(connection_id).await.unwrap();
-
-        assert_eq!(stored.as_ref(), expected.as_ref());
-        assert_eq!(stored.principal_id.as_str(), TEST_SUPERUSER_PRINCIPAL_ID);
-    }
-
-    #[tokio::test]
-    async fn connection_context_binds_registered_id_and_exact_principal() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-        let stored = manager.connection_principal(connection_id).await.unwrap();
-        let context = manager.connection_context(connection_id).await.unwrap();
-
-        assert_eq!(context.connection_id(), connection_id);
-        assert!(Arc::ptr_eq(context.principal_arc(), &stored));
-        assert_eq!(
-            context.principal().principal_id.as_str(),
-            TEST_SUPERUSER_PRINCIPAL_ID
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_mutation_preserves_the_immutable_principal() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-        let before = manager.connection_principal(connection_id).await.unwrap();
-
-        manager
-            .set_connection_workspace(connection_id, Some("ws_a".to_owned()))
-            .await;
-        let after = manager.connection_principal(connection_id).await.unwrap();
-
-        assert!(Arc::ptr_eq(&before, &after));
-        assert_eq!(after.principal_id.as_str(), TEST_SUPERUSER_PRINCIPAL_ID);
-    }
-
-    #[tokio::test]
-    async fn unregister_removes_principal_lookup() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
-        let connection_id = register_authenticated_test_connection(&manager, tx).await;
-
-        manager.unregister_connection(connection_id).await;
-
-        assert!(manager.connection_principal(connection_id).await.is_err());
-    }
-
-    #[tokio::test]
     async fn multiple_connections_share_one_stable_principal_identity() {
         let manager = SessionManager::new();
-        let (tx_a, _rx_a) = mpsc::channel(2);
-        let (tx_b, _rx_b) = mpsc::channel(2);
+        let (tx_a, _rx_a) = crate::session::test_support::outbound_channel(2);
+        let (tx_b, _rx_b) = crate::session::test_support::outbound_channel(2);
         let connection_a = register_authenticated_test_connection(&manager, tx_a).await;
         let connection_b = register_authenticated_test_connection(&manager, tx_b).await;
 
@@ -752,8 +1060,8 @@ mod tests {
     #[tokio::test]
     async fn shared_principal_connections_keep_distinct_message_routing() {
         let manager = SessionManager::new();
-        let (tx_a, mut rx_a) = mpsc::channel(2);
-        let (tx_b, mut rx_b) = mpsc::channel(2);
+        let (tx_a, mut rx_a) = crate::session::test_support::outbound_channel(2);
+        let (tx_b, mut rx_b) = crate::session::test_support::outbound_channel(2);
         let connection_a = register_authenticated_test_connection(&manager, tx_a).await;
         let connection_b = register_authenticated_test_connection(&manager, tx_b).await;
 
@@ -776,9 +1084,9 @@ mod tests {
     #[tokio::test]
     async fn disconnect_session_closes_every_matching_connection_only() {
         let manager = SessionManager::new();
-        let (tx_a1, mut rx_a1) = mpsc::channel(4);
-        let (tx_a2, mut rx_a2) = mpsc::channel(4);
-        let (tx_b, mut rx_b) = mpsc::channel(4);
+        let (tx_a1, mut rx_a1) = crate::session::test_support::outbound_channel(4);
+        let (tx_a2, mut rx_a2) = crate::session::test_support::outbound_channel(4);
+        let (tx_b, mut rx_b) = crate::session::test_support::outbound_channel(4);
         let session_a = authenticated_test_superuser();
         let session_b = peer_session_principal();
         let a1 = manager
@@ -821,7 +1129,7 @@ mod tests {
     #[tokio::test]
     async fn committed_revoke_response_precedes_notification_and_close() {
         let manager = SessionManager::new();
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(4);
         let principal = authenticated_test_superuser();
         let connection_id = manager
             .register_connection(tx, principal.clone())
@@ -856,7 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_indexes_are_derived_from_live_registration_after_restart() {
         let before_restart = SessionManager::new();
-        let (tx, _rx) = mpsc::channel(2);
+        let (tx, _rx) = crate::session::test_support::outbound_channel(2);
         let principal = peer_session_principal();
         before_restart
             .register_connection(tx, principal.clone())
@@ -896,7 +1204,7 @@ mod tests {
             )
             .await;
 
-        let (sender, _receiver) = mpsc::channel(1);
+        let (sender, _receiver) = crate::session::test_support::outbound_channel(2);
         let error = manager
             .register_connection(sender, principal.clone())
             .await
@@ -928,7 +1236,7 @@ mod tests {
             tombstone.recorded_at = std::time::Instant::now() - TERMINATED_SESSION_TOMBSTONE_TTL;
         }
 
-        let (sender, _receiver) = mpsc::channel(1);
+        let (sender, _receiver) = crate::session::test_support::outbound_channel(2);
         manager
             .register_connection(sender, principal)
             .await
@@ -940,7 +1248,7 @@ mod tests {
     async fn disconnect_signal_is_delivered_even_when_outbound_queue_is_full() {
         let manager = SessionManager::new();
         let principal = authenticated_test_superuser();
-        let (sender, _receiver) = mpsc::channel(1);
+        let (sender, _receiver) = crate::session::test_support::outbound_channel(2);
         let connection_id = manager
             .register_connection(sender, principal.clone())
             .await
@@ -951,6 +1259,11 @@ mod tests {
             .unwrap();
         manager
             .send_text(connection_id, "occupy-queue".to_owned())
+            .await
+            .unwrap();
+
+        manager
+            .send_text(connection_id, "occupy-second-slot".to_owned())
             .await
             .unwrap();
 
@@ -967,5 +1280,218 @@ mod tests {
             Some(pioneer_protocol::AuthSessionTerminationReason::SessionRevoked)
         );
         assert!(manager.connection_principal(connection_id).await.is_err());
+    }
+    #[tokio::test]
+    async fn execution_delivery_retired_subject_and_lease_cannot_enqueue_or_abort_replacement() {
+        use crate::thread::{ThreadSubscriptionIdentity, replay::SubscriptionIncarnation};
+        let manager = SessionManager::new();
+        let principal = authenticated_test_superuser();
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
+        let connection = manager
+            .register_connection(tx.clone(), principal.clone())
+            .await
+            .unwrap();
+        let old = SubscriptionIncarnation::new(
+            connection,
+            ThreadSubscriptionIdentity::new(
+                principal.principal_id.clone(),
+                principal.session_id.clone(),
+            ),
+        );
+        let owner = Arc::new(crate::thread::replay::ReplayTasks::default());
+        let order = Arc::new(crate::thread::replay::PendingDeliveryOrder::default());
+        let reservation = owner.reserve(old.clone(), tx.clone(), &order).unwrap();
+        old.retire();
+        old.run(manager.recover_execution_delivery(
+            connection,
+            &principal,
+            events::TURN_PERMISSION_REQUEST_OPENED,
+        ))
+        .await;
+        // Replay read/decoding errors use the same exact token failure gate.
+        old.run(async { crate::thread::replay::fail_current() })
+            .await;
+        drop(reservation);
+        // The old scope's recovery cannot terminally seal the current socket.
+        manager
+            .try_send_execution_notification(
+                connection,
+                &principal,
+                "replacement".into(),
+                events::TURN_PERMISSION_REQUEST_OPENED,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(Message::Text(text)) if text == "replacement"));
+        let mut foreign = (*principal).clone();
+        foreign.session_id = pioneer_protocol::AuthSessionId::new("S00000000000000000002").unwrap();
+        manager
+            .try_send_execution_notification(
+                connection,
+                &foreign,
+                "foreign".into(),
+                events::TURN_PERMISSION_REQUEST_OPENED,
+            )
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+        tx.try_send_data(Message::Text("still current".into()))
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(Message::Text(text)) if text == "still current"));
+        let mut expired = (*principal).clone();
+        expired.access_jti.push_str("-expired");
+        expired.access_expires_at_unix = 0;
+        manager
+            .renew_connection_principal(connection, &principal, Arc::new(expired.clone()))
+            .await
+            .unwrap();
+        manager
+            .try_send_execution_notification(
+                connection,
+                &expired,
+                "expired".into(),
+                events::TURN_PERMISSION_REQUEST_RESOLVED,
+            )
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(
+            tx.try_send_data(Message::Text("expired lease is terminal".into()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_derived_payload_checks_current_workspace_identity_and_expiry_at_enqueue() {
+        let manager = SessionManager::new();
+        let principal = authenticated_test_superuser();
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(4);
+        let connection = manager
+            .register_connection(tx, principal.clone())
+            .await
+            .unwrap();
+        manager
+            .set_connection_workspace(connection, Some("first".into()))
+            .await;
+        let send = |outbound: &SessionOutbound| {
+            outbound
+                .try_send(Message::Text("derived value".into()))
+                .map_err(|error| anyhow!("{error}"))?;
+            Ok(())
+        };
+        assert!(
+            manager
+                .with_notification_outbound(connection, &principal, "first", send)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            rx.recv().await.unwrap().into_text().unwrap(),
+            "derived value"
+        );
+        manager
+            .set_connection_workspace(connection, Some("second".into()))
+            .await;
+        assert!(
+            manager
+                .with_notification_outbound(connection, &principal, "first", send)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let mut renewed = (*principal).clone();
+        renewed.access_jti = "new-access-token".into();
+        manager
+            .renew_connection_principal(connection, &principal, Arc::new(renewed.clone()))
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .with_notification_outbound(connection, &principal, "second", send)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .with_notification_outbound(connection, &renewed, "second", send)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let _ = rx.recv().await.unwrap();
+        let mut expired = renewed;
+        expired.access_expires_at_unix = 0;
+        let (expired_tx, mut expired_rx) = crate::session::test_support::outbound_channel(2);
+        let expired_connection = manager
+            .register_connection(expired_tx, Arc::new(expired.clone()))
+            .await
+            .unwrap();
+        manager
+            .set_connection_workspace(expired_connection, Some("second".into()))
+            .await;
+        assert!(
+            manager
+                .with_notification_outbound(expired_connection, &expired, "second", send)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            expired_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn registered_identity_descriptor_preserves_exact_principal_and_connection_context() {
+        let manager = SessionManager::new();
+        let (tx, _rx) = crate::session::test_support::outbound_channel(2);
+        let expected = authenticated_test_superuser();
+        let connection_id = register_authenticated_test_connection(&manager, tx).await;
+        let stored = manager.connection_principal(connection_id).await.unwrap();
+
+        assert_eq!(stored.as_ref(), expected.as_ref());
+        assert_eq!(stored.principal_id.as_str(), TEST_SUPERUSER_PRINCIPAL_ID);
+
+        let stored = manager.connection_principal(connection_id).await.unwrap();
+        let context = manager.connection_context(connection_id).await.unwrap();
+
+        assert_eq!(context.connection_id(), connection_id);
+        assert!(Arc::ptr_eq(context.principal_arc(), &stored));
+        assert_eq!(
+            context.principal().principal_id.as_str(),
+            TEST_SUPERUSER_PRINCIPAL_ID
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_mutation_updates_scope_and_preserves_immutable_identity() {
+        let manager = SessionManager::new();
+        let (tx, _rx) = crate::session::test_support::outbound_channel(2);
+        let connection_id = register_authenticated_test_connection(&manager, tx).await;
+
+        assert_eq!(manager.connection_workspace_id(connection_id).await, None);
+        let before = manager.connection_principal(connection_id).await.unwrap();
+
+        manager
+            .set_connection_workspace(connection_id, Some("ws_a".to_owned()))
+            .await;
+        let after = manager.connection_principal(connection_id).await.unwrap();
+
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(after.principal_id.as_str(), TEST_SUPERUSER_PRINCIPAL_ID);
+        assert_eq!(
+            manager
+                .connection_workspace_id(connection_id)
+                .await
+                .as_deref(),
+            Some("ws_a")
+        );
     }
 }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use pioneer_crud::{
     CrudStore, PersistedCapabilityScopeKind, PersistedThreadAccessClass,
@@ -31,6 +33,32 @@ pub(crate) struct CapabilityThreadFacts {
     pub(crate) access: ThreadAccessFacts,
     pub(crate) internal_child: bool,
     pub(crate) parent_execution_actions: Option<Vec<String>>,
+}
+
+/// Stage-local authoritative classification. Only a validated persisted
+/// workspace/private scope can enter the shared evaluator. Missing resources
+/// can authorize only an exact runtime draft, never fabricated ordinary facts.
+pub(crate) struct ThreadNotificationScope {
+    scope: Option<pioneer_crud::ThreadAuthorizationScope>,
+}
+
+impl ThreadNotificationScope {
+    pub(crate) fn is_internal(&self) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|scope| scope.access_class == PersistedThreadAccessClass::Internal)
+    }
+
+    pub(crate) fn is_missing(&self) -> bool {
+        self.scope.is_none()
+    }
+}
+
+pub(crate) struct ThreadNotificationMemberships<'a> {
+    scope: &'a pioneer_crud::ThreadAuthorizationScope,
+    requested: HashSet<PrincipalId>,
+    workspace_members: HashSet<String>,
+    thread_members: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -520,6 +548,85 @@ impl AuthorizationResolver {
             }))
     }
 
+    pub(crate) async fn load_thread_notification_scope(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadNotificationScope> {
+        let scope =
+            resolve_thread_authorization_scope(&self.store.database_connection(), thread_id, None)
+                .await?;
+        Ok(ThreadNotificationScope { scope })
+    }
+
+    pub(crate) async fn load_thread_notification_memberships<'a>(
+        &self,
+        scope: &'a ThreadNotificationScope,
+        principal_ids: &[PrincipalId],
+    ) -> Result<ThreadNotificationMemberships<'a>> {
+        let scope = scope
+            .scope
+            .as_ref()
+            .filter(|scope| scope.access_class != PersistedThreadAccessClass::Internal)
+            .context("ordinary notification requires a persisted workspace/private scope")?;
+        let workspace_members = pioneer_crud::load_workspace_membership_principal_ids(
+            &self.store.database_connection(),
+            &scope.workspace_id,
+            principal_ids,
+        )
+        .await?;
+        let thread_members = pioneer_crud::load_thread_membership_principal_ids(
+            &self.store.database_connection(),
+            &scope.thread_id,
+            principal_ids,
+        )
+        .await?;
+        // Both bounded materializations have released their physical readers.
+        Ok(ThreadNotificationMemberships {
+            scope,
+            requested: principal_ids.iter().cloned().collect(),
+            workspace_members: workspace_members.into_iter().collect(),
+            thread_members: thread_members.into_iter().collect(),
+        })
+    }
+
+    pub(crate) fn authorize_thread_notification(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        memberships: &ThreadNotificationMemberships<'_>,
+    ) -> ProofResolution<AuthorizedThread> {
+        let action = ResourceAction::ThreadRead;
+        if let Some(denied) = self.preflight(action_gate, action) {
+            return ProofResolution::Denied(denied);
+        }
+        if !action_gate.is_final_allow() && !memberships.requested.contains(&principal.principal_id)
+        {
+            return ProofResolution::Denied(missing_resource());
+        }
+        let scope = memberships.scope;
+        let Some(resource) = thread_resource(&scope.workspace_id, &scope.thread_id) else {
+            return ProofResolution::Denied(missing_resource());
+        };
+        let facts = self.thread_facts_from_memberships(
+            principal,
+            scope,
+            memberships
+                .workspace_members
+                .contains(principal.principal_id.as_str()),
+            memberships
+                .thread_members
+                .contains(principal.principal_id.as_str()),
+        );
+        self.finish(
+            principal,
+            action_gate,
+            action,
+            resource,
+            ResolvedResourceAccess::Thread(facts),
+        )
+        .map(AuthorizedThread)
+    }
+
     /// Authorizes an exact connection-owned draft without pretending that it
     /// already exists in persistence. `RuntimeDraftAccess` is the server-owned
     /// resource proof; persisted workspace state is still resolved here so a
@@ -753,6 +860,89 @@ impl AuthorizationResolver {
                 }),
             },
         )))
+    }
+
+    /// Bounded page authorization through the same root ACL and durable actor
+    /// verifier as the single-child path. Facts/maps live only for this request.
+    pub(crate) async fn authorize_internal_thread_page(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        action: ResourceAction,
+        requested: &[(String, String)],
+    ) -> Result<HashSet<(String, String)>> {
+        let mut allowed = HashSet::new();
+        if self.preflight(action_gate, action).is_some() {
+            return Ok(allowed);
+        }
+        let Some(child_action) = super::execution_child_policy_action(action) else {
+            return Ok(allowed);
+        };
+        let child_gate = self.service.authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            child_action,
+        );
+        if !child_gate.permits_resource_resolution() && !child_gate.is_final_allow() {
+            return Ok(allowed);
+        }
+        let requested = requested.iter().cloned().collect::<HashSet<_>>();
+        let child_ids = requested
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>();
+        let facts = pioneer_crud::load_internal_thread_authorization_facts(
+            &self.store.database_connection(),
+            &child_ids,
+            &principal.principal_id,
+        )
+        .await?;
+        let eligible = facts
+            .into_iter()
+            .filter(|f| {
+                requested.contains(&(f.child.workspace_id.clone(), f.child.thread_id.clone()))
+                    && thread_resource(&f.child.workspace_id, &f.child.thread_id).is_some()
+                    && thread_resource(&f.root.workspace_id, &f.root.thread_id).is_some()
+                    && f.root_collaboration_thread_id
+                        .as_ref()
+                        .is_none_or(|id| resource_id(ThreadResourceId::new(id.clone())).is_some())
+                    && self
+                        .service
+                        .authorize_resource(
+                            action_gate,
+                            action,
+                            ResolvedResourceAccess::Thread(self.thread_facts_from_memberships(
+                                principal,
+                                &f.root,
+                                f.workspace_member,
+                                f.root_thread_member,
+                            )),
+                        )
+                        .is_allowed()
+            })
+            .collect::<Vec<_>>();
+        let parents = eligible
+            .iter()
+            .map(|f| f.parent_turn_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let encoded = self
+            .store
+            .get_turn_execution_authorization_contexts(&parents)
+            .await?;
+        let contexts =
+            super::ExecutionAuthorizationContext::load_for_turns(&self.store, encoded).await?;
+        for f in eligible {
+            if contexts.get(&f.parent_turn_id).is_some_and(|context| {
+                context.workspace_id() == f.child.workspace_id
+                    && context.root_thread_id() == f.root.thread_id
+                    && context.grants_action(action)
+            }) {
+                allowed.insert((f.child.workspace_id, f.child.thread_id));
+            }
+        }
+        Ok(allowed)
     }
 
     /// Resolves a turn in an internal child through the same persisted root
@@ -1401,17 +1591,41 @@ impl AuthorizationResolver {
             .context("failed to resolve thread authorization membership")?
             .is_some(),
         };
-        Ok(ThreadAccessFacts {
-            workspace,
+        Ok(self.thread_facts_from_memberships(
+            principal,
+            scope,
+            workspace.workspace_member,
+            thread_member,
+        ))
+    }
+
+    /// Fact assembly is shared by the single and bounded notification loaders;
+    /// `finish` / AuthorizationService remain the only ACL evaluator.
+    fn thread_facts_from_memberships(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        scope: &pioneer_crud::ThreadAuthorizationScope,
+        workspace_member: bool,
+        thread_member: bool,
+    ) -> ThreadAccessFacts {
+        let scoped = self
+            .service
+            .runtime_principal_policy(principal.kind, principal.role_key.as_ref())
+            == Some(super::RuntimePrincipalPolicy::ScopedCollaboration);
+        ThreadAccessFacts {
+            workspace: WorkspaceAccessFacts {
+                workspace_active: scope.workspace_is_active,
+                workspace_member: scoped && workspace_member,
+            },
             access_class: match scope.access_class {
                 PersistedThreadAccessClass::Private => ThreadAccessClass::Private,
                 PersistedThreadAccessClass::Workspace => ThreadAccessClass::Workspace,
                 PersistedThreadAccessClass::Internal => ThreadAccessClass::Internal,
             },
             resource_class: ThreadResourceClass::Root,
-            thread_member,
+            thread_member: scoped && thread_member,
             thread_creator: scope.creator_principal_id.as_ref() == Some(&principal.principal_id),
-        })
+        }
     }
 
     fn finish(
@@ -1909,7 +2123,7 @@ mod tests {
                     turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id\
                  ) VALUES(\
                     'U0000000000000000000A','T0000000000000000000A','completed','{}',\
-                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'chat','user','principal',\
+                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'conversation','user','principal',\
                     'P0000000000000000000A'),(\
                     'U0000000000000000000I','T0000000000000000000I','completed','{}',\
                     CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'agent','task','system',NULL\
@@ -1979,66 +2193,6 @@ mod tests {
             .expect("parent authority should persist");
         let resolver = AuthorizationResolver::new(store);
         (harness, resolver)
-    }
-
-    #[tokio::test]
-    async fn workspace_resolution_uses_member_join_and_superuser_absolute_access() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
-        let member_gate = service.authorize_action(
-            member.kind,
-            member.role_key.as_ref(),
-            ResourceAction::WorkspaceRead,
-        );
-        let superuser_gate = service.authorize_action(
-            superuser.kind,
-            superuser.role_key.as_ref(),
-            ResourceAction::WorkspaceRead,
-        );
-
-        let member_proof = resolver
-            .authorize_workspace(
-                &member,
-                &member_gate,
-                ResourceAction::WorkspaceRead,
-                WORKSPACE_ID,
-            )
-            .await
-            .expect("resolve Member workspace")
-            .into_authorized()
-            .expect("Member has persisted workspace membership");
-        assert_eq!(member_proof.workspace_id(), WORKSPACE_ID);
-
-        assert!(
-            resolver
-                .authorize_workspace(
-                    &member,
-                    &member_gate,
-                    ResourceAction::WorkspaceRead,
-                    WORKSPACE_GREEN_ID,
-                )
-                .await
-                .expect("resolve ungranted workspace")
-                .into_authorized()
-                .is_none(),
-            "ordinary-principal resolution must use the membership-scoped SQL path"
-        );
-        assert!(
-            resolver
-                .authorize_workspace(
-                    &superuser,
-                    &superuser_gate,
-                    ResourceAction::WorkspaceRead,
-                    WORKSPACE_GREEN_ID,
-                )
-                .await
-                .expect("resolve Superuser workspace")
-                .into_authorized()
-                .is_some(),
-            "Superuser must not require membership rows"
-        );
     }
 
     #[tokio::test]
@@ -2154,10 +2308,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_two_member_three_workspace_thread_matrix_is_exact_and_fail_closed() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated Epic 4 harness");
-        let resolver = AuthorizationResolver::new(CrudStore::new(harness.database.clone()));
+        let (_harness, resolver) = resolver_fixture().await;
         let service = AuthorizationService::new();
         let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
         let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
@@ -2181,19 +2332,18 @@ mod tests {
                 ResourceAction::WorkspaceRead,
             );
             for workspace_id in allowed {
-                assert!(
-                    resolver
-                        .authorize_workspace(
-                            principal,
-                            &gate,
-                            ResourceAction::WorkspaceRead,
-                            workspace_id,
-                        )
-                        .await
-                        .expect("resolve granted workspace")
-                        .into_authorized()
-                        .is_some()
-                );
+                let proof = resolver
+                    .authorize_workspace(
+                        principal,
+                        &gate,
+                        ResourceAction::WorkspaceRead,
+                        workspace_id,
+                    )
+                    .await
+                    .expect("resolve granted workspace")
+                    .into_authorized()
+                    .expect("persisted workspace membership");
+                assert_eq!(proof.workspace_id(), workspace_id);
             }
             assert_eq!(
                 resolver
@@ -2207,6 +2357,26 @@ mod tests {
                 })
             );
         }
+
+        let superuser_workspace_gate = service.authorize_action(
+            superuser.kind,
+            superuser.role_key.as_ref(),
+            ResourceAction::WorkspaceRead,
+        );
+        assert!(
+            resolver
+                .authorize_workspace(
+                    &superuser,
+                    &superuser_workspace_gate,
+                    ResourceAction::WorkspaceRead,
+                    WORKSPACE_GREEN_ID,
+                )
+                .await
+                .expect("resolve Superuser workspace")
+                .into_authorized()
+                .is_some(),
+            "Superuser must not require membership rows"
+        );
 
         let member_cases = [
             (
@@ -2294,7 +2464,22 @@ mod tests {
                 principal.role_key.as_ref(),
                 ResourceAction::ThreadRead,
             );
+            assert!(
+                resolver
+                    .authorize_thread(
+                        principal,
+                        &gate,
+                        ResourceAction::ThreadRead,
+                        PRIVATE_THREAD_ID,
+                        Some(WORKSPACE_ID),
+                    )
+                    .await
+                    .expect("resolve exact persisted parent before mismatch")
+                    .into_authorized()
+                    .is_some()
+            );
             for (thread_id, workspace_id) in [
+                (PRIVATE_THREAD_ID, "W00000000000000000002"),
                 (THREAD_RED_PRIVATE_A_ID, WORKSPACE_GREEN_ID),
                 ("T00000000000000000099", WORKSPACE_RED_ID),
             ] {
@@ -2530,44 +2715,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_mismatch_denies_member_and_superuser_before_proof_construction() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
-        let member_gate = service.authorize_action(
-            member.kind,
-            member.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-        let superuser_gate = service.authorize_action(
-            superuser.kind,
-            superuser.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-
-        for (principal, gate) in [(&member, &member_gate), (&superuser, &superuser_gate)] {
-            let denied = resolver
-                .authorize_thread(
-                    principal,
-                    gate,
-                    ResourceAction::ThreadRead,
-                    PRIVATE_THREAD_ID,
-                    Some("W00000000000000000002"),
-                )
-                .await
-                .expect("resolve mismatched thread");
-            assert_eq!(
-                denied.denial(),
-                Some(&AuthorizationDecision::Deny {
-                    reason: DenyReason::MissingAuthoritativeResource,
-                    disclosure: DisclosurePolicy::NotFound,
-                })
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn internal_thread_is_denied_directly_and_requires_authorized_root_lineage() {
         let (harness, resolver) = resolver_fixture().await;
         let service = AuthorizationService::new();
@@ -2609,6 +2756,23 @@ mod tests {
             .into_authorized()
             .expect("authorized root permits indirect internal projection");
         assert_eq!(inherited.thread_id(), INTERNAL_THREAD_ID);
+        // Page authorization preserves the same ACL with mixed scopes and
+        // duplicate children, including a page beyond the metadata quantum.
+        let mut requested = (0..65)
+            .map(|i| (WORKSPACE_ID.to_owned(), format!("missing-child-{i}")))
+            .collect::<Vec<_>>();
+        requested.extend([
+            (WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned()),
+            (WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned()),
+            (WORKSPACE_ID.to_owned(), PRIVATE_THREAD_ID.to_owned()),
+            ("wrong-workspace".to_owned(), INTERNAL_THREAD_ID.to_owned()),
+        ]);
+        let batch = resolver
+            .authorize_internal_thread_page(&member, &gate, ResourceAction::ThreadRead, &requested)
+            .await
+            .expect("authorize bounded mixed page");
+        assert_eq!(batch.len(), 1);
+        assert!(batch.contains(&(WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned())));
 
         let peer = principal(MEMBER_B_ID, PrincipalKind::User);
         let peer_gate = service.authorize_action(
@@ -2630,6 +2794,19 @@ mod tests {
                 .into_authorized()
                 .is_none(),
             "guessed child id must not bypass inaccessible root ACL"
+        );
+
+        assert!(
+            resolver
+                .authorize_internal_thread_page(
+                    &peer,
+                    &peer_gate,
+                    ResourceAction::ThreadRead,
+                    &requested
+                )
+                .await
+                .expect("peer must retain the root ACL denial")
+                .is_empty()
         );
 
         harness
@@ -2654,6 +2831,19 @@ mod tests {
                 .into_authorized()
                 .is_none(),
             "missing parent authority must never become unrestricted child access"
+        );
+        // No request-local result may survive across requests after revocation.
+        assert!(
+            resolver
+                .authorize_internal_thread_page(
+                    &member,
+                    &gate,
+                    ResourceAction::ThreadRead,
+                    &requested
+                )
+                .await
+                .expect("removed authority must deny a fresh page")
+                .is_empty()
         );
     }
 

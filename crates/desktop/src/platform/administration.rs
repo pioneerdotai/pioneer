@@ -24,9 +24,16 @@ impl AdministrationAvatarPort for DesktopAdministrationPlatform {
         let client = self.client.clone();
         cx.background_spawn(async move {
             let home = crate::state::runtime_home_dir().map_err(|_| AvatarCacheError::Offline)?;
-            let service = client.avatar_cache_service(home)?;
+            let service = client.image_cache_service(home)?;
             let runtime = tokio::runtime::Runtime::new().map_err(|_| AvatarCacheError::Offline)?;
-            runtime.block_on(client.resolve_member_avatar(&service, request, cancellation))
+            let _runtime_observer = pioneer_observability::runtime::register(
+                runtime.handle(),
+                pioneer_observability::runtime::RuntimeRole::DesktopHelper,
+            );
+            _runtime_observer.block_on(
+                &runtime,
+                client.resolve_member_avatar(&service, request, cancellation),
+            )
         })
     }
 }

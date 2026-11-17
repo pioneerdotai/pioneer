@@ -35,3 +35,5 @@ pub use runtime::{
 pub use secrets::McpSecretMaterialization;
 
 pub use oauth::{McpOAuthProvider, OAuthFailureCause, OAuthHttpClient, oauth_runtime_error};
+
+pub use validation::is_valid_server_name;

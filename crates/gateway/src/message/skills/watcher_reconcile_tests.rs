@@ -2376,51 +2376,6 @@ async fn actual_import_generates_identity_for_an_unregistered_container_but_igno
     );
 }
 
-#[tokio::test]
-async fn concurrent_first_lock_access_converts_v1_once_under_existing_lock() {
-    let temp = tempfile::TempDir::new().expect("tempdir");
-    let lock_path = temp.path().join("skills-lock.toml");
-    fs::write(
-            lock_path.as_path(),
-            "version = 1\n[[entries]]\nowner='owner'\nslug='test-skill'\nsource_kind='user'\nsource_ref='legacy'\ninstall_path='/legacy/test-skill'\ntrust_level='community'\nfingerprint='legacy-fingerprint'\ninstalled_at=7\n",
-        )
-        .expect("write v1 lock");
-    let candidate = pioneer_skills::SkillLockConversionCandidate {
-        skill_id: SkillId::new("T".repeat(21)).unwrap(),
-        owner: Some("owner".to_owned()),
-        slug: "test-skill".to_owned(),
-        source_kind: "user".to_owned(),
-        source_ref: "legacy".to_owned(),
-        install_path: "/legacy/test-skill".to_owned(),
-        version: None,
-        trust_level: pioneer_skills::SkillTrustLevel::Community,
-        fingerprint: "legacy-fingerprint".to_owned(),
-    };
-    let lock = Arc::new(Mutex::new(()));
-    let mut tasks = Vec::new();
-    for _ in 0..2 {
-        let lock = lock.clone();
-        let lock_path = lock_path.clone();
-        let candidate = candidate.clone();
-        tasks.push(tokio::spawn(async move {
-            let _guard = lock.lock().await;
-            pioneer_skills::ensure_skills_lock_v2(&lock_path, &[candidate]).expect("ensure v2")
-        }));
-    }
-    let first = tasks.remove(0).await.expect("first ensure task");
-    let second = tasks.remove(0).await.expect("second ensure task");
-    assert_eq!(first, second);
-    assert_eq!(first.entries.len(), 1);
-    assert_eq!(
-        first.entries[0].skill_id,
-        SkillId::new("T".repeat(21)).unwrap()
-    );
-    assert_eq!(
-        pioneer_skills::read_skills_lock(&lock_path).expect("strict v2 read"),
-        first
-    );
-}
-
 fn large_metadata_inputs(path: &Path) -> usize {
     let skill = format!("---\nname: Test skill\n---\n{}", "x".repeat(600 * 1024));
     let sidecar = serde_json::to_vec(

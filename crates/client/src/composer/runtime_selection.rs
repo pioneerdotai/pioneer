@@ -150,6 +150,7 @@ impl ClientCore {
             .unwrap_or_default()
     }
     pub(crate) fn sync_composer_provider_runtimes(&self, workspace: &str) {
+        self.resume_cli_runtime_model_collections(workspace);
         let snapshot = self.provider_runtime_snapshot(workspace);
         let mut store = self.composer_store.lock().expect("composer store poisoned");
         let threads: Vec<_> = store
@@ -158,7 +159,29 @@ impl ClientCore {
             .filter(|(thread, s)| s.workspace == workspace && !store.suspended.contains(*thread))
             .map(|(thread, _)| thread.clone())
             .collect();
+        let mut refresh_displays = Vec::new();
         for thread in &threads {
+            let runtime_id = store
+                .drafts
+                .get(thread)
+                .and_then(|draft| draft.domain().selected_provider.as_deref())
+                .and_then(list::runtime_id_from_cli_runtime_provider_key);
+            let old_rows = Self::composer_runtime_rows(&store, thread);
+            let changed = runtime_id.is_some_and(|id| {
+                list::cli_runtime_catalog_changed(
+                    old_rows.iter().find(|row| row.runtime_id == id),
+                    snapshot.as_ref().and_then(|p| {
+                        p.runtimes()
+                            .iter()
+                            .find(|row| row.runtime().runtime_id == id)
+                            .map(|row| row.runtime())
+                    }),
+                )
+            });
+            if changed {
+                self.invalidate_composer_cli_model_display(&mut store, thread);
+                refresh_displays.push(thread.clone());
+            }
             let state = store.runtimes.get_mut(thread).unwrap();
             state.snapshot = snapshot.clone();
             self.publish_composer_runtime_selection(&mut store, thread);
@@ -166,6 +189,9 @@ impl ClientCore {
         drop(store);
         for thread in threads {
             self.resume_composer_model_picker_models(&thread);
+        }
+        for thread in refresh_displays {
+            self.observe_composer_model_display(&thread, None);
         }
     }
     fn publish_composer_runtime_selection(&self, store: &mut ComposerStore, thread: &str) {
@@ -250,14 +276,14 @@ impl ClientCore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         composer::store::ComposerIntent,
         core::{ClientDemand, ClientScope},
     };
     use pioneer_protocol::*;
-    fn fixture() -> Arc<ClientCore> {
+    pub(in crate::composer) fn fixture() -> Arc<ClientCore> {
         let core = Arc::new(ClientCore::new());
         ClientMutationAuthority { _private: () }.accept_thread_capabilities_for_test(
             &core,
@@ -376,7 +402,7 @@ mod tests {
         core
     }
     fn runtime(ready: bool) -> RuntimeSummary {
-        serde_json::from_value(serde_json::json!({"runtime_id":"codex","kind":"codex","display_name":"Codex","enabled":true,"status":{"state":if ready {"ready"} else {"needs_auth"}},"capabilities": RuntimeCapabilities { supports_threads: true, supports_model_list: true, supports_steer: true, supports_skills: true, supports_mcp_tools: true, ..Default::default() }})).unwrap()
+        serde_json::from_value(serde_json::json!({"runtime_id":"codex","kind":"codex","display_name":"Codex","enabled":true,"status":{"state":if ready {"ready"} else {"needs_auth"}},"capabilities": RuntimeCapabilities { supports_threads: true, supports_model_list: true, supports_steer: true, supports_skills: true, supports_mcp_tools: ready, ..Default::default() }})).unwrap()
     }
     fn response(revision: u64, ready: bool) -> CLIRuntimeListResponse {
         CLIRuntimeListResponse {
@@ -599,8 +625,30 @@ mod tests {
                 .selected_provider_ready()
         );
         core.complete_provider_runtime_for_test(request.clone(), Ok(response(1, true)));
+        let draft = core.composer_snapshot("a").unwrap();
+        core.composer_intent(ComposerIntent::Domain {
+            thread_id: "a".into(),
+            draft_id: draft.draft_id(),
+            action: super::super::state_machine::ComposerDomainAction::SetCapabilities {
+                capabilities: vec![super::super::capabilities::ComposerCapability {
+                    id: super::super::capabilities::ComposerCapabilityKind::McpTool {
+                        server_name: "docs".into(),
+                        raw_tool_name: "search".into(),
+                        scope_kind: McpScopeKind::Workspace,
+                    }
+                    .key(),
+                    label: "Search".into(),
+                    kind: super::super::capabilities::ComposerCapabilityKind::McpTool {
+                        server_name: "docs".into(),
+                        raw_tool_name: "search".into(),
+                        scope_kind: McpScopeKind::Workspace,
+                    },
+                }],
+            },
+        });
         let ready = core.composer_snapshot("a").unwrap();
         assert!(ready.selected_provider_ready());
+        assert_eq!(ready.domain().capabilities.len(), 1);
         assert_eq!(
             serde_json::to_value(&ready).unwrap()["selected_provider_ready"],
             true
@@ -610,7 +658,9 @@ mod tests {
         assert!(Arc::ptr_eq(&ready, &core.composer_snapshot("a").unwrap()));
         delta(&core, 2, false);
         let unavailable = core.composer_snapshot("a").unwrap();
-        assert!(!unavailable.selected_provider_ready());
+        assert!(unavailable.selected_provider_ready());
+        assert_eq!(unavailable.domain(), ready.domain());
+        assert!(ready.has_same_submission_prerequisites(&unavailable));
         delta(&core, 1, true);
         assert!(Arc::ptr_eq(
             &unavailable,

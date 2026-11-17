@@ -1,4 +1,4 @@
-//! Owned background preparation of completed CLI history. Queue rows contain
+//! Owned background preparation of active user conversations. Queue rows contain
 //! locators/settings only; the existing canonical history remains authoritative.
 use super::*;
 use crate::compaction::{CompactionClock, SystemCompactionClock};
@@ -24,7 +24,8 @@ pub(super) struct OwnedHistoryCheck {
     turn: String,
     cancel: CancellationToken,
     suspending: Arc<AtomicBool>,
-    pub(super) handle: Option<JoinHandle<()>>,
+    completed: Arc<AtomicBool>,
+    pub(super) handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 #[cfg(test)]
@@ -91,6 +92,13 @@ impl MessageProcessor {
     }
 
     #[cfg(test)]
+    pub(crate) async fn wait_at_completed_history_preparation_barrier(&self, phase: &str) {
+        self.completed_history_preparation_barrier
+            .wait_if_armed(phase, &CancellationToken::new())
+            .await;
+    }
+
+    #[cfg(test)]
     pub(crate) fn release_completed_history_preparation_barrier(&self) {
         self.completed_history_preparation_barrier.release();
     }
@@ -104,6 +112,19 @@ impl MessageProcessor {
     ) -> anyhow::Result<()> {
         let clock = SystemCompactionClock::default();
         let current = ModelSelection {
+            service_mode: context
+                .context_budget
+                .as_ref()
+                .and_then(|saved| saved.service_choice()),
+            context_authority: context.context_budget.as_ref().and_then(|saved| {
+                saved.authority.as_deref().map(|authority| {
+                    pioneer_provider::catalog::context_choice_authority(authority, &saved.model)
+                })
+            }),
+            context_window: context
+                .context_budget
+                .as_ref()
+                .map(|saved| saved.context_window),
             transport: Transport::Api,
             instance: context.provider_instance.clone(),
             model: prepared.request.model.clone(),
@@ -140,6 +161,138 @@ impl MessageProcessor {
             result=enqueue=>result,
         }
     }
+    /// Root activity limits optional work only. Mandatory request preparation
+    /// never consults this policy. Strict subtraction avoids deadline overflow.
+    pub(crate) async fn root_history_check_admission(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<Option<HistoryCheckOutcome>> {
+        let activity = self
+            .crud_store
+            .compaction_root_history_activity(workspace, thread, turn)
+            .await?;
+        let Some(activity) = activity.and_then(|value| u64::try_from(value).ok()) else {
+            return Ok(Some(HistoryCheckOutcome::Cancelled));
+        };
+        let window = self
+            .context_compaction_config
+            .hot_conversation_window_secs
+            .checked_mul(1000)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid hot conversation window"))?;
+        if now_ms.saturating_sub(activity) >= window {
+            return Ok(Some(HistoryCheckOutcome::Cancelled));
+        }
+        if self
+            .crud_store
+            .compaction_root_history_busy(workspace, thread)
+            .await?
+        {
+            return Ok(Some(HistoryCheckOutcome::WaitingExecutor));
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn acquire_composer_history_priority(
+        &self,
+        store: &pioneer_crud::CrudStore,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<Option<crate::compaction::ContextCompactionLease>> {
+        let Some(root) = store
+            .compaction_root_for_execution(workspace, thread, turn)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.compaction_coordinator
+            .acquire(
+                workspace,
+                &root,
+                crate::compaction::ContextWorkPriority::Foreground,
+                cancellation,
+            )
+            .await
+    }
+
+    /// Separate owner: caller installs this in the resilience worker guard and
+    /// removes the general-control poll at the same time.
+    pub(super) async fn run_compaction_background_worker(processor: Weak<Self>) {
+        let Some(owner) = processor.upgrade() else {
+            return;
+        };
+        let database = owner.crud_store.database_connection().maintenance();
+        let shutdown = owner.cli_history_shutdown.clone();
+        let mut changes = database.work_signal("compaction").subscribe();
+        let mut releases = owner.compaction_coordinator.release_subscription();
+        drop(owner);
+        loop {
+            if shutdown.is_cancelled() {
+                return;
+            }
+            let Some(owner) = processor.upgrade() else {
+                return;
+            };
+            let owner = owner.for_background_reconciliation();
+            let result = AssertUnwindSafe(async {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => anyhow::bail!("compaction owner stopping"),
+                    result = changes.begin_pass(&database) => result?,
+                }
+                releases.begin_pass(&database).await?;
+                if !owner.agent_manager.has_context_controller().await {
+                    return Ok(None);
+                }
+                if owner
+                    .compaction_lifecycle_not_before
+                    .read()
+                    .expect("lifecycle schedule lock")
+                    .is_some_and(|due| tokio::time::Instant::now() < due)
+                {
+                    anyhow::bail!("compaction lifecycle retry is deferred");
+                }
+                #[cfg(test)]
+                owner
+                    .completed_history_preparation_barrier
+                    .wait_if_armed("__resilience_before_history_poll__", &shutdown)
+                    .await;
+                owner.poll_completed_history_checks().await?;
+                let owned = {
+                    let jobs = owner.completed_history_checks.lock().await;
+                    jobs.keys().cloned().collect::<Vec<_>>()
+                };
+                owner
+                    .crud_store
+                    .next_compaction_background_deadline(&owned)
+                    .await
+            })
+            .catch_unwind()
+            .await;
+            drop(owner);
+            match result {
+                Ok(Ok(deadline)) => tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = changes.wait(deadline) => {},
+                    _ = releases.changed() => {}
+                },
+                _ => {
+                    warn!("compaction background pass failed");
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = sleep(Duration::from_secs(5)) => {}
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Existing resilience owner polls only durable completion intents, not all
     /// histories. Service work runs separately and never stalls its poll loop.
     pub(crate) async fn poll_completed_history_checks(&self) -> anyhow::Result<()> {
@@ -155,24 +308,43 @@ impl MessageProcessor {
             let mut jobs = self.completed_history_checks.lock().await;
             let keys: Vec<_> = jobs
                 .iter()
-                .filter(|(_, job)| job.handle.as_ref().is_none_or(JoinHandle::is_finished))
+                .filter(|(_, job)| {
+                    job.completed.load(Ordering::Acquire)
+                        || job.handle.as_ref().is_none_or(JoinHandle::is_finished)
+                })
                 .map(|(key, _)| key.clone())
                 .collect();
             keys.into_iter()
                 .filter_map(|key| jobs.remove(&key))
                 .collect::<Vec<_>>()
         };
+        let mut service_failed = false;
         for mut job in finished {
             if let Some(handle) = job.handle.take() {
-                let _ = handle.await;
+                service_failed |= !matches!(handle.await, Ok(Ok(())));
             }
         }
+        if service_failed {
+            // A panic/failed claim or unconfirmed result write is not EOF.
+            // Let the owner back off before this same due row is rediscovered.
+            anyhow::bail!("completed history service failed before durable settlement");
+        }
+        let owned = {
+            let jobs = self.completed_history_checks.lock().await;
+            jobs.keys().cloned().collect::<Vec<_>>()
+        };
         for mut row in store
-            .compaction_due_history_checks(SystemCompactionClock::default().now_ms() as i64)
+            .compaction_due_history_checks_excluding(
+                self.compaction_clock.now_ms().min(i64::MAX as u64) as i64,
+                &owned,
+            )
             .await?
         {
             let key = (row.workspace_id.clone(), row.thread_id.clone());
             let mut jobs = self.completed_history_checks.lock().await;
+            if self.cli_history_shutdown.is_cancelled() {
+                break;
+            }
             if jobs.contains_key(&key) {
                 continue;
             }
@@ -187,18 +359,46 @@ impl MessageProcessor {
             let task_cancel = cancel.clone();
             let task_suspending = suspending.clone();
             let turn = row.turn_id.clone();
+            // Construct before spawn so cancellation of an unpolled future also
+            // releases the 16-job capacity and wakes its discovery owner.
+            struct CompletionWake(pioneer_sqlite::WorkSignal, Arc<AtomicBool>);
+            impl Drop for CompletionWake {
+                fn drop(&mut self) {
+                    self.1.store(true, Ordering::Release);
+                    self.0.notify();
+                }
+            }
+            let completed = Arc::new(AtomicBool::new(false));
+            let completion = CompletionWake(
+                self.crud_store
+                    .database_connection()
+                    .work_signal("compaction"),
+                completed.clone(),
+            );
             let handle = tokio::spawn(async move {
-                let now = SystemCompactionClock::default().now_ms();
+                let _completion = completion;
+                if task_cancel.is_cancelled() {
+                    return Ok(());
+                }
+                let change = processor
+                    .crud_store
+                    .database_connection()
+                    .work_signal("compaction")
+                    .changing();
+                let now = processor.compaction_clock.now_ms();
                 let claimed = tokio::select! { biased;
-                    _ = task_cancel.cancelled() => return,
-                    result = processor.crud_store.compaction_claim_history_check(&row.turn_id, row.revision, now as i64) => result,
+                    _ = task_cancel.cancelled() => return Ok(()),
+                    result = processor.crud_store.compaction_claim_history_check(&row.turn_id, row.revision, now.min(i64::MAX as u64) as i64) => result,
                 };
                 let claimed = match claimed {
                     Ok(Some(value)) => value,
-                    Ok(None) => return,
-                    Err(_) => {
+                    Ok(None) => {
+                        change.completed(false);
+                        return Ok(());
+                    }
+                    Err(error) => {
                         warn!("failed to claim history check");
-                        return;
+                        return Err(error);
                     }
                 };
                 let mut diagnostic = claimed
@@ -214,7 +414,7 @@ impl MessageProcessor {
                 row.config_hash = claimed.config_hash;
                 row.failures = claimed.failures;
                 row.outcome = claimed.outcome;
-                let result = processor
+                let mut result = processor
                     .run_completed_history_check(
                         &row,
                         task_cancel.clone(),
@@ -223,15 +423,55 @@ impl MessageProcessor {
                     )
                     .await;
                 if !task_suspending.load(Ordering::Acquire) {
-                    let outcome =
-                        classify_check_result(result, &mut diagnostic, task_cancel.is_cancelled());
+                    // Technical foreground work can preempt the same user
+                    // conversation without replacing its publication request.
+                    let mut deferred = false;
+                    let mut cancellation_observed = task_cancel.is_cancelled();
+                    if matches!(&result, Ok(HistoryCheckOutcome::Cancelled)) {
+                        let readiness = async {
+                            Ok::<_, anyhow::Error>(
+                                processor
+                                    .crud_store
+                                    .compaction_history_check_is_current(&row.turn_id)
+                                    .await?
+                                    && matches!(
+                                        processor
+                                            .root_history_check_admission(
+                                                &row.workspace_id,
+                                                &row.thread_id,
+                                                &row.turn_id,
+                                                processor.compaction_clock.now_ms(),
+                                            )
+                                            .await?,
+                                        Some(HistoryCheckOutcome::WaitingExecutor)
+                                    ),
+                            )
+                        }
+                        .await;
+                        match readiness {
+                            Ok(true) => {
+                                deferred = true;
+                                result = Ok(HistoryCheckOutcome::WaitingExecutor);
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                cancellation_observed = false;
+                                result = Err(error);
+                            }
+                        }
+                    }
+                    let outcome = classify_check_result(
+                        result,
+                        &mut diagnostic,
+                        cancellation_observed && !deferred,
+                    );
                     if outcome == HistoryCheckOutcome::Retryable && row.failures >= 3 {
                         diagnostic
                             .explanation
                             .push_str("; automatic preparation retry limit reached");
                     }
-                    diagnostic.observed_ms = SystemCompactionClock::default().now_ms();
-                    if processor
+                    diagnostic.observed_ms = processor.compaction_clock.now_ms();
+                    if let Err(error) = processor
                         .crud_store
                         .compaction_record_history_result(
                             &row.turn_id,
@@ -239,14 +479,16 @@ impl MessageProcessor {
                             row.failures,
                             outcome,
                             &diagnostic,
-                            diagnostic.observed_ms as i64,
+                            diagnostic.observed_ms.min(i64::MAX as u64) as i64,
                         )
                         .await
-                        .is_err()
                     {
                         warn!("failed to persist history check result");
+                        return Err(error);
                     }
                 }
+                change.completed(false);
+                Ok(())
             });
             jobs.insert(
                 key,
@@ -254,6 +496,7 @@ impl MessageProcessor {
                     turn,
                     cancel,
                     suspending,
+                    completed,
                     handle: Some(handle),
                 },
             );
@@ -283,7 +526,7 @@ impl MessageProcessor {
         let mut storage_error = None;
         let processor = Arc::new(self.scoped_with_database_class(SqliteWriteClass::Maintenance));
         let store = &processor.crud_store;
-        let clock = || i64::try_from(SystemCompactionClock::default().now_ms()).unwrap_or(i64::MAX);
+        let clock = || i64::try_from(self.compaction_clock.now_ms()).unwrap_or(i64::MAX);
         // One shared input budget: 4 seed + 4 scope + 8 pending. Neither an
         // outer lock-race retry nor per-row repair can rediscover this batch.
         for seed in [true, false] {
@@ -429,9 +672,16 @@ impl MessageProcessor {
         if !current {
             return Ok(HistoryCheckOutcome::Cancelled);
         }
+        let admission = tokio::select! { biased;
+            _ = cancel.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
+            result = self.root_history_check_admission(&row.workspace_id, &row.thread_id, &row.turn_id, self.compaction_clock.now_ms()) => result?,
+        };
+        if let Some(outcome) = admission {
+            return Ok(outcome);
+        }
         diagnostic.stage = "configuration".into();
         let legacy = self.compaction_settings()?;
-        let (settings, cli_override) = {
+        let (mut settings, mut cli_override) = {
             let workspace = self
                 .workspace_compaction_settings
                 .read()
@@ -439,7 +689,14 @@ impl MessageProcessor {
             match workspace.get(&row.workspace_id) {
                 Some(value) => (
                     value.compaction(&legacy),
-                    value.cli_overrides.get(&row.runtime_id).cloned(),
+                    value
+                        .cli_overrides
+                        .get(
+                            row.runtime_id
+                                .strip_prefix("cli_runtime:")
+                                .unwrap_or(&row.runtime_id),
+                        )
+                        .cloned(),
                 ),
                 None => (legacy, None),
             }
@@ -449,12 +706,39 @@ impl MessageProcessor {
             serde_json::from_str(descriptor)?
         } else {
             let transport = match row.runtime_kind.as_str() {
+                "acp" => Transport::Acp,
                 "codex" => Transport::Codex,
                 "claude" => Transport::Claude,
                 "opencode" => Transport::OpenCode,
                 _ => {
-                    diagnostic.code = "unknown_transport".into();
-                    return Ok(HistoryCheckOutcome::Failed);
+                    let runtime_id = row.runtime_id.strip_prefix("cli_runtime:");
+                    if let Some(runtime_id) = runtime_id {
+                        match self
+                            .load_cli_runtime_instances()?
+                            .into_iter()
+                            .find(|value| value.id == runtime_id)
+                            .map(|value| value.kind)
+                        {
+                            Some(pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp) => {
+                                Transport::Acp
+                            }
+                            Some(pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex) => {
+                                Transport::Codex
+                            }
+                            Some(pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude) => {
+                                Transport::Claude
+                            }
+                            Some(pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode) => {
+                                Transport::OpenCode
+                            }
+                            None => {
+                                diagnostic.code = "unknown_transport".into();
+                                return Ok(HistoryCheckOutcome::WaitingSettings);
+                            }
+                        }
+                    } else {
+                        Transport::Api
+                    }
                 }
             };
             let Some(model) = row.model.clone().filter(|model| !model.trim().is_empty()) else {
@@ -463,8 +747,15 @@ impl MessageProcessor {
             };
             CapturedCheck {
                 current: ModelSelection {
+                    service_mode: None,
+                    context_authority: None,
+                    context_window: None,
                     transport,
-                    instance: row.runtime_id.clone(),
+                    instance: row
+                        .runtime_id
+                        .strip_prefix("cli_runtime:")
+                        .unwrap_or(&row.runtime_id)
+                        .to_owned(),
                     model,
                     effort: row.reasoning_effort.clone(),
                 },
@@ -476,6 +767,16 @@ impl MessageProcessor {
             }
         };
         diagnostic.stage = "configuration".into();
+        crate::compaction::isolate_cli_summary_service_modes(
+            &mut captured.current,
+            &mut captured.settings,
+            &mut captured.cli_override,
+        );
+        crate::compaction::isolate_cli_summary_service_modes(
+            &mut captured.current,
+            &mut settings,
+            &mut cli_override,
+        );
         // Compare only relevant settings/authorities. No secrets or paths are
         // persisted; the fingerprint is a one-way digest. Waiting never calls a model.
         let waiting_settings = row.outcome.as_deref() == Some("waiting_settings");
@@ -520,11 +821,11 @@ impl MessageProcessor {
         }
         // A resumed attempt retains its deadline and captured settings. Only a
         // scheduled pre-admission retry/readiness wakeup receives a fresh deadline.
-        let now = SystemCompactionClock::default().now_ms();
+        let now = self.compaction_clock.now_ms();
         let descriptor = serde_json::to_string(&captured)?;
         let deadline = tokio::select! { biased;
             _ = cancel.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
-            result = self.crud_store.compaction_begin_history_attempt(&row.turn_id, row.revision, &descriptor, &hash, now as i64) => result?,
+            result = self.crud_store.compaction_begin_history_attempt(&row.turn_id, row.revision, &descriptor, &hash, now.min(i64::MAX as u64) as i64) => result?,
         };
         let Some(deadline) = deadline else {
             return Ok(HistoryCheckOutcome::Cancelled);
@@ -569,6 +870,7 @@ impl MessageProcessor {
                 suspending,
                 None,
                 None,
+                Some(row.revision),
                 diagnostic,
             );
             tokio::pin!(work);

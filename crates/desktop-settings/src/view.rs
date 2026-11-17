@@ -113,12 +113,6 @@ impl SettingsScreenView {
                         cx,
                     ))
                     .child(Self::render_settings_divider(cx))
-                    .child(Self::render_preflight_model_setting(
-                        settings.general.preflight_model.clone(),
-                        desktop_entity.clone(),
-                        cx,
-                    ))
-                    .child(Self::render_settings_divider(cx))
                     .child(self.render_compaction_model_setting(&settings.general, cx))
                     .child(Self::render_settings_divider(cx))
                     .child(self.voice.clone().expect("general voice surface"))
@@ -539,6 +533,9 @@ impl SettingsScreenView {
                     }
                     .and_then(|selection| selection.reasoning_effort.clone())
                 }),
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
                 mode: ProviderModelSelectorMode::SelfImprovement,
                 workspace_id,
                 client: self.config.client.clone(),
@@ -595,6 +592,9 @@ impl SettingsScreenView {
                             selected_provider: selected.provider,
                             selected_model: selected.model,
                             selected_reasoning_effort: selected.selected_reasoning_effort,
+                            selected_context_window: selected.selected_context_window,
+                            selected_service_mode: selected.selected_service_mode.clone(),
+                            selected_context_authority: selected.selected_context_authority.clone(),
                             mode: ProviderModelSelectorMode::Chat,
                             workspace_id: view.model_selector_workspace_id(),
                             client: view.config.client.clone(),
@@ -795,18 +795,6 @@ impl SettingsScreenView {
 
         if memory.enabled {
             settings = settings.child(Self::render_settings_divider(cx)).child(
-                Self::render_memory_toggle_row(
-                    "settings-memory-active-recall",
-                    MemorySettingToggle::ActiveRecall,
-                    memory.active_recall_enabled,
-                    t!("settings.memory.active_recall.label").to_string(),
-                    t!("settings.memory.active_recall.description").to_string(),
-                    desktop_entity.clone(),
-                    cx,
-                ),
-            );
-
-            settings = settings.child(Self::render_settings_divider(cx)).child(
                 Self::render_thread_episodic_toggle_row(
                     "settings-memory-thread-context",
                     ThreadEpisodicSettingToggle::Enabled,
@@ -897,138 +885,6 @@ impl SettingsScreenView {
             .w_full()
             .py_3()
             .child(div().text_xs().opacity(0.65).child(message))
-            .into_any_element()
-    }
-
-    fn render_preflight_model_setting(
-        selection: GatewayMemoryModelSelection,
-        desktop_entity: Entity<Self>,
-        _cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selected_provider = selection.model_provider_override();
-        let selected_model = selection.model_override();
-        let is_custom =
-            settings_memory::gateway_memory_model_selection_has_custom_model(&selection);
-        let selection_label = settings_memory::gateway_memory_model_selection_display_label(
-            &selection,
-            t!("settings.general.preflight_model.default").to_string(),
-        );
-
-        v_flex()
-            .w_full()
-            .gap_3()
-            .py_3()
-            .justify_between()
-            .items_start()
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(t!("settings.general.preflight_model.label").to_string()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .opacity(0.6)
-                            .child(t!("settings.general.preflight_model.description").to_string()),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_6()
-                    .items_center()
-                    .justify_between()
-                    .mt_0p5()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .text_sm()
-                            .font_medium()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(selection_label),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .gap_1()
-                            .child(
-                                small_outline_button(("settings-preflight-model", 0usize))
-                                    .label(
-                                        t!("settings.general.preflight_model.select_model")
-                                            .to_string(),
-                                    )
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let selected_provider = selected_provider.clone();
-                                        let selected_model = selected_model.clone();
-                                        move |_, window, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                let workspace_id = view.model_selector_workspace_id();
-                                                view.open_model_selector_dialog(
-                                                    ModelSelectorDialogOptions {
-                                                        title: t!(
-                                                            "settings.general.preflight_model.dialog_title"
-                                                        )
-                                                        .to_string(),
-                                                        selected_provider: selected_provider
-                                                            .clone(),
-                                                        selected_model: selected_model.clone(),
-                                                        selected_reasoning_effort: None,
-                                                        mode: ProviderModelSelectorMode::Chat,
-                                                        workspace_id,
-                                                        client: view
-                                                            .config.client
-                                                            .clone(),
-                                                        on_save: Rc::new(
-                                                            move |view: &mut SettingsScreenView,
-                                                                  selection: ModelSelectorSelection,
-                                                                  cx| {
-                                                                let model_selection = pioneer_client::settings::memory::gateway_memory_model_selection_from_model_selector(selection);
-                                                                view.apply_preflight_model_setting(
-                                                                    model_selection,
-                                                                    cx,
-                                                                );
-                                                                true
-                                                            },
-                                                        ),
-                                                    },
-                                                    window,
-                                                    cx,
-                                                );
-                                            });
-                                        }
-                                    }),
-                            )
-                            .when(is_custom, |row| {
-                                row.child(div().flex_none().child(
-                                    small_outline_button(("settings-preflight-model", 1usize))
-                                        .label(
-                                            t!("settings.general.preflight_model.default")
-                                                .to_string(),
-                                        )
-                                        .on_click({
-                                            let desktop_entity = desktop_entity.clone();
-                                            move |_, _, cx| {
-                                                let _ = desktop_entity.update(cx, |view, cx| {
-                                                    view.apply_preflight_model_setting(
-                                                        GatewayMemoryModelSelection::thread(),
-                                                        cx,
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }),
-                                ))
-                            }),
-                    ),
-            )
             .into_any_element()
     }
 
@@ -1299,7 +1155,7 @@ impl SettingsScreenView {
             settings.runtime.phase == GatewayVoiceInputRuntimePhase::Failed,
             selected_provider,
             selected_model,
-            desktop_entity,
+            desktop_entity.clone(),
         );
 
         v_flex()
@@ -1308,6 +1164,7 @@ impl SettingsScreenView {
             .gap_3()
             .child(
                 h_flex()
+                    .debug_selector(|| "settings-voice-input-model-row".to_string())
                     .w_full()
                     .gap_6()
                     .justify_between()
@@ -1325,6 +1182,7 @@ impl SettingsScreenView {
                     )
                     .child(actions),
             )
+            .child(self.render_voice_input_transcription_mode(settings, desktop_entity))
             .when_some(progress, |this, progress| this.child(progress))
             .when_some(settings.runtime.error.clone(), |this, error| {
                 this.child(Self::render_voice_input_error(error, cx))
@@ -1332,6 +1190,50 @@ impl SettingsScreenView {
             .when_some(action_error, |this, error| {
                 this.child(Self::render_voice_input_error(error, cx))
             })
+            .into_any_element()
+    }
+
+    fn render_voice_input_transcription_mode(
+        &self,
+        settings: &GatewayVoiceInputSettings,
+        desktop_entity: Entity<Self>,
+    ) -> AnyElement {
+        let label = t!("settings.voice_input.transcribe_while_recording").to_string();
+        let description =
+            t!("settings.voice_input.transcribe_while_recording_description").to_string();
+        let disabled = self.gateway.settings_loading
+            || self.gateway.connection_state != GatewayConnectionState::Connected
+            || !self
+                .principal_presentation_capabilities()
+                .can_manage_gateway_settings;
+
+        h_flex()
+            .debug_selector(|| "settings-voice-input-transcription-mode-row".to_string())
+            .w_full()
+            .gap_6()
+            .py_3()
+            .justify_between()
+            .items_center()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(div().text_sm().font_semibold().child(label.clone()))
+                    .child(div().text_xs().opacity(0.6).child(description.clone())),
+            )
+            .child(
+                Switch::new("settings-voice-input-transcribe-while-recording")
+                    .checked(settings.transcribe_while_recording)
+                    .accessibility_label(label)
+                    .tooltip(description)
+                    .disabled(disabled)
+                    .on_click(move |enabled, _, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.apply_voice_input_transcribe_while_recording(*enabled, cx);
+                            cx.notify();
+                        });
+                    }),
+            )
             .into_any_element()
     }
 
@@ -1497,6 +1399,9 @@ impl SettingsScreenView {
                 selected_provider,
                 selected_model,
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
                 mode: ProviderModelSelectorMode::Transcription,
                 workspace_id,
                 client: self.config.client.clone(),
@@ -1790,6 +1695,9 @@ impl SettingsScreenView {
         let provider = match settings.provider {
             Some(GatewayThreadEpisodicVectorProvider::OpenAi) => Some("openai".to_owned()),
             Some(GatewayThreadEpisodicVectorProvider::OpenRouter) => Some("openrouter".to_owned()),
+            Some(GatewayThreadEpisodicVectorProvider::VercelAiGateway) => {
+                Some("vercel-ai-gateway".to_owned())
+            }
             Some(GatewayThreadEpisodicVectorProvider::Local) => Some("local".to_owned()),
             None => None,
         };
@@ -1821,6 +1729,9 @@ impl SettingsScreenView {
                 selected_provider,
                 selected_model,
                 selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
                 mode: ProviderModelSelectorMode::Embeddings,
                 workspace_id,
                 client: self.config.client.clone(),
@@ -2181,7 +2092,10 @@ impl SettingsScreenView {
                                                 selected_provider: selected_provider.clone(),
                                                 selected_model: selected_model.clone(),
                                                 selected_reasoning_effort: None,
-                                                mode: ProviderModelSelectorMode::Chat,
+                                                selected_context_window: None,
+                                                selected_service_mode: None,
+                                                selected_context_authority: None,
+                                                mode: ProviderModelSelectorMode::AuxiliaryChat,
                                                 workspace_id,
                                                 client: view.config.client.clone(),
                                                 on_save: Rc::new(
@@ -2420,7 +2334,7 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn settings_general_view_owns_preflight_model_selector() {
+    fn settings_general_view_preserves_settings_order() {
         let source = production_view_source();
         let general_view = source
             .split("fn render_settings_general")
@@ -2430,11 +2344,9 @@ mod tests {
             .next()
             .expect("general renderer body exists");
 
-        assert!(general_view.contains("render_preflight_model_setting"));
         assert!(general_view.contains("render_telemetry_setting"));
         assert!(general_view.contains("render_model_catalog_setting"));
         assert!(general_view.contains("self.remote.clone()"));
-        assert!(general_view.contains("settings.general.preflight_model"));
         assert!(include_str!("screen.rs").contains("self.render_remote_access_setting"));
         assert!(
             general_view
@@ -2447,7 +2359,6 @@ mod tests {
         );
         assert!(!general_view.contains("\"settings-general-thread-context\""));
         assert!(!general_view.contains("settings.general.thread_context"));
-        assert!(source.contains("\"settings-preflight-model\""));
         assert!(source.contains("\"settings-telemetry\""));
         assert!(source.contains("\"settings-model-catalog-proxy-clear\""));
 
@@ -2612,8 +2523,6 @@ mod tests {
             .next()
             .expect("memory renderer body exists");
 
-        assert!(memory_view.contains("\"settings-memory-active-recall\""));
-        assert!(memory_view.contains("settings.memory.active_recall"));
         assert!(memory_view.contains("\"settings-memory-post-turn-extractor-model\""));
         assert!(memory_view.contains("MemoryModelSetting::PostTurnExtractor"));
         assert!(memory_view.contains("\"settings-memory-thread-context\""));
@@ -2660,10 +2569,6 @@ mod tests {
         assert!(vector_model_view.contains("render_voice_input_download_progress"));
         assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Indexing"));
         assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Recall"));
-        assert!(!memory_view.contains("render_preflight_model_setting"));
-        assert!(!memory_view.contains("settings.general.preflight_model"));
-        assert!(!memory_view.contains("settings.memory.active_recall_model"));
-        assert!(!memory_view.contains("settings-memory-active-recall-model"));
     }
 
     #[::core::prelude::v1::test]
@@ -2718,13 +2623,12 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn settings_locale_keys_cover_preflight_and_memory_model_rows() {
+    fn settings_locale_keys_cover_memory_model_rows() {
         let en = include_str!("../locales/en.toml");
         let ru = include_str!("../locales/ru.toml");
 
         for source in [en, ru] {
             for key in [
-                "[settings.general.preflight_model]",
                 "select_model",
                 "dialog_title",
                 "[settings.remote_access]",
@@ -2738,12 +2642,10 @@ mod tests {
                 "refill_required",
                 "local_status_installed",
                 "[settings.memory.thread_context]",
-                "[settings.memory.active_recall]",
                 "[settings.memory.proactive_writes_model]",
             ] {
                 assert!(source.contains(key), "missing locale key `{key}`");
             }
-            assert!(!source.contains("[settings.memory.active_recall_model]"));
         }
     }
 
@@ -2791,6 +2693,8 @@ mod tests {
         let required_keys = [
             "label",
             "description",
+            "transcribe_while_recording",
+            "transcribe_while_recording_description",
             "no_model_selected",
             "recommended",
             "change_model",

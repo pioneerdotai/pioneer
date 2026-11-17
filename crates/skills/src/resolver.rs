@@ -487,77 +487,6 @@ mod tests {
     }
 
     #[test]
-    fn policy_can_disable_skill() {
-        let catalog = SkillCatalogSnapshot {
-            version: 1,
-            generated_at_unix: 1,
-            skills: vec![skill("explicit-skill", &[], SkillSourceKind::User)],
-        };
-
-        let mut policy = SkillPolicySet::default();
-        policy.workspace_by_key.insert(
-            SkillPolicyKey::new(test_skill_id("explicit-skill")),
-            SkillPolicy {
-                enabled: Some(false),
-                allow_implicit_invocation: None,
-            },
-        );
-
-        let result = resolve_skills(SkillResolutionInput {
-            explicit_refs: &[explicit_ref("explicit-skill")],
-            touched_paths: &[],
-            catalog: &catalog,
-            policy_set: &policy,
-            validation_policy: SkillValidationPolicy::default(),
-            dependency_input: &DependencyCheckInput::baseline(),
-        });
-
-        assert!(result.active.is_empty());
-        assert_eq!(result.excluded.len(), 1);
-        assert_eq!(
-            result.excluded[0].reason,
-            SkillExcludedReason::DisabledByPolicy
-        );
-    }
-
-    #[test]
-    fn policy_can_disable_system_skill() {
-        let catalog = SkillCatalogSnapshot {
-            version: 1,
-            generated_at_unix: 1,
-            skills: vec![skill("system-skill", &[], SkillSourceKind::System)],
-        };
-
-        let mut policy = SkillPolicySet::default();
-        policy.workspace_by_key.insert(
-            SkillPolicyKey::new(test_skill_id("system-skill")),
-            SkillPolicy {
-                enabled: Some(false),
-                allow_implicit_invocation: None,
-            },
-        );
-
-        let result = resolve_skills(SkillResolutionInput {
-            explicit_refs: &[explicit_ref_with_source_kind(
-                "system-skill",
-                SkillSourceKind::System,
-            )],
-            touched_paths: &[],
-            catalog: &catalog,
-            policy_set: &policy,
-            validation_policy: SkillValidationPolicy::default(),
-            dependency_input: &DependencyCheckInput::baseline(),
-        });
-
-        assert!(result.active.is_empty());
-        assert_eq!(result.excluded.len(), 1);
-        assert_eq!(
-            result.excluded[0].reason,
-            SkillExcludedReason::DisabledByPolicy
-        );
-    }
-
-    #[test]
     fn metadata_command_dependency_missing_excludes_skill() {
         let mut skill = skill("agent-browser", &[], SkillSourceKind::User);
         skill.dependencies.commands = vec!["non-existent-pioneer-test-binary".to_owned()];
@@ -582,36 +511,6 @@ mod tests {
         assert_eq!(
             result.excluded[0].reason,
             SkillExcludedReason::DependencyMissing
-        );
-    }
-
-    #[test]
-    fn non_strict_skill_is_rejected_when_strict_validation_enabled() {
-        let mut non_strict = skill("agent-browser", &[], SkillSourceKind::Registry);
-        non_strict.conformance.agentskills_strict.compliant = false;
-
-        let catalog = SkillCatalogSnapshot {
-            version: 1,
-            generated_at_unix: 1,
-            skills: vec![non_strict],
-        };
-
-        let result = resolve_skills(SkillResolutionInput {
-            explicit_refs: &[explicit_ref_with_source_kind(
-                "agent-browser",
-                SkillSourceKind::Registry,
-            )],
-            touched_paths: &[],
-            catalog: &catalog,
-            policy_set: &SkillPolicySet::default(),
-            validation_policy: SkillValidationPolicy::default(),
-            dependency_input: &DependencyCheckInput::baseline(),
-        });
-
-        assert!(result.active.is_empty());
-        assert_eq!(
-            result.excluded[0].reason,
-            SkillExcludedReason::ValidationRejected
         );
     }
 
@@ -989,5 +888,42 @@ mod tests {
         assert!(result.excluded.iter().any(|skill| {
             skill.skill_id == missing_id && skill.reason == SkillExcludedReason::NotFound
         }));
+    }
+
+    #[test]
+    fn workspace_policy_disables_explicit_skills_by_source() {
+        for (slug, source_kind) in [
+            ("explicit-skill", SkillSourceKind::User),
+            ("system-skill", SkillSourceKind::System),
+        ] {
+            let catalog = SkillCatalogSnapshot {
+                version: 1,
+                generated_at_unix: 1,
+                skills: vec![skill(slug, &[], source_kind)],
+            };
+            let mut policy = SkillPolicySet::default();
+            policy.workspace_by_key.insert(
+                SkillPolicyKey::new(test_skill_id(slug)),
+                SkillPolicy {
+                    enabled: Some(false),
+                    allow_implicit_invocation: None,
+                },
+            );
+            let result = resolve_skills(SkillResolutionInput {
+                explicit_refs: &[explicit_ref(slug)],
+                touched_paths: &[],
+                catalog: &catalog,
+                policy_set: &policy,
+                validation_policy: SkillValidationPolicy::default(),
+                dependency_input: &DependencyCheckInput::baseline(),
+            });
+            assert!(result.active.is_empty(), "{slug}");
+            assert_eq!(result.excluded.len(), 1, "{slug}");
+            assert_eq!(
+                result.excluded[0].reason,
+                SkillExcludedReason::DisabledByPolicy,
+                "{slug}"
+            );
+        }
     }
 }

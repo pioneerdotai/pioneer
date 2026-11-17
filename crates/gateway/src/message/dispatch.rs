@@ -24,8 +24,8 @@ use pioneer_protocol::{
     SkillsPackUpdateParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
     SkillsUpdateParams, TaskAcceptParams, TaskAgendaParams, TaskCancelParams,
     TaskCompletionInboxEntryParams, TaskCompletionInboxListParams, TaskCreateParams,
-    TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
-    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
+    TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskFinishParams, TaskGetParams,
+    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskUserNotificationAcknowledgeParams,
     TaskUserNotificationListParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
@@ -252,69 +252,59 @@ fn vector_provider_key_name(
         Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter) => {
             Some("openrouter")
         }
+        Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::VercelAiGateway) => {
+            Some("vercel-ai-gateway")
+        }
         Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local) | None => None,
     }
 }
 
 impl MessageProcessor {
-    /// Process one owned RPC request from a fresh Tokio task.
-    ///
-    /// Connection readers await this method, so requests remain ordered except
-    /// accepted voice finalization, which releases ingress at its ACK. The
-    /// task boundary prevents a handler's generated poll stack from inheriting
-    /// the WebSocket reader or another orchestration future, and aborts the
-    /// handler if the awaiting connection workflow is cancelled.
-    pub(crate) async fn process_owned_request(
+    pub(crate) fn start_owned_request(
         self: Arc<Self>,
         connection: crate::request_context::ConnectionContext,
         payload: String,
-    ) {
-        // A single, bounded exception to RPC completion ordering. Authentication,
-        // context validation and the ACK still run through the real dispatcher.
-        if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&payload)
-            && request.method == methods::VOICE_SESSION_FINALIZE
-        {
-            let Some(lease) = self
-                .voice_finalizations
-                .begin_finalize(connection.connection_id())
-            else {
-                self.send_error(
-                    connection.connection_id(),
-                    JsonRpcErrorResponse::new(
-                        Some(request.id),
-                        INVALID_REQUEST_CODE,
-                        "voice finalization is busy or shutting down",
-                    ),
-                )
-                .await;
-                return;
-            };
-            let (accepted, ingress) = tokio::sync::oneshot::channel();
-            let tasks = self.voice_finalizations.tasks.clone();
-            tasks.spawn(pioneer_observability::turn_startup::scope(
-                pioneer_observability::turn_startup::current_key(),
-                async move {
-                    let _lease = lease;
-                    crate::voice::finalization::with_ack(accepted, async {
-                        self.process_request(&connection, &payload).await;
-                    })
+    ) -> super::AbortOnDropMessageTask<()> {
+        super::spawn_message_task(async move {
+            // A single, bounded exception to RPC completion ordering. Authentication,
+            // context validation and the ACK still run through the real dispatcher.
+            if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&payload)
+                && request.method == methods::VOICE_SESSION_FINALIZE
+            {
+                let Some(lease) = self
+                    .voice_finalizations
+                    .begin_finalize(connection.connection_id())
+                else {
+                    self.send_error(
+                        connection.connection_id(),
+                        JsonRpcErrorResponse::new(
+                            Some(request.id),
+                            INVALID_REQUEST_CODE,
+                            "voice finalization is busy or shutting down",
+                        ),
+                    )
                     .await;
-                },
-            ));
-            // Invalid requests finish/drop sender without ACK; accepted requests
-            // release the reader while their tracked worker retains the slot.
-            let _ = ingress.await;
-            return;
-        }
-        match message_fresh_task(async move {
+                    return;
+                };
+                let (accepted, ingress) = tokio::sync::oneshot::channel();
+                let tasks = self.voice_finalizations.tasks.clone();
+                tasks.spawn(pioneer_observability::turn_startup::scope(
+                    pioneer_observability::turn_startup::current_key(),
+                    async move {
+                        let _lease = lease;
+                        crate::voice::finalization::with_ack(accepted, async {
+                            self.process_request(&connection, &payload).await;
+                        })
+                        .await;
+                    },
+                ));
+                // Invalid requests finish/drop sender without ACK; accepted requests
+                // release the reader while their tracked worker retains the slot.
+                let _ = ingress.await;
+                return;
+            }
             self.process_request(&connection, payload.as_str()).await;
         })
-        .await
-        {
-            Ok(()) => {}
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => warn!(error = %error, "RPC request task did not finish"),
-        }
     }
 
     pub fn process_request<'a>(
@@ -355,6 +345,13 @@ impl MessageProcessor {
             .and_then(JsonValue::as_str)
             .unwrap_or("")
             .to_owned();
+        let (rpc_parent, rpc_ingress) = request_value
+            .get_mut("params")
+            .map(|params| pioneer_observability::scenario::accept_params(&telemetry_method, params))
+            .unwrap_or((
+                pioneer_observability::scenario::Correlation::default(),
+                pioneer_observability::scenario::Ingress::Missing,
+            ));
         if let Some(params) = request_value.get_mut("params") {
             pioneer_observability::turn_startup::accept_params(&telemetry_method, params);
             if let Some(key) = pioneer_observability::turn_startup::request_key(params) {
@@ -438,36 +435,101 @@ impl MessageProcessor {
         } else {
             None
         };
-        let dispatched = message_future(pioneer_observability::turn_startup::scope_stage(
-            startup_key,
-            pioneer_observability::turn_startup::Stage::GatewayDispatch,
-            async move {
-                let admission_span = pioneer_observability::turn_startup::current_stage(
-                    pioneer_observability::turn_startup::Stage::Admission,
-                );
-                let admission = match self.authorize_normal_request(&context, &request).await {
-                    Ok(admission) => admission,
-                    Err(response) => {
-                        self.send_error(context.connection_id(), response).await;
-                        return;
-                    }
-                };
+        use pioneer_observability::work::{Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind};
+        let work_kind = match normal_method_entry(request.method.as_str()).map(|entry| entry.action)
+        {
+            Ok(
+                ResourceAction::AgentTurnStart
+                | ResourceAction::AgentExecutionResume
+                | ResourceAction::AgentExecutionSteer,
+            ) => WorkKind::RpcTurn,
+            Ok(
+                ResourceAction::WorkspaceList
+                | ResourceAction::WorkspaceRead
+                | ResourceAction::ThreadRead
+                | ResourceAction::AgentExecutionObserve
+                | ResourceAction::AgentRequestObserve
+                | ResourceAction::ArtifactRead
+                | ResourceAction::MemoryRead
+                | ResourceAction::TaskRead
+                | ResourceAction::TaskReadOperator
+                | ResourceAction::AgentsDocumentRead,
+            ) => WorkKind::RpcRead,
+            Ok(
+                ResourceAction::GatewayManage
+                | ResourceAction::AgentExecutionCancel
+                | ResourceAction::ChildControl,
+            ) => WorkKind::RpcControl,
+            Ok(_) => WorkKind::RpcMutation,
+            Err(_) => WorkKind::RpcUnknown,
+        };
+        let mut rpc_observation = pioneer_observability::scenario::Observation::accept_rpc(
+            &telemetry_method,
+            &rpc_parent,
+            rpc_ingress,
+        );
+        let rpc_context = rpc_observation
+            .as_ref()
+            .map(|o| o.correlation())
+            .unwrap_or_else(pioneer_observability::scenario::Correlation::capture);
+        let make_work = || {
+            WorkCarrier::independent(
+                Boundary::Rpc,
+                work_kind,
+                Trigger::Rpc,
+                ExecutorRole::Gateway,
+            )
+        };
+        let selected_rpc = rpc_observation.is_some();
+        let work = if selected_rpc {
+            rpc_context.run(make_work)
+        } else {
+            make_work()
+        };
+        let dispatched = message_future(async move {
+            work.scope(pioneer_observability::turn_startup::scope_stage(
+                startup_key,
+                pioneer_observability::turn_startup::Stage::GatewayDispatch,
+                async move {
+                    let handler = async move {
+                        let admission_span = pioneer_observability::turn_startup::current_stage(
+                            pioneer_observability::turn_startup::Stage::Admission,
+                        );
+                        let admission =
+                            match self.authorize_normal_request(&context, &request).await {
+                                Ok(admission) => admission,
+                                Err(response) => {
+                                    self.send_error(context.connection_id(), response).await;
+                                    return;
+                                }
+                            };
 
-                drop(admission_span);
-                // Large start workflows expose dedicated erased futures so constructing them does
-                // not share one native stack frame with every branch in the dispatch match.
-                let handler = if request.method == methods::TURN_START {
-                    self.dispatch_turn_start(context, request, admission)
-                } else if request.method == methods::THREAD_START {
-                    self.dispatch_thread_start(context, request, admission)
-                } else if request.method == methods::SETTINGS_UPDATE {
-                    self.dispatch_settings_update(context, request)
-                } else {
-                    self.process_request_inner(context, request, admission)
-                };
-                handler.await;
-            },
-        ));
+                        drop(admission_span);
+                        // Large start workflows expose dedicated erased futures so constructing them does
+                        // not share one native stack frame with every branch in the dispatch match.
+                        let handler = if request.method == methods::TURN_START {
+                            self.dispatch_turn_start(context, request, admission)
+                        } else if request.method == methods::THREAD_START {
+                            self.dispatch_thread_start(context, request, admission)
+                        } else if request.method == methods::SETTINGS_UPDATE {
+                            self.dispatch_settings_update(context, request)
+                        } else {
+                            self.process_request_inner(context, request, admission)
+                        };
+                        handler.await;
+                    };
+                    if selected_rpc {
+                        rpc_context.scope(handler).await;
+                    } else {
+                        handler.await;
+                    }
+                },
+            ))
+            .await;
+            if let Some(observation) = &mut rpc_observation {
+                observation.finish(pioneer_observability::scenario::Outcome::Returned);
+            }
+        });
 
         instrument_message_future(dispatched, span)
     }
@@ -879,7 +941,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn authorize_normal_request(
+    pub(super) async fn authorize_normal_request(
         &self,
         context: &crate::request_context::RequestContext,
         request: &JsonRpcRequest,
@@ -1530,9 +1592,18 @@ impl MessageProcessor {
             ResourceResolverKind::Workspace
                 if matches!(
                     request.method.as_str(),
-                    methods::ARTIFACT_CAPABILITIES
+                    methods::WORKSPACE_PUSH
+                        | methods::WORKSPACE_EXECUTION_OBSERVABILITY
+                        | methods::WORKSPACE_EXECUTION_RECONCILE
+                        | methods::ARTIFACT_CAPABILITIES
                         | methods::ARTIFACT_LIST
                         | methods::SKILLS_LIST
+                        | methods::PLUGINS_LIST
+                        | methods::PLUGINS_DETAILS
+                        | methods::APPS_LIST
+                        | methods::APPS_DETAILS
+                        | methods::APPS_RUNTIME_INFO
+                        | methods::APPS_OPEN_VIEW
                         | methods::CLI_RUNTIME_LIST
                         | methods::CLI_RUNTIME_GET
                         | methods::CLI_RUNTIME_STATUS
@@ -1558,6 +1629,23 @@ impl MessageProcessor {
                 };
                 let params = request.params.clone().unwrap_or_else(empty_object_value);
                 let workspace_id = match request.method.as_str() {
+                    methods::WORKSPACE_EXECUTION_RECONCILE => serde_json::from_value::<
+                        pioneer_protocol::WorkspaceExecutionReconcileParams,
+                    >(params)
+                    .map_err(|_| invalid_params())?
+                    .workspace_id,
+                    methods::WORKSPACE_EXECUTION_OBSERVABILITY => {
+                        serde_json::from_value::<
+                            pioneer_protocol::WorkspaceExecutionObservabilityParams,
+                        >(params)
+                        .map_err(|_| invalid_params())?
+                        .workspace_id
+                    }
+                    methods::WORKSPACE_PUSH => {
+                        serde_json::from_value::<pioneer_protocol::WorkspacePushParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
                     methods::ARTIFACT_CAPABILITIES => {
                         serde_json::from_value::<ArtifactCapabilitiesParams>(params)
                             .map_err(|_| invalid_params())?
@@ -1568,6 +1656,16 @@ impl MessageProcessor {
                             .map_err(|_| invalid_params())?
                             .workspace_id
                     }
+                    methods::PLUGINS_LIST
+                    | methods::PLUGINS_DETAILS
+                    | methods::APPS_LIST
+                    | methods::APPS_DETAILS
+                    | methods::APPS_RUNTIME_INFO
+                    | methods::APPS_OPEN_VIEW => params
+                        .get("workspace_id")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(invalid_params)?
+                        .to_owned(),
                     methods::SKILLS_LIST => {
                         serde_json::from_value::<SkillListParams>(params)
                             .map_err(|_| invalid_params())?
@@ -1872,8 +1970,11 @@ impl MessageProcessor {
             ResourceResolverKind::Thread
                 if matches!(
                     request.method.as_str(),
-                    methods::THREAD_GET
+                    methods::THREAD_OPEN
+                        | methods::THREAD_GET
                         | methods::THREADS_TOOLS_RESULT_READ
+                        | methods::THREAD_EXECUTION_RECONCILE
+                        | methods::THREAD_EXECUTION_OBSERVABILITY
                         | methods::THREAD_TIMELINE_PAGE
                         | methods::THREAD_PATCH_STEPS_PAGE
                         | methods::THREAD_FILE_PATCH_HISTORY_PAGE
@@ -1972,7 +2073,10 @@ impl MessageProcessor {
                     ProofResolution::Denied(decision)
                         if matches!(
                             request.method.as_str(),
-                            methods::THREAD_GET | methods::THREAD_UNSUBSCRIBE | methods::TURN_START
+                            methods::THREAD_OPEN
+                                | methods::THREAD_GET
+                                | methods::THREAD_UNSUBSCRIBE
+                                | methods::TURN_START
                         ) && matches!(
                             decision,
                             AuthorizationDecision::Deny {
@@ -4428,12 +4532,18 @@ impl MessageProcessor {
                     )
                     .await;
                 }
+                methods::WORKSPACE_PUSH => {
+                    match serde_json::from_value::<pioneer_protocol::WorkspacePushParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params) => self.workspace_push(&context, request.id, params).await,
+                        Err(_) => self.send_error(connection_id, JsonRpcErrorResponse::new(Some(request.id), INVALID_PARAMS_CODE, "invalid push params")).await,
+                    }
+                }
                 methods::THREAD_TREE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadTreeParams>(params_value) {
                         Ok(params) => {
                             crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::ThreadTreeLoad,
+                                pioneer_observability::DatabaseWorkload::ThreadTreeLoad, pioneer_observability::DatabaseOperationSite::ThreadTreeLoad,
                                 self.thread_tree(
                                     &context,
                                     admission.workspace().expect(
@@ -4767,6 +4877,24 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::THREAD_OPEN => {
+                    match serde_json::from_value::<ThreadGetParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params) => {
+                            if let Some(proof) = admission.thread() {
+                                // Workspace and every start option come from the authorized resource.
+                                let start = super::thread_handlers::open_only_thread_start_params_for_id(
+                                    params.thread_id, proof.workspace_id().to_owned());
+                                self.thread_open(&context, proof, request.id, start).await;
+                            } else if let Some(access) = admission.runtime_draft() {
+                                self.thread_open_runtime_draft(&context, access, request.id).await;
+                            } else {
+                                unreachable!("central admission supplies exact open proof");
+                            }
+                        }
+                        Err(error) => self.send_error(connection_id, JsonRpcErrorResponse::new(
+                            Some(request.id), INVALID_PARAMS_CODE, format!("invalid thread/open params: {error}"))).await,
+                    }
+                }
                 methods::THREAD_GET => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadGetParams>(params_value) {
@@ -4800,6 +4928,36 @@ impl MessageProcessor {
                         }
                     }
                 }
+                // Keep the observation/reconciliation state machines off the shared
+                // dispatcher future, which is also polled by ordinary turn RPCs.
+                methods::WORKSPACE_EXECUTION_OBSERVABILITY => {
+                    let proof=admission.workspace().expect("central admission supplies workspace proof");
+                    match serde_json::from_value::<pioneer_protocol::WorkspaceExecutionObservabilityParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params)=>self.workspace_execution_observability(&context,proof,request.id,params).await,
+                        Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid workspace execution observability params")).await,
+                    }
+                }
+                methods::WORKSPACE_EXECUTION_RECONCILE => {
+                    let proof=admission.workspace().expect("central admission supplies workspace proof");
+                    match serde_json::from_value::<pioneer_protocol::WorkspaceExecutionReconcileParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params)=>self.workspace_execution_reconcile(&context,proof,request.id,params).await,
+                        Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid workspace reconciliation params")).await,
+                    }
+                }
+                methods::THREAD_EXECUTION_RECONCILE => {
+                    let proof=admission.thread().expect("central admission supplies thread proof");
+                    match serde_json::from_value::<pioneer_protocol::ExecutionReconcileParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params)=>self.execution_reconcile(&context,proof,request.id,params).await,
+                        Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid execution reconciliation params")).await,
+                    }
+                }
+                methods::THREAD_EXECUTION_OBSERVABILITY => {
+                    let proof=admission.thread().expect("central admission supplies thread proof");
+                    match serde_json::from_value::<pioneer_protocol::ExecutionObservabilityParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params)=>self.execution_observability(&context,proof,request.id,params).await,
+                        Err(_)=>self.send_error(connection_id,JsonRpcErrorResponse::new(Some(request.id),INVALID_PARAMS_CODE,"invalid execution observability params")).await,
+                    }
+                }
                 methods::THREAD_TIMELINE_PAGE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadTimelinePageParams>(params_value) {
@@ -4809,7 +4967,7 @@ impl MessageProcessor {
                                 .expect("central admission supplies thread proof");
                             debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
                             crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::TimelinePage,
+                                pioneer_observability::DatabaseWorkload::TimelinePage, pioneer_observability::DatabaseOperationSite::TimelinePage,
                                 self.thread_timeline_page(&context, proof, request.id, params),
                             )
                                 .await;
@@ -6107,6 +6265,8 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::PLUGINS_LIST | methods::PLUGINS_DETAILS | methods::PLUGINS_PREVIEW | methods::PLUGINS_INSTALL | methods::PLUGINS_SET_ENABLED | methods::PLUGINS_UPDATE | methods::PLUGINS_REMOVE | methods::PLUGINS_RETRY | methods::PLUGINS_CONTINUE => { self.plugins_request(&context, request).await; }
+                methods::APPS_RENEW_VIEW | methods::APPS_CLOSE_VIEW | methods::APPS_RUNTIME_INFO | methods::APPS_OPEN_VIEW | methods::APPS_LIST | methods::APPS_DETAILS | methods::APPS_PREVIEW | methods::APPS_INSTALL | methods::APPS_SET_ENABLED | methods::APPS_UPDATE | methods::APPS_REMOVE | methods::APPS_RETRY | methods::APPS_CONTINUE => { self.apps_request(&context, request).await; }
                 methods::SKILLS_INSTALL => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<SkillsInstallParams>(params_value) {
@@ -7039,6 +7199,29 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::TASK_FINISH => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TaskFinishParams>(params_value) {
+                        Ok(params) => {
+                            self.task_finish(&context, admission.task(), request.id, params)
+                                .await
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TASK_FINISH
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
                 methods::TASK_RESCHEDULE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskRescheduleParams>(params_value) {
@@ -7566,10 +7749,29 @@ impl MessageProcessor {
         .await
     }
 
-    async fn update_gateway_settings(
+    pub(super) async fn update_gateway_settings(
         &self,
         request_context: &RequestContext,
         update: pioneer_protocol::GatewaySettingsUpdate,
+    ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
+        self.update_gateway_settings_with_saver(
+            request_context,
+            update,
+            crate::settings::save_gateway_settings,
+        )
+        .await
+    }
+
+    // One application path, with an injectable file writer for deterministic
+    // save/rollback failure coverage; production always uses the atomic writer.
+    pub(super) async fn update_gateway_settings_with_saver(
+        &self,
+        request_context: &RequestContext,
+        update: pioneer_protocol::GatewaySettingsUpdate,
+        save_settings: impl Fn(
+            &std::path::Path,
+            &crate::settings::GatewaySettings,
+        ) -> anyhow::Result<()>,
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
         let connection_id = request_context.connection_id();
         let _settings_guard = self.gateway_settings_update_lock.lock().await;
@@ -7650,8 +7852,11 @@ impl MessageProcessor {
                 )
                 .vector_search
         });
-        let changes =
+        let mut changes =
             settings.apply_protocol_update_for_workspace(update, workspace_id.as_deref())?;
+        let changed_cli_runtime_ids =
+            settings.changed_cli_runtime_ids(&previous_settings, &config.gateway);
+        changes.cli_runtimes = !changed_cli_runtime_ids.is_empty();
         let cli_identity_instances = if changes.cli_runtimes {
             let effective_gateway = settings.apply_to_gateway_config(config.gateway.clone());
             let identity_settings = settings.effective_cli_runtime_settings(&config.gateway);
@@ -7718,9 +7923,17 @@ impl MessageProcessor {
                 }
             }
         }
-        if let Err(error) =
-            crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
-        {
+        if let Err(error) = save_settings(settings_path.as_path(), &settings) {
+            let readiness_error = self
+                .reconcile_cli_readiness_after_settings_write_error(
+                    &settings_path,
+                    &previous_settings,
+                    &settings,
+                    &config.gateway,
+                    &changed_cli_runtime_ids,
+                )
+                .await
+                .err();
             if let Some(previous_proxy) = previous_catalog_proxy.as_ref() {
                 let rollback = match previous_proxy {
                     Some(proxy_url) => self.gateway_secrets.set_model_catalog_proxy(proxy_url),
@@ -7746,7 +7959,10 @@ impl MessageProcessor {
                     );
                 }
             }
-            return Err(error);
+            return match readiness_error {
+                Some(readiness_error) => Err(error).context(format!("{readiness_error:#}")),
+                None => Err(error),
+            };
         }
         let cli_identity_projection: anyhow::Result<()> = async {
             let Some(instances) = cli_identity_instances else {
@@ -7767,9 +7983,21 @@ impl MessageProcessor {
         }
         .await;
         if let Err(commit_error) = cli_identity_projection {
-            let restore_error =
-                crate::settings::save_gateway_settings(settings_path.as_path(), &previous_settings)
-                    .err();
+            let restore_error = save_settings(settings_path.as_path(), &previous_settings).err();
+            let readiness_error = if restore_error.is_some() {
+                self.reconcile_cli_readiness_after_settings_write_error(
+                    &settings_path,
+                    &previous_settings,
+                    &settings,
+                    &config.gateway,
+                    &changed_cli_runtime_ids,
+                )
+                .await
+                .err()
+            } else {
+                None
+            };
+
             if let Some(previous_proxy) = previous_catalog_proxy.as_ref() {
                 let rollback = match previous_proxy {
                     Some(proxy_url) => self.gateway_secrets.set_model_catalog_proxy(proxy_url),
@@ -7809,16 +8037,20 @@ impl MessageProcessor {
                     "failed to roll back keepawake setting after CLI identity commit failure"
                 );
             }
-            return match (restore_error, projection_restore_error) {
+            let result = match (restore_error, projection_restore_error) {
                 (Some(restore_error), _) => Err(anyhow::anyhow!(
-                    "failed to apply CLI identity settings projection: {commit_error}; failed to restore settings file: {restore_error}"
+                    "failed to apply CLI identity settings projection: {commit_error:#}; failed to restore settings file: {restore_error:#}"
                 )),
                 (None, Some(projection_restore_error)) => Err(anyhow::anyhow!(
-                    "failed to apply CLI identity settings projection: {commit_error}; settings file was restored, but the previous identity projection could not be restored: {projection_restore_error}"
+                    "failed to apply CLI identity settings projection: {commit_error:#}; settings file was restored, but the previous identity projection could not be restored: {projection_restore_error:#}"
                 )),
                 (None, None) => Err(commit_error).context(
                     "failed to apply CLI identity settings projection; settings file restored",
                 ),
+            };
+            return match readiness_error {
+                Some(readiness_error) => result.context(format!("{readiness_error:#}")),
+                None => result,
             };
         }
 
@@ -7833,14 +8065,12 @@ impl MessageProcessor {
             pioneer_provider::catalog::runtime::configure_refresh_proxy(proxy_url)?;
         }
 
-        if changes.cli_runtimes {
-            match workspace_id.as_deref() {
-                Some(workspace_id) => {
-                    self.invalidate_and_request_cli_runtime_warmup(workspace_id.to_owned())
-                        .await;
-                }
-                None => self.invalidate_and_request_all_cli_runtime_warmup().await,
-            }
+        if !changed_cli_runtime_ids.is_empty() {
+            let instances = settings
+                .apply_to_gateway_config(config.gateway.clone())
+                .effective_cli_agent_runtime_instances();
+            self.invalidate_and_request_cli_runtime_instances(&changed_cli_runtime_ids, &instances)
+                .await;
         }
 
         if changes.self_improvement {
@@ -7872,7 +8102,7 @@ impl MessageProcessor {
             }
         }
 
-        if changes.voice_input.changed || changes.voice_input.retry_install {
+        if changes.voice_input.reconfigure || changes.voice_input.retry_install {
             if let Some(supervisor) = self.voice_input_supervisor.as_ref() {
                 let desired = crate::voice::supervisor::VoiceInputDesiredState::from_config(
                     &settings.effective_voice_input_config(&config.gateway.voice),
@@ -7966,14 +8196,15 @@ impl MessageProcessor {
                             &config.gateway.thread_episodic,
                             Some(workspace_id),
                         );
-                    crate::database::startup::spawn_thread_episodic_workspace_capsule_refill_for_workspace(
+                    crate::database::startup::spawn_thread_episodic_refill_for_workspace(
                         self.crud_store.clone(),
                         workspace_thread_episodic_settings.enabled
                             && workspace_thread_episodic_settings.indexing_enabled,
                         crate::thread_episodic_runtime_config_from_gateway_settings(
                             &workspace_thread_episodic_settings,
-                        ).index_executor,
-                        self.thread_episodic_storage_root.clone(),
+                        )
+                        .index_executor,
+                        self.thread_episodic_lock_root.clone(),
                         workspace_id.to_owned(),
                         workspace_thread_episodic_settings.vector_search,
                         thread_episodic_settings.vector_search.clone(),
@@ -7986,7 +8217,7 @@ impl MessageProcessor {
                     .await;
                     vector_refill_started = true;
                 } else {
-                    crate::database::startup::spawn_thread_episodic_workspace_capsule_refill(
+                    crate::database::startup::spawn_thread_episodic_refill(
                         self.crud_store.clone(),
                         thread_episodic_settings.enabled
                             && thread_episodic_settings.indexing_enabled,
@@ -7994,7 +8225,7 @@ impl MessageProcessor {
                             &thread_episodic_settings,
                         )
                         .index_executor,
-                        self.thread_episodic_storage_root.clone(),
+                        self.thread_episodic_lock_root.clone(),
                         thread_episodic_settings.vector_search.clone(),
                         workspace_vector_search_configs,
                         self.provider_registry.clone(),
@@ -8014,7 +8245,72 @@ impl MessageProcessor {
             );
         }
 
+        if changes.voice_input.changed {
+            self.send_gateway_management_notification(
+                events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
+                &pioneer_protocol::GatewayVoiceInputStatusChangedNotification {
+                    settings: snapshot.voice_input.clone(),
+                },
+            )
+            .await;
+        }
+
         Ok(snapshot)
+    }
+
+    /// The settings application lock remains held through this readback and
+    /// fence. Neither a saver error nor a rollback error proves that rename did
+    /// not happen. Only confirmed equality allows old CLI evidence to survive.
+    async fn reconcile_cli_readiness_after_settings_write_error(
+        &self,
+        settings_path: &std::path::Path,
+        previous: &crate::settings::GatewaySettings,
+        attempted: &crate::settings::GatewaySettings,
+        config: &pioneer_config::GatewayConfig,
+        attempted_ids: &std::collections::BTreeSet<String>,
+    ) -> anyhow::Result<()> {
+        if attempted_ids.is_empty() {
+            return Ok(());
+        }
+        let (ids, instances, read_error) =
+            match crate::settings::read_gateway_settings(settings_path, config.settings_version) {
+                Ok(actual) => (
+                    actual.changed_cli_runtime_ids(previous, config),
+                    actual
+                        .apply_to_gateway_config(config.clone())
+                        .effective_cli_agent_runtime_instances(),
+                    None,
+                ),
+                Err(error) => {
+                    // Keep existing identities visible as errors when the actual
+                    // file is unknown; also fence newly added IDs. No old account,
+                    // models or MCP evidence can authorize the uncertain config.
+                    let mut fallback = attempted
+                        .apply_to_gateway_config(config.clone())
+                        .effective_cli_agent_runtime_instances()
+                        .into_iter()
+                        .map(|instance| (instance.id.clone(), instance))
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    fallback.extend(
+                        previous
+                            .apply_to_gateway_config(config.clone())
+                            .effective_cli_agent_runtime_instances()
+                            .into_iter()
+                            .map(|instance| (instance.id.clone(), instance)),
+                    );
+                    (
+                        attempted_ids.clone(),
+                        fallback.into_values().collect(),
+                        Some(error),
+                    )
+                }
+            };
+        self.invalidate_cli_runtime_instances(&ids, &instances, true)
+            .await;
+        match read_error {
+            Some(error) => Err(error).context("failed to confirm persisted CLI configuration after settings write error; affected readiness was invalidated"),
+            None => Ok(()),
+        }
     }
 
     async fn gateway_settings_snapshot_from_settings(
@@ -8096,11 +8392,11 @@ impl MessageProcessor {
             return Ok(());
         };
         let projection_target =
-            crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+            crate::database::startup::thread_episodic_refill::ThreadEpisodicWorkspaceProjectionTarget::from_vector_search_config(
                 &thread_episodic_settings.vector_search,
             );
         let marker_status =
-            crate::database::startup::thread_episodic_workspace_capsule_refill::refill_status_for_workspace_target(
+            crate::database::startup::thread_episodic_refill::refill_status_for_workspace_target(
                 self.crud_store.as_ref(),
                 workspace_id,
                 &projection_target,

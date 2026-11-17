@@ -277,9 +277,9 @@ mod tests {
         assert!(validate_response(&request, &response).is_ok());
     }
     #[test]
-    fn sdk_multiselect_items_have_no_type_and_use_any_of_for_titles() {
+    fn sdk_multiselect_uses_typed_string_enums_and_untagged_titled_items() {
         for items in [
-            json!({"enum":["opaque/a","opaque/b"]}),
+            json!({"type":"string","enum":["opaque/a","opaque/b"]}),
             json!({"anyOf":[{"const":"opaque/a","title":"A"},{"const":"opaque/b","title":"B"}]}),
         ] {
             let request = serde_json::from_value(json!({"mode":"form","sessionId":"s","message":"Choose","requestedSchema":{"type":"object","properties":{"v":{"type":"array","items":items}},"required":["v"]}})).unwrap();

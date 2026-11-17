@@ -209,9 +209,14 @@ fn desktop_foundation_is_narrow() {
     let manifest: toml::Value = toml::from_str(&source("desktop-foundation/Cargo.toml")).unwrap();
     assert_eq!(
         dependencies(&manifest),
-        ["gpui-kit".into(), "pioneer-client".into()]
-            .into_iter()
-            .collect()
+        [
+            "gpui-kit".into(),
+            "pioneer-client".into(),
+            "tokio".into(),
+            "tokio-util".into()
+        ]
+        .into_iter()
+        .collect()
     );
     let modules: Vec<_> = ast(&dir.join("lib.rs"))
         .items
@@ -226,16 +231,50 @@ fn desktop_foundation_is_narrow() {
         .collect();
     assert_eq!(modules, c.foundation_modules);
     for file in sources(&dir) {
+        let name = file.file_name().unwrap().to_str().unwrap().to_owned();
         let text = fs::read_to_string(file).unwrap();
         let text = text.split("#[cfg(test)]").next().unwrap();
-        for forbidden in [
-            "ClientIntent",
-            "ClientEffectPlan",
-            "Entity<",
-            "ClientCore",
-            "impl Element for",
-        ] {
+        for forbidden in ["ClientIntent", "ClientEffectPlan", "impl Element for"] {
             assert!(!text.contains(forbidden), "Foundation: {forbidden}");
+        }
+        // These two shared presentation owners retain typed Client handles:
+        // package delivery (Skills / Plugins), imagery (catalogue / thread).
+        // Neither owns domain policy, transport or byte caching. Every other
+        // module remains a value/registration seam; exceptions stay closed.
+        if !["package_upload.rs", "image_views.rs"].contains(&name.as_str()) {
+            assert!(
+                !text.contains("Entity<") && !text.contains("ClientCore"),
+                "Foundation: {name}"
+            );
+        } else {
+            for forbidden in [
+                "PluginIntent",
+                "SkillsIntent",
+                "GatewayNotification",
+                "requests_for_connection",
+                "crate::rpc",
+                "crate::transport",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "Shared presentation {name} owns {forbidden}"
+                );
+            }
+        }
+        if name == "image_views.rs" {
+            for forbidden in [
+                "std::fs",
+                "tokio::fs",
+                "reqwest",
+                "base64",
+                "ImageStore",
+                "ImageCacheService",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "Image presentation owns {forbidden}"
+                );
+            }
         }
     }
 }
@@ -423,6 +462,13 @@ struct RenderAudit {
     closures: bool,
 }
 impl<'ast> Visit<'ast> for RenderAudit {
+    fn visit_expr_block(&mut self, e: &'ast syn::ExprBlock) {
+        // Test probes are absent from production Render implementations.
+        if !is_test(&e.attrs) {
+            visit::visit_expr_block(self, e);
+        }
+    }
+
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         // This feature helper's last parameter is passed to PopupMenuItem::on_click.
         if matches!(e.func.as_ref(),syn::Expr::Path(p) if p.path.segments.last().is_some_and(|s|s.ident=="composer_add_menu_item"))
@@ -444,6 +490,9 @@ impl<'ast> Visit<'ast> for RenderAudit {
         }
     }
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
+        if is_test(&e.attrs) {
+            return;
+        }
         if [
             "notify",
             "spawn",
@@ -649,6 +698,8 @@ fn render_units_are_pure_and_optional_caches_are_absent() {
     for text in [
         "rows.map(|row| { cx.notify(); row })",
         "popover.content(|cx| cx.new(|cx| State::new(cx)))",
+        "{ #[cfg(not(test))] { self.cache = value; } }",
+        "{ #[cfg(not(test))] probe.borrow_mut(); }",
     ] {
         let mut audit = RenderAudit {
             violations: vec![],
@@ -657,8 +708,19 @@ fn render_units_are_pure_and_optional_caches_are_absent() {
         audit.visit_expr(&syn::parse_str::<syn::Expr>(text).unwrap());
         assert!(
             !audit.violations.is_empty(),
-            "value callback bypass: {text}"
+            "production Render bypass: {text}"
         );
+    }
+    for text in [
+        "{ #[cfg(test)] { *probe.borrow_mut() = value; } }",
+        "{ #[cfg(test)] probe.borrow_mut(); }",
+    ] {
+        let mut audit = RenderAudit {
+            violations: vec![],
+            closures: true,
+        };
+        audit.visit_expr(&syn::parse_str::<syn::Expr>(text).unwrap());
+        assert!(audit.violations.is_empty(), "test probe in audit: {text}");
     }
     let mut event = RenderAudit {
         violations: vec![],
@@ -673,9 +735,9 @@ fn unit_identity_cache_and_cross_shell_policies_match_the_contract() {
     assert_eq!(c.version, 1);
     assert_eq!(c.platforms, ["desktop", "ios", "android"]);
     assert_eq!(c.ui_cases.iter().collect::<BTreeSet<_>>().len(), 47);
-    assert_eq!(c.units.len(), 47);
+    assert_eq!(c.units.len(), 49);
     assert_eq!(c.divergence_owners.len(), 10);
-    for number in 1..=47 {
+    for number in 1..=49 {
         let unit = &c.units[&format!("TUI-{number:02}")];
         assert!(!unit.owner.is_empty());
         let text = source(&unit.file);
@@ -728,17 +790,14 @@ fn unit_identity_cache_and_cross_shell_policies_match_the_contract() {
             })
             .expect("cache limit constant")
     };
-    let avatars = &c.caches["avatar_bytes"];
+    let images = &c.caches["image_bytes"];
     assert_eq!(
-        limit(
-            avatars["source"].as_str().unwrap(),
-            "AVATAR_CACHE_MAX_FILES"
-        ),
-        avatars["max_files"].as_integer().unwrap() as u64
+        limit(images["source"].as_str().unwrap(), "IMAGE_CACHE_MAX_FILES"),
+        images["max_files"].as_integer().unwrap() as u64
     );
     assert_eq!(
-        limit(avatars["source"].as_str().unwrap(), "AVATAR_CACHE_MAX_AGE"),
-        avatars["max_age_days"].as_integer().unwrap() as u64 * 24 * 60 * 60
+        limit(images["source"].as_str().unwrap(), "IMAGE_CACHE_MAX_AGE"),
+        images["max_age_days"].as_integer().unwrap() as u64 * 24 * 60 * 60
     );
     let previews = &c.caches["artifact_preview"];
     assert_eq!(

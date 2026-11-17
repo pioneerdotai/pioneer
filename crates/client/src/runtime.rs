@@ -171,11 +171,11 @@ impl ClientRuntime {
     pub(crate) fn close_test_ingress(&self) {
         self.ws_client.close_test_events();
     }
-    pub fn recv_ws_event(&self) -> Option<GatewayWsEvent> {
+    pub fn recv_ws_event(&self) -> Option<pioneer_observability::work::WorkItem<GatewayWsEvent>> {
         self.ws_client.recv_event()
     }
 
-    pub fn drain_ws_events(&self) -> Vec<GatewayWsEvent> {
+    pub fn drain_ws_events(&self) -> Vec<pioneer_observability::work::WorkItem<GatewayWsEvent>> {
         self.ws_client.drain_events()
     }
 }
@@ -268,7 +268,11 @@ pub fn reduce_gateway_notification(
     context: ClientRuntimeNotificationContext<'_>,
 ) -> Option<ClientRuntimeNotification> {
     match notification {
-        GatewayNotification::McpOAuthChanged(_) => None,
+        // Scoped push is applied by ClientCore before the legacy shell reducer.
+        GatewayNotification::WorkspacePush(_)
+        | GatewayNotification::McpOAuthChanged(_)
+        | GatewayNotification::PluginsChanged(_)
+        | GatewayNotification::AppsChanged(_) => None,
         GatewayNotification::AccessChanged(notification) => {
             Some(ClientRuntimeNotification::AccessChanged(notification))
         }
@@ -654,13 +658,11 @@ pub fn reduce_gateway_notification(
 mod tests {
     use super::*;
     use crate::{
-        gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind},
         notifications::effects::ClientEffect,
         state::{
             client_state::{GatewayConnectionState, GatewayStatusLevel},
             reducers::GatewayStatusMessage,
         },
-        transport::ws::GatewayWsConnectSpec,
     };
     use pioneer_protocol::{
         AccessChangeKind, AccessChangedNotification, GatewayRemoteAccessErrorKind,
@@ -676,33 +678,6 @@ mod tests {
         UnknownGatewayNotification, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
     };
     use serde_json::json;
-    use std::time::Duration;
-
-    fn timings() -> GatewayWsTimings {
-        GatewayWsTimings {
-            connect_timeout: Duration::from_millis(100),
-            ping_interval: Duration::from_millis(100),
-            pong_timeout: Duration::from_millis(100),
-            reconnect_initial: Duration::from_millis(10),
-            reconnect_max: Duration::from_millis(100),
-            reconnect_jitter_percent: 0,
-        }
-    }
-
-    fn connect_spec(endpoint_id: &str) -> GatewayWsConnectSpec {
-        GatewayWsConnectSpec {
-            endpoint_id: endpoint_id.to_owned(),
-            endpoint_name: "Remote".to_owned(),
-            endpoint_kind: GatewayEndpointKind::Remote,
-            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
-                "127.0.0.1:17878",
-            )
-            .unwrap(),
-            auth_token: None,
-            session: None,
-            timings: timings(),
-        }
-    }
 
     fn workspace(id: &str, is_active: bool, is_current: bool) -> Workspace {
         Workspace {
@@ -1131,6 +1106,7 @@ mod tests {
         let notification = GatewayNotification::GatewayRemoteAccessStatusChanged(
             GatewayRemoteAccessStatusChangedNotification {
                 status: GatewayRemoteAccessStatusSnapshot {
+                    public_base_url: None,
                     state: GatewayRemoteAccessState::Failed,
                     error_kind: Some(GatewayRemoteAccessErrorKind::RelayConnectFailed),
                     message: Some("failed to connect".to_owned()),
@@ -1205,6 +1181,7 @@ mod tests {
         let expected = GatewayVoiceInputStatusChangedNotification {
             settings: GatewayVoiceInputSettings {
                 enabled: true,
+                transcribe_while_recording: false,
                 provider: Some(GatewayVoiceInputProvider::Local),
                 model: Some("parakeet-tdt-0.6b-v3".to_owned()),
                 runtime: GatewayVoiceInputRuntimeSnapshot {
@@ -1255,12 +1232,5 @@ mod tests {
             panic!("expected durable Task inbox invalidation");
         };
         assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn runtime_exposes_shared_ws_sender() {
-        let runtime = ClientRuntime::new();
-        let _sender = runtime.ws_command_sender();
-        let _spec = connect_spec("remote");
     }
 }

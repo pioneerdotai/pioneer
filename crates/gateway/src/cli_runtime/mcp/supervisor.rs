@@ -223,6 +223,7 @@ pub(crate) struct CliMcpBridgeLaunch {
     grant_ref: CliMcpGrantRef,
     endpoint: BridgeEndpoint,
     bootstrap_path: PathBuf,
+    cleanup_completed: Arc<AtomicBool>,
     #[cfg(test)]
     cancellation: CancellationToken,
 }
@@ -258,6 +259,12 @@ impl CliMcpBridgeLaunch {
         self.bootstrap_path.as_path()
     }
 
+    /// Proof for this exact launch, published only after strict cleanup succeeds.
+    /// Cancellation and absence from the session map are not completion.
+    pub(crate) fn cleanup_confirmed(&self) -> bool {
+        self.cleanup_completed.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
@@ -283,6 +290,19 @@ struct CliMcpBridgeSession {
     bootstrap_directory: Option<PrivateSessionDirectory>,
     endpoint_directory: Option<PrivateSessionDirectory>,
     cancellation: CancellationToken,
+    cleanup_completed: Arc<AtomicBool>,
+    cleanup: Option<Arc<Mutex<CliMcpBridgeCleanup>>>,
+}
+// Cleanup resources stay in the same supervisor session entry across awaits.
+struct CliMcpBridgeCleanup {
+    connection: Option<PlatformConnection>,
+    listener: Option<PlatformListener>,
+    bootstrap: Option<PrivateBootstrapArtifact>,
+    bootstrap_directory: Option<PrivateSessionDirectory>,
+    endpoint_directory: Option<PrivateSessionDirectory>,
+    grant_ref: CliMcpGrantRef,
+    grant_revoked: bool,
+    finished: bool,
 }
 
 pub(crate) struct CliMcpBridgeSupervisor {
@@ -357,7 +377,9 @@ impl CliMcpBridgeSupervisor {
                 .collect::<Vec<_>>()
         };
         for stale in replaced {
-            self.revoke_session(&stale).await;
+            if let Err(error) = self.revoke_session_result(&stale).await {
+                tracing::warn!(error = %error, "CLI MCP cleanup retained");
+            }
         }
 
         let issued = self
@@ -433,6 +455,7 @@ impl CliMcpBridgeSupervisor {
         let endpoint = document.endpoint;
         let bootstrap_path = bootstrap.path().to_path_buf();
         let cancellation = CancellationToken::new();
+        let cleanup_completed = Arc::new(AtomicBool::new(false));
         #[cfg(test)]
         let launch_cancellation = cancellation.clone();
         let session = CliMcpBridgeSession {
@@ -448,6 +471,8 @@ impl CliMcpBridgeSupervisor {
             bootstrap_directory,
             endpoint_directory: Some(endpoint_directory),
             cancellation,
+            cleanup_completed: cleanup_completed.clone(),
+            cleanup: None,
         };
         let mut sessions = self.sessions.lock().await;
         if self.issuing_stopped.load(Ordering::Acquire)
@@ -455,7 +480,9 @@ impl CliMcpBridgeSupervisor {
         {
             drop(sessions);
             let _ = self.coordinator.revoke_grant(&grant_ref).await;
-            self.revoke_session(&process_instance).await;
+            if let Err(error) = self.revoke_session_result(&process_instance).await {
+                tracing::warn!(error = %error, "CLI MCP cleanup retained");
+            }
             return Err(CliMcpBridgeSupervisorError::ShuttingDown);
         }
         Ok(CliMcpBridgeLaunch {
@@ -463,6 +490,7 @@ impl CliMcpBridgeSupervisor {
             grant_ref,
             endpoint,
             bootstrap_path,
+            cleanup_completed,
             #[cfg(test)]
             cancellation: launch_cancellation,
         })
@@ -580,7 +608,9 @@ impl CliMcpBridgeSupervisor {
         let (connection, bound_grant) = match outcome {
             Ok(attached) => attached,
             Err(error) => {
-                self.revoke_session(process_instance).await;
+                if let Err(error) = self.revoke_session_result(process_instance).await {
+                    tracing::warn!(error = %error, "CLI MCP cleanup retained");
+                }
                 return Err(error);
             }
         };
@@ -590,7 +620,9 @@ impl CliMcpBridgeSupervisor {
             .ok_or(CliMcpBridgeSupervisorError::UnknownSession)?;
         if session.state != CliMcpBridgeSessionState::AwaitingAttach {
             drop(sessions);
-            self.revoke_session(process_instance).await;
+            if let Err(error) = self.revoke_session_result(process_instance).await {
+                tracing::warn!(error = %error, "CLI MCP cleanup retained");
+            }
             return Err(CliMcpBridgeSupervisorError::StaleGeneration);
         }
         session.connection = Some(connection);
@@ -632,50 +664,87 @@ impl CliMcpBridgeSupervisor {
     }
 
     pub(crate) async fn cancel_session(&self, process_instance: &CliSessionInstanceId) {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(process_instance) {
+        // Native server shutdown carries the normal drain. No socket send while
+        // holding the session inventory lock and no artifact release here.
+        if let Some(session) = self.sessions.lock().await.get(process_instance) {
             session.cancellation.cancel();
-            if let Some(connection) = session.connection.as_mut()
-                && let Ok(frame) = BridgeFrame::new(BridgeFrameType::Cancellation, Vec::new())
-            {
-                let _ = timeout(CONTROL_FRAME_TIMEOUT, connection.send_frame(&frame)).await;
-            }
         }
     }
-
-    pub(crate) async fn revoke_session(&self, process_instance: &CliSessionInstanceId) -> bool {
-        let mut session = {
+    pub(crate) async fn revoke_session_result(
+        &self,
+        process_instance: &CliSessionInstanceId,
+    ) -> anyhow::Result<bool> {
+        let (cleanup, cleanup_completed) = {
             let mut sessions = self.sessions.lock().await;
-            let Some(mut session) = sessions.remove(process_instance) else {
-                return false;
+            let Some(session) = sessions.get_mut(process_instance) else {
+                return Ok(false);
             };
+            if session.state == CliMcpBridgeSessionState::TransportOwned {
+                anyhow::bail!("CLI MCP facade still owns its transport");
+            }
+            session.cancellation.cancel();
             session.state = CliMcpBridgeSessionState::Revoking;
-            session
+            let cleanup = session
+                .cleanup
+                .get_or_insert_with(|| {
+                    Arc::new(Mutex::new(CliMcpBridgeCleanup {
+                        connection: session.connection.take(),
+                        listener: session.listener.take(),
+                        bootstrap: session.bootstrap.take(),
+                        bootstrap_directory: session.bootstrap_directory.take(),
+                        endpoint_directory: session.endpoint_directory.take(),
+                        grant_ref: session.grant_ref.clone(),
+                        grant_revoked: false,
+                        finished: false,
+                    }))
+                })
+                .clone();
+            (cleanup, session.cleanup_completed.clone())
         };
-        session.cancellation.cancel();
-        if let Some(mut connection) = session.connection.take() {
-            if let Ok(frame) = BridgeFrame::new(BridgeFrameType::Cancellation, Vec::new()) {
-                let _ = timeout(CONTROL_FRAME_TIMEOUT, connection.send_frame(&frame)).await;
+        let mut resources = cleanup.lock().await;
+        if !resources.finished {
+            if let Some(connection) = resources.connection.as_mut() {
+                // A shutdown error retains the actual socket for a subsequent
+                // strict retry. Peer EOF is handled by the existing IPC path.
+                timeout(CONTROL_FRAME_TIMEOUT, connection.shutdown())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("CLI MCP connection shutdown timed out"))??;
+                resources.connection.take();
             }
-            if let Ok(frame) = BridgeFrame::new(BridgeFrameType::Shutdown, Vec::new()) {
-                let _ = timeout(CONTROL_FRAME_TIMEOUT, connection.send_frame(&frame)).await;
+            resources.listener.take();
+            if !resources.grant_revoked {
+                self.coordinator
+                    .revoke_grant(&resources.grant_ref)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("CLI MCP revoke failed: {e:?}"))?;
+                resources.grant_revoked = true;
             }
-            let _ = timeout(CONTROL_FRAME_TIMEOUT, connection.shutdown()).await;
+            if let Some(bootstrap) = resources.bootstrap.as_mut() {
+                bootstrap.cleanup()?;
+                resources.bootstrap.take();
+            }
+            if let Some(directory) = resources.bootstrap_directory.as_mut() {
+                directory.cleanup()?;
+                resources.bootstrap_directory.take();
+            }
+            if let Some(directory) = resources.endpoint_directory.as_mut() {
+                directory.cleanup()?;
+                resources.endpoint_directory.take();
+            }
+            resources.finished = true;
         }
-        drop(session.listener.take());
-        let _ = self.coordinator.revoke_grant(&session.grant_ref).await;
-        if let Some(mut bootstrap) = session.bootstrap.take() {
-            let _ = bootstrap.cleanup();
+        drop(resources);
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(process_instance)
+            .and_then(|session| session.cleanup.as_ref())
+            .is_some_and(|current| Arc::ptr_eq(current, &cleanup))
+        {
+            sessions.remove(process_instance);
+            cleanup_completed.store(true, Ordering::Release);
         }
-        if let Some(mut directory) = session.bootstrap_directory.take() {
-            let _ = directory.cleanup();
-        }
-        if let Some(mut directory) = session.endpoint_directory.take() {
-            let _ = directory.cleanup();
-        }
-        true
+        Ok(true)
     }
-
     pub(crate) async fn stop_issuing_and_cancel(&self) {
         self.issuing_stopped.store(true, Ordering::Release);
         let sessions = self.sessions.lock().await;
@@ -694,7 +763,9 @@ impl CliMcpBridgeSupervisor {
             .cloned()
             .collect::<Vec<_>>();
         for instance in instances {
-            self.revoke_session(&instance).await;
+            if let Err(error) = self.revoke_session_result(&instance).await {
+                tracing::warn!(error = %error, "CLI MCP cleanup retained");
+            }
         }
         self.coordinator.shutdown().await;
         if self.endpoint_root != self.artifact_root {
@@ -708,8 +779,29 @@ impl CliMcpBridgeSupervisor {
         }
     }
 
+    async fn return_connection(
+        &self,
+        process_instance: &CliSessionInstanceId,
+        bound_grant: &CliMcpBoundGrant,
+        connection: &mut Option<PlatformConnection>,
+    ) -> Result<(), CliMcpBridgeSupervisorError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(process_instance)
+            .ok_or(CliMcpBridgeSupervisorError::UnknownSession)?;
+        if session.state != CliMcpBridgeSessionState::TransportOwned
+            || session.connection.is_some()
+            || session.bound_grant.as_ref() != Some(bound_grant)
+        {
+            return Err(CliMcpBridgeSupervisorError::InvalidTransition);
+        }
+        session.connection = connection.take();
+        session.state = CliMcpBridgeSessionState::Attached;
+        Ok(())
+    }
+
     #[cfg(test)]
-    async fn state(
+    pub(super) async fn state(
         &self,
         process_instance: &CliSessionInstanceId,
     ) -> Option<CliMcpBridgeSessionState> {
@@ -764,17 +856,7 @@ impl CliMcpBridgeTransport {
             .ok_or(CliMcpBridgeSupervisorError::InvalidTransition)?
             .receive_frame()
             .await;
-        match outcome {
-            Ok(Some(frame)) => Ok(Some(frame)),
-            Ok(None) => {
-                self.terminate().await;
-                Ok(None)
-            }
-            Err(error) => {
-                self.terminate().await;
-                Err(error.into())
-            }
-        }
+        outcome.map_err(Into::into)
     }
 
     pub(crate) async fn send_frame(
@@ -788,36 +870,47 @@ impl CliMcpBridgeTransport {
             .send_frame(frame)
             .await;
         if let Err(error) = outcome {
-            self.terminate().await;
             return Err(error.into());
         }
         Ok(())
     }
 
-    pub(crate) async fn terminate(&mut self) {
+    pub(crate) async fn retire_connection(&mut self) -> Result<(), CliMcpBridgeSupervisorError> {
         if self.terminated {
-            return;
+            return Ok(());
         }
+        self.supervisor
+            .return_connection(
+                &self.process_instance,
+                &self.bound_grant,
+                &mut self.connection,
+            )
+            .await?;
         self.terminated = true;
-        if let Some(connection) = self.connection.as_mut() {
-            let _ = connection.shutdown().await;
-        }
-        self.connection.take();
-        self.supervisor.revoke_session(&self.process_instance).await;
+        Ok(())
     }
 }
-
 impl Drop for CliMcpBridgeTransport {
     fn drop(&mut self) {
         if self.terminated {
             return;
         }
-        self.connection.take();
-        let supervisor = self.supervisor.clone();
-        let process_instance = self.process_instance.clone();
+        // Cancellation returns the connection to the same supervisor owner.
+        // Grant/artifact cleanup still waits for the owning session to join.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let supervisor = self.supervisor.clone();
+            let process_instance = self.process_instance.clone();
+            let bound_grant = self.bound_grant.clone();
+            let mut connection = self.connection.take();
+            // Capture plain resources: cancellation during runtime shutdown must
+            // not drop another transport and recursively schedule this cleanup.
             runtime.spawn(async move {
-                supervisor.revoke_session(&process_instance).await;
+                if let Err(error) = supervisor
+                    .return_connection(&process_instance, &bound_grant, &mut connection)
+                    .await
+                {
+                    tracing::warn!(error = %error, "CLI MCP connection return failed");
+                }
             });
         }
     }
@@ -834,7 +927,17 @@ impl CLIAgentRuntimeSessionLifecycle for CliMcpBridgeSupervisor {
     }
 
     async fn after_session_close(&self, instance: &CliSessionInstanceId) {
-        self.revoke_session(instance).await;
+        if let Err(error) = self.revoke_session_result(instance).await {
+            tracing::warn!(error = %error, "CLI MCP cleanup retained");
+        }
+    }
+
+    async fn after_session_close_result(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> anyhow::Result<()> {
+        self.revoke_session_result(instance).await?;
+        Ok(())
     }
 
     async fn shutdown_finished(&self) {
@@ -975,6 +1078,43 @@ mod tests {
         ));
         assert!(supervisor.state(launch.process_instance()).await.is_none());
         assert!(!launch.bootstrap_path().exists());
+        assert!(launch.cleanup_confirmed());
+    }
+
+    #[tokio::test]
+    async fn strict_cleanup_retains_failed_directory_and_retries_same_owner() {
+        let root = temporary_root();
+        let supervisor = CliMcpBridgeSupervisor::new(root.path().join("sessions"));
+        let launch = supervisor.prepare(scope(1), expiry()).await.unwrap();
+        assert!(!launch.cleanup_confirmed());
+        let directory = launch.bootstrap_path().parent().unwrap().to_path_buf();
+        let blocker = directory.join("unexpected-file");
+        std::fs::write(&blocker, b"cleanup failure injection").unwrap();
+        assert!(
+            supervisor
+                .revoke_session_result(launch.process_instance())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            supervisor.state(launch.process_instance()).await,
+            Some(CliMcpBridgeSessionState::Revoking)
+        );
+        assert!(directory.exists());
+        assert!(
+            !launch.cleanup_confirmed(),
+            "failed cleanup is not completion"
+        );
+        std::fs::remove_file(blocker).unwrap();
+        assert!(
+            supervisor
+                .revoke_session_result(launch.process_instance())
+                .await
+                .unwrap()
+        );
+        assert!(supervisor.state(launch.process_instance()).await.is_none());
+        assert!(!directory.exists());
+        assert!(launch.cleanup_confirmed());
     }
 
     #[tokio::test]
@@ -1054,10 +1194,20 @@ mod tests {
             assert!(launch_a.endpoint().address().len() <= 103);
         }
 
-        assert!(supervisor.revoke_session(launch_a.process_instance()).await);
+        assert!(
+            supervisor
+                .revoke_session_result(launch_a.process_instance())
+                .await
+                .unwrap()
+        );
         assert!(!launch_a.bootstrap_path().exists());
         assert!(launch_b.bootstrap_path().exists());
-        assert!(supervisor.revoke_session(launch_b.process_instance()).await);
+        assert!(
+            supervisor
+                .revoke_session_result(launch_b.process_instance())
+                .await
+                .unwrap()
+        );
         assert!(!launch_b.bootstrap_path().exists());
     }
 
@@ -1193,7 +1343,60 @@ mod tests {
                 .expect("helper EOF")
                 .is_none()
         );
+        transport
+            .retire_connection()
+            .await
+            .expect("return exact connection");
+        CLIAgentRuntimeSessionLifecycle::after_session_close_result(
+            supervisor.as_ref(),
+            launch.process_instance(),
+        )
+        .await
+        .expect("join cleanup");
+        assert!(launch.cancellation().is_cancelled());
         assert!(supervisor.state(launch.process_instance()).await.is_none());
+    }
+
+    #[test]
+    fn cli_mcp_transport_drop_during_runtime_shutdown_does_not_reschedule_cleanup() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = temporary_root();
+        let supervisor = CliMcpBridgeSupervisor::new(root.path().join("sessions"));
+        runtime.block_on(async {
+            let launch = supervisor
+                .prepare(scope(1), expiry())
+                .await
+                .expect("prepare");
+            supervisor
+                .associate_provider_process(
+                    launch.process_instance(),
+                    std::process::id(),
+                    Some(std::process::id()),
+                )
+                .await
+                .expect("associate");
+            let (attached, helper) = tokio::join!(
+                supervisor.await_attach(launch.process_instance(), Duration::from_secs(1)),
+                run_hidden_helper_with_io(
+                    launch.bootstrap_path(),
+                    tokio::io::empty(),
+                    tokio::io::sink()
+                ),
+            );
+            attached.expect("attach");
+            helper.expect("helper EOF");
+            let transport = supervisor
+                .take_transport(launch.process_instance())
+                .await
+                .expect("transport");
+            // No yield: shutdown cancels the queued return operation before its first poll.
+            drop(transport);
+        });
+        drop(runtime);
+        drop(supervisor);
     }
 
     #[tokio::test]

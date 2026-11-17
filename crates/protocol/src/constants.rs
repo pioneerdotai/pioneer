@@ -32,8 +32,10 @@ pub mod methods {
     pub const WORKSPACE_DEFAULT: &str = "workspace/default";
     pub const WORKSPACE_SELECT: &str = "workspace/select";
     pub const WORKSPACE_UPDATE: &str = "workspace/update";
+    pub const THREAD_OPEN: &str = "thread/open";
     pub const THREAD_START: &str = "thread/start";
     pub const THREAD_TREE: &str = "thread/tree";
+    pub const WORKSPACE_PUSH: &str = "workspace/push";
     pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_MOVE: &str = "thread/move";
     pub const THREAD_PARTICIPANTS_LIST: &str = "thread/participants/list";
@@ -48,6 +50,10 @@ pub mod methods {
     pub const THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD: &str = "thread/agents_doc/resolve_for_thread";
     pub const THREADS_TOOLS_RESULT_READ: &str = "threads/tools/result/read";
     pub const THREAD_GET: &str = "thread/get";
+    pub const WORKSPACE_EXECUTION_RECONCILE: &str = "workspace/execution/reconcile";
+    pub const WORKSPACE_EXECUTION_OBSERVABILITY: &str = "workspace/execution/observability";
+    pub const THREAD_EXECUTION_RECONCILE: &str = "thread/execution/reconcile";
+    pub const THREAD_EXECUTION_OBSERVABILITY: &str = "thread/execution/observability";
     pub const THREAD_TIMELINE_PAGE: &str = "thread/timeline/page";
     pub const THREAD_PATCH_STEPS_PAGE: &str = "thread/patch_steps/page";
     pub const THREAD_FILE_PATCH_HISTORY_PAGE: &str = "thread/file_patch_history/page";
@@ -97,6 +103,30 @@ pub mod methods {
     pub const CLI_RUNTIME_REQUEST_RESPOND: &str = "cli_runtime/request/respond";
     pub const SETTINGS_GET: &str = "settings/get";
     pub const SETTINGS_UPDATE: &str = "settings/update";
+    pub const PLUGINS_PREVIEW: &str = "plugins/preview";
+    pub const PLUGINS_INSTALL: &str = "plugins/install";
+    pub const PLUGINS_UPDATE: &str = "plugins/update";
+    pub const PLUGINS_REMOVE: &str = "plugins/remove";
+    pub const PLUGINS_RETRY: &str = "plugins/retry";
+    pub const PLUGINS_CONTINUE: &str = "plugins/continue";
+    pub const PLUGINS_SET_ENABLED: &str = "plugins/set_enabled";
+    pub const PLUGINS_LIST: &str = "plugins/list";
+    pub const PLUGINS_DETAILS: &str = "plugins/details";
+    pub const PLUGINS_CHANGED: &str = "plugins/changed";
+    pub const APPS_PREVIEW: &str = "apps/preview";
+    pub const APPS_INSTALL: &str = "apps/install";
+    pub const APPS_UPDATE: &str = "apps/update";
+    pub const APPS_REMOVE: &str = "apps/remove";
+    pub const APPS_RETRY: &str = "apps/retry";
+    pub const APPS_CONTINUE: &str = "apps/continue";
+    pub const APPS_SET_ENABLED: &str = "apps/set_enabled";
+    pub const APPS_RUNTIME_INFO: &str = "apps/runtime_info";
+    pub const APPS_RENEW_VIEW: &str = "apps/renew_view";
+    pub const APPS_CLOSE_VIEW: &str = "apps/close_view";
+    pub const APPS_OPEN_VIEW: &str = "apps/open_view";
+    pub const APPS_LIST: &str = "apps/list";
+    pub const APPS_DETAILS: &str = "apps/details";
+    pub const APPS_CHANGED: &str = "apps/changed";
     pub const SKILLS_LIST: &str = "skills/list";
     pub const SKILLS_INSTALL: &str = "skills/install";
     pub const SKILLS_UPDATE: &str = "skills/update";
@@ -126,6 +156,7 @@ pub mod methods {
     pub const TASK_ACCEPT: &str = "task/accept";
     pub const TASK_REVISE: &str = "task/revise";
     pub const TASK_CANCEL: &str = "task/cancel";
+    pub const TASK_FINISH: &str = "task/finish";
     pub const TASK_UPDATE: &str = "task/update";
     pub const TASK_RESCHEDULE: &str = "task/reschedule";
     pub const TASK_DETACH: &str = "task/detach";
@@ -201,8 +232,10 @@ pub mod methods {
         WORKSPACE_DEFAULT,
         WORKSPACE_SELECT,
         WORKSPACE_UPDATE,
+        THREAD_OPEN,
         THREAD_START,
         THREAD_TREE,
+        WORKSPACE_PUSH,
         THREAD_UPDATE,
         THREAD_MOVE,
         THREAD_PARTICIPANTS_LIST,
@@ -218,6 +251,10 @@ pub mod methods {
         THREAD_GET,
         THREADS_TOOLS_RESULT_READ,
         THREAD_TIMELINE_PAGE,
+        THREAD_EXECUTION_OBSERVABILITY,
+        WORKSPACE_EXECUTION_OBSERVABILITY,
+        WORKSPACE_EXECUTION_RECONCILE,
+        THREAD_EXECUTION_RECONCILE,
         THREAD_FILE_VIEW_GRANT_CREATE,
         THREAD_PATCH_STEPS_PAGE,
         THREAD_FILE_PATCH_HISTORY_PAGE,
@@ -266,6 +303,28 @@ pub mod methods {
         CLI_RUNTIME_REQUEST_RESPOND,
         SETTINGS_GET,
         SETTINGS_UPDATE,
+        PLUGINS_PREVIEW,
+        PLUGINS_INSTALL,
+        PLUGINS_UPDATE,
+        PLUGINS_REMOVE,
+        PLUGINS_RETRY,
+        PLUGINS_CONTINUE,
+        PLUGINS_SET_ENABLED,
+        PLUGINS_LIST,
+        PLUGINS_DETAILS,
+        APPS_PREVIEW,
+        APPS_INSTALL,
+        APPS_UPDATE,
+        APPS_REMOVE,
+        APPS_RETRY,
+        APPS_CONTINUE,
+        APPS_SET_ENABLED,
+        APPS_RUNTIME_INFO,
+        APPS_RENEW_VIEW,
+        APPS_CLOSE_VIEW,
+        APPS_OPEN_VIEW,
+        APPS_LIST,
+        APPS_DETAILS,
         SKILLS_LIST,
         SKILLS_INSTALL,
         SKILLS_UPDATE,
@@ -295,6 +354,7 @@ pub mod methods {
         TASK_ACCEPT,
         TASK_REVISE,
         TASK_CANCEL,
+        TASK_FINISH,
         TASK_RESCHEDULE,
         TASK_DETACH,
         TASK_PAUSE,
@@ -363,6 +423,7 @@ pub mod events {
     pub const THREAD_PARTICIPANTS_CHANGED: &str = "thread/participants/changed";
     pub const THREAD_CLOSED: &str = "thread/closed";
     pub const THREAD_TREE_CHANGED: &str = "thread/tree/changed";
+    pub const WORKSPACE_PUSH_CHANGED: &str = "workspace/push";
     pub const THREAD_AGENTS_DOC_CHANGED: &str = "thread/agents_doc/changed";
     pub const THREAD_TIMELINE_BLOCKS_CHANGED: &str = "thread/timeline/blocks/changed";
     pub const THREAD_READ_CURSOR_CHANGED: &str = "thread/read/changed";

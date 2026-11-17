@@ -1,7 +1,29 @@
 # Database Architecture
 
-These rules apply to the whole repository. More specific `AGENTS.md` files may
-add crate-local rules, but must not weaken the database invariants below.
+These implementation rules apply across the repository. More specific
+`AGENTS.md` files may add crate-local rules, but must not weaken the database
+invariants below.
+
+## Diagnostics
+
+For debugging development or production databases, use direct SQL with `sqlite3`,
+another SQL client, or a short script. Raw SQL and direct connections are allowed
+for this work; the application architecture/ORM requirements below govern code
+implementation. Do not add Rust files/crates or generate Entity/ORM scaffolding
+solely to inspect a database. Use read-only connections for inspection; data
+changes must stay within the task's authorized scope.
+
+## Database Changes
+
+Follow this dependency order: standalone migrations → database schema →
+SeaORM CLI → generated Entity → CRUD. Migrations must not depend on Entity.
+
+For any database behavior change, including callers in other crates, read
+[CRUD rules](crates/crud/AGENTS.md). Also read the rules for layers you change:
+
+- Schema: [migration](crates/migration/AGENTS.md).
+- Entity generation: [entity](crates/entity/AGENTS.md).
+- Data migration/backfill: [Gateway database](crates/gateway/src/database/AGENTS.md).
 
 ## Runtime Model
 
@@ -11,7 +33,7 @@ The Gateway SQLite runtime has two independent contours:
 - one serialized writer executor, because SQLite still has only one effective
   writer.
 
-All database access must go through `SqliteDatabase`, `CrudStore`, and the
+Application database access must go through `SqliteDatabase`, `CrudStore`, and the
 existing repositories. Do not open ad hoc SQLite connections, use the writer
 pool directly, acquire scheduling permits manually, or bypass the writer
 executor.
@@ -50,6 +72,34 @@ priority changes the database class. Do not classify work from actor kind,
 repository method, SQL text at the call site, or an arbitrary timeout. Do not
 promote background work to interactive or critical to make a test or latency
 symptom disappear.
+
+## Background Work and Idle
+
+- After startup/backlog reaches EOF, wait for a relevant change or a known
+  domain deadline. Do not add periodic empty database discovery, TTL-based
+  rescans, or longer polling intervals as a substitute for correct wakeups.
+  Timers must serve a concrete obligation: due work, lease, error backoff,
+  active heartbeat, or an explicitly justified periodic duty.
+- Reuse existing domain owners and notification protocols. For shared database
+  invalidation, use runtime-owned `WorkSignal` subscriptions; independent
+  consumers need independent subscriptions. Do not add another job engine,
+  durable queue, or competing worker to repair a missing wakeup.
+- Acknowledge invalidation before discovery, once per finite pass, not between
+  batches. A full batch is not EOF: continue with bounded quanta and yield.
+  Preserve fairness when new work arrives beyond the captured frontier.
+- Notify after the relevant commit and release of database resources. Preserve
+  `WorkChange` handling of unknown outcomes and writer settlement after
+  cancellation; a notification in `Drop` alone cannot cover a late commit.
+  Successful ACK/no-change operations must not cause endless self-wakes.
+- Changes to eligibility, earlier deadlines, dependencies, read holds or
+  capacity must wake the affected owner, including changes behind its cursor.
+  Preserve wall-clock deadline semantics and startup/restart/shutdown recovery.
+- Database state, claims, leases and CAS remain authoritative; signals only
+  request rediscovery. Preserve cooperative writable database ownership:
+  process-local notifications cannot cover an independent process writer.
+- For affected behavior, reuse or extend focused regressions for wake/sleep
+  races, continuation without new input, deadlines, release and cancellation.
+  A successful turn does not establish idle behavior or measured CPU savings.
 
 ## Never Hold Database Capacity During Other Work
 
@@ -146,6 +196,17 @@ Database changes require focused regression coverage for:
 - cancellation without leaked queue entries or permits;
 - concurrent interactive and maintenance work;
 - retry/restart idempotency and poison-row progress for background jobs.
+
+Use `cargo-nextest` for Rust unit and integration tests:
+
+- Workspace: `cargo nextest run --locked --workspace --test-threads 2 --no-fail-fast --retries 0`.
+- Focused: `cargo nextest run --locked -p <package> --test-threads 2 --no-fail-fast --retries 0 <filter>`;
+  retain the required feature and target flags.
+- Doctests only: `cargo test --locked --workspace --doc` (nextest does not run
+  doctests).
+
+Do not use `cargo test` for unit or integration suites. If nextest is missing,
+install its pre-built binary rather than falling back to `cargo test`.
 
 Run the narrow affected tests first. Before declaring a repository-wide
 database change complete, run formatting checks and the relevant workspace

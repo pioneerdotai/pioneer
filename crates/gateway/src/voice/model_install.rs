@@ -2137,27 +2137,6 @@ mod tests {
         assert!(!layout.staging_dir.exists());
     }
 
-    #[tokio::test]
-    async fn model_install_unsafe_archive_rejects_link_before_promotion() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let layout = test_layout(&temp_dir);
-        let archive = symlink_archive_bytes();
-        let entry = test_entry_with_sha256(sha256_bytes(archive.as_slice()));
-        let downloader = MemoryArchiveDownloader {
-            bytes: archive,
-            calls: Arc::new(AtomicUsize::new(0)),
-        };
-
-        let error = ensure_voice_model_installed_at(&entry, layout.clone(), &downloader)
-            .await
-            .expect_err("link archive must fail");
-
-        assert!(format!("{error:#}").contains("link entries"));
-        assert!(!layout.staging_dir.exists());
-        assert!(!layout.install_dir.exists());
-        assert!(!layout.ready_marker_path.exists());
-    }
-
     #[test]
     fn model_install_unsafe_archive_rejects_paths_links_and_special_files() {
         for path in [
@@ -2183,29 +2162,6 @@ mod tests {
         assert!(
             reject_unsafe_archive_member(tar::EntryType::Directory, Path::new("model")).is_ok()
         );
-    }
-
-    #[tokio::test]
-    async fn bad_checksum_does_not_mark_model_ready() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let layout = test_layout(&temp_dir);
-        let archive = test_archive_bytes();
-        let entry = test_entry_with_sha256("f".repeat(64));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let downloader = MemoryArchiveDownloader {
-            bytes: archive,
-            calls,
-        };
-
-        let error = ensure_voice_model_installed_at(&entry, layout.clone(), &downloader)
-            .await
-            .expect_err("checksum must fail");
-
-        assert!(format!("{error:#}").contains("checksum mismatch"));
-        assert!(!layout.ready_marker_path.exists());
-        assert!(!layout.partial_archive_path.exists());
-        assert!(!layout.staging_dir.exists());
-        assert!(!layout.install_dir.exists());
     }
 
     #[tokio::test]
@@ -2569,27 +2525,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_install_staging_invalid_layout_is_cleaned_without_ready_marker() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let layout = test_layout(&temp_dir);
-        let archive = unexpected_layout_archive_bytes();
-        let entry = test_entry_with_sha256(sha256_bytes(archive.as_slice()));
-        let downloader = MemoryArchiveDownloader {
-            bytes: archive,
-            calls: Arc::new(AtomicUsize::new(0)),
-        };
-
-        let error = ensure_voice_model_installed_at(&entry, layout.clone(), &downloader)
-            .await
-            .expect_err("unexpected layout must fail");
-
-        assert!(format!("{error:#}").contains("expected runtime layout"));
-        assert!(!layout.staging_dir.exists());
-        assert!(!layout.install_dir.exists());
-        assert!(!layout.ready_marker_path.exists());
-    }
-
-    #[tokio::test]
     async fn model_install_staging_refuses_to_remove_unowned_directory() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let layout = test_layout(&temp_dir);
@@ -2746,5 +2681,59 @@ mod tests {
         assert!(format!("{error:#}").contains("must not be a symlink"));
         assert!(!layout.install_dir.exists());
         assert!(!layout.staging_dir.exists());
+    }
+
+    #[test]
+    fn rejected_archives_leave_no_install_or_transient_files() {
+        let link_archive = symlink_archive_bytes();
+        let link_sha = sha256_bytes(&link_archive);
+        let layout_archive = unexpected_layout_archive_bytes();
+        let layout_sha = sha256_bytes(&layout_archive);
+        for (archive, expected_sha, error_fragment, rejection_diagnostic) in [
+            (
+                link_archive,
+                link_sha,
+                "link entries",
+                "link archive must fail",
+            ),
+            (
+                layout_archive,
+                layout_sha,
+                "expected runtime layout",
+                "unexpected layout must fail",
+            ),
+            (
+                test_archive_bytes(),
+                "f".repeat(64),
+                "checksum mismatch",
+                "checksum must fail",
+            ),
+        ] {
+            let body = async {
+                let temp_dir = tempfile::tempdir().expect("temp dir");
+                let layout = test_layout(&temp_dir);
+                let entry = test_entry_with_sha256(expected_sha);
+                let downloader = MemoryArchiveDownloader {
+                    bytes: archive,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                };
+                let error = ensure_voice_model_installed_at(&entry, layout.clone(), &downloader)
+                    .await
+                    .expect_err(rejection_diagnostic);
+                assert!(format!("{error:#}").contains(error_fragment));
+                assert!(!layout.staging_dir.exists());
+                assert!(!layout.install_dir.exists());
+                assert!(!layout.ready_marker_path.exists());
+                assert!(!layout.archive_path.exists());
+                assert!(!layout.partial_archive_path.exists());
+            };
+            tokio::pin!(body);
+            let body: std::pin::Pin<&mut dyn std::future::Future<Output = ()>> = body;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed building the Runtime")
+                .block_on(body);
+        }
     }
 }

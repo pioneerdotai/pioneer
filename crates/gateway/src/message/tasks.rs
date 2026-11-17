@@ -6,6 +6,7 @@ use pioneer_crud::{
     TaskRunOccurrenceClaimFailurePhase, TaskRunOccurrenceClock,
     TaskRunOccurrenceTerminalizationOutcome,
 };
+use pioneer_observability::closing::{Closing, Fact, Phase};
 use pioneer_protocol::{
     ItemUpdatedNotification, TaskDeliveryStatus, TaskEventPayload, TaskRescheduleReason,
     TaskTriggerKind,
@@ -161,6 +162,14 @@ struct TaskTimelineChangedTarget {
     run_id: Option<String>,
 }
 
+// Advisory only: one finite due-set pass, shared by scoped processor clones.
+// Ownership remains entirely in durable claim/revision fences.
+#[derive(Clone, Default)]
+pub(super) struct ChildDiscoveryPass<K> {
+    after: Option<K>,
+    upper: Option<K>,
+}
+
 impl MessageProcessor {
     pub(super) async fn reconcile_terminal_task_child_turns_with_retry(
         &self,
@@ -176,104 +185,107 @@ impl MessageProcessor {
     }
 
     pub(super) async fn reconcile_terminal_task_child_turns(&self, limit: u64) -> Result<usize> {
-        let turns = self
-            .crud_store
-            .list_unreconciled_terminal_task_child_turns(limit)
-            .await?;
-        let mut reconciled = 0usize;
+        let store = self.crud_store.with_maintenance_access();
+        let clock = || chrono::Utc::now().timestamp();
         let mut errors = TaskChildReconciliationFailures::default();
-        for turn in turns {
-            let result = match turn.status {
-                TurnStatus::Completed => {
-                    self.task_agent_executor
-                        .reconcile_child_turn_completed(
-                            turn.thread_id.as_str(),
-                            turn.turn_id.as_str(),
-                            TaskChildReconciliationOrigin::DurableBackground,
-                        )
-                        .await
+        let ready = match store.child_work_queues_ready().await {
+            Ok(ready) => ready,
+            Err(error) => {
+                errors.push("", "", error);
+                false
+            }
+        };
+        if !ready {
+            if let Err(error) = store.discover_legacy_child_work(limit).await {
+                errors.push("", "", error);
+            }
+        }
+        let mut scope_pass = self.task_child_scope_cursor.lock().await.clone();
+        let scope_candidate = async {
+            if scope_pass.upper.is_none() {
+                scope_pass.upper = store.child_scope_due_upper(clock()).await?;
+                scope_pass.after = None;
+            }
+            if let Some(upper) = &scope_pass.upper {
+                store
+                    .discover_child_scope_in_pass(clock(), scope_pass.after.as_ref(), upper)
+                    .await
+            } else {
+                Ok(None)
+            }
+        }
+        .await;
+        match scope_candidate {
+            Ok(Some(candidate)) => {
+                // Publish raw discovery progress before any potentially failing
+                // claim/page. New suffix growth cannot extend the captured pass.
+                scope_pass.after = candidate.next_attempt_at.map(|due| {
+                    (
+                        due,
+                        candidate.scope_kind.clone(),
+                        candidate.scope_key.clone(),
+                    )
+                });
+                if scope_pass.after == scope_pass.upper {
+                    scope_pass = Default::default();
                 }
-                TurnStatus::Failed => {
-                    let error = turn.error.as_deref().unwrap_or("child turn failed");
-                    self.task_agent_executor
-                        .reconcile_child_turn_failed(
-                            turn.thread_id.as_str(),
-                            turn.turn_id.as_str(),
-                            error,
-                            TaskChildReconciliationOrigin::DurableBackground,
-                        )
-                        .await
+                *self.task_child_scope_cursor.lock().await = scope_pass;
+                if let Err(error) = store
+                    .expand_child_scope_candidate_with_clock(&candidate, &clock, false)
+                    .await
+                {
+                    errors.push("", "", error);
                 }
-                TurnStatus::Interrupted => {
-                    let reason = turn
-                        .error
-                        .as_deref()
-                        .unwrap_or("child turn was interrupted");
-                    self.task_agent_executor
-                        .reconcile_child_turn_cancelled(
-                            turn.thread_id.as_str(),
-                            turn.turn_id.as_str(),
-                            reason,
-                            TaskChildReconciliationOrigin::DurableBackground,
-                        )
-                        .await
-                }
-                TurnStatus::Blocked => {
-                    let reason = turn.error.as_deref().unwrap_or("child turn was blocked");
-                    self.task_agent_executor
-                        .reconcile_child_turn_blocked(
-                            turn.thread_id.as_str(),
-                            turn.turn_id.as_str(),
-                            reason,
-                            TaskChildReconciliationOrigin::DurableBackground,
-                        )
-                        .await
-                }
-                TurnStatus::InProgress => continue,
-            };
-            match result {
-                Ok(true) => {
-                    if turn.status != TurnStatus::Blocked {
-                        match self
-                            .crud_store
-                            .with_maintenance_access()
-                            .cleanup_terminal_task_child_capsule(&turn.thread_id, &turn.turn_id)
-                            .await
-                        {
-                            Ok(Some(true)) => {
-                                reconciled = reconciled.saturating_add(1);
-                                continue;
-                            }
-                            Ok(Some(false)) => continue,
-                            Ok(None) => {} // Active aggregate: existing cleanup below.
-                            Err(error) => {
-                                errors.push(&turn.thread_id, &turn.turn_id, error);
-                                continue;
-                            }
-                        }
-                        if let Err(error) = self
-                            .crud_store
-                            .delete_turn_llm_context_for_turn(turn.turn_id.as_str())
-                            .await
-                        {
-                            warn!(
-                                thread_id = turn.thread_id.as_str(),
-                                turn_id = turn.turn_id.as_str(),
-                                error = %format!("{error:#}"),
-                                "failed to delete child Turn LLM context after durable task reconciliation"
-                            );
-                        }
-                        self.delete_turn_runtime_snapshot_for_closed_turn(
-                            turn.thread_id.as_str(),
-                            turn.turn_id.as_str(),
-                            "durably reconciled",
-                        )
-                        .await;
+            }
+            Ok(None) => *self.task_child_scope_cursor.lock().await = Default::default(),
+            Err(error) => errors.push("", "", error),
+        }
+        let mut point_pass = self.task_child_point_cursor.lock().await.clone();
+        if point_pass.upper.is_none() {
+            point_pass.upper = store.child_point_due_upper(clock()).await?;
+            point_pass.after = None;
+        }
+        let candidates = if let Some(upper) = &point_pass.upper {
+            store
+                .discover_child_points_in_pass(clock(), limit, point_pass.after.as_ref(), upper)
+                .await?
+        } else {
+            Vec::new()
+        };
+        point_pass.after = candidates
+            .last()
+            .and_then(|row| row.next_attempt_at.map(|due| (due, row.turn_id.clone())));
+        if candidates.len() < limit.min(32) as usize || point_pass.after == point_pass.upper {
+            point_pass = Default::default();
+        }
+        // Save the complete raw page before processing, including poison rows.
+        *self.task_child_point_cursor.lock().await = point_pass;
+        let mut reconciled = 0usize;
+        for candidate in candidates {
+            let claim = match store.claim_child_point_with_clock(&candidate, &clock).await {
+                Ok(Some(claim)) => claim,
+                Ok(None) => continue,
+                Err(error) => {
+                    errors.push(&candidate.thread_id, &candidate.turn_id, error);
+                    if let Err(error) = store.defer_child_point_snapshot(&candidate, &clock).await {
+                        errors.push(&candidate.thread_id, &candidate.turn_id, error);
                     }
-                    reconciled = reconciled.saturating_add(1);
+                    continue;
                 }
-                Ok(false) => {}
-                Err(error) => errors.push(&turn.thread_id, &turn.turn_id, error),
+            };
+            // Claim exactly one candidate and process it before claiming another.
+            // Every record/executor/ACK error is isolated to this exact snapshot.
+            match self
+                .reconcile_claimed_task_child_point(&store, &claim, &clock)
+                .await
+            {
+                Ok(changed) => reconciled = reconciled.saturating_add(changed),
+                Err(error) => {
+                    errors.push(&claim.thread_id, &claim.turn_id, error);
+                    if let Err(error) = store.defer_child_point_snapshot(&claim, &clock).await {
+                        errors.push(&claim.thread_id, &claim.turn_id, error);
+                    }
+                }
             }
         }
         if errors.pending_projection > 0
@@ -283,6 +295,101 @@ impl MessageProcessor {
             return Err(anyhow::Error::new(errors));
         }
         Ok(reconciled)
+    }
+
+    async fn reconcile_claimed_task_child_point<F: Fn() -> i64 + Sync>(
+        &self,
+        store: &CrudStore,
+        claim: &pioneer_entity::task_child_reconcile_pending::Model,
+        clock: &F,
+    ) -> Result<usize> {
+        let Some(turn) = store.child_point_record(claim).await? else {
+            store.finish_child_point(claim, None, true).await?;
+            return Ok(0);
+        };
+        if turn.status != TurnStatus::Blocked
+            && store
+                .terminal_task_child_cleanup_ready(&turn.thread_id, &turn.turn_id)
+                .await?
+                == Some(false)
+        {
+            store.finish_child_point(claim, None, false).await?;
+            return Ok(0);
+        }
+        let result = match turn.status {
+            TurnStatus::Completed => {
+                self.task_agent_executor
+                    .reconcile_child_turn_completed(
+                        turn.thread_id.as_str(),
+                        turn.turn_id.as_str(),
+                        TaskChildReconciliationOrigin::DurableBackground,
+                    )
+                    .await
+            }
+            TurnStatus::Failed => {
+                let error = turn.error.as_deref().unwrap_or("child turn failed");
+                self.task_agent_executor
+                    .reconcile_child_turn_failed(
+                        turn.thread_id.as_str(),
+                        turn.turn_id.as_str(),
+                        error,
+                        TaskChildReconciliationOrigin::DurableBackground,
+                    )
+                    .await
+            }
+            TurnStatus::Interrupted => {
+                let reason = turn
+                    .error
+                    .as_deref()
+                    .unwrap_or("child turn was interrupted");
+                self.task_agent_executor
+                    .reconcile_child_turn_cancelled(
+                        turn.thread_id.as_str(),
+                        turn.turn_id.as_str(),
+                        reason,
+                        TaskChildReconciliationOrigin::DurableBackground,
+                    )
+                    .await
+            }
+            TurnStatus::Blocked => {
+                let reason = turn.error.as_deref().unwrap_or("child turn was blocked");
+                self.task_agent_executor
+                    .reconcile_child_turn_blocked(
+                        turn.thread_id.as_str(),
+                        turn.turn_id.as_str(),
+                        reason,
+                        TaskChildReconciliationOrigin::DurableBackground,
+                    )
+                    .await
+            }
+            TurnStatus::InProgress => {
+                store
+                    .finish_child_point(claim, Some(clock().saturating_add(2)), false)
+                    .await?;
+                return Ok(0);
+            }
+        };
+        match result? {
+            true if turn.status != TurnStatus::Blocked => {
+                if store.cleanup_claimed_child_capsule(claim).await? {
+                    Ok(1)
+                } else {
+                    store
+                        .finish_child_point(claim, Some(clock().saturating_add(2)), false)
+                        .await?;
+                    Ok(0)
+                }
+            }
+            true => Ok(usize::from(
+                store.finish_child_point(claim, None, true).await?,
+            )),
+            false => {
+                store
+                    .finish_child_point(claim, Some(clock().saturating_add(2)), false)
+                    .await?;
+                Ok(0)
+            }
+        }
     }
 
     pub(super) async fn reconcile_terminal_task_run_occurrence_turns(
@@ -310,15 +417,20 @@ impl MessageProcessor {
     ) -> Result<TaskRunOccurrenceReconcileSummary> {
         // Exactly one advisory discovery per pass. Every selected candidate
         // consumes budget, including lost claims and failed preparations.
-        let candidates = self
+        let discovery = self
             .crud_store
-            .discover_task_run_occurrence_reconcile(clock(), limit)
+            .discover_task_run_occurrence_reconcile_with_audit(clock(), limit)
             .await?;
         let mut summary = TaskRunOccurrenceReconcileSummary {
-            selected: candidates.len(),
+            selected: discovery.candidates.len(),
             ..Default::default()
         };
-        for candidate in candidates {
+        let audit_failed = discovery.audit_error.is_some();
+        if let Some(error) = discovery.audit_error {
+            summary.queue_state_errors += 1;
+            summary.record_error(error);
+        }
+        for candidate in discovery.candidates {
             let claim = match self
                 .crud_store
                 .claim_task_run_occurrence_reconcile(&candidate, clock)
@@ -397,6 +509,9 @@ impl MessageProcessor {
                 .has_pending_task_run_occurrence_reconcile()
                 .await,
         );
+        if audit_failed {
+            summary.pending = None;
+        }
         Ok(summary)
     }
 
@@ -404,6 +519,84 @@ impl MessageProcessor {
         &self,
         event: pioneer_crud::AppendedTaskEvent,
     ) -> Result<()> {
+        use pioneer_observability::{
+            updates,
+            work::{Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind},
+        };
+        let parent = self
+            .task_runtime
+            .event_bus()
+            .closing_publication_parent(&event.task_id, event.sequence);
+        let origin = if parent.is_some() {
+            updates::Origin::Observed
+        } else {
+            updates::Origin::Recovery
+        };
+        let parent = parent.unwrap_or_else(|| {
+            use pioneer_observability::scenario::Correlation;
+            Correlation::default().run(Correlation::capture)
+        });
+        let context = updates::with_context(None, || {
+            parent.run(|| updates::UpdateContext::source_with_origin(None, origin))
+        });
+        let work = updates::with_context(context, || {
+            WorkCarrier::child(
+                Boundary::EventLane,
+                WorkKind::Event,
+                Trigger::Event,
+                ExecutorRole::Event,
+            )
+        });
+        work.scope_result(parent.scope(self.emit_task_event_observed(event)))
+            .await
+    }
+
+    async fn emit_task_event_observed(&self, event: pioneer_crud::AppendedTaskEvent) -> Result<()> {
+        let closing_fact = match &event.payload {
+            TaskEventPayload::RunCompleted { .. } => {
+                Some((Phase::TaskState, Fact::ExecutionSucceeded))
+            }
+            TaskEventPayload::RunFailed { .. } => Some((Phase::TaskState, Fact::ExecutionFailed)),
+            TaskEventPayload::RunBlocked { .. } => Some((Phase::TaskState, Fact::Blocked)),
+            TaskEventPayload::RunCancelled { .. } => Some((Phase::TaskState, Fact::Cancelled)),
+            TaskEventPayload::TaskRunEnteredReview { .. } => {
+                Some((Phase::TaskState, Fact::PendingReview))
+            }
+            TaskEventPayload::TaskResultCandidateAccepted { .. } => {
+                Some((Phase::TaskState, Fact::Accepted))
+            }
+            TaskEventPayload::TaskResultCandidateRejected { .. } => {
+                Some((Phase::TaskState, Fact::Rejected))
+            }
+            TaskEventPayload::TaskResultCandidateCancelled { .. } => {
+                Some((Phase::TaskState, Fact::Cancelled))
+            }
+            TaskEventPayload::DeliveryQueued { .. } => {
+                Some((Phase::DestinationState, Fact::Scheduled))
+            }
+            TaskEventPayload::DeliveryDelivered { .. } => {
+                Some((Phase::DestinationState, Fact::Delivered))
+            }
+            TaskEventPayload::DeliveryCancelled { .. } => {
+                Some((Phase::DestinationState, Fact::Cancelled))
+            }
+            TaskEventPayload::DeliveryFailed { delivery, .. } => Some((
+                Phase::DestinationState,
+                if delivery.status == TaskDeliveryStatus::Failed {
+                    if delivery.attempt_count >= delivery.max_attempts {
+                        Fact::Exhausted
+                    } else {
+                        Fact::DeliveryFailed
+                    }
+                } else {
+                    Fact::Retrying
+                },
+            )),
+            _ => None,
+        };
+        if let Some((phase, fact)) = closing_fact {
+            Closing::committed_event(phase, fact);
+        }
         let Some(task_response) = self
             .crud_store
             .get_task_event_context(&event.payload)
@@ -434,25 +627,34 @@ impl MessageProcessor {
         }
         // Activity changes use the existing authorized tree invalidation path.
         // Progress/heartbeat/streaming deltas deliberately do not enter it.
-        if task_event_changes_tree_activity(&event.payload)
-            && pioneer_crud::resolve_task_authorization_scope(
+        if task_event_changes_tree_activity(&event.payload) {
+            if let Some(root) = pioneer_crud::resolve_task_authorization_scope(
                 &self.crud_store.database_connection(),
                 &task_response.task.id,
                 Some(&task_response.task.workspace_id),
                 None,
             )
             .await?
-            .is_some_and(|scope| scope.root_thread_id.is_some())
-        {
-            self.send_notification_to_task_workspace_connections(
-                task_response.task.id.as_str(),
-                task_response.task.workspace_id.as_str(),
-                events::THREAD_TREE_CHANGED,
-                &ThreadTreeChangedNotification {
-                    workspace_id: task_response.task.workspace_id.clone(),
-                },
-            )
-            .await;
+            .and_then(|scope| scope.root_thread_id)
+            {
+                self.dirty_push(
+                    &task_response.task.workspace_id,
+                    None,
+                    Some(&root),
+                    None,
+                    false,
+                    None,
+                );
+                self.send_notification_to_task_workspace_connections(
+                    &task_response.task.id,
+                    &task_response.task.workspace_id,
+                    events::THREAD_TREE_CHANGED,
+                    &ThreadTreeChangedNotification {
+                        workspace_id: task_response.task.workspace_id.clone(),
+                    },
+                )
+                .await;
+            }
         }
         if matches!(event.payload, TaskEventPayload::RunStarting { .. }) {
             // The dispatch claim has no conversation/timeline side effects.
@@ -498,6 +700,32 @@ impl MessageProcessor {
                 | TaskEventPayload::TaskThreadLineageCreated { .. }
                 | TaskEventPayload::ChildThreadLinked { .. }
         ) {
+            let changes_inbox =
+                !matches!(
+                    &event.payload,
+                    TaskEventPayload::RunStarted { .. } | TaskEventPayload::TaskResumed { .. }
+                        // Task terminal projections change lifecycle only. Each
+                        // changed run has its own durable Run terminal event;
+                        // direct task terminal/cancel does not rewrite historical
+                        // run cards. Metadata/root/access events below still reset.
+                        | TaskEventPayload::TaskCompleted { .. }
+                        | TaskEventPayload::TaskFailed { .. }
+                        | TaskEventPayload::TaskBlocked { .. }
+                        | TaskEventPayload::TaskCancelled { .. }
+                ) && (!matches!(&event.payload, TaskEventPayload::RunCreated { .. })
+                    || task_response
+                        .run
+                        .as_ref()
+                        .is_some_and(|run| run.status.is_terminal()));
+            if changes_inbox {
+                if let Some(run_id) = context.run_id.as_deref() {
+                    self.dirty_push(&workspace_id, None, None, Some(run_id), false, None);
+                } else {
+                    // Task metadata/root/lineage may affect several historical
+                    // unread runs; a latest-only lookup is insufficient.
+                    self.dirty_push_inbox(&workspace_id, None, None);
+                }
+            }
             self.send_notification_to_task_workspace_connections(
                 &notification_task_id,
                 &workspace_id,
@@ -1065,6 +1293,41 @@ impl MessageProcessor {
             .await
     }
 
+    /// Independent task anchors retain their canonical LIVE owner after start
+    /// publication; generic/occurrence anchors retain their eager path.
+    pub(crate) async fn persist_task_anchor_event(
+        &self,
+        event: pioneer_crud::CanonicalTurnEventPayload,
+        timestamp: i64,
+    ) -> Result<bool> {
+        if self
+            .materialize_independent_item_lifecycle(event.clone(), timestamp)
+            .await?
+        {
+            return Ok(true);
+        }
+        match event {
+            pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    &notification.thread_id,
+                    events::ITEM_COMPLETED,
+                    &notification,
+                )
+                .await;
+            }
+            pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(notification) => {
+                self.send_notification_to_thread_subscribers(
+                    &notification.thread_id,
+                    events::ITEM_UPDATED,
+                    &notification,
+                )
+                .await;
+            }
+            _ => anyhow::bail!("task anchor requires an item completion or update"),
+        }
+        Ok(false)
+    }
+
     pub(super) async fn refresh_task_anchor_in_turn(
         &self,
         response: &TaskEventContext,
@@ -1125,23 +1388,22 @@ impl MessageProcessor {
             item: TurnItem::Task { item },
         };
         let event_timestamp_secs = now_timestamp_secs();
-        self.crud_store
-            .materialize_item_updated(notification.clone(), event_timestamp_secs)
+        let deferred = self
+            .persist_task_anchor_event(
+                pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(notification.clone()),
+                event_timestamp_secs,
+            )
             .await?;
-        self.send_notification_to_thread_subscribers(
-            thread_id,
-            events::ITEM_UPDATED,
-            &notification,
-        )
-        .await;
-        self.notify_semantic_timeline_item_changed(
-            notification.workspace_id.as_str(),
-            notification.thread_id.as_str(),
-            notification.turn_id.as_str(),
-            &notification.item,
-            Some("completed"),
-        )
-        .await;
+        if !deferred {
+            self.notify_semantic_timeline_item_changed(
+                notification.workspace_id.as_str(),
+                notification.thread_id.as_str(),
+                notification.turn_id.as_str(),
+                &notification.item,
+                Some("completed"),
+            )
+            .await;
+        }
         Ok(true)
     }
 
@@ -1573,6 +1835,9 @@ async fn task_delivery_child_lineage(
 }
 
 fn task_event_changes_tree_activity(payload: &TaskEventPayload) -> bool {
+    // Active-run state owns this projection. Pure TaskCompleted/Failed/Blocked/
+    // Cancelled lifecycle mirrors do not change it; direct cancellation emits
+    // a separate event for each changed run just like terminal orchestration.
     matches!(
         payload,
         TaskEventPayload::RunStarting { .. }

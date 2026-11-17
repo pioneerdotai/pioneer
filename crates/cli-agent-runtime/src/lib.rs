@@ -26,6 +26,7 @@ pub mod registry;
 pub mod reserved_args;
 pub mod service;
 pub mod session;
+pub mod usage;
 
 pub const CLI_AGENT_RUNTIME_BOUNDARY: &str = "cli-agent-runtime";
 
@@ -33,16 +34,10 @@ pub use identity::{
     AgentExecutionProfileIdError, CliRuntimeAgentBinding, CliRuntimeExecutionBinding,
     CliRuntimeIdentityBindingError, CliRuntimeReconnectDecision,
 };
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn exposes_boundary_marker() {
-        assert_eq!(crate::CLI_AGENT_RUNTIME_BOUNDARY, "cli-agent-runtime");
-    }
-}
 mod native_event;
 pub use native_event::{
     BoundedNativeEventCodec, DEFAULT_MAX_RECOVERY_FRAME_BYTES, NativeEventBudget,
     NativeIngressError, NativeIngressErrorKind, SpooledNativeFrame,
 };
+
+pub mod executable_digest;

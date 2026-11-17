@@ -29,6 +29,10 @@ pub struct ExternalRuntimeSkillReceiptEntry {
     pub source_kind: String,
     pub source_folder_hash: String,
     pub install_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_owner: Option<pioneer_protocol::PackageIdentity>,
     pub installed_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
 }
@@ -273,6 +277,8 @@ pub fn prepare_external_runtime_receipt_v2(
         upsert_external_runtime_receipt_entry(
             &mut converted,
             ExternalRuntimeSkillReceiptEntry {
+                plugin_id: None,
+                package_owner: None,
                 skill_id: candidate.skill_id.clone(),
                 owner: candidate.owner.clone(),
                 slug: candidate.slug.clone(),
@@ -422,6 +428,16 @@ pub fn external_runtime_skill_is_current(
         && actual.source_kind == expected.source_kind
         && actual.source_folder_hash == expected.source_folder_hash
         && actual.install_path == expected_install_path
+        && pioneer_protocol::PackageIdentity::resolve(
+            actual.package_owner.as_ref(),
+            actual.plugin_id.as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?
+            == pioneer_protocol::PackageIdentity::resolve(
+                expected.package_owner.as_ref(),
+                expected.plugin_id.as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?
         && actual.install_path == destination)
 }
 
@@ -536,6 +552,8 @@ mod tests {
     ) -> ExternalRuntimeSkillReceiptEntry {
         let leaf_slug = slug.rsplit('/').next().unwrap_or(slug);
         ExternalRuntimeSkillReceiptEntry {
+            plugin_id: None,
+            package_owner: None,
             skill_id: test_skill_id(slug),
             owner: Some("workspace".to_owned()),
             slug: leaf_slug.to_owned(),
@@ -623,23 +641,6 @@ mod tests {
     }
 
     #[test]
-    fn external_runtime_receipt_all_fields_round_trip_deterministically() {
-        let root = Path::new("/tmp/runtime/skills");
-        let mut receipt = ExternalRuntimeSkillReceipt::default();
-        upsert_external_runtime_receipt_entry(&mut receipt, entry(root, "zeta", "zeta", 1))
-            .unwrap();
-        upsert_external_runtime_receipt_entry(&mut receipt, entry(root, "alpha", "alpha", 2))
-            .unwrap();
-
-        let first = serde_json::to_string_pretty(&receipt).unwrap();
-        let round_trip: ExternalRuntimeSkillReceipt = serde_json::from_str(&first).unwrap();
-        let second = serde_json::to_string_pretty(&round_trip).unwrap();
-        assert_eq!(receipt, round_trip);
-        assert_eq!(first, second);
-        assert!(first.find("alpha").unwrap() < first.find("zeta").unwrap());
-    }
-
-    #[test]
     fn external_runtime_receipt_keeps_same_label_for_distinct_ids_and_roots() {
         let first_root = Path::new("/tmp/runtime-a/skills");
         let second_root = Path::new("/tmp/runtime-b/skills");
@@ -692,6 +693,13 @@ mod tests {
             .unwrap();
         write_external_runtime_receipt_atomic(&path, &receipt).unwrap();
         let first = fs::read(&path).unwrap();
+        let decoded: ExternalRuntimeSkillReceipt = serde_json::from_slice(&first).unwrap();
+        assert_eq!(receipt, decoded);
+        let encoded_again = serde_json::to_string_pretty(&decoded).unwrap();
+        assert_eq!(first, format!("{encoded_again}\n").into_bytes());
+        let encoded: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(encoded["entries"][0]["install_name"], "alpha");
+        assert_eq!(encoded["entries"][1]["install_name"], "zeta");
         assert_eq!(first.last(), Some(&b'\n'));
         write_external_runtime_receipt_atomic(&path, &receipt).unwrap();
         assert_eq!(first, fs::read(&path).unwrap());

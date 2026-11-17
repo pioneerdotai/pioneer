@@ -113,6 +113,10 @@ impl AuthorizationInvalidationHub {
         Ok(PolicyGeneration::INITIAL)
     }
 
+    pub(crate) fn observed_revision(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     fn cached_generation(&self) -> Option<PolicyGeneration> {
         PolicyGeneration::new(self.generation.load(Ordering::Acquire))
     }

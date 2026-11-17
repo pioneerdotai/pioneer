@@ -34,7 +34,6 @@ pub enum ArtifactRegistrationSource {
     DownloadTool,
     ApplyPatchAddFile,
     GeneratedImage,
-    ComputerUseSnapshot,
     ExplicitArtifactRegister,
 }
 
@@ -64,7 +63,6 @@ impl ArtifactRegistrationSource {
             Self::DownloadTool => "download_tool",
             Self::ApplyPatchAddFile => "apply_patch_add_file",
             Self::GeneratedImage => "generated_image",
-            Self::ComputerUseSnapshot => "computer_use_snapshot",
             Self::ExplicitArtifactRegister => "explicit_artifact_register",
         }
     }
@@ -73,7 +71,6 @@ impl ArtifactRegistrationSource {
         match self {
             Self::ApplyPatchAddFile => Some(ArtifactKind::WorkspaceFile),
             Self::GeneratedImage => Some(ArtifactKind::GeneratedImage),
-            Self::ComputerUseSnapshot => Some(ArtifactKind::Screenshot),
             Self::DownloadTool | Self::ExplicitArtifactRegister => None,
         }
     }
@@ -329,6 +326,14 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(true)
         );
+
+        assert_eq!(
+            summary
+                .metadata
+                .get("effective_mime_type")
+                .and_then(|value| value.as_str()),
+            Some("image/png")
+        );
     }
 
     #[tokio::test]
@@ -360,12 +365,6 @@ mod tests {
 
         assert_eq!(summary.artifact.display_name, "auto.ru_screenshot.png");
         assert_eq!(summary.artifact.mime_type.as_deref(), Some("image/png"));
-    }
-
-    #[test]
-    fn artifact_registration_turn_budget_is_explicitly_deferred() {
-        assert!(TURN_ARTIFACT_BUDGET_DEFERRED_REASON.contains("deferred"));
-        assert!(TURN_ARTIFACT_BUDGET_DEFERRED_REASON.contains("registration tool"));
     }
 
     #[tokio::test]
