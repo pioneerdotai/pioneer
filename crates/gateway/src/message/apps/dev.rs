@@ -192,6 +192,11 @@ impl MessageProcessor {
                     let lock = self.plugin_mutation_lock(&identity).await;
                     let _guard = lock.lock().await;
                     if let Some(parent) = self.crud_store.find_plugin_by_upload(&identity).await? {
+                        ensure!(
+                            parent.state == "installed" && parent.pending_json.is_none(),
+                            "apps.dev_operation_pending: {}; continue or remove the existing connection",
+                            parent.state
+                        );
                         let old = read_source(&parent)?;
                         ensure!(
                             old.url == source.url,
@@ -684,27 +689,14 @@ impl MessageProcessor {
                 if let Some(error) = watch_error {
                     anyhow::bail!("apps.dev_watch_failed: {error}");
                 }
-                if let Some(current) = self
+                let current = self
                     .crud_store
                     .find_package_installation(&parent.id)
                     .await?
-                {
-                    if current.pending_json.is_some() && current.state != "removing" {
-                        let request = RequestId::new(generate_id(21))?;
-                        self.mutate_plugin(
-                            &source.context(),
-                            &request,
-                            PluginsMutateParams {
-                                workspace_id: current.workspace_id,
-                                plugin_id: current.id,
-                                expected_revision: current.revision,
-                                intent: PluginManagementIntent::Continue,
-                            },
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{}", e.error.message))?;
-                    }
-                }
+                    .context("apps.dev_removed")?;
+                // Pending package operations belong to the management lifecycle.
+                // Retrying them on our own revision notifications causes a loop.
+                ensure!(current.pending_json.is_none(), "apps.dev_mutation_pending");
                 let captured = captured?;
                 ensure!(
                     captured.project == source.project,

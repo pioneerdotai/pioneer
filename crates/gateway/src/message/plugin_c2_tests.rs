@@ -1563,7 +1563,7 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
     let id = added["id"].as_str().unwrap().to_owned();
     assert_ne!(id, release.id);
     assert_eq!(
-        app_rpc(&mut harness, methods::APPS_DEV_ADD, add).await["id"],
+        app_rpc(&mut harness, methods::APPS_DEV_ADD, add.clone()).await["id"],
         id
     );
     // Both transitions go through the same real MCP stop barrier as updates,
@@ -1626,6 +1626,58 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
         .interrupt_unfinished_plugins()
         .await
         .unwrap();
+    // A pending operation is not a successful duplicate add. The observer
+    // reports it without resuming it on its own lifecycle notifications.
+    let interrupted = harness
+        .crud_store
+        .find_package_installation(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    let request = pioneer_protocol::generate_id(21);
+    harness
+        .processor
+        .process_request_for_connection(
+            harness.connection_id,
+            &json!({"jsonrpc":"2.0","id":request,"method":methods::APPS_DEV_ADD,"params":add})
+                .to_string(),
+        )
+        .await;
+    let response: serde_json::Value =
+        serde_json::from_str(&recv_jsonrpc_payload_by_id(&mut harness.rx, &request).await).unwrap();
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("apps.dev_operation_pending")
+    );
+    assert!(response.get("result").is_none());
+    harness.processor.start_dev_apps().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness
+            .processor
+            .app_view_status(&id)
+            .await
+            .failure
+            .as_deref()
+            != Some("apps.dev_mutation_pending")
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    harness.processor.shutdown_dev_apps().await;
+    let observed = harness
+        .crud_store
+        .find_package_installation(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.revision, interrupted.revision);
+    assert_eq!(observed.state, "interrupted");
+    assert_eq!(observed.pending_json, interrupted.pending_json);
+
     let resumed: pioneer_protocol::AppsMutationResponse = serde_json::from_value(
         app_rpc(
             &mut harness,
@@ -1678,6 +1730,25 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
         mcp.iter()
             .any(|server| server.name == format!("mcp-{slug}"))
     );
+
+    // Persisted installation names are attributes, not ownership keys.
+    // Model a previously saved public name while preserving the real ID/link.
+    // The source refresh below must stop and remove this exact MCP installation.
+    {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        let row = pioneer_entity::mcp_server_installation::Entity::find_by_id(
+            mcp_child.mcp_installation_id.clone().unwrap(),
+        )
+        .one(&harness.crud_store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+        let mut row: pioneer_entity::mcp_server_installation::ActiveModel = row.into();
+        row.name = Set(format!("saved-public-name-{id}"));
+        row.update(&harness.crud_store.database_connection())
+            .await
+            .unwrap();
+    }
 
     harness.processor.start_dev_apps().await;
     tokio::time::timeout(Duration::from_secs(10), async {

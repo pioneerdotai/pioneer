@@ -1120,12 +1120,23 @@ impl MessageProcessor {
             .await
             .map_err(|_| anyhow::anyhow!("plugins.component_remove_failed"))?;
         } else {
+            let installation = self
+                .crud_store
+                .find_mcp_server_installation_by_id(
+                    "workspace",
+                    &guard.parent.workspace_id,
+                    link.mcp_installation_id
+                        .as_deref()
+                        .context("plugins.child_missing")?,
+                )
+                .await?
+                .context("plugins.component_owner_changed")?;
             self.uninstall_mcp_with_plugin_change(
                 context,
                 request.clone(),
                 McpUninstallParams {
                     workspace_id: guard.parent.workspace_id.clone(),
-                    name: mcp::package::package_server_name(&guard.parent, &link.member_key),
+                    name: installation.name,
                     scope_kind: pioneer_protocol::McpScopeKind::Workspace,
                 },
                 Some(&write),
@@ -1420,12 +1431,21 @@ impl MessageProcessor {
                         .await?
                         .filter(|link| link.package_id == guard.parent.id)
                         .ok_or_else(|| anyhow::anyhow!("plugins.component_owner_changed"))?;
+                    let installation = self
+                        .crud_store
+                        .find_mcp_server_installation_by_id(
+                            "workspace",
+                            &guard.parent.workspace_id,
+                            id,
+                        )
+                        .await?
+                        .context("plugins.component_owner_changed")?;
                     let _native = self
                         .mcp_service
                         .installation_lifecycle_guard(
                             "workspace",
                             &guard.parent.workspace_id,
-                            &mcp::package::package_server_name(&guard.parent, &link.member_key),
+                            &installation.name,
                         )
                         .await;
                     self.mcp_service

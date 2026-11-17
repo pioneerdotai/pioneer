@@ -1666,14 +1666,18 @@ impl MessageProcessor {
             let Some(id) = child.mcp_installation_id else {
                 continue;
             };
-            let name = mcp::package::package_server_name(parent, &child.member_key);
+            let installation = self
+                .crud_store
+                .find_mcp_server_installation_by_id("workspace", &parent.workspace_id, &id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("plugins.component_owner_changed"))?;
             let _native = self
                 .mcp_service
-                .installation_lifecycle_guard("workspace", &parent.workspace_id, &name)
+                .installation_lifecycle_guard("workspace", &parent.workspace_id, &installation.name)
                 .await;
             let row = self
                 .crud_store
-                .find_mcp_server_installation("workspace", &parent.workspace_id, &name)
+                .find_mcp_server_installation("workspace", &parent.workspace_id, &installation.name)
                 .await?
                 .filter(|row| row.id.as_deref() == Some(id.as_str()))
                 .ok_or_else(|| anyhow::anyhow!("plugins.component_owner_changed"))?;

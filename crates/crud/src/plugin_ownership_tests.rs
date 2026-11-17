@@ -129,6 +129,30 @@ fn mcp_audit(row: &McpServerInstallationRecord) -> McpAuditEventRecord {
     }
 }
 
+// Source-only regression: NOT_RUN / NOT_COMPILED.
+#[tokio::test]
+async fn mcp_installation_id_lookup_preserves_workspace_and_scope_boundaries() {
+    let store = test_store_with_workspace("ws-mcp-id").await;
+    let id = "M".repeat(21);
+    let row = mcp(&id, "ws-mcp-id", "saved-public-name");
+    store.upsert_mcp_server_installation(&row, 1).await.unwrap();
+    let found = store
+        .find_mcp_server_installation_by_id("workspace", "ws-mcp-id", &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.name, "saved-public-name");
+    for (kind, scope) in [("workspace", "foreign-workspace"), ("user", "ws-mcp-id")] {
+        assert!(
+            store
+                .find_mcp_server_installation_by_id(kind, scope, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 #[tokio::test]
 async fn package_update_retains_native_identity_policy_overrides_and_successful_sibling() {
     let store = test_store_with_workspace("ws-update").await;
