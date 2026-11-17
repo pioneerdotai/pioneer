@@ -161,3 +161,83 @@ pub(super) fn app_response(
         _ => json!(AppItem::from_package(serde_json::from_value(value)?)),
     })
 }
+
+impl MessageProcessor {
+    /// Resolve the declaring App's current backend. The existing MCP actor owns
+    /// connection lifecycle; this adapter only supplies runtime routing/authority.
+    pub(crate) async fn resolve_pioneer_mcp_target(
+        &self,
+        installation_id: &str,
+        installation: &pioneer_mcp::McpServerInstallation,
+        is_invocation: bool,
+    ) -> anyhow::Result<pioneer_mcp::McpHttpTarget> {
+        anyhow::ensure!(installation.is_pioneer(), "apps.invalid_mcp_target");
+        // Metadata/session reconciliation is maintenance; tool routing blocks
+        // its invocation owner. Reuse the existing database-scoped processor.
+        let processor = self.scoped_with_database_class(if is_invocation {
+            pioneer_sqlite::SqliteWriteClass::Interactive
+        } else {
+            pioneer_sqlite::SqliteWriteClass::Maintenance
+        });
+        let app_id = installation.source_ref["app_id"]
+            .as_str()
+            .context("apps.mcp_owner_missing")?;
+        let owner = processor
+            .crud_store
+            .find_mcp_plugin_owner(installation_id)
+            .await?
+            .context("apps.mcp_owner_missing")?;
+        anyhow::ensure!(
+            owner.package_id == app_id
+                && owner.member_key == installation.source_ref["member_key"].as_str().unwrap_or(""),
+            "apps.mcp_owner_mismatch"
+        );
+        anyhow::ensure!(
+            processor
+                .crud_store
+                .plugin_child_runtime_available(installation_id, &installation.scope_key)
+                .await?,
+            "apps.mcp_unavailable"
+        );
+        let parent = processor
+            .crud_store
+            .find_package_installation(app_id)
+            .await?
+            .context("apps.not_found")?;
+        anyhow::ensure!(parent.kind == PackageKind::App, "apps.mcp_owner_not_app");
+        let pioneer_mcp::McpTransportConfig::StreamableHttp { url, .. } = &installation.transport
+        else {
+            anyhow::bail!("apps.invalid_mcp_transport")
+        };
+        // The common parser owns URL validation. Only its path is used here;
+        // the destination authority always comes from the App runtime owner.
+        let url = url::Url::parse(url)?;
+        anyhow::ensure!(url.path().starts_with('/'), "apps.invalid_mcp_path");
+        let mut headers = std::collections::HashMap::new();
+        let (origin, cancellation) = if dev::is_dev(&parent) {
+            (dev::view_url(&parent)?, None)
+        } else {
+            let (address, credential, cancel) = self
+                .app_runtime
+                .upstream(app_id)
+                .await
+                .context("apps.not_ready")?;
+            anyhow::ensure!(
+                self.app_runtime.status(app_id).await.state == "ready" && !cancel.is_cancelled(),
+                "apps.not_ready"
+            );
+            let mut value = axum::http::HeaderValue::from_str(credential.expose_secret())?;
+            value.set_sensitive(true);
+            headers.insert(
+                axum::http::HeaderName::from_static("pioneer-app-execution-credential"),
+                value,
+            );
+            (format!("http://{address}"), Some(cancel))
+        };
+        Ok(pioneer_mcp::McpHttpTarget {
+            uri: format!("{}{}", origin.trim_end_matches('/'), url.path()).into(),
+            headers,
+            cancellation,
+        })
+    }
+}

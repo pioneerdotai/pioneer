@@ -18,13 +18,14 @@ pub(crate) enum ManagedHttpError {
     Network(reqwest_0_13::Error),
     Forbidden,
     OAuth(McpRuntimeError),
+    Routing(McpRuntimeError),
 }
 impl std::fmt::Display for ManagedHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Network(e) => e.fmt(f),
             Self::Forbidden => f.write_str("MCP server denied access (403)"),
-            Self::OAuth(error) => error.fmt(f),
+            Self::OAuth(error) | Self::Routing(error) => error.fmt(f),
         }
     }
 }
@@ -33,7 +34,7 @@ impl std::error::Error for ManagedHttpError {
         match self {
             Self::Network(e) => Some(e),
             Self::Forbidden => None,
-            Self::OAuth(error) => Some(error),
+            Self::OAuth(error) | Self::Routing(error) => Some(error),
         }
     }
 }
@@ -145,8 +146,59 @@ pub(crate) struct ManagedHttpClient {
     pub owner: Option<Arc<dyn McpOAuthProvider>>,
     pub id: String,
     pub installation: McpServerInstallation,
+    pub resolver: Option<Arc<dyn crate::McpHttpResolver>>,
 }
 impl ManagedHttpClient {
+    async fn route(
+        &self,
+        uri: Arc<str>,
+        mut headers: HashMap<HeaderName, HeaderValue>,
+        caller: Option<&crate::McpCaller>,
+    ) -> Result<
+        (
+            Arc<str>,
+            HashMap<HeaderName, HeaderValue>,
+            Option<tokio_util::sync::CancellationToken>,
+        ),
+        StreamableHttpError<ManagedHttpError>,
+    > {
+        if !self.installation.is_pioneer() {
+            return Ok((uri, headers, None));
+        }
+        let resolver = self.resolver.as_ref().ok_or_else(|| {
+            StreamableHttpError::Client(ManagedHttpError::Routing(McpRuntimeError::failed(
+                "Pioneer App HTTP resolver unavailable",
+            )))
+        })?;
+        let target = resolver
+            .resolve(&self.id, &self.installation, caller)
+            .await
+            .map_err(|error| StreamableHttpError::Client(ManagedHttpError::Routing(error)))?;
+        // Gateway owns all authority headers, including absence during discovery.
+        for name in [
+            "pioneer-app-user-id",
+            "pioneer-app-agent-id",
+            "pioneer-app-execution-credential",
+        ] {
+            headers.remove(&HeaderName::from_static(name));
+        }
+        headers.extend(target.headers);
+        if let Some(caller) = caller {
+            for (name, value) in [
+                ("pioneer-app-user-id", &caller.user_id),
+                ("pioneer-app-agent-id", &caller.agent_id),
+            ] {
+                let value = HeaderValue::from_str(value).map_err(|_| {
+                    StreamableHttpError::Client(ManagedHttpError::Routing(McpRuntimeError::failed(
+                        "Invalid Pioneer MCP caller",
+                    )))
+                })?;
+                headers.insert(HeaderName::from_static(name), value);
+            }
+        }
+        Ok((target.uri, headers, target.cancellation))
+    }
+
     fn request_headers(
         &self,
         auth_token: Option<&str>,
@@ -334,7 +386,8 @@ impl StreamableHttpClient for ManagedHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
         let custom_headers = self.request_headers(auth_token.as_deref(), custom_headers);
-        let result = async {
+        let (uri, custom_headers, cancellation) = self.route(uri, custom_headers, None).await?;
+        let result = runtime_request(cancellation.as_ref(), async {
             match &self.authorized {
                 Some(c) => {
                     c.delete_session(uri, session_id, auth_token, custom_headers)
@@ -346,10 +399,10 @@ impl StreamableHttpClient for ManagedHttpClient {
                         .await
                 }
             }
-        }
+        })
         .with_subscriber(tracing::subscriber::NoSubscriber::default())
         .await;
-        self.checked(result).await
+        self.checked(result?).await
     }
     async fn get_stream(
         &self,
@@ -363,7 +416,8 @@ impl StreamableHttpClient for ManagedHttpClient {
         StreamableHttpError<Self::Error>,
     > {
         let custom_headers = self.request_headers(auth_token.as_deref(), custom_headers);
-        let result = async {
+        let (uri, custom_headers, cancellation) = self.route(uri, custom_headers, None).await?;
+        let result = runtime_request(cancellation.as_ref(), async {
             match &self.authorized {
                 Some(c) => {
                     c.get_stream(uri, session_id, last_event_id, auth_token, custom_headers)
@@ -375,10 +429,11 @@ impl StreamableHttpClient for ManagedHttpClient {
                         .await
                 }
             }
-        }
+        })
         .with_subscriber(tracing::subscriber::NoSubscriber::default())
         .await;
-        let stream = self.checked(result).await?;
+        let stream = self.checked(result?).await?;
+        let stream = runtime_stream(stream, cancellation);
         Ok(if self.authorized.is_some() {
             safe_oauth_stream(stream)
         } else {
@@ -393,8 +448,31 @@ impl StreamableHttpClient for ManagedHttpClient {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let caller = match &message {
+            rmcp::model::ClientJsonRpcMessage::Request(request) => {
+                use rmcp::model::GetExtensions;
+                request
+                    .request
+                    .extensions()
+                    .get::<crate::McpCaller>()
+                    .cloned()
+            }
+            _ => None,
+        };
+        if self.installation.is_pioneer()
+            && matches!(&message,
+            rmcp::model::ClientJsonRpcMessage::Request(request)
+                if matches!(&request.request, rmcp::model::ClientRequest::CallToolRequest(_)))
+            && caller.is_none()
+        {
+            return Err(StreamableHttpError::Client(ManagedHttpError::Routing(
+                McpRuntimeError::failed("Pioneer MCP tool call has no admitted caller"),
+            )));
+        }
         let custom_headers = self.request_headers(auth_token.as_deref(), custom_headers);
-        let result = async {
+        let (uri, custom_headers, cancellation) =
+            self.route(uri, custom_headers, caller.as_ref()).await?;
+        let result = runtime_request(cancellation.as_ref(), async {
             match &self.authorized {
                 Some(c) => {
                     c.post_message(uri, message, session_id, auth_token, custom_headers)
@@ -406,10 +484,10 @@ impl StreamableHttpClient for ManagedHttpClient {
                         .await
                 }
             }
-        }
+        })
         .with_subscriber(tracing::subscriber::NoSubscriber::default())
         .await;
-        let result = match result {
+        let result = match result? {
             Ok(StreamableHttpPostResponse::Json(mut message, session))
                 if self.authorized.is_some() =>
             {
@@ -425,9 +503,33 @@ impl StreamableHttpClient for ManagedHttpClient {
                     session,
                 ))
             }
+            Ok(StreamableHttpPostResponse::Sse(stream, session)) => Ok(
+                StreamableHttpPostResponse::Sse(runtime_stream(stream, cancellation), session),
+            ),
             other => other,
         };
         self.checked(result).await
+    }
+}
+
+async fn runtime_request<T>(
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    request: impl std::future::Future<Output = T>,
+) -> Result<T, StreamableHttpError<ManagedHttpError>> {
+    tokio::select! {
+        biased;
+        _ = async { match cancellation { Some(token) => token.cancelled().await, None => std::future::pending().await } } =>
+            Err(StreamableHttpError::Client(ManagedHttpError::Routing(McpRuntimeError::cancelled("App execution stopped")))),
+        result = request => Ok(result),
+    }
+}
+fn runtime_stream<T: Send + 'static>(
+    stream: BoxStream<'static, T>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> BoxStream<'static, T> {
+    match cancellation {
+        Some(token) => stream.take_until(token.cancelled_owned()).boxed(),
+        None => stream,
     }
 }
 
@@ -452,6 +554,7 @@ mod tests {
             owner: None,
             id: "http".into(),
             installation,
+            resolver: None,
         };
         let headers = HashMap::from([
             (
@@ -533,6 +636,7 @@ mod tests {
             owner: Some(owner.clone()),
             id: "installation".into(),
             installation,
+            resolver: None,
         };
         let task = tokio::spawn(async move {
             client
