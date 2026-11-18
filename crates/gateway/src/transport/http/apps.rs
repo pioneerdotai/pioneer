@@ -126,6 +126,35 @@ pub(super) async fn app_view(
             .body(Body::empty())
             .map_err(|_| HttpError::service_unavailable(id));
     }
+    // Host-owned resources use the existing App view identity and origin policy.
+    if path == "_pioneer/profiles" || path.starts_with("_pioneer/profiles/") {
+        use axum::response::IntoResponse as _;
+
+        let revoked = lease.cancellation_token();
+        let mut response = tokio::select! {
+            biased;
+            _ = execution.cancelled() => return Err(HttpError::not_found(id)),
+            _ = revoked.cancelled() => return Err(HttpError::not_found(id)),
+            _ = stream_cancel.cancelled() => return Err(HttpError::not_found(id)),
+            _ = state.view_grants.wait_app_expiry(&grant) => return Err(HttpError::not_found(id)),
+            result = tokio::time::timeout(Duration::from_secs(10), super::app_profiles::request(
+                &state, context.principal(), &scope.workspace_id, &path,
+                &parts.method, &parts.headers, body, &id,
+            )) => match result {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => error.into_response(),
+                Err(_) => HttpError::service_unavailable(id.clone()).into_response(),
+            },
+        };
+        let headers = response.headers_mut();
+        headers.insert("access-control-allow-origin", allowed_origin);
+        headers.insert("cross-origin-resource-policy", HeaderValue::from_static("cross-origin"));
+        headers.insert("cache-control", HeaderValue::from_static("no-store"));
+        if development {
+            headers.insert("vary", HeaderValue::from_static("origin"));
+        }
+        return Ok(response);
+    }
     if parts
         .headers
         .get("upgrade")
@@ -357,7 +386,7 @@ fn app_content_security_policy(
     // Sandboxed WebKit documents can reject connect-src 'self'. Explicit
     // sources preserve the same Gateway authority for fetch and WebSocket.
     Ok(format!(
-        "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://{authority} https://{authority} ws://{authority} wss://{authority}; frame-src 'none'; object-src 'none'; worker-src 'none'; base-uri 'self'; form-action 'self'"
+        "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://{authority} https://{authority}; connect-src 'self' http://{authority} https://{authority} ws://{authority} wss://{authority}; frame-src 'none'; object-src 'none'; worker-src 'none'; base-uri 'self'; form-action 'self'"
     ))
 }
 
