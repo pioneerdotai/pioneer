@@ -148,7 +148,10 @@ pub(super) async fn app_view(
         };
         let headers = response.headers_mut();
         headers.insert("access-control-allow-origin", allowed_origin);
-        headers.insert("cross-origin-resource-policy", HeaderValue::from_static("cross-origin"));
+        headers.insert(
+            "cross-origin-resource-policy",
+            HeaderValue::from_static("cross-origin"),
+        );
         headers.insert("cache-control", HeaderValue::from_static("no-store"));
         if development {
             headers.insert("vary", HeaderValue::from_static("origin"));

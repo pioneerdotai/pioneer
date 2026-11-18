@@ -14,6 +14,7 @@ mod attachment;
 mod auth;
 pub(crate) mod authorization;
 mod bootstrap;
+mod browser_render;
 pub mod claude_mcp_conformance;
 #[doc(hidden)]
 pub mod cli_mcp_client_validation;
@@ -27,7 +28,6 @@ mod epic5_observability;
 mod helpers;
 mod hook_run_store;
 mod hook_runtime;
-mod browser_render;
 mod host_api;
 mod human_interaction;
 mod identity;

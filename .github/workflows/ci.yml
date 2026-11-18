@@ -52,6 +52,9 @@ jobs:
         with:
           shared-key: ci-${{ matrix.target }}
 
+      - uses: ./.github/actions/install-onnx-runtime-macos-x86_64
+        if: matrix.target == 'x86_64-apple-darwin'
+
       - name: cargo-check-workspace
         shell: bash
         run: |
