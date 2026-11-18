@@ -213,31 +213,32 @@ impl MessageProcessor {
         // the destination authority always comes from the App runtime owner.
         let url = url::Url::parse(url)?;
         anyhow::ensure!(url.path().starts_with('/'), "apps.invalid_mcp_path");
-        let mut headers = std::collections::HashMap::new();
-        let (origin, cancellation) = if dev::is_dev(&parent) {
-            (dev::view_url(&parent)?, None)
+        let (address, credential, cancellation) = if dev::is_dev(&parent) {
+            let upstream = processor.dev_upstream(&parent).await?;
+            (upstream.address, upstream.credential, upstream.cancellation)
         } else {
-            let (address, credential, cancel) = self
+            let upstream = self
                 .app_runtime
                 .upstream(app_id)
                 .await
                 .context("apps.not_ready")?;
             anyhow::ensure!(
-                self.app_runtime.status(app_id).await.state == "ready" && !cancel.is_cancelled(),
+                self.app_runtime.status(app_id).await.state == "ready"
+                    && !upstream.2.is_cancelled(),
                 "apps.not_ready"
             );
-            let mut value = axum::http::HeaderValue::from_str(credential.expose_secret())?;
-            value.set_sensitive(true);
-            headers.insert(
-                axum::http::HeaderName::from_static("pioneer-app-execution-credential"),
-                value,
-            );
-            (format!("http://{address}"), Some(cancel))
+            upstream
         };
+        let mut value = axum::http::HeaderValue::from_str(credential.expose_secret())?;
+        value.set_sensitive(true);
+        let headers = std::collections::HashMap::from([(
+            axum::http::HeaderName::from_static("pioneer-app-execution-credential"),
+            value,
+        )]);
         Ok(pioneer_mcp::McpHttpTarget {
-            uri: format!("{}{}", origin.trim_end_matches('/'), url.path()).into(),
+            uri: format!("http://{address}{}", url.path()).into(),
             headers,
-            cancellation,
+            cancellation: Some(cancellation),
         })
     }
 }

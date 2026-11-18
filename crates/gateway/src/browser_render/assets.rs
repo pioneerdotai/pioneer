@@ -9,6 +9,7 @@ pub(crate) struct AssetSource {
     address: std::net::SocketAddr,
     credential: pioneer_protocol::AuthSecretString,
     entry: String,
+    development: bool,
     remaining: usize,
     requests: usize,
 }
@@ -18,6 +19,7 @@ impl AssetSource {
         address: std::net::SocketAddr,
         credential: pioneer_protocol::AuthSecretString,
         entry: String,
+        development: bool,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
@@ -28,6 +30,7 @@ impl AssetSource {
             address,
             credential,
             entry,
+            development,
             remaining: ASSET_BUDGET,
             requests: 0,
         })
@@ -50,17 +53,18 @@ impl AssetSource {
     async fn load(&mut self, event: &Value) -> Option<(Vec<Value>, Vec<u8>)> {
         let request = &event["request"];
         let path = request["url"].as_str()?.strip_prefix(RENDER_ORIGIN)?;
-        let component_ok = |p: &str| {
-            !p.is_empty()
-                && p != "."
-                && p != ".."
-                && p.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        };
-        if request["method"] != "GET"
-            || self.requests >= 256
-            || !path.starts_with('/')
-            || !path[1..].split('/').all(component_ok)
+        if request["method"] != "GET" || self.requests >= 256 {
+            return None;
+        }
+        let resource = event["resourceType"].as_str().unwrap_or_default();
+        if self.development {
+            if !dev_render_path(path, &self.entry, resource) {
+                return None;
+            }
+        } else if !path.starts_with('/')
+            || !path[1..]
+                .split('/')
+                .all(|part| valid_component(part, b"-_."))
             || (path != self.entry && !path.starts_with("/assets/"))
         {
             return None;
@@ -85,6 +89,9 @@ impl AssetSource {
             .to_str()
             .ok()?
             .to_owned();
+        if self.development && path != self.entry && !dev_render_mime(resource, &content_type) {
+            return None;
+        }
         let mut headers = vec![json!({"name":"content-type","value":content_type})];
         if path == self.entry {
             headers.push(json!({"name":"content-security-policy","value":
@@ -96,5 +103,54 @@ impl AssetSource {
             data.extend_from_slice(&chunk);
         }
         Some((headers, data))
+    }
+}
+
+fn valid_component(part: &str, extra: &[u8]) -> bool {
+    !part.is_empty()
+        && !matches!(part, "." | "..")
+        && part
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || extra.contains(&byte))
+}
+
+fn dev_render_path(path: &str, entry: &str, resource: &str) -> bool {
+    if path == entry {
+        return resource == "Document";
+    }
+    if !matches!(
+        resource,
+        "Script" | "Stylesheet" | "Image" | "Font" | "Media"
+    ) || path.len() > 4096
+    {
+        return false;
+    }
+    let pathname = path.split('?').next().unwrap_or_default();
+    let Some(relative) = pathname.strip_prefix('/') else {
+        return false;
+    };
+    relative.split('/').all(|part| {
+        valid_component(part, b"-_.@:+~")
+            && (!part.starts_with('.') || part == ".vite")
+            && !part.eq_ignore_ascii_case("credential.json")
+            && part != "@fs"
+    }) && !matches!(relative.split('/').next(), Some("api" | "collaboration"))
+}
+
+fn dev_render_mime(resource: &str, value: &str) -> bool {
+    let mime = value.split(';').next().unwrap_or_default().trim();
+    match resource {
+        "Script" => matches!(
+            mime,
+            "text/javascript"
+                | "application/javascript"
+                | "application/ecmascript"
+                | "text/ecmascript"
+        ),
+        "Stylesheet" => mime == "text/css",
+        "Image" => mime.starts_with("image/"),
+        "Font" => mime.starts_with("font/") || mime.starts_with("application/font-"),
+        "Media" => mime.starts_with("audio/") || mime.starts_with("video/"),
+        _ => false,
     }
 }

@@ -175,8 +175,10 @@ impl AppView {
         let changed = self
             .publication
             .as_ref()
-            .map(|p| (&p.state, &p.title, &p.url))
-            != next.as_ref().map(|p| (&p.state, &p.title, &p.url));
+            .map(|p| (&p.state, &p.title, &p.url, &p.base_url))
+            != next
+                .as_ref()
+                .map(|p| (&p.state, &p.title, &p.url, &p.base_url));
         self.publication = next;
         if self.publication.as_ref().is_none_or(|p| p.state != "ready") {
             self.hide(cx);
@@ -369,7 +371,13 @@ fn view_attributes<'a>(
             })
         }));
         attributes.url = Some(url.to_owned());
-        dev_theme_script(palette, url)
+        let base = prefix.ok_or_else(|| anyhow::anyhow!("missing App view prefix"))?;
+        let origin = serde_json::to_string(&parsed.origin().ascii_serialization())?;
+        let base = serde_json::to_string(base)?;
+        format!(
+            r#"if(window.top===window&&location.origin==={origin})Object.defineProperty(window,"__pioneerAppBaseUrl",{{value:{base}}});{}"#,
+            dev_theme_script(palette, url)
+        )
     } else {
         let prefix = prefix
             .ok_or_else(|| anyhow::anyhow!("missing App view prefix"))?
@@ -468,8 +476,18 @@ mod tests {
     fn dev_panel_passes_the_url_to_wry_with_only_the_presentation_bridge() {
         // Inspect the actual loader attributes passed to WebView::build. A
         // registration-only or location-planner test cannot cover this boundary.
-        let (attributes, _requests) =
-            view_attributes("http://localhost:3000", None, true, "App", &palette()).unwrap();
+        let prefix = "http://localhost:17878/storage/app-views/dev-grant/";
+        let (attributes, _requests) = view_attributes(
+            "http://localhost:3000",
+            Some(prefix),
+            true,
+            "App",
+            &palette(),
+        )
+        .unwrap();
+        assert!(attributes.initialization_scripts.iter().any(|script| {
+            script.script.contains("__pioneerAppBaseUrl") && script.script.contains(prefix)
+        }));
         assert_eq!(attributes.url.as_deref(), Some("http://localhost:3000"));
         assert!(attributes.html.is_none());
         assert!(attributes.headers.is_none());

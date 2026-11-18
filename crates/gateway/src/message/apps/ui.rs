@@ -13,6 +13,7 @@ impl MessageProcessor {
         std::net::SocketAddr,
         pioneer_protocol::AuthSecretString,
         tokio_util::sync::CancellationToken,
+        Option<url::Origin>,
     )> {
         self.admit_plugin_image(context, &scope.workspace_id)
             .await?;
@@ -28,18 +29,30 @@ impl MessageProcessor {
                 && parent.state == "installed",
             "apps.unavailable"
         );
-        let status = self.app_view_status(&scope.app_id).await;
+        if super::dev::is_dev(&parent) {
+            anyhow::ensure!(
+                self.dev_view_execution(&scope.app_id).await.as_deref()
+                    == Some(scope.execution_id.as_str()),
+                "apps.execution_unavailable"
+            );
+            let upstream = self.dev_upstream(&parent).await?;
+            return Ok((
+                upstream.address,
+                upstream.credential,
+                upstream.cancellation,
+                Some(upstream.origin),
+            ));
+        }
+        let status = self.app_runtime.status(&scope.app_id).await;
         anyhow::ensure!(
             status.state == "ready"
                 && status.execution_id.as_deref() == Some(scope.execution_id.as_str()),
             "apps.execution_unavailable"
         );
-        // Dev grants control the native view lease only. They cannot be used
-        // to serve a dev page or its resources through the release proxy.
-        anyhow::ensure!(!super::dev::is_dev(&parent), "apps.dev_direct_view_only");
         self.app_runtime
             .upstream(&scope.app_id)
             .await
+            .map(|(address, credential, cancel)| (address, credential, cancel, None))
             .context("apps.execution_unavailable")
     }
     pub(super) async fn app_open_view(&self, context: &RequestContext, request: JsonRpcRequest) {
@@ -242,10 +255,16 @@ impl MessageProcessor {
                     && parent.workspace_id == app.workspace_id,
                 "apps.unavailable"
             );
-            let status = self.app_view_status(&app.app_id).await;
+            let execution = if super::dev::is_dev(&parent) {
+                self.dev_view_execution(&app.app_id).await
+            } else {
+                let status = self.app_runtime.status(&app.app_id).await;
+                (status.state == "ready")
+                    .then_some(status.execution_id)
+                    .flatten()
+            };
             anyhow::ensure!(
-                status.execution_id.as_deref() == Some(app.execution_id.as_str())
-                    && status.state == "ready",
+                execution.as_deref() == Some(app.execution_id.as_str()),
                 "apps.unavailable"
             );
             let expires_at = service

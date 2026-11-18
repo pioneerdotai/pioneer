@@ -140,12 +140,7 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> Result<()> {
             &config, &home, operation,
         ))?;
     match command.as_str() {
-        "add" => println!(
-            "{}",
-            result["id"]
-                .as_str()
-                .context("Gateway did not return a dev connection ID")?
-        ),
+        "add" => println!("{}", serde_json::to_string_pretty(&result)?),
         "list" => {
             let connections: Vec<pioneer_protocol::AppDevConnection> =
                 serde_json::from_value(result)?;

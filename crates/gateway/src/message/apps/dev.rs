@@ -110,10 +110,72 @@ struct ViewState {
     execution: String,
     diagnostic: Option<String>,
 }
+
+#[derive(Serialize, Deserialize)]
+struct DevCredentials {
+    host: AuthSecretString,
+    proxy: AuthSecretString,
+}
+
+impl DevCredentials {
+    fn read(path: &Path) -> Result<Option<Self>> {
+        use std::io::Read;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.take(1025).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 1024, "apps.dev_invalid_credentials");
+        let credentials: Self = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("apps.dev_invalid_credentials"))?;
+        for key in [&credentials.host, &credentials.proxy] {
+            ensure!(
+                key.expose_secret().len() == 64
+                    && key
+                        .expose_secret()
+                        .bytes()
+                        .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) }),
+                "apps.dev_invalid_credentials"
+            );
+        }
+        Ok(Some(credentials))
+    }
+
+    fn load(data: &Path, create: bool) -> Result<Option<Self>> {
+        use std::io::Write;
+        let path = data.join("dev-credentials.json");
+        let existing = Self::read(&path)?;
+        if existing.is_some() || !create {
+            return Ok(existing);
+        }
+        let credentials = Self {
+            host: AuthSecretString::new(hex::encode(rand::random::<[u8; 32]>())),
+            proxy: AuthSecretString::new(hex::encode(rand::random::<[u8; 32]>())),
+        };
+        let mut file = tempfile::NamedTempFile::new_in(data)?;
+        serde_json::to_writer(&mut file, &credentials)?;
+        file.flush()?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(data)?.sync_all()?;
+        Ok(Some(credentials))
+    }
+}
+pub(super) struct DevUpstream {
+    pub(super) origin: url::Origin,
+    pub(super) address: SocketAddr,
+    pub(super) credential: AuthSecretString,
+    pub(super) cancellation: CancellationToken,
+}
+
 #[derive(Default)]
 pub(in crate::message) struct DevApps {
     views: Mutex<BTreeMap<String, ViewState>>,
     worker: Mutex<Option<(CancellationToken, JoinHandle<()>)>>,
+    probe: std::sync::OnceLock<reqwest::Client>,
 }
 impl MessageProcessor {
     pub(super) async fn dev_apps_request(&self, context: &RequestContext, request: JsonRpcRequest) {
@@ -254,12 +316,7 @@ impl MessageProcessor {
                                 .context("apps.invalid_manifest")?
                                 .as_bytes(),
                         )?;
-                        let reachable = tokio::time::timeout(
-                            Duration::from_secs(1),
-                            tokio::net::TcpStream::connect(source.address()?),
-                        )
-                        .await
-                        .is_ok_and(|r| r.is_ok());
+                        let reachable = self.dev_server_ready(&parent).await?;
                         items.push(AppDevConnection {
                             id: parent.id,
                             name: manifest.presentation("", &Default::default()).name,
@@ -335,15 +392,182 @@ impl MessageProcessor {
             device: DeviceId::new("D00000000000000000000")?,
             session: AuthSessionId::new("S00000000000000000000")?,
         };
-        self.execute_dev_apps(
-            &source.context(),
-            method,
-            &RequestId::new(generate_id(21))?,
-            params,
-        )
-        .await
+        let result = self
+            .execute_dev_apps(
+                &source.context(),
+                method,
+                &RequestId::new(generate_id(21))?,
+                params,
+            )
+            .await?;
+        if method != constants::methods::APPS_DEV_ADD {
+            return Ok(result);
+        }
+        let id = result["id"].as_str().context("apps.dev_invalid_id")?;
+        let address = self
+            .gateway_listen_addr
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .context("apps.gateway_endpoint_unavailable")?;
+        let mut endpoint =
+            GatewayBaseUrl::from_local_listen_addr(&address.to_string())?.websocket_url();
+        endpoint.set_path("/apps/host");
+        let credentials = self
+            .dev_host_credentials(id, true)
+            .await?
+            .context("apps.dev_unavailable")?;
+        Ok(serde_json::json!({
+            "id": id,
+            "execution_id": id,
+            "ui_base_path": "/",
+            "ui_proxy": { "credential": credentials.proxy },
+            "host_api": {
+                "endpoint": endpoint.as_str(),
+                "credential": credentials.host,
+                "capabilities": ["host.pty", "host.render"]
+            }
+        }))
     }
+
+    async fn dev_host_credentials(&self, id: &str, create: bool) -> Result<Option<DevCredentials>> {
+        let lock = self.plugin_mutation_lock(id).await;
+        let guard = Arc::new(lock.lock_owned().await);
+        let Some(parent) = self.crud_store.find_package_installation(id).await? else {
+            return Ok(None);
+        };
+        if !is_dev(&parent)
+            || !parent.enabled
+            || parent.state != "installed"
+            || parent.pending_json.is_some()
+        {
+            return Ok(None);
+        }
+        read_source(&parent)?;
+        if !pioneer_crud::resolve_workspace_authorization_scope(
+            &self.crud_store.database_connection(),
+            &parent.workspace_id,
+        )
+        .await?
+        .is_some_and(|scope| scope.is_active)
+        {
+            return Ok(None);
+        }
+        let data = PathBuf::from(parent.data_path);
+        let hold = guard.clone();
+        let credentials = tokio::task::spawn_blocking(move || {
+            let _hold = hold;
+            DevCredentials::load(&data, create)
+        })
+        .await??;
+        if let Some(credentials) = &credentials {
+            // A dev server is started by the developer, so its execution ID
+            // follows the durable registration rather than the native view.
+            self.host_api.register(
+                credentials.host.expose_secret(),
+                parent.id.clone(),
+                parent.workspace_id,
+                parent.id,
+                CancellationToken::new(),
+            );
+        }
+        Ok(credentials)
+    }
+    pub(super) async fn dev_upstream(
+        &self,
+        parent: &pioneer_crud::PackageRecord,
+    ) -> Result<DevUpstream> {
+        ensure!(
+            is_dev(parent)
+                && parent.enabled
+                && parent.state == "installed"
+                && parent.pending_json.is_none(),
+            "apps.dev_unavailable"
+        );
+        let source = read_source(parent)?;
+        let address = source.address()?;
+        let origin = url::Url::parse(&source.url)?.origin();
+        let data = PathBuf::from(&parent.data_path);
+        let credentials = tokio::task::spawn_blocking(move || DevCredentials::load(&data, false))
+            .await??
+            .context("apps.dev_credentials_missing")?;
+        let authority = self
+            .host_api
+            .admit(credentials.host.expose_secret())
+            .filter(|scope| {
+                scope.app_id == parent.id
+                    && scope.execution_id == parent.id
+                    && scope.workspace_id == parent.workspace_id
+                    && !scope.cancel.is_cancelled()
+            })
+            .context("apps.dev_unavailable")?;
+        Ok(DevUpstream {
+            address,
+            origin,
+            credential: credentials.proxy,
+            cancellation: authority.cancel.clone(),
+        })
+    }
+
+    async fn dev_server_ready(&self, parent: &pioneer_crud::PackageRecord) -> Result<bool> {
+        let source = read_source(parent)?;
+        let manifest = pioneer_apps::AppManifest::parse(
+            parent
+                .app_manifest_json
+                .as_deref()
+                .context("apps.invalid_manifest")?
+                .as_bytes(),
+        )?;
+        let address = source.address()?;
+        let path = manifest
+            .runtime()
+            .map(|runtime| runtime.readiness.path.as_str())
+            .or_else(|| manifest.ui().map(|ui| ui.path.as_str()));
+        let Some(path) = path else {
+            return Ok(tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::net::TcpStream::connect(address),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok()));
+        };
+        let client = if let Some(client) = self.dev_apps.probe.get() {
+            client
+        } else {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(1))
+                .build()?;
+            self.dev_apps.probe.get_or_init(|| client)
+        };
+        let mut request = client.get(format!("http://{address}{path}"));
+        if let Ok(upstream) = self.dev_upstream(parent).await {
+            request = request.header(
+                "pioneer-app-execution-credential",
+                upstream.credential.expose_secret(),
+            );
+        }
+        Ok(request
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success()))
+    }
+
+    pub(super) async fn dev_view_execution(&self, app: &str) -> Option<String> {
+        self.dev_apps
+            .views
+            .lock()
+            .await
+            .get(app)
+            .map(|view| view.execution.clone())
+    }
+
     pub(in crate::message) async fn stop_dev_view(&self, app: &str) {
+        self.host_api.revoke_execution(app);
+        self.invalidate_dev_view(app).await;
+    }
+
+    async fn invalidate_dev_view(&self, app: &str) {
         if let Some(view) = self.dev_apps.views.lock().await.remove(app) {
             if let Some(grants) = self.view_grant_service() {
                 grants.invalidate_app_views(&view.workspace, Some(app), None);
@@ -354,15 +578,40 @@ impl MessageProcessor {
         &self,
         app: &str,
     ) -> super::runtime::RuntimeStatus {
-        if let Some(view) = self.dev_apps.views.lock().await.get(app) {
-            return super::runtime::RuntimeStatus {
-                state: "ready".into(),
-                failure: view.diagnostic.clone(),
-                execution_id: Some(view.execution.clone()),
-            };
-        }
         match self.crud_store.find_package_installation(app).await {
             Ok(Some(parent)) if is_dev(&parent) => {
+                if !parent.enabled {
+                    return super::runtime::RuntimeStatus {
+                        state: "stopped".into(),
+                        failure: None,
+                        execution_id: None,
+                    };
+                }
+                let view = self
+                    .dev_apps
+                    .views
+                    .lock()
+                    .await
+                    .get(app)
+                    .map(|view| (view.execution.clone(), view.diagnostic.clone()));
+                if let Some((execution, diagnostic)) = view {
+                    let (ready, failure) = match self.dev_server_ready(&parent).await {
+                        Ok(true) => (true, diagnostic),
+                        Ok(false) => (
+                            false,
+                            diagnostic.or_else(|| Some("apps.dev_server_unavailable".into())),
+                        ),
+                        Err(error) => (false, diagnostic.or_else(|| Some(error.to_string()))),
+                    };
+                    let ready = ready
+                        && self.dev_view_execution(app).await.as_deref()
+                            == Some(execution.as_str());
+                    return super::runtime::RuntimeStatus {
+                        state: if ready { "ready" } else { "starting" }.into(),
+                        failure,
+                        execution_id: ready.then_some(execution),
+                    };
+                }
                 return super::runtime::RuntimeStatus {
                     state: "preparing".into(),
                     failure: None,
@@ -517,7 +766,7 @@ impl MessageProcessor {
         stop: CancellationToken,
         wake: Arc<tokio::sync::Notify>,
     ) {
-        self.stop_dev_view(&parent.id).await;
+        self.invalidate_dev_view(&parent.id).await;
         let source = match read_source(&parent) {
             Ok(source) => source,
             Err(error) => {
@@ -751,6 +1000,11 @@ impl MessageProcessor {
             if stop.is_cancelled() {
                 break;
             }
+            let host = tokio::select! {
+                _ = stop.cancelled() => break,
+                result = self.dev_host_credentials(&parent.id, false) => result.map(|_| ()),
+            };
+            let outcome = outcome.and(host);
             let mut views = self.dev_apps.views.lock().await;
             let view = views.entry(parent.id.clone()).or_insert_with(|| ViewState {
                 workspace: parent.workspace_id.clone(),
@@ -808,6 +1062,22 @@ impl MessageProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_credentials_survive_reopening_registration() {
+        let data = tempfile::tempdir().unwrap();
+        assert!(DevCredentials::load(data.path(), false).unwrap().is_none());
+        let issued = DevCredentials::load(data.path(), true).unwrap().unwrap();
+        let restored = DevCredentials::load(data.path(), false).unwrap().unwrap();
+        let repeated = DevCredentials::load(data.path(), true).unwrap().unwrap();
+        assert_eq!(restored.host.expose_secret(), issued.host.expose_secret());
+        assert_eq!(repeated.host.expose_secret(), issued.host.expose_secret());
+        assert_eq!(restored.proxy.expose_secret(), issued.proxy.expose_secret());
+        assert_ne!(
+            restored.proxy.expose_secret(),
+            restored.host.expose_secret()
+        );
+    }
 
     #[test]
     fn source_origin_cannot_select_remote_authority_or_embed_credentials() {

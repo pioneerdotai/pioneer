@@ -49,11 +49,39 @@ pub(super) async fn app_view(
             .contains(&peer.ip()),
     )
     .map_err(|_| HttpError::bad_request(id.clone()))?;
-    let (address, proxy_credential, execution) = state
+    let (address, proxy_credential, execution, dev_origin) = state
         .message_processor
         .app_ui_endpoint(&context, scope)
         .await
         .map_err(|_| HttpError::not_found(id.clone()))?;
+    let development = dev_origin.is_some();
+    let origin = parts.headers.get("origin");
+    let allowed_origin = if let Some(dev_origin) = dev_origin {
+        let network = crate::transport::network::resolve_request_network(
+            peer,
+            &parts.headers,
+            &state.config.gateway.trusted_proxy_peers,
+        );
+        if !matches!(
+            network,
+            crate::request_context::RequestNetworkContext::DirectPeer(peer)
+                if peer.ip().is_loopback()
+        ) {
+            return Err(HttpError::not_found(id));
+        }
+        let expected = dev_origin.ascii_serialization();
+        // The page and HMR stay on the registered local origin. Only SDK
+        // fetches and sockets use this scoped grant across origins.
+        let supplied = origin.filter(|origin| origin.as_bytes() == expected.as_bytes());
+        supplied
+            .cloned()
+            .ok_or_else(|| HttpError::not_found(id.clone()))?
+    } else {
+        if origin.is_some_and(|value| value.as_bytes() != b"null") {
+            return Err(HttpError::not_found(id));
+        }
+        HeaderValue::from_static("null")
+    };
     let mut target = url::Url::parse(&format!("http://{address}/"))
         .map_err(|_| HttpError::service_unavailable(id.clone()))?;
     target.set_path(&format!("/{path}"));
@@ -79,19 +107,13 @@ pub(super) async fn app_view(
     } else {
         "../".repeat(depth)
     };
-    // Both native shells sandbox App documents into an opaque origin. Storage
-    // and ambient browser authority are unavailable; this grant is the resource scope.
-    if parts
-        .headers
-        .get("origin")
-        .is_some_and(|v| v.as_bytes() != b"null")
-    {
-        return Err(HttpError::not_found(id));
-    }
     if parts.method == axum::http::Method::OPTIONS {
-        return Response::builder()
-            .status(204)
-            .header("access-control-allow-origin", "null")
+        let mut response = Response::builder().status(204);
+        if development {
+            response = response.header("vary", "origin");
+        }
+        return response
+            .header("access-control-allow-origin", allowed_origin)
             .header(
                 "access-control-allow-methods",
                 "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
@@ -162,9 +184,14 @@ pub(super) async fn app_view(
     };
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|_| HttpError::service_unavailable(id.clone()))?;
+        .connect_timeout(Duration::from_secs(10));
+    let client = if development {
+        client.no_proxy()
+    } else {
+        client
+    }
+    .build()
+    .map_err(|_| HttpError::service_unavailable(id.clone()))?;
     let mut request = client
         .request(parts.method, target)
         .header("pioneer-app-base-path", base)
@@ -196,6 +223,9 @@ pub(super) async fn app_view(
         result = tokio::time::timeout(Duration::from_secs(30), request.send()) => result.map_err(|_| HttpError::service_unavailable(id.clone()))?.map_err(|_| HttpError::service_unavailable(id.clone()))?,
     };
     let mut response = Response::builder().status(upstream.status());
+    if development {
+        response = response.header("vary", "origin");
+    }
     for name in [
         "content-type",
         "content-length",
@@ -266,7 +296,7 @@ pub(super) async fn app_view(
         .header("referrer-policy", "no-referrer")
         .header("x-content-type-options", "nosniff")
         .header("cross-origin-resource-policy", "cross-origin")
-        .header("access-control-allow-origin", "null")
+        .header("access-control-allow-origin", allowed_origin)
         .header(
             "access-control-expose-headers",
             "content-range, accept-ranges, etag, last-modified",

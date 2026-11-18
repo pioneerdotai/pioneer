@@ -449,10 +449,19 @@ fn view_publication(
     bootstrap: &pioneer_protocol::AppViewBootstrap,
 ) -> anyhow::Result<AppViewPublication> {
     use crate::transport::http::BrowserViewUrl;
-    // Validate the lease separately. A dev browser never receives this grant.
+    // Validate the entry and the grant root before publishing either URL.
     let proxied = BrowserViewUrl::resolve_app(gateway, bootstrap.relative_url.expose_secret())
         .map_err(|_| anyhow::anyhow!("app_view_invalid_url"))?;
-    let (url, base_url) = if bootstrap.development {
+    let token = bootstrap
+        .relative_url
+        .expose_secret()
+        .strip_prefix("/storage/app-views/")
+        .and_then(|tail| tail.split_once('/'))
+        .map(|(token, _)| token)
+        .ok_or_else(|| anyhow::anyhow!("app_view_invalid_url"))?;
+    let base_url = BrowserViewUrl::resolve_app(gateway, &format!("/storage/app-views/{token}/"))
+        .map_err(|_| anyhow::anyhow!("app_view_invalid_url"))?;
+    let url = if bootstrap.development {
         let gateway_url = url::Url::parse(gateway.as_str())?;
         let dev = url::Url::parse(
             bootstrap
@@ -479,31 +488,18 @@ fn view_publication(
                 && dev.port_or_known_default() != gateway_url.port_or_known_default(),
             "app_view_invalid_url"
         );
-        (bootstrap.dev_url.clone().unwrap(), None)
+        bootstrap.dev_url.clone().expect("validated dev URL")
     } else {
         anyhow::ensure!(bootstrap.dev_url.is_none(), "app_view_invalid_url");
-        let token = bootstrap
-            .relative_url
-            .expose_secret()
-            .strip_prefix("/storage/app-views/")
-            .and_then(|tail| tail.split_once('/'))
-            .map(|(token, _)| token)
-            .ok_or_else(|| anyhow::anyhow!("app_view_invalid_url"))?;
-        let base_url =
-            BrowserViewUrl::resolve_app(gateway, &format!("/storage/app-views/{token}/"))
-                .map_err(|_| anyhow::anyhow!("app_view_invalid_url"))?;
-        (
-            proxied.expose_url().to_owned(),
-            Some(pioneer_protocol::AuthSecretString::new(
-                base_url.expose_url(),
-            )),
-        )
+        proxied.expose_url().to_owned()
     };
     Ok(AppViewPublication {
         development: bootstrap.development,
         state: "ready".into(),
         url: Some(pioneer_protocol::AuthSecretString::new(url)),
-        base_url,
+        base_url: Some(pioneer_protocol::AuthSecretString::new(
+            base_url.expose_url(),
+        )),
         title: bootstrap.title.clone(),
         expires_at: Some(bootstrap.expires_at),
     })
@@ -583,18 +579,16 @@ mod view_tests {
             first.url.as_ref().unwrap().expose_secret(),
             "http://localhost:3000"
         );
-        assert!(first.base_url.is_none());
-        assert!(
-            !serde_json::to_string(&first)
-                .unwrap()
-                .contains("storage/app-views")
-        );
+        let base = first.base_url.as_ref().unwrap().expose_secret();
+        assert!(base.starts_with("http://127.0.0.1:17878/storage/app-views/"));
+        assert!(base.ends_with('/'));
         bootstrap.relative_url = pioneer_protocol::AuthSecretString::new(format!(
             "/storage/app-views/{}/",
             "B".repeat(43)
         ));
         let second = view_publication(&gateway, true, &bootstrap).unwrap();
         assert_eq!(first.url, second.url);
+        assert_ne!(first.base_url, second.base_url);
         // Installed Apps continue using the Gateway capability, including its
         // base prefix, even when the Gateway registry entry is remote.
         bootstrap.development = false;

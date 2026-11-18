@@ -1535,8 +1535,28 @@ async fn app_update_preserves_native_mcp_secret_override() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-// Source-only regression: NOT_RUN / NOT_COMPILED. Native MCP fixture is disabled;
-// no developer server, provider, process or VM is needed by this scenario.
+async fn dev_fixture_endpoint(
+    readiness: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (String, tokio::task::JoinHandle<std::io::Result<()>>) {
+    use std::sync::atomic::Ordering;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(move || async move {
+            if readiness.load(Ordering::Acquire) {
+                axum::http::StatusCode::NO_CONTENT
+            } else {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        }),
+    );
+    (
+        origin,
+        tokio::spawn(async move { axum::serve(listener, app).await }),
+    )
+}
+
 #[tokio::test]
 async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
     let mut harness = setup_cli_runtime_security_harness(None).await;
@@ -1558,8 +1578,24 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
     manifest["runtime"] = json!({"environment":"node","cwd":"not-built","command":["node","main.js"],"port":3000,"readiness":{"path":"/"}});
     manifest["ui"] = json!({"path":"/"});
     std::fs::write(project.join("app.json"), manifest.to_string()).unwrap();
-    let add = json!({"workspace_id":workspace,"project":project,"url":"http://127.0.0.1:9"});
-    let added = app_rpc(&mut harness, methods::APPS_DEV_ADD, add.clone()).await;
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (origin, endpoint) = dev_fixture_endpoint(ready.clone()).await;
+    let add = json!({"workspace_id":workspace,"project":project,"url":origin});
+    let identity = crate::identity::bootstrap_identity(&harness.crud_store.database_connection())
+        .await
+        .unwrap()
+        .snapshot;
+    harness
+        .processor
+        .set_gateway_listen_addr("127.0.0.1:17878".parse().unwrap());
+    let added = harness
+        .processor
+        .local_dev_app(
+            &identity,
+            pioneer_protocol::DevAppOperation::Add(serde_json::from_value(add.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
     let id = added["id"].as_str().unwrap().to_owned();
     assert_ne!(id, release.id);
     assert_eq!(
@@ -1752,15 +1788,26 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
 
     harness.processor.start_dev_apps().await;
     tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = harness.processor.app_view_status(&id).await;
+            assert_ne!(status.state, "ready");
+            if status.failure.as_deref() == Some("apps.dev_server_unavailable") {
+                assert!(status.execution_id.is_none());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    ready.store(true, std::sync::atomic::Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(10), async {
         while harness.processor.app_view_status(&id).await.state != "ready" {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
     .unwrap();
-    // The same authenticated Apps RPC used by Desktop returns the registered
-    // URL even with no listening dev server. Its grant is native lease control,
-    // never a browser resource URL for this App.
     let first: pioneer_protocol::AppViewBootstrap = serde_json::from_value(
         app_rpc(
             &mut harness,
@@ -1780,7 +1827,7 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
     )
     .unwrap();
     assert!(first.development);
-    assert_eq!(first.dev_url.as_deref(), Some("http://127.0.0.1:9"));
+    assert_eq!(first.dev_url.as_deref(), Some(origin.as_str()));
     assert_eq!(first.dev_url, second.dev_url);
     assert_ne!(first.relative_url, second.relative_url);
     for params in [
@@ -1823,15 +1870,18 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
         crate::request_context::RequestNetworkContext::Unavailable,
         crate::request_context::CanonicalMethod::rpc(methods::APPS_OPEN_VIEW),
     );
+    let (address, credential, cancel, dev_origin) = harness
+        .processor
+        .app_ui_endpoint(&authenticated, app_scope)
+        .await
+        .unwrap();
+    assert_eq!(format!("http://{address}"), origin);
     assert_eq!(
-        harness
-            .processor
-            .app_ui_endpoint(&authenticated, app_scope)
-            .await
-            .unwrap_err()
-            .to_string(),
-        "apps.dev_direct_view_only"
+        credential.expose_secret(),
+        added["ui_proxy"]["credential"].as_str().unwrap()
     );
+    assert_eq!(dev_origin.unwrap().ascii_serialization(), origin);
+    assert!(!cancel.is_cancelled());
     app_rpc(
         &mut harness,
         methods::APPS_CLOSE_VIEW,
@@ -2023,7 +2073,7 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
         .await,
     )
     .unwrap();
-    assert_eq!(final_view.dev_url.as_deref(), Some("http://127.0.0.1:9"));
+    assert_eq!(final_view.dev_url.as_deref(), Some(origin.as_str()));
     let final_secret = final_view
         .relative_url
         .expose_secret()
@@ -2038,6 +2088,8 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
         json!({"workspace_id":workspace,"app_id":id}),
     )
     .await;
+    endpoint.abort();
+    assert!(cancel.is_cancelled());
     assert_eq!(removed["removed"], true);
     assert!(grants.app_scope(final_secret).is_err());
     harness.processor.shutdown_dev_apps().await;
@@ -2074,10 +2126,12 @@ async fn dev_app_observes_repairs_of_invalid_nested_skills_after_restart_and_cre
     let _release = install_rpc_app(&mut harness, root.path(), slug, false, true).await;
     let project = root.path().join(slug);
     let workspace = harness.workspace_id.clone();
+    let (origin, endpoint) =
+        dev_fixture_endpoint(Arc::new(std::sync::atomic::AtomicBool::new(true))).await;
     let added = app_rpc(
         &mut harness,
         methods::APPS_DEV_ADD,
-        json!({"workspace_id":workspace,"project":project,"url":"http://127.0.0.1:9"}),
+        json!({"workspace_id":workspace,"project":project,"url":origin}),
     )
     .await;
     let id = added["id"].as_str().unwrap().to_owned();
@@ -2225,5 +2279,6 @@ async fn dev_app_observes_repairs_of_invalid_nested_skills_after_restart_and_cre
         .unwrap(),
         "---\nname: added\ndescription: Added skill\n---\nNew instructions.\n"
     );
+    endpoint.abort();
     harness.processor.shutdown_dev_apps().await;
 }
