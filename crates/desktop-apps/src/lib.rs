@@ -472,7 +472,7 @@ mod tests {
         snapshot
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn dev_panel_passes_the_url_to_wry_with_only_the_presentation_bridge() {
         // Inspect the actual loader attributes passed to WebView::build. A
         // registration-only or location-planner test cannot cover this boundary.
@@ -520,7 +520,7 @@ mod tests {
         assert!(attributes.new_window_req_handler.is_some());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn installed_panel_keeps_its_sandboxed_document_and_devtools_disabled() {
         let prefix = "http://localhost:17878/storage/app-views/release-grant/";
         let (attributes, _requests) = view_attributes(
