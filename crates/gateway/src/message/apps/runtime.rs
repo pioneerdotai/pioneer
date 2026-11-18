@@ -639,7 +639,7 @@ impl MessageProcessor {
                 execution: execution_id.clone(),
             };
             let secret = credential.clone();
-            let host = serde_json::json!({"endpoint":format!("ws://host.microsandbox.internal:{port}/apps/host"),"credential":credential,"capabilities":["host.pty"]});
+            let host = serde_json::json!({"endpoint":format!("ws://host.microsandbox.internal:{port}/apps/host"),"credential":credential,"capabilities":["host.pty","host.render"]});
             let proxy_credential =
                 pioneer_protocol::AuthSecretString::new(hex::encode(rand::random::<[u8; 32]>()));
             let bootstrap = serde_json::json!({"execution_id":execution_id,"host_api":host,"ui_base_path":"/","ui_proxy":{"credential":proxy_credential}});

@@ -42,6 +42,11 @@ pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
         )
         .route("/storage/workspaces/{workspace_id}/apps/{app_id}/icons/{icon_revision}", get(app_icon_route).head(app_icon_route))
         .layer(middleware::from_fn(super::header_policy::enforce))
+        .merge(
+            Router::new()
+                .route("/apps/host/render", post(crate::host_api::render::request))
+                .layer(middleware::from_fn(super::header_policy::enforce_app)),
+        )
         .merge(Router::new().route("/storage/app-views/{grant}/", axum::routing::any(super::apps::app_view_root)).route("/storage/app-views/{grant}/{*path}", axum::routing::any(super::apps::app_view)).layer(middleware::from_fn(super::header_policy::enforce_app)))
         .merge(
             Router::new()

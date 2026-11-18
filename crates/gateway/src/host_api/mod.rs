@@ -1,5 +1,6 @@
 //! Execution admission and capability dispatch. App credentials never enter user RPC.
 mod pty;
+pub(crate) mod render;
 #[cfg(any(unix, windows))]
 mod shell;
 mod stream;

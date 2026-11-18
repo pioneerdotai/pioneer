@@ -44,3 +44,27 @@ impl MessageProcessor {
         Ok(())
     }
 }
+
+impl MessageProcessor {
+    pub(crate) async fn app_render_source(
+        &self,
+        scope: &crate::host_api::ExecutionAuthority,
+        path: String,
+    ) -> Result<crate::browser_render::AssetSource> {
+        let (address, credential, upstream) = self
+            .app_runtime
+            .upstream(&scope.app_id)
+            .await
+            .context("host.revoked")?;
+        self.validate_host_execution(scope).await?;
+        anyhow::ensure!(
+            !upstream.is_cancelled() && !scope.cancel.is_cancelled(),
+            "host.revoked"
+        );
+        crate::browser_render::AssetSource::new(address, credential, path)
+    }
+
+    pub(crate) fn app_render_scratch(&self) -> std::path::PathBuf {
+        self.artifact_runtime_home.join("app-render")
+    }
+}

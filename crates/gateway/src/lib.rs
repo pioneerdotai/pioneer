@@ -27,6 +27,7 @@ mod epic5_observability;
 mod helpers;
 mod hook_run_store;
 mod hook_runtime;
+mod browser_render;
 mod host_api;
 mod human_interaction;
 mod identity;
