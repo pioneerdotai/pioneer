@@ -162,7 +162,7 @@ pub(super) async fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser_render::observe_browser_wait;
+    use serde_json::Value;
     use tokio::sync::Mutex;
     static BROWSER_FIXTURE: Mutex<()> = Mutex::const_new(());
 
@@ -346,6 +346,7 @@ mod tests {
 #[cfg(all(test, any(unix, windows)))]
 mod exit_observation_tests {
     use super::*;
+    use crate::browser_render::observe_browser_wait;
     #[test]
     fn cleanup_wait_records_exit_before_preview_or_profile_error() {
         let old = pioneer_observability::telemetry_enabled();
