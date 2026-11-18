@@ -176,6 +176,10 @@ jobs:
       # A separate Cargo invocation keeps CU features out of these server owners.
       - name: cargo-nextest-default-server-contracts
         id: server-contracts
+        env:
+          # This also compiles the large gateway test binary. Bound compiler
+          # concurrency just as for the archive after SIGTERM with jobs=2.
+          CARGO_BUILD_JOBS: 1
         shell: bash
         run: |
           set -euo pipefail
@@ -191,7 +195,7 @@ jobs:
       # Keep diagnostics in a separate shell: SIGTERM may kill the build shell
       # before its EXIT trap can report runner resource exhaustion.
       - name: diagnose-server-contract-build-failure
-        if: ${{ failure() && steps.server-contracts.outcome == 'failure' }}
+        if: ${{ always() && steps.server-contracts.outcome == 'failure' }}
         shell: bash
         run: |
           df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
