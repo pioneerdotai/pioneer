@@ -114,6 +114,19 @@ pub fn resolve_voice_turn_selection(
 
     let requested_provider = non_empty_string(requested_provider);
     let requested_model = non_empty_string(requested_model);
+    if let Some(provider) = requested_provider.as_deref() {
+        if inner.prepared_acp_provider(&coordinator.workspace_id, thread_id, provider) {
+            anyhow::ensure!(
+                coordinator.conversation.can_submit_message(),
+                "active thread is not ready to start voice"
+            );
+            return Ok(ComposerTurnSelection {
+                selected_provider: Some(provider.into()),
+                selected_model: requested_model,
+                selected_mode,
+            });
+        }
+    }
     let requested_selection = match (requested_provider, requested_model) {
         (Some(provider), Some(model)) => Some(composer_model_selection::ComposerModelSelection {
             provider,
@@ -270,6 +283,29 @@ pub fn resolve_turn_selection(
 
     let requested_provider = non_empty_string(requested_provider);
     let requested_model = non_empty_string(requested_model);
+    if let Some(provider) = requested_provider.as_deref() {
+        if inner.prepared_acp_provider(&coordinator.workspace_id, thread_id, provider) {
+            anyhow::ensure!(
+                can_submit_composer_message(ComposerSubmitAvailabilityInput {
+                    gateway_connected: true,
+                    upload_in_progress: false,
+                    has_active_thread: true,
+                    selected_mode,
+                    has_complete_model_selection: true,
+                    conversation_can_submit: coordinator.conversation.can_submit_message(),
+                    text,
+                    has_attachments,
+                    has_capabilities,
+                }),
+                "active thread is not ready to start a new turn"
+            );
+            return Ok(ComposerTurnSelection {
+                selected_provider: Some(provider.into()),
+                selected_model: requested_model,
+                selected_mode,
+            });
+        }
+    }
     let requested_selection = match (requested_provider, requested_model) {
         (Some(provider), Some(model)) => Some(composer_model_selection::ComposerModelSelection {
             provider,
@@ -681,6 +717,11 @@ impl ClientCore {
         } else {
             selection.selected_provider.clone()
         };
+        let acp_options = self.acp_options_for_backend(
+            execution_target.execution_backend.as_ref(),
+            &workspace_id,
+            &thread_id,
+        )?;
         let submit_reduction = reduce_prepared_composer_turn_submit_success(
             PreparedComposerTurnSubmitContext {
                 thread_id: thread_id.clone(),
@@ -699,7 +740,7 @@ impl ClientCore {
                 selected_context_window,
                 selected_service_mode,
                 selected_context_authority,
-                cli_runtime_options: None,
+                cli_runtime_options: acp_options,
                 updated_at_unix: now_unix_seconds(),
             },
             prepared,
@@ -947,6 +988,11 @@ impl ClientCore {
                 identity,
                 transport: &sender,
             };
+            let acp_options = self.acp_options_for_backend(
+                execution_backend.as_ref(),
+                &context.workspace_id,
+                &context.thread_id,
+            )?;
             let prepared = super::turn_prepare::prepare_voice_composer_snapshot(
                 &transport,
                 file_system,
@@ -970,7 +1016,7 @@ impl ClientCore {
                     selected_context_window: domain.selected_context_window,
                     selected_service_mode: domain.selected_service_mode.clone(),
                     selected_context_authority: domain.selected_context_authority.clone(),
-                    cli_runtime_options: None,
+                    cli_runtime_options: acp_options,
                 },
             )?;
             anyhow::ensure!(
@@ -2062,7 +2108,7 @@ mod tests {
                 let previous = core.snapshot(&scope).unwrap();
                 let mut epoch = (*previous.snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
                 epoch.connection_id = Some(2);
-                core.publish(&crate::core::ClientMutationAuthority::for_test(), scope,
+                core.publish(&crate::core::ClientMutationAuthority { _private: () }, scope,
                     crate::threads::registry::revisions(previous.revisions().scoped().get() + 1), Arc::new(epoch), vec![]);
             } else {
                 let request = core.provider_runtime_request_for_test("workspace").unwrap();

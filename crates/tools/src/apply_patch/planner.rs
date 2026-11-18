@@ -296,10 +296,11 @@ fn plan_add(
             "Add File destination already exists",
         ));
     }
-    let OperationBody::Add(file) = &operation.operation.body else {
-        return Err(invalid_body(operation_index, &path));
+    let bytes = match &operation.operation.body {
+        OperationBody::Add(file) => join_lines(&file.lines),
+        OperationBody::ExactText { text } => text.as_bytes().to_vec(),
+        _ => return Err(invalid_body(operation_index, &path)),
     };
-    let bytes = join_lines(&file.lines);
     let after = VirtualFile::virtual_file(bytes, operation_index, None);
     let snapshot = PlannedSnapshot::from(&after);
     invalidate_move_path(move_edges, &path);
@@ -322,18 +323,14 @@ fn plan_replace(
     path: String,
 ) -> Result<PlannedChange, PlanError> {
     let before = consume_source(workspace, operation_index, operation, &path)?;
-    let OperationBody::Replace(file) = &operation.operation.body else {
-        return Err(invalid_body(operation_index, &path));
+    let bytes = match &operation.operation.body {
+        OperationBody::Replace(file) => render_replacement(&file.lines, &before.bytes),
+        OperationBody::ExactText { text } => text.as_bytes().to_vec(),
+        _ => return Err(invalid_body(operation_index, &path)),
     };
-    // A complete replacement changes the logical lines but keeps the existing
-    // text-file framing unless the patch explicitly supplies a different
-    // format.  In particular, do not silently turn a CRLF/BOM file into LF
-    // without a BOM or drop its final newline.
-    let after = VirtualFile::virtual_file(
-        render_replacement(&file.lines, &before.bytes),
-        operation_index,
-        None,
-    );
+    // Line-oriented replacements retain existing framing; typed full-text
+    // writes explicitly provide every byte, including the final newline.
+    let after = VirtualFile::virtual_file(bytes, operation_index, None);
     let before_snapshot = PlannedSnapshot::from(&before);
     let after_snapshot = PlannedSnapshot::from(&after);
     workspace.files.insert(path.clone(), after);

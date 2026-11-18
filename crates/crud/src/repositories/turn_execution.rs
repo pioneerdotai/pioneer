@@ -15,6 +15,17 @@ pub enum TurnExecutorKind {
 }
 
 impl TurnExecutorKind {
+    pub const fn is_cli_runtime(self) -> bool {
+        matches!(self, Self::CliRuntime | Self::AcpRuntime)
+    }
+
+    pub fn matches_cli_runtime_kind(self, runtime_kind: &str) -> bool {
+        matches!(
+            (self, runtime_kind),
+            (Self::CliRuntime, "codex" | "claude" | "opencode") | (Self::AcpRuntime, "acp")
+        )
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NativeAgent => "native_agent",

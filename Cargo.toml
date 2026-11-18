@@ -208,6 +208,7 @@ icu_collator = "2.4"
 base64 = "0.23"
 url = "2"
 libc = "0.2"
+rustix = { version = "1.1.6", features = ["fs"] }
 mime_guess = "2"
 image = "0.25"
 qrcode = { version = "0.14", default-features = false }

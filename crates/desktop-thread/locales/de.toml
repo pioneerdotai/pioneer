@@ -368,3 +368,22 @@
 "apps.stale" = "Die ausgewählte Version ist nicht mehr aktuell"
 
 "apps.view" = "App view"
+
+[chat.acp]
+prepare = "Sitzung vorbereiten"
+send_input = "Eingabe senden"
+refresh_output = "Ausgabe aktualisieren"
+close_terminal = "Terminal schließen"
+session_id = "Sitzungs-ID"
+additional_directories = "Zusätzliche Verzeichnisse (ein absoluter Pfad pro Zeile)"
+logout = "Abmelden"
+list = "Sitzungen auflisten"
+load = "Laden"
+resume = "Fortsetzen"
+delete = "Sitzung löschen"
+close_session = "Sitzung schließen"
+more = "Weitere Sitzungen"
+partial_input = "Nur ein Teil der Eingabe wurde angenommen. Sie wurde nicht erneut gesendet."
+output_truncated = "Frühere Ausgabe wurde gekürzt."
+auth_finished = "Authentifizierung beendet (Exit-Code %{code}). Schließen Sie die Sitzung und verbinden Sie sich erneut, um die Authentifizierung zu aktualisieren."
+close_reconnect = "Zum erneuten Verbinden schließen"

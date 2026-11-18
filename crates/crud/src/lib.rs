@@ -5391,6 +5391,23 @@ impl CrudStore {
         turn_llm_context::delete_expired_turn_llm_context(&self.connection).await
     }
 
+    pub async fn task_turn_has_accepted_cancellation(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<bool> {
+        repositories::task_cancellation_actor::accepted_for_turn(
+            &self.connection,
+            workspace_id,
+            task_id,
+            run_id,
+            turn_id,
+        )
+        .await
+    }
+
     pub async fn list_unreconciled_terminal_task_child_turns(
         &self,
         limit: u64,
@@ -6326,6 +6343,24 @@ impl CrudStore {
             frozen_lifetime::complete_keys(frozen_change, keys, *value);
         }
         result.map(|(record, _)| record)
+    }
+
+    /// Uses this handle's existing scheduling class and physical reader route.
+    pub async fn list_acp_compaction_items(
+        &self,
+        workspace: &str,
+        runtime: &str,
+        continuation: &str,
+        session: &str,
+    ) -> Result<Vec<pioneer_protocol::ItemUpdatedNotification>> {
+        cli_runtime_binding::list_acp_compaction_items(
+            &self.connection,
+            workspace,
+            runtime,
+            continuation,
+            session,
+        )
+        .await
     }
 
     pub async fn get_cli_runtime_thread_binding(
@@ -7802,7 +7837,9 @@ impl CrudStore {
                             .context("task continuation owner disappeared")?;
                         anyhow::ensure!(
                             owner.owner_id == owner_id
-                                && owner.executor_kind == TurnExecutorKind::CliRuntime
+                                && owner
+                                    .executor_kind
+                                    .matches_cli_runtime_kind(&source.runtime_kind)
                                 && owner.executor_key.as_deref()
                                     == Some(source.runtime_id.as_str())
                                 && owner.status.is_active()
@@ -8612,7 +8649,9 @@ impl CrudStore {
                 Some(owner) => {
                     owner.owner_id == owner_id
                         && owner.status.is_active()
-                        && owner.executor_kind == TurnExecutorKind::CliRuntime
+                        && owner
+                            .executor_kind
+                            .matches_cli_runtime_kind(&expected.runtime_kind)
                         && owner.executor_key.as_deref() == Some(expected.runtime_id.as_str())
                         && owner.lease_until > chrono::Utc::now().fixed_offset()
                 }
@@ -35114,7 +35153,9 @@ impl CrudStore {
             .as_ref()
             .context("CLI cancellation attempt is missing")?;
         anyhow::ensure!(
-            expected.executor_kind == TurnExecutorKind::CliRuntime
+            expected
+                .executor_kind
+                .matches_cli_runtime_kind(&source.binding.runtime_kind)
                 && source.turn_status == TurnStatus::InProgress
                 && attempt.status.is_active()
                 && attempt.turn_id == expected.turn_id
@@ -35841,7 +35882,10 @@ impl CrudStore {
             // TurnStarted was projected before the ownership receipt existed.
             // Refresh within this same atomic admission so a visible CLI child
             // already shows its queued state, even without a runtime binding.
-            if execution.executor_kind == TurnExecutorKind::CliRuntime {
+            if matches!(
+                execution.executor_kind,
+                TurnExecutorKind::CliRuntime | TurnExecutorKind::AcpRuntime
+            ) {
                 self.project_cli_runtime_turn_binding_state(
                     &transaction,
                     &execution.turn_id,
@@ -56855,6 +56899,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(saved.principal_id, "P00000000000000000001");
+        for (workspace, task, run, origin, expected) in [
+            (workspace_id, "stop-task", "stop-run", turn_id, true),
+            (workspace_id, "stop-task", "stop-run", "other-turn", false),
+            (workspace_id, "other-task", "stop-run", turn_id, false),
+            ("other-workspace", "stop-task", "stop-run", turn_id, false),
+            (workspace_id, "stop-task", "other-run", turn_id, false),
+        ] {
+            assert_eq!(
+                store
+                    .task_turn_has_accepted_cancellation(workspace, task, run, origin)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
         assert!(
             pioneer_entity::task_run_read::Entity::find()
                 .all(&db)

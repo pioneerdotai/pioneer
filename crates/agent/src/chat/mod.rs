@@ -1,5 +1,5 @@
 mod provider;
-mod skill_tools;
+pub(crate) mod skill_tools;
 mod skills;
 mod tool_recovery_policy;
 mod tool_retry_lifecycle;

@@ -5070,6 +5070,7 @@ async fn cli_statistics_materialization_failure_rejects_ack_without_opening_reco
             })
         } else {
             RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: Some(BLOCKED_NATIVE_THREAD.into()),
                 native_turn_id: BLOCKED_TURN.into(),
                 native_item_id: "usage-fault".into(),

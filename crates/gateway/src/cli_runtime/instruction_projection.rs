@@ -1,7 +1,5 @@
 use anyhow::{Context, Result, bail};
-use pioneer_cli_agent_runtime::instructions::{
-    CLIRuntimeElevatedInstructionTransport, CLIRuntimeElevatedInstructions,
-};
+use pioneer_cli_agent_runtime::instructions::CLIRuntimeInstructionDelivery;
 use pioneer_crud::{
     CliRuntimeInstructionProjectionRecord, CrudStore, NewCliRuntimeInstructionProjection,
 };
@@ -13,12 +11,12 @@ pub(crate) async fn persist_cli_runtime_instruction_projection(
     turn_id: &str,
     runtime_kind: CLIAgentRuntimeKind,
     plan: &CompiledInstructionDeliveryPlan,
-    instructions: &CLIRuntimeElevatedInstructions,
+    instructions: &CLIRuntimeInstructionDelivery,
 ) -> Result<()> {
     if plan.provider_instructions.fingerprint != instructions.fingerprint()
         || plan.provider_instructions.text != instructions.text()
     {
-        bail!("compiled instruction delivery plan does not match its CLI elevated projection");
+        bail!("compiled instruction delivery plan does not match its CLI instruction projection");
     }
     let section_ids = plan
         .sections
@@ -27,19 +25,19 @@ pub(crate) async fn persist_cli_runtime_instruction_projection(
         .map(|section| section.section_id.clone())
         .collect::<Vec<_>>();
     if section_ids.is_empty() {
-        bail!("CLI elevated instruction projection has no governing sections");
+        bail!("CLI instruction projection has no governing sections");
     }
     let section_ids_json = serde_json::to_string(&section_ids)
         .context("failed to serialize CLI elevated instruction section ids")?;
     let compiler_version = plan.bundle.compiler_version.to_owned();
     let now = chrono::Utc::now().fixed_offset();
-    let transport = CLIRuntimeElevatedInstructionTransport::for_runtime(runtime_kind);
+    let transport = instructions.transport(runtime_kind)?;
     let runtime_kind_name = runtime_kind_label(runtime_kind);
     let persisted = store
         .insert_cli_runtime_instruction_projection_if_absent(NewCliRuntimeInstructionProjection {
             turn_id: turn_id.to_owned(),
             runtime_kind: runtime_kind_name.to_owned(),
-            transport_kind: transport.as_str().to_owned(),
+            transport_kind: transport.to_owned(),
             instruction_text: instructions.text().to_owned(),
             instruction_fingerprint: instructions.fingerprint().to_owned(),
             section_ids_json: section_ids_json.clone(),
@@ -50,7 +48,7 @@ pub(crate) async fn persist_cli_runtime_instruction_projection(
         .await
         .context("failed to persist CLI runtime instruction projection")?;
     if persisted.runtime_kind != runtime_kind_name
-        || persisted.transport_kind != transport.as_str()
+        || persisted.transport_kind != transport
         || persisted.instruction_text != instructions.text()
         || persisted.instruction_fingerprint != instructions.fingerprint()
         || persisted.section_ids_json != section_ids_json
@@ -66,7 +64,7 @@ pub(crate) async fn load_cli_runtime_instruction_projection(
     store: &CrudStore,
     turn_id: &str,
     runtime_kind: CLIAgentRuntimeKind,
-) -> Result<CLIRuntimeElevatedInstructions> {
+) -> Result<CLIRuntimeInstructionDelivery> {
     let projection = store
         .get_cli_runtime_instruction_projection(turn_id)
         .await
@@ -80,7 +78,7 @@ pub(crate) async fn load_cli_runtime_instruction_projection(
 fn restore_cli_runtime_instruction_projection_record(
     projection: &CliRuntimeInstructionProjectionRecord,
     runtime_kind: CLIAgentRuntimeKind,
-) -> Result<CLIRuntimeElevatedInstructions> {
+) -> Result<CLIRuntimeInstructionDelivery> {
     let expected_runtime_kind = runtime_kind_label(runtime_kind);
     if projection.runtime_kind != expected_runtime_kind {
         bail!(
@@ -88,8 +86,12 @@ fn restore_cli_runtime_instruction_projection_record(
             projection.runtime_kind
         );
     }
-    let expected_transport =
-        CLIRuntimeElevatedInstructionTransport::for_runtime(runtime_kind).as_str();
+    let restored = CLIRuntimeInstructionDelivery::for_runtime(
+        runtime_kind,
+        projection.instruction_text.clone(),
+        projection.instruction_fingerprint.clone(),
+    )?;
+    let expected_transport = restored.transport(runtime_kind)?;
     if projection.transport_kind != expected_transport {
         bail!(
             "CLI runtime instruction transport `{}` does not match `{expected_transport}`",
@@ -104,16 +106,14 @@ fn restore_cli_runtime_instruction_projection_record(
     if projection.compiler_version.trim().is_empty() {
         bail!("CLI runtime instruction compiler identity is empty");
     }
-    CLIRuntimeElevatedInstructions::try_new(
-        projection.instruction_text.clone(),
-        projection.instruction_fingerprint.clone(),
-    )
+    Ok(restored)
 }
 
 const fn runtime_kind_label(runtime_kind: CLIAgentRuntimeKind) -> &'static str {
     match runtime_kind {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
+        pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
         CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }

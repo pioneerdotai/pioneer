@@ -1940,7 +1940,7 @@ impl MessageProcessor {
                     .map(|projected| projected.author.clone())
                     .or_else(|| direct_authors_by_turn.get(turn_id.as_str()).cloned())
             } else if let Some(execution) = executions_by_turn.get(turn_id)
-                && execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+                && execution.executor_kind.is_cli_runtime()
                 && let Some(runtime_id) = execution.executor_key.as_deref()
             {
                 let source_key = (execution.workspace_id.clone(), runtime_id.to_owned());

@@ -156,6 +156,11 @@ fn classify_cli_runtime_turn_recovery_outcome(
     binding: &CliRuntimeTurnBindingRecord,
     runtime: Option<&CLIAgentRuntimeRecoveryRuntime>,
 ) -> CLIAgentRuntimeTurnRecoveryOutcome {
+    if binding.runtime_kind == "acp" {
+        return blocked_recovery(binding, "acp_outcome_unknown",
+            "ACP execution outcome is unknown after connection loss; the original prompt was not resubmitted.".into(),
+            vec!["Inspect the accepted Pioneer history and external effects before starting a new turn.".into()]);
+    }
     let Some(runtime) = runtime else {
         return blocked_recovery(
             binding,
@@ -289,10 +294,14 @@ fn blocked_recovery(
             reason_class: reason_class.to_owned(),
             human_message,
             resume_requirements,
-            resume_command: format!("turn.resume:{}", binding.turn_id),
+            resume_command: if binding.runtime_kind == "acp" {
+                String::new()
+            } else {
+                format!("turn.resume:{}", binding.turn_id)
+            },
             blocked_recovery_job_id: None,
             latest_checkpoint_id: None,
-            can_resume_same_turn: true,
+            can_resume_same_turn: binding.runtime_kind != "acp",
         },
     }
 }
@@ -374,6 +383,181 @@ fn cli_agent_runtime_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
+        pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
         CLIAgentRuntimeKind::OpenCode => "opencode",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CLIAgentRuntimeRecoveryRuntime, CLIAgentRuntimeTurnRecoveryOutcome};
+    use crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING;
+    use chrono::{FixedOffset, TimeZone};
+    use migration::{Migrator, MigratorTrait};
+    use pioneer_crud::{CrudStore, NewCliRuntimeTurnBinding};
+    use pioneer_entity::turn;
+    use pioneer_protocol::{
+        RuntimeStatus, SandboxMode, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
+        ThreadStatus, Turn, TurnStatus, UserInput,
+    };
+    use sea_orm::entity::prelude::DateTimeWithTimeZone;
+    use sea_orm::{Database, EntityTrait};
+
+    async fn test_store() -> CrudStore {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        CrudStore::new(connection)
+    }
+
+    fn timestamp(secs: i64) -> DateTimeWithTimeZone {
+        FixedOffset::east_opt(0)
+            .expect("UTC offset should exist")
+            .timestamp_opt(secs, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn runtime(runtime_id: &str, status: RuntimeStatus) -> CLIAgentRuntimeRecoveryRuntime {
+        CLIAgentRuntimeRecoveryRuntime {
+            runtime_id: runtime_id.to_owned(),
+            runtime_kind: "codex".to_owned(),
+            display_name: format!("Runtime {runtime_id}"),
+            enabled: true,
+            status,
+            binary_path: Some("codex".to_owned()),
+        }
+    }
+
+    async fn materialize_in_progress_turn(store: &CrudStore, thread_id: &str, turn_id: &str) {
+        let timestamp_secs = 1_700_030_000;
+        let thread = Thread {
+            workspace_id: "ws_cli_recovery".to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            preview_author: None,
+            mode: ThreadMode::Agent,
+            model: "test-model".to_owned(),
+            model_provider: "echo".to_owned(),
+            reasoning_effort: None,
+            context_window: None,
+            service_mode: None,
+            context_authority: None,
+            created_at: timestamp_secs,
+            updated_at: timestamp_secs,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            work_owner: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[UserInput::Text {
+                    text: "recover cli runtime turn".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("turn should materialize");
+        let persisted = turn::Entity::find_by_id(turn_id)
+            .one(&store.database_connection())
+            .await
+            .expect("recovery fixture turn query should succeed")
+            .expect("recovery fixture turn should exist");
+        assert_eq!(
+            persisted.initiated_by_actor_kind.as_deref(),
+            Some("system"),
+            "CLI recovery fixtures must retain explicit System provenance"
+        );
+        assert_eq!(persisted.initiated_by_actor_id, None);
+    }
+
+    async fn persist_binding(
+        store: &CrudStore,
+        runtime_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        status: &str,
+    ) {
+        store
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
+                workspace_id: "ws_cli_recovery".to_owned(),
+                runtime_id: runtime_id.to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: format!("native-thread-{thread_id}"),
+                native_turn_id: (status == CLI_RUNTIME_TURN_STATUS_RUNNING)
+                    .then(|| format!("native-turn-{turn_id}")),
+                request_id: Some(format!("request-{turn_id}")),
+                status: status.to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: Some(r#"{"mode":"workspace-write"}"#.to_owned()),
+                approval_policy: Some("on-request".to_owned()),
+                input_mapping_json: r#"{"input":1}"#.to_owned(),
+                created_at: timestamp(1_700_030_000),
+                updated_at: timestamp(1_700_030_001),
+            })
+            .await
+            .expect("binding should persist");
+    }
+
+    #[tokio::test]
+    async fn ready_acp_session_does_not_prove_unknown_prompt_outcome() {
+        let store = test_store().await;
+        materialize_in_progress_turn(&store, "acp-child", "acp-turn").await;
+        persist_binding(
+            &store,
+            "arbitrary-agent",
+            "acp-child",
+            "acp-turn",
+            CLI_RUNTIME_TURN_STATUS_RUNNING,
+        )
+        .await;
+        let mut binding = store
+            .get_cli_runtime_turn_binding("acp-turn")
+            .await
+            .unwrap()
+            .unwrap();
+        binding.runtime_kind = "acp".into();
+        let mut ready = runtime("arbitrary-agent", RuntimeStatus::Ready);
+        ready.runtime_kind = "acp".into();
+        for current in [None, Some(&ready)] {
+            let outcome = super::classify_cli_runtime_turn_recovery_outcome(&binding, current);
+            assert!(matches!(outcome,
+                CLIAgentRuntimeTurnRecoveryOutcome::Blocked { resume, .. }
+                    if resume.reason_class == "acp_outcome_unknown" && !resume.can_resume_same_turn
+                        && resume.resume_command.is_empty()
+            ));
+        }
     }
 }

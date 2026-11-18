@@ -162,11 +162,11 @@ use pioneer_cli_agent_runtime::codex::{
 };
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
 use pioneer_cli_agent_runtime::event::{
-    RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemCompleted,
-    RuntimeItemStarted, RuntimeRequestOpened, RuntimeRequestResolved, RuntimeThreadGoalStatus,
-    RuntimeThreadGoalUpdated, RuntimeThreadStateChanged, RuntimeTurnCompleted, RuntimeTurnFailed,
-    RuntimeTurnInterrupted, RuntimeTurnRetrying, RuntimeTurnStarted,
-    map_codex_server_request_event,
+    RuntimeAgentMessagePhase, RuntimeCompactionProjection, RuntimeEvent,
+    RuntimeEventMappingOptions, RuntimeItemCompleted, RuntimeItemStarted, RuntimeRequestOpened,
+    RuntimeRequestResolved, RuntimeThreadGoalStatus, RuntimeThreadGoalUpdated,
+    RuntimeThreadStateChanged, RuntimeTurnCompleted, RuntimeTurnFailed, RuntimeTurnInterrupted,
+    RuntimeTurnRetrying, RuntimeTurnStarted, map_codex_server_request_event,
 };
 use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructionTransport;
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
@@ -714,6 +714,7 @@ async fn persist_test_cli_instruction_projection(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let (runtime_kind_label, transport_kind) = match runtime_kind {
+        CLIAgentRuntimeKind::Acp => panic!("native recovery fixture excludes ACP journal delivery"),
         CLIAgentRuntimeKind::Codex => (
             "codex",
             CLIRuntimeElevatedInstructionTransport::CodexTurnCollaborationMode,
@@ -819,6 +820,11 @@ async fn wait_for_episodic_ingestor_item(
 
 #[derive(Default)]
 pub(super) struct RecordingCliRuntimeSession {
+    acp_snapshot: std::sync::Mutex<Option<pioneer_protocol::AcpSessionSnapshot>>,
+    acp_configuration_hold: AtomicBool,
+    acp_configuration_entered: tokio::sync::Notify,
+    acp_configuration_resume: tokio::sync::Notify,
+    acp_configuration_confirmations: AtomicUsize,
     thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
     thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
     pub(super) turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
@@ -851,6 +857,7 @@ pub(super) struct RecordingCliRuntimeSession {
     mcp_preparations: TokioMutex<Vec<(String, String)>>,
     projected_mcp_store: TokioMutex<Option<Arc<CrudStore>>>,
     projected_mcp_metadata: TokioMutex<HashMap<String, CLIAgentRuntimeMcpTurnMetadata>>,
+    acp_mcp_metadata: TokioMutex<Option<CLIAgentRuntimeMcpTurnMetadata>>,
     mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
     mcp_terminals: TokioMutex<Vec<String>>,
     goal_resets: TokioMutex<Vec<String>>,
@@ -970,6 +977,92 @@ impl RecordingCliRuntimeSession {
 
 #[async_trait]
 impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
+    fn acp_snapshot(&self) -> anyhow::Result<pioneer_protocol::AcpSessionSnapshot> {
+        self.acp_snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .context("no prepared ACP snapshot")
+    }
+
+    async fn acp_initialize(
+        &self,
+        _: Duration,
+    ) -> anyhow::Result<pioneer_protocol::AcpSessionSnapshot> {
+        self.acp_snapshot()
+    }
+    async fn acp_apply_configuration(
+        &self,
+        _: &str,
+        selected: &pioneer_protocol::AcpTurnConfiguration,
+        timeout: Duration,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        let result = crate::cli_runtime::acp_input::await_configuration_transfer(
+            timeout,
+            &cancellation,
+            async {
+                self.acp_configuration_entered.notify_one();
+                if self.acp_configuration_hold.load(Ordering::SeqCst) {
+                    self.acp_configuration_resume.notified().await;
+                }
+                let snapshot = self.acp_snapshot()?;
+                anyhow::ensure!(
+                    selected.values.is_empty()
+                        && selected.configuration_replay.is_empty()
+                        && selected.descriptor_fingerprint
+                            == pioneer_protocol::acp_descriptor_fingerprint(
+                                &snapshot.config_options,
+                                snapshot.modes.as_ref()
+                            )?,
+                    "recording ACP configuration drift"
+                );
+                self.acp_configuration_confirmations
+                    .fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        if result.is_err() {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            if let Some(snapshot) = self.acp_snapshot.lock().unwrap().as_mut() {
+                snapshot.connected = false;
+                snapshot.session_id = None;
+                snapshot.version = None;
+            }
+        }
+        result
+    }
+    fn acp_can_continue(&self, expected: Option<&str>) -> bool {
+        self.acp_snapshot().is_ok_and(|snapshot| {
+            expected.is_some_and(|id| snapshot.session_id.as_deref() == Some(id))
+                || snapshot.capabilities.load_session
+        })
+    }
+    async fn acp_control(
+        &self,
+        operation: pioneer_protocol::AcpSessionOperation,
+        _: Duration,
+    ) -> anyhow::Result<Option<JsonValue>> {
+        let mut prepared = self.acp_snapshot.lock().unwrap();
+        let snapshot = prepared.as_mut().context("not recording ACP")?;
+        match operation {
+            pioneer_protocol::AcpSessionOperation::Prepare {
+                additional_directories,
+            } => {
+                snapshot.session_id = Some(format!("prepared-{}", snapshot.generation));
+                snapshot.version = Some(pioneer_protocol::AcpConfigurationVersion {
+                    connection_id: uuid::Uuid::new_v4().to_string(),
+                    revision: 1,
+                });
+                snapshot.additional_directories = additional_directories;
+            }
+            pioneer_protocol::AcpSessionOperation::Snapshot => {}
+            _ => anyhow::bail!("recording controls only prepare/snapshot"),
+        }
+        snapshot.presentation_revision += 1;
+        Ok(None)
+    }
     async fn close(&self) -> anyhow::Result<()> {
         self.closes.fetch_add(1, Ordering::SeqCst);
         if let Some((entered, release)) = self.close_pause.lock().await.take() {
@@ -1005,6 +1098,14 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
                     format!("native_thread_default_{}", sequence + 1)
                 }
             });
+        if let Some(snapshot) = self.acp_snapshot.lock().unwrap().as_mut() {
+            snapshot.session_id = Some(native_thread_id.clone());
+            snapshot.version = Some(pioneer_protocol::AcpConfigurationVersion {
+                connection_id: uuid::Uuid::new_v4().to_string(),
+                revision: 1,
+            });
+            snapshot.presentation_revision += 1;
+        }
         Ok(CLIAgentRuntimeThreadOpenSnapshot {
             native_thread_id: native_thread_id.clone(),
             cwd: Some(params.cwd.clone()),
@@ -1032,6 +1133,16 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
             .lock()
             .await
             .push((native_thread_id.to_owned(), params.clone()));
+        if let Some(snapshot) = self.acp_snapshot.lock().unwrap().as_mut() {
+            snapshot.session_id = Some(native_thread_id.to_owned());
+            snapshot
+                .version
+                .get_or_insert_with(|| pioneer_protocol::AcpConfigurationVersion {
+                    connection_id: uuid::Uuid::new_v4().to_string(),
+                    revision: 1,
+                });
+            snapshot.presentation_revision += 1;
+        }
         Ok(CLIAgentRuntimeThreadOpenSnapshot {
             native_thread_id: native_thread_id.to_owned(),
             cwd: Some(params.cwd.clone()),
@@ -1094,6 +1205,32 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         let Some(crud_store) = self.projected_mcp_store.lock().await.clone() else {
             return Ok(None);
         };
+        let acp_generation = self
+            .acp_snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|snapshot| snapshot.generation);
+        if let Some(generation) = acp_generation {
+            let projection = crud_store
+                .get_turn_mcp_projection(pioneer_turn_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("test ACP MCP projection is missing"))?;
+            let mut slot = self.acp_mcp_metadata.lock().await;
+            let metadata = slot
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("test ACP MCP session was not launched"))?;
+            anyhow::ensure!(
+                metadata.session_generation == generation
+                    && metadata.manifest_hash == projection.manifest_hash,
+                "test ACP MCP session does not match the current projection"
+            );
+            // A reused ACP process reserves each turn against the same facade,
+            // with a new activation generation, just like AcpMcpBridge.
+            let reserved = metadata.clone();
+            metadata.projection_activation_generation += 1;
+            return Ok(Some(reserved));
+        }
         if let Some(metadata) = self
             .projected_mcp_metadata
             .lock()
@@ -1114,7 +1251,12 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
             projection_fingerprint: "a".repeat(64),
             provider_contract_fingerprint: "b".repeat(64),
             isolation_contract_fingerprint: "c".repeat(64),
-            session_generation: 1,
+            session_generation: self
+                .acp_snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(1, |snapshot| snapshot.generation),
             projection_activation_generation: 1,
         }))
     }
@@ -1427,21 +1569,39 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
                         .as_str()
                         .to_owned(),
                 )),
+                CliMcpSessionLaunch::Acp(launch) => Some((
+                    launch.canonical_projection.turn_id.clone(),
+                    crate::cli_runtime::acp_mcp::ACP_MCP_ADAPTER_KIND,
+                    launch.canonical_projection.manifest_hash.clone(),
+                    launch.contract_fingerprint.clone(),
+                    launch.semantic_restart_fingerprint().to_owned(),
+                    launch
+                        .facade_projection(limits)?
+                        .fingerprint()
+                        .as_str()
+                        .to_owned(),
+                )),
                 _ => None,
             };
             if let Some((turn_id, adapter, manifest, contract, isolation, projection)) = facts {
-                self.session.projected_mcp_metadata.lock().await.insert(
-                    turn_id,
-                    CLIAgentRuntimeMcpTurnMetadata {
-                        adapter_kind: adapter.to_owned(),
-                        manifest_hash: manifest,
-                        projection_fingerprint: projection,
-                        provider_contract_fingerprint: contract,
-                        isolation_contract_fingerprint: isolation,
-                        session_generation: instance.generation(),
-                        projection_activation_generation: 1,
-                    },
-                );
+                let metadata = CLIAgentRuntimeMcpTurnMetadata {
+                    adapter_kind: adapter.to_owned(),
+                    manifest_hash: manifest,
+                    projection_fingerprint: projection,
+                    provider_contract_fingerprint: contract,
+                    isolation_contract_fingerprint: isolation,
+                    session_generation: instance.generation(),
+                    projection_activation_generation: 1,
+                };
+                if adapter == crate::cli_runtime::acp_mcp::ACP_MCP_ADAPTER_KIND {
+                    *self.session.acp_mcp_metadata.lock().await = Some(metadata);
+                } else {
+                    self.session
+                        .projected_mcp_metadata
+                        .lock()
+                        .await
+                        .insert(turn_id, metadata);
+                }
             }
         }
         if let Some(launch_specs) = self.launch_specs.as_ref() {
@@ -1451,6 +1611,21 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
             .continuation
             .claude_provider_session_id()
             .map(|id| id.to_string());
+        if matches!(
+            launch_spec.continuation,
+            crate::cli_runtime::continuation::CliProviderContinuation::AcpSession { .. }
+        ) {
+            if let Some(snapshot) = self.session.acp_snapshot.lock().unwrap().as_mut() {
+                snapshot.workspace_id = instance.key().workspace_id.clone();
+                snapshot.thread_id = instance.key().thread_id.clone();
+                snapshot.runtime_id = instance.key().runtime_id.clone();
+                snapshot.generation = instance.generation();
+                snapshot.presentation_revision = 1;
+                snapshot.session_id = None;
+                snapshot.version = None;
+                snapshot.connected = true;
+            }
+        }
         Ok(self.session.clone())
     }
 }
@@ -1516,6 +1691,10 @@ fn supported_test_cli_mcp_readiness(
     runtime_kind: CLIAgentRuntimeKind,
 ) -> pioneer_protocol::CliMcpAdapterReadiness {
     let (injection, projection_update) = match runtime_kind {
+        CLIAgentRuntimeKind::Acp => (
+            pioneer_protocol::CliMcpInjectionKind::AcpStandardStdioMcp,
+            pioneer_protocol::CliMcpProjectionUpdateKind::AcpNewOrNegotiatedSession,
+        ),
         CLIAgentRuntimeKind::Codex => (
             pioneer_protocol::CliMcpInjectionKind::CodexManagedStdioMcp,
             pioneer_protocol::CliMcpProjectionUpdateKind::CodexRestartAppServerResumeThread,
@@ -1533,7 +1712,7 @@ fn supported_test_cli_mcp_readiness(
         supported: true,
         injection,
         projection_update,
-        strict_isolation: true,
+        strict_isolation: runtime_kind != CLIAgentRuntimeKind::Acp,
         contract_fingerprint: "d".repeat(64),
         local_executable_fingerprint: "e".repeat(64),
         provider_version: Some("recording-runtime".to_owned()),
@@ -2616,6 +2795,9 @@ pub(super) async fn setup_cli_runtime_skill_preflight_harness(
     )
     .unwrap();
     let runtime_id = match runtime_kind {
+        CLIAgentRuntimeKind::Acp => {
+            panic!("native skill installer fixture excludes ACP package transfer")
+        }
         CLIAgentRuntimeKind::Codex => "codex_proposal_51",
         CLIAgentRuntimeKind::Claude => "claude_proposal_51",
         CLIAgentRuntimeKind::OpenCode => "opencode_proposal_51",
@@ -2633,6 +2815,8 @@ pub(super) async fn setup_cli_runtime_skill_preflight_harness(
                 binary_path: "recording-runtime".to_owned(),
                 home_path: native_home.to_string_lossy().into_owned(),
                 shadow_home_path: None,
+                args: Vec::new(),
+                env_from: Default::default(),
             }],
         })
         .unwrap();
@@ -2835,6 +3019,9 @@ pub(super) async fn seed_cli_runtime_skill_preflight_thread(
                 name: Some("Proposal 51 skill preflight".to_owned()),
                 model: Some(
                     match harness.runtime_kind {
+                        CLIAgentRuntimeKind::Acp => {
+                            panic!("native model catalog fixture excludes ACP descriptors")
+                        }
                         CLIAgentRuntimeKind::Codex => "o4-mini",
                         CLIAgentRuntimeKind::Claude => "claude-sonnet",
                         CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
@@ -2956,6 +3143,7 @@ async fn capability_persistence_order_impl() {
             match runtime_kind {
                 CLIAgentRuntimeKind::Codex => "codex",
                 CLIAgentRuntimeKind::Claude => "claude",
+                pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
                 CLIAgentRuntimeKind::OpenCode => "opencode",
             },
         );
@@ -3193,10 +3381,17 @@ async fn capability_persistence_order_impl() {
                     ("selected Skill input", "- $beta", "- $alpha", "Codex")
                 }
                 CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
-                CLIAgentRuntimeKind::Claude => unreachable!(),
+                CLIAgentRuntimeKind::Claude | CLIAgentRuntimeKind::Acp => unreachable!(),
             };
             assert!(context.contains(directive));
-            assert!(!native_turn.elevated_instructions.text().contains(directive));
+            assert!(
+                !native_turn
+                    .instructions
+                    .elevated()
+                    .unwrap()
+                    .text()
+                    .contains(directive)
+            );
             let beta = context
                 .find(beta_label)
                 .unwrap_or_else(|| panic!("{runtime_label} turn context should include beta"));
@@ -3225,7 +3420,14 @@ async fn capability_persistence_order_impl() {
                 .expect("turn context should precede native user input");
             let directive = "Invoke every selected skill through Claude's native Skill tool";
             assert!(context.contains(directive));
-            assert!(!native_turn.elevated_instructions.text().contains(directive));
+            assert!(
+                !native_turn
+                    .instructions
+                    .elevated()
+                    .unwrap()
+                    .text()
+                    .contains(directive)
+            );
             let beta = context
                 .find("- beta")
                 .expect("Claude turn context should include beta");
@@ -3702,8 +3904,22 @@ async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_i
     let directive = "Invoke every selected skill through Claude's native Skill tool";
     assert!(context.contains(directive));
     assert!(context.contains("- refresh"));
-    assert!(!native.elevated_instructions.text().contains(directive));
-    assert!(!native.elevated_instructions.text().contains("- refresh"));
+    assert!(
+        !native
+            .instructions
+            .elevated()
+            .unwrap()
+            .text()
+            .contains(directive)
+    );
+    assert!(
+        !native
+            .instructions
+            .elevated()
+            .unwrap()
+            .text()
+            .contains("- refresh")
+    );
     assert_eq!(
         input
             .iter()
@@ -9082,6 +9298,7 @@ fn detached_cli_task_create_params(
                     pioneer_protocol::TurnPermissionProfileSelection::full_access(),
                 ),
                 cli_runtime_options: Some(pioneer_protocol::TurnCLIRuntimeOptions {
+                    acp_configuration: None,
                     sandbox: None,
                     effort: None,
                     personality: Some(format!("{runtime_id}-task-personality")),
@@ -9094,17 +9311,17 @@ fn detached_cli_task_create_params(
     params
 }
 
-async fn complete_recorded_cli_task_turn(
-    processor: &Arc<MessageProcessor>,
-    cli: &RecordingCliRuntimeSession,
-    manager: &Arc<CLIAgentRuntimeManager>,
-    workspace_id: &str,
-    runtime_id: &str,
-    _parent_thread_id: &str,
-    native_thread_id: &str,
-    native_turn_id: &str,
-    result_text: &str,
-) {
+fn complete_recorded_cli_task_turn<'a>(
+    processor: &'a Arc<MessageProcessor>,
+    cli: &'a RecordingCliRuntimeSession,
+    manager: &'a Arc<CLIAgentRuntimeManager>,
+    workspace_id: &'a str,
+    runtime_id: &'a str,
+    _parent_thread_id: &'a str,
+    native_thread_id: &'a str,
+    native_turn_id: &'a str,
+    result_text: &'a str,
+) -> MessageFuture<'a, ()> {
     complete_recorded_cli_task_turn_with_recovery(
         processor,
         cli,
@@ -9118,281 +9335,290 @@ async fn complete_recorded_cli_task_turn(
         false,
         false,
     )
-    .await;
 }
 
-async fn complete_recorded_cli_task_turn_with_recovery(
-    processor: &Arc<MessageProcessor>,
-    cli: &RecordingCliRuntimeSession,
-    manager: &Arc<CLIAgentRuntimeManager>,
-    workspace_id: &str,
-    runtime_id: &str,
-    _parent_thread_id: &str,
-    native_thread_id: &str,
-    native_turn_id: &str,
-    result_text: &str,
+// Completion composes several large timeline-handler futures. Erase the shared
+// fixture and each handler separately so repeated completions do not accumulate
+// their state machines in the enclosing CLI Task test frame.
+fn complete_recorded_cli_task_turn_with_recovery<'a>(
+    processor: &'a Arc<MessageProcessor>,
+    cli: &'a RecordingCliRuntimeSession,
+    manager: &'a Arc<CLIAgentRuntimeManager>,
+    workspace_id: &'a str,
+    runtime_id: &'a str,
+    _parent_thread_id: &'a str,
+    native_thread_id: &'a str,
+    native_turn_id: &'a str,
+    result_text: &'a str,
     fail_boundary_write_once: bool,
     recover_from_minimal_journal: bool,
-) {
-    cli.record_provider_assistant_message(native_thread_id, result_text)
-        .await;
-    cli.record_provider_boundary(native_thread_id, native_turn_id)
-        .await;
-    let continuation = timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(binding) = processor
-                .crud_store
-                .get_cli_runtime_turn_binding_by_native_turn(runtime_id, native_turn_id)
-                .await
-                .expect("native Task binding lookup should succeed")
-            {
-                // Native ownership is persisted before admission confirms the
-                // provider context. Wait for that confirmation before injecting
-                // terminal events, just as the ordinary buffered consumer does.
-                let thread_binding = processor
+) -> MessageFuture<'a, ()> {
+    message_future(async move {
+        cli.record_provider_assistant_message(native_thread_id, result_text)
+            .await;
+        cli.record_provider_boundary(native_thread_id, native_turn_id)
+            .await;
+        let continuation = timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(binding) = processor
                     .crud_store
-                    .get_cli_runtime_thread_binding(binding.continuation_thread_id.as_str())
+                    .get_cli_runtime_turn_binding_by_native_turn(runtime_id, native_turn_id)
                     .await
-                    .expect("native Task context receipt lookup should succeed");
-                if let Some(thread_binding) = thread_binding {
-                    let cursor: serde_json::Value =
-                        serde_json::from_str(&thread_binding.resume_cursor_json)
-                            .expect("native Task context receipt should decode");
-                    if cursor["pioneerContext"]["acceptedTurnId"].as_str()
-                        == Some(binding.turn_id.as_str())
-                    {
-                        break binding;
+                    .expect("native Task binding lookup should succeed")
+                {
+                    // Native ownership is persisted before admission confirms the
+                    // provider context. Wait for that confirmation before injecting
+                    // terminal events, just as the ordinary buffered consumer does.
+                    let thread_binding = processor
+                        .crud_store
+                        .get_cli_runtime_thread_binding(binding.continuation_thread_id.as_str())
+                        .await
+                        .expect("native Task context receipt lookup should succeed");
+                    if let Some(thread_binding) = thread_binding {
+                        let cursor: serde_json::Value =
+                            serde_json::from_str(&thread_binding.resume_cursor_json)
+                                .expect("native Task context receipt should decode");
+                        if cursor["pioneerContext"]["acceptedTurnId"].as_str()
+                            == Some(binding.turn_id.as_str())
+                        {
+                            break binding;
+                        }
                     }
                 }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("native Task binding must become durable after provider start");
-    let continuation_thread_id = continuation.continuation_thread_id.clone();
-    let pioneer_turn_id = continuation.turn_id.clone();
-    let claude_runtime = continuation.runtime_kind == "claude";
-    let claude_record_uuid = if claude_runtime {
-        let record_uuid = uuid::Uuid::new_v4();
-        cli.record_claude_boundary(record_uuid, native_thread_id)
-            .await;
-        Some(record_uuid)
-    } else {
-        None
-    };
-    let key =
-        CLIAgentRuntimeSessionKey::new(workspace_id, runtime_id, continuation_thread_id.as_str())
-            .expect("native Task session key should build");
-    let handle = manager
-        .existing_session(&key)
-        .await
-        .expect("native Task session should remain active");
-    processor
-        .handle_cli_runtime_timeline_event(
-            handle.instance(),
-            RuntimeEvent::TurnStarted(RuntimeTurnStarted {
-                native_thread_id: Some(native_thread_id.to_owned()),
-                native_turn_id: native_turn_id.to_owned(),
-                native: None,
-            }),
-        )
-        .await;
-    processor
-        .handle_cli_runtime_timeline_event(
-            handle.instance(),
-            RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
-                native_thread_id: Some(native_thread_id.to_owned()),
-                native_turn_id: native_turn_id.to_owned(),
-                native_item_id: format!("item_{native_turn_id}"),
-                item_kind: "agentMessage".to_owned(),
-                text: Some(result_text.to_owned()),
-                summary: Vec::new(),
-                content: Vec::new(),
-                phase: RuntimeAgentMessagePhase::FinalAnswer,
-                metadata: None,
-                native_item_redacted: None,
-                native: None,
-            }),
-        )
-        .await;
-    let terminal = if let Some(record_uuid) = claude_record_uuid {
-        crate::cli_runtime::claude_session::tests::mapped_assistant_completion_for_gateway_test(
-            uuid::Uuid::parse_str(native_thread_id).unwrap(),
-            native_turn_id,
-            record_uuid,
-        )
-        .await
-    } else {
-        RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
-            native_thread_id: Some(native_thread_id.to_owned()),
-            native_turn_id: native_turn_id.to_owned(),
-            status: "completed".to_owned(),
-            native: None,
         })
-    };
-    if fail_boundary_write_once {
-        assert!(
-            claude_runtime,
-            "boundary write recovery requires a Claude adapter"
-        );
-        processor
-            .persist_cli_runtime_canonical_event(handle.instance(), "claude", &terminal, false)
-            .await;
-        let journal = processor
-            .crud_store
-            .latest_cli_runtime_native_event(CliRuntimeNativeEventListFilter {
-                runtime_id: Some(runtime_id.to_owned()),
-                turn_id: Some(pioneer_turn_id.clone()),
-                native_method: Some("turn_completed".to_owned()),
-                limit: Some(1),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        let journal_payload: serde_json::Value =
-            serde_json::from_str(&journal.payload_redacted_json).unwrap();
-        assert_eq!(
-            journal_payload["assistantRecordUuid"],
-            json!(claude_record_uuid.unwrap()),
-            "minimal journal must retain the transcript UUID without debug capture"
-        );
-        processor
-            .claude_boundary_write_failures
-            .lock()
-            .await
-            .insert(pioneer_turn_id.clone());
-    }
-    processor
-        .handle_cli_runtime_timeline_event(handle.instance(), terminal.clone())
-        .await;
-    if fail_boundary_write_once {
-        let (_, before) = processor
-            .crud_store
-            .get_turn(continuation.thread_id.as_str(), pioneer_turn_id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(
-            before.status,
-            TurnStatus::Completed,
-            "a failed Claude boundary write must not commit completion"
-        );
-        let observed_terminal = if recover_from_minimal_journal {
-            let mut without_native = terminal.clone();
-            if let RuntimeEvent::TurnCompleted(completed) = &mut without_native {
-                completed.native = None;
-            }
-            without_native
+        .await
+        .expect("native Task binding must become durable after provider start");
+        let continuation_thread_id = continuation.continuation_thread_id.clone();
+        let pioneer_turn_id = continuation.turn_id.clone();
+        let claude_runtime = continuation.runtime_kind == "claude";
+        let claude_record_uuid = if claude_runtime {
+            let record_uuid = uuid::Uuid::new_v4();
+            cli.record_claude_boundary(record_uuid, native_thread_id)
+                .await;
+            Some(record_uuid)
         } else {
-            terminal.clone()
+            None
         };
-        *cli.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
-            status: CLIAgentRuntimeObservedTurnStatus::Completed,
-            message: None,
-            reconciliation_events: vec![observed_terminal],
-        });
-        // The first lookup may race admission's final context bookkeeping.
-        // Reconciliation receives a fresh discovery snapshot after delivery.
-        let current_binding = processor
-            .crud_store
-            .get_cli_runtime_turn_binding(&pioneer_turn_id)
+        let key = CLIAgentRuntimeSessionKey::new(
+            workspace_id,
+            runtime_id,
+            continuation_thread_id.as_str(),
+        )
+        .expect("native Task session key should build");
+        let handle = manager
+            .existing_session(&key)
             .await
-            .unwrap()
-            .unwrap();
-        let recovered = processor
-            .reconcile_cli_runtime_turn_from_runtime(&current_binding, workspace_id, &before)
+            .expect("native Task session should remain active");
+        processor
+            .handle_cli_runtime_timeline_event(
+                handle.instance(),
+                RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                    native_thread_id: Some(native_thread_id.to_owned()),
+                    native_turn_id: native_turn_id.to_owned(),
+                    native: None,
+                }),
+            )
+            .await;
+        processor
+            .handle_cli_runtime_timeline_event(
+                handle.instance(),
+                RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                    item: None,
+                    native_thread_id: Some(native_thread_id.to_owned()),
+                    native_turn_id: native_turn_id.to_owned(),
+                    native_item_id: format!("item_{native_turn_id}"),
+                    item_kind: "agentMessage".to_owned(),
+                    text: Some(result_text.to_owned()),
+                    summary: Vec::new(),
+                    content: Vec::new(),
+                    phase: RuntimeAgentMessagePhase::FinalAnswer,
+                    metadata: None,
+                    native_item_redacted: None,
+                    native: None,
+                }),
+            )
+            .await;
+        let terminal = if let Some(record_uuid) = claude_record_uuid {
+            crate::cli_runtime::claude_session::tests::mapped_assistant_completion_for_gateway_test(
+                uuid::Uuid::parse_str(native_thread_id).unwrap(),
+                native_turn_id,
+                record_uuid,
+            )
             .await
-            .unwrap();
-        assert!(matches!(
-            recovered,
-            crate::message::cli_runtime::CLIRuntimeAuthoritativeTurnState::Terminal
-        ));
+        } else {
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: native_turn_id.to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            })
+        };
+        if fail_boundary_write_once {
+            assert!(
+                claude_runtime,
+                "boundary write recovery requires a Claude adapter"
+            );
+            processor
+                .persist_cli_runtime_canonical_event(handle.instance(), "claude", &terminal, false)
+                .await;
+            let journal = processor
+                .crud_store
+                .latest_cli_runtime_native_event(CliRuntimeNativeEventListFilter {
+                    runtime_id: Some(runtime_id.to_owned()),
+                    turn_id: Some(pioneer_turn_id.clone()),
+                    native_method: Some("turn_completed".to_owned()),
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let journal_payload: serde_json::Value =
+                serde_json::from_str(&journal.payload_redacted_json).unwrap();
+            assert_eq!(
+                journal_payload["assistantRecordUuid"],
+                json!(claude_record_uuid.unwrap()),
+                "minimal journal must retain the transcript UUID without debug capture"
+            );
+            processor
+                .claude_boundary_write_failures
+                .lock()
+                .await
+                .insert(pioneer_turn_id.clone());
+        }
         processor
             .handle_cli_runtime_timeline_event(handle.instance(), terminal.clone())
             .await;
-        let boundaries = processor
-            .crud_store
-            .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
-                runtime_id: Some(runtime_id.to_owned()),
-                thread_id: Some(continuation.thread_id.clone()),
-                turn_id: Some(pioneer_turn_id.clone()),
-                native_method: Some("claude/assistant_record_boundary".to_owned()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            boundaries.len(),
-            1,
-            "replay must retain one transcript boundary"
-        );
-    }
-    let receipt_wait = timeout(Duration::from_secs(10), async {
-        loop {
-            let binding = processor
+        if fail_boundary_write_once {
+            let (_, before) = processor
                 .crud_store
-                .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
+                .get_turn(continuation.thread_id.as_str(), pioneer_turn_id.as_str())
                 .await
-                .expect("completed provider conversation binding should load")
-                .expect("completed provider conversation binding should exist");
-            assert_eq!(
-                binding.native_thread_id, native_thread_id,
-                "completion must not switch provider conversations"
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                before.status,
+                TurnStatus::Completed,
+                "a failed Claude boundary write must not commit completion"
             );
-            if crate::cli_runtime::thread_binding::completed_context_basis_from_binding(&binding)
+            let observed_terminal = if recover_from_minimal_journal {
+                let mut without_native = terminal.clone();
+                if let RuntimeEvent::TurnCompleted(completed) = &mut without_native {
+                    completed.native = None;
+                }
+                without_native
+            } else {
+                terminal.clone()
+            };
+            *cli.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+                status: CLIAgentRuntimeObservedTurnStatus::Completed,
+                message: None,
+                reconciliation_events: vec![observed_terminal],
+            });
+            // The first lookup may race admission's final context bookkeeping.
+            // Reconciliation receives a fresh discovery snapshot after delivery.
+            let current_binding = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(&pioneer_turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let recovered = processor
+                .reconcile_cli_runtime_turn_from_runtime(&current_binding, workspace_id, &before)
+                .await
+                .unwrap();
+            assert!(matches!(
+                recovered,
+                crate::message::cli_runtime::CLIRuntimeAuthoritativeTurnState::Terminal
+            ));
+            processor
+                .handle_cli_runtime_timeline_event(handle.instance(), terminal.clone())
+                .await;
+            let boundaries = processor
+                .crud_store
+                .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
+                    runtime_id: Some(runtime_id.to_owned()),
+                    thread_id: Some(continuation.thread_id.clone()),
+                    turn_id: Some(pioneer_turn_id.clone()),
+                    native_method: Some("claude/assistant_record_boundary".to_owned()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                boundaries.len(),
+                1,
+                "replay must retain one transcript boundary"
+            );
+        }
+        let receipt_wait = timeout(Duration::from_secs(10), async {
+            loop {
+                let binding = processor
+                    .crud_store
+                    .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
+                    .await
+                    .expect("completed provider conversation binding should load")
+                    .expect("completed provider conversation binding should exist");
+                assert_eq!(
+                    binding.native_thread_id, native_thread_id,
+                    "completion must not switch provider conversations"
+                );
+                if crate::cli_runtime::thread_binding::completed_context_basis_from_binding(
+                    &binding,
+                )
                 .expect("completed context receipt should decode")
                 .is_some_and(|basis| {
                     basis
                         .delivered_turns
                         .iter()
                         .any(|turn| turn.turn_id == pioneer_turn_id)
-                })
-            {
-                break;
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
+        })
+        .await;
+        if receipt_wait.is_err() {
+            let binding = processor
+                .crud_store
+                .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
+                .await;
+            let turn = processor
+                .crud_store
+                .get_turn(continuation.thread_id.as_str(), pioneer_turn_id.as_str())
+                .await;
+            panic!(
+                "provider completion must publish its exact continuity receipt before the next turn: runtime={runtime_id}, pioneer_turn={pioneer_turn_id}, native_turn={native_turn_id}, binding={:?}, turn={:?}",
+                binding.map(|row| row.map(|row| (
+                    row.status,
+                    row.native_thread_id,
+                    row.resume_cursor_json
+                ))),
+                turn.map(|row| row.map(|(_, turn)| (turn.status, turn.error)))
+            );
+        }
+        if let Some(expected) = claude_record_uuid {
+            let source = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(pioneer_turn_id.as_str())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::cli_runtime::thread_binding::claude_assistant_record_boundary(
+                    processor.crud_store.as_ref(),
+                    &source,
+                )
+                .await
+                .unwrap(),
+                Some(expected),
+                "the completion handler must persist the mapper's transcript UUID",
+            );
         }
     })
-    .await;
-    if receipt_wait.is_err() {
-        let binding = processor
-            .crud_store
-            .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
-            .await;
-        let turn = processor
-            .crud_store
-            .get_turn(continuation.thread_id.as_str(), pioneer_turn_id.as_str())
-            .await;
-        panic!(
-            "provider completion must publish its exact continuity receipt before the next turn: runtime={runtime_id}, pioneer_turn={pioneer_turn_id}, native_turn={native_turn_id}, binding={:?}, turn={:?}",
-            binding.map(|row| row.map(|row| (
-                row.status,
-                row.native_thread_id,
-                row.resume_cursor_json
-            ))),
-            turn.map(|row| row.map(|(_, turn)| (turn.status, turn.error)))
-        );
-    }
-    if let Some(expected) = claude_record_uuid {
-        let source = processor
-            .crud_store
-            .get_cli_runtime_turn_binding(pioneer_turn_id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            crate::cli_runtime::thread_binding::claude_assistant_record_boundary(
-                processor.crud_store.as_ref(),
-                &source,
-            )
-            .await
-            .unwrap(),
-            Some(expected),
-            "the completion handler must persist the mapper's transcript UUID",
-        );
-    }
 }
 
 async fn sync_test_cli_runtime_identities(processor: &MessageProcessor) -> anyhow::Result<()> {
@@ -9427,6 +9653,9 @@ async fn exact_cli_task_launch_for_test(
         .find(|runtime| runtime.id == runtime_id && runtime.enabled)
         .context("test CLI runtime missing")?;
     let runtime_kind = match runtime.kind {
+        pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp => {
+            anyhow::bail!("ACP requires the negotiated session fixture")
+        }
         pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
             pioneer_protocol::CLIAgentRuntimeKind::Codex
         }
@@ -30536,6 +30765,9 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                 let parent = "thr_composer_cli_pack";
                 let source = "turn_composer_cli_pack";
                 let model = match runtime_kind {
+                    CLIAgentRuntimeKind::Acp => {
+                        panic!("native model catalog fixture excludes ACP descriptors")
+                    }
                     CLIAgentRuntimeKind::Codex => "gpt-5",
                     CLIAgentRuntimeKind::Claude => "claude-sonnet",
                     CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
@@ -30891,6 +31123,7 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                 pioneer_protocol::TurnPermissionProfileSelection::full_access(),
             ),
             cli_runtime_options: Some(pioneer_protocol::TurnCLIRuntimeOptions {
+                acp_configuration: None,
                 sandbox: None,
                 effort: None,
                 personality: Some(format!("{runtime_id}-dynamic-personality")),
@@ -35159,13 +35392,14 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         runtime_id: runtime_id.to_owned(),
                     }
                 }
-                CLIAgentRuntimeKind::OpenCode => unreachable!(),
+                CLIAgentRuntimeKind::OpenCode | CLIAgentRuntimeKind::Acp => unreachable!(),
             },
         )
         .await;
         assert_eq!(
             security.backend.execution_backend,
             match runtime_kind {
+                CLIAgentRuntimeKind::Acp => pioneer_protocol::TurnSecurityExecutionBackendKind::Acp,
                 CLIAgentRuntimeKind::Codex => {
                     pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli
                 }
@@ -51648,7 +51882,9 @@ async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profi
     );
     assert!(
         turn_start
-            .elevated_instructions
+            .instructions
+            .elevated()
+            .expect("native elevated instructions")
             .text()
             .contains("## Pioneer CLI Runtime Instructions")
     );
@@ -52591,8 +52827,15 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
         let native = native_turns
             .last()
             .expect("exact CLI Composer child must reach its native runtime");
-        let serialized_payload =
-            format!("{}\n{}", native.input, native.elevated_instructions.text());
+        let serialized_payload = format!(
+            "{}\n{}",
+            native.input,
+            native
+                .instructions
+                .elevated()
+                .expect("native elevated instructions")
+                .text()
+        );
         for forbidden in [
             skill_id_text.as_str(),
             version_id.as_str(),
@@ -52698,7 +52941,9 @@ async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile_impl() 
     assert_eq!(turn_start.permissions.as_deref(), Some(":read-only"));
     assert!(
         turn_start
-            .elevated_instructions
+            .instructions
+            .elevated()
+            .expect("native elevated instructions")
             .text()
             .contains("## Pioneer CLI Runtime Instructions")
     );
@@ -54512,6 +54757,7 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
         status: CLIAgentRuntimeObservedTurnStatus::Completed,
         message: None,
         reconciliation_events: vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: Some("native-thread-transport-gap".to_owned()),
             native_turn_id: "native-turn-transport-gap".to_owned(),
             native_item_id: "transport_gap_final_item".to_owned(),
@@ -54673,6 +54919,7 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
             status: CLIAgentRuntimeObservedTurnStatus::Completed,
             message: None,
             reconciliation_events: vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: native_turn_id.to_owned(),
                 native_item_id: "reconciled_final_item".to_owned(),
@@ -54864,6 +55111,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
         status: CLIAgentRuntimeObservedTurnStatus::Completed,
         message: None,
         reconciliation_events: vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: Some(native_thread_id.to_owned()),
             native_turn_id: native_turn_id.to_owned(),
             native_item_id: "reconciled_unloaded_final_item".to_owned(),
@@ -55046,6 +55294,7 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
         .handle_cli_runtime_timeline_event(
             handle.instance(),
             RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                item: None,
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: native_turn_id.to_owned(),
                 native_item_id: "deferred_reasoning_item".to_owned(),
@@ -55725,6 +55974,7 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
         .handle_cli_runtime_timeline_event(
             session_handle.instance(),
             RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: second_segment_id.to_owned(),
                 native_item_id: "goal_segment_final_answer".to_owned(),
@@ -56328,6 +56578,7 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
         .handle_cli_runtime_timeline_event(
             &key,
             RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: native_turn_id.to_owned(),
                 native_item_id: "late_terminal_attempt_item".to_owned(),
@@ -56931,7 +57182,9 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     );
     assert!(
         starts[0]
-            .elevated_instructions
+            .instructions
+            .elevated()
+            .expect("native elevated instructions")
             .text()
             .contains("## Pioneer CLI Runtime Instructions")
     );
@@ -57022,6 +57275,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .handle_cli_runtime_timeline_event(
             recovery_handle.instance(),
             RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                item: None,
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: "native_turn_default".to_owned(),
                 native_item_id: "recovery_user_echo".to_owned(),
@@ -57070,6 +57324,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .handle_cli_runtime_timeline_event(
             recovery_handle.instance(),
             RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                item: None,
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: "native_turn_default".to_owned(),
                 native_item_id: "recovery_reasoning".to_owned(),
@@ -62003,6 +62258,7 @@ async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_tur
         status: CLIAgentRuntimeObservedTurnStatus::Completed,
         message: None,
         reconciliation_events: vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: Some("codex-thread-command".to_owned()),
             native_turn_id: "codex-turn-command".to_owned(),
             native_item_id: "codex-terminal-answer".to_owned(),
@@ -62457,7 +62713,7 @@ async fn materialize_cli_runtime_approval_turn(
     .await;
 }
 
-async fn materialize_cli_runtime_turn_with_text(
+pub(super) async fn materialize_cli_runtime_turn_with_text(
     crud_store: &CrudStore,
     workspace_id: &str,
     thread_id: &str,
@@ -93069,6 +93325,975 @@ mod task_start_failure;
 
 #[path = "tests/frozen_history_lifetime.rs"]
 mod frozen_history_lifetime;
+
+#[tokio::test]
+async fn acp_preparation_tracks_the_parent_continuation_and_rejects_old_submission() {
+    let (processor, _, _rx, workspace, _store, session) = cli_runtime_approval_processor().await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "acp-test", "parent-acp").unwrap();
+    let manager = processor.cli_runtime_manager.as_ref().unwrap();
+    let handle = manager
+        .get_or_start_with_launch_spec(
+            key.clone(),
+            CliSessionLaunchSpec::acp(
+                Default::default(),
+                crate::cli_runtime::continuation::CliMcpSessionLaunch::ManagementOnly,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    let snapshot: pioneer_protocol::AcpSessionSnapshot = serde_json::from_value(json!({
+        "workspace_id":workspace,"thread_id":"parent-acp","runtime_id":"acp-test","generation":handle.instance().generation(),
+        "connected":true,"presentation_revision":1,"capabilities":{},"auth_methods":[],"session_id":"prepared",
+        "version":{"connection_id":"preparation-connection","revision":1},"has_config_options":true,"config_options":[],
+        "modes":null,"commands":[],"session_info":null,"usage":null,"notice":null,"completed_elicitations":[],
+        "additional_directories":[],"initial_descriptor_fingerprint":pioneer_protocol::acp_descriptor_fingerprint(&[],None).unwrap(),
+        "configuration_replay":[],"continuation_requested":false
+    })).unwrap();
+    let selection = pioneer_protocol::AcpTurnConfiguration {
+        session_id: "prepared".into(),
+        expected: snapshot.version.clone().unwrap(),
+        descriptor_fingerprint: pioneer_protocol::acp_descriptor_fingerprint(&[], None).unwrap(),
+        values: Default::default(),
+        mode: None,
+        additional_directories: vec![],
+        initial_descriptor_fingerprint: snapshot.initial_descriptor_fingerprint.clone(),
+        configuration_replay: vec![],
+        continuation_requested: false,
+    };
+    *session.acp_snapshot.lock().unwrap() = Some(snapshot.clone());
+    let mut params: pioneer_protocol::TurnStartParams = serde_json::from_value(json!({
+        "thread_id":"parent-acp","turn_id":"submission-one","execution_backend":{"type":"acpAgentRuntime","runtime_id":"acp-test"},
+        "cli_runtime_options":{"acp_configuration":selection}
+    })).unwrap();
+    processor
+        .validate_acp_prepared_configuration(&workspace, &params)
+        .await
+        .unwrap();
+    // Composer's detached child keeps the continuation owner at parent-acp.
+    let mut actual = snapshot;
+    actual.session_id = Some("execution".into());
+    actual.version.as_mut().unwrap().revision = 2;
+    actual.version.as_mut().unwrap().connection_id = "execution-connection".into();
+    *session.acp_snapshot.lock().unwrap() = Some(actual.clone());
+    assert!(
+        processor
+            .validate_acp_prepared_configuration(&workspace, &params)
+            .await
+            .is_err()
+    );
+    let selected = params
+        .cli_runtime_options
+        .as_mut()
+        .unwrap()
+        .acp_configuration
+        .as_mut()
+        .unwrap();
+    selected.session_id = actual.session_id.unwrap();
+    selected.expected = actual.version.unwrap();
+    params.turn_id = "submission-two".into();
+    processor
+        .validate_acp_prepared_configuration(&workspace, &params)
+        .await
+        .unwrap();
+    session
+        .acp_snapshot
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .connected = false;
+    assert!(
+        processor
+            .validate_acp_prepared_configuration(&workspace, &params)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn acp_session_compaction_patches_keep_the_original_child_row_between_prompts() {
+    use pioneer_cli_agent_runtime::acp::{
+        reducer::{Context as AcpContext, Reducer},
+        schema,
+    };
+    let (processor, _, _rx, workspace, store, _session) = cli_runtime_approval_processor().await;
+    drop(_rx);
+    let parent = "parent-compaction";
+    let child = "child-compaction";
+    let first = "first-compaction";
+    materialize_cli_runtime_turn_with_text(&store, &workspace, child, first, "first").await;
+    let key = CLIAgentRuntimeSessionKey::new(&workspace, "acp-test", parent).unwrap();
+    let handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .get_or_start_with_launch_spec(
+            key,
+            CliSessionLaunchSpec::acp(
+                Default::default(),
+                crate::cli_runtime::continuation::CliMcpSessionLaunch::ManagementOnly,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().fixed_offset();
+    store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            workspace_id: workspace.clone(),
+            thread_id: child.into(),
+            continuation_thread_id: parent.into(),
+            turn_id: first.into(),
+            runtime_id: "acp-test".into(),
+            runtime_kind: "acp".into(),
+            native_thread_id: "session".into(),
+            native_turn_id: Some("prompt-one".into()),
+            request_id: None,
+            status: "completed".into(),
+            model: None,
+            cwd: None,
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".into(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let context = AcpContext {
+        workspace_id: workspace.clone(),
+        thread_id: child.into(),
+        turn_id: first.into(),
+        session_id: "session".into(),
+        session_scope: "same-process-and-session".into(),
+    };
+    let mut reducer = Reducer::new(context.clone(), 64, 65536).unwrap();
+    let mut id = None;
+    for (step, update) in [
+        json!({"sessionUpdate":"compaction_update","compactionId":"C","status":"in_progress","summary":[{"type":"text","text":"kept"}]}),
+        json!({"sessionUpdate":"compaction_update","compactionId":"C","status":"completed"}),
+        json!({"sessionUpdate":"compaction_update","compactionId":"C","status":"completed","summary":null}),
+        json!({"sessionUpdate":"compaction_update","compactionId":"C","status":"completed","summary":[{"type":"text","text":"replacement"}]}),
+        json!({"sessionUpdate":"compaction_update","compactionId":"C","status":"completed","summary":[{"type":"text","text":"replacement"}]}),
+    ].into_iter().enumerate() {
+        if step == 1 { reducer.retire_prompt().unwrap(); }
+        if step == 2 { reducer.begin_prompt(AcpContext { turn_id:"second-compaction".into(), ..context.clone() }).unwrap(); }
+        let projection = reducer.update(serde_json::from_value(json!({"sessionId":"session","update":update})).unwrap()).unwrap();
+        for snapshot in projection.snapshots {
+            let pioneer_runtime_events::ExecutionSnapshotEvent::ItemUpdated { notification: updated } = snapshot;
+            assert_eq!(updated.turn_id, first);
+            if let Some(id) = &id { assert_eq!(updated.item.item_id(), id); } else { id = Some(updated.item.item_id().to_owned()); }
+            let started = projection.durable.iter().find_map(|event| match event {
+                pioneer_protocol::AgentDurableEvent::ItemStarted { notification } => Some(notification.clone()), _ => None,
+            });
+            processor.handle_cli_runtime_event(handle.instance(), RuntimeEvent::SessionCompaction { entries: vec![RuntimeCompactionProjection { started, updated }] }).await;
+        }
+    }
+    let item = store
+        .get_turn_item(first, id.as_ref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        serde_json::to_value(item)
+            .unwrap()
+            .to_string()
+            .contains("replacement")
+    );
+    assert!(
+        store
+            .get_turn_item("second-compaction", id.as_ref().unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_turn_items_by_type(first, "system_event")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let canonical = store
+        .list_acp_compaction_items(&workspace, "acp-test", parent, "session")
+        .await
+        .unwrap();
+    assert_eq!(canonical.len(), 1);
+    for (w, r, p, session) in [
+        ("wrong-workspace", "acp-test", parent, "session"),
+        (workspace.as_str(), "wrong-runtime", parent, "session"),
+        (workspace.as_str(), "acp-test", "wrong-parent", "session"),
+        (workspace.as_str(), "acp-test", parent, "wrong-session"),
+    ] {
+        assert!(
+            store
+                .list_acp_compaction_items(w, r, p, session)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let mut replacement = Reducer::new(
+        AcpContext {
+            session_scope: "new-process-generation".into(),
+            ..context.clone()
+        },
+        64,
+        65536,
+    )
+    .unwrap();
+    for item in canonical {
+        replacement.hydrate_compaction(item).unwrap();
+    }
+    replacement
+        .begin_prompt(AcpContext {
+            turn_id: "new-generation-turn".into(),
+            session_scope: "new-process-generation".into(),
+            ..context
+        })
+        .unwrap();
+    let patch: schema::SessionNotification = serde_json::from_value(json!({"sessionId":"session","update":{"sessionUpdate":"compaction_update","compactionId":"C","status":"completed"}})).unwrap();
+    let replay = replacement.update(patch).unwrap();
+    assert!(replay.durable.is_empty());
+    for snapshot in replay.snapshots {
+        let pioneer_runtime_events::ExecutionSnapshotEvent::ItemUpdated { notification } = snapshot;
+        assert_eq!(notification.turn_id, first);
+        assert_eq!(notification.item.item_id(), id.as_ref().unwrap());
+        assert!(
+            serde_json::to_value(&notification.item)
+                .unwrap()
+                .to_string()
+                .contains("replacement")
+        );
+        processor
+            .project_acp_compaction(handle.instance(), None, notification.clone())
+            .await
+            .unwrap();
+        processor
+            .cli_runtime_manager
+            .as_ref()
+            .unwrap()
+            .close_session(handle.instance().key())
+            .await
+            .unwrap();
+        assert!(
+            processor
+                .project_acp_compaction(handle.instance(), None, notification)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn acp_loaded_destination_must_match_the_accepted_binding_before_dispatch() {
+    let (_processor, _, _rx, workspace, store, session) = cli_runtime_approval_processor().await;
+    materialize_cli_runtime_turn_with_text(
+        &store,
+        &workspace,
+        "parent-loaded",
+        "turn-loaded",
+        "request",
+    )
+    .await;
+    let now = chrono::Utc::now().fixed_offset();
+    store
+        .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+            thread_id: "parent-loaded".into(),
+            workspace_id: workspace.clone(),
+            runtime_id: "acp-test".into(),
+            runtime_kind: "acp".into(),
+            native_thread_id: "selected-session".into(),
+            native_session_id: None,
+            native_root_thread_id: None,
+            native_cwd: Some("/tmp/project".into()),
+            native_model: None,
+            resume_cursor_json: "{}".into(),
+            status: "active".into(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let binding = store
+        .get_cli_runtime_thread_binding("parent-loaded")
+        .await
+        .unwrap()
+        .unwrap();
+    for can_continue in [true, false] {
+        assert_eq!(
+            crate::cli_runtime::acp_input::validate_selected_continuation(
+                "selected-session",
+                Some(&binding),
+                "acp-test",
+                false,
+                can_continue,
+            )
+            .is_ok(),
+            can_continue
+        );
+    }
+    for (destination, runtime, bootstrap) in [
+        ("foreign-session", "acp-test", false),
+        ("selected-session", "another-instance", false),
+        ("selected-session", "acp-test", true), // Changed roots/context/security must bootstrap.
+    ] {
+        assert!(
+            crate::cli_runtime::acp_input::validate_selected_continuation(
+                destination,
+                Some(&binding),
+                runtime,
+                bootstrap,
+                true
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        crate::cli_runtime::acp_input::validate_selected_continuation(
+            "selected-session",
+            None,
+            "acp-test",
+            false,
+            true
+        )
+        .is_err()
+    );
+    assert!(session.turn_starts.lock().await.is_empty());
+}
+
+#[test]
+fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
+    run_gateway_message_test("acp-composer-detached-results", || async {
+        use pioneer_cli_agent_runtime::acp::{
+            reducer::{Context as AcpContext, Reducer},
+            schema,
+        };
+        for (answer, cancelled, closed) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let interrupted = cancelled || closed;
+            let (processor, _, old_rx, workspace, store, cli) =
+                cli_runtime_approval_processor().await;
+            drop(old_rx);
+            let (tx, mut rx) = crate::session::test_support::outbound_channel(512);
+            let connection =
+                register_authenticated_test_connection(processor.session_manager.as_ref(), tx)
+                    .await;
+            processor
+                .session_manager
+                .set_connection_workspace(connection, Some(workspace.clone()))
+                .await;
+            let app = crate::isolated_test_app_config().unwrap();
+            let settings_name =
+                crate::settings::normalize_settings_file_name(&app.gateway.settings_file_name)
+                    .unwrap();
+            let settings_path = processor.artifact_runtime_home.join(&settings_name);
+            let mut settings = crate::settings::load_or_create_gateway_settings(
+                &settings_path,
+                app.gateway.settings_version,
+                &settings_name,
+            )
+            .unwrap();
+            let mut catalog = pioneer_protocol::GatewayCliRuntimeSettings::default();
+            catalog
+                .instances
+                .push(pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                    id: "acp_regression".into(),
+                    kind: CLIAgentRuntimeKind::Acp,
+                    display_name: "ACP regression".into(),
+                    nickname: "acp_regression".into(),
+                    enabled: true,
+                    binary_path: "recording-runtime".into(),
+                    home_path: String::new(),
+                    shadow_home_path: None,
+                    args: vec![],
+                    env_from: Default::default(),
+                    compaction_model: None,
+                });
+            settings
+                .set_cli_runtime_settings_for_tests(catalog)
+                .unwrap();
+            crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
+            let processor = Arc::new(processor.with_cli_mcp_readiness_override_for_tests(
+                supported_test_cli_mcp_readiness(CLIAgentRuntimeKind::Acp),
+            ));
+            processor
+                .mark_cli_runtimes_ready_for_tests(&workspace)
+                .await
+                .unwrap();
+            sync_test_cli_runtime_identities(&processor).await.unwrap();
+            processor.bind_task_bridge().await;
+            processor.start_task_event_listener().await;
+            cli.enable_projected_mcp_metadata(store.clone()).await;
+            *cli.acp_snapshot.lock().unwrap() = Some(pioneer_protocol::AcpSessionSnapshot {
+                connected: true,
+                has_config_options: true,
+                capabilities: schema::AgentCapabilities::new().load_session(true),
+                initial_descriptor_fingerprint: pioneer_protocol::acp_descriptor_fingerprint(
+                    &[],
+                    None,
+                )
+                .unwrap(),
+                ..Default::default()
+            });
+            let parent = format!("parent-acp-{answer}-{cancelled}");
+            let started = processor
+                .thread_manager
+                .thread_start_seeded(
+                    connection,
+                    workspace.clone(),
+                    ThreadStartParams {
+                        thread_id: parent.clone(),
+                        workspace_id: workspace.clone(),
+                        name: Some("ACP parent".into()),
+                        model: Some("thread-default".into()),
+                        model_provider: Some("openai".into()),
+                        sandbox: Some(SandboxMode::FullAccess),
+                        mode: Some(ThreadMode::Agent),
+                        origin_kind: Some(ThreadOriginKind::Collaborative),
+                        sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                        visibility: None,
+                        agent_nickname: None,
+                        agent_role: None,
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .upsert_thread_model(
+                    &started.response.thread,
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .unwrap();
+            let context = processor
+                .session_manager
+                .connection_context(connection)
+                .await
+                .unwrap();
+            let prepare = generate_test_request_id("acp", "prepare");
+            Arc::clone(&processor).process_owned_request(context.clone(),json!({
+                "jsonrpc":"2.0","id":prepare,"method":pioneer_protocol::constants::methods::CLI_RUNTIME_ACP_SESSION,
+                "params":{"workspace_id":workspace,"thread_id":parent,"runtime_id":"acp_regression","operation":{"type":"prepare","additional_directories":[]}}
+            }).to_string()).await;
+            let prepared: pioneer_protocol::AcpSessionResponse =
+                serde_json::from_value(recv_response_by_id(&mut rx, &prepare).await.result)
+                    .unwrap();
+            let mut snapshot = prepared.snapshot;
+            let mut previous_mcp: Option<pioneer_crud::CliRuntimeTurnMcpMetadata> = None;
+            // A second send uses the published execution snapshot, without any selector RPC.
+            for index in 0..if answer && !interrupted { 2 } else { 1 } {
+                let native_turn = format!("acp-native-{index}");
+                cli.set_next_native_turn_id(&native_turn).await;
+                let source_turn = format!("acp-source-{answer}-{cancelled}-{index}");
+                let selection = pioneer_protocol::AcpTurnConfiguration {
+                    session_id: snapshot.session_id.clone().unwrap(),
+                    expected: snapshot.version.clone().unwrap(),
+                    initial_descriptor_fingerprint: snapshot.initial_descriptor_fingerprint.clone(),
+                    configuration_replay: snapshot.configuration_replay.clone(),
+                    continuation_requested: false,
+                    descriptor_fingerprint: pioneer_protocol::acp_descriptor_fingerprint(
+                        &snapshot.config_options,
+                        snapshot.modes.as_ref(),
+                    )
+                    .unwrap(),
+                    values: Default::default(),
+                    mode: None,
+                    additional_directories: vec![],
+                };
+                let request = generate_test_request_id("acp", "send");
+                Arc::clone(&processor).process_owned_request(context.clone(),json!({
+                    "jsonrpc":"2.0","id":request,"method":"turn/start","params":{
+                        "thread_id":parent,"turn_id":source_turn,"input":[{"type":"text","text":format!("request {index}")}],
+                        "mode":"Agent","permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access(),
+                        "execution_backend":{"type":"acpAgentRuntime","runtime_id":"acp_regression"},"cli_runtime_options":{"acp_configuration":selection}
+                    }
+                }).to_string()).await;
+                let _: TurnStartResponse =
+                    serde_json::from_value(recv_response_by_id(&mut rx, &request).await.result)
+                        .unwrap();
+                let binding = timeout(Duration::from_secs(10), async {
+                    loop {
+                        if let Some(binding) = store
+                            .get_cli_runtime_turn_binding_by_native_turn(
+                                "acp_regression",
+                                &native_turn,
+                            )
+                            .await
+                            .unwrap()
+                        {
+                            break binding;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                let binding = match binding {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        let tasks = store
+                            .list_tasks_created_by_turn(&workspace, &parent, &source_turn)
+                            .await
+                            .unwrap();
+                        let mut states = Vec::new();
+                        let mut child_turns = Vec::new();
+                        for task in tasks {
+                            let state = store.get_task(&task.id).await.unwrap().unwrap();
+                            for child in &state.task_run_turns {
+                                child_turns.push(
+                                    store
+                                        .get_turn(&child.thread_id, &child.turn_id)
+                                        .await
+                                        .unwrap(),
+                                );
+                            }
+                            states.push(state);
+                        }
+                        let starts = cli.turn_starts.lock().await.clone();
+                        panic!(
+                            "ACP detached child must dispatch (answer={answer}, cancelled={cancelled}, index={index}): {error}; tasks={states:#?}; child_turns={child_turns:#?}; provider_starts={starts:#?}"
+                        );
+                    }
+                };
+                assert_ne!(binding.thread_id, parent);
+                assert_eq!(binding.continuation_thread_id, parent);
+                assert_eq!(binding.runtime_kind, "acp");
+                assert_eq!(
+                    store
+                        .get_turn_execution(&binding.turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .executor_kind,
+                    pioneer_crud::TurnExecutorKind::AcpRuntime,
+                );
+                assert_eq!(
+                    binding.mcp.as_ref().unwrap().adapter_kind,
+                    crate::cli_runtime::acp_mcp::ACP_MCP_ADAPTER_KIND
+                );
+                let metadata = binding.mcp.as_ref().unwrap();
+                if let Some(previous) = previous_mcp.as_ref() {
+                    assert_eq!(metadata.session_generation, previous.session_generation);
+                    assert_eq!(metadata.manifest_hash, previous.manifest_hash);
+                    assert_eq!(
+                        metadata.projection_fingerprint,
+                        previous.projection_fingerprint
+                    );
+                    assert_eq!(
+                        metadata.provider_contract_fingerprint,
+                        previous.provider_contract_fingerprint
+                    );
+                    assert_eq!(
+                        metadata.isolation_contract_fingerprint,
+                        previous.isolation_contract_fingerprint
+                    );
+                    assert!(
+                        metadata.projection_activation_generation
+                            > previous.projection_activation_generation
+                    );
+                }
+                previous_mcp = Some(metadata.clone());
+                assert!(
+                    store
+                        .list_turn_mcp_bindings(&binding.turn_id)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool.server_installation_id
+                            == crate::cli_runtime::acp_skills::SKILL_SERVER_ID)
+                );
+                let mut authority =
+                    crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+                        store.as_ref(),
+                        &binding.turn_id,
+                    )
+                    .await
+                    .unwrap();
+                let skills = store
+                    .find_turn_skill_bindings(&binding.turn_id)
+                    .await
+                    .unwrap();
+                assert!(!skills.is_empty());
+                processor
+                    .revalidate_persisted_turn_skill_projection(
+                        &binding.thread_id,
+                        &binding.turn_id,
+                    )
+                    .await
+                    .unwrap();
+                let projection = store
+                    .get_turn_mcp_projection(&binding.turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                // Carrying skill tools through the managed facade must not
+                // grant an external MCP server, even with the same name.
+                assert!(
+                    authority
+                        .bind_mcp_projection(
+                            &workspace,
+                            projection.projection_version.try_into().unwrap(),
+                            &projection.manifest_hash,
+                            &[crate::cli_runtime::acp_skills::SKILL_SERVER_NAME.to_owned()],
+                        )
+                        .is_err()
+                );
+                let execution = store
+                    .get_task_run_turn_by_turn(&binding.thread_id, &binding.turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let manager = processor.cli_runtime_manager.as_ref().unwrap();
+                let key =
+                    CLIAgentRuntimeSessionKey::new(&workspace, "acp_regression", &parent).unwrap();
+                let handle = manager.existing_session(&key).await.unwrap();
+                snapshot = timeout(Duration::from_secs(10), async {
+                    loop {
+                        let event = recv_notification_by_method(
+                            &mut rx,
+                            events::CLI_RUNTIME_ACP_SESSION_CHANGED,
+                        )
+                        .await;
+                        let value: pioneer_protocol::AcpSessionSnapshot =
+                            serde_json::from_value(event.params.unwrap()).unwrap();
+                        if value.generation == handle.instance().generation()
+                            && value.session_id.as_deref()
+                                == Some(binding.native_thread_id.as_str())
+                        {
+                            break value;
+                        }
+                    }
+                })
+                .await
+                .expect("execution snapshot must be published for the parent continuation owner");
+                assert_eq!(snapshot.thread_id, parent);
+                processor
+                    .handle_cli_runtime_timeline_event(
+                        handle.instance(),
+                        RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                            native_thread_id: Some(binding.native_thread_id.clone()),
+                            native_turn_id: native_turn.clone(),
+                            native: None,
+                        }),
+                    )
+                    .await;
+                let mut reducer = Reducer::new(
+                    AcpContext {
+                        workspace_id: workspace.clone(),
+                        thread_id: binding.thread_id.clone(),
+                        turn_id: binding.turn_id.clone(),
+                        session_id: binding.native_thread_id.clone().into(),
+                        session_scope: format!(
+                            "acp:{}:{}",
+                            handle.instance().generation(),
+                            binding.native_thread_id
+                        ),
+                    },
+                    64,
+                    65536,
+                )
+                .unwrap();
+                let mut updates = vec![
+                    json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Проверю"}}),
+                    json!({"sessionUpdate":"tool_call","toolCallId":"opaque","title":"Work","status":"completed"}),
+                ];
+                if answer {
+                    updates.push(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":format!("Done {index}")}}));
+                }
+                for update in updates {
+                    let projection = reducer
+                        .update(
+                            serde_json::from_value(
+                                json!({"sessionId":binding.native_thread_id,"update":update}),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    for event in projection
+                        .runtime_events(&binding.native_thread_id, &native_turn)
+                        .unwrap()
+                    {
+                        processor
+                            .handle_cli_runtime_timeline_event(handle.instance(), event)
+                            .await;
+                    }
+                }
+                let stop = if interrupted {
+                    schema::StopReason::Cancelled
+                } else {
+                    schema::StopReason::EndTurn
+                };
+                let (mut projection, candidate) =
+                    reducer.finish(&schema::PromptResponse::new(stop)).unwrap();
+                let source = candidate
+                    .as_ref()
+                    .map(|item| item.item.item_id().to_owned());
+                if let Some(notification) = candidate {
+                    projection
+                        .durable
+                        .push(pioneer_protocol::AgentDurableEvent::ItemCompleted { notification });
+                }
+                for event in projection
+                    .runtime_events(&binding.native_thread_id, &native_turn)
+                    .unwrap()
+                {
+                    processor
+                        .handle_cli_runtime_timeline_event(handle.instance(), event)
+                        .await;
+                }
+                let terminal = if interrupted {
+                    RuntimeEvent::TurnInterrupted(RuntimeTurnInterrupted {
+                        native_thread_id: Some(binding.native_thread_id.clone()),
+                        native_turn_id: native_turn.clone(),
+                        reason: if closed {
+                            "session_closed"
+                        } else {
+                            "cancelled"
+                        }
+                        .into(),
+                        native: None,
+                    })
+                } else {
+                    RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                        native_thread_id: Some(binding.native_thread_id.clone()),
+                        native_turn_id: native_turn.clone(),
+                        status: "completed".into(),
+                        native: None,
+                    })
+                };
+                processor
+                    .handle_cli_runtime_timeline_event(handle.instance(), terminal.clone())
+                    .await;
+                let expected = if answer && !interrupted {
+                    TaskStatus::Completed
+                } else if cancelled {
+                    TaskStatus::Cancelled
+                } else {
+                    TaskStatus::Failed
+                };
+                wait_for_task_status(store.clone(), &execution.task_id, expected).await;
+                let task = store.get_task(&execution.task_id).await.unwrap().unwrap();
+                let child = store
+                    .get_turn(&binding.thread_id, &binding.turn_id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    task.task.status, expected,
+                    "ACP task did not settle (answer={answer}, cancelled={cancelled}, closed={closed}, index={index}); task={task:#?}; child={child:#?}"
+                );
+                assert_eq!(
+                    child.as_ref().unwrap().1.status,
+                    if interrupted {
+                        TurnStatus::Interrupted
+                    } else {
+                        TurnStatus::Completed
+                    },
+                );
+                let child_record = task
+                    .task_run_turns
+                    .iter()
+                    .find(|turn| turn.turn_id == binding.turn_id)
+                    .unwrap();
+                assert_eq!(
+                    super::task_agent_executor::acp_child_interruption_is_cancellation(
+                        &processor,
+                        child_record,
+                    )
+                    .await
+                    .unwrap(),
+                    interrupted.then_some(cancelled),
+                    "durable ACP provenance must preserve cancellation versus session closure",
+                );
+                assert_eq!(
+                    task.runs
+                        .iter()
+                        .find(|run| run.id == execution.run_id)
+                        .unwrap()
+                        .status,
+                    if cancelled {
+                        pioneer_protocol::TaskRunStatus::Cancelled
+                    } else if answer && !closed {
+                        pioneer_protocol::TaskRunStatus::Succeeded
+                    } else {
+                        pioneer_protocol::TaskRunStatus::Failed
+                    },
+                );
+                if cancelled {
+                    assert_eq!(
+                        task.task_run_turns
+                            .iter()
+                            .find(|turn| turn.turn_id == binding.turn_id)
+                            .unwrap()
+                            .status,
+                        pioneer_protocol::TaskRunTurnStatus::Cancelled,
+                    );
+                } else if closed {
+                    assert_eq!(task.task.error.as_ref().unwrap().code, "child_turn_failed");
+                } else if !answer {
+                    assert_eq!(
+                        task.task.error.as_ref().unwrap().code,
+                        "task_agent_result_missing"
+                    );
+                }
+                if answer && !interrupted {
+                    assert_eq!(
+                        task.task.result.as_ref().unwrap().summary.as_deref(),
+                        Some(format!("Done {index}").as_str())
+                    );
+                    assert!(
+                        serde_json::to_string(&task.task.result)
+                            .unwrap()
+                            .contains(source.as_ref().unwrap())
+                    );
+                } else {
+                    assert!(task.task.result.is_none());
+                }
+                // Repeated terminal notification and delivery wake use the existing outbox.
+                processor
+                    .handle_cli_runtime_timeline_event(handle.instance(), terminal)
+                    .await;
+                for _ in 0..2 {
+                    processor
+                        .process_due_task_deliveries(
+                            super::now_timestamp_secs().saturating_add(60),
+                            20,
+                        )
+                        .await
+                        .unwrap();
+                }
+                let deliveries = processor
+                    .task_runtime
+                    .service()
+                    .list_deliveries(TaskDeliveriesParams {
+                        workspace_id: workspace.clone(),
+                        task_id: Some(execution.task_id.clone()),
+                        run_id: Some(execution.run_id.clone()),
+                        statuses: vec![],
+                        limit: Some(10),
+                    })
+                    .await
+                    .unwrap();
+                if !cancelled {
+                    assert_eq!(deliveries.deliveries.len(), 1);
+                }
+                assert!(deliveries.deliveries.len() <= 1);
+                assert_eq!(
+                    store
+                        .get_task(&execution.task_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .status,
+                    expected,
+                    "duplicate ACP terminal delivery must preserve the Task outcome",
+                );
+                assert!(
+                    deliveries
+                        .deliveries
+                        .iter()
+                        .all(|delivery| delivery.target_thread_id.as_deref()
+                            == Some(parent.as_str()))
+                );
+                assert!(
+                    !serde_json::to_string(&deliveries)
+                        .unwrap()
+                        .contains("Проверю")
+                );
+                if answer && !interrupted {
+                    assert_eq!(
+                        deliveries.deliveries[0].status,
+                        TaskDeliveryStatus::Delivered
+                    );
+                    let id = pioneer_protocol::task_delivery_result_item_id(
+                        &deliveries.deliveries[0].id,
+                    );
+                    let turn = deliveries.deliveries[0].delivered_turn_id.as_ref().unwrap();
+                    assert!(store.get_turn_item(turn, &id).await.unwrap().is_some());
+                }
+            }
+            processor.shutdown_resilience_workers().await;
+        }
+    });
+}
+
+#[tokio::test]
+async fn acp_configuration_failure_releases_preparation_and_never_dispatches_a_prompt() {
+    for cancel in [false, true] {
+        let (processor, _, rx, workspace, store, cli) = cli_runtime_approval_processor().await;
+        drop(rx);
+        let thread = "acp-deadline-child";
+        let turn = "acp-deadline-turn";
+        materialize_cli_runtime_turn_with_text(&store, &workspace, thread, turn, "request").await;
+        *cli.acp_snapshot.lock().unwrap() = Some(pioneer_protocol::AcpSessionSnapshot {
+            connected: true,
+            session_id: Some("session".into()),
+            version: Some(pioneer_protocol::AcpConfigurationVersion {
+                connection_id: "connection".into(),
+                revision: 1,
+            }),
+            initial_descriptor_fingerprint: pioneer_protocol::acp_descriptor_fingerprint(&[], None)
+                .unwrap(),
+            ..Default::default()
+        });
+        cli.acp_configuration_hold.store(true, Ordering::SeqCst);
+        let selected =
+            pioneer_client::cli_runtime::acp::capture_configuration(&cli.acp_snapshot().unwrap())
+                .unwrap();
+        let key = CLIAgentRuntimeSessionKey::new(&workspace, "agent", thread).unwrap();
+        let transition = processor.cli_runtime_session_transition_mutex(&key).await;
+        {
+            let _guard = transition.lock().await;
+            let cancelling = async {
+                if cancel {
+                    cli.acp_configuration_entered.notified().await;
+                    processor.user_turn_cancel_intents.lock().await.insert(
+                        (thread.into(), turn.into()),
+                        super::UserTurnCancellationIntent {
+                            pending_requests: 1,
+                            reason: "cancel during replay".into(),
+                            actor_id: Some(authenticated_test_superuser().principal_id.to_string()),
+                        },
+                    );
+                }
+            };
+            let applying = processor.apply_prepared_acp_configuration(
+                cli.as_ref(),
+                "session",
+                &selected,
+                Duration::from_millis(100),
+                thread,
+                turn,
+            );
+            let (result, ()) = tokio::join!(applying, cancelling);
+            assert!(result.is_err());
+        }
+        assert!(transition.try_lock().is_ok());
+        assert!(!cli.acp_snapshot().unwrap().connected);
+        assert!(cli.acp_snapshot().unwrap().version.is_none());
+        assert!(cli.turn_starts.lock().await.is_empty());
+        cli.acp_configuration_resume.notify_waiters(); // Late response has no waiting preparation.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            cli.acp_configuration_confirmations.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(cli.closes.load(Ordering::SeqCst), 1);
+        processor.shutdown_resilience_workers().await;
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_without_timeline() {

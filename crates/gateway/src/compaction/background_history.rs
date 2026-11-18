@@ -1,6 +1,7 @@
 //! Prepare completed native or completed history for later Pioneer continuations.
 //! Every actual native model call independently budgets its complete request.
 use super::*;
+use anyhow::Context as _;
 use pioneer_agent::compaction::{history::NativeHistoryLayout, request::NativeRequestProjection};
 use pioneer_compaction::{
     CompactionMode, CompactionSettings, CoverageDomain, ModelBudget, ModelSelection, Transport,
@@ -249,7 +250,7 @@ pub(crate) async fn prepare_completed_history_owned(
         }
     }
     diagnostic.stage = "catalog".into();
-    if pioneer_provider::catalog::model_catalog().is_err() {
+    if current.transport != Transport::Acp && pioneer_provider::catalog::model_catalog().is_err() {
         diagnostic.code = "catalog_unavailable".into();
         return Ok(HistoryCheckOutcome::WaitingCatalog);
     }
@@ -348,6 +349,7 @@ pub(crate) async fn prepare_completed_history_owned(
         super::frozen::order_conversation_history(&store, workspace, &mut messages).await?;
         diagnostic.stage = "target_configuration".into();
         let catalog = match current.transport {
+            Transport::Acp => String::new(),
             Transport::Codex => "openai-codex".to_owned(),
             Transport::Claude => "anthropic".to_owned(),
             Transport::OpenCode => current
@@ -371,14 +373,18 @@ pub(crate) async fn prepare_completed_history_owned(
         } else {
             &current.model
         };
-        let limits = if current.transport == Transport::Api {
-            processor
-                .provider_registry()
-                .get_or_create_for_workspace(workspace, &current.instance)?
-                .model_limits(catalog_model)
-                .await?
+        let limits = if current.transport == Transport::Acp {
+            None
+        } else if current.transport == Transport::Api {
+            Some(
+                processor
+                    .provider_registry()
+                    .get_or_create_for_workspace(workspace, &current.instance)?
+                    .model_limits(catalog_model)
+                    .await?,
+            )
         } else {
-            pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model)
+            Some(pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model))
         };
         let saved = if current.transport == Transport::Api {
             let mut record = store.get_turn_execution_security_snapshot(turn).await?;
@@ -455,7 +461,17 @@ pub(crate) async fn prepare_completed_history_owned(
                 current.context_window,
             )
             .await?
+        } else if current.transport == Transport::Acp {
+            // A local retained-history/wire bound, not the agent's hidden model window.
+            ModelBudget::new(
+                Some((crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES / 8) as u64),
+                None,
+                None,
+            )
         } else {
+            let limits = limits
+                .as_ref()
+                .context("native CLI catalog limits are unavailable")?;
             ModelBudget::new(
                 Some(limits.context_window),
                 limits.max_input,
@@ -521,6 +537,7 @@ pub(crate) async fn prepare_completed_history_owned(
             .await?;
         let cli = match current.transport {
             Transport::Api => None,
+            Transport::Acp => Some(pioneer_protocol::CLIAgentRuntimeKind::Acp),
             Transport::Codex => Some(pioneer_protocol::CLIAgentRuntimeKind::Codex),
             Transport::Claude => Some(pioneer_protocol::CLIAgentRuntimeKind::Claude),
             Transport::OpenCode => Some(pioneer_protocol::CLIAgentRuntimeKind::OpenCode),

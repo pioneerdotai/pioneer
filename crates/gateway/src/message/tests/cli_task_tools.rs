@@ -675,6 +675,7 @@ async fn deliver_task_cli_outcome(
         .handle_cli_runtime_timeline_event(
             handle.instance(),
             RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: Some(binding.native_thread_id),
                 native_turn_id: binding.native_turn_id.unwrap(),
                 native_item_id: call_id.into(),
@@ -1120,6 +1121,7 @@ fn cli_terminal_outcomes_require_successful_identified_durable_delivery() {
                     .handle_cli_runtime_timeline_event(
                         handle.instance(),
                         RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                            item: None,
                             native_thread_id: Some(binding.native_thread_id.clone()),
                             native_turn_id: binding.native_turn_id.clone().unwrap(),
                             native_item_id: "premature-final".into(),
@@ -2679,7 +2681,9 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 }
             }
             let instructions = harness.cli_session.turn_starts.lock().await[0]
-                .elevated_instructions
+                .instructions
+                .elevated()
+                .unwrap()
                 .text()
                 .to_owned();
             assert!(instructions.contains("Do not finish the parent turn while attached"));
@@ -3389,6 +3393,7 @@ fn cli_final_candidate_survives_concurrent_detach() {
                 .handle_cli_runtime_timeline_event(
                     handle.instance(),
                     RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                        item: None,
                         native_thread_id: Some(binding.native_thread_id.clone()),
                         native_turn_id: native_turn_id.to_owned(),
                         native_item_id: answer_id.clone(),
@@ -3652,6 +3657,7 @@ fn a_lost_wait_response_does_not_count_as_empty_orchestration_or_cancel_child_wo
                 assert!(!observed.is_error);
                 drop(observed);
                 processor.handle_cli_runtime_timeline_event(handle.instance(), RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                        item: None,
                     native_thread_id: Some(binding.native_thread_id.clone()), native_turn_id: binding.native_turn_id.clone().unwrap(),
                     native_item_id: "lost-wait".to_owned(), item_kind: "mcpToolCall".to_owned(), text: None,
                     summary: Vec::new(), content: Vec::new(), phase: RuntimeAgentMessagePhase::FinalAnswer,
@@ -4857,6 +4863,7 @@ async fn start_threads_cli_fixture_with_policy(
         .unwrap();
     let mut security = test_full_access_execution_security_snapshot();
     security.backend.execution_backend = match kind {
+        CLIAgentRuntimeKind::Acp => pioneer_protocol::TurnSecurityExecutionBackendKind::Acp,
         CLIAgentRuntimeKind::Codex => pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli,
         CLIAgentRuntimeKind::Claude => {
             pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
@@ -5299,6 +5306,7 @@ impl ThreadsFacade {
         let limits =
             crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(128);
         let projection = match kind {
+            CLIAgentRuntimeKind::Acp => unreachable!("this harness tests native item correlation"),
             CLIAgentRuntimeKind::Codex => {
                 crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection(
                     canonical,
@@ -5407,6 +5415,7 @@ impl ThreadsFacade {
                 CLIAgentRuntimeKind::Codex => CliMcpCallContract::Codex,
                 CLIAgentRuntimeKind::Claude => CliMcpCallContract::Claude,
                 CLIAgentRuntimeKind::OpenCode => CliMcpCallContract::OpenCode,
+                CLIAgentRuntimeKind::Acp => CliMcpCallContract::Acp,
             },
         )
         .unwrap();
@@ -5482,6 +5491,7 @@ impl ThreadsFacade {
             let fingerprint =
                 crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&arguments).unwrap();
             let item_id = match self.kind {
+                CLIAgentRuntimeKind::Acp => unreachable!("native correlation fixture"),
                 CLIAgentRuntimeKind::Claude => format!("toolu_{item}"),
                 CLIAgentRuntimeKind::OpenCode => format!("assistant:tool:{item}"),
                 CLIAgentRuntimeKind::Codex => item.to_owned(),
@@ -5513,6 +5523,7 @@ impl ThreadsFacade {
                     .unwrap();
             }
             let (wire, meta) = match self.kind {
+                CLIAgentRuntimeKind::Acp => unreachable!("native correlation fixture"),
                 CLIAgentRuntimeKind::Codex => (
                     arguments,
                     json!({"callId":item,"threadId":self.native_thread,"x-codex-turn-metadata":{"thread_id":self.native_thread,"turn_id":self.native_turn}}),
@@ -5761,6 +5772,7 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .await;
             assert_eq!(created["status"], "accepted");
             let create_item_id = match kind {
+                CLIAgentRuntimeKind::Acp => unreachable!("native correlation fixture"),
                 CLIAgentRuntimeKind::Codex => "create",
                 CLIAgentRuntimeKind::Claude => "toolu_create",
                 CLIAgentRuntimeKind::OpenCode => "assistant:tool:create",
@@ -5942,6 +5954,7 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .await;
             assert_eq!(started["receiptId"], replay["receiptId"]);
             let native_start_item = match kind {
+                CLIAgentRuntimeKind::Acp => unreachable!("native correlation fixture"),
                 CLIAgentRuntimeKind::Codex => "start".to_owned(),
                 CLIAgentRuntimeKind::Claude => "toolu_start".to_owned(),
                 CLIAgentRuntimeKind::OpenCode => "assistant:tool:start".to_owned(),

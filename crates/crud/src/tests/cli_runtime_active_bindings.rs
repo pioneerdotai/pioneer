@@ -448,6 +448,12 @@ async fn cli_active_binding_index_down_and_up_preserve_domain_and_workspace_inde
 }
 
 async fn terminal_guard_fixture() -> (CrudStore, crate::CliRuntimeTurnTerminalGuard) {
+    terminal_guard_fixture_for_runtime("codex").await
+}
+
+async fn terminal_guard_fixture_for_runtime(
+    runtime_kind: &str,
+) -> (CrudStore, crate::CliRuntimeTurnTerminalGuard) {
     let (store, thread, turn) =
         test_store_with_started_turn("ws_cli_guard", "thr_cli_guard", "turn_cli_guard").await;
     let timestamp = unix_to_datetime(1_700_000_000);
@@ -458,8 +464,8 @@ async fn terminal_guard_fixture() -> (CrudStore, crate::CliRuntimeTurnTerminalGu
                 thread_id: thread.id.clone(),
                 continuation_thread_id: thread.id.clone(),
                 workspace_id: thread.workspace_id.clone(),
-                runtime_id: "codex".into(),
-                runtime_kind: "codex".into(),
+                runtime_id: runtime_kind.into(),
+                runtime_kind: runtime_kind.into(),
                 native_thread_id: "native_thread".into(),
                 native_turn_id: None,
                 request_id: None,
@@ -1218,7 +1224,17 @@ async fn native_delivery_fixture() -> (
     pioneer_protocol::CliRuntimeBlockedTurnGuard,
     crate::NewCliRuntimeNativeEvent,
 ) {
-    let (store, guard) = terminal_guard_fixture().await;
+    native_delivery_fixture_for_runtime("codex").await
+}
+
+async fn native_delivery_fixture_for_runtime(
+    runtime_kind: &str,
+) -> (
+    CrudStore,
+    pioneer_protocol::CliRuntimeBlockedTurnGuard,
+    crate::NewCliRuntimeNativeEvent,
+) {
+    let (store, guard) = terminal_guard_fixture_for_runtime(runtime_kind).await;
     store
         .update_turn_status(
             &guard.binding.thread_id,
@@ -1510,8 +1526,13 @@ async fn cli_accepted_outcome_wins_recovery_preparation_writer_and_preserves_sou
 
 #[tokio::test]
 async fn cli_task_continuation_rolls_back_and_replays_across_scopes_without_a_new_window() {
-    for already_completed in [false, true] {
-        let (store, _, mut terminal) = native_delivery_fixture().await;
+    for (runtime_kind, executor_kind, already_completed) in [
+        ("codex", crate::TurnExecutorKind::CliRuntime, false),
+        ("codex", crate::TurnExecutorKind::CliRuntime, true),
+        ("acp", crate::TurnExecutorKind::AcpRuntime, false),
+        ("acp", crate::TurnExecutorKind::AcpRuntime, true),
+    ] {
+        let (store, _, mut terminal) = native_delivery_fixture_for_runtime(runtime_kind).await;
         let turn_id = terminal.turn_id.clone().unwrap();
         crate::repositories::turn_execution::insert_immutable(
             &store.database_connection(),
@@ -1519,8 +1540,8 @@ async fn cli_task_continuation_rolls_back_and_replays_across_scopes_without_a_ne
                 turn_id: turn_id.clone(),
                 thread_id: terminal.thread_id.clone().unwrap(),
                 workspace_id: terminal.workspace_id.clone().unwrap(),
-                executor_kind: crate::TurnExecutorKind::CliRuntime,
-                executor_key: Some("codex".into()),
+                executor_kind,
+                executor_key: Some(terminal.runtime_id.clone()),
                 status: crate::TurnExecutionStatus::Running,
                 owner_id: "task-owner".into(),
                 lease_until: chrono::Utc::now().fixed_offset() + chrono::Duration::hours(1),
@@ -1717,6 +1738,107 @@ async fn cli_task_continuation_rolls_back_and_replays_across_scopes_without_a_ne
                 .await
                 .is_err(),
             "replay still requires the active owner"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cli_initial_cancellation_requires_matching_runtime_owner_and_commits_terminal() {
+    for (runtime_kind, executor_kind) in [
+        ("codex", crate::TurnExecutorKind::CliRuntime),
+        ("acp", crate::TurnExecutorKind::AcpRuntime),
+    ] {
+        let (store, _, terminal) = native_delivery_fixture_for_runtime(runtime_kind).await;
+        let turn_id = terminal.turn_id.as_ref().unwrap();
+        crate::repositories::turn_execution::insert_immutable(
+            &store.database_connection(),
+            crate::NewTurnExecution {
+                turn_id: turn_id.clone(),
+                thread_id: terminal.thread_id.clone().unwrap(),
+                workspace_id: terminal.workspace_id.clone().unwrap(),
+                executor_kind,
+                executor_key: Some(terminal.runtime_id.clone()),
+                status: crate::TurnExecutionStatus::Running,
+                owner_id: "cancellation-owner".into(),
+                lease_until: chrono::Utc::now().fixed_offset() + chrono::Duration::hours(1),
+                created_at: terminal.created_at,
+            },
+        )
+        .await
+        .unwrap();
+        let owner = store.get_turn_execution(turn_id).await.unwrap().unwrap();
+        let source = store
+            .cli_runtime_turn_terminal_guard_by_id(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, mut turn) = store
+            .get_turn(&owner.thread_id, turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        turn.status = TurnStatus::Interrupted;
+        turn.error = Some("cancelled".into());
+        let notification = pioneer_protocol::TurnFailedNotification {
+            workspace_id: owner.workspace_id.clone(),
+            thread_id: owner.thread_id.clone(),
+            turn,
+        };
+        let mut wrong_kind = owner.clone();
+        wrong_kind.executor_kind = match executor_kind {
+            crate::TurnExecutorKind::CliRuntime => crate::TurnExecutorKind::AcpRuntime,
+            _ => crate::TurnExecutorKind::CliRuntime,
+        };
+        assert!(
+            store
+                .materialize_cli_runtime_cancellation_owned_as(
+                    notification.clone(),
+                    &wrong_kind,
+                    &source,
+                    None,
+                    terminal.created_at.timestamp(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_turn(&owner.thread_id, turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::InProgress
+        );
+        store
+            .materialize_cli_runtime_cancellation_owned_as(
+                notification,
+                &owner,
+                &source,
+                None,
+                terminal.created_at.timestamp(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_turn(&owner.thread_id, turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Interrupted
+        );
+        assert_eq!(
+            store
+                .get_turn_execution(turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::TurnExecutionStatus::Interrupted
         );
     }
 }

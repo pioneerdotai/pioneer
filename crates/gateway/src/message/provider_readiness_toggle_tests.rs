@@ -33,6 +33,7 @@ fn ready_result(mut summary: RuntimeSummary, marker: &str) -> CliRuntimeProbeRes
     summary.recent_stderr = vec![format!("stderr-{marker}")];
     let mut mcp = mcp_readiness();
     match summary.kind {
+        CLIAgentRuntimeKind::Acp => unreachable!("native model catalog fixture"),
         CLIAgentRuntimeKind::Codex => {}
         CLIAgentRuntimeKind::Claude => {
             mcp.injection = pioneer_protocol::CliMcpInjectionKind::ClaudeStrictStdioMcp;

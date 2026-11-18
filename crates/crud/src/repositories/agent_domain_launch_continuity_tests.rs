@@ -20,11 +20,15 @@ async fn store() -> crate::CrudStore {
 }
 
 async fn sync(store: &crate::CrudStore, enabled: bool, settings: &str) {
+    sync_kind(store, "codex", enabled, settings).await;
+}
+
+async fn sync_kind(store: &crate::CrudStore, kind: &str, enabled: bool, settings: &str) {
     crate::sync_cli_runtime_identity_catalog(
         &store.database_connection(),
         &[crate::CliRuntimeIdentitySeed {
             id: "continuity-cli".to_owned(),
-            kind: "codex".to_owned(),
+            kind: kind.to_owned(),
             display_name: "CLI".to_owned(),
             nickname: "continuity-cli".to_owned(),
             enabled,
@@ -83,8 +87,14 @@ async fn graph_for_source(
     let profile = pioneer_protocol::AgentExecutionProfileProjection {
         id: pioneer_protocol::AgentExecutionProfileId::new("Pcontinuity1234567890").unwrap(),
         compatible_agent_identity_ids: vec![identity.id.clone()],
-        backend: pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
-            runtime_instance_id: row.source_id.clone(),
+        backend: if snapshot.role_label.as_deref() == Some("acp") {
+            pioneer_protocol::AgentExecutionProfileBackend::AcpAgentRuntime {
+                runtime_id: row.source_id.clone(),
+            }
+        } else {
+            pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+                runtime_instance_id: row.source_id.clone(),
+            }
         },
         provider_id: format!("cli_runtime:{}", row.source_id),
         model_id: "pinned-model".to_owned(),
@@ -386,57 +396,59 @@ async fn graph_detects_source_change_after_preparation_and_retirement_before_com
 
 #[tokio::test]
 async fn existing_cli_graph_replays_technical_revision_but_refuses_changed_engine() {
-    let store = store().await;
-    sync(&store, true, "original").await;
-    let original = graph(&store, "Econtinuityroot123456", None).await;
-    store
-        .commit_agent_execution_graph(original.clone())
+    for kind in ["codex", "acp"] {
+        let store = store().await;
+        sync_kind(&store, kind, true, "original").await;
+        let original = graph(&store, "Econtinuityroot123456", None).await;
+        store
+            .commit_agent_execution_graph(original.clone())
+            .await
+            .unwrap();
+        let before = saved_graph_state(&store, &original).await;
+
+        sync_kind(&store, kind, false, "disabled").await;
+        sync_kind(&store, kind, true, "new-binary-home-args-timeouts").await;
+        let mut replay = original.clone();
+        replay.identity = graph(&store, &original.child_execution.id, None)
+            .await
+            .identity;
+        assert!(replay.identity.source_revision > original.identity.source_revision);
+        assert_ne!(
+            replay.identity.source_fingerprint,
+            original.identity.source_fingerprint
+        );
+        store
+            .commit_agent_execution_graph(replay.clone())
+            .await
+            .unwrap();
+        assert_eq!(saved_graph_state(&store, &original).await, before);
+
+        crate::sync_cli_runtime_identity_catalog(
+            &store.database_connection(),
+            &[crate::CliRuntimeIdentitySeed {
+                id: "continuity-cli".to_owned(),
+                kind: "claude".to_owned(),
+                display_name: "Renamed CLI".to_owned(),
+                nickname: "renamed-cli".to_owned(),
+                enabled: true,
+                source_revision_material: "changed-engine".to_owned(),
+            }],
+            utc_now(),
+        )
         .await
         .unwrap();
-    let before = saved_graph_state(&store, &original).await;
-
-    sync(&store, false, "disabled").await;
-    sync(&store, true, "new-binary-home-args-timeouts").await;
-    let mut replay = original.clone();
-    replay.identity = graph(&store, &original.child_execution.id, None)
-        .await
-        .identity;
-    assert!(replay.identity.source_revision > original.identity.source_revision);
-    assert_ne!(
-        replay.identity.source_fingerprint,
-        original.identity.source_fingerprint
-    );
-    store
-        .commit_agent_execution_graph(replay.clone())
-        .await
-        .unwrap();
-    assert_eq!(saved_graph_state(&store, &original).await, before);
-
-    crate::sync_cli_runtime_identity_catalog(
-        &store.database_connection(),
-        &[crate::CliRuntimeIdentitySeed {
-            id: "continuity-cli".to_owned(),
-            kind: "claude".to_owned(),
-            display_name: "Renamed CLI".to_owned(),
-            nickname: "renamed-cli".to_owned(),
-            enabled: true,
-            source_revision_material: "changed-engine".to_owned(),
-        }],
-        utc_now(),
-    )
-    .await
-    .unwrap();
-    // Use the real current source fence, while retaining every historical
-    // execution/presentation/profile/grant fact exactly as recovery does.
-    replay.identity = graph(&store, &original.child_execution.id, None)
-        .await
-        .identity;
-    let error = store
-        .commit_agent_execution_graph(replay)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("admitted runtime kind"));
-    assert_eq!(saved_graph_state(&store, &original).await, before);
+        // Use the real current source fence, while retaining every historical
+        // execution/presentation/profile/grant fact exactly as recovery does.
+        replay.identity = graph(&store, &original.child_execution.id, None)
+            .await
+            .identity;
+        let error = store
+            .commit_agent_execution_graph(replay)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("admitted runtime kind"));
+        assert_eq!(saved_graph_state(&store, &original).await, before);
+    }
 }
 
 async fn saved_graph_state(
@@ -509,114 +521,116 @@ async fn changed_cli_engine_cannot_reuse_an_old_label_to_pass_parent_ceiling() {
 
 #[tokio::test]
 async fn ephemeral_cli_execution_is_fenced_by_its_registered_runtime_source() {
-    let store = store().await;
-    sync(&store, true, "original").await;
-    let mut root = graph(&store, "Econtinuityroot123456", None).await;
-    let (identity, profile, ceiling) =
-        parse_agent_execution_launch_grant(&root.grant.grant_json).unwrap();
-    let ceiling = ceiling
-        .clone()
-        .with_policy(
-            false,
-            true,
-            false,
-            Vec::new(),
-            Vec::new(),
-            ceiling.max_permission_profile,
-        )
-        .unwrap();
-    root.grant.grant_json = serde_json::json!({"identity": identity, "profile": profile, "child_launch_grant": ceiling}).to_string();
-    root.grant.grant_fingerprint =
-        agent_execution_grant_fingerprint(&root.grant.grant_json).unwrap();
-    store
-        .commit_agent_execution_graph(root.clone())
-        .await
-        .unwrap();
-    let mut child = graph(
-        &store,
-        "Econtinuitychild12345",
-        Some(&root.child_execution.id),
-    )
-    .await;
-    let (backing, mut profile, _) =
-        parse_agent_execution_launch_grant(&child.grant.grant_json).unwrap();
-    let mut actor = backing.clone();
-    actor.id = AgentIdentityId::new("Acontinuityephem12345").unwrap();
-    actor.source_kind = AgentIdentitySourceKind::Ephemeral;
-    actor.source_revision = 1;
-    actor.source_fingerprint = "ephemeral-source".to_owned();
-    actor.display_name = "Ephemeral".to_owned();
-    actor.nickname = "ephemeral".to_owned();
-    actor.role_label = None;
-    profile.compatible_agent_identity_ids.push(actor.id.clone());
-    profile.compatible_agent_identity_ids.sort();
-    // Match the production derivation when extending a profile to an
-    // execution-local identity; the parent profile itself remains immutable.
-    profile.fingerprint = hex::encode(Sha256::digest(
-        format!(
-            "agent-derived-profile\0{}\0{}",
-            profile.fingerprint,
-            actor.id.as_str()
-        )
-        .as_bytes(),
-    ));
-    child.child_execution.resolved_profile_fingerprint = Some(profile.fingerprint.clone());
-    child.identity.id = actor.id.as_str().to_owned();
-    child.identity.source_kind = SOURCE_EPHEMERAL.to_owned();
-    child.identity.source_id = "ephemeral:test".to_owned();
-    child.identity.source_revision = 1;
-    child.identity.source_fingerprint = actor.source_fingerprint.clone();
-    child.presentation.id = canonical_agent_id('S', "ephemeral:test");
-    child.presentation.agent_identity_id = child.identity.id.clone();
-    child.presentation.source_revision = 1;
-    child.presentation.source_fingerprint = actor.source_fingerprint.clone();
-    child.presentation.display_name = actor.display_name.clone();
-    child.presentation.nickname = actor.nickname.clone();
-    child.presentation.role_label = None;
-    child.child_execution.agent_identity_id = child.identity.id.clone();
-    child.child_execution.identity_source_revision = 1;
-    child.child_execution.identity_source_fingerprint = actor.source_fingerprint.clone();
-    child.child_execution.presentation_snapshot_id = Some(child.presentation.id.clone());
-    child.grant.child_identity_id = child.identity.id.clone();
-    let ceiling =
-        pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![actor.clone(), backing]).unwrap();
-    child.grant.grant_json =
-        serde_json::json!({"identity": actor, "profile": profile, "child_launch_grant": ceiling})
-            .to_string();
-    child.grant.grant_fingerprint =
-        agent_execution_grant_fingerprint(&child.grant.grant_json).unwrap();
-    sync(&store, true, "updated-binary").await;
-    assert!(
+    for kind in ["codex", "acp"] {
+        let store = store().await;
+        sync_kind(&store, kind, true, "original").await;
+        let mut root = graph(&store, "Econtinuityroot123456", None).await;
+        let (identity, profile, ceiling) =
+            parse_agent_execution_launch_grant(&root.grant.grant_json).unwrap();
+        let ceiling = ceiling
+            .clone()
+            .with_policy(
+                false,
+                true,
+                false,
+                Vec::new(),
+                Vec::new(),
+                ceiling.max_permission_profile,
+            )
+            .unwrap();
+        root.grant.grant_json = serde_json::json!({"identity": identity, "profile": profile, "child_launch_grant": ceiling}).to_string();
+        root.grant.grant_fingerprint =
+            agent_execution_grant_fingerprint(&root.grant.grant_json).unwrap();
         store
-            .commit_agent_execution_graph(child.clone())
+            .commit_agent_execution_graph(root.clone())
             .await
-            .is_err()
-    );
-    assert!(
-        load_agent_execution(&store.database_connection(), &child.child_execution.id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let (current, _, _) = parse_agent_execution_launch_grant(
-        &graph(
+            .unwrap();
+        let mut child = graph(
             &store,
             "Econtinuitychild12345",
             Some(&root.child_execution.id),
         )
-        .await
-        .grant
-        .grant_json,
-    )
-    .unwrap();
-    let ceiling =
-        pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![actor.clone(), current]).unwrap();
-    child.grant.grant_json =
-        serde_json::json!({"identity": actor, "profile": profile, "child_launch_grant": ceiling})
-            .to_string();
-    child.grant.grant_fingerprint =
-        agent_execution_grant_fingerprint(&child.grant.grant_json).unwrap();
-    store.commit_agent_execution_graph(child).await.unwrap();
+        .await;
+        let (backing, mut profile, _) =
+            parse_agent_execution_launch_grant(&child.grant.grant_json).unwrap();
+        let mut actor = backing.clone();
+        actor.id = AgentIdentityId::new("Acontinuityephem12345").unwrap();
+        actor.source_kind = AgentIdentitySourceKind::Ephemeral;
+        actor.source_revision = 1;
+        actor.source_fingerprint = "ephemeral-source".to_owned();
+        actor.display_name = "Ephemeral".to_owned();
+        actor.nickname = "ephemeral".to_owned();
+        actor.role_label = None;
+        profile.compatible_agent_identity_ids.push(actor.id.clone());
+        profile.compatible_agent_identity_ids.sort();
+        // Match the production derivation when extending a profile to an
+        // execution-local identity; the parent profile itself remains immutable.
+        profile.fingerprint = hex::encode(Sha256::digest(
+            format!(
+                "agent-derived-profile\0{}\0{}",
+                profile.fingerprint,
+                actor.id.as_str()
+            )
+            .as_bytes(),
+        ));
+        child.child_execution.resolved_profile_fingerprint = Some(profile.fingerprint.clone());
+        child.identity.id = actor.id.as_str().to_owned();
+        child.identity.source_kind = SOURCE_EPHEMERAL.to_owned();
+        child.identity.source_id = "ephemeral:test".to_owned();
+        child.identity.source_revision = 1;
+        child.identity.source_fingerprint = actor.source_fingerprint.clone();
+        child.presentation.id = canonical_agent_id('S', "ephemeral:test");
+        child.presentation.agent_identity_id = child.identity.id.clone();
+        child.presentation.source_revision = 1;
+        child.presentation.source_fingerprint = actor.source_fingerprint.clone();
+        child.presentation.display_name = actor.display_name.clone();
+        child.presentation.nickname = actor.nickname.clone();
+        child.presentation.role_label = None;
+        child.child_execution.agent_identity_id = child.identity.id.clone();
+        child.child_execution.identity_source_revision = 1;
+        child.child_execution.identity_source_fingerprint = actor.source_fingerprint.clone();
+        child.child_execution.presentation_snapshot_id = Some(child.presentation.id.clone());
+        child.grant.child_identity_id = child.identity.id.clone();
+        let ceiling =
+            pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![actor.clone(), backing]).unwrap();
+        child.grant.grant_json =
+            serde_json::json!({"identity": actor, "profile": profile, "child_launch_grant": ceiling})
+                .to_string();
+        child.grant.grant_fingerprint =
+            agent_execution_grant_fingerprint(&child.grant.grant_json).unwrap();
+        sync_kind(&store, kind, true, "updated-binary").await;
+        assert!(
+            store
+                .commit_agent_execution_graph(child.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            load_agent_execution(&store.database_connection(), &child.child_execution.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (current, _, _) = parse_agent_execution_launch_grant(
+            &graph(
+                &store,
+                "Econtinuitychild12345",
+                Some(&root.child_execution.id),
+            )
+            .await
+            .grant
+            .grant_json,
+        )
+        .unwrap();
+        let ceiling =
+            pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![actor.clone(), current]).unwrap();
+        child.grant.grant_json =
+            serde_json::json!({"identity": actor, "profile": profile, "child_launch_grant": ceiling})
+                .to_string();
+        child.grant.grant_fingerprint =
+            agent_execution_grant_fingerprint(&child.grant.grant_json).unwrap();
+        store.commit_agent_execution_graph(child).await.unwrap();
+    }
 }
 
 #[tokio::test]

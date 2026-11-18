@@ -72,6 +72,143 @@ pub struct ReadFileHandler;
 pub struct ListDirHandler;
 pub struct GrepHandler;
 
+impl ReadFileHandler {
+    /// Capture an explicitly selected binary input through the same opened
+    /// filesystem capability as text reads. The attachment pipeline owns the
+    /// resulting bytes/digest; it must not reopen the checked pathname.
+    pub async fn read_bytes(
+        &self,
+        snapshot: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+        path: &Path,
+        max_bytes: usize,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<u8>, ToolError> {
+        if !path.is_absolute() || max_bytes == 0 || max_bytes as u64 > HARD_MAX_READ_FILE_BYTES {
+            return Err(ToolError::invalid_arguments(
+                "binary input requires an absolute path and a bounded byte limit",
+            ));
+        }
+        let slot = acquire_native_filesystem_slot(&cancellation).await?;
+        let requested = path
+            .to_str()
+            .ok_or_else(|| ToolError::invalid_arguments("input path must be UTF-8"))?;
+        let resolved = resolve_authorized_tool_path(
+            Some(snapshot),
+            Path::new(&snapshot.sandbox.cwd),
+            FilePolicyOperation::Read,
+            requested,
+        )?;
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let _slot = slot;
+            if cancellation.is_cancelled() {
+                return Err(ToolError::cancelled("binary input cancelled"));
+            }
+            let file = resolved.capability.open_regular_file().map_err(|error| {
+                ToolError::execution_failed(format!("failed to open binary input: {error}"))
+            })?;
+            let mut bytes = Vec::new();
+            file.take(max_bytes as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| {
+                    ToolError::execution_failed(format!("failed to read binary input: {error}"))
+                })?;
+            if bytes.len() > max_bytes {
+                return Err(ToolError::Rejected(
+                    "binary input exceeds the delivery byte budget".to_owned(),
+                ));
+            }
+            if cancellation.is_cancelled() {
+                return Err(ToolError::cancelled("binary input cancelled"));
+            }
+            Ok(bytes)
+        })
+        .await
+        .map_err(|error| {
+            ToolError::execution_failed(format!("binary input worker failed: {error}"))
+        })?
+    }
+
+    /// Content-only, one-based line ranges for external client callbacks.
+    /// Unlike read_file's display output this never adds line numbers or a
+    /// continuation marker to the requested contents. If the response cannot
+    /// fit, return an error instead of claiming a complete read.
+    pub async fn read_text(
+        &self,
+        snapshot: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+        path: &Path,
+        line: Option<u32>,
+        limit: Option<u32>,
+        cancellation: CancellationToken,
+    ) -> Result<String, ToolError> {
+        if !path.is_absolute() || line == Some(0) || limit == Some(0) {
+            return Err(ToolError::invalid_arguments(
+                "text read requires an absolute path and positive line range",
+            ));
+        }
+        let requested = path
+            .to_str()
+            .ok_or_else(|| ToolError::invalid_arguments("read path must be UTF-8"))?;
+        let filesystem_slot = acquire_native_filesystem_slot(&cancellation).await?;
+        let resolved = resolve_authorized_tool_path(
+            Some(snapshot),
+            Path::new(&snapshot.sandbox.cwd),
+            FilePolicyOperation::Read,
+            requested,
+        )?;
+        let capability = resolved.capability;
+        let target = capability.canonical_target().cloned().ok_or_else(|| {
+            ToolError::Rejected("text read capability has no regular-file target".to_owned())
+        })?;
+        let requested_lines = limit.unwrap_or(u32::MAX);
+        // JSON escaping can expand text sixfold. Reserve headroom for the
+        // standard JSON-RPC envelope within the default 1 MiB frame budget.
+        const TEXT_RESPONSE_BYTES: u64 = 128 * 1024;
+        tokio::task::spawn_blocking(move || {
+            let _slot = filesystem_slot;
+            if cancellation.is_cancelled() {
+                return Err(ToolError::cancelled("text read cancelled"));
+            }
+            let file = capability.open_regular_file().map_err(|error| {
+                ToolError::execution_failed(format!("failed to open text file: {error}"))
+            })?;
+            let page = PaginatedReader::new(
+                SnapshotLimits {
+                    max_file_bytes: HARD_MAX_READ_FILE_BYTES,
+                    inline_threshold: 64 * 1024,
+                },
+                AllowAllReadAccess,
+            )
+            .read_target_with_file(
+                &target,
+                file,
+                ReadRequest {
+                    start_line: u64::from(line.unwrap_or(1) - 1),
+                    start_byte: None,
+                    max_lines: requested_lines,
+                    max_bytes: TEXT_RESPONSE_BYTES,
+                },
+                None,
+            )
+            .map_err(|error| map_read_error(target.absolute(), error))?;
+            if cancellation.is_cancelled() {
+                return Err(ToolError::cancelled("text read cancelled"));
+            }
+            // Reaching the caller's requested line count is a complete range;
+            // reaching the byte budget before that count is not.
+            let returned_lines = split_lines_inclusive(&page.content).len() as u64;
+            if page.truncated && returned_lines < u64::from(requested_lines) {
+                return Err(ToolError::execution_failed(
+                    "requested text range exceeds the client response byte budget",
+                ));
+            }
+            Ok(page.content)
+        })
+        .await
+        .map_err(|error| ToolError::execution_failed(format!("text read worker failed: {error}")))?
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadFileArgs {

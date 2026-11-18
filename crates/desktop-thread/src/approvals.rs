@@ -335,6 +335,15 @@ impl PendingRequestView {
             .cloned()
             .map(|row| render_pending_request_detail_row(row, cx))
             .collect::<Vec<_>>();
+        if let Some(url) = &presentation.external_url {
+            let url = url.clone();
+            rows.push(
+                Button::new("pending-request-open-url")
+                    .label(url.clone())
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .into_any_element(),
+            );
+        }
         if !presentation.user_input_questions.is_empty() {
             rows.push(render_user_input_question_summary(
                 &presentation.user_input_questions,
@@ -427,6 +436,17 @@ impl PendingRequestView {
                             .masked(is_secret)
                     }))
                 };
+                if let Some(default) = question
+                    .value_schema
+                    .as_ref()
+                    .and_then(|schema| schema.get("default"))
+                {
+                    let text = default
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| default.to_string());
+                    input.set_value(text, window, cx);
+                }
                 (question.id.clone(), input)
             })
             .collect::<Vec<_>>();
@@ -437,33 +457,54 @@ impl PendingRequestView {
         let desktop_entity = cx.weak_entity();
         let submit_request = request.clone();
 
+        let validation_error = cx.new(|_| None::<String>);
         let submit: Rc<dyn Fn(&mut App) -> bool> = Rc::new({
             let desktop_entity = desktop_entity.clone();
             let inputs = inputs.clone();
             let request = submit_request;
+            let validation_error = validation_error.clone();
             let selections = selections.clone();
             let questions = questions.clone();
             move |cx| {
-                let answers = inputs.iter().map(|(id, input)| {
-                    let question = questions.iter().find(|q| &q.id == id).unwrap();
-                    let value = input.value(cx);
-                    let mut selected = selections.borrow().get(id).cloned().unwrap_or_default();
-                    let answer = if question.multiple {
-                        if question.allow_custom
-                            && !value.trim().is_empty()
-                            && !selected.contains(&value)
-                        {
-                            selected.push(value);
+                let resolution = if questions.iter().any(|q| q.value_schema.is_some()) {
+                    let answers = inputs
+                        .iter()
+                        .map(|(id, input)| (id.clone(), input.value(cx)));
+                    match pioneer_client::cli_runtime::acp_human::answered_resolution(
+                        &request, answers,
+                    ) {
+                        Ok(resolution) => resolution,
+                        Err(error) => {
+                            validation_error.update(cx, |value, cx| {
+                                *value = Some(error.to_string());
+                                cx.notify();
+                            });
+                            cx.refresh_windows();
+                            return false;
                         }
-                        serde_json::json!(selected)
-                    } else if question.allow_custom {
-                        serde_json::json!(value)
-                    } else {
-                        serde_json::json!(selected.first().cloned().unwrap_or_default())
-                    };
-                    (id.clone(), answer)
-                });
-                let resolution = pending_request_answered_resolution(answers);
+                    }
+                } else {
+                    let answers = inputs.iter().map(|(id, input)| {
+                        let question = questions.iter().find(|q| &q.id == id).unwrap();
+                        let value = input.value(cx);
+                        let mut selected = selections.borrow().get(id).cloned().unwrap_or_default();
+                        let answer = if question.multiple {
+                            if question.allow_custom
+                                && !value.trim().is_empty()
+                                && !selected.contains(&value)
+                            {
+                                selected.push(value);
+                            }
+                            serde_json::json!(selected)
+                        } else if question.allow_custom {
+                            serde_json::json!(value)
+                        } else {
+                            serde_json::json!(selected.first().cloned().unwrap_or_default())
+                        };
+                        (id.clone(), answer)
+                    });
+                    pending_request_answered_resolution(answers)
+                };
 
                 let _ = desktop_entity.update(cx, |view, cx| {
                     view.dialog_open.set(false);
@@ -487,6 +528,7 @@ impl PendingRequestView {
             .find(|(id, _)| questions.iter().any(|q| &q.id == id && q.allow_custom))
             .map(|(_, input)| input.clone());
         window.open_dialog(cx, move |dialog, _window, cx| {
+            let error = validation_error.read(cx).clone();
             dialog
                 .w(px(520.))
                 .gap_1()
@@ -542,6 +584,9 @@ impl PendingRequestView {
                             .into_any_element(),
                     ]
                 }))
+                .when_some(error, |dialog, error| {
+                    dialog.child(div().text_sm().text_color(cx.theme().danger).child(error))
+                })
                 .child(
                     v_form()
                         .gap_4()
@@ -581,12 +626,29 @@ fn render_pending_request_action(
     request_generation: u64,
     cx: &mut Context<PendingRequestView>,
 ) -> AnyElement {
-    let request_id = request.request_id.clone();
+    let request_id = if action.label.is_some() {
+        format!(
+            "{}:{}",
+            request.request_id,
+            serde_json::to_string(&action.resolution).unwrap_or_default()
+        )
+    } else {
+        request.request_id.clone()
+    };
     let element_id = pending_request_element_id(
         pending_request_action_element_prefix(action.kind),
         request_id.as_str(),
     );
 
+    if let Some(label) = action.label.clone() {
+        return respond_pending_request_button(
+            default_outline_button(element_id).label(label),
+            request,
+            action.resolution,
+            request_generation,
+            cx,
+        );
+    }
     match action.kind {
         PendingRequestActionKind::CancelTurn => respond_pending_request_button(
             default_outline_button(element_id)
@@ -704,7 +766,17 @@ fn render_user_input_question(
                                 format!("{}-{}", question.id, option.label).as_str(),
                             ))
                             .label(option.label.clone())
-                            .selected(if question.multiple || !question.allow_custom {
+                            .selected(if question.value_schema.is_some() {
+                                let value = option.value.as_deref().unwrap_or(&option.label);
+                                if question.multiple {
+                                    serde_json::from_str::<Vec<String>>(&input.value(cx))
+                                        .unwrap_or_default()
+                                        .iter()
+                                        .any(|selected| selected == value)
+                                } else {
+                                    input.value(cx) == value
+                                }
+                            } else if question.multiple || !question.allow_custom {
                                 selections
                                     .borrow()
                                     .get(&question.id)
@@ -714,12 +786,35 @@ fn render_user_input_question(
                             })
                             .on_click({
                                 let input = input.clone();
-                                let label = option.label.clone();
+                                let label =
+                                    option.value.clone().unwrap_or_else(|| option.label.clone());
+                                let has_schema = question.value_schema.is_some();
                                 let id = question.id.clone();
                                 let selections = selections.clone();
-                                let multiple = question.multiple;
+                                let multiple = question.multiple
+                                    || question
+                                        .value_schema
+                                        .as_ref()
+                                        .is_some_and(|s| s["type"] == "array");
                                 let allow_custom = question.allow_custom;
                                 move |_, window, cx| {
+                                    if has_schema {
+                                        let value = if multiple {
+                                            let mut selected: Vec<String> =
+                                                serde_json::from_str(&input.value(cx))
+                                                    .unwrap_or_default();
+                                            if selected.contains(&label) {
+                                                selected.retain(|v| v != &label);
+                                            } else {
+                                                selected.push(label.clone());
+                                            }
+                                            serde_json::to_string(&selected).unwrap_or_default()
+                                        } else {
+                                            label.clone()
+                                        };
+                                        input.set_value(value, window, cx);
+                                        return;
+                                    }
                                     let mut selections = selections.borrow_mut();
                                     let selected = selections.entry(id.clone()).or_default();
                                     if multiple {

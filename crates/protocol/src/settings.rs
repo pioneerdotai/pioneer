@@ -571,9 +571,16 @@ pub struct GatewayCliRuntimeInstanceSettings {
     pub nickname: String,
     pub enabled: bool,
     pub binary_path: String,
+    #[serde(default)]
     pub home_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_home_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Environment references only; resolved secret values never cross the
+    /// shared settings/catalog boundary.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env_from: std::collections::BTreeMap<String, String>,
 }
 
 impl GatewayCliRuntimeInstanceSettings {
@@ -588,6 +595,8 @@ impl GatewayCliRuntimeInstanceSettings {
             binary_path: "codex".to_owned(),
             home_path: "~/.codex".to_owned(),
             shadow_home_path: None,
+            args: Vec::new(),
+            env_from: Default::default(),
         }
     }
 
@@ -602,6 +611,8 @@ impl GatewayCliRuntimeInstanceSettings {
             binary_path: "claude".to_owned(),
             home_path: "~/.claude".to_owned(),
             shadow_home_path: None,
+            args: Vec::new(),
+            env_from: Default::default(),
         }
     }
 
@@ -616,6 +627,8 @@ impl GatewayCliRuntimeInstanceSettings {
             binary_path: "opencode".to_owned(),
             home_path: "~/.config/opencode".to_owned(),
             shadow_home_path: None,
+            args: Vec::new(),
+            env_from: Default::default(),
         }
     }
 }
@@ -1116,6 +1129,8 @@ mod tests {
                     binary_path: "codex".to_owned(),
                     home_path: "~/.codex".to_owned(),
                     shadow_home_path: Some("~/.pioneer/codex-work".to_owned()),
+                    args: Vec::new(),
+                    env_from: Default::default(),
                 }],
             },
             remote_access: Default::default(),
@@ -1152,6 +1167,8 @@ mod tests {
                     binary_path: "/opt/homebrew/bin/codex".to_owned(),
                     home_path: "~/.codex-personal".to_owned(),
                     shadow_home_path: None,
+                    args: Vec::new(),
+                    env_from: Default::default(),
                 }],
             }),
             ..GatewaySettingsUpdate::default()

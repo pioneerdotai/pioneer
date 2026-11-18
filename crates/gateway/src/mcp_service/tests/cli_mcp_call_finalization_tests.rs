@@ -346,6 +346,7 @@ mod cli_mcp_finalization {
 
         async fn start(&self, id: &str, persist: bool) -> RuntimeEvent {
             let mut event = RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                item: None,
                 native_thread_id: Some("native-thread".into()),
                 native_turn_id: "native-turn".into(),
                 native_item_id: id.into(),
@@ -588,6 +589,7 @@ mod cli_mcp_finalization {
             assert_eq!(h.execution.calls.load(Ordering::SeqCst), 0);
             let before = h.item("item").await;
             let native = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: started.native_thread_id,
                 native_turn_id: started.native_turn_id,
                 native_item_id: started.native_item_id,
@@ -967,6 +969,7 @@ mod cli_mcp_finalization {
             panic!("start");
         };
         let late = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: started.native_thread_id,
             native_turn_id: started.native_turn_id,
             native_item_id: started.native_item_id,

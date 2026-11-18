@@ -6309,6 +6309,9 @@ pub async fn commit_agent_execution_graph(
                 AgentIdentitySourceKind::CliRuntimeInstance,
                 pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
                     runtime_instance_id,
+                }
+                | pioneer_protocol::AgentExecutionProfileBackend::AcpAgentRuntime {
+                    runtime_id: runtime_instance_id,
                 },
             ) => {
                 runtime_instance_id != &identity.source_id
@@ -6337,6 +6340,9 @@ pub async fn commit_agent_execution_graph(
     if grant_identity.source_kind == AgentIdentitySourceKind::Ephemeral
         && let pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
             runtime_instance_id,
+        }
+        | pioneer_protocol::AgentExecutionProfileBackend::AcpAgentRuntime {
+            runtime_id: runtime_instance_id,
         } = &grant_profile.backend
     {
         let source = load_agent_identity_by_source(

@@ -541,7 +541,15 @@ impl GatewayTurnMcpInvoker {
                     "unknown native callable",
                 )
             })?
-            .unwrap_or_else(|| vec![ResourceAction::McpUse]);
+            .unwrap_or_else(|| {
+                vec![if binding.server_installation_id
+                    == crate::cli_runtime::acp_skills::SKILL_SERVER_ID
+                {
+                    ResourceAction::SkillUse
+                } else {
+                    ResourceAction::McpUse
+                }]
+            });
         let revision = self
             .authorization_invalidation_hub
             .current_revision()
@@ -578,7 +586,10 @@ impl GatewayTurnMcpInvoker {
             )
         })?;
 
-        if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID && native_family.is_none() {
+        if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID
+            && native_family.is_none()
+            && binding.server_installation_id != crate::cli_runtime::acp_skills::SKILL_SERVER_ID
+        {
             let action_gate = AuthorizationService::new().authorize_action(
                 revalidated.principal().kind,
                 revalidated.principal().role_key.as_ref(),

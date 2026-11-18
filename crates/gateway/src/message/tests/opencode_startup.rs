@@ -29,6 +29,8 @@ fn opencode_readiness_publishes_first_probe_catalog_without_second_process() {
                         binary_path: fixture.instance.binary_path.clone(),
                         home_path: fixture.instance.home_path.clone(),
                         shadow_home_path: None,
+                        args: Vec::new(),
+                        env_from: Default::default(),
                         compaction_model: None,
                     }],
                 })

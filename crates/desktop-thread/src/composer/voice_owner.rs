@@ -257,13 +257,9 @@ impl VoiceInputView {
             .is_some_and(|c| c.can_start_turn)
     }
     pub(super) fn has_complete_composer_model_selection(&self) -> bool {
-        pioneer_client::composer::model_selection::has_complete_composer_model_selection(
-            self.composer_domain().selected_provider.as_deref(),
-            self.composer_domain().selected_model.as_deref(),
-        ) && self
-            .composer_input
+        self.composer_input
             .as_ref()
-            .is_some_and(|input| input.selected_provider_ready())
+            .is_some_and(|input| input.execution_selection_ready())
     }
     pub(super) fn composer_upload_in_progress(&self) -> bool {
         use pioneer_client::composer::store::ComposerOperationStatus;

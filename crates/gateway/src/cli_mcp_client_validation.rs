@@ -19,6 +19,7 @@ pub struct CliMcpClientValidationAuditContext<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliMcpClientTarget {
     Api,
+    Acp,
     Codex,
     Claude,
     OpenCode,
@@ -27,6 +28,7 @@ pub enum CliMcpClientTarget {
 impl CliMcpClientTarget {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Acp => "acp",
             Self::Api => "api",
             Self::Codex => "codex",
             Self::Claude => "claude",

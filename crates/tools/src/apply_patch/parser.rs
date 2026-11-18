@@ -42,6 +42,12 @@ pub struct Operation {
 pub enum OperationBody {
     Add(AddFile),
     Replace(ReplaceFile),
+    /// Constructed by typed full-text APIs, never by the patch text parser.
+    /// Unlike line-oriented Replace, the caller supplied the exact framing,
+    /// including empty content, BOM, CRLF and the final newline.
+    ExactText {
+        text: String,
+    },
     Update(UpdateFile),
     Delete,
 }

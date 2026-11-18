@@ -112,6 +112,7 @@ pub(crate) fn cli_runtime_manager(
     mcp_limits: CliMcpRuntimeLimits,
     turn_mcp_invoker: Arc<dyn TurnMcpInvoker>,
     crud_store: Arc<pioneer_crud::CrudStore>,
+    acp_services: super::acp_session::AcpRuntimeServices,
 ) -> Result<Arc<CLIAgentRuntimeManager>> {
     let bridge_supervisor =
         CliMcpBridgeSupervisor::new(runtime_home.join("cli-runtime").join("mcp-bridge-sessions"));
@@ -121,6 +122,7 @@ pub(crate) fn cli_runtime_manager(
         mcp_limits,
         turn_mcp_invoker,
         crud_store,
+        acp_services,
     });
     Ok(Arc::new(CLIAgentRuntimeManager::new_with_lifecycle(
         factory,
@@ -503,6 +505,7 @@ struct DispatchingCLIAgentRuntimeSessionFactory {
     mcp_limits: CliMcpRuntimeLimits,
     turn_mcp_invoker: Arc<dyn TurnMcpInvoker>,
     crud_store: Arc<pioneer_crud::CrudStore>,
+    acp_services: super::acp_session::AcpRuntimeServices,
 }
 
 #[async_trait]
@@ -519,6 +522,9 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
             .find(|instance| instance.id == key.runtime_id)
             .ok_or_else(|| anyhow!("unknown CLI runtime `{}`", key.runtime_id))?;
         match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Acp => {
+                super::acp_session::AcpSession::spawn(process_instance.clone(), instance, launch_spec, self.bridge_supervisor.clone(), self.mcp_limits, self.turn_mcp_invoker.clone(), self.acp_services.clone(), startup).await.map(|session| session as Arc<dyn CLIAgentRuntimeSession>)
+            }
             GatewayCliAgentRuntimeKindConfig::Codex => {
                 CodexCLIAgentRuntimeSessionFactory {
                     runtime_home: self.runtime_home.clone(),
@@ -1068,7 +1074,8 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
             CliProviderContinuation::CodexRpcThread { native_thread_id } => {
                 native_thread_id.clone()
             }
-            CliProviderContinuation::ClaudeNew { .. }
+            CliProviderContinuation::AcpSession { .. }
+            | CliProviderContinuation::ClaudeNew { .. }
             | CliProviderContinuation::ClaudeResume { .. }
             | CliProviderContinuation::OpenCodeServerSession { .. }
             | CliProviderContinuation::ClaudeFork { .. } => {
@@ -1078,7 +1085,9 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         let launch_projection = match &launch_spec.mcp {
             CliMcpSessionLaunch::Disabled | CliMcpSessionLaunch::ManagementOnly => None,
             CliMcpSessionLaunch::Codex(projection) => Some(projection),
-            CliMcpSessionLaunch::Claude(_) | CliMcpSessionLaunch::OpenCode(_) => {
+            CliMcpSessionLaunch::Acp(_)
+            | CliMcpSessionLaunch::Claude(_)
+            | CliMcpSessionLaunch::OpenCode(_) => {
                 bail!("Codex CLI runtime cannot consume another provider's MCP launch projection")
             }
         };
@@ -1723,7 +1732,7 @@ fn codex_read_only_thread_open_params(
 fn codex_turn_collaboration_mode(
     params: &CLIAgentRuntimeTurnStartParams,
 ) -> Result<CodexCollaborationMode> {
-    let instructions = &params.elevated_instructions;
+    let instructions = params.instructions.elevated()?;
     let model = params
         .model
         .as_deref()
@@ -3241,8 +3250,9 @@ mod tests {
             effort: Some("high".to_owned()),
             personality: None,
             summary: None,
-            elevated_instructions: CLIRuntimeElevatedInstructions::try_new(text, fingerprint)
-                .expect("valid elevated instructions"),
+            instructions: CLIRuntimeElevatedInstructions::try_new(text, fingerprint)
+                .expect("valid elevated instructions")
+                .into(),
         };
 
         let mapped = codex_turn_collaboration_mode(&params)
@@ -3284,8 +3294,9 @@ mod tests {
             effort: None,
             personality: None,
             summary: None,
-            elevated_instructions: CLIRuntimeElevatedInstructions::try_new(text, fingerprint)
-                .expect("valid elevated instructions"),
+            instructions: CLIRuntimeElevatedInstructions::try_new(text, fingerprint)
+                .expect("valid elevated instructions")
+                .into(),
         };
 
         let error = codex_turn_collaboration_mode(&params)

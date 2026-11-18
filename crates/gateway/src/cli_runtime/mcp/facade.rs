@@ -303,7 +303,7 @@ struct CliMcpLedgerKey {
 struct CliMcpLedgerIdentity {
     callable: String,
     arguments_hash: String,
-    native_call: NativeMcpCallIdentity,
+    native_call: Option<NativeMcpCallIdentity>,
 }
 
 type CliMcpCachedOutcome = Result<JsonValue, FacadeProtocolError>;
@@ -575,6 +575,7 @@ pub(crate) fn defer_cua_delivery(
 /// select the provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CliMcpCallContract {
+    Acp,
     Codex,
     Claude,
     OpenCode,
@@ -1033,7 +1034,7 @@ impl CliMcpToolFacade {
         name: &str,
         arguments: JsonValue,
         progress_token: Option<JsonValue>,
-        native_call: NativeMcpCallIdentity,
+        native_call: Option<NativeMcpCallIdentity>,
         admission_deadline: tokio::time::Instant,
         thread_id: String,
         turn_id: String,
@@ -1078,7 +1079,7 @@ impl CliMcpToolFacade {
             runtime_id: Some(process_instance.key().runtime_id.clone()),
             session_generation: Some(process_instance.generation()),
             provider_call_id: request_id.provider_call_id(),
-            native_call: Some(native_call),
+            native_call,
             admission_deadline: Some(admission_deadline),
             canonical_callable_name: name.to_owned(),
             arguments,
@@ -1366,7 +1367,7 @@ fn parse_native_call(
     wire_arguments: JsonValue,
     native_thread: &str,
     native_turn: &str,
-) -> Result<(JsonValue, NativeMcpCallIdentity), FacadeProtocolError> {
+) -> Result<(JsonValue, Option<NativeMcpCallIdentity>), FacadeProtocolError> {
     let invalid = || {
         FacadeProtocolError::new(
             INVALID_PARAMS,
@@ -1388,6 +1389,10 @@ fn parse_native_call(
             .ok_or_else(invalid)
     };
     let (arguments, item) = match contract {
+        // Standard ACP carries raw MCP arguments and no provider-native item id.
+        // The existing grant, process generation, activation and RPC ledger own
+        // this call; never manufacture a Codex/Claude/OpenCode correlation id.
+        CliMcpCallContract::Acp => return Ok((wire_arguments, None)),
         CliMcpCallContract::Codex => {
             let identity = parse_codex_native_call(meta)?;
             if identity.native_thread_id != native_thread {
@@ -1396,7 +1401,7 @@ fn parse_native_call(
                     "Codex MCP request belongs to a different native thread",
                 )));
             }
-            return Ok((wire_arguments, identity));
+            return Ok((wire_arguments, Some(identity)));
         }
         CliMcpCallContract::Claude => {
             let meta = meta.and_then(JsonValue::as_object).ok_or_else(invalid)?;
@@ -1432,11 +1437,11 @@ fn parse_native_call(
     };
     Ok((
         arguments,
-        NativeMcpCallIdentity {
+        Some(NativeMcpCallIdentity {
             native_thread_id: native_thread.into(),
             native_turn_id: native_turn.into(),
             native_item_id: item,
-        },
+        }),
     ))
 }
 
@@ -1847,6 +1852,62 @@ mod tests {
             },
             coordinator,
         )
+    }
+
+    #[tokio::test]
+    async fn acp_raw_calls_retain_arguments_and_exact_rpc_replay_without_native_item_claims() {
+        let invoker = Arc::new(RecordingInvoker {
+            calls: AtomicUsize::new(0),
+            invocations: std::sync::Mutex::new(Vec::new()),
+            result: basic_result(json!([])),
+        });
+        let (facade, mut context, coordinator) = fixture_with_runtime(
+            vec![fixture_tool("read")],
+            invoker.clone(),
+            CliMcpFacadeLimits::default(),
+            "acp",
+            CliMcpCallContract::Acp,
+        )
+        .await;
+        initialize(&facade, &context).await;
+        let arguments = json!({"__pioneer_mcp": {"opaque": true}, "value":"raw"});
+        let request = json!({"jsonrpc":"2.0", "id":"raw-call", "method":"tools/call", "params":{"name":"read", "arguments":arguments}});
+        assert!(
+            facade
+                .handle_message(&context, request.clone())
+                .await
+                .unwrap()
+                .get("error")
+                .is_some()
+        );
+        assert_eq!(invoker.calls.load(AtomicOrdering::SeqCst), 0);
+        activate(&facade, &mut context, &coordinator, "turn").await;
+        let first = facade
+            .handle_message(&context, request.clone())
+            .await
+            .unwrap();
+        assert!(first.get("result").is_some(), "{first}");
+        assert_eq!(
+            facade
+                .handle_message(&context, request.clone())
+                .await
+                .unwrap(),
+            first
+        );
+        let mut conflicting = request;
+        conflicting["params"]["arguments"]["value"] = json!("different");
+        assert!(
+            facade
+                .handle_message(&context, conflicting)
+                .await
+                .unwrap()
+                .get("error")
+                .is_some()
+        );
+        assert_eq!(invoker.calls.load(AtomicOrdering::SeqCst), 1);
+        let calls = invoker.invocations.lock().unwrap();
+        assert_eq!(calls[0].arguments, arguments);
+        assert!(calls[0].native_call.is_none());
     }
 
     async fn initialize(facade: &CliMcpToolFacade, context: &CliMcpFacadeRequestContext) {
@@ -2694,7 +2755,7 @@ mod tests {
                 }),
                 json!({"ai.opencode/sessionID": "native-thread-turn"}),
             ),
-            CliMcpCallContract::Codex => unreachable!(),
+            CliMcpCallContract::Codex | CliMcpCallContract::Acp => unreachable!(),
         };
         json!({"jsonrpc":"2.0", "id":rpc, "method":"tools/call", "params":{"name":"read", "arguments":arguments, "_meta":meta}})
     }
@@ -2726,7 +2787,7 @@ mod tests {
         let items = match contract {
             CliMcpCallContract::Claude => ExactItems::Claude(Arc::default()),
             CliMcpCallContract::OpenCode => ExactItems::OpenCode(Arc::default()),
-            CliMcpCallContract::Codex => unreachable!(),
+            CliMcpCallContract::Codex | CliMcpCallContract::Acp => unreachable!(),
         };
         let facade_mut = Arc::get_mut(&mut facade).unwrap();
         facade_mut.invoker = items.invoker(

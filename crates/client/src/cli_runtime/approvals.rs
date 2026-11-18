@@ -173,6 +173,8 @@ pub enum PendingRequestActionKind {
 pub struct PendingRequestAvailableAction {
     pub kind: PendingRequestActionKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<PendingRequestResolution>,
 }
 
@@ -202,6 +204,8 @@ pub struct PendingRequestUserInputQuestion {
     pub question: String,
     pub options: Vec<PendingRequestUserInputOption>,
     pub is_secret: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub multiple: bool,
     #[serde(default = "default_allow_custom_answer")]
@@ -217,6 +221,8 @@ fn default_allow_custom_answer() -> bool {
 pub struct PendingRequestUserInputOption {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
@@ -231,9 +237,34 @@ pub struct PendingRequestPresentation {
     pub details: Vec<PendingRequestDetailRow>,
     pub user_input_questions: Vec<PendingRequestUserInputQuestion>,
     pub actions: Vec<PendingRequestAvailableAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_url: Option<String>,
 }
 
 pub fn present_pending_request(request: &PendingRequest) -> PendingRequestPresentation {
+    if let Some(presentation) = super::acp_human::present(request) {
+        return presentation;
+    }
+    if let PendingRequestPayload::CLIRuntime { request: cli } = &request.payload {
+        if super::acp_human::is_acp(cli) {
+            // A malformed standard request must never fall back to native
+            // permission semantics or manufacture an allow option.
+            return PendingRequestPresentation {
+                origin_label: pending_request_origin_label(&request.origin).into(),
+                kind_label: pending_request_kind_label(request.kind).into(),
+                title: request.title.clone().unwrap_or_default(),
+                message: request.message.clone(),
+                details: vec![],
+                user_input_questions: vec![],
+                external_url: None,
+                actions: vec![PendingRequestAvailableAction {
+                    kind: PendingRequestActionKind::CancelTurn,
+                    label: None,
+                    resolution: Some(PendingRequestResolution::Cancel),
+                }],
+            };
+        }
+    }
     PendingRequestPresentation {
         origin_label: pending_request_origin_label(&request.origin).to_owned(),
         kind_label: pending_request_kind_label(request.kind).to_owned(),
@@ -245,6 +276,7 @@ pub fn present_pending_request(request: &PendingRequest) -> PendingRequestPresen
         details: pending_request_detail_rows(request),
         user_input_questions: pending_request_user_input_questions(request),
         actions: pending_request_available_actions(request),
+        external_url: None,
     }
 }
 
@@ -289,6 +321,7 @@ pub fn pending_request_available_actions(
         .copied()
         .map(|kind| PendingRequestAvailableAction {
             kind,
+            label: None,
             resolution: pending_request_action_resolution(request, kind),
         })
         .collect()
@@ -428,6 +461,10 @@ fn cli_runtime_resolution_from_pending_resolution(
     request: &CLIRuntimePendingRequest,
     resolution: PendingRequestResolution,
 ) -> Result<CLIRuntimeRequestResolution, PendingRequestResponsePlanError> {
+    if super::acp_human::is_acp(request) {
+        return super::acp_human::validate_resolution(request, resolution)
+            .map_err(|_| PendingRequestResponsePlanError::UnsupportedResolutionForOrigin);
+    }
     match request.kind {
         CLIRuntimeRequestKind::CommandApproval
         | CLIRuntimeRequestKind::FileChangeApproval
@@ -1050,7 +1087,11 @@ fn cli_runtime_user_input_questions(
                         .and_then(JsonValue::as_str)
                         .map(str::to_owned)
                         .filter(|description| !description.trim().is_empty());
-                    Some(PendingRequestUserInputOption { label, description })
+                    Some(PendingRequestUserInputOption {
+                        label,
+                        value: None,
+                        description,
+                    })
                 })
                 .collect();
             let is_secret = value
@@ -1064,6 +1105,7 @@ fn cli_runtime_user_input_questions(
                 question,
                 options,
                 is_secret,
+                value_schema: None,
                 multiple: value
                     .get("multiple")
                     .and_then(JsonValue::as_bool)

@@ -179,6 +179,54 @@ impl HumanInteractionService {
         })
     }
 
+    /// The runtime kind comes from the server-owned pending row/session, never
+    /// from an agent's raw payload or a client response.
+    pub(crate) fn validate_cli_request_for_runtime(
+        self,
+        request: &CLIRuntimePendingRequest,
+        runtime_kind: &str,
+    ) -> Result<ValidatedHumanInteraction> {
+        if runtime_kind != "acp" {
+            return self.validate_cli_request(request);
+        }
+        let form = crate::cli_runtime::acp_requests::validate_pending(request)?;
+        Ok(ValidatedHumanInteraction {
+            // Form contents remain ephemeral even when the schema did not
+            // explicitly mark a field sensitive. Persist only the resolution.
+            secret_question_ids: if form {
+                BTreeSet::from(["acp_form".to_owned()])
+            } else {
+                BTreeSet::new()
+            },
+        })
+    }
+
+    pub(crate) fn validate_client_resolution_for_runtime(
+        self,
+        request: &CLIRuntimePendingRequest,
+        resolution: &CLIRuntimeRequestResolution,
+        runtime_kind: &str,
+    ) -> Result<ValidatedHumanInteraction> {
+        if runtime_kind != "acp" {
+            return self.validate_client_resolution(request, resolution);
+        }
+        let validated = self.validate_cli_request_for_runtime(request, runtime_kind)?;
+        anyhow::ensure!(
+            matches!(
+                resolution,
+                CLIRuntimeRequestResolution::Answered { response: Some(_) }
+                    | CLIRuntimeRequestResolution::Denied { .. }
+                    | CLIRuntimeRequestResolution::Cancelled
+            ),
+            "ACP interaction requires an answer, decline or cancellation"
+        );
+        crate::cli_runtime::acp_requests::response(
+            request.payload.as_ref().context("ACP payload is missing")?,
+            resolution,
+        )?;
+        Ok(validated)
+    }
+
     pub(crate) fn validate_client_resolution(
         self,
         request: &CLIRuntimePendingRequest,

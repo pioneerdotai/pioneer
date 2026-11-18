@@ -1214,7 +1214,10 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
         && turn_model.status == "in_progress"
         && let Some(execution) =
             crate::repositories::turn_execution::find(db, &turn_model.id).await?
-        && execution.executor_kind == crate::TurnExecutorKind::CliRuntime
+        && matches!(
+            execution.executor_kind,
+            crate::TurnExecutorKind::CliRuntime | crate::TurnExecutorKind::AcpRuntime
+        )
         && execution.status == crate::TurnExecutionStatus::Starting
     {
         cli_runtime_status = Some("starting".to_owned());

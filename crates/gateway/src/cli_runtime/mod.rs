@@ -1,3 +1,9 @@
+pub(crate) mod acp_input;
+pub(crate) mod acp_mcp;
+pub(crate) mod acp_output;
+pub(crate) mod acp_requests;
+pub(crate) mod acp_session;
+pub(crate) mod acp_skills;
 pub(crate) mod claude_mcp;
 pub(crate) mod claude_session;
 pub(crate) mod codex_mcp;

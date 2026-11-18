@@ -2152,7 +2152,7 @@ impl RecoveryCoordinator {
                 )
                 .await;
         }
-        if execution.executor_kind == TurnExecutorKind::CliRuntime
+        if execution.executor_kind.is_cli_runtime()
             && self
                 .crud_store
                 .has_pending_cli_runtime_terminal_event(&execution.turn_id)
@@ -2612,7 +2612,7 @@ impl RecoveryCoordinator {
             .get_turn_execution(&job.turn_id)
             .await?
             .is_some_and(|execution| {
-                execution.executor_kind == TurnExecutorKind::CliRuntime
+                execution.executor_kind.is_cli_runtime()
                     && execution.status.is_active()
                     && (execution.owner_id != self.turn_execution_owner_id.as_ref()
                         || execution.lease_until.timestamp() <= now_unix)

@@ -95,14 +95,14 @@ impl TurnMcpPersistenceCoordinator {
         let server_names = request
             .bindings
             .iter()
-            // The managed Claude filesystem facade is a Pioneer-owned
-            // capability. It is persisted as a frozen binding so invocation
-            // validation and drift checks remain exact, but it is not an
-            // external MCP server that must appear in the user's immutable
-            // MCP server admission. External MCP names remain the only names
-            // bound to role/capability grants here.
+            // Managed filesystem, native and ACP skill tools are Pioneer-owned
+            // capabilities. Their frozen bindings still fence invocation and
+            // drift, but only external servers consume immutable MCP grants.
+            // ACP skill calls revalidate SkillUse and the selected packages.
             .filter(|binding| {
                 binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID
+                    && binding.server_installation_id
+                        != crate::cli_runtime::acp_skills::SKILL_SERVER_ID
                     && crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
                         &binding.server_installation_id,
                     )

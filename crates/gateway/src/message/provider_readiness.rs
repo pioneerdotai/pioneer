@@ -1871,6 +1871,7 @@ fn telemetry_cli_runtime_kind(kind: CLIAgentRuntimeKind) -> GatewayCliRuntimeKin
     match kind {
         CLIAgentRuntimeKind::Codex => GatewayCliRuntimeKind::Codex,
         CLIAgentRuntimeKind::Claude => GatewayCliRuntimeKind::Claude,
+        CLIAgentRuntimeKind::Acp => GatewayCliRuntimeKind::Acp,
         CLIAgentRuntimeKind::OpenCode => GatewayCliRuntimeKind::OpenCode,
     }
 }
@@ -2425,6 +2426,9 @@ fn cli_model_source_fingerprint(
         }
     }
     let files: &[&str] = match instance.kind {
+        GatewayCliAgentRuntimeKindConfig::Acp => {
+            anyhow::bail!("ACP model choices are negotiated per session")
+        }
         GatewayCliAgentRuntimeKindConfig::Codex => &["auth.json", "config.toml"],
         GatewayCliAgentRuntimeKindConfig::Claude => &[".credentials.json", "settings.json"],
         GatewayCliAgentRuntimeKindConfig::OpenCode => &["opencode.json", "opencode.jsonc"],
@@ -2689,6 +2693,7 @@ mod tests {
             shadow_home_path: None,
             custom_models: vec![],
             app_server_args: vec![],
+            env_from: Default::default(),
             startup_probe_timeout_ms: 100,
             request_timeout_ms: 100,
             idle_session_ttl_secs: 300,

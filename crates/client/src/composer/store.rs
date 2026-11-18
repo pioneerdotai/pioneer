@@ -193,6 +193,10 @@ pub struct ComposerPublication {
     preparing_send: Option<ComposerPreparingSend>,
     pub(super) voice_readiness: Option<super::voice_readiness::ComposerVoiceReadinessPublication>,
     selected_provider_ready: bool,
+    #[serde(default)]
+    execution_selection_ready: bool,
+    #[serde(default)]
+    session_model_label: Option<String>,
     permission_options: Vec<super::permissions::ComposerPermissionModeOption>,
     selected_permission_mode_allowed: bool,
     pub(super) runtime_selection: Option<super::runtime_selection::ComposerRuntimePublication>,
@@ -253,10 +257,7 @@ impl ComposerPublication {
     }
     /// The selection gate used by Send, without model display/catalog metadata.
     pub fn has_complete_model_selection(&self) -> bool {
-        super::model_selection::has_complete_composer_model_selection(
-            self.domain().selected_provider.as_deref(),
-            self.domain().selected_model.as_deref(),
-        ) && self.selected_provider_ready()
+        self.execution_selection_ready()
     }
 
     /// Compare only action prerequisites when acknowledging a rendered composer.
@@ -276,8 +277,88 @@ impl ComposerPublication {
     pub fn selected_provider_ready(&self) -> bool {
         self.selected_provider_ready
     }
-    pub(super) fn refresh_runtime_readiness(&mut self) {
+    pub fn execution_selection_ready(&self) -> bool {
+        self.execution_selection_ready
+    }
+    pub fn session_model_label(&self) -> Option<&str> {
+        self.session_model_label.as_deref()
+    }
+    pub(super) fn refresh_runtime_readiness(&mut self, core: &ClientCore) {
         self.selected_provider_ready = self.compute_provider_ready();
+        self.session_model_label = None;
+        let prepared = self
+            .domain()
+            .selected_provider
+            .as_deref()
+            .and_then(crate::providers::list::runtime_id_from_cli_runtime_provider_key)
+            .and_then(|runtime| {
+                core.thread_coordinator_snapshot(&self.thread_id)
+                    .and_then(|thread| {
+                        core.acp_session_snapshot(&thread.workspace_id, &self.thread_id, runtime)
+                    })
+            })
+            .filter(|snapshot| {
+                snapshot.connected
+                    && crate::cli_runtime::acp::capture_configuration(snapshot).is_ok()
+            });
+        if let Some(snapshot) = &prepared {
+            self.session_model_label = snapshot
+                .config_options
+                .iter()
+                .find_map(|option| {
+                    if option.category
+                        != Some(pioneer_protocol::acp::SessionConfigOptionCategory::Model)
+                    {
+                        return None;
+                    }
+                    let pioneer_protocol::acp::SessionConfigKind::Select(select) = &option.kind
+                    else {
+                        return None;
+                    };
+                    match &select.options {
+                        pioneer_protocol::acp::SessionConfigSelectOptions::Ungrouped(options) => {
+                            options
+                                .iter()
+                                .find(|option| option.value == select.current_value)
+                                .map(|option| option.name.clone())
+                        }
+                        pioneer_protocol::acp::SessionConfigSelectOptions::Grouped(groups) => {
+                            groups
+                                .iter()
+                                .flat_map(|group| &group.options)
+                                .find(|option| option.value == select.current_value)
+                                .map(|option| option.name.clone())
+                        }
+                        _ => None,
+                    }
+                })
+                .or_else(|| {
+                    core.provider_runtime_snapshot(&snapshot.workspace_id)
+                        .and_then(|selection| {
+                            selection
+                                .runtimes()
+                                .iter()
+                                .find(|runtime| runtime.runtime_id == snapshot.runtime_id)
+                                .map(|runtime| runtime.display_name.clone())
+                        })
+                });
+        }
+        let selects_acp = self.runtime_selection.as_ref().is_some_and(|selection| {
+            core.provider_runtime_snapshot(&selection.workspace_id)
+                .is_some_and(|catalog| catalog.runtimes().iter().any(|runtime| {
+                    runtime.kind == pioneer_protocol::CLIAgentRuntimeKind::Acp
+                        && Some(runtime.runtime_id.as_str()) == self.domain().selected_provider
+                            .as_deref()
+                            .and_then(crate::providers::list::runtime_id_from_cli_runtime_provider_key)
+                }))
+        });
+        self.execution_selection_ready = self.selected_provider_ready
+            && (prepared.is_some()
+                || (!selects_acp
+                    && super::model_selection::has_complete_composer_model_selection(
+                        self.domain().selected_provider.as_deref(),
+                        self.domain().selected_model.as_deref(),
+                    )));
         self.selected_permission_mode_allowed = self
             .permission_options
             .iter()
@@ -460,6 +541,8 @@ impl ComposerStore {
                 next.permission_options.clear();
                 next.selected_permission_mode_allowed = false;
                 next.selected_provider_ready = false;
+                next.execution_selection_ready = false;
+                next.session_model_label = None;
                 next.runtime_selection = None;
                 next.model_display = None;
                 next.voice_readiness = None;
@@ -663,7 +746,7 @@ impl ClientCore {
             .checked_add(1)
             .expect("composer revision exhausted");
         let revision = next.revision;
-        next.refresh_runtime_readiness();
+        next.refresh_runtime_readiness(self);
         let next = Arc::new(next);
         store
             .drafts
@@ -818,7 +901,7 @@ impl ClientCore {
         // Retire preparing feedback before any optimistic timeline publication can be
         // observed. The existing owner lock still binds cancellation to the commit.
         let revision = next.revision;
-        next.refresh_runtime_readiness();
+        next.refresh_runtime_readiness(self);
         next.refresh_preparing_send();
         let next = Arc::new(next);
         store
@@ -880,7 +963,7 @@ impl ClientCore {
                 .expect("composer revision exhausted");
             let revision = next.revision;
             let thread_id = next.thread_id.clone();
-            next.refresh_runtime_readiness();
+            next.refresh_runtime_readiness(self);
             let next = Arc::new(next);
             publications.push(authority.publication(
                 ClientScope::Composer {
@@ -1309,6 +1392,8 @@ impl ClientCore {
                     runtime_selection: None,
                     voice_readiness: None,
                     selected_provider_ready: false,
+                    execution_selection_ready: false,
+                    session_model_label: None,
                     permission_options: vec![],
                     selected_permission_mode_allowed: false,
                 };
@@ -1877,7 +1962,7 @@ impl ClientCore {
                 (next.thread_id.clone(), next)
             }
         };
-        next.refresh_runtime_readiness();
+        next.refresh_runtime_readiness(self);
         next.refresh_preparing_send();
         let next = Arc::new(next);
         store.drafts.insert(thread_id.clone(), next.clone());

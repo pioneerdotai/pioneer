@@ -163,6 +163,7 @@ while read line; do :; done
             shadow_home_path: None,
             custom_models: vec!["local/custom".into()],
             app_server_args: vec![],
+            env_from: Default::default(),
             // Allow OS process startup under a workspace run. Deadline tests
             // set their own budget or expire it at a deterministic checkpoint.
             startup_probe_timeout_ms: 10_000,

@@ -538,6 +538,7 @@ fn committed_hunk_count(
                 crate::apply_patch::OperationBody::Update(update) => update.hunks.len() as u64,
                 crate::apply_patch::OperationBody::Add(_)
                 | crate::apply_patch::OperationBody::Replace(_)
+                | crate::apply_patch::OperationBody::ExactText { .. }
                 | crate::apply_patch::OperationBody::Delete => 1,
             })
             .unwrap_or(1);

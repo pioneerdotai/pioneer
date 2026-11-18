@@ -189,7 +189,7 @@ impl ClientCore {
             .revision
             .checked_add(1)
             .expect("composer revision exhausted");
-        next.refresh_runtime_readiness();
+        next.refresh_runtime_readiness(self);
         let next = Arc::new(next);
         store.drafts.insert(next.thread_id().into(), next.clone());
         self.publish(

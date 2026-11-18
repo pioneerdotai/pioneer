@@ -924,12 +924,7 @@ mod tests {
         let id = created["session_id"].as_str().unwrap();
         let mut input = "Приветя".as_bytes().to_vec();
         input.extend_from_slice(&[127, b'\n']);
-        owner
-            .call(
-                "host.pty.input",
-                json!({"session_id":id,"sequence":1,"bytes":input}),
-            )
-            .unwrap();
+        let mut input_sent = false;
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut cursor = 0;
         let mut bytes = Vec::new();
@@ -945,6 +940,22 @@ mod tests {
                     .iter()
                     .map(|v| v.as_u64().unwrap() as u8),
             );
+            // Wait for the complete locale line before typing: terminal echo
+            // can otherwise interleave input between ENCODING: and charmap.
+            if !input_sent && bytes.contains(&b'\n') {
+                let output = String::from_utf8_lossy(&bytes);
+                assert!(
+                    output.contains("ENCODING:UTF-8"),
+                    "non-UTF-8 child locale: {output:?}"
+                );
+                owner
+                    .call(
+                        "host.pty.input",
+                        json!({"session_id":id,"sequence":1,"bytes":&input}),
+                    )
+                    .unwrap();
+                input_sent = true;
+            }
             if !frame["exit_status"].is_null() {
                 break;
             }
@@ -952,10 +963,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let output = String::from_utf8(bytes).expect("PTY output must remain valid UTF-8");
-        assert!(
-            output.contains("ENCODING:UTF-8"),
-            "non-UTF-8 child locale: {output:?}"
-        );
         assert!(
             output.contains("RESULT:Привет\r\n"),
             "multibyte erase corrupted the input: {output:?}"

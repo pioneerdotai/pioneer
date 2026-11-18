@@ -120,6 +120,7 @@ pub(crate) struct CLIAgentRuntimeSessionStartOptions {
     pub authorization_scope_fingerprint: Option<String>,
     pub app_server_args: Vec<String>,
     pub env: SensitiveEnvironment,
+    pub additional_directories: Vec<PathBuf>,
     /// Exact selected Claude skill installations in canonical install-name order.
     /// Application order is delivered separately in turn instructions. Claude
     /// receives these as generation-scoped managed plugins; the shared user settings source is
@@ -172,7 +173,7 @@ pub(crate) struct CLIAgentRuntimeTurnStartParams {
     pub effort: Option<String>,
     pub personality: Option<String>,
     pub summary: Option<String>,
-    pub elevated_instructions: CLIRuntimeElevatedInstructions,
+    pub instructions: pioneer_cli_agent_runtime::instructions::CLIRuntimeInstructionDelivery,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,7 +239,7 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     /// A provider may close its generation after an uncertain dispatch. Other
     /// adapters retain their existing reuse semantics.
     fn is_usable(&self) -> bool {
-        true
+        !self.is_closed()
     }
 
     /// Provider-specific barrier used only for a launch-contract replacement.
@@ -262,6 +263,49 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     }
 
     fn take_event_receivers(&self) -> Option<CLIAgentRuntimeEventReceivers> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+    fn acp_snapshot(&self) -> Result<pioneer_protocol::AcpSessionSnapshot> {
+        bail!("not an ACP session")
+    }
+    async fn acp_initialize(
+        &self,
+        _timeout: Duration,
+    ) -> Result<pioneer_protocol::AcpSessionSnapshot> {
+        bail!("not an ACP session")
+    }
+    async fn acp_apply_configuration(
+        &self,
+        _session: &str,
+        _selected: &pioneer_protocol::AcpTurnConfiguration,
+        _timeout: Duration,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        bail!("not an ACP session")
+    }
+    async fn acp_control(
+        &self,
+        _operation: pioneer_protocol::AcpSessionOperation,
+        _timeout: Duration,
+    ) -> Result<Option<JsonValue>> {
+        bail!("not an ACP session")
+    }
+    async fn execute_acp_skill_tool(
+        &self,
+        _invocation: &crate::turn_mcp::invoker::ValidatedTurnMcpInvocation,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::turn_mcp::result::CanonicalMcpToolResult> {
+        bail!("session has no ACP skill runtime")
+    }
+    fn acp_can_continue(&self, _expected: Option<&str>) -> bool {
+        false
+    }
+
+    fn acp_connection(&self) -> Option<Arc<pioneer_cli_agent_runtime::acp::Connection>> {
         None
     }
 
@@ -1082,6 +1126,18 @@ impl CLIAgentRuntimeManager {
         let handle = cached.handle()?;
         Some(handle)
     }
+
+    pub(crate) async fn cached_launch_spec(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+    ) -> Option<CliSessionLaunchSpec> {
+        self.sessions
+            .lock()
+            .expect("CLI registry poisoned")
+            .get(key)
+            .map(|cached| cached.launch_spec.clone())
+    }
+
     pub(crate) async fn existing_session(
         &self,
         key: &CLIAgentRuntimeSessionKey,
@@ -1626,6 +1682,7 @@ mod tests {
         let manager = manager_with_factory(factory.clone());
         let key = key("thread-a");
         let options_a = CLIAgentRuntimeSessionStartOptions {
+            additional_directories: Vec::new(),
             plugin_selection: None,
             cwd: None,
             approval_policy: Some("on-request".to_owned()),
@@ -1636,6 +1693,7 @@ mod tests {
             elevated_instructions: None,
         };
         let options_b = CLIAgentRuntimeSessionStartOptions {
+            additional_directories: Vec::new(),
             plugin_selection: None,
             cwd: None,
             approval_policy: Some("never".to_owned()),

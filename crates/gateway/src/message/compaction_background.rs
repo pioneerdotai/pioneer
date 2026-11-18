@@ -706,6 +706,7 @@ impl MessageProcessor {
             serde_json::from_str(descriptor)?
         } else {
             let transport = match row.runtime_kind.as_str() {
+                "acp" => Transport::Acp,
                 "codex" => Transport::Codex,
                 "claude" => Transport::Claude,
                 "opencode" => Transport::OpenCode,
@@ -718,6 +719,9 @@ impl MessageProcessor {
                             .find(|value| value.id == runtime_id)
                             .map(|value| value.kind)
                         {
+                            Some(pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp) => {
+                                Transport::Acp
+                            }
                             Some(pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex) => {
                                 Transport::Codex
                             }

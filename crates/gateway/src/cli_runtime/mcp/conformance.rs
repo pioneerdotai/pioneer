@@ -406,6 +406,7 @@ fn call_message(
 ) -> JsonValue {
     let item = format!("call-{id}");
     let (arguments, meta) = match contract {
+        CliMcpCallContract::Acp => (arguments, serde_json::Value::Null),
         CliMcpCallContract::Codex => (
             arguments,
             json!({

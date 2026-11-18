@@ -117,6 +117,9 @@ async fn generate_cli_title(
     let home = crate::cli_runtime::config::service_home(&instance)?;
     let kind = instance.kind;
     let (provider, api) = match kind {
+        GatewayCliAgentRuntimeKindConfig::Acp => anyhow::bail!(
+            "ACP has no native title service; select an API or native CLI title model"
+        ),
         Codex => ("codex-cli", "codex_exec_json"),
         Claude => ("claude-cli", "claude_print_json"),
         OpenCode => ("opencode-cli", "opencode_http"),
@@ -141,6 +144,7 @@ async fn generate_cli_title(
     // These are fresh nonpersistent service contexts, never the user's session.
     // No compaction prompt, runner, lifecycle, or visible Pioneer turn is used.
     let result = match kind {
+        GatewayCliAgentRuntimeKindConfig::Acp => anyhow::bail!("ACP has no native title service"),
         Codex => {
             let service = CodexService::new(CodexServiceConfig {
                 executable: instance.binary_path,
@@ -343,6 +347,7 @@ mod tests {
             shadow_home_path: None,
             custom_models: vec![],
             app_server_args: vec![],
+            env_from: Default::default(),
             startup_probe_timeout_ms: 1000,
             request_timeout_ms: 1000,
             idle_session_ttl_secs: 60,

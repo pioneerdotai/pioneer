@@ -5,9 +5,10 @@
 //! separate from `pioneer-provider`, which remains the API-provider transport
 //! abstraction.
 //!
-//! ACP integrations should be added as a sibling backend, not as a subtype of
-//! this CLI process/runtime boundary.
+//! ACP uses the same local process primitives, with its own standard wire
+//! contract. It does not use the native Codex or Claude adapters.
 
+pub mod acp;
 pub mod approval;
 pub mod capabilities;
 pub mod claude;

@@ -361,6 +361,10 @@ impl ProviderCatalogView {
             state.set_value(draft.shadow_home_path.clone(), window, cx);
             state
         });
+        let arguments_input =
+            cx.new(|cx| InputState::new(window, cx).default_value(draft.args_json.clone()));
+        let environment_input =
+            cx.new(|cx| InputState::new(window, cx).default_value(draft.env_from_json.clone()));
         let enabled_state = Rc::new(Cell::new(draft.enabled));
         let initial_focus_input = id_input_state.clone();
         let field_error: Rc<RefCell<Option<CLIRuntimeProviderDialogFieldError>>> =
@@ -399,6 +403,8 @@ impl ProviderCatalogView {
             let binary_input_state = binary_input_state.clone();
             let home_input_state = home_input_state.clone();
             let shadow_home_input_state = shadow_home_input_state.clone();
+            let arguments_input = arguments_input.clone();
+            let environment_input = environment_input.clone();
             let enabled_state = enabled_state.clone();
             let draft_seed = draft.clone();
             let compaction_model = compaction_field.model.clone();
@@ -427,6 +433,14 @@ impl ProviderCatalogView {
                 draft.set_text_field(
                     CLIRuntimeProviderDraftField::ShadowHomePath,
                     shadow_home_input_state.read(cx).value().to_string(),
+                );
+                draft.set_text_field(
+                    CLIRuntimeProviderDraftField::Arguments,
+                    arguments_input.read(cx).value().to_string(),
+                );
+                draft.set_text_field(
+                    CLIRuntimeProviderDraftField::EnvironmentReferences,
+                    environment_input.read(cx).value().to_string(),
                 );
                 draft.enabled = enabled_state.get();
                 draft.compaction_model = compaction_model.borrow().clone();
@@ -579,6 +593,7 @@ impl ProviderCatalogView {
                                         ))
                                     },
                                 )
+                                .when(draft.kind != pioneer_client::providers::types::CLIAgentRuntimeKind::Acp, |this| this
                                 .child(
                                     field()
                                         .label(t!("providers.cli.dialog.home_label").to_string())
@@ -614,6 +629,11 @@ impl ProviderCatalogView {
                                         ))
                                     },
                                 )
+                                )
+                                .when(draft.kind == pioneer_client::providers::types::CLIAgentRuntimeKind::Acp, |this| this
+                                    .child(field().label(t!("providers.cli.acp.arguments").to_string()).child(Input::new(&arguments_input).min_w_0()))
+                                    .child(field().label(t!("providers.cli.acp.environment").to_string()).description(t!("providers.cli.acp.environment_hint").to_string()).child(Input::new(&environment_input).min_w_0()))
+                                )
                                 .when_some(
                                     cli_runtime_provider_dialog_error_for_field(
                                         field_error_message.as_ref(),
@@ -626,7 +646,7 @@ impl ProviderCatalogView {
                                     },
                                 ),
                         )
-                        .child(compaction_field.render(cx))
+                        .when(draft.kind != pioneer_client::providers::types::CLIAgentRuntimeKind::Acp, |this| this.child(compaction_field.render(cx)))
                         .child(
                             h_flex()
                                 .w_full()
@@ -705,7 +725,8 @@ fn cli_runtime_provider_dialog_field_error(
         CLIRuntimeProviderSettingsRejection::MissingSettings
         | CLIRuntimeProviderSettingsRejection::MissingRuntime { .. }
         | CLIRuntimeProviderSettingsRejection::UnsupportedKind { .. }
-        | CLIRuntimeProviderSettingsRejection::InvalidCompactionModel { .. } => None,
+        | CLIRuntimeProviderSettingsRejection::InvalidCompactionModel { .. }
+        | CLIRuntimeProviderSettingsRejection::InvalidLaunchData { .. } => None,
     };
 
     CLIRuntimeProviderDialogFieldError {
@@ -715,6 +736,11 @@ fn cli_runtime_provider_dialog_field_error(
             CLIRuntimeProviderSettingsRejection::InvalidCompactionModel { .. }
         ) {
             t!("providers.cli.compaction.invalid").to_string()
+        } else if matches!(
+            rejection,
+            CLIRuntimeProviderSettingsRejection::InvalidLaunchData { .. }
+        ) {
+            t!("providers.cli.acp.invalid_launch").to_string()
         } else {
             cli_runtime_provider_settings_rejection_message(rejection)
         },

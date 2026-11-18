@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+agent-client-protocol-schema = { version = "=1.11.0", default-features = false, features = ["schemars"] }
 icu_locale_core = { version = "2.4", features = ["alloc"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -15,4 +16,6 @@ schemars.workspace = true
 sha2.workspace = true
 hex.workspace = true
 url.workspace = true
+chrono.workspace = true
+rquickjs-core = { version = "=0.13.0", default-features = false, features = ["bindgen"] }
 zeroize.workspace = true

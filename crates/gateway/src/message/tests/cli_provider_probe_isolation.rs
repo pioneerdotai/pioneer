@@ -238,6 +238,7 @@ fn cli_probe_failure_uses_the_same_admission_for_durable_tasks() {
             processor.bind_task_bridge().await;
             processor.start_task_event_listener().await;
             let model = match kind {
+                CLIAgentRuntimeKind::Acp => unreachable!("native model catalog fixture"),
                 CLIAgentRuntimeKind::Codex => "o4-mini",
                 CLIAgentRuntimeKind::Claude => "claude-sonnet",
                 CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
@@ -308,6 +309,8 @@ fn cli_probe_failure_cannot_admit_a_disabled_or_deleted_configuration() {
                         binary_path: "recording-runtime".into(),
                         home_path: harness.native_home.to_string_lossy().into_owned(),
                         shadow_home_path: None,
+                        args: Vec::new(),
+                        env_from: Default::default(),
                     }]
                 };
                 settings

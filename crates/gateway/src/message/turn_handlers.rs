@@ -854,6 +854,7 @@ struct PreparedCliRuntimeCombinedPreflight {
         Option<crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection>,
     claude_mcp_launch_projection:
         Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
+    acp_mcp_launch_projection: Option<crate::cli_runtime::acp_mcp::AcpMcpSessionLaunchProjection>,
     opencode_mcp_launch_projection:
         Option<crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection>,
     max_input_tokens: Option<u64>,
@@ -883,6 +884,7 @@ struct CliRuntimeAdmissionPhase {
         Option<crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection>,
     claude_mcp_launch_projection:
         Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
+    acp_mcp_launch_projection: Option<crate::cli_runtime::acp_mcp::AcpMcpSessionLaunchProjection>,
     opencode_mcp_launch_projection:
         Option<crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection>,
     max_input_tokens: Option<u64>,
@@ -917,8 +919,7 @@ pub(super) struct RestoredCliRuntimeLaunchSpec {
     pub(super) native_cwd: String,
     pub(super) sandbox: Option<JsonValue>,
     pub(super) permissions: Option<String>,
-    pub(super) elevated_instructions:
-        pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions,
+    pub(super) instructions: pioneer_cli_agent_runtime::instructions::CLIRuntimeInstructionDelivery,
 }
 
 pub(super) enum CliRuntimeLaunchSpecRestore {
@@ -2157,6 +2158,20 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            if let Err(error) = self
+                .validate_acp_prepared_configuration(&thread.workspace_id, &params)
+                .await
+            {
+                self.send_error(
+                    connection_id,
+                    public_turn_start_error(
+                        request_id,
+                        TurnStartFailure::invalid_input(error.to_string()),
+                    ),
+                )
+                .await;
+                return;
+            }
             pioneer_observability::turn_startup::thread_role(
                 &params.turn_id,
                 thread.origin_kind == pioneer_protocol::ThreadOriginKind::TaskRun,
@@ -2204,14 +2219,15 @@ impl MessageProcessor {
                         return;
                     }
                     AgentExecutionBackend::ACPAgentRuntime { runtime_id } => {
-                        self.send_error(
+                        self.turn_start_cli_runtime(
                             connection_id,
-                            public_turn_error(
-                                Some(request_id),
-                                INVALID_REQUEST_CODE,
-                                pioneer_protocol::PublicErrorStage::Admission,
-                                format!("ACP agent runtime `{runtime_id}` is not supported"),
-                            ),
+                            request_id,
+                            request_actor,
+                            params,
+                            runtime_id,
+                            CLIAgentRuntimeKind::Acp,
+                            TurnExecutionAuthority::Fresh(execution_admission),
+                            TurnStartSuccessResponse::TurnStart,
                         )
                         .await;
                         return;
@@ -4454,7 +4470,8 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn prepare_task_cli_runtime_turn(
+    // Keep CLI preparation out of the enclosing Task workflow's future frame.
+    pub(super) fn prepare_task_cli_runtime_turn(
         &self,
         params: TurnStartParams,
         runtime_id: String,
@@ -4470,8 +4487,8 @@ impl MessageProcessor {
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
         agent_turn_response: pioneer_crud::AgentTurnResponseInput,
         admitted_outcome: Option<crate::thread::TurnStartOutcome>,
-    ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
-        scope_current_stage(Stage::TaskCliPrepare, async {
+    ) -> MessageFuture<'_, anyhow::Result<PreparedCliRuntimeNativeTurnStart>> {
+        message_future(scope_current_stage(Stage::TaskCliPrepare, async move {
             #[cfg(test)]
             self.task_cli_preparation_attempts
                 .fetch_add(1, Ordering::SeqCst);
@@ -4506,8 +4523,7 @@ impl MessageProcessor {
             receiver
                 .await
                 .context("task CLI runtime preparation ended without a result")?
-        })
-        .await
+        }))
     }
 
     pub(super) async fn prepare_committed_agent_cli_runtime_turn(
@@ -4880,6 +4896,7 @@ impl MessageProcessor {
         plan: &mut crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan,
         codex: &mut Option<crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection>,
         claude: &mut Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
+        acp: &mut Option<crate::cli_runtime::acp_mcp::AcpMcpSessionLaunchProjection>,
         opencode: &mut Option<crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection>,
         committed_agent: bool,
     ) -> anyhow::Result<()> {
@@ -4952,17 +4969,31 @@ impl MessageProcessor {
                         )?,
                     );
                 }
+                if let Some(launch) = acp.as_ref() {
+                    *acp = Some(
+                        crate::cli_runtime::acp_mcp::AcpMcpSessionLaunchProjection::new(
+                            projection.clone(),
+                            launch.contract_fingerprint.clone(),
+                        )?
+                        .with_skill_tooling(launch.skill_tooling.clone()),
+                    );
+                }
                 if let Some(launch) = opencode.as_ref() {
                     *opencode = Some(crate::cli_runtime::opencode_mcp::build_opencode_mcp_session_launch_projection(projection.clone(), launch.provider_contract_fingerprint.clone())?);
                 }
             }
         }
-        if !plan.mcp_projection.as_ref().is_some_and(|projection| {
-            projection
-                .tools
-                .iter()
-                .any(crate::turn_mcp::native_tools::is_task_operation)
-        }) {
+        // ACP carries selected packages through its frozen skill-tooling owner,
+        // rather than native installations. Keep those exact selected bindings;
+        // pruning Task callables never grants any additional operation.
+        if kind != CLIAgentRuntimeKind::Acp
+            && !plan.mcp_projection.as_ref().is_some_and(|projection| {
+                projection
+                    .tools
+                    .iter()
+                    .any(crate::turn_mcp::native_tools::is_task_operation)
+            })
+        {
             let omitted = plan
                 .skill_bindings
                 .iter()
@@ -5143,12 +5174,13 @@ impl MessageProcessor {
                         .iter()
                         .any(crate::turn_mcp::native_tools::is_threads_operation)
                 });
-            let (skill_install_plans, resolved_skill_bindings) = if attachments.is_empty()
+            let (skill_install_plans, resolved_skill_bindings, acp_skills) = if attachments
+                .is_empty()
                 && !include_task_orchestration
                 && !include_threads
                 && !include_html
             {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new())
             } else {
                 let preflight_started = std::time::Instant::now();
                 let resolved = match scope_current_stage(
@@ -5242,8 +5274,10 @@ impl MessageProcessor {
                 let receipt_path = self
                     .artifact_runtime_home
                     .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
-                let plans =
-                    match crate::cli_runtime::skills::build_cli_runtime_owned_skill_install_plans(
+                let plans = match if runtime_kind == CLIAgentRuntimeKind::Acp {
+                    Ok(Vec::new())
+                } else {
+                    crate::cli_runtime::skills::build_cli_runtime_owned_skill_install_plans(
                         self.crud_store.as_ref(),
                         thread.workspace_id.as_str(),
                         runtime_config,
@@ -5252,42 +5286,76 @@ impl MessageProcessor {
                         &receipt_path,
                     )
                     .await
-                    {
-                        Ok(plans) => plans,
-                        Err(error) => {
-                            let failure_reason =
-                                format!("failed to plan CLI runtime skills: {error:#}");
-                            for skill in &resolved {
-                                warn!(
-                                    event = "cli_runtime_skill_preflight",
-                                    runtime_id,
-                                    runtime_kind = ?runtime_kind,
-                                    skill_slug = skill.slug.as_str(),
-                                    source_kind = skill.definition.identity.source_kind.as_db_value(),
-                                    install_name = pioneer_skills::sanitize_name(
-                                        &skill.definition.identity.name
-                                    ),
-                                    result = "failed",
-                                    failure_reason = failure_reason.as_str(),
-                                    elapsed_ms = preflight_started.elapsed().as_millis(),
-                                    "CLI runtime skill preflight planning failed"
-                                );
-                            }
-                            return Err(TurnStartFailure::internal_typed(
-                                pioneer_tasks::TaskStartStage::CliAdmission,
-                                error.context("failed to plan CLI runtime skills"),
-                            ));
+                } {
+                    Ok(plans) => plans,
+                    Err(error) => {
+                        let failure_reason =
+                            format!("failed to plan CLI runtime skills: {error:#}");
+                        for skill in &resolved {
+                            warn!(
+                                event = "cli_runtime_skill_preflight",
+                                runtime_id,
+                                runtime_kind = ?runtime_kind,
+                                skill_slug = skill.slug.as_str(),
+                                source_kind = skill.definition.identity.source_kind.as_db_value(),
+                                install_name = pioneer_skills::sanitize_name(
+                                    &skill.definition.identity.name
+                                ),
+                                result = "failed",
+                                failure_reason = failure_reason.as_str(),
+                                elapsed_ms = preflight_started.elapsed().as_millis(),
+                                "CLI runtime skill preflight planning failed"
+                            );
                         }
-                    };
-                (plans, resolved_skill_bindings)
+                        return Err(TurnStartFailure::internal_typed(
+                            pioneer_tasks::TaskStartStage::CliAdmission,
+                            error.context("failed to plan CLI runtime skills"),
+                        ));
+                    }
+                };
+                (
+                    plans,
+                    resolved_skill_bindings,
+                    if runtime_kind == CLIAgentRuntimeKind::Acp {
+                        resolved
+                    } else {
+                        Vec::new()
+                    },
+                )
             };
-            let plan = crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan {
+            let mut plan = crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan {
                 mcp_projection: combined_preflight_input.mcp_projection,
                 skill_install_plans,
                 skill_bindings: resolved_skill_bindings,
+                acp_skills,
             };
+            let acp_skill_tooling =
+                if runtime_kind == CLIAgentRuntimeKind::Acp && !plan.acp_skills.is_empty() {
+                    let tooling = crate::cli_runtime::acp_skills::AcpSkillTooling::prepare(
+                        plan.acp_skills.clone(),
+                        self.tool_loop_config.skills.clone(),
+                    )
+                    .await
+                    .map_err(|error| TurnStartFailure::internal(error.to_string()))?;
+                    if let Some(projection) = plan.mcp_projection.as_mut() {
+                        tooling
+                            .extend_projection(
+                                projection,
+                                crate::turn_mcp::McpProjectionLimits {
+                                    max_tools,
+                                    max_total_schema_bytes,
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(|error| TurnStartFailure::internal(error.to_string()))?;
+                    }
+                    Some(tooling)
+                } else {
+                    None
+                };
             let mut codex_mcp_launch_projection = None;
             let mut claude_mcp_launch_projection = None;
+            let mut acp_mcp_launch_projection = None;
             let mut opencode_mcp_launch_projection = None;
             if let Some(projection) = plan.mcp_projection.as_ref() {
                 // Managed Claude always receives the reserved first-party
@@ -5385,7 +5453,20 @@ impl MessageProcessor {
                                 .unwrap_or("MCP tool readiness is not available")
                         )));
                     }
-                    if runtime_kind == CLIAgentRuntimeKind::Codex {
+                    if runtime_kind == CLIAgentRuntimeKind::Acp {
+                        acp_mcp_launch_projection = Some(
+                            crate::cli_runtime::acp_mcp::AcpMcpSessionLaunchProjection::new(
+                                projection.clone(),
+                                readiness.contract_fingerprint,
+                            )
+                            .map_err(|e| TurnStartFailure::internal(e.to_string()))?
+                            .with_skill_tooling(
+                                acp_skill_tooling
+                                    .clone()
+                                    .filter(|tooling| tooling.has_tools()),
+                            ),
+                        );
+                    } else if runtime_kind == CLIAgentRuntimeKind::Codex {
                         codex_mcp_launch_projection = Some(
                             crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection(
                                 projection.clone(),
@@ -5445,6 +5526,7 @@ impl MessageProcessor {
                 plan,
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
+                acp_mcp_launch_projection,
                 opencode_mcp_launch_projection,
                 max_input_tokens,
             })
@@ -5492,7 +5574,10 @@ impl MessageProcessor {
                     CLIAgentRuntimeKind::Codex => {
                         pioneer_observability::turn_startup::Runtime::Codex
                     }
-                    _ => pioneer_observability::turn_startup::Runtime::Claude,
+                    CLIAgentRuntimeKind::Claude | CLIAgentRuntimeKind::OpenCode => {
+                        pioneer_observability::turn_startup::Runtime::Claude
+                    }
+                    CLIAgentRuntimeKind::Acp => pioneer_observability::turn_startup::Runtime::Acp,
                 },
             );
             let response_thread_id = params.thread_id.clone();
@@ -5552,6 +5637,21 @@ impl MessageProcessor {
                 return;
             }
 
+            if matches!(&execution_authority, TurnExecutionAuthority::Fresh(_)) {
+                let workspace = self
+                    .thread_manager
+                    .thread_get(&params.thread_id)
+                    .await
+                    .map(|thread| thread.workspace_id)
+                    .unwrap_or_default();
+                if let Err(error) = self
+                    .validate_acp_prepared_configuration(&workspace, &params)
+                    .await
+                {
+                    send_turn_start_failure!(TurnStartFailure::invalid_input(error.to_string()));
+                    return;
+                }
+            }
             let Some(runtime_config) = self
                 .validate_cli_runtime_turn_start_backend(
                     connection_id,
@@ -6194,7 +6294,7 @@ impl MessageProcessor {
                             return None;
                         }
                     };
-                    if !execution.is_some_and(|execution| execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime)
+                    if !execution.is_some_and(|execution| execution.executor_kind.matches_cli_runtime_kind(&binding.runtime_kind))
                         || turn_binding.as_ref().is_some_and(|attempt_binding| {
                             attempt_binding.native_turn_id.is_some()
                                 || attempt_binding.native_thread_id != binding.native_thread_id
@@ -6316,7 +6416,7 @@ impl MessageProcessor {
                     }
                 };
                 if prior_execution.is_some_and(|execution| {
-                    execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+                    execution.executor_kind.is_cli_runtime()
                 }) && !previous_parent_turn.as_ref().is_some_and(|turn| {
                     matches!(turn.status, TurnStatus::Blocked | TurnStatus::Interrupted)
                 }) {
@@ -6345,6 +6445,7 @@ impl MessageProcessor {
                 plan: combined_preflight,
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
+                acp_mcp_launch_projection,
                 opencode_mcp_launch_projection,
                 max_input_tokens,
             } = match self
@@ -6668,6 +6769,7 @@ impl MessageProcessor {
                 combined_preflight,
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
+                acp_mcp_launch_projection,
                 opencode_mcp_launch_projection,
                 max_input_tokens,
             })
@@ -6689,6 +6791,7 @@ impl MessageProcessor {
                 mut combined_preflight,
                 mut codex_mcp_launch_projection,
                 mut claude_mcp_launch_projection,
+                mut acp_mcp_launch_projection,
                 mut opencode_mcp_launch_projection,
                 max_input_tokens,
             }) = admission_phase
@@ -6746,23 +6849,24 @@ impl MessageProcessor {
                 }
             } };
             let input_mapping = match match runtime_kind {
+                CLIAgentRuntimeKind::Acp => crate::cli_runtime::acp_input::map_input(params.input.as_slice(), resolved_artifacts.as_slice()),
                 CLIAgentRuntimeKind::Codex => {
                     crate::cli_runtime::input_mapping::map_codex_turn_input_from_pioneer(
                         params.input.as_slice(),
                         resolved_artifacts.as_slice(),
-                    )
+                    ).map_err(anyhow::Error::new)
                 }
                 CLIAgentRuntimeKind::Claude => {
                     crate::cli_runtime::input_mapping::map_claude_turn_input_from_pioneer(
                         params.input.as_slice(),
                         resolved_artifacts.as_slice(),
-                    )
+                    ).map_err(anyhow::Error::new)
                 }
                 CLIAgentRuntimeKind::OpenCode => {
                     crate::cli_runtime::input_mapping::map_opencode_turn_input_from_pioneer(
                         params.input.as_slice(),
                         resolved_artifacts.as_slice(),
-                    )
+                    ).map_err(anyhow::Error::new)
                 }
             } {
                 Ok(input_mapping) => input_mapping,
@@ -7323,7 +7427,8 @@ impl MessageProcessor {
                     workspace_id: outcome.started_notification.workspace_id.clone(),
                     thread_id: outcome.started_notification.thread_id.clone(), turn_id: outcome.started_notification.turn.id.clone(),
                 }, runtime_kind, &mut combined_preflight, &mut codex_mcp_launch_projection,
-                &mut claude_mcp_launch_projection, &mut opencode_mcp_launch_projection,
+                &mut claude_mcp_launch_projection, &mut acp_mcp_launch_projection,
+                &mut opencode_mcp_launch_projection,
                 matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. }),
             ).await {
                 #[cfg(test)]
@@ -7387,6 +7492,7 @@ impl MessageProcessor {
                                 .collect::<Vec<_>>()
                         })
                     })
+                    .or_else(|| acp_mcp_launch_projection.as_ref().map(|launch| launch.canonical_projection.tools.iter().map(|tool| crate::turn_mcp::persistence::TurnMcpProviderBindingIdentity { canonical_callable_name: tool.canonical_callable_name.clone(), provider_callable_name: tool.canonical_callable_name.clone(), provider_schema_fingerprint: tool.schema_fingerprint.clone() }).collect()))
                     .or_else(|| {
                         opencode_mcp_launch_projection.as_ref().map(|launch| {
                             launch
@@ -7661,10 +7767,137 @@ impl MessageProcessor {
                 None => None,
             };
             self.ensure_hook_runtime_with_run_store().await;
+            let selected_skill_names = if runtime_kind == CLIAgentRuntimeKind::Acp { combined_preflight.acp_skills.iter().map(|skill| skill.slug.clone()).collect::<Vec<_>>() } else { selected_skill_names };
+            #[cfg(test)]
+            if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. }) {
+                self.completed_history_preparation_barrier.wait_if_armed(
+                    "__cli_agent_before_context_proof__", &tokio_util::sync::CancellationToken::new(),
+                ).await;
+            }
+            let execution_authorization_context = match self
+                .load_turn_execution_authorization_context(
+                    outcome.started_notification.turn.id.as_str(),
+                )
+                .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. })
+                        && super::agent_action_tools::agent_start_has_storage_failure(&error) {
+                        send_turn_start_failure!(TurnStartFailure::internal_typed(
+                            pioneer_tasks::TaskStartStage::CliPreparation, error,
+                        ));
+                        return;
+                    }
+
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!(
+                            "failed to bind CLI runtime session authorization scope: {error:#}"
+                        ),
+                    )
+                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to bind CLI runtime session authorization scope: {error:#}"
+                    ));
+                    return;
+                }
+            };
+            let authorization_scope_fingerprint =
+                match cli_runtime_session_authorization_scope_fingerprint(
+                    &execution_authorization_context,
+                    &security_snapshot,
+                ) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(error) => {
+                        self.mark_turn_blocked(
+                            outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            format!(
+                                "failed to fingerprint CLI runtime session authorization scope: {error:#}"
+                            ),
+                        )
+                        .await;
+                        send_turn_start_failure!(format!(
+                            "failed to fingerprint CLI runtime session authorization scope: {error:#}"
+                        ));
+                        return;
+                    }
+                };
+            let native_cwd = security_snapshot.sandbox.cwd.clone();
+            let proxy_env = crate::cli_runtime::config::proxy_env(proxy_url.as_deref());
+            let committed_plugin_selection = match super::packages::validate_cli_plugin_selection(
+                self.crud_store.as_ref(),
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+            ).await {
+                Ok(selection) => selection,
+                Err(error) => {
+                    self.mark_turn_blocked(outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("CLI plugin selection is not ready: {error:#}")).await;
+                    send_turn_start_failure!(format!("CLI plugin selection is not ready: {error:#}"));
+                    return;
+                }
+            };
+            // ACP has no elevated startup payload. Its existing manager lease
+            // can be acquired now, so negotiated continuation determines the
+            // accepted-context plan before any input is persisted or prompted.
+            let mut bootstrap_provider_context = bootstrap_provider_context;
+            let mut early_acp_session = None;
+            if runtime_kind == CLIAgentRuntimeKind::Acp {
+                let acquiring = async {
+                    let options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                        plugin_selection: committed_plugin_selection.clone(),
+                        cwd: Some(std::path::PathBuf::from(&native_cwd)), approval_policy: Some(effective_approval_policy.clone()), authorization_scope_fingerprint: Some(authorization_scope_fingerprint.clone()), env: proxy_env.clone(),
+                        additional_directories: security_params.cli_runtime_options.as_ref().and_then(|options| options.acp_configuration.as_ref()).map(|configuration| configuration.additional_directories.iter().map(std::path::PathBuf::from).collect()).unwrap_or_default(), ..Default::default()
+                    };
+                    if let Some(old) = manager.cached_launch_spec(&session_key).await {
+                        if old.options.authorization_scope_fingerprint != options.authorization_scope_fingerprint || old.options.cwd != options.cwd || old.options.additional_directories != options.additional_directories { bootstrap_provider_context = true; }
+                    }
+                    let selected_continuation = security_params.cli_runtime_options.as_ref()
+                        .and_then(|options| options.acp_configuration.as_ref())
+                        .filter(|selected| selected.continuation_requested);
+                    if let Some(selected) = selected_continuation {
+                        let binding = self.crud_store.get_cli_runtime_thread_binding(&continuation_thread_id).await?;
+                        crate::cli_runtime::acp_input::validate_selected_continuation(&selected.session_id, binding.as_ref(), &runtime_id, bootstrap_provider_context, true)?;
+                    }
+                    if bootstrap_provider_context {
+                        if let Some(old) = manager.existing_session(&session_key).await {
+                            self.invalidate_acp_session_snapshot(old.instance()).await;
+                        }
+                        manager.close_session(&session_key).await?;
+                    }
+                    let launch = crate::cli_runtime::continuation::CliSessionLaunchSpec::acp(options, acp_mcp_launch_projection.clone().map(crate::cli_runtime::continuation::CliMcpSessionLaunch::Acp).unwrap_or(crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled), None).with_native_event_budget(native_event_budget);
+                    if manager.cached_launch_spec(&session_key).await.as_ref().is_some_and(|old| old != &launch) {
+                        if let Some(old) = manager.existing_session(&session_key).await {
+                            old.session().prepare_for_replacement().await?;
+                            self.invalidate_acp_session_snapshot(old.instance()).await;
+                        }
+                    }
+                    let handle = manager.get_or_start_with_launch_spec(session_key.clone(), launch).await?;
+                    self.ensure_cli_runtime_session_event_pumps(handle.instance(), handle.session(), false).await;
+                    handle.session().acp_initialize(std::time::Duration::from_millis(runtime_config.startup_probe_timeout_ms)).await?;
+                    let existing = self.crud_store.get_cli_runtime_thread_binding(&continuation_thread_id).await?;
+                    let expected = existing.as_ref().filter(|binding| binding.runtime_id == runtime_id && binding.runtime_kind == "acp").map(|binding| binding.native_thread_id.as_str());
+                    let can_continue = handle.session().acp_can_continue(expected);
+                    if let Some(selected) = selected_continuation {
+                        crate::cli_runtime::acp_input::validate_selected_continuation(&selected.session_id, existing.as_ref(), &runtime_id, bootstrap_provider_context, can_continue)?;
+                    }
+                    if !can_continue { bootstrap_provider_context = true; }
+                    Ok::<_, anyhow::Error>(handle)
+                }.await;
+                match acquiring {
+                    Ok(handle) => early_acp_session = Some(handle),
+                    Err(error) => { if let Some(handle) = manager.existing_session(&session_key).await { self.emit_acp_session_snapshot(handle.instance()).await; } self.mark_turn_blocked(outcome.started_notification.thread_id.clone(), outcome.started_notification.turn.id.clone(), format!("ACP preparation failed: {error:#}")).await; send_turn_start_failure!(format!("ACP preparation failed: {error:#}")); return; }
+                }
+            }
             crate::cli_runtime::context::prepend_cli_environment_input(
                 &mut input_mapping,
                 &security_snapshot,
             );
+
             let PreparedCliRuntimeDelivery {
                 frozen_hold: cli_basis_hold,
                 plan: delivery_plan,
@@ -7776,8 +8009,8 @@ impl MessageProcessor {
                     return;
                 }
             }
-            let elevated_instructions = match pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions::try_new(
-                delivery_plan.provider_instructions.text.clone(),
+            let instructions = match pioneer_cli_agent_runtime::instructions::CLIRuntimeInstructionDelivery::for_runtime(
+                runtime_kind, delivery_plan.provider_instructions.text.clone(),
                 delivery_plan.provider_instructions.fingerprint.clone(),
             ) {
                 Ok(instructions) => instructions,
@@ -7800,7 +8033,7 @@ impl MessageProcessor {
                     outcome.started_notification.turn.id.as_str(),
                     runtime_kind,
                     &delivery_plan,
-                    &elevated_instructions,
+                    &instructions,
                 )
                 .await
             {
@@ -7815,85 +8048,13 @@ impl MessageProcessor {
                 ));
                 return;
             }
-            #[cfg(test)]
-            if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. }) {
-                self.completed_history_preparation_barrier.wait_if_armed(
-                    "__cli_agent_before_context_proof__", &tokio_util::sync::CancellationToken::new(),
-                ).await;
-            }
-            let execution_authorization_context = match self
-                .load_turn_execution_authorization_context(
-                    outcome.started_notification.turn.id.as_str(),
-                )
-                .await
-            {
-                Ok(context) => context,
-                Err(error) => {
-                    if matches!(&success_response, TurnStartSuccessResponse::DurableAgent { .. })
-                        && super::agent_action_tools::agent_start_has_storage_failure(&error) {
-                        send_turn_start_failure!(TurnStartFailure::internal_typed(
-                            pioneer_tasks::TaskStartStage::CliPreparation, error,
-                        ));
-                        return;
-                    }
-
-                    self.mark_turn_blocked(
-                        outcome.started_notification.thread_id.clone(),
-                        outcome.started_notification.turn.id.clone(),
-                        format!(
-                            "failed to bind CLI runtime session authorization scope: {error:#}"
-                        ),
-                    )
-                    .await;
-                    send_turn_start_failure!(format!(
-                        "failed to bind CLI runtime session authorization scope: {error:#}"
-                    ));
-                    return;
-                }
-            };
-            let authorization_scope_fingerprint =
-                match cli_runtime_session_authorization_scope_fingerprint(
-                    &execution_authorization_context,
-                    &security_snapshot,
-                ) {
-                    Ok(fingerprint) => fingerprint,
-                    Err(error) => {
-                        self.mark_turn_blocked(
-                            outcome.started_notification.thread_id.clone(),
-                            outcome.started_notification.turn.id.clone(),
-                            format!(
-                                "failed to fingerprint CLI runtime session authorization scope: {error:#}"
-                            ),
-                        )
-                        .await;
-                        send_turn_start_failure!(format!(
-                            "failed to fingerprint CLI runtime session authorization scope: {error:#}"
-                        ));
-                        return;
-                    }
-                };
-            let native_cwd = security_snapshot.sandbox.cwd.clone();
-            let proxy_env = crate::cli_runtime::config::proxy_env(proxy_url.as_deref());
-            let committed_plugin_selection = match super::packages::validate_cli_plugin_selection(
-                self.crud_store.as_ref(),
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.started_notification.turn.id.as_str(),
-            ).await {
-                Ok(selection) => selection,
-                Err(error) => {
-                    self.mark_turn_blocked(outcome.started_notification.thread_id.clone(),
-                        outcome.started_notification.turn.id.clone(),
-                        format!("CLI plugin selection is not ready: {error:#}")).await;
-                    send_turn_start_failure!(format!("CLI plugin selection is not ready: {error:#}"));
-                    return;
-                }
-            };
             let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
                 plugin_selection: committed_plugin_selection.clone(),
                 cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
                 approval_policy: Some(effective_approval_policy.clone()),
-                authorization_scope_fingerprint: Some(authorization_scope_fingerprint),
+                authorization_scope_fingerprint: Some(authorization_scope_fingerprint.clone()),
                 env: proxy_env,
+                additional_directories: security_params.cli_runtime_options.as_ref().and_then(|options| options.acp_configuration.as_ref()).map(|configuration| configuration.additional_directories.iter().map(std::path::PathBuf::from).collect()).unwrap_or_default(),
                 selected_skills: if matches!(runtime_kind, CLIAgentRuntimeKind::Claude) || committed_plugin_selection.is_some() {
                     match crate::cli_runtime::skills::normalize_cli_runtime_selected_skills(
                         installed_skills.iter().map(crate::cli_runtime::skills::CliRuntimeSelectedSkill::from),
@@ -7914,10 +8075,10 @@ impl MessageProcessor {
                     Vec::new()
                 },
                 elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
-                    .then_some(elevated_instructions.clone()),
+                    .then(|| instructions.elevated().expect("native instruction delivery validated").clone()),
                 ..Default::default()
             };
-            if bootstrap_provider_context
+            if bootstrap_provider_context && runtime_kind != CLIAgentRuntimeKind::Acp
                 && let Err(error) = manager.close_session(&session_key).await
             {
                 self.mark_turn_blocked(
@@ -7932,6 +8093,7 @@ impl MessageProcessor {
                 return;
             }
             let session_result = { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::CliAcquire); match runtime_kind {
+                CLIAgentRuntimeKind::Acp => Ok(early_acp_session.take().expect("ACP prepared before context compilation")),
                 CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode => {
                     let persisted_binding = match self
                         .crud_store
@@ -8010,8 +8172,8 @@ impl MessageProcessor {
                                 native_thread_id,
                             )
                         }
-                        CLIAgentRuntimeKind::Claude => unreachable!(
-                            "Claude cannot enter RPC/server continuation launch"
+                        CLIAgentRuntimeKind::Claude | CLIAgentRuntimeKind::Acp => unreachable!(
+                            "runtime cannot enter RPC/server continuation launch"
                         ),
                     };
                     manager
@@ -8093,7 +8255,7 @@ impl MessageProcessor {
                         boundary_message_uuid,
                         provider_session_id,
                     ).with_native_event_budget(native_event_budget),
-                    crate::cli_runtime::continuation::CliProviderContinuation::CodexRpcThread {
+                    crate::cli_runtime::continuation::CliProviderContinuation::AcpSession { .. } | crate::cli_runtime::continuation::CliProviderContinuation::CodexRpcThread {
                         ..
                     } => unreachable!("Claude preparation returned a Codex continuation"),
                     crate::cli_runtime::continuation::CliProviderContinuation::OpenCodeServerSession {
@@ -8152,7 +8314,7 @@ impl MessageProcessor {
                         permissions: provider_permissions_id.clone(),
                         service_tier: None,
                         resume_existing: !bootstrap_provider_context
-                            && cli_runtime_supports_durable_thread_resume(runtime_kind),
+                            && if runtime_kind == CLIAgentRuntimeKind::Acp { !cli_session.is_closed() } else { cli_runtime_supports_durable_thread_resume(runtime_kind) },
                         request_timeout: std::time::Duration::from_millis(
                             runtime_config.request_timeout_ms,
                         ),
@@ -8175,6 +8337,25 @@ impl MessageProcessor {
                         return;
                     }
                 } };
+            if runtime_kind == CLIAgentRuntimeKind::Acp {
+                let preparing = async {
+                    let capabilities = cli_session.acp_snapshot()?.capabilities;
+                    if let Some(selected) = security_params.cli_runtime_options.as_ref().and_then(|options| options.acp_configuration.as_ref()) {
+                        self.apply_prepared_acp_configuration(cli_session.as_ref(), &native_thread.binding.native_thread_id, selected,
+                            std::time::Duration::from_millis(runtime_config.request_timeout_ms),
+                            &outcome.started_notification.thread_id, &outcome.started_notification.turn.id).await?;
+                    }
+                    crate::cli_runtime::acp_input::append_skills(&mut input_mapping, &combined_preflight.acp_skills, &capabilities).await?;
+                    crate::cli_runtime::acp_input::materialize(&mut input_mapping, &capabilities, &security_snapshot, &authorization_scope_fingerprint, crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES / 2, tokio_util::sync::CancellationToken::new()).await?;
+                    crate::cli_runtime::context::validate_cli_runtime_turn_input_frame(&input_mapping, &delivery_plan, None, runtime_kind)
+                }.await;
+                self.emit_acp_session_snapshot(session_handle.instance()).await;
+                if let Err(error) = preparing {
+                    self.mark_turn_blocked(outcome.started_notification.thread_id.clone(), outcome.started_notification.turn.id.clone(), format!("ACP input preparation failed: {error:#}")).await;
+                    send_turn_start_failure!(format!("ACP input preparation failed: {error:#}"));
+                    return;
+                }
+            }
             if let Some(name) = native_thread.name.as_ref() {
                 self.handle_cli_runtime_event(
                     session_handle.instance(),
@@ -8187,6 +8368,17 @@ impl MessageProcessor {
                 ).await;
             }
             let input_mapping_json = match pioneer_crud::serialize_cli_runtime_json(&input_mapping)
+                .and_then(|json| {
+                    if runtime_kind != CLIAgentRuntimeKind::Acp { return Ok(json); }
+                    let snapshot = cli_session.acp_snapshot()?;
+                    let mut receipt: serde_json::Value = serde_json::from_str(&json)?;
+                    receipt.as_object_mut().context("CLI input mapping is not an object")?.insert("acpConfiguration".into(), serde_json::json!({
+                        "sessionId":snapshot.session_id,"version":snapshot.version,
+                        "configOptions":snapshot.config_options,"modes":snapshot.modes,
+                        "additionalDirectories":snapshot.additional_directories,
+                    }));
+                    Ok(serde_json::to_string(&receipt)?)
+                })
                 .and_then(|json| crate::cli_runtime::context::persist_inventory_mapping(&json, &delivery_plan))
                 .and_then(|json| match sent_context_basis.as_ref() {
                     Some(basis) => crate::cli_runtime::thread_binding::persist_sent_context_basis_in_input_mapping(
@@ -8304,7 +8496,7 @@ impl MessageProcessor {
                     effort: effective_cli_runtime_effort,
                     personality: cli_runtime_personality,
                     summary: cli_runtime_summary,
-                    elevated_instructions,
+                    instructions,
                 };
             let native_turn_start = PreparedCliRuntimeNativeTurnStart {
                 plugin_launch_guards,
@@ -9055,6 +9247,11 @@ impl MessageProcessor {
         &self,
         requested_binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
     ) -> CliRuntimeLaunchSpecRestore {
+        if requested_binding.runtime_kind == "acp" {
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic: "ACP cannot prove an interrupted prompt outcome through process/session restoration; known outcomes use the durable delivery journal".into(),
+            };
+        }
         let binding = match self
             .crud_store
             .get_cli_runtime_turn_binding(requested_binding.turn_id.as_str())
@@ -9309,7 +9506,7 @@ impl MessageProcessor {
                 ),
             };
         }
-        let elevated_instructions = match crate::cli_runtime::instruction_projection::load_cli_runtime_instruction_projection(
+        let instructions = match crate::cli_runtime::instruction_projection::load_cli_runtime_instruction_projection(
             self.crud_store.as_ref(),
             binding.turn_id.as_str(),
             runtime_kind,
@@ -9445,11 +9642,15 @@ impl MessageProcessor {
             plugin_selection,
             cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
             approval_policy: binding.approval_policy.clone(),
-            authorization_scope_fingerprint: Some(authorization_scope_fingerprint),
+            authorization_scope_fingerprint: Some(authorization_scope_fingerprint.clone()),
             env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
             selected_skills,
-            elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
-                .then_some(elevated_instructions.clone()),
+            elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude).then(|| {
+                instructions
+                    .elevated()
+                    .expect("native instruction delivery validated")
+                    .clone()
+            }),
             ..Default::default()
         };
         let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
@@ -9487,6 +9688,9 @@ impl MessageProcessor {
             }
         };
         let launch_spec = match runtime_kind {
+            CLIAgentRuntimeKind::Acp => {
+                unreachable!("ACP restoration rejected before native launch reconstruction")
+            }
             CLIAgentRuntimeKind::Codex => {
                 crate::cli_runtime::continuation::CliSessionLaunchSpec::codex(
                     session_options,
@@ -9549,7 +9753,7 @@ impl MessageProcessor {
             native_cwd,
             sandbox,
             permissions,
-            elevated_instructions,
+            instructions,
         })
     }
 
@@ -9637,6 +9841,11 @@ impl MessageProcessor {
         &self,
         request: crate::resilience::CliRuntimeRecoveryAttemptRequest,
     ) -> Result<bool, CliRuntimeRecoveryStartFailure> {
+        if request.binding.runtime_kind == "acp" {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: "ACP cannot resubmit an interrupted prompt through native recovery; inspect accepted history and external effects before starting a new turn".into(),
+            });
+        }
         let _plugin_launch = self
             .acquire_plugin_launch_guards(
                 request.binding.workspace_id.as_str(),
@@ -10067,7 +10276,7 @@ impl MessageProcessor {
                     effort: None,
                     personality: None,
                     summary: None,
-                    elevated_instructions: restored.elevated_instructions.clone(),
+                    instructions: restored.instructions.clone(),
                 },
                 std::time::Duration::from_millis(restored.runtime.request_timeout_ms),
             )
@@ -10368,7 +10577,107 @@ impl MessageProcessor {
         Ok(None)
     }
 
-    async fn cli_runtime_session_turn_mutex(
+    /// Share the existing turn cancellation observer with the session-owned
+    /// configuration deadline. Await retirement before leaving preparation.
+    pub(super) async fn apply_prepared_acp_configuration(
+        &self,
+        session: &dyn crate::cli_runtime::manager::CLIAgentRuntimeSession,
+        native_session: &str,
+        selected: &pioneer_protocol::AcpTurnConfiguration,
+        timeout: std::time::Duration,
+        thread: &str,
+        turn: &str,
+    ) -> anyhow::Result<()> {
+        let cancellation = self.cli_history_shutdown.child_token();
+        let applying = session.acp_apply_configuration(
+            native_session,
+            selected,
+            timeout,
+            cancellation.clone(),
+        );
+        tokio::pin!(applying);
+        tokio::select! {
+            biased;
+            _ = self.monitor_cli_history_turn(thread, turn) => { cancellation.cancel(); applying.await },
+            result = &mut applying => result,
+        }
+    }
+
+    pub(super) async fn validate_acp_prepared_configuration(
+        &self,
+        workspace: &str,
+        params: &TurnStartParams,
+    ) -> anyhow::Result<()> {
+        let Some(selected) = params
+            .cli_runtime_options
+            .as_ref()
+            .and_then(|options| options.acp_configuration.as_ref())
+        else {
+            return Ok(());
+        };
+        let Some(AgentExecutionBackend::ACPAgentRuntime { runtime_id }) = &params.execution_backend
+        else {
+            anyhow::bail!("ACP configuration requires the ACP execution backend");
+        };
+        let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+            workspace,
+            runtime_id,
+            &params.thread_id,
+        )?;
+        let handle = self
+            .cli_runtime_manager
+            .as_ref()
+            .context("CLI manager unavailable")?
+            .existing_session(&key)
+            .await
+            .context("Prepared ACP session expired; prepare the agent again")?;
+        let snapshot = handle.session().acp_snapshot()?;
+        anyhow::ensure!(
+            snapshot.session_id.as_deref() == Some(selected.session_id.as_str())
+                && snapshot.version.as_ref() == Some(&selected.expected)
+                && snapshot.connected
+                && snapshot.additional_directories == selected.additional_directories
+                && snapshot.initial_descriptor_fingerprint
+                    == selected.initial_descriptor_fingerprint
+                && snapshot.configuration_replay == selected.configuration_replay
+                && snapshot.continuation_requested == selected.continuation_requested,
+            "Prepared ACP session changed; refresh its configuration"
+        );
+        anyhow::ensure!(
+            pioneer_protocol::acp_descriptor_fingerprint(
+                &snapshot.config_options,
+                snapshot.modes.as_ref()
+            )? == selected.descriptor_fingerprint
+                && snapshot.config_options.len() == selected.values.len(),
+            "Prepared ACP descriptors changed"
+        );
+        for option in snapshot.config_options {
+            let value = match option.kind {
+                pioneer_protocol::acp::SessionConfigKind::Select(select) => {
+                    pioneer_protocol::acp::SessionConfigOptionValue::value_id(select.current_value)
+                }
+                pioneer_protocol::acp::SessionConfigKind::Boolean(boolean) => {
+                    pioneer_protocol::acp::SessionConfigOptionValue::boolean(boolean.current_value)
+                }
+                _ => anyhow::bail!("unsupported ACP configuration kind"),
+            };
+            anyhow::ensure!(
+                selected.values.get(&option.id.to_string()) == Some(&value),
+                "Prepared ACP selection is stale"
+            );
+        }
+        let mode = (!snapshot.has_config_options)
+            .then(|| {
+                snapshot
+                    .modes
+                    .map(|modes| modes.current_mode_id.to_string())
+            })
+            .flatten();
+        anyhow::ensure!(selected.mode == mode, "Prepared ACP mode is stale");
+        Ok(())
+    }
+
+    pub(super) async fn cli_runtime_session_turn_mutex(
         &self,
         key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
     ) -> Arc<tokio::sync::Mutex<()>> {
@@ -11192,6 +11501,7 @@ impl MessageProcessor {
             // its provider frame. Re-capturing here could revive an older revision
             // or a different checkpoint between admission and publication.
             let transport = match runtime_kind {
+                CLIAgentRuntimeKind::Acp => pioneer_compaction::Transport::Acp,
                 CLIAgentRuntimeKind::Codex => pioneer_compaction::Transport::Codex,
                 CLIAgentRuntimeKind::Claude => pioneer_compaction::Transport::Claude,
                 CLIAgentRuntimeKind::OpenCode => pioneer_compaction::Transport::OpenCode,
@@ -11212,21 +11522,25 @@ impl MessageProcessor {
                 .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))?
                 .get(workspace_id)
                 .and_then(|workspace| workspace.cli_overrides.get(runtime_id).cloned());
-            let (catalog_provider, catalog_model) = match runtime_kind {
-                CLIAgentRuntimeKind::Codex => ("openai-codex", model),
-                CLIAgentRuntimeKind::Claude => ("anthropic", model),
-                CLIAgentRuntimeKind::OpenCode => model.split_once('/').unwrap_or(("opencode", model)),
-            };
-            let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog_provider, catalog_model);
             let fraction = 2_u64.saturating_pow(attempt.saturating_add(1));
-            let desired = limits
-                .context_window
+            let context_window = if runtime_kind == CLIAgentRuntimeKind::Acp {
+                (crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES / 8) as u64
+            } else {
+                let (provider, catalog_model) = match runtime_kind {
+                    CLIAgentRuntimeKind::Codex => ("openai-codex", model),
+                    CLIAgentRuntimeKind::Claude => ("anthropic", model),
+                    CLIAgentRuntimeKind::OpenCode => model.split_once('/').unwrap_or(("opencode", model)),
+                    CLIAgentRuntimeKind::Acp => unreachable!("ACP uses the local input bound"),
+                };
+                pioneer_provider::catalog::model_catalog()?.limits(provider, catalog_model).context_window
+            };
+            let desired = context_window
                 .checked_div(fraction)
                 .unwrap_or(0)
                 .min(max_input_tokens.unwrap_or(u64::MAX))
                 .min((crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES / 8) as u64)
                 .max(1);
-            let fixed_input_tokens = limits.context_window.saturating_sub(desired);
+            let fixed_input_tokens = context_window.saturating_sub(desired);
             let codex_history_budget = codex_history_budget
                 .map(|budget| budget.with_token_target(desired, fraction));
             let transfer_store = ordinary_history_store(self.crud_store.as_ref());
@@ -13812,8 +14126,10 @@ pub(super) fn cli_runtime_provider_key(runtime_id: &str) -> String {
 }
 
 fn canonicalize_cli_runtime_model_provider(params: &mut TurnStartParams) {
-    if let Some(AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. }) =
-        params.execution_backend.as_ref()
+    if let Some(
+        AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. }
+        | AgentExecutionBackend::ACPAgentRuntime { runtime_id },
+    ) = params.execution_backend.as_ref()
     {
         params.model_provider = Some(cli_runtime_provider_key(runtime_id));
     }
@@ -13823,6 +14139,7 @@ fn cli_mcp_client_target(
     runtime_kind: CLIAgentRuntimeKind,
 ) -> crate::cli_mcp_client_validation::CliMcpClientTarget {
     match runtime_kind {
+        CLIAgentRuntimeKind::Acp => crate::cli_mcp_client_validation::CliMcpClientTarget::Acp,
         CLIAgentRuntimeKind::Codex => crate::cli_mcp_client_validation::CliMcpClientTarget::Codex,
         CLIAgentRuntimeKind::Claude => crate::cli_mcp_client_validation::CliMcpClientTarget::Claude,
         CLIAgentRuntimeKind::OpenCode => {
@@ -13868,6 +14185,9 @@ fn cli_runtime_kind_matches_config(
             CLIAgentRuntimeKind::Claude,
             pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude
         ) | (
+            CLIAgentRuntimeKind::Acp,
+            pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp
+        ) | (
             CLIAgentRuntimeKind::OpenCode,
             pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode
         )
@@ -13878,6 +14198,7 @@ fn cli_runtime_protocol_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
+        pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
         CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }
@@ -13886,6 +14207,7 @@ fn cli_runtime_context_label(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "Codex CLI",
         CLIAgentRuntimeKind::Claude => "Claude CLI",
+        CLIAgentRuntimeKind::Acp => "ACP agent",
         CLIAgentRuntimeKind::OpenCode => "OpenCode CLI",
     }
 }
@@ -13894,6 +14216,7 @@ fn cli_runtime_supports_durable_thread_resume(kind: CLIAgentRuntimeKind) -> bool
     match kind {
         CLIAgentRuntimeKind::Codex => true,
         CLIAgentRuntimeKind::Claude => false,
+        CLIAgentRuntimeKind::Acp => true,
         CLIAgentRuntimeKind::OpenCode => true,
     }
 }
@@ -13904,6 +14227,7 @@ fn cli_runtime_config_kind_label(
     match kind {
         pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => "codex",
         pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => "claude",
+        pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp => "acp",
         pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => "opencode",
     }
 }

@@ -191,3 +191,19 @@ pub(crate) async fn principal<C: ConnectionTrait>(
         .await?
         .map(|r| r.principal_id))
 }
+
+pub(crate) async fn accepted_for_turn<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    task_id: &str,
+    run_id: &str,
+    turn_id: &str,
+) -> Result<bool> {
+    Ok(actor::Entity::find_by_id(run_id)
+        .filter(actor::Column::TaskId.eq(task_id))
+        .filter(actor::Column::WorkspaceId.eq(workspace))
+        .filter(actor::Column::OriginTurnId.eq(turn_id))
+        .one(db)
+        .await?
+        .is_some())
+}

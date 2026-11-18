@@ -20,7 +20,7 @@ pub use mcp::{
     McpToolExecutor, materialize_mcp_runtime_tools,
 };
 pub use request_tools::{RequestToolsDomainDiagnostic, RequestToolsHandler, RequestToolsResult};
-pub use shell::UnifiedExecHandler;
+pub use shell::{ProcessTerminal, ProcessTerminalExit, ProcessTerminalOutput, UnifiedExecHandler};
 pub use skill::{
     ExcludedSkillRuntimeTool, SkillDynamicToolDescriptor, SkillDynamicToolKind,
     SkillReadToolConfig, SkillReadToolEntry, SkillRuntimeToolMaterialization,

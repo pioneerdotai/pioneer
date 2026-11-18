@@ -461,10 +461,7 @@ pub(crate) async fn previous_delivered_parent_turn(
             || !store
                 .get_turn_execution(&execution_turn)
                 .await?
-                .is_some_and(|e| {
-                    e.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
-                        && !e.status.is_active()
-                })
+                .is_some_and(|e| e.executor_kind.is_cli_runtime() && !e.status.is_active())
             || store
                 .get_cli_runtime_turn_binding_control(&execution_turn)
                 .await?
@@ -534,7 +531,9 @@ async fn message_delivery_evidence(
         .get_turn_execution(&source.turn_id)
         .await?
         .is_some_and(|execution| {
-            execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+            execution
+                .executor_kind
+                .matches_cli_runtime_kind(&source.runtime_kind)
                 && execution.status == pioneer_crud::TurnExecutionStatus::Completed
         })
         || !store
@@ -832,7 +831,9 @@ pub(crate) async fn failed_context_basis_from_binding(
         .get_turn_execution(&source.turn_id)
         .await?
         .is_some_and(|execution| {
-            execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+            execution
+                .executor_kind
+                .matches_cli_runtime_kind(&source.runtime_kind)
                 && !execution.status.is_active()
         })
     {

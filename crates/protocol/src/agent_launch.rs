@@ -519,6 +519,9 @@ pub fn validate_selected_agent_launch_profile(
             AgentIdentitySourceKind::CliRuntimeInstance | AgentIdentitySourceKind::Ephemeral,
             AgentExecutionProfileBackend::CliRuntime {
                 runtime_instance_id,
+            }
+            | AgentExecutionProfileBackend::AcpAgentRuntime {
+                runtime_id: runtime_instance_id,
             },
         ) => {
             !runtime_instance_id.trim().is_empty()
@@ -1438,6 +1441,62 @@ mod tests {
             tampered.validate(),
             Err(ChildAgentLaunchGrantSetError::FingerprintMismatch)
         );
+    }
+
+    #[test]
+    fn acp_and_native_cli_profiles_require_exact_provider_and_source_identity() {
+        let identity = AgentIdentityProjection::new(
+            identity_id("A00000000000000000001"),
+            crate::AgentIdentitySourceKind::CliRuntimeInstance,
+            "Runtime",
+            "runtime",
+            None,
+            None,
+            1,
+            "runtime-source",
+        )
+        .unwrap();
+        let grant = ChildAgentLaunchGrantSet::new(vec![identity.clone()]).unwrap();
+        for backend in [
+            AgentExecutionProfileBackend::CliRuntime {
+                runtime_instance_id: "runtime".into(),
+            },
+            AgentExecutionProfileBackend::AcpAgentRuntime {
+                runtime_id: "runtime".into(),
+            },
+        ] {
+            let profile = AgentExecutionProfileProjection {
+                id: profile_id("P00000000000000000001"),
+                compatible_agent_identity_ids: vec![identity.id.clone()],
+                backend,
+                provider_id: "cli_runtime:runtime".into(),
+                model_id: "selected-model".into(),
+                provider_display_name: "Runtime".into(),
+                model_display_name: "Selected model".into(),
+                allowed_reasoning: vec![],
+                allowed_permission_profiles: vec![TurnPermissionMode::Supervised],
+                catalog_generation: 1,
+                policy_generation: 1,
+                fingerprint: "selected-profile".into(),
+            };
+            grant
+                .validate_selected_profile(&identity, &profile)
+                .unwrap();
+            let mut wrong_provider = profile.clone();
+            wrong_provider.provider_id = "cli_runtime:other".into();
+            assert!(
+                grant
+                    .validate_selected_profile(&identity, &wrong_provider)
+                    .is_err()
+            );
+            let native = AgentIdentityProjection::pioneer(identity.id.clone(), 1, "native-source");
+            let native_grant = ChildAgentLaunchGrantSet::new(vec![native.clone()]).unwrap();
+            assert!(
+                native_grant
+                    .validate_selected_profile(&native, &profile)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

@@ -113,7 +113,7 @@ impl MessageProcessor {
         .await;
     }
 
-    async fn send_cli_runtime_notification_to_reauthorized_connections<T: Serialize>(
+    pub(super) async fn send_cli_runtime_notification_to_reauthorized_connections<T: Serialize>(
         &self,
         workspace_id: &str,
         runtime_id: &str,
@@ -2312,7 +2312,7 @@ impl MessageProcessor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CliRuntimeNotificationDisclosure {
+pub(super) enum CliRuntimeNotificationDisclosure {
     Full,
     Collaborator,
 }
