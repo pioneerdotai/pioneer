@@ -1,40 +1,18 @@
-# Running Migrator CLI
+# Pioneer 1.0 database migrations
 
-- Set `DATABASE_URL` via environment or `.env` file before running migrations.
-- You can also pass `-u/--database-url` explicitly.
-- Generate a new migration file
-    ```sh
-    cargo run -p pioneer-migration -- generate MIGRATION_NAME
-    ```
-- Apply all pending migrations
-    ```sh
-    cargo run -p pioneer-migration -- up
-    ```
-- Apply first 10 pending migrations
-    ```sh
-    cargo run -p pioneer-migration -- up -n 10
-    ```
-- Rollback last applied migrations
-    ```sh
-    cargo run -p pioneer-migration -- down
-    ```
-- Rollback last 10 applied migrations
-    ```sh
-    cargo run -p pioneer-migration -- down -n 10
-    ```
-- Drop all tables from the database, then reapply all migrations
-    ```sh
-    cargo run -p pioneer-migration -- fresh
-    ```
-- Rollback all applied migrations, then reapply all migrations
-    ```sh
-    cargo run -p pioneer-migration -- refresh
-    ```
-- Rollback all applied migrations
-    ```sh
-    cargo run -p pioneer-migration -- reset
-    ```
-- Check the status of all migrations
-    ```sh
-    cargo run -p pioneer-migration -- status
-    ```
+The Migrator installs a fresh schema on PostgreSQL. Use PostgreSQL 16 or later
+with pgvector available to the server. The migration role must be able to create
+objects in the target schema and install `vector`, or the extension must already
+be visible in the target search path. The default schema is `public`.
+
+Pass the target database URL explicitly.
+
+```sh
+cargo run --locked -p pioneer-migration -- --database-url "$PIONEER_POSTGRES_URL" up
+cargo run --locked -p pioneer-migration -- --database-url "$PIONEER_POSTGRES_URL" status
+```
+
+SeaORM applies PostgreSQL migrations and their ledger entries in the same
+transaction. On a disposable database, `down -n 1` rolls back the last migration
+and `reset` rolls back the whole chain. The shared `vector` extension survives
+rollback. Use the 0.x release history to inspect the SQLite migration chain.

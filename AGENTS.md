@@ -197,6 +197,12 @@ Database changes require focused regression coverage for:
 - concurrent interactive and maintenance work;
 - retry/restart idempotency and poison-row progress for background jobs.
 
+For PostgreSQL tests and schema checks, reuse the installed local PostgreSQL
+service with pgvector. Use `PIONEER_TEST_POSTGRES_ADMIN_URL` (an explicit role
+and the maintenance database) to create and drop uniquely named test databases.
+Run migrations, codegen and tests only in those databases. Local Cargo config or
+the CI job supplies the URL.
+
 Use `cargo-nextest` for Rust unit and integration tests:
 
 - Workspace: `cargo nextest run --locked --workspace --test-threads 2 --no-fail-fast --retries 0`.

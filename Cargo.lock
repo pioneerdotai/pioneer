@@ -11897,14 +11897,8 @@ dependencies = [
 name = "pioneer-migration"
 version = "0.73.0"
 dependencies = [
- "anyhow",
- "hex",
- "pioneer-sqlite",
  "sea-orm-migration",
- "serde_json",
- "sha2 0.11.1",
  "tokio",
- "tracing",
 ]
 
 [[package]]
