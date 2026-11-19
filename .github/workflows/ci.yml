@@ -127,12 +127,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Keep the runner's official Ubuntu fallbacks; its Azure mirror stalled CI.
-          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
-          # Prefer the official archive: the kernel mirror stalled index downloads.
-          # Keep an independent DNS fallback and the runner's remaining signed mirrors.
+          # Replace the runner's regional mirrors: both Azure and EC2 have
+          # stalled dependency downloads. Appending preferred entries still lets
+          # APT fall back to those slow mirrors for individual package requests.
+          # Keep the official archive first and an independent DNS fallback.
           printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://mirrors.edge.kernel.org/ubuntu/\tpriority:2\n' | \
-            sudo tee -a /etc/apt/apt-mirrors.txt > /dev/null
+            sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           apt_options=(
             -o Acquire::Retries=3
             -o Acquire::http::Timeout=30
