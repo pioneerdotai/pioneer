@@ -23,8 +23,6 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
@@ -72,6 +70,15 @@ jobs:
     env: &linux-env
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       CARGO_BUILD_JOBS: 2
+      # whisper.cpp defaults to -march=native, but archived tests run on other CPUs.
+      # Use the x86_64 baseline rather than inheriting the build runner's ISA.
+      GGML_NATIVE: "OFF"
+      GGML_SSE42: "OFF"
+      GGML_AVX: "OFF"
+      GGML_AVX2: "OFF"
+      GGML_BMI2: "OFF"
+      GGML_F16C: "OFF"
+      GGML_FMA: "OFF"
 
     steps:
       - uses: actions/checkout@v5
@@ -110,7 +117,9 @@ jobs:
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-v1
+          # whisper-rs-sys does not track arbitrary GGML_* environment changes.
+          # Exclude cached native objects compiled for a previous runner CPU.
+          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-portable-ggml-v2
 
       - name: rustfmt-check
         shell: bash
@@ -186,6 +195,9 @@ jobs:
 
       - name: archive-workspace-tests
         id: archive
+        env:
+          # Concurrent workspace test compilations nearly exhaust RAM and swap.
+          CARGO_BUILD_JOBS: 1
         shell: bash
         run: |
           set -euo pipefail
@@ -207,6 +219,8 @@ jobs:
             exit "$archive_status"
           }
           trap archive_exit EXIT
+          # Bash otherwise runs EXIT with status 0 when the runner sends TERM.
+          trap 'exit 143' TERM
           archive_resources
           /usr/bin/time -v cargo nextest archive --locked --workspace --features pioneer-cli/computer-use \
             --archive-file "$RUNNER_TEMP/nextest-tests.tar.zst"
