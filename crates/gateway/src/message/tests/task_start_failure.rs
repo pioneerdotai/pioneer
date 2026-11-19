@@ -2824,6 +2824,197 @@ fn blocked_attached_child_keeps_capsule_for_explicit_resume() {
     });
 }
 
+async fn expire_revision_admission_claim(store: &CrudStore, run_id: &str) {
+    let execution = store.load_execution_for_run(run_id).await.unwrap().unwrap();
+    let stale = now_timestamp_secs() - 1;
+    // The faulting call has ended. Model its abandoned lease expiring without
+    // waiting five minutes or bypassing the durable claim on redispatch.
+    store
+        .heartbeat_execution(&execution.id, stale, Some(stale))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn revision_admission_and_recovery_share_one_execution_claim() {
+    for case in ["request_first", "recovery_first", "abandoned_claim"] {
+        capture_task_start(async move {
+            let (harness, processor) = review_cli_fixture().await;
+            let (task, child) =
+                create_review_cli_child(&harness, &processor, "revision-race", true, false).await;
+            assert!(
+                processor
+                    .complete_turn(child.child_thread_id, child.child_turn_id, None)
+                    .await
+            );
+            let run = task.run.unwrap();
+            let candidate = harness
+                .crud_store
+                .list_task_result_candidates(&run.id)
+                .await
+                .unwrap()
+                .remove(0);
+            let revised = processor
+                .task_runtime
+                .service()
+                .revise_task_result_candidate(
+                    pioneer_tasks::TaskMutationContext::user(
+                        authenticated_test_superuser().principal_id.to_string(),
+                    ),
+                    pioneer_protocol::TaskReviseParams {
+                        task_id: task.task.id.clone(),
+                        run_id: run.id.clone(),
+                        candidate_id: candidate.id,
+                        feedback: "Return the corrected result in this worker.".to_owned(),
+                        additional_instructions: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            let store = &harness.crud_store;
+            // Stop at the durable request/Turn materialization boundary. No
+            // scheduler loop or sleeps choose which contender reaches it first.
+            assert!(
+                store
+                    .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let activations = harness.cli_session.turn_starts.lock().await.len();
+            harness
+                .cli_session
+                .set_next_native_turn_id("native-revision-race")
+                .await;
+            let now = now_timestamp_secs();
+            if case == "request_first" {
+                dispatch_revision_turn_for_test(&processor, revised.clone())
+                    .await
+                    .unwrap();
+                assert!(
+                    store
+                        .claim_task_run_execution_for_recovery(
+                            &run.id,
+                            TaskExecutorKind::Agent,
+                            "competing-recovery",
+                            now,
+                            now + pioneer_tasks::TASK_EXECUTION_LEASE_SECONDS,
+                        )
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "recovery must not steal a live revision admission"
+                );
+            } else {
+                if case == "abandoned_claim" {
+                    // A process can stop after acquiring admission, before it
+                    // creates a Turn. An expired real claim must be recoverable.
+                    let stale = now - pioneer_tasks::TASK_EXECUTION_LEASE_SECONDS - 1;
+                    assert!(
+                        store
+                            .claim_task_run_execution_for_recovery(
+                                &run.id,
+                                TaskExecutorKind::Agent,
+                                "abandoned-admission",
+                                stale,
+                                now - 1,
+                            )
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                let execution = store
+                    .claim_task_run_execution_for_recovery(
+                        &run.id,
+                        TaskExecutorKind::Agent,
+                        "winning-recovery",
+                        now,
+                        now + pioneer_tasks::TASK_EXECUTION_LEASE_SECONDS,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                dispatch_revision_turn_for_test(&processor, revised.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    harness.cli_session.turn_starts.lock().await.len(),
+                    activations,
+                    "the losing request must leave dispatch to the lease owner"
+                );
+                let outcome = pioneer_tasks::TaskExecutor::recover_run(
+                    processor.task_agent_executor.as_ref(),
+                    pioneer_tasks::TaskExecutionContext {
+                        workspace_id: harness.workspace_id.clone(),
+                        task_id: task.task.id.clone(),
+                        execution_id: Some(execution.id),
+                        worker_id: "winning-recovery".to_owned(),
+                    },
+                    revised.run.clone(),
+                    pioneer_tasks::TaskExecutionHandle::new(
+                        store.clone(),
+                        processor.task_runtime.event_bus(),
+                        task.task.id.clone(),
+                        run.id.clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    outcome,
+                    pioneer_tasks::TaskExecutorRecoveryOutcome::Recovered
+                );
+            }
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                activations + 1
+            );
+            assert_eq!(
+                store
+                    .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::InProgress
+            );
+            dispatch_revision_turn_for_test(&processor, revised.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                activations + 1,
+                "repeated dispatch must not start another native Turn"
+            );
+            assert!(
+                processor
+                    .complete_turn(
+                        revised.child_thread_id.clone(),
+                        revised.child_turn_id.clone(),
+                        None
+                    )
+                    .await
+            );
+            let replacement = store
+                .list_task_result_candidates(&run.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.round == 1)
+                .expect("the recovered revision must return a new review candidate");
+            assert_eq!(replacement.thread_id, revised.child_thread_id);
+            assert_eq!(replacement.turn_id, revised.child_turn_id);
+            assert_eq!(replacement.status, TaskResultCandidateStatus::PendingReview);
+            assert_eq!(
+                store.get_task_run(&run.id).await.unwrap().unwrap().status,
+                TaskRunStatus::WaitingReview
+            );
+        });
+    }
+}
+
 #[test]
 fn revision_early_authority_and_lock_admission_complete_the_reserved_revision() {
     for case in ["lock_reject", "authority_missing", "authority_persistence"] {
@@ -3000,6 +3191,7 @@ fn revision_early_authority_and_lock_admission_complete_the_reserved_revision() 
                     assert!(format!("{error:#}").contains("independent persistence failure"));
                     return;
                 }
+                expire_revision_admission_claim(&harness.crud_store, &run.id).await;
                 dispatch_revision_turn_for_test(&processor, revised.clone())
                     .await
                     .unwrap();
@@ -3337,6 +3529,7 @@ fn revision_internal_completion_failure_is_not_reclassified_or_completed_twice()
                     .await
                     .unwrap();
             }
+            expire_revision_admission_claim(&harness.crud_store, &run.id).await;
             dispatch_revision_turn_for_test(&processor, revised.clone())
                 .await
                 .unwrap();
