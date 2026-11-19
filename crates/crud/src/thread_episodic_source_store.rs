@@ -6,7 +6,7 @@ use sea_orm::{DatabaseTransaction, TransactionTrait};
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSourceSave {
-    source_payload: String,
+    source_payload: crate::repositories::turn_payload::PreparedItemPayload,
     workspace_id: String,
     thread_id: String,
     turn_id: String,
@@ -193,7 +193,9 @@ impl CrudStore {
             ThreadEpisodicSourceSelection::Rejected { .. } => (None, None),
         };
         Ok(PreparedSourceSave {
-            source_payload: serde_json::to_string(item)?,
+            source_payload: crate::repositories::turn_payload::PreparedItemPayload::new(
+                serde_json::to_string(item)?,
+            ),
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -222,11 +224,11 @@ impl CrudStore {
                 .is_some(),
             "episodic source turn ownership changed"
         );
-        let source = turn::find_turn_item(db, &prepared.turn_id, &prepared.item_id)
+        let source = turn::find_turn_item_metadata(db, &prepared.turn_id, &prepared.item_id)
             .await?
             .context("episodic canonical source missing")?;
         ensure!(
-            source.payload == prepared.source_payload,
+            prepared.source_payload.matches(db, &source).await?,
             "episodic source payload changed before commit"
         );
         // Started items remain drafts even when their payload contains final-answer text.

@@ -6,6 +6,20 @@ use sea_orm::{
 };
 
 const MIGRATION: &str = "m20261106_000001_agent_ledger_deadline_index";
+
+// Exercise this schema owner's down/up without traversing later irreversible storage.
+struct LedgerSchemaMigrator;
+impl MigratorTrait for LedgerSchemaMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        let migrations = Migrator::migrations();
+        let end = migrations
+            .iter()
+            .position(|m| m.name() == MIGRATION)
+            .unwrap()
+            + 1;
+        migrations.into_iter().take(end).collect()
+    }
+}
 const INDEX: &str = "idx_agent_action_outbox_status_created_id";
 
 #[tokio::test]
@@ -15,15 +29,17 @@ async fn ledger_deadline_index_fresh_upgrade_down_reapply_preserves_rows() {
         db.execute_unprepared("PRAGMA foreign_keys=OFF")
             .await
             .unwrap();
-        let migrations = Migrator::migrations();
+        let migrations = LedgerSchemaMigrator::migrations();
         let position = migrations
             .iter()
             .position(|m| m.name() == MIGRATION)
             .unwrap();
         if fresh {
-            Migrator::up(&db, None).await.unwrap();
+            LedgerSchemaMigrator::up(&db, None).await.unwrap();
         } else {
-            Migrator::up(&db, Some(position as u32)).await.unwrap();
+            LedgerSchemaMigrator::up(&db, Some(position as u32))
+                .await
+                .unwrap();
         }
         let created = chrono::DateTime::from_timestamp(1_700_000_000, 123_000_000)
             .unwrap()
@@ -44,17 +60,17 @@ async fn ledger_deadline_index_fresh_upgrade_down_reapply_preserves_rows() {
         .await
         .unwrap();
         if !fresh {
-            Migrator::up(&db, Some(1)).await.unwrap();
+            LedgerSchemaMigrator::up(&db, Some(1)).await.unwrap();
         }
         for installed in [true, false, true] {
             if !installed {
                 // Later migrations must be rolled back before the index owner.
-                Migrator::down(&db, Some((migrations.len() - position) as u32))
+                LedgerSchemaMigrator::down(&db, Some((migrations.len() - position) as u32))
                     .await
                     .unwrap();
             } else {
                 // Idempotent on fresh/upgrade; reinstalls the index and later schema.
-                Migrator::up(&db, None).await.unwrap();
+                LedgerSchemaMigrator::up(&db, None).await.unwrap();
             }
             let columns = db
                 .query_all_raw(Statement::from_string(

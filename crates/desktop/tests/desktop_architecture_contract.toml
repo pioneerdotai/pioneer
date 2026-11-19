@@ -93,7 +93,7 @@ path = "desktop-packages"
 root = "PackageCatalogView"
 constructor = "PackageCatalogView::new"
 public_modules = []
-edges = ["pioneer-client", "pioneer-desktop-foundation"]
+edges = ["pioneer-client", "pioneer-desktop-foundation", "pioneer-protocol"]
 [[features]]
 package = "pioneer-desktop-apps"
 path = "desktop-apps"

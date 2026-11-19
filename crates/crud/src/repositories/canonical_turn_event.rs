@@ -9,7 +9,7 @@ use pioneer_protocol::{
     TurnOrigin, TurnStatus, UserInput, task_delivery_id_from_result_item_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
 use super::identity::actor_ref_from_db;
 use super::self_improvement_source_turn::{
@@ -25,8 +25,8 @@ use crate::{
     SelfImprovementSourceTurnRecord, SelfImprovementThreadTerminalBoundary,
 };
 
-pub async fn list_for_frozen_range<C: ConnectionTrait>(
-    db: &C,
+pub async fn list_for_frozen_range(
+    db: &pioneer_sqlite::SqliteDatabase,
     frozen_range: &SelfImprovementFrozenSourceRange,
 ) -> Result<Vec<CanonicalTurnEventRecord>> {
     frozen_range.validate()?;
@@ -178,8 +178,8 @@ pub async fn list_for_frozen_range<C: ConnectionTrait>(
     Ok(result)
 }
 
-async fn foreground_exchange_bundle<C: ConnectionTrait>(
-    db: &C,
+async fn foreground_exchange_bundle(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace_id: &str,
     parent_turn: &turn::Model,
     source: Option<&self_improvement_source_turn::Model>,
@@ -251,8 +251,8 @@ async fn foreground_exchange_bundle<C: ConnectionTrait>(
     ))
 }
 
-async fn collaborative_exchange_bundle<C: ConnectionTrait>(
-    db: &C,
+async fn collaborative_exchange_bundle(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace_id: &str,
     parent_thread_id: &str,
     parent_turn: &turn::Model,
@@ -434,8 +434,8 @@ async fn collaborative_exchange_bundle<C: ConnectionTrait>(
     Ok(Some(bundle))
 }
 
-async fn load_collaborative_delivery_terminals<C: ConnectionTrait>(
-    db: &C,
+async fn load_collaborative_delivery_terminals(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace_id: &str,
     parent_thread_id: &str,
     parent_turn_id: &str,
@@ -483,8 +483,8 @@ async fn load_collaborative_delivery_terminals<C: ConnectionTrait>(
     Ok(terminals)
 }
 
-async fn load_collaborative_child_events<C: ConnectionTrait>(
-    db: &C,
+async fn load_collaborative_child_events(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace_id: &str,
     parent_thread_id: &str,
     parent_turn_id: &str,
@@ -670,8 +670,8 @@ async fn load_collaborative_child_events<C: ConnectionTrait>(
     Ok(result)
 }
 
-async fn verify_selected_source<C: ConnectionTrait>(
-    db: &C,
+async fn verify_selected_source(
+    db: &pioneer_sqlite::SqliteDatabase,
     selected: &SelfImprovementSourceTurnRecord,
 ) -> Result<()> {
     let persisted = self_improvement_source_turn::Entity::find_by_id(selected.id)
@@ -727,8 +727,8 @@ async fn verify_selected_source<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn verify_thread_boundary<C: ConnectionTrait>(
-    db: &C,
+async fn verify_thread_boundary(
+    db: &pioneer_sqlite::SqliteDatabase,
     boundary: &SelfImprovementThreadTerminalBoundary,
     selected_sources: &[SelfImprovementSourceTurnRecord],
 ) -> Result<CanonicalTurnEventRecord> {
@@ -761,6 +761,10 @@ async fn verify_thread_boundary<C: ConnectionTrait>(
                 boundary.terminal_event_id
             )
         })?;
+    let event = super::turn_payload::hydrate_events(db, vec![event])
+        .await?
+        .pop()
+        .unwrap();
     let event = decode_event(event, source.workspace_id.as_str())?;
     let terminal_matches = match boundary.task_delivery_id.as_deref() {
         None => {
@@ -795,8 +799,8 @@ async fn verify_thread_boundary<C: ConnectionTrait>(
     Ok(event)
 }
 
-async fn load_decoded_event<C: ConnectionTrait>(
-    db: &C,
+async fn load_decoded_event(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace_id: &str,
     event_id: &str,
 ) -> Result<CanonicalTurnEventRecord> {
@@ -805,6 +809,10 @@ async fn load_decoded_event<C: ConnectionTrait>(
         .await
         .with_context(|| format!("failed to load canonical event `{event_id}`"))?
         .with_context(|| format!("canonical event `{event_id}` is missing"))?;
+    let row = super::turn_payload::hydrate_events(db, vec![row])
+        .await?
+        .pop()
+        .unwrap();
     decode_event(row, workspace_id)
 }
 
@@ -826,8 +834,8 @@ fn parent_turn_at_or_before_boundary(
     parent_turn.id == boundary.turn_id || parent_turn_precedes_boundary(parent_turn, boundary)
 }
 
-async fn load_decoded_turn_events<C: ConnectionTrait>(
-    db: &C,
+async fn load_decoded_turn_events(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -872,7 +880,7 @@ async fn load_decoded_turn_events<C: ConnectionTrait>(
         None
     };
 
-    let mut rows = turn_event::Entity::find()
+    let rows = turn_event::Entity::find()
         .filter(turn_event::Column::ThreadId.eq(thread_id.to_owned()))
         .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
         .all(db)
@@ -880,6 +888,7 @@ async fn load_decoded_turn_events<C: ConnectionTrait>(
         .with_context(|| {
             format!("failed to load canonical events for turn `{turn_id}` in `{thread_id}`")
         })?;
+    let mut rows = super::turn_payload::hydrate_events(db, rows).await?;
     rows.sort_by(|left, right| {
         (left.sequence, left.id.as_str()).cmp(&(right.sequence, right.id.as_str()))
     });

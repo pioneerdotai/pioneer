@@ -45,7 +45,7 @@ macro_rules! labels {
 labels!(Family {
     ToolText => "tool.text", ToolMetadata => "tool.metadata",
     CliMapping => "cli.mapping", TaskHistory => "task.history",
-    TaskEvent => "task.event", Mixed => "mixed",
+    TaskEvent => "task.event", TurnEvent => "turn.event", TurnItem => "turn.item", Mixed => "mixed",
 });
 labels!(Mode { Full => "full", Range => "range", Background => "background" });
 labels!(Stage {

@@ -83,6 +83,7 @@ impl Change {
                 "maintenance.native",
                 "maintenance.receipts",
                 "maintenance.zstd",
+                "maintenance.portable",
             ]
             .map(|domain| db.work_signal(domain).changing())
             .into(),
@@ -94,7 +95,11 @@ impl Change {
     }
 
     pub(crate) fn payload(db: &SqliteDatabase) -> Self {
-        Self(vec![db.work_signal("maintenance.zstd").changing()])
+        Self(
+            ["maintenance.zstd", "maintenance.portable"]
+                .map(|domain| db.work_signal(domain).changing())
+                .into(),
+        )
     }
 
     /// The caller's atomic write already proves a committed completed/failed/
@@ -116,7 +121,12 @@ impl Change {
                 .select_only()
                 .column(turn::Column::Id)
                 .filter(turn::Column::Id.is_in(turns.iter().cloned()))
-                .filter(turn::Column::Status.is_in(["completed", "failed", "interrupted"]))
+                .filter(turn::Column::Status.is_in([
+                    "completed",
+                    "failed",
+                    "interrupted",
+                    "blocked",
+                ]))
                 .into_tuple::<String>()
                 .all(db)
                 .await

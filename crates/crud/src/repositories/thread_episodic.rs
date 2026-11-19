@@ -1329,8 +1329,8 @@ pub async fn count_canceled_index_jobs_for_workspace<C: ConnectionTrait>(
         })
 }
 
-pub async fn search_source_batch<C: ConnectionTrait>(
-    db: &C,
+pub async fn search_source_batch(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace_id: &str,
     ids: &[String],
 ) -> Result<
@@ -1397,9 +1397,7 @@ pub async fn search_source_batch<C: ConnectionTrait>(
                 .add(turn_item::Column::ItemId.eq(item.item_id.clone())),
         );
     }
-    let canonical = turn_item::Entity::find()
-        .filter(sources)
-        .all(db)
+    let canonical = super::turn_payload::items(db, turn_item::Entity::find().filter(sources))
         .await?
         .into_iter()
         .map(|row| ((row.turn_id.clone(), row.item_id.clone()), row))
@@ -2317,7 +2315,7 @@ pub async fn complete_index_attempt<C: ConnectionTrait>(
     db: &C,
     job_id: &str,
     expected_attempt_count: i64,
-    expected_source_payload: &str,
+    expected_source_payload: &super::turn_payload::PreparedItemPayload,
     item_update: ThreadEpisodicItemIndexedUpdate,
     job_update: ThreadEpisodicIndexJobCompletionUpdate,
     now: DateTimeWithTimeZone,
@@ -2502,7 +2500,7 @@ pub async fn fail_index_attempt<C: ConnectionTrait>(
     db: &C,
     job_id: &str,
     expected_attempt_count: i64,
-    expected_source_payload: &str,
+    expected_source_payload: &super::turn_payload::PreparedItemPayload,
     update: ThreadEpisodicIndexJobFailureUpdate,
     now: DateTimeWithTimeZone,
 ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
@@ -2601,7 +2599,7 @@ pub async fn recover_index_attempt_after_persistence_error<C: ConnectionTrait>(
 async fn index_attempt_source_matches<C: ConnectionTrait>(
     db: &C,
     item: &thread_episodic_items::Model,
-    expected_source_payload: &str,
+    expected_source_payload: &super::turn_payload::PreparedItemPayload,
 ) -> Result<bool> {
     let Some(source_thread) = thread::Entity::find_by_id(item.thread_id.clone())
         .one(db)
@@ -2630,7 +2628,7 @@ async fn index_attempt_source_matches<C: ConnectionTrait>(
     else {
         return Ok(false);
     };
-    Ok(source.payload == expected_source_payload
+    Ok(expected_source_payload.matches(db, &source).await?
         && crate::thread_episodic_source::source_status_is_committed(source.status.as_deref()))
 }
 

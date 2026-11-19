@@ -8,6 +8,20 @@ use sea_orm::{
 
 const MIGRATION: &str = "m20261112_000001_package_installations";
 
+// Exercise this schema owner's down/up without traversing later irreversible storage.
+struct AppSchemaMigrator;
+impl MigratorTrait for AppSchemaMigrator {
+    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+        let migrations = Migrator::migrations();
+        let end = migrations
+            .iter()
+            .position(|m| m.name() == MIGRATION)
+            .unwrap()
+            + 1;
+        migrations.into_iter().take(end).collect()
+    }
+}
+
 async fn install(
     db: &DatabaseConnection,
     id: &str,
@@ -72,8 +86,8 @@ async fn app_workspace_slug_fresh_down_reapply_enforces_scope_and_preserves_guar
     db.execute_unprepared("PRAGMA foreign_keys=OFF")
         .await
         .unwrap();
-    Migrator::up(&db, None).await.unwrap();
-    let migrations = Migrator::migrations();
+    AppSchemaMigrator::up(&db, None).await.unwrap();
+    let migrations = AppSchemaMigrator::migrations();
     let position = migrations
         .iter()
         .position(|m| m.name() == MIGRATION)
@@ -111,7 +125,9 @@ async fn app_workspace_slug_fresh_down_reapply_enforces_scope_and_preserves_guar
     renamed.manifest_json = Set(r#"{"slug":"renamed"}"#.into());
     assert!(renamed.update(&db).await.is_err());
     assert!(
-        Migrator::down(&db, Some(rollback_steps)).await.is_err(),
+        AppSchemaMigrator::down(&db, Some(rollback_steps))
+            .await
+            .is_err(),
         "removing the Apps schema must refuse live installations"
     );
     for (id, expected) in [("app-one", original), ("app-two", second)] {
@@ -136,14 +152,16 @@ async fn app_workspace_slug_fresh_down_reapply_enforces_scope_and_preserves_guar
             "package cleanup must remove only the owned App metadata"
         );
     }
-    Migrator::down(&db, Some(rollback_steps)).await.unwrap();
+    AppSchemaMigrator::down(&db, Some(rollback_steps))
+        .await
+        .unwrap();
     assert!(
         !SchemaManager::new(&db)
             .has_table("app_installation")
             .await
             .unwrap()
     );
-    Migrator::up(&db, None).await.unwrap();
+    AppSchemaMigrator::up(&db, None).await.unwrap();
     install(&db, "reapplied-one", "ws-one").await.unwrap();
     install(&db, "reapplied-two", "ws-two").await.unwrap();
     assert!(

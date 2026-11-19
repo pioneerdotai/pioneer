@@ -268,7 +268,17 @@ async fn action_outbox_plans_exclude_closed_refusals_from_small_and_empty_backlo
 
 #[tokio::test]
 async fn exhausted_discovery_uses_indexed_null_and_timed_ranges_with_a_large_closed_ledger() {
-    let db = database().await;
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let end = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == "m20261026_000001_agent_start_reconciliation_index")
+        .unwrap()
+        + 1;
+    // Start at the index owner's released schema; later portable storage cannot be downgraded.
+    Migrator::up(&db, Some(end as u32)).await.unwrap();
+    db.execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
     let now = utc_now();
     for n in 0..2048 {
         seed(

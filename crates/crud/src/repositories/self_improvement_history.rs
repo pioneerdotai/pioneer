@@ -20,8 +20,8 @@ pub(crate) struct HistoryEvent {
     pub decoded: Option<CanonicalTurnEventRecord>,
 }
 
-pub(crate) async fn discover<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn discover(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace_id: &str,
     after: Option<&str>,
     limit: u64,
@@ -53,6 +53,8 @@ pub(crate) async fn discover<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to discover historical self-improvement events")?;
+    // Portable integrity errors cannot be mistaken for malformed legacy JSON.
+    let rows = super::turn_payload::hydrate_events(db, rows).await?;
     // The bounded result is materialized and its reader permit released before JSON decoding.
     Ok(rows
         .into_iter()

@@ -69,6 +69,7 @@ pub struct TurnProjector;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PreparedTurnProjection {
+    pub(crate) inline_item: Option<crate::repositories::turn_payload::PreparedInlineItem>,
     liveness: Option<turn_liveness::TurnLivenessObservation>,
     item: Option<turn::PreparedTurnItemProjection>,
     item_attempt_payload_json: Option<String>,
@@ -372,6 +373,9 @@ impl TurnProjector {
         {
             return Ok(());
         }
+        if let Some(inline) = &prepared.inline_item {
+            inline.apply(db).await?;
+        }
         if let Some(mut observation) = prepared.liveness {
             observation.activity_sequence = event.sequence;
             turn_liveness::observe_activity(db, observation).await?;
@@ -446,7 +450,8 @@ impl TurnProjector {
                     .context("item/completed attempt status was not prepared")?;
                 if managed_cli_mcp_completion
                     && let Some(item) =
-                        turn::find_turn_item(db, &payload.turn_id, payload.item.item_id()).await?
+                        turn::find_turn_item_metadata(db, &payload.turn_id, payload.item.item_id())
+                            .await?
                 {
                     if item.active_attempt_status.as_deref() == Some("interrupted") {
                         anyhow::ensure!(

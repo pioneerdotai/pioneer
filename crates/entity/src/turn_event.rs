@@ -20,6 +20,11 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     #[sea_orm(unique_key = "uq_turn_event_turn_id_idempotency_key")]
     pub idempotency_key: Option<String>,
+    pub portable_revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub portable_identity: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub payload_payload_id: Option<String>,
     #[sea_orm(has_many)]
     pub turn_event_deliveries: HasMany<super::turn_event_delivery::Entity>,
 }
