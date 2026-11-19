@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint-test-build:
     name: ci-${{ matrix.os }}-${{ matrix.target }}
@@ -321,7 +325,7 @@ jobs:
     # Preserve the Linux check name used by branch protection.
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu
     needs: [linux-build, linux-default-server, linux-doctests, linux-tests]
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
