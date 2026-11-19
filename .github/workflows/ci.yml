@@ -63,7 +63,7 @@ jobs:
   linux-build:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-build
     runs-on: ubuntu-latest
-    # Compile once for all shards; keep doctests on the same build/dependency tree.
+    # Compile once for all shards. End this job after publishing the archive.
     timeout-minutes: 180
     outputs:
       archive-id: ${{ steps.upload-tests.outputs.artifact-id }}
@@ -81,7 +81,8 @@ jobs:
       GGML_FMA: "OFF"
 
     steps:
-      - uses: actions/checkout@v5
+      - &linux-checkout
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
           submodules: recursive
@@ -105,7 +106,8 @@ jobs:
           echo 'CARGO_PROFILE_DEV_DEBUG=0' >> "$GITHUB_ENV"
           echo 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
 
-      - name: free-linux-build-disk
+      - &linux-build-disk
+        name: free-linux-build-disk
         shell: bash
         run: |
           set -euo pipefail
@@ -173,28 +175,7 @@ jobs:
           # Official pre-built binary; use the same version to archive and run.
           curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
-      - name: cargo-check-default-server
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo check --locked -p pioneer-cli
-
-      # A separate Cargo invocation keeps CU features out of these server owners.
-      - name: cargo-nextest-default-server-contracts
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo nextest run --locked --no-default-features \
-            -p pioneer-cli -p pioneer-gateway -p pioneer-tools -p pioneer-promt -p pioneer-agent \
-            --test-threads 2 --no-fail-fast --retries 0 \
-            -E '(package(pioneer-cli) & test(installer::tests::)) |
-                (package(pioneer-tools) & test(computer_use_registration_matches_build_and_backend_and_starts_hidden)) |
-                (package(pioneer-promt) & (test(request_tools) | test(continuation_prompt_assistant_))) |
-                (package(pioneer-agent) & (test(agent_dispatch_starts_with_main_prompt) | test(computer_use_) | test(request_tools_catalog_is_compiled_for_tool_enabled_native_delivery_plan))) |
-                (package(pioneer-gateway) & test(capability_persistence_order_materializes_before_skill_install_and_native_start))'
-
       - name: archive-workspace-tests
-        id: archive
         shell: bash
         run: |
           set -euo pipefail
@@ -232,8 +213,66 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  linux-default-server:
+    name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-default-server
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env: *linux-env
+
+    steps:
+      - *linux-checkout
+      - *linux-toolchain
+      - *linux-build-profile
+      - *linux-build-disk
+
+      - name: rust-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-portable-ggml-v2-default-server
+
+      - *linux-dependencies
+      - *install-nextest
+
+      - name: cargo-check-default-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked -p pioneer-cli
+
+      # A separate Cargo invocation keeps CU features out of these server owners.
+      - name: cargo-nextest-default-server-contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo nextest run --locked --no-default-features \
+            -p pioneer-cli -p pioneer-gateway -p pioneer-tools -p pioneer-promt -p pioneer-agent \
+            --test-threads 2 --no-fail-fast --retries 0 \
+            -E '(package(pioneer-cli) & test(installer::tests::)) |
+                (package(pioneer-tools) & test(computer_use_registration_matches_build_and_backend_and_starts_hidden)) |
+                (package(pioneer-promt) & (test(request_tools) | test(continuation_prompt_assistant_))) |
+                (package(pioneer-agent) & (test(agent_dispatch_starts_with_main_prompt) | test(computer_use_) | test(request_tools_catalog_is_compiled_for_tool_enabled_native_delivery_plan))) |
+                (package(pioneer-gateway) & test(capability_persistence_order_materializes_before_skill_install_and_native_start))'
+
+  linux-doctests:
+    name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-doctests
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env: *linux-env
+
+    steps:
+      - *linux-checkout
+      - *linux-toolchain
+      - *linux-build-profile
+      - *linux-build-disk
+
+      - name: rust-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-portable-ggml-v2-doctests
+
+      - *linux-dependencies
+
       - name: cargo-test-doctests
-        if: ${{ !cancelled() && (steps.archive.outcome == 'success' || steps.archive.outcome == 'failure') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -251,10 +290,7 @@ jobs:
         shard: [1, 2, 3, 4]
 
     steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.sha }}
-          submodules: recursive
+      - *linux-checkout
 
       - *linux-toolchain
       - *linux-build-profile
@@ -293,7 +329,7 @@ jobs:
   linux-result:
     # Preserve the Linux check name used by branch protection.
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu
-    needs: [linux-build, linux-tests]
+    needs: [linux-build, linux-default-server, linux-doctests, linux-tests]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -301,12 +337,17 @@ jobs:
       - name: require-all-linux-checks
         env:
           BUILD_RESULT: ${{ needs.linux-build.result }}
+          DEFAULT_SERVER_RESULT: ${{ needs.linux-default-server.result }}
+          DOCTESTS_RESULT: ${{ needs.linux-doctests.result }}
           LINUX_RESULT: ${{ needs.linux-tests.result }}
         shell: bash
         run: |
           set -euo pipefail
-          # Require the build, rustfmt, doctests, archive upload and all four shards.
-          echo "Linux build and doctests: ${BUILD_RESULT}"
-          echo "Linux checks: ${LINUX_RESULT}"
+          echo "Linux build and archive: ${BUILD_RESULT}"
+          echo "Linux default server: ${DEFAULT_SERVER_RESULT}"
+          echo "Linux doctests: ${DOCTESTS_RESULT}"
+          echo "Linux test shards: ${LINUX_RESULT}"
           test "${BUILD_RESULT}" = success
+          test "${DEFAULT_SERVER_RESULT}" = success
+          test "${DOCTESTS_RESULT}" = success
           test "${LINUX_RESULT}" = success
