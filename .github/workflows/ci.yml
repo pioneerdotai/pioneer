@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint-test-build:
     name: ci-${{ matrix.os }}-${{ matrix.target }}
@@ -62,7 +66,17 @@ jobs:
 
   linux-build:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: &linux-container
+      # Reap orphaned descendants so the process-group tests see completed cleanup.
+      options: --init
+      image: ghcr.io/pioneerdotai/pioneer-ci-linux@sha256:a6fa1023a0f0df98944db716e54817bdb01918832852bf1e8f1c4d765244dd64
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: read
+      packages: read
     # Compile once for all shards. End this job after publishing the archive.
     timeout-minutes: 180
     outputs:
@@ -106,22 +120,12 @@ jobs:
           echo 'CARGO_PROFILE_DEV_DEBUG=0' >> "$GITHUB_ENV"
           echo 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
 
-      - &linux-build-disk
-        name: free-linux-build-disk
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The Rust cache can fill the hosted runner before any build starts.
-          # These preinstalled SDKs are unused by this Linux Rust job.
-          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
-
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
           # whisper-rs-sys does not track arbitrary GGML_* environment changes.
           # Exclude cached native objects compiled for a previous runner CPU.
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-portable-ggml-v2
+          shared-key: ci-ubuntu24-x86_64-gnu-no-debug-portable-ggml-v3
 
       - name: rustfmt-check
         shell: bash
@@ -129,41 +133,11 @@ jobs:
           set -euo pipefail
           cargo fmt --all --check
 
-      - &linux-dependencies
-        name: install-linux-build-dependencies
-        timeout-minutes: 10
+      - &linux-bindgen
+        name: configure-linux-bindgen
         shell: bash
         run: |
           set -euo pipefail
-          # Keep the runner's official Ubuntu fallbacks; its Azure mirror stalled CI.
-          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
-          # Prefer the official archive: the kernel mirror stalled index downloads.
-          # Keep an independent DNS fallback and the runner's remaining signed mirrors.
-          printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://mirrors.edge.kernel.org/ubuntu/\tpriority:2\n' | \
-            sudo tee -a /etc/apt/apt-mirrors.txt > /dev/null
-          apt_options=(
-            -o Acquire::Retries=3
-            -o Acquire::http::Timeout=30
-            -o Acquire::https::Timeout=30
-          )
-          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
-          sudo apt-get "${apt_options[@]}" install -y \
-            pkg-config \
-            libasound2-dev \
-            libegl1-mesa-dev \
-            libgbm-dev \
-            libssl-dev \
-            libpipewire-0.3-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libfontconfig-dev \
-            libfreetype6-dev \
-            libwebkit2gtk-4.1-dev \
-            libx11-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libgl1-mesa-dev
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
 
@@ -176,6 +150,9 @@ jobs:
           curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
       - name: archive-workspace-tests
+        env:
+          # Concurrent rustc processes exhausted the hosted runner while building Gateway tests.
+          CARGO_BUILD_JOBS: 1
         shell: bash
         run: |
           set -euo pipefail
@@ -225,7 +202,11 @@ jobs:
 
   linux-default-server:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-default-server
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: *linux-container
+    permissions:
+      contents: read
+      packages: read
     timeout-minutes: 180
     env: *linux-env
 
@@ -233,14 +214,13 @@ jobs:
       - *linux-checkout
       - *linux-toolchain
       - *linux-build-profile
-      - *linux-build-disk
 
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-portable-ggml-v2-default-server
+          shared-key: ci-ubuntu24-x86_64-gnu-no-debug-portable-ggml-v3-default-server
 
-      - *linux-dependencies
+      - *linux-bindgen
       - *install-nextest
 
       - name: cargo-check-default-server
@@ -265,7 +245,11 @@ jobs:
 
   linux-doctests:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-doctests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: *linux-container
+    permissions:
+      contents: read
+      packages: read
     timeout-minutes: 180
     env: *linux-env
 
@@ -273,14 +257,13 @@ jobs:
       - *linux-checkout
       - *linux-toolchain
       - *linux-build-profile
-      - *linux-build-disk
 
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-portable-ggml-v2-doctests
+          shared-key: ci-ubuntu24-x86_64-gnu-no-debug-portable-ggml-v3-doctests
 
-      - *linux-dependencies
+      - *linux-bindgen
 
       - name: cargo-test-doctests
         shell: bash
@@ -291,7 +274,11 @@ jobs:
   linux-tests:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-shard-${{ matrix.shard }}
     needs: linux-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: *linux-container
+    permissions:
+      contents: read
+      packages: read
     timeout-minutes: 180
     env: *linux-env
     strategy:
@@ -304,7 +291,7 @@ jobs:
 
       - *linux-toolchain
       - *linux-build-profile
-      - *linux-dependencies
+      - *linux-bindgen
       - *install-nextest
 
       - name: require-workspace-test-archive
@@ -316,7 +303,8 @@ jobs:
           test -n "$ARCHIVE_ID"
 
       # The producing job's artifact ID also works when only failed shards are rerun.
-      - name: download-workspace-tests
+      - &download-workspace-tests
+        name: download-workspace-tests
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.linux-build.outputs.archive-id }}
@@ -324,6 +312,8 @@ jobs:
           merge-multiple: true
 
       - name: cargo-nextest-workspace
+        env:
+          BROWSER_TESTS: &browser-tests 'package(pioneer-gateway) & test(/^message::html_tools::browser::tests::/)'
         shell: bash
         run: |
           set -euo pipefail
@@ -332,15 +322,46 @@ jobs:
           cargo nextest run --archive-file "$RUNNER_TEMP/nextest/nextest-tests.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE" \
             --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
-            --partition hash:${{ matrix.shard }}/16 \
+            --partition hash:${{ matrix.shard }}/16 -E "not ($BROWSER_TESTS)" \
             --test-threads 2 --no-fail-fast --retries 0 \
             --status-level pass --final-status-level fail --failure-output immediate-final
+
+  linux-browser-tests:
+    name: ci-linux-browser-tests
+    needs: linux-build
+    # The hosted image provides a sandboxed Chrome for the browser integration tests.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env: *linux-env
+
+    steps:
+      - *linux-checkout
+      - *install-nextest
+      - *download-workspace-tests
+
+      - name: cargo-nextest-browser
+        env:
+          BROWSER_TESTS: *browser-tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep paths embedded by the container build valid on the host runner.
+          runner_work="$(dirname "$(dirname "$GITHUB_WORKSPACE")")"
+          if [[ ! -e /__w ]]; then
+            sudo ln -s "$runner_work" /__w
+          fi
+          test "$GITHUB_WORKSPACE" -ef "/__w/${GITHUB_WORKSPACE#"$runner_work"/}"
+          cargo nextest run --archive-file "$RUNNER_TEMP/nextest/nextest-tests.tar.zst" \
+            --workspace-remap "$GITHUB_WORKSPACE" \
+            --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+            --test-threads 2 --no-fail-fast --retries 0 --failure-output immediate-final \
+            -E "$BROWSER_TESTS"
 
   linux-result:
     # Preserve the Linux check name used by branch protection.
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu
-    needs: [linux-build, linux-default-server, linux-doctests, linux-tests]
-    if: ${{ always() }}
+    needs: [linux-build, linux-default-server, linux-doctests, linux-tests, linux-browser-tests]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -350,6 +371,7 @@ jobs:
           DEFAULT_SERVER_RESULT: ${{ needs.linux-default-server.result }}
           DOCTESTS_RESULT: ${{ needs.linux-doctests.result }}
           LINUX_RESULT: ${{ needs.linux-tests.result }}
+          BROWSER_RESULT: ${{ needs.linux-browser-tests.result }}
         shell: bash
         run: |
           set -euo pipefail
@@ -357,7 +379,9 @@ jobs:
           echo "Linux default server: ${DEFAULT_SERVER_RESULT}"
           echo "Linux doctests: ${DOCTESTS_RESULT}"
           echo "Linux test shards: ${LINUX_RESULT}"
+          echo "Linux browser tests: ${BROWSER_RESULT}"
           test "${BUILD_RESULT}" = success
           test "${DEFAULT_SERVER_RESULT}" = success
           test "${DOCTESTS_RESULT}" = success
           test "${LINUX_RESULT}" = success
+          test "${BROWSER_RESULT}" = success

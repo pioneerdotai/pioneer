@@ -924,15 +924,10 @@ mod tests {
         let id = created["session_id"].as_str().unwrap();
         let mut input = "Приветя".as_bytes().to_vec();
         input.extend_from_slice(&[127, b'\n']);
-        owner
-            .call(
-                "host.pty.input",
-                json!({"session_id":id,"sequence":1,"bytes":input}),
-            )
-            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut cursor = 0;
         let mut bytes = Vec::new();
+        let mut sent_input = false;
         loop {
             let frame = owner
                 .call("host.pty.read", json!({"session_id":id,"after":cursor}))
@@ -945,6 +940,18 @@ mod tests {
                     .iter()
                     .map(|v| v.as_u64().unwrap() as u8),
             );
+            // Wait for the complete locale line before input can be echoed
+            // between printf's prefix and locale's output on the same PTY.
+            let ready = b"ENCODING:UTF-8\r\n";
+            if !sent_input && bytes.windows(ready.len()).any(|window| window == ready) {
+                owner
+                    .call(
+                        "host.pty.input",
+                        json!({"session_id":id,"sequence":1,"bytes":input}),
+                    )
+                    .unwrap();
+                sent_input = true;
+            }
             if !frame["exit_status"].is_null() {
                 break;
             }
