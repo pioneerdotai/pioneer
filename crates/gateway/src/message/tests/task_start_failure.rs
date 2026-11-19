@@ -2842,18 +2842,33 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
             let (harness, processor) = review_cli_fixture().await;
             let (task, child) =
                 create_review_cli_child(&harness, &processor, "revision-race", true, false).await;
-            assert!(
-                processor
-                    .complete_turn(child.child_thread_id, child.child_turn_id, None)
-                    .await
-            );
-            let run = task.run.unwrap();
-            let candidate = harness
+            let initial_binding = harness
                 .crud_store
-                .list_task_result_candidates(&run.id)
+                .get_cli_runtime_turn_binding(&child.child_turn_id)
                 .await
                 .unwrap()
-                .remove(0);
+                .unwrap();
+            // Finish the native attempt and publish its accepted/completed
+            // context, not just the Turn projection, before revising its result.
+            complete_recorded_cli_task_turn(
+                &processor,
+                &harness.cli_session,
+                &harness.cli_manager,
+                &harness.workspace_id,
+                &harness.runtime_id,
+                &child.parent_thread_id,
+                &initial_binding.native_thread_id,
+                initial_binding.native_turn_id.as_deref().unwrap(),
+                r#"<task_result>{"summary":"needs revision","data":{"ok":false}}</task_result>"#,
+            )
+            .await;
+            let run = task.run.unwrap();
+            let candidate = wait_for_result_candidate_status(
+                harness.crud_store.clone(),
+                &run.id,
+                TaskResultCandidateStatus::PendingReview,
+            )
+            .await;
             let revised = processor
                 .task_runtime
                 .service()
@@ -2966,6 +2981,21 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
                     pioneer_tasks::TaskExecutorRecoveryOutcome::Recovered
                 );
             }
+            let revision_binding = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(binding) = store
+                        .get_cli_runtime_turn_binding(&revised.child_turn_id)
+                        .await
+                        .unwrap()
+                        && binding.native_turn_id.as_deref() == Some("native-revision-race")
+                    {
+                        break binding;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("revision native activation must become durable");
             assert_eq!(
                 harness.cli_session.turn_starts.lock().await.len(),
                 activations + 1
@@ -2988,22 +3018,25 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
                 activations + 1,
                 "repeated dispatch must not start another native Turn"
             );
-            assert!(
-                processor
-                    .complete_turn(
-                        revised.child_thread_id.clone(),
-                        revised.child_turn_id.clone(),
-                        None
-                    )
-                    .await
-            );
-            let replacement = store
-                .list_task_result_candidates(&run.id)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|candidate| candidate.round == 1)
-                .expect("the recovered revision must return a new review candidate");
+            complete_recorded_cli_task_turn(
+                &processor,
+                &harness.cli_session,
+                &harness.cli_manager,
+                &harness.workspace_id,
+                &harness.runtime_id,
+                &child.parent_thread_id,
+                &revision_binding.native_thread_id,
+                revision_binding.native_turn_id.as_deref().unwrap(),
+                r#"<task_result>{"summary":"corrected result","data":{"ok":true}}</task_result>"#,
+            )
+            .await;
+            let replacement = wait_for_result_candidate_status(
+                store.clone(),
+                &run.id,
+                TaskResultCandidateStatus::PendingReview,
+            )
+            .await;
+            assert_eq!(replacement.round, 1);
             assert_eq!(replacement.thread_id, revised.child_thread_id);
             assert_eq!(replacement.turn_id, revised.child_turn_id);
             assert_eq!(replacement.status, TaskResultCandidateStatus::PendingReview);
