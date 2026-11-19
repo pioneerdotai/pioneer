@@ -200,7 +200,7 @@ jobs:
           # Bash otherwise runs EXIT with status 0 when the runner sends TERM.
           trap 'exit 143' TERM
           archive_resources
-          /usr/bin/time -v cargo nextest archive --locked --workspace --features pioneer-cli/computer-use \
+          /usr/bin/time -v cargo nextest archive --locked --workspace --features pioneer-cli/computer-use --timings \
             --archive-file "$RUNNER_TEMP/nextest-tests.tar.zst"
 
       - name: upload-workspace-tests
@@ -211,6 +211,16 @@ jobs:
           path: ${{ runner.temp }}/nextest-tests.tar.zst
           if-no-files-found: error
           compression-level: 0
+          retention-days: 7
+
+      - name: upload-cargo-timings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-cargo-timings-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: warn
           retention-days: 7
 
   linux-default-server:
