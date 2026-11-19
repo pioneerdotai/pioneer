@@ -62,7 +62,15 @@ jobs:
 
   linux-build:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: &linux-container
+      image: ghcr.io/pioneerdotai/pioneer-ci-linux@sha256:a6fa1023a0f0df98944db716e54817bdb01918832852bf1e8f1c4d765244dd64
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: read
+      packages: read
     # Compile once for all shards. End this job after publishing the archive.
     timeout-minutes: 180
     outputs:
@@ -106,22 +114,12 @@ jobs:
           echo 'CARGO_PROFILE_DEV_DEBUG=0' >> "$GITHUB_ENV"
           echo 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
 
-      - &linux-build-disk
-        name: free-linux-build-disk
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The Rust cache can fill the hosted runner before any build starts.
-          # These preinstalled SDKs are unused by this Linux Rust job.
-          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
-
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
           # whisper-rs-sys does not track arbitrary GGML_* environment changes.
           # Exclude cached native objects compiled for a previous runner CPU.
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-portable-ggml-v2
+          shared-key: ci-ubuntu24-x86_64-gnu-no-debug-portable-ggml-v3
 
       - name: rustfmt-check
         shell: bash
@@ -129,41 +127,11 @@ jobs:
           set -euo pipefail
           cargo fmt --all --check
 
-      - &linux-dependencies
-        name: install-linux-build-dependencies
-        timeout-minutes: 10
+      - &linux-bindgen
+        name: configure-linux-bindgen
         shell: bash
         run: |
           set -euo pipefail
-          # Keep the runner's official Ubuntu fallbacks; its Azure mirror stalled CI.
-          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
-          # Prefer the official archive: the kernel mirror stalled index downloads.
-          # Keep an independent DNS fallback and the runner's remaining signed mirrors.
-          printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://mirrors.edge.kernel.org/ubuntu/\tpriority:2\n' | \
-            sudo tee -a /etc/apt/apt-mirrors.txt > /dev/null
-          apt_options=(
-            -o Acquire::Retries=3
-            -o Acquire::http::Timeout=30
-            -o Acquire::https::Timeout=30
-          )
-          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
-          sudo apt-get "${apt_options[@]}" install -y \
-            pkg-config \
-            libasound2-dev \
-            libegl1-mesa-dev \
-            libgbm-dev \
-            libssl-dev \
-            libpipewire-0.3-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libfontconfig-dev \
-            libfreetype6-dev \
-            libwebkit2gtk-4.1-dev \
-            libx11-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libgl1-mesa-dev
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
 
@@ -225,7 +193,11 @@ jobs:
 
   linux-default-server:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-default-server
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: *linux-container
+    permissions:
+      contents: read
+      packages: read
     timeout-minutes: 180
     env: *linux-env
 
@@ -233,14 +205,13 @@ jobs:
       - *linux-checkout
       - *linux-toolchain
       - *linux-build-profile
-      - *linux-build-disk
 
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-portable-ggml-v2-default-server
+          shared-key: ci-ubuntu24-x86_64-gnu-no-debug-portable-ggml-v3-default-server
 
-      - *linux-dependencies
+      - *linux-bindgen
       - *install-nextest
 
       - name: cargo-check-default-server
@@ -265,7 +236,11 @@ jobs:
 
   linux-doctests:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-doctests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: *linux-container
+    permissions:
+      contents: read
+      packages: read
     timeout-minutes: 180
     env: *linux-env
 
@@ -273,14 +248,13 @@ jobs:
       - *linux-checkout
       - *linux-toolchain
       - *linux-build-profile
-      - *linux-build-disk
 
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-portable-ggml-v2-doctests
+          shared-key: ci-ubuntu24-x86_64-gnu-no-debug-portable-ggml-v3-doctests
 
-      - *linux-dependencies
+      - *linux-bindgen
 
       - name: cargo-test-doctests
         shell: bash
@@ -291,7 +265,11 @@ jobs:
   linux-tests:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-shard-${{ matrix.shard }}
     needs: linux-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: *linux-container
+    permissions:
+      contents: read
+      packages: read
     timeout-minutes: 180
     env: *linux-env
     strategy:
@@ -304,7 +282,7 @@ jobs:
 
       - *linux-toolchain
       - *linux-build-profile
-      - *linux-dependencies
+      - *linux-bindgen
       - *install-nextest
 
       - name: require-workspace-test-archive
