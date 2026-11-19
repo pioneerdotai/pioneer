@@ -2280,6 +2280,7 @@ struct PreparedProjectedTurnEvent {
 /// preceding event in that same transaction.
 #[derive(Clone, Debug)]
 struct PreparedTurnEventEnvelope {
+    inline_item: Option<repositories::turn_payload::PreparedInlineItem>,
     event: turn_event::PreparedTurnEvent,
     projection_context_json: String,
     claim_token: String,
@@ -5732,23 +5733,22 @@ impl CrudStore {
                 .iter()
                 .map(|c| c.row.event_id.clone())
                 .collect::<Vec<_>>();
-            let events = turn_event::find_event_models_by_ids(&self.connection, &ids)
+            let mut events = turn_event::find_event_models_by_ids(&self.connection, &ids)
                 .await?
                 .into_iter()
-                .map(|e| (e.id.clone(), e))
                 .collect::<std::collections::HashMap<_, _>>();
             let mut records = Vec::with_capacity(claimed.len());
             let mut invalid = Vec::new();
             for claim in claimed {
                 let event = events
-                    .get(&claim.row.event_id)
-                    .cloned()
+                    .remove(&claim.row.event_id)
                     .with_context(|| {
                         format!(
                             "turn event `{}` is missing for delivery `{}`",
                             claim.row.event_id, claim.row.id
                         )
                     })
+                    .and_then(|row| row)
                     .and_then(turn_event::appended_event_from_model)
                     .and_then(|event| {
                         anyhow::ensure!(
@@ -13477,7 +13477,9 @@ impl CrudStore {
         .await?;
         item.projection_group_id = context.projection_group_id(&committed, &item.source_text_hash);
         self.run_serialized_write(|| {
-            let expected_source_payload = expected_source_payload.to_owned();
+            let expected_source_payload = repositories::turn_payload::PreparedItemPayload::new(
+                expected_source_payload.to_owned(),
+            );
             let item = item.clone();
             let context = context.clone();
             let item_type = committed.item_type;
@@ -13507,7 +13509,7 @@ impl CrudStore {
                     {
                         return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
                     }
-                    let Some(source) = turn::find_turn_item(
+                    let Some(source) = turn::find_turn_item_metadata(
                         &transaction,
                         item.turn_id.as_str(),
                         item.item_id.as_str(),
@@ -13516,7 +13518,9 @@ impl CrudStore {
                     else {
                         return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
                     };
-                    if source.payload != expected_source_payload
+                    if !expected_source_payload
+                        .matches(&transaction, &source)
+                        .await?
                         || !thread_episodic_source::source_status_is_committed(
                             source.status.as_deref(),
                         )
@@ -13564,7 +13568,8 @@ impl CrudStore {
             let thread_id = thread_id.to_owned();
             let turn_id = turn_id.to_owned();
             let item_id = item_id.to_owned();
-            let expected_source_payload = expected_source_payload.map(str::to_owned);
+            let expected_source_payload = expected_source_payload
+                .map(|s| repositories::turn_payload::PreparedItemPayload::new(s.to_owned()));
             async move {
                 let transaction = self
                     .connection
@@ -13594,11 +13599,16 @@ impl CrudStore {
                         }
                         _ => {}
                     }
-                    let current =
-                        turn::find_turn_item(&transaction, turn_id.as_str(), item_id.as_str())
-                            .await?;
+                    let current = turn::find_turn_item_metadata(
+                        &transaction,
+                        turn_id.as_str(),
+                        item_id.as_str(),
+                    )
+                    .await?;
                     let source_is_stable = match (&expected_source_payload, current.as_ref()) {
-                        (Some(expected), Some(current)) => current.payload == *expected,
+                        (Some(expected), Some(current)) => {
+                            expected.matches(&transaction, current).await?
+                        }
                         (None, None) => true,
                         _ => false,
                     };
@@ -14473,7 +14483,9 @@ impl CrudStore {
     ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
         self.run_serialized_write(|| {
             let job_id = job_id.to_owned();
-            let expected_source_payload = expected_source_payload.to_owned();
+            let expected_source_payload = repositories::turn_payload::PreparedItemPayload::new(
+                expected_source_payload.to_owned(),
+            );
             let item_update = item_update.clone();
             let job_update = job_update.clone();
             async move {
@@ -14485,7 +14497,7 @@ impl CrudStore {
                     &transaction,
                     job_id.as_str(),
                     expected_attempt_count,
-                    expected_source_payload.as_str(),
+                    &expected_source_payload,
                     item_update,
                     job_update,
                     unix_to_datetime(now_unix),
@@ -14535,7 +14547,9 @@ impl CrudStore {
     ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
         self.run_serialized_write(|| {
             let job_id = job_id.to_owned();
-            let expected_source_payload = expected_source_payload.to_owned();
+            let expected_source_payload = repositories::turn_payload::PreparedItemPayload::new(
+                expected_source_payload.to_owned(),
+            );
             let update = update.clone();
             async move {
                 let transaction = self
@@ -14547,7 +14561,7 @@ impl CrudStore {
                     &transaction,
                     job_id.as_str(),
                     expected_attempt_count,
-                    expected_source_payload.as_str(),
+                    &expected_source_payload,
                     update,
                     unix_to_datetime(now_unix),
                 )
@@ -16978,7 +16992,7 @@ impl CrudStore {
                 let already_committed = authoritative_status == TurnStatus::Completed;
                 if already_committed {
                     if intent.status != turn_finalization::STATUS_COMMITTED {
-                        let existing_item = turn::find_turn_item(
+                        let existing_item = turn::find_turn_item_metadata(
                             &transaction,
                             turn_id.as_str(),
                             intent.item_id.as_str(),
@@ -17263,13 +17277,9 @@ impl CrudStore {
                         );
                     }
 
-                    let source_sequence = turn_event::latest_event_for_turn(
-                        &transaction,
-                        notification.turn_id.as_str(),
-                    )
-                    .await?
-                    .map(|event| event.sequence)
-                    .unwrap_or(0);
+                    let source_sequence = turn_event::max_sequence_for_turn(
+                        &transaction, notification.turn_id.as_str(),
+                    ).await?;
                     prepared_item.preserve_uncommitted_source_status(&transaction).await?;
                     turn::upsert_prepared_turn_item(&transaction, prepared_item).await?;
                     self.commit_episodic_source_save(&transaction, &episodic_source, updated_at).await?;
@@ -28868,6 +28878,9 @@ impl CrudStore {
             .await
             .context("failed to list terminal turn_item rows for invariant check")?;
 
+        let terminal_turn_item_rows =
+            repositories::turn_payload::hydrate_items(&self.connection, terminal_turn_item_rows)
+                .await?;
         let mut violations = Vec::new();
         for row in terminal_turn_item_rows {
             let item: TurnItem = serde_json::from_str(row.payload.as_str()).with_context(|| {
@@ -29212,6 +29225,7 @@ impl CrudStore {
                 .map(|row| row.id.clone())
                 .context("non-empty terminal turn_item repair batch has no cursor")?;
 
+            let rows = repositories::turn_payload::hydrate_items(&self.connection, rows).await?;
             // JSON decoding and terminalization are deliberately outside the
             // database quantum so foreground requests can use SQLite.
             let repairs = timings.observe_sync(
@@ -29413,6 +29427,8 @@ impl CrudStore {
                 )
                 .await?;
 
+            let source_rows =
+                repositories::turn_payload::hydrate_items(&self.connection, source_rows).await?;
             // Payload parsing remains outside both the SQLite permit and the
             // write transaction. Only dirty terminal rows pay this CPU cost.
             let repairs = timings.observe_sync(
@@ -29604,7 +29620,11 @@ impl CrudStore {
         pioneer_entity::turn_item::Entity::update_many()
             .filter(pioneer_entity::turn_item::Column::Id.eq(row.id.clone()))
             .filter(pioneer_entity::turn_item::Column::Status.eq(row.status.clone()))
-            .filter(pioneer_entity::turn_item::Column::Payload.eq(row.payload.clone()))
+            .filter(
+                pioneer_entity::turn_item::Column::PortableIdentity
+                    .eq(row.portable_identity.clone()),
+            )
+            .filter(pioneer_entity::turn_item::Column::PortableRevision.eq(row.portable_revision))
             .col_expr(
                 pioneer_entity::turn_item::Column::Payload,
                 Expr::value(payload_json.to_owned()),
@@ -30566,37 +30586,62 @@ impl CrudStore {
         &self,
         turn_id: &str,
     ) -> Result<Option<pioneer_protocol::RecoveryDiagnostic>> {
+        // Select the same latest transition before JSON work. The second
+        // relational read revalidates its exact incarnation/revision and the
+        // latest-transition fence, so no mixed snapshot can authorize a job.
+        let source = repositories::turn_payload::events(
+            &self.connection,
+            pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
+                .filter(pioneer_entity::turn_event::Column::EventType.is_in([
+                    "turn/started",
+                    "turn/blocked",
+                    "turn/failed",
+                    "turn/completed",
+                ]))
+                .order_by_desc(pioneer_entity::turn_event::Column::Sequence)
+                .limit(1),
+        )
+        .await?
+        .pop();
+        let event = if let Some(source) = source.as_ref().filter(|s| s.event_type == "turn/blocked")
+        {
+            // Preserve malformed-JSON errors; portable integrity was checked by hydration.
+            serde_json::from_str::<serde::de::IgnoredAny>(&source.payload)?;
+            match serde_json::from_str(&source.payload) {
+                Ok(CanonicalTurnEventPayload::TurnBlocked(event)) => Some(event),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let job_id = event
+            .as_ref()
+            .and_then(|event| event.resume.as_ref())
+            .and_then(|resume| resume.blocked_recovery_job_id.clone());
+        // Even without a transition, prepare the same relational read as before:
+        // missing required schema must remain a database error, not successful None.
         let row = self.connection.query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "SELECT e.payload, t.error, j.diagnostic FROM turn t \
+            "SELECT t.error, j.diagnostic FROM turn t \
              JOIN turn_event e ON e.turn_id = t.id AND e.sequence = \
                (SELECT MAX(sequence) FROM turn_event WHERE turn_id = t.id \
                 AND event_type IN ('turn/started', 'turn/blocked', 'turn/failed', 'turn/completed')) \
-             JOIN recovery_job j ON j.id = json_extract(e.payload, '$.payload.resume.blocked_recovery_job_id') \
+             JOIN recovery_job j ON j.id = ?1 \
              JOIN recovery_terminalization_outbox o ON o.recovery_job_id = j.id \
-             WHERE t.id = ? AND t.status = 'blocked' AND e.event_type = 'turn/blocked' \
+             WHERE t.id = ?2 AND e.id=?3 AND e.portable_identity=?4 AND e.portable_revision=?5 AND t.status = 'blocked' AND e.event_type = 'turn/blocked' \
              AND j.turn_id = t.id AND j.status = 'blocked' AND o.status = 'delivered' \
              AND o.turn_id = j.turn_id AND o.item_id = j.item_id AND o.item_type = j.item_type \
              AND o.recovery_status = j.status AND o.attempt_number = MAX(j.run_count, 1) \
              AND o.error_message = COALESCE(j.last_error, j.reason, 'recovery reached a terminal outcome')",
-            [turn_id.into()],
+            vec![job_id.clone().into(), turn_id.into(), source.as_ref().map(|s| s.id.clone()).into(), source.as_ref().map(|s| s.portable_identity.clone()).into(), source.as_ref().map(|s| s.portable_revision).into()],
         )).await?;
-        let Some(row) = row else {
+        let Some(row) = row else { return Ok(None) };
+        let (Some(event), Some(job_id)) = (event, job_id) else {
             return Ok(None);
         };
-        let payload: String = row.try_get("", "payload")?;
         let error: Option<String> = row.try_get("", "error")?;
         let diagnostic: Option<String> = row.try_get("", "diagnostic")?;
-        let Ok(CanonicalTurnEventPayload::TurnBlocked(event)) = serde_json::from_str(&payload)
-        else {
-            return Ok(None);
-        };
-        let Some(job_id) = event
-            .resume
-            .and_then(|resume| resume.blocked_recovery_job_id)
-        else {
-            return Ok(None);
-        };
         let diagnostic = diagnostic.as_deref().and_then(|value| {
             serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
         });
@@ -33753,7 +33798,7 @@ impl CrudStore {
                 // Turn status is already present, then consume the outbox in
                 // the same transaction.
                 if prepared.revalidate_item {
-                    let current_item = turn::find_turn_item(
+                    let current_item = turn::find_turn_item_metadata(
                         &transaction,
                         record.turn_id.as_str(),
                         record.item_id.as_str(),
@@ -36505,7 +36550,7 @@ impl CrudStore {
         let _release_wake = (terminal_turn_execution_status_for_event(&appended_event.payload)
             .is_some())
         .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
-        let projection = self
+        let mut projection = self
             .projector
             .prepare(
                 &self.connection,
@@ -36526,6 +36571,7 @@ impl CrudStore {
             } else {
                 None
             };
+        projection.inline_item = repositories::turn_payload::PreparedInlineItem::prepare(&self.connection,&appended_event.payload).await?;
         let transaction = self
             .connection
             .begin()
@@ -37225,7 +37271,7 @@ impl CrudStore {
                 }
 
                 let raw_event =
-                    turn_event::find_event_by_id(&transaction, expected_blocking_event_id)
+                    pioneer_entity::turn_event::Entity::find_by_id(expected_blocking_event_id.to_owned()).one(&transaction)
                         .await?
                         .with_context(|| {
                             format!(
@@ -39038,8 +39084,8 @@ fn remember_agent_diff_snapshot_payload(
     Ok(())
 }
 
-async fn latest_agent_diff_raw_payload_for_item<C: ConnectionTrait>(
-    db: &C,
+async fn latest_agent_diff_raw_payload_for_item(
+    db: &pioneer_sqlite::SqliteDatabase,
     thread_id: &str,
     turn_id: &str,
     item_id: &str,
@@ -39067,8 +39113,8 @@ async fn latest_agent_diff_raw_payload_for_item<C: ConnectionTrait>(
     Ok(latest_payload)
 }
 
-async fn append_agent_diff_snapshot_turn_item_events<C: ConnectionTrait>(
-    db: &C,
+async fn append_agent_diff_snapshot_turn_item_events(
+    db: &pioneer_sqlite::SqliteDatabase,
     events: &mut Vec<TurnItemEvent>,
     latest_agent_diff_payload_by_item_id: &HashMap<String, String>,
     workspace_id: &str,
@@ -39772,8 +39818,8 @@ fn build_task_tree(
     }
 }
 
-async fn prepare_turn_event_for_permanent_storage<C: ConnectionTrait>(
-    db: &C,
+async fn prepare_turn_event_for_permanent_storage(
+    db: &pioneer_sqlite::SqliteDatabase,
     event: TurnEventPayload,
 ) -> Result<turn_event::PreparedTurnEvent> {
     validate_turn_event_for_permanent_storage(&event)?;
@@ -39782,8 +39828,8 @@ async fn prepare_turn_event_for_permanent_storage<C: ConnectionTrait>(
         .await
 }
 
-async fn prepare_projected_turn_event_for_permanent_storage<C: ConnectionTrait>(
-    db: &C,
+async fn prepare_projected_turn_event_for_permanent_storage(
+    db: &pioneer_sqlite::SqliteDatabase,
     event: TurnEventPayload,
     created_at: DateTimeWithTimeZone,
 ) -> Result<PreparedProjectedTurnEvent> {
@@ -39791,8 +39837,8 @@ async fn prepare_projected_turn_event_for_permanent_storage<C: ConnectionTrait>(
     prepare_projected_turn_event_from_envelope(db, event, created_at).await
 }
 
-async fn prepare_turn_event_envelope_for_permanent_storage<C: ConnectionTrait>(
-    db: &C,
+async fn prepare_turn_event_envelope_for_permanent_storage(
+    db: &pioneer_sqlite::SqliteDatabase,
     event: TurnEventPayload,
 ) -> Result<PreparedTurnEventEnvelope> {
     let event = prepare_turn_event_for_permanent_storage(db, event).await?;
@@ -39800,7 +39846,10 @@ async fn prepare_turn_event_envelope_for_permanent_storage<C: ConnectionTrait>(
         &TurnEventProjectionContext::default(),
         event.id(),
     )?;
+    let inline_item =
+        repositories::turn_payload::PreparedInlineItem::prepare(db, event.payload()).await?;
     Ok(PreparedTurnEventEnvelope {
+        inline_item,
         event,
         projection_context_json,
         claim_token: generate_id(DB_ID_LEN),
@@ -39813,13 +39862,15 @@ async fn prepare_projected_turn_event_from_envelope<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
 ) -> Result<PreparedProjectedTurnEvent> {
     let PreparedTurnEventEnvelope {
+        inline_item,
         event,
         projection_context_json,
         claim_token,
     } = prepared;
-    let projection = TurnProjector::new()
+    let mut projection = TurnProjector::new()
         .prepare(db, event.id(), event.payload(), created_at)
         .await?;
+    projection.inline_item = inline_item;
     let terminal_effect_activation =
         if terminal_turn_execution_status_for_event(event.payload()).is_some() {
             Some(
@@ -40684,6 +40735,7 @@ mod tests {
                         candidate.name(),
                         "m20261027_000001_portable_payload"
                             | "m20261027_000005_portable_task_event"
+                            | "m20261115_000001_portable_turn_payload"
                     ) && !migrations
                         .iter()
                         .any(|migration| migration.name() == candidate.name())
@@ -59283,6 +59335,7 @@ mod tests {
                 lease_expires_at: Set(None),
                 created_at: Set(item_timestamp),
                 updated_at: Set(item_timestamp),
+                ..Default::default()
             })
             .exec(&store.connection)
             .await
@@ -59371,6 +59424,7 @@ mod tests {
                     lease_expires_at: Set(None),
                     created_at: Set(timestamp.clone()),
                     updated_at: Set(timestamp),
+                    ..Default::default()
                 })
                 .exec(&connection)
                 .await
@@ -59471,6 +59525,7 @@ mod tests {
             lease_expires_at: Set(None),
             created_at: Set(timestamp.clone()),
             updated_at: Set(timestamp),
+            ..Default::default()
         })
         .exec(&connection)
         .await
@@ -59531,6 +59586,7 @@ mod tests {
             lease_expires_at: Set(None),
             created_at: Set(timestamp.clone()),
             updated_at: Set(timestamp),
+            ..Default::default()
         })
         .exec(&connection)
         .await
@@ -59618,6 +59674,7 @@ mod tests {
             lease_expires_at: Set(None),
             created_at: Set(timestamp.clone()),
             updated_at: Set(timestamp),
+            ..Default::default()
         })
         .exec(&connection)
         .await
@@ -64181,6 +64238,8 @@ mod tests {
             Migrator::up(&connection, None)
                 .await
                 .expect("migrations must succeed");
+            let store = CrudStore::new(connection);
+            let connection = store.database_connection();
             let timestamp = 1_700_000_000;
             let thread_id = format!("thr_replay_actor_{suffix}");
             let turn_id = format!("turn_replay_actor_{suffix}");

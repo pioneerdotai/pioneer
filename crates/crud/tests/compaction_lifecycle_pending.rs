@@ -1699,13 +1699,18 @@ async fn lifecycle_terminal_repair_uses_saved_event_time_and_matches_canonical_r
         // Damage both the item data and projection time, then repair at T2.
         db.execute_unprepared("UPDATE turn_item SET payload='{\"details\":{\"status\":\"started\"}}',updated_at='2090-01-01 00:00:00+00:00' WHERE item_id='compaction:op'").await.unwrap();
         assert!(apply(&store, "op", t2).await);
+        let repaired = turn_item::Entity::find_by_id(&original.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repaired.portable_revision > original.portable_revision);
         assert_eq!(
-            turn_item::Entity::find_by_id(&original.id)
-                .one(&db)
-                .await
-                .unwrap()
-                .unwrap(),
-            original
+            repaired,
+            turn_item::Model {
+                portable_revision: repaired.portable_revision,
+                ..original.clone()
+            }
         );
         let table = if compressed {
             "_turn_item_zstd"

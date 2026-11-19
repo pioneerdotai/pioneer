@@ -240,18 +240,18 @@ mod worker_tests {
             reads.enqueued.load(SeqCst) > during_rest
         })
         .await;
-        // Six reads per empty pass. Reaching twelve worker reads proves the
+        // Eight reads per empty pass. Reaching sixteen worker reads proves the
         // signal sent during rest was not acknowledged/lost within that pass.
         drive_worker_until(&mut worker, Duration::from_millis(1), || {
-            reads.finished.load(SeqCst) >= stream_finishes + 12
+            reads.finished.load(SeqCst) >= stream_finishes + 16
         })
         .await;
-        // All twelve reads are complete. Flush the last portion's rest and
+        // All sixteen reads are complete. Flush the last portion's rest and
         // EOF; prolonged idle must not bank credit for the later active pass.
         for _ in 0..2 {
             tokio::time::advance(Duration::from_secs(3600)).await;
             assert!(futures_util::poll!(&mut worker).is_pending());
-            assert_eq!(reads.finished.load(SeqCst), stream_finishes + 12);
+            assert_eq!(reads.finished.load(SeqCst), stream_finishes + 16);
         }
 
         // Start a fresh pass with another known active await, then interrupt
@@ -291,9 +291,9 @@ mod worker_tests {
         tokio::time::pause();
         let mut worker = Box::pin(run(Arc::new(CrudStore::new(db)), cancellation.clone()));
         // Drive actual DB futures while virtual time pays active pacing. The
-        // empty pass has one cleanup frontier and five family frontier reads.
+        // empty pass has one cleanup frontier and seven family frontier reads.
         let mut invalidated_during_pass = false;
-        for expected in [12, 18] {
+        for expected in [16, 24] {
             for _ in 0..10000 {
                 assert!(futures_util::poll!(&mut worker).is_pending());
                 let count = reads.finished.load(SeqCst);
@@ -319,7 +319,7 @@ mod worker_tests {
         cancellation.cancel();
         worker.await;
         assert!(invalidated_during_pass);
-        assert_eq!(reads.finished.load(SeqCst), 18);
+        assert_eq!(reads.finished.load(SeqCst), 24);
     }
     #[tokio::test]
     async fn database_error_keeps_backoff_and_shutdown_interrupts_it() {

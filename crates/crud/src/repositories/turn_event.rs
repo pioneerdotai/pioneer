@@ -79,7 +79,7 @@ pub struct PreparedTurnEvent {
     idempotency_key: String,
     legacy_idempotency_key: String,
     payload: TurnEventPayload,
-    semantically_matching_existing_id: Option<String>,
+    semantically_matching_existing_id: Option<(String, String, i64)>,
     execution_observation: Option<super::execution_observability::PreparedExecutionObservation>,
 }
 
@@ -127,24 +127,35 @@ impl PreparedTurnEvent {
     /// Performs the potentially expensive legacy-payload decode before a
     /// caller acquires the writer. Newly written rows use canonical JSON, but
     /// older rows may be semantically identical without being byte-identical.
-    /// The immutable row ID is carried into the write transaction as the
-    /// compare fence, preserving the old idempotent replay semantics without
-    /// parsing JSON while the writer is held.
-    pub async fn preflight_idempotency<C: ConnectionTrait>(mut self, db: &C) -> Result<Self> {
-        if let Some(existing) = turn_event::Entity::find()
-            .filter(turn_event::Column::TurnId.eq(self.turn_id.clone()))
-            .filter(
-                sea_orm::Condition::any()
-                    .add(turn_event::Column::IdempotencyKey.eq(self.idempotency_key.clone()))
-                    .add(
-                        turn_event::Column::IdempotencyKey.eq(self.legacy_idempotency_key.clone()),
-                    ),
-            )
-            .one(db)
-            .await
-            .context("failed to preflight idempotent turn event")?
+    /// Row ID, incarnation and logical revision enter the write transaction as
+    /// the compare fence, preserving idempotent replay without parsing JSON
+    /// while the writer is held.
+    pub async fn preflight_idempotency(
+        mut self,
+        db: &pioneer_sqlite::SqliteDatabase,
+    ) -> Result<Self> {
+        if let Some(existing) = super::turn_payload::events(
+            db,
+            turn_event::Entity::find()
+                .filter(turn_event::Column::TurnId.eq(self.turn_id.clone()))
+                .filter(
+                    sea_orm::Condition::any()
+                        .add(turn_event::Column::IdempotencyKey.eq(self.idempotency_key.clone()))
+                        .add(
+                            turn_event::Column::IdempotencyKey
+                                .eq(self.legacy_idempotency_key.clone()),
+                        ),
+                )
+                .limit(1),
+        )
+        .await?
+        .pop()
         {
-            let existing_id = existing.id.clone();
+            let existing_id = (
+                existing.id.clone(),
+                existing.portable_identity.clone(),
+                existing.portable_revision,
+            );
             let mut existing = appended_event_from_model(existing)?;
             if let Some(observation) =
                 super::execution_observability::prepare_event(&existing.payload)?
@@ -170,9 +181,16 @@ fn validate_existing_prepared_event(
     existing: &turn_event::Model,
     prepared: &PreparedTurnEvent,
 ) -> Result<()> {
-    let canonical_payload_matches = existing.payload == prepared.payload_json;
-    let preflight_fence_matches =
-        prepared.semantically_matching_existing_id.as_deref() == Some(existing.id.as_str());
+    let canonical_payload_matches =
+        existing.payload_payload_id.is_none() && existing.payload == prepared.payload_json;
+    let preflight_fence_matches = prepared
+        .semantically_matching_existing_id
+        .as_ref()
+        .is_some_and(|(id, identity, revision)| {
+            id == &existing.id
+                && identity == &existing.portable_identity
+                && revision == &existing.portable_revision
+        });
     if !canonical_payload_matches && !preflight_fence_matches {
         anyhow::bail!(
             "turn event idempotency key collision for turn `{}`",
@@ -209,8 +227,8 @@ pub async fn prepared_event_already_exists<C: ConnectionTrait>(
 }
 
 #[cfg(test)]
-pub async fn append_event<C: ConnectionTrait>(
-    db: &C,
+pub async fn append_event(
+    db: &pioneer_sqlite::SqliteDatabase,
     payload: &TurnEventPayload,
     created_at: DateTimeWithTimeZone,
 ) -> Result<AppendedTurnEvent> {
@@ -331,24 +349,26 @@ pub fn appended_event_from_model(model: turn_event::Model) -> Result<AppendedTur
     })
 }
 
-pub async fn find_event_by_id<C: ConnectionTrait>(
-    db: &C,
+pub async fn find_event_by_id(
+    db: &pioneer_sqlite::SqliteDatabase,
     event_id: &str,
 ) -> Result<Option<AppendedTurnEvent>> {
-    turn_event::Entity::find_by_id(event_id.to_owned())
-        .one(db)
-        .await
-        .context("failed to query turn_event by id")?
-        .map(appended_event_from_model)
-        .transpose()
+    super::turn_payload::events(
+        db,
+        turn_event::Entity::find_by_id(event_id.to_owned()).limit(1),
+    )
+    .await?
+    .pop()
+    .map(appended_event_from_model)
+    .transpose()
 }
 
 /// Read finite rows after the claim commit. The caller decodes each body
 /// independently so one corrupt legacy body cannot suppress healthy deliveries.
-pub async fn find_event_models_by_ids<C: ConnectionTrait>(
-    db: &C,
+pub async fn find_event_models_by_ids(
+    db: &pioneer_sqlite::SqliteDatabase,
     ids: &[String],
-) -> Result<Vec<turn_event::Model>> {
+) -> Result<Vec<(String, Result<turn_event::Model>)>> {
     anyhow::ensure!(
         ids.len() <= super::turn_event_delivery::DELIVERY_BATCH_LIMIT,
         "event body batch exceeds bound"
@@ -356,11 +376,17 @@ pub async fn find_event_models_by_ids<C: ConnectionTrait>(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    turn_event::Entity::find()
-        .filter(turn_event::Column::Id.is_in(ids.iter().cloned()))
-        .all(db)
-        .await
-        .context("failed to read delivery event batch")
+    let mut result = Vec::with_capacity(ids.len());
+    for id in ids {
+        // Keep per-event failures independent: one damaged portable header or
+        // block must not prevent healthy claimed deliveries from progressing.
+        let row =
+            super::turn_payload::events(db, turn_event::Entity::find_by_id(id.clone()).limit(1))
+                .await
+                .and_then(|mut rows| rows.pop().context("delivery event disappeared"));
+        result.push((id.clone(), row));
+    }
+    Ok(result)
 }
 
 /// Repairs a legacy final agent-diff snapshot whose denormalized thread owner
@@ -507,18 +533,21 @@ pub async fn repair_legacy_agent_diff_thread_owner<C: ConnectionTrait>(
     Ok(true)
 }
 
-pub async fn latest_event_for_turn<C: ConnectionTrait>(
-    db: &C,
+pub async fn latest_event_for_turn(
+    db: &pioneer_sqlite::SqliteDatabase,
     turn_id: &str,
 ) -> Result<Option<AppendedTurnEvent>> {
-    turn_event::Entity::find()
-        .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
-        .order_by_desc(turn_event::Column::Sequence)
-        .one(db)
-        .await
-        .context("failed to query latest turn_event")?
-        .map(appended_event_from_model)
-        .transpose()
+    super::turn_payload::events(
+        db,
+        turn_event::Entity::find()
+            .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .order_by_desc(turn_event::Column::Sequence)
+            .limit(1),
+    )
+    .await?
+    .pop()
+    .map(appended_event_from_model)
+    .transpose()
 }
 
 pub async fn max_sequence_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<i64> {
@@ -549,8 +578,8 @@ async fn next_sequence_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) -> Re
     Ok(max_sequence_for_turn(db, turn_id).await? + 1)
 }
 
-pub async fn list_events_for_turn<C: ConnectionTrait>(
-    db: &C,
+pub async fn list_events_for_turn(
+    db: &pioneer_sqlite::SqliteDatabase,
     thread_id: &str,
     turn_id: &str,
     after_sequence: Option<i64>,
@@ -566,11 +595,13 @@ pub async fn list_events_for_turn<C: ConnectionTrait>(
     if let Some(limit) = limit {
         query = query.limit(limit);
     }
-    query.all(db).await.context("failed to query turn events")
+    super::turn_payload::events(db, query)
+        .await
+        .context("failed to query turn events")
 }
 
-pub async fn list_events_for_thread<C: ConnectionTrait>(
-    db: &C,
+pub async fn list_events_for_thread(
+    db: &pioneer_sqlite::SqliteDatabase,
     thread_id: &str,
     limit: Option<u64>,
 ) -> Result<Vec<turn_event::Model>> {
@@ -584,8 +615,7 @@ pub async fn list_events_for_thread<C: ConnectionTrait>(
         query = query.limit(limit);
     }
 
-    query
-        .all(db)
+    super::turn_payload::events(db, query)
         .await
         .map(|mut rows| {
             rows.reverse();

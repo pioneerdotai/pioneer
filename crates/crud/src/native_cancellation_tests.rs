@@ -1300,6 +1300,23 @@ struct HistoricalMigrationRows {
     obligation: pioneer_entity::native_terminal_effect_outbox::Model,
 }
 
+// Read the exact pre-portable event schema without requiring today's storage columns.
+fn historical_event_query(id: &str) -> sea_orm::Select<pioneer_entity::turn_event::Entity> {
+    use pioneer_entity::turn_event::{Column, Entity};
+    use sea_orm::Iterable;
+    Entity::find_by_id(id)
+        .select_only()
+        .columns(Column::iter().filter(|c| {
+            !matches!(
+                c,
+                Column::PortableRevision | Column::PortableIdentity | Column::PayloadPayloadId
+            )
+        }))
+        .expr_as(Expr::val(0_i64), Column::PortableRevision)
+        .expr_as(Expr::val(""), Column::PortableIdentity)
+        .expr_as(Expr::val(None::<String>), Column::PayloadPayloadId)
+}
+
 fn historical_thread_query(id: &str) -> sea_orm::Select<pioneer_entity::thread::Entity> {
     use pioneer_entity::thread;
     use sea_orm::Iterable;
@@ -1426,6 +1443,25 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
         ])
         .to_owned();
     let stream = DatabaseBackend::Sqlite.build(&stream);
+    // This fixture represents an already-written historical database. Insert
+    // only its released columns, rather than invoking today's append repository.
+    let historical_events = [(start, at, 1_i64), (terminal, terminal_at, 2_i64)].map(
+        |(prepared, timestamp, sequence)| {
+            let id = prepared.id().to_owned();
+            let model = pioneer_entity::turn_event::ActiveModel {
+                id: Set(id.clone()),
+                thread_id: Set(thread_id.to_owned()),
+                turn_id: Set(turn_id.to_owned()),
+                sequence: Set(sequence),
+                event_type: Set(prepared.payload().event_type().to_owned()),
+                payload: Set(serde_json::to_string(prepared.payload()).unwrap()),
+                idempotency_key: Set(Some(prepared.payload().idempotency_key().unwrap())),
+                created_at: Set(timestamp),
+                ..Default::default()
+            };
+            (id, model, timestamp, sequence)
+        },
+    );
     // All JSON, hashing and statement preparation above precede the writer.
     let transaction = db.begin().await.unwrap();
     assert!(
@@ -1496,15 +1532,14 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
     .unwrap();
     let mut events = Vec::with_capacity(2);
     let mut receipts = Vec::with_capacity(2);
-    for (prepared, timestamp, sequence) in [(start, at, 1), (terminal, terminal_at, 2)] {
-        let appended = turn_event::append_prepared_event(&transaction, prepared, timestamp)
+    for (event_id, model, timestamp, sequence) in historical_events {
+        pioneer_entity::turn_event::Entity::insert(model)
+            .exec_without_returning(&transaction)
             .await
             .unwrap();
-        assert!(appended.was_inserted);
-        assert_eq!(appended.sequence, sequence);
         receipts.push(
             pioneer_entity::turn_event_projection_state::ActiveModel {
-                event_id: Set(appended.id.clone()),
+                event_id: Set(event_id.clone()),
                 thread_id: Set(thread_id.to_owned()),
                 turn_id: Set(turn_id.to_owned()),
                 sequence: Set(sequence),
@@ -1522,7 +1557,7 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
             .unwrap(),
         );
         events.push(
-            pioneer_entity::turn_event::Entity::find_by_id(appended.id)
+            historical_event_query(&event_id)
                 .one(&transaction)
                 .await
                 .unwrap()
@@ -1604,10 +1639,7 @@ impl HistoricalMigrationRows {
         );
         for event in &self.events {
             assert_eq!(
-                pioneer_entity::turn_event::Entity::find_by_id(event.id.clone())
-                    .one(db)
-                    .await
-                    .unwrap(),
+                historical_event_query(&event.id).one(db).await.unwrap(),
                 Some(event.clone())
             );
         }

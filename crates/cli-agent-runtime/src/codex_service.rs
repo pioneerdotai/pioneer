@@ -223,16 +223,30 @@ impl CodexService {
     }
 }
 
-fn profile() -> JsonValue {
-    let mut features = serde_json::Map::new();
+fn profile() -> toml::Table {
+    let mut features = toml::Table::new();
     for name in DISABLED_FEATURES {
-        features.insert((*name).into(), json!(false));
+        features.insert((*name).into(), toml::Value::Boolean(false));
     }
-    features.insert("skip_host_skill_discovery".into(), json!(true));
-    json!({"features":features, "agents":{"enabled":false},
-        "web_search":"disabled", "project_doc_max_bytes":0,
-        "include_environment_context":false, "include_collaboration_mode_instructions":false,
-        "history":{"persistence":"none"}, "suppress_unstable_features_warning":true})
+    features.insert(
+        "skip_host_skill_discovery".into(),
+        toml::Value::Boolean(true),
+    );
+    // Construct native TOML values. Serializing serde_json::Number through
+    // Serde with arbitrary_precision turns even 0 into a private-token table.
+    let mut profile = toml::toml! {
+        web_search = "disabled"
+        project_doc_max_bytes = 0
+        include_environment_context = false
+        include_collaboration_mode_instructions = false
+        suppress_unstable_features_warning = true
+        [agents]
+        enabled = false
+        [history]
+        persistence = "none"
+    };
+    profile.insert("features".into(), toml::Value::Table(features));
+    profile
 }
 fn process_config(
     config: &CodexServiceConfig,
@@ -259,11 +273,10 @@ fn process_config(
     .into_iter()
     .map(str::to_owned)
     .collect();
-    for (key, value) in profile().as_object().unwrap() {
-        process.args.extend([
-            "--config".into(),
-            format!("{key}={}", toml::Value::try_from(value)?),
-        ]);
+    for (key, value) in profile() {
+        process
+            .args
+            .extend(["--config".into(), format!("{key}={value}")]);
     }
     // --ignore-user-config also resets credential storage to "file". Keep
     // only the account's storage selector, without loading user behavior,
@@ -746,7 +759,7 @@ mod exec_tests {
         std::fs::write(home.join("config.toml"), user_config).unwrap();
         let executable = fixture.path().join("mock-codex");
         let script=r#"#!/usr/bin/env python3
-import json, os, pathlib, sys, time
+import tomllib, json, os, pathlib, sys, time
 home=pathlib.Path(os.environ['CODEX_HOME'])
 if sys.argv[1:] == ['--version']:
     raise AssertionError('summary service must not probe the CLI version')
@@ -757,6 +770,19 @@ assert a[a.index('--model')+1]=='gpt-5.6-luna'
 assert a[a.index('--sandbox')+1]=='read-only'
 assert 'cli_auth_credentials_store="keyring"' in a
 assert 'model_reasoning_effort="low"' in a
+
+# Parse the actual argv using an independent TOML implementation. Codex's
+# config schema requires an integer here, not Serde's JSON-number token map.
+overrides = {}
+for index, arg in enumerate(a[:-1]):
+    if arg == '--config': overrides.update(tomllib.loads(a[index+1]))
+assert type(overrides['project_doc_max_bytes']) is int
+assert overrides['project_doc_max_bytes'] == 0
+assert overrides['agents']['enabled'] is False
+assert overrides['history']['persistence'] == 'none'
+assert overrides['features']['shell_tool'] is False
+assert overrides['features']['skip_host_skill_discovery'] is True
+
 assert 'private fixture portion' not in str(a)
 assert 'service instructions' not in str(a)
 assert pathlib.Path('instructions.txt').read_text()=='service instructions'

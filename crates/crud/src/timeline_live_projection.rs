@@ -429,7 +429,7 @@ async fn project_turn_item_event<C: ConnectionTrait>(
             turn_model.thread_id
         );
     };
-    let item_model = turn::find_turn_item(db, turn_model.id.as_str(), item_id).await?;
+    let item_model = turn::find_turn_item_metadata(db, turn_model.id.as_str(), item_id).await?;
     let Some(item_model) = item_model else {
         if item_payload_event_requires_canonical_row(&event.payload) {
             anyhow::bail!(
@@ -486,7 +486,9 @@ pub(crate) async fn project_semantic_timeline_snapshot_turn_item<C: ConnectionTr
             turn_model.thread_id
         );
     };
-    let Some(item_model) = turn::find_turn_item(db, turn_model.id.as_str(), item_id).await? else {
+    let Some(item_model) =
+        turn::find_turn_item_metadata(db, turn_model.id.as_str(), item_id).await?
+    else {
         return refresh_turn_work_summary(
             db,
             &thread_model,
@@ -1392,7 +1394,7 @@ async fn count_pending_cli_runtime_requests<C: ConnectionTrait>(
     Ok(i64::try_from(count).unwrap_or(i64::MAX))
 }
 
-fn payload_item_id(payload: &TurnEventPayload) -> Option<&str> {
+pub(crate) fn payload_item_id(payload: &TurnEventPayload) -> Option<&str> {
     match payload {
         TurnEventPayload::ItemStarted(notification) => Some(notification.item.item_id()),
         TurnEventPayload::ItemCompleted(notification) => Some(notification.item.item_id()),
@@ -1512,6 +1514,9 @@ mod tests {
     ) -> turn_item_entity::Model {
         let created_at = unix_to_datetime(10);
         turn_item_entity::Model {
+            portable_identity: String::new(),
+            portable_revision: 0,
+            payload_payload_id: None,
             id: "row_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             item_id: "task_anchor".to_owned(),

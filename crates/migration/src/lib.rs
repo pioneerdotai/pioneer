@@ -31,6 +31,9 @@ mod portable_payload_target;
 mod m20261111_000001_plugin_ownership;
 mod m20261112_000001_package_installations;
 
+mod m20261115_000001_dev_app_identity;
+mod m20261115_000001_portable_turn_payload;
+
 pub struct Migrator;
 
 pub mod stable_skill_id;
@@ -127,8 +130,6 @@ mod m20261012_000001_turn_event_delivery_unfinished_predecessor;
 mod m20261015_000001_compaction_invalid_completion_resume;
 mod m20261015_000002_terminal_task_input_roots;
 mod m20261018_000001_thread_unread_start;
-
-mod m20261115_000001_dev_app_identity;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -254,6 +255,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261108_000001_sqlite_memory_search::Migration),
             Box::new(m20261111_000001_plugin_ownership::Migration),
             Box::new(m20261112_000001_package_installations::Migration),
+            Box::new(m20261115_000001_portable_turn_payload::Migration),
             Box::new(m20261115_000001_dev_app_identity::Migration),
         ]
     }
