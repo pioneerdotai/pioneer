@@ -1657,6 +1657,34 @@ impl TaskAgentExecutor {
                     if let Some(child_runtime) =
                         load_child_runtime_for_run(&processor, run.id.as_str()).await?
                     {
+                        // A revision request is durable before its conversation Turn
+                        // is materialized. Recovery owns the execution lease here,
+                        // so it must finish revision admission rather than diagnose
+                        // the not-yet-created Turn as lost.
+                        if child_runtime.task_run_turn.kind == TaskRunTurnKind::Revision
+                            && processor
+                                .crud_store
+                                .get_turn(
+                                    &child_runtime.task_run_turn.thread_id,
+                                    &child_runtime.task_run_turn.turn_id,
+                                )
+                                .await?
+                                .is_none()
+                        {
+                            processor
+                                .task_agent_executor
+                                .dispatch_claimed_revision(
+                                    Arc::clone(&processor),
+                                    task_response.clone(),
+                                    run.clone(),
+                                    agent_spec,
+                                    execution,
+                                    child_runtime,
+                                    handle,
+                                )
+                                .await?;
+                            return Ok(TaskExecutorStartOutcome::Started);
+                        }
                         return self
                             .recover_existing_child_turn(
                                 &processor,
@@ -3047,6 +3075,22 @@ impl TaskAgentExecutor {
         response: TaskReviseResponse,
     ) -> Result<TaskReviseResponse> {
         let processor = self.processor()?;
+        // The request path and background recovery compete for the same
+        // durable lease. Only its winner may materialize or dispatch the Turn.
+        let now = now_timestamp_secs();
+        let worker_id = format!("task-revision-{}", pioneer_protocol::generate_id(21));
+        let Some(execution) =
+            message_future(processor.crud_store.claim_task_run_execution_for_recovery(
+                response.run.id.as_str(),
+                TaskExecutorKind::Agent,
+                worker_id.as_str(),
+                now,
+                now.saturating_add(TASK_EXECUTION_LEASE_SECONDS),
+            ))
+            .await?
+        else {
+            return message_future(task_revise_response_from_store(&processor, response)).await;
+        };
         let task_response =
             message_future(processor.crud_store.get_task(response.task.id.as_str()))
                 .await?
@@ -3059,31 +3103,43 @@ impl TaskAgentExecutor {
             .ok_or_else(|| anyhow!("task run `{}` not found", response.run.id))?;
         let agent_spec = select_agent_spec(&task_response, run.id.as_str())
             .ok_or_else(|| anyhow!("agent task `{}` has no agent spec", task_response.task.id))?;
-        let execution =
-            match message_future(processor.crud_store.load_execution_for_run(run.id.as_str()))
-                .await?
-            {
-                Some(execution) => execution,
-                None => {
-                    message_future(processor.crud_store.reserve_execution_for_run(
-                        run.id.as_str(),
-                        TaskExecutorKind::Agent,
-                        now_timestamp_secs(),
-                    ))
-                    .await?
-                }
-            };
-        let child_runtime = message_future(load_child_runtime_from_task_run_turn(
-            &processor,
-            response.task_run_turn.clone(),
-        ))
-        .await?;
+        // Re-read after claiming: an idempotent request for an older candidate
+        // must never dispatch that obsolete revision over a newer round.
+        let child_runtime = message_future(load_child_runtime_for_run(&processor, &run.id))
+            .await?
+            .context("revision Task has no durable child runtime")?;
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
             processor.task_runtime.event_bus(),
             run.task_id.clone(),
             run.id.clone(),
         );
+        self.dispatch_claimed_revision(
+            Arc::clone(&processor),
+            task_response,
+            run,
+            agent_spec,
+            execution,
+            child_runtime,
+            handle,
+        )
+        .await?;
+        message_future(task_revise_response_from_store(&processor, response)).await
+    }
+
+    /// Both live admission and restart recovery enter with the same durable
+    /// execution claim. Keep authorization, write locks and failure completion
+    /// identical when resuming a request that has not created its Turn yet.
+    async fn dispatch_claimed_revision(
+        self: &Arc<Self>,
+        processor: Arc<MessageProcessor>,
+        task_response: TaskGetResponse,
+        run: TaskRun,
+        agent_spec: TaskAgentSpec,
+        execution: TaskRunExecution,
+        child_runtime: TaskRunChildRuntime,
+        handle: TaskExecutionHandle,
+    ) -> Result<()> {
         let revision_executor = Arc::clone(self);
         let revision_processor = Arc::clone(&processor);
         let failed_child = child_runtime.clone();
@@ -3210,7 +3266,7 @@ impl TaskAgentExecutor {
             }
             Ok(None) => {}
         }
-        message_future(task_revise_response_from_store(&processor, response)).await
+        Ok(())
     }
 
     async fn dispatch_existing_revision_turn(

@@ -34201,17 +34201,26 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
     };
     let turn = "cancel-transfer-turn";
     let start_id = generate_test_request_id("cancel-transfer", turn);
-    let start_processor = processor.clone();
     let start_context = sessions.connection_context(connection).await.unwrap();
-    let start_work = tokio::spawn(async move {
-        start_processor.process_owned_request(start_context, json!({
-            "jsonrpc":"2.0", "id":start_id, "method":"turn/start",
-            "params":{"thread_id":thread,"turn_id":turn,"input":[{"type":"text","text":"CURRENT CANCELLED INPUT"}],
-                "mode":"Agent","model":"gpt-5",
-                "execution_backend":{"type":"cliAgentRuntime","runtime_id":"codex","runtime_kind":CLIAgentRuntimeKind::Codex},
-                "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()}
-        }).to_string()).await;
-    });
+    let start_request = json!({
+        "jsonrpc":"2.0", "id":start_id, "method":"turn/start",
+        "params":{"thread_id":thread,"turn_id":turn,"input":[{"type":"text","text":"CURRENT CANCELLED INPUT"}],
+            "mode":"Agent","model":"gpt-5",
+            "execution_backend":{"type":"cliAgentRuntime","runtime_id":"codex","runtime_kind":CLIAgentRuntimeKind::Codex},
+            "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()}
+    })
+    .to_string();
+    let mut start_work = if pause_summarizer {
+        let start_processor = processor.clone();
+        let task = tokio::spawn(async move {
+            start_processor
+                .process_owned_request(start_context, start_request)
+                .await;
+        });
+        super::message_future(async move { task.await.unwrap() })
+    } else {
+        processor.process_request(&start_context, &start_request)
+    };
     if pause_summarizer {
         let summarizer_started = timeout(Duration::from_secs(180), async {
             while summary.call_count() == 0 {
@@ -34259,9 +34268,14 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
         .expect("paused foreground summarizer should forward its live heartbeat");
     } else {
         let background_cancel = background_lease.as_ref().unwrap().cancellation();
-        timeout(Duration::from_secs(180), background_cancel.cancelled())
-            .await
-            .expect("foreground transfer should reach the coordinator");
+        // Drive the request to the real coordinator wait, then leave it parked
+        // so Stop must complete without help from the preparation's cleanup.
+        tokio::select! {
+            reached = timeout(Duration::from_secs(180), background_cancel.cancelled()) => {
+                reached.expect("foreground transfer should reach the coordinator");
+            }
+            () = &mut start_work => panic!("foreground transfer should wait for the coordinator"),
+        }
     }
     if shutdown {
         processor.shutdown_cli_runtime_manager().await;
@@ -34277,8 +34291,7 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
     }
     timeout(Duration::from_secs(5), start_work)
         .await
-        .expect("cancelled preparation must join before the session can continue")
-        .unwrap();
+        .expect("cancelled preparation must join before the session can continue");
     assert!(
         cli.turn_starts.lock().await.is_empty(),
         "provider start is forbidden after Stop"
