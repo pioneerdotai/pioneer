@@ -1,0 +1,56 @@
+name: PR 306 native test probe
+on:
+  push:
+    branches: [ci/pr306-native-test-probe]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: 454221db0489bbb9fb06fb1baa98540fd5639401
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44533638112
+          artifact-ids: 14537284427
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/nextest
+          merge-multiple: true
+      - name: Run previous failures on the host
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -e /__w ]]; then
+            sudo ln -s "$(dirname "$(dirname "$GITHUB_WORKSPACE")")" /__w
+          fi
+          test "$GITHUB_WORKSPACE" -ef "/__w/$GITHUB_REPOSITORY"
+          google-chrome --version
+          curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "$RUNNER_TEMP"
+          case_filter="$(cat <<'FILTER'
+          test(=cli_runtime::opencode_session::startup_tests::failed_startup_retains_actual_process_and_reader_through_cancelled_stop_and_retry) |
+          test(=cli_runtime::opencode_session::startup_tests::startup_cancellation_during_address_wait_cleans_owned_children) |
+          test(=cli_runtime::opencode_session::startup_tests::startup_retry_requires_group_cleanup_even_when_descendant_closed_all_pipes) |
+          test(=database::maintenance::portable_payload::worker_tests::empty_worker_parks_until_signal_and_cancels_without_idle_polling) |
+          test(=handlers::shell::tests::command_output_commit_is_cancellable_without_a_storage_ack) |
+          test(=handlers::shell::tests::dropped_one_shot_dispatch_retains_child_and_async_cleanup_reaps_it) |
+          test(=handlers::shell::tests::exec_command_timeout_returns_structured_payload) |
+          test(=handlers::shell::tests::native_completion_reaps_yielded_persistent_sessions) |
+          test(=handlers::shell::tests::one_shot_reaps_descendant_that_keeps_pipes_open_after_parent_exit) |
+          test(=handlers::shell::tests::reader_panic_does_not_abandon_other_readers_or_other_owned_processes) |
+          test(=handlers::shell::tests::tty_exec_command_cancellation_removes_live_session) |
+          test(=handlers::shell::tests::write_stdin_cleans_up_expired_sessions) |
+          test(=message::html_tools::browser::tests::html_capture_presets_use_fresh_contexts_and_cancelled_process_profiles_are_reaped) |
+          test(=message::html_tools::browser::tests::html_initial_resource_load_and_errors_are_bounded_and_width_scoped) |
+          test(=message::tests::task_start_failure::revision_admission_and_recovery_share_one_execution_claim)
+          FILTER
+          )"
+          "$RUNNER_TEMP/cargo-nextest" nextest run \
+            --archive-file "$RUNNER_TEMP/nextest/nextest-tests.tar.zst" \
+            --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+            --test-threads 2 --no-fail-fast --retries 0 --status-level pass --failure-output immediate-final \
+            -E "$case_filter"
