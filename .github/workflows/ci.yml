@@ -23,8 +23,6 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
@@ -51,9 +49,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-${{ matrix.target }}
-
-      - uses: ./.github/actions/install-onnx-runtime-macos-x86_64
-        if: matrix.target == 'x86_64-apple-darwin'
 
       - name: cargo-check-workspace
         shell: bash
