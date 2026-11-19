@@ -25,10 +25,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          runner_work="$(dirname "$(dirname "$GITHUB_WORKSPACE")")"
           if [[ ! -e /__w ]]; then
-            sudo ln -s "$(dirname "$(dirname "$GITHUB_WORKSPACE")")" /__w
+            sudo ln -s "$runner_work" /__w
           fi
-          test "$GITHUB_WORKSPACE" -ef "/__w/$GITHUB_REPOSITORY"
+          test "$GITHUB_WORKSPACE" -ef "/__w/${GITHUB_WORKSPACE#"$runner_work"/}"
           google-chrome --version
           curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "$RUNNER_TEMP"
           case_filter="$(cat <<'FILTER'
