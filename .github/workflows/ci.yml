@@ -75,6 +75,14 @@ jobs:
     env: &linux-env
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       CARGO_BUILD_JOBS: 2
+      # The archive runs on other hosts. Compile Whisper for baseline x86-64.
+      GGML_NATIVE: "OFF"
+      GGML_SSE42: "OFF"
+      GGML_AVX: "OFF"
+      GGML_AVX2: "OFF"
+      GGML_BMI2: "OFF"
+      GGML_FMA: "OFF"
+      GGML_F16C: "OFF"
 
     steps:
       - uses: actions/checkout@v5
@@ -113,7 +121,7 @@ jobs:
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-v1
+          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-portable-whisper-v1
 
       - name: rustfmt-check
         shell: bash
@@ -175,6 +183,9 @@ jobs:
 
       # A separate Cargo invocation keeps CU features out of these server owners.
       - name: cargo-nextest-default-server-contracts
+        env:
+          # Keep concurrent Rust compilation and linking within runner capacity.
+          CARGO_BUILD_JOBS: 1
         shell: bash
         run: |
           set -euo pipefail

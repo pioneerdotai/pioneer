@@ -409,8 +409,8 @@ pub(super) async fn renew_same_subject(sessions: &SessionManager, connection: Co
 
 #[tokio::test]
 async fn native_replay_and_live_terminal_survive_same_socket_renewal_without_lost_cards() {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        for orphan in [false, true] {
+    for orphan in [false, true] {
+        tokio::time::timeout(Duration::from_secs(20), async {
             let mut f = Fixture::new(orphan).await;
             let (entered, release) = f.pause();
             let (id, mut opening) = f.open("renewal").await;
@@ -513,10 +513,10 @@ async fn native_replay_and_live_terminal_survive_same_socket_renewal_without_los
             f.outbound
                 .try_send_data(Message::Text("same socket remains live".into()))
                 .unwrap();
-        }
-    })
-    .await
-    .expect("native renewal watchdog");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("native renewal watchdog elapsed (orphan={orphan})"));
+    }
 }
 
 #[tokio::test]

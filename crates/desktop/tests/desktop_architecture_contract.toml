@@ -25,8 +25,8 @@ custom_elements = ["desktop-thread/src/timeline/markdown.rs:MarkdownLinkText"]
 # Catalog presentation: native MCP / Plugins headers and sidebar slots.
 # ImageViews: shared plugin catalogue / composer / timeline presentation leases.
 # Image publication and bounded byte/disk caching remain owned by Client.
-foundation_modules = ["avatar", "image_surface", "binding", "catalog_binding", "identity", "package_upload", "catalog_presentation", "catalog_details_header", "catalog_card", "image_views", "catalog_summary_card"]
-foundation_sources = ["avatar.rs", "binding.rs", "catalog_binding.rs", "catalog_card.rs", "catalog_details_header.rs", "catalog_presentation.rs", "catalog_summary_card.rs", "identity.rs", "image_surface.rs", "image_views.rs", "lib.rs", "package_upload.rs"]
+foundation_modules = ["avatar", "image_surface", "binding", "catalog_binding", "identity", "package_upload", "catalog_presentation", "catalog_details_header", "catalog_icon", "catalog_card", "image_views", "catalog_summary_card", "settings_surface", "catalog_list"]
+foundation_sources = ["avatar.rs", "binding.rs", "catalog_binding.rs", "catalog_card.rs", "catalog_details_header.rs", "catalog_icon.rs", "catalog_list.rs", "catalog_presentation.rs", "catalog_summary_card.rs", "identity.rs", "image_surface.rs", "image_views.rs", "lib.rs", "package_upload.rs", "settings_surface.rs"]
 # Framework creates this transient host through on_drag's Entity<W: Render> API.
 # Its value preview has no retained UI behavior or cache.
 framework_hosts = ["desktop-workspaces/src/drag_preview.rs:SidebarDragSession"]
