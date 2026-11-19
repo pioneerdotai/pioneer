@@ -189,6 +189,9 @@ jobs:
 
       - name: archive-workspace-tests
         id: archive
+        env:
+          # Concurrent compilation nearly exhausted RAM and swap before SIGTERM.
+          CARGO_BUILD_JOBS: 1
         shell: bash
         run: |
           set -euo pipefail
