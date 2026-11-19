@@ -2897,9 +2897,10 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
                     .is_none()
             );
             let activations = harness.cli_session.turn_starts.lock().await.len();
+            let revision_native_turn_id = "native-revision-race-followup";
             harness
                 .cli_session
-                .set_next_native_turn_id("native-revision-race")
+                .set_next_native_turn_id(revision_native_turn_id)
                 .await;
             let now = now_timestamp_secs();
             if case == "request_first" {
@@ -3016,7 +3017,7 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
             };
             assert_eq!(
                 revision_binding.native_turn_id.as_deref(),
-                Some("native-revision-race"),
+                Some(revision_native_turn_id),
                 "{case}: activation must belong to this revision"
             );
             assert_eq!(
