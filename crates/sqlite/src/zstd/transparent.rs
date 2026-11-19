@@ -518,6 +518,12 @@ fn create_insert_trigger(
                 dictcol = escape_sqlite_identifier(&dict_id)
             ));
             columns_selection.push(String::from(&dict_id));
+        } else if matches!(table_name, "turn_event" | "turn_item") && c.name == "portable_identity"
+        {
+            insert_selection.push("coalesce(new.portable_identity,'')".into());
+        } else if matches!(table_name, "turn_event" | "turn_item") && c.name == "portable_revision"
+        {
+            insert_selection.push("coalesce(new.portable_revision,0)".into());
         } else {
             insert_selection.push(format_sqlite!("new.{}", &c.name));
         }
@@ -580,6 +586,30 @@ fn create_update_triggers(
     primary_key_condition: &str,
     _config: &TransparentCompressConfig,
 ) -> anyhow::Result<()> {
+    // Stage-one turn publication changes source representation and reference
+    // atomically. Per-column view triggers cannot preserve that boundary. Keep
+    // this exception limited to the two admitted turn payload targets.
+    if matches!(table_name, "turn_event" | "turn_item")
+        && columns_info.iter().any(|c| c.name == "payload_payload_id")
+    {
+        // Mirrors the upgrade migration when transparent storage is installed
+        // later on a fresh database. Index only old raw rows, never PPAY work.
+        db.execute(&format!("CREATE INDEX IF NOT EXISTS {index} ON {backing}(_payload_dict) WHERE portable_identity='' AND _payload_dict IS NULL",
+            index=escape_sqlite_identifier(&format!("{table_name}_payload_legacy_pending")),
+            backing=escape_sqlite_identifier(internal_table_name)), [])
+            .context("could not create legacy turn payload pending index")?;
+        let assignments = columns_info.iter().filter(|c| !c.is_dict_id).map(|c| {
+            let column = escape_sqlite_identifier(&c.name);
+            if c.to_compress {
+                format!("{column}=CASE WHEN new.{column} IS old.{column} THEN {column} ELSE new.{column} END, {dict}=CASE WHEN new.{column} IS old.{column} THEN {dict} ELSE NULL END", dict=escape_sqlite_identifier(&get_dict_id(&c.name)))
+            } else { format!("{column}=new.{column}") }
+        }).collect::<Vec<_>>().join(",");
+        db.execute(&format!("CREATE TRIGGER {trigger} INSTEAD OF UPDATE ON {view} BEGIN UPDATE {backing} SET {assignments} WHERE {primary_key_condition}; END",
+            trigger=escape_sqlite_identifier(&format!("{table_name}_portable_update_trigger")),
+            view=escape_sqlite_identifier(table_name), backing=escape_sqlite_identifier(internal_table_name)), [])
+            .context("could not create atomic portable turn update trigger")?;
+        return Ok(());
+    }
     for col in columns_info {
         if col.is_dict_id {
             continue;

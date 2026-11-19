@@ -155,3 +155,5 @@ pub(crate) mod task_occurrence_producers;
 pub mod execution_observability;
 pub(crate) mod plugin_metadata;
 pub(crate) mod thread_episodic_search;
+
+pub(crate) mod turn_payload;

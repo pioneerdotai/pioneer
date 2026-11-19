@@ -176,7 +176,8 @@ impl LifecycleFacts {
                     &i.item_id,
                     &i.item_type,
                     &i.status,
-                    &i.payload,
+                    &i.portable_identity,
+                    i.portable_revision,
                 )
             }) == fresh.item.as_ref().map(|i| {
                 (
@@ -185,7 +186,8 @@ impl LifecycleFacts {
                     &i.item_id,
                     &i.item_type,
                     &i.status,
-                    &i.payload,
+                    &i.portable_identity,
+                    i.portable_revision,
                 )
             })
             && self.stopped == fresh.stopped
@@ -312,7 +314,12 @@ pub(crate) async fn prepare_lifecycle(
     if !queue::owns(&store.connection, claim).await? {
         return Ok(None);
     }
-    let facts = LifecycleFacts::read(&store.connection, claim.operation_id()).await?;
+    let mut facts = LifecycleFacts::read(&store.connection, claim.operation_id()).await?;
+    if let Some(item) = facts.item.take() {
+        facts.item = super::turn_payload::hydrate_items(&store.connection, vec![item])
+            .await?
+            .pop();
+    }
     let mut prepared = PreparedCompactionLifecycle {
         claim: claim.clone(),
         facts,

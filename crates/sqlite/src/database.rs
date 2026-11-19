@@ -185,7 +185,7 @@ impl SqliteReadPool {
         }
         let bindings = crate::blob_range::bindings(&mut guard)?;
         let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
-        // Attribute only the five portable source columns. Frozen-history and
+        // Attribute only the installed portable source columns. Frozen-history and
         // other native readers keep their existing read/admission/pool signals.
         let mut native = match (source.table, source.column) {
             ("tool_output_chunk", "text") => Some(NativeRead::new(PortableFamily::ToolText)),
@@ -199,6 +199,12 @@ impl SqliteReadPool {
                 Some(NativeRead::new(PortableFamily::TaskHistory))
             }
             ("task_event", "payload_json") => Some(NativeRead::new(PortableFamily::TaskEvent)),
+            ("turn_event" | "_turn_event_zstd", "payload") => {
+                Some(NativeRead::new(PortableFamily::TurnEvent))
+            }
+            ("turn_item" | "_turn_item_zstd", "payload") => {
+                Some(NativeRead::new(PortableFamily::TurnItem))
+            }
             _ => None,
         };
         // Keep the recorder outside the resource-owning future. On Ready and

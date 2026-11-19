@@ -712,7 +712,7 @@ pub async fn transition_prepared_running_attempt_to_timed_out<C: ConnectionTrait
     // when the backing row changed, so changes()/rows_affected cannot prove
     // whether the conditional update won. Verify the exact stored CAS result
     // while the caller's transaction still owns the writer instead.
-    let item_updated = crate::repositories::turn::find_turn_item(
+    let item_updated = crate::repositories::turn::find_turn_item_metadata(
         db,
         attempt.turn_id.as_str(),
         attempt.item_id.as_str(),
@@ -939,7 +939,7 @@ pub async fn reactivate_prepared_timed_out_attempt<C: ConnectionTrait>(
         .await
         .context("failed to reactivate timed_out turn item")?;
 
-    let item_updated = crate::repositories::turn::find_turn_item(
+    let item_updated = crate::repositories::turn::find_turn_item_metadata(
         db,
         prepared.turn_id.as_str(),
         prepared.item_id.as_str(),
@@ -1187,7 +1187,7 @@ pub(crate) async fn close_prepared_terminal_running_attempts<C: ConnectionTrait>
             .await
             .context("failed to terminalize running turn item")?;
 
-        let item_updated = crate::repositories::turn::find_turn_item(
+        let item_updated = crate::repositories::turn::find_turn_item_metadata(
             db,
             attempt.turn_id.as_str(),
             attempt.item_id.as_str(),

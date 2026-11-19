@@ -25,7 +25,7 @@ pub use super::compaction_lifecycle_pending::{
     CompactionLifecycleCandidate, CompactionLifecycleClaim, CompactionLifecycleStorageError,
 };
 use crate::CrudStore;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 pub use background::CompletedHistoryCheck;
 #[cfg(any(test, feature = "test-support"))]
 pub use frozen_import::{CheckpointImportGraphReadObserver, observe_checkpoint_import_graph_reads};
@@ -450,8 +450,8 @@ pub(crate) async fn compaction_item_created_at(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn compaction_source_page_inner(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -474,8 +474,8 @@ pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
     .await
 }
 
-pub(crate) async fn compaction_source_page_inner_bounded<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn compaction_source_page_inner_bounded(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -534,6 +534,7 @@ struct CanonicalProjection<E: EntityTrait, P = SourcePaging> {
     query: sea_orm::Select<E>,
     id: E::Column,
     payload: E::Column,
+    portable: Option<(E::Column, super::portable_payload::Family)>,
     revision: Expr,
     present: Expr,
     paging: P,
@@ -563,8 +564,8 @@ struct CanonicalSourceMetadata {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
-    db: &C,
+async fn read_source_page<E: EntityTrait>(
+    db: &pioneer_sqlite::SqliteDatabase,
     projection: CanonicalProjection<E>,
     kind: PagedSource,
     turn: &str,
@@ -574,10 +575,10 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
     before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
 ) -> Result<SourcePage> {
     let kind = CanonicalSource::from(kind);
-    let payload_bytes: Expr = Func::char_length(
-        Expr::col((E::default(), projection.payload)).cast_as(Alias::new("BLOB")),
-    )
-    .into();
+    let payload_bytes = logical_payload_bytes::<E>(
+        projection.payload,
+        projection.portable.map(|(reference, _)| reference),
+    );
     let rows = projection
         .query
         .clone()
@@ -626,6 +627,10 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
     let mut bytes = 0usize;
     for row in rows {
         let size = row.bytes;
+        ensure!(
+            !include_payload || size >= 0,
+            "canonical portable payload size missing"
+        );
         if include_payload
             && size >= 0
             && size as usize <= SOURCE_PAGE_BYTES
@@ -636,21 +641,23 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
         let payload = if !include_payload || size < 0 || size as usize > SOURCE_PAGE_BYTES {
             None
         } else {
-            projection
-                .query
-                .clone()
-                .select_only()
-                .column(projection.payload)
-                .filter(projection.id.eq(row.id.clone()))
-                .filter(projection.revision.clone().eq(row.revision))
-                .filter(
-                    payload_bytes
-                        .clone()
-                        .lte((SOURCE_PAGE_BYTES - bytes) as u64),
-                )
-                .into_tuple::<String>()
-                .one(db)
-                .await?
+            read_source_payload(
+                db,
+                CanonicalProjection {
+                    query: projection.query.clone(),
+                    id: projection.id,
+                    payload: projection.payload,
+                    portable: projection.portable,
+                    revision: projection.revision.clone(),
+                    // Discovery also supports old rows whose revision is
+                    // not registered yet; preserve that page contract.
+                    present: Expr::val(1_i64),
+                    paging: (),
+                },
+                &row.id,
+                row.revision,
+            )
+            .await?
         };
         // Reader capacity is released before parsing or assembling the page.
         bytes += payload.as_ref().map_or(0, String::len);
@@ -717,6 +724,7 @@ fn turn_input_projection(
             .filter(turn_input::Column::TurnId.eq(turn_id)),
         id: turn_input::Column::Id,
         payload: turn_input::Column::Payload,
+        portable: None,
         revision: Func::coalesce([
             Expr::col((
                 compaction_input_revision::Entity,
@@ -805,6 +813,10 @@ fn turn_event_projection(
             .filter(turn_event::Column::TurnId.eq(turn_id)),
         id: turn_event::Column::Id,
         payload: turn_event::Column::Payload,
+        portable: Some((
+            turn_event::Column::PayloadPayloadId,
+            super::portable_payload::Family::TurnEvent,
+        )),
         revision: Func::coalesce([
             Expr::col((
                 compaction_event_revision::Entity,
@@ -882,6 +894,7 @@ fn turn_llm_context_projection(
             .filter(turn_llm_context::Column::TurnId.eq(turn_id)),
         id: turn_llm_context::Column::Id,
         payload: turn_llm_context::Column::Payload,
+        portable: None,
         revision: Func::coalesce([
             Expr::col((
                 compaction_source_revision::Entity,
@@ -957,6 +970,10 @@ fn turn_item_projection(
             .filter(turn_item::Column::TurnId.eq(turn_id)),
         id: turn_item::Column::Id,
         payload: turn_item::Column::Payload,
+        portable: Some((
+            turn_item::Column::PayloadPayloadId,
+            super::portable_payload::Family::TurnItem,
+        )),
         revision: Func::coalesce([
             Expr::col((
                 compaction_item_revision::Entity,
@@ -2946,8 +2963,8 @@ pub(crate) async fn compaction_source_fragment(
         .await
 }
 
-pub(crate) async fn compaction_payload_fragment<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn compaction_payload_fragment(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -3095,38 +3112,57 @@ pub(crate) async fn tool_result_access_source(
     turn: &str,
     item: &str,
 ) -> Result<Option<serde_json::Value>> {
-    let row = store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "SELECT ti.item_type AS item_type, json_extract(ti.payload,'$.toolName') AS tool_name, \
-         CASE WHEN json_extract(ti.payload,'$.toolName') IN ('threads_list','threads_history_read','threads_children_list','threads_tools_result_read') \
-         THEN json_extract(ti.payload,'$.arguments') ELSE NULL END AS arguments \
-         FROM turn_item ti JOIN turn t ON t.id=ti.turn_id JOIN thread th ON th.id=t.thread_id \
-         WHERE th.workspace_id=? AND t.thread_id=? AND t.id=? AND ti.item_id=? AND t.message_deleted_at IS NULL \
-         AND ti.item_type IN ('command_execution','file_change','web_search','web_fetch','download','dynamic_tool_call')",
-        vec![workspace.into(), thread.into(), turn.into(), item.into()])).await?;
-    let Some(row) = row else {
+    let query = scoped_tool_item(workspace, thread, turn, item)
+        .filter(turn::Column::MessageDeletedAt.is_null())
+        .filter(turn_item::Column::ItemType.is_in([
+            "command_execution",
+            "file_change",
+            "web_search",
+            "web_fetch",
+            "download",
+            "dynamic_tool_call",
+        ]));
+    let Some(row) = super::turn_payload::items(&store.connection, query.limit(1))
+        .await?
+        .pop()
+    else {
         return Ok(None);
     };
-    let arguments: Option<String> = row.try_get("", "arguments")?;
+    let value = super::turn_payload::json1_fields(&row.payload, &["toolName"])?;
+    let tool = value.get("toolName").and_then(|v| v.as_str());
+    let arguments = if matches!(
+        tool,
+        Some(
+            "threads_list"
+                | "threads_history_read"
+                | "threads_children_list"
+                | "threads_tools_result_read"
+        )
+    ) {
+        let value = super::turn_payload::json1_fields(&row.payload, &["arguments"])?;
+        match value.get("arguments") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(text)) => {
+                Some(serde_json::from_str::<serde_json::Value>(text)?)
+            }
+            Some(value) => Some(value.clone()),
+        }
+    } else {
+        None
+    };
     Ok(Some(
-        serde_json::json!({"itemType":row.try_get::<String>("", "item_type")?,
-        "toolName":row.try_get::<Option<String>>("", "tool_name")?,
-        "arguments":arguments.map(|arguments| serde_json::from_str::<serde_json::Value>(&arguments)).transpose()?}),
+        serde_json::json!({"itemType":row.item_type,"toolName":tool,"arguments":arguments}),
     ))
 }
 
-/// Prefer an already retained full shell source. Other tools use their canonical result.
-/// Both lookups and fragments retain the same workspace/thread/turn scope.
-pub(crate) async fn compaction_tool_result_fragment(
-    store: &CrudStore,
+// Typed canonical owner lookup shared by the two JSON-dependent tool reads.
+fn scoped_tool_item(
     workspace: &str,
-    thread: &str,
-    turn: &str,
+    thread_id: &str,
+    turn_id: &str,
     item: &str,
-    expected_revision: Option<&str>,
-    character_offset: u64,
-) -> Result<Option<CanonicalFragment>> {
-    let row = turn_item::Entity::find()
-        .select_only()
+) -> sea_orm::Select<turn_item::Entity> {
+    turn_item::Entity::find()
         .join(
             JoinType::InnerJoin,
             turn_item::Entity::belongs_to(turn::Entity)
@@ -3141,49 +3177,47 @@ pub(crate) async fn compaction_tool_result_fragment(
                 .to(thread::Column::Id)
                 .into(),
         )
-        .expr(Expr::col((turn_item::Entity, turn_item::Column::Id)))
-        .filter(
-            Expr::col((thread::Entity, thread::Column::WorkspaceId))
-                .eq(Expr::Value(workspace.into()))
-                .and(
-                    Expr::col((turn::Entity, turn::Column::ThreadId))
-                        .eq(Expr::Value(thread.into())),
+        .filter(thread::Column::WorkspaceId.eq(workspace))
+        .filter(turn::Column::ThreadId.eq(thread_id))
+        .filter(turn::Column::Id.eq(turn_id))
+        .filter(turn_item::Column::ItemId.eq(item))
+}
+
+/// Prefer an already retained full shell source. Other tools use their canonical result.
+/// Both lookups and fragments retain the same workspace/thread/turn scope.
+pub(crate) async fn compaction_tool_result_fragment(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    item: &str,
+    expected_revision: Option<&str>,
+    character_offset: u64,
+) -> Result<Option<CanonicalFragment>> {
+    let source = super::turn_payload::items(
+        &store.connection,
+        scoped_tool_item(workspace, thread, turn, item).limit(1),
+    )
+    .await?
+    .pop();
+    if let Some(source) = source {
+        // Malformed legacy JSON did not satisfy the old json_valid predicate.
+        // Portable integrity failures have already propagated from hydration.
+        if super::turn_payload::json1_value(&source.payload).is_ok_and(|payload| {
+            payload.pointer("/storage/kind").and_then(|v| v.as_str()) == Some("shell")
+        }) {
+            return store
+                .compaction_payload_fragment(
+                    workspace,
+                    thread,
+                    turn,
+                    &source.id,
+                    expected_revision,
+                    character_offset,
+                    CanonicalSource::ToolItem,
                 )
-                .and(
-                    Expr::col((turn_item::Entity, turn_item::Column::TurnId))
-                        .eq(Expr::Value(turn.into())),
-                )
-                .and(
-                    Expr::col((turn_item::Entity, turn_item::Column::ItemId))
-                        .eq(Expr::Value(item.into())),
-                )
-                .and(Expr::expr(Func::cust(Alias::new("json_valid")).args([
-                    Expr::col((turn_item::Entity, turn_item::Column::Payload)),
-                ])))
-                .and(
-                    Expr::expr(Func::cust(Alias::new("json_extract")).args([
-                        Expr::col((turn_item::Entity, turn_item::Column::Payload)),
-                        Expr::val("$.storage.kind"),
-                    ]))
-                    .eq(Expr::val("shell")),
-                ),
-        )
-        .limit(1)
-        .into_tuple::<String>()
-        .one(&store.connection)
-        .await?;
-    if let Some(id) = row {
-        return store
-            .compaction_payload_fragment(
-                workspace,
-                thread,
-                turn,
-                &id,
-                expected_revision,
-                character_offset,
-                CanonicalSource::ToolItem,
-            )
-            .await;
+                .await;
+        }
     }
     let Some(id) = store
         .compaction_tool_result_id(workspace, thread, turn, item)
@@ -3588,22 +3622,61 @@ pub(crate) async fn compaction_reference_payload(
     Ok(payload)
 }
 
-async fn read_source_payload<C: ConnectionTrait, E: EntityTrait, P>(
-    db: &C,
+fn logical_payload_bytes<E: EntityTrait>(payload: E::Column, reference: Option<E::Column>) -> Expr {
+    let plain: Expr = Func::cust(Alias::new("octet_length"))
+        .arg(Expr::col((E::default(), payload)))
+        .into();
+    match reference {
+        None => plain,
+        Some(reference) => {
+            use pioneer_entity::portable_payload as p;
+            Expr::case(Expr::col((E::default(), reference)).is_null(), plain)
+                .finally(Expr::from(
+                    Query::select()
+                        .column(p::Column::OriginalBytes)
+                        .from(p::Entity)
+                        .and_where(
+                            Expr::col((p::Entity, p::Column::Id))
+                                .eq(Expr::col((E::default(), reference))),
+                        )
+                        .to_owned(),
+                ))
+                .into()
+        }
+    }
+}
+
+async fn read_source_payload<E: EntityTrait, P>(
+    db: &pioneer_sqlite::SqliteDatabase,
     projection: CanonicalProjection<E, P>,
     id: &str,
     expected_revision: i64,
 ) -> Result<Option<String>> {
-    Ok(projection
+    let reference = projection
+        .portable
+        .map_or(Expr::val(Option::<String>::None), |(column, _)| {
+            Expr::col((E::default(), column))
+        });
+    let row = projection
         .query
         .select_only()
         .column(projection.payload)
+        .expr(reference)
         .filter(projection.id.eq(id))
         .filter(projection.revision.eq(expected_revision))
         .filter(projection.present.eq(1_i64))
-        .into_tuple::<String>()
+        .into_tuple::<(String, Option<String>)>()
         .one(db)
-        .await?)
+        .await?;
+    let Some((plain, id)) = row else {
+        return Ok(None);
+    };
+    match projection.portable {
+        Some((_, family)) => Ok(Some(
+            super::portable_payload::hydrate(db, family, id.as_deref(), plain).await?,
+        )),
+        None => Ok(Some(plain)),
+    }
 }
 
 #[derive(FromQueryResult)]
@@ -4105,12 +4178,85 @@ struct SourceFragmentRow {
     characters: i64,
 }
 
-async fn read_source_fragment<C: ConnectionTrait, E: EntityTrait, P>(
-    db: &C,
+async fn read_source_fragment<E: EntityTrait, P>(
+    db: &pioneer_sqlite::SqliteDatabase,
     projection: CanonicalProjection<E, P>,
     id: &str,
     offset: i64,
 ) -> Result<Option<SourceFragmentRow>> {
+    if let Some((reference, family)) = projection.portable {
+        use pioneer_entity::portable_payload as p;
+        // Capture the raw fallback and legacy fragment with their reference in
+        // one snapshot. A second source SELECT could otherwise see publication
+        // or a logical replacement instead of the value whose header we read.
+        let raw = Query::select()
+            .column(p::Column::Raw)
+            .from(p::Entity)
+            .and_where(
+                Expr::col((p::Entity, p::Column::Id)).eq(Expr::col((E::default(), reference))),
+            )
+            .to_owned();
+        let source = projection
+            .query
+            .clone()
+            .select_only()
+            .expr(projection.revision.clone())
+            .column(reference)
+            .expr(
+                Expr::case(
+                    Expr::from(raw).eq(1_i64),
+                    Expr::col((E::default(), projection.payload)),
+                )
+                .finally(Expr::val(Option::<String>::None)),
+            )
+            .expr(Func::cust(Alias::new("substr")).args([
+                Expr::col((E::default(), projection.payload)),
+                Expr::val(offset),
+                Expr::val(16384_i64),
+            ]))
+            .expr(Func::char_length(Expr::col((
+                E::default(),
+                projection.payload,
+            ))))
+            .filter(projection.id.eq(id))
+            .filter(projection.present.clone().eq(1_i64))
+            .into_tuple::<(i64, Option<String>, Option<String>, String, i64)>()
+            .one(db)
+            .await?;
+        let Some((revision, payload_id, raw, fragment, characters)) = source else {
+            return Ok(None);
+        };
+        if let Some(id) = payload_id {
+            let meta = super::portable_payload::header(db, &id, family).await?;
+            let fragment = if meta.raw == 0 {
+                String::from_utf8(
+                    super::portable_payload::read_range(db, &meta, offset - 1, 16384, true).await?,
+                )?
+            } else {
+                let plain = super::portable_payload::hydrate_header(
+                    db,
+                    &meta,
+                    raw.context("portable raw source missing")?,
+                )
+                .await?;
+                plain
+                    .chars()
+                    .skip(usize::try_from(offset - 1)?)
+                    .take(16384)
+                    .collect()
+            };
+            return Ok(Some(SourceFragmentRow {
+                revision,
+                fragment,
+                characters: meta.original_chars,
+            }));
+        }
+        return Ok(Some(SourceFragmentRow {
+            revision,
+            fragment,
+            characters,
+        }));
+    }
     Ok(projection
         .query
         .select_only()

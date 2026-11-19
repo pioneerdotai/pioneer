@@ -70868,6 +70868,7 @@ async fn materialize_synthetic_large_turn_fixture(
                 lease_expires_at: Set(None),
                 created_at: Set(occurred_at),
                 updated_at: Set(occurred_at),
+                ..Default::default()
             });
             projection_rows.push(turn_work_item_projection::ActiveModel {
                 work_item_id: Set(pioneer_crud::work_item_projection_id(
@@ -71024,6 +71025,7 @@ async fn materialize_synthetic_long_thread_fixture(
                 lease_expires_at: Set(None),
                 created_at: Set(started_at),
                 updated_at: Set(completed_at),
+                ..Default::default()
             });
             projection_rows.push(turn_work_item_projection::ActiveModel {
                 work_item_id: Set(work_item_id),

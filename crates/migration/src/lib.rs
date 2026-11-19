@@ -31,6 +31,8 @@ mod portable_payload_target;
 mod m20261111_000001_plugin_ownership;
 mod m20261112_000001_package_installations;
 
+mod m20261115_000001_portable_turn_payload;
+
 pub struct Migrator;
 
 pub mod stable_skill_id;
@@ -252,6 +254,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261108_000001_sqlite_memory_search::Migration),
             Box::new(m20261111_000001_plugin_ownership::Migration),
             Box::new(m20261112_000001_package_installations::Migration),
+            Box::new(m20261115_000001_portable_turn_payload::Migration),
         ]
     }
 }

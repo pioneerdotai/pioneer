@@ -43,48 +43,109 @@ pub struct PostTurnToolSummary {
     pub error_class: Option<pioneer_protocol::ToolErrorClass>,
 }
 
-pub async fn post_turn_tool_summaries<C: ConnectionTrait>(
-    db: &C,
+#[derive(FromQueryResult)]
+struct PostTurnToolCandidate {
+    #[sea_orm(nested)]
+    row: turn_item::Model,
+    cursor_created_at: String,
+}
+
+pub async fn post_turn_tool_summaries(
+    db: &pioneer_sqlite::SqliteDatabase,
     turn_id: &str,
     limit: usize,
 ) -> Result<Vec<PostTurnToolSummary>> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT item_id, item_type, active_attempt_number, \
-         substr(json_extract(payload, '$.toolName'), 1, 160) AS tool_name, \
-         json_extract(payload, '$.success') AS success, \
-         json_extract(payload, '$.outcome.status') AS outcome_status, \
-         json_extract(payload, '$.outcome.errorClass') AS error_class \
-         FROM turn_item WHERE turn_id = ? AND status IN ('completed', 'failed') \
-         AND json_type(payload, '$.toolName') = 'text' \
-         AND json_type(payload, '$.success') IN ('true', 'false') \
-         ORDER BY created_at ASC, item_id ASC LIMIT ?",
-            [turn_id.into(), (limit.clamp(1, 129) as i64).into()],
-        ))
-        .await?;
-    rows.into_iter()
-        .map(|row| {
-            let outcome: Option<String> = row.try_get("", "outcome_status")?;
-            let error: Option<String> = row.try_get("", "error_class")?;
-            Ok(PostTurnToolSummary {
-                item_id: row.try_get("", "item_id")?,
-                item_type: crate::convention::turn_item_type_from_db(
-                    &row.try_get::<String>("", "item_type")?,
+    let limit = limit.clamp(1, 129);
+    // The former SQL projection retained only small fields. Hydrate one body
+    // at a time so large portable results cannot accumulate while filtering.
+    const PAGE_ROWS: u64 = 1;
+    let mut result = Vec::new();
+    // SQLite orders the stored TEXT. Re-encoding its timestamp through chrono
+    // can change that text (for example T/Z to spaces/+00:00) and repeat a page.
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let mut query = turn_item::Entity::find()
+            .filter(turn_item::Column::TurnId.eq(turn_id))
+            .filter(turn_item::Column::Status.is_in(["completed", "failed"]))
+            .order_by_asc(turn_item::Column::CreatedAt)
+            .order_by_asc(turn_item::Column::ItemId)
+            .limit(PAGE_ROWS);
+        if let Some((time, id)) = &after {
+            query = query.filter(
+                Condition::any()
+                    .add(turn_item::Column::CreatedAt.gt(time.clone()))
+                    .add(
+                        Condition::all()
+                            .add(turn_item::Column::CreatedAt.eq(time.clone()))
+                            .add(turn_item::Column::ItemId.gt(id)),
+                    ),
+            );
+        }
+        let (rows, cursor) = crate::CrudStore::new(db.clone())
+            .run_scoped_database_quantum(|| async {
+                let candidates = query
+                    .clone()
+                    .expr_as(
+                        Expr::col((turn_item::Entity, turn_item::Column::CreatedAt))
+                            .cast_as(Alias::new("TEXT")),
+                        "cursor_created_at",
+                    )
+                    .into_model::<PostTurnToolCandidate>()
+                    .all(db)
+                    .await?;
+                let cursor = candidates
+                    .last()
+                    .map(|c| (c.cursor_created_at.clone(), c.row.item_id.clone()));
+                let rows = super::turn_payload::hydrate_items(
+                    db,
+                    candidates.into_iter().map(|c| c.row).collect(),
                 )
-                .context("unknown post-turn tool item type")?,
-                tool_name: row.try_get("", "tool_name")?,
-                attempt_number: u32::try_from(row.try_get::<i64>("", "active_attempt_number")?)?,
-                success: row.try_get::<i64>("", "success")? != 0,
-                outcome_status: outcome
-                    .map(|v| serde_json::from_value(serde_json::Value::String(v)))
-                    .transpose()?,
-                error_class: error
-                    .map(|v| serde_json::from_value(serde_json::Value::String(v)))
-                    .transpose()?,
+                .await?;
+                Ok((rows, cursor))
             })
-        })
-        .collect()
+            .await?;
+        let eof = rows.len() < PAGE_ROWS as usize;
+        after = cursor;
+        for row in rows {
+            let value = super::turn_payload::json1_value(&row.payload)?;
+            let Some(tool) = value.get("toolName").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(success) = value.get("success").and_then(|v| v.as_bool()) else {
+                continue;
+            };
+            result.push(PostTurnToolSummary {
+                item_id: row.item_id,
+                item_type: crate::convention::turn_item_type_from_db(&row.item_type)
+                    .context("unknown post-turn tool item type")?,
+                tool_name: tool
+                    .split('\0')
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(160)
+                    .collect(),
+                attempt_number: u32::try_from(row.active_attempt_number)?,
+                success,
+                outcome_status: value
+                    .pointer("/outcome/status")
+                    .filter(|v| !v.is_null())
+                    .map(|v| serde_json::from_value(v.clone()))
+                    .transpose()?,
+                error_class: value
+                    .pointer("/outcome/errorClass")
+                    .filter(|v| !v.is_null())
+                    .map(|v| serde_json::from_value(v.clone()))
+                    .transpose()?,
+            });
+            if result.len() == limit {
+                return Ok(result);
+            }
+        }
+        if eof {
+            return Ok(result);
+        }
+    }
 }
 
 /// Bounded original user messages for post-turn processing. Read the canonical
@@ -1502,7 +1563,7 @@ impl PreparedTurnItemProjection {
             self.item_type.as_str(),
             "user_message" | "agent_message" | "task"
         ) {
-            let current = find_turn_item(db, &self.turn_id, &self.item_id).await?;
+            let current = find_turn_item_metadata(db, &self.turn_id, &self.item_id).await?;
             if current.as_ref().is_none_or(|row| {
                 !crate::thread_episodic_source::source_status_is_committed(row.status.as_deref())
             }) {
@@ -1560,6 +1621,7 @@ pub(crate) async fn upsert_prepared_turn_item<C: ConnectionTrait>(
         lease_expires_at: Set(None),
         created_at: Set(prepared.created_at),
         updated_at: Set(prepared.updated_at),
+        ..Default::default()
     })
     .on_conflict(
         OnConflict::columns([turn_item::Column::TurnId, turn_item::Column::ItemId])
@@ -1683,7 +1745,7 @@ pub async fn find_turn_item_type<C: ConnectionTrait>(
     Ok(row.map(|row| row.item_type))
 }
 
-pub async fn find_turn_item<C: ConnectionTrait>(
+pub(crate) async fn find_turn_item_metadata<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
     item_id: &str,
@@ -1694,6 +1756,22 @@ pub async fn find_turn_item<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query turn item row")
+}
+
+pub async fn find_turn_item(
+    db: &pioneer_sqlite::SqliteDatabase,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<Option<turn_item::Model>> {
+    Ok(super::turn_payload::items(
+        db,
+        turn_item::Entity::find()
+            .filter(turn_item::Column::TurnId.eq(turn_id))
+            .filter(turn_item::Column::ItemId.eq(item_id))
+            .limit(1),
+    )
+    .await?
+    .pop())
 }
 
 pub(crate) async fn is_completed_agent_message<C: ConnectionTrait>(
@@ -1718,6 +1796,7 @@ pub(crate) async fn is_completed_agent_message<C: ConnectionTrait>(
 /// SQL snapshot. No non-page body participates in the final-answer lookup.
 #[derive(Debug, FromQueryResult)]
 pub(crate) struct TimelineAssistantItemRow {
+    pub payload_payload_id: Option<String>,
     pub turn_id: String,
     pub item_id: String,
     pub item_type: String,
@@ -1726,8 +1805,8 @@ pub(crate) struct TimelineAssistantItemRow {
     pub is_last_final: bool,
 }
 
-pub(crate) async fn timeline_assistant_items<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn timeline_assistant_items(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace_id: &str,
     thread_id: &str,
     targets: &[(String, String)],
@@ -1809,6 +1888,7 @@ pub(crate) async fn timeline_assistant_items<C: ConnectionTrait>(
                 turn_item::Column::ItemId,
                 turn_item::Column::ItemType,
                 turn_item::Column::Payload,
+                turn_item::Column::PayloadPayloadId,
                 turn_item::Column::Status,
             ])
             .column_as(Expr::exists(newer).not(), "is_last_final")
@@ -1835,20 +1915,45 @@ pub(crate) async fn timeline_assistant_items<C: ConnectionTrait>(
             .context("failed to load exact timeline assistant items")?;
         result.extend(rows);
     }
+    let holds = result
+        .iter()
+        .map(|row| {
+            row.payload_payload_id
+                .as_deref()
+                .map(|id| {
+                    super::portable_payload::PayloadReadHold::capture(
+                        id,
+                        super::portable_payload::Family::TurnItem,
+                    )
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (row, hold) in result.iter_mut().zip(holds) {
+        row.payload = super::portable_payload::hydrate_with_hold(
+            db,
+            super::portable_payload::Family::TurnItem,
+            row.payload_payload_id.as_deref(),
+            std::mem::take(&mut row.payload),
+            hold.as_ref(),
+        )
+        .await?;
+    }
     Ok(result)
 }
 
 /// Only exact source messages, never all bodies in a source Turn.
 #[derive(FromQueryResult)]
 pub(crate) struct ExactAgentMessageRow {
+    pub payload_payload_id: Option<String>,
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
     pub payload: String,
 }
 
-pub(crate) async fn exact_agent_messages<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn exact_agent_messages(
+    db: &pioneer_sqlite::SqliteDatabase,
     workspace: &str,
     targets: &[(String, String, String)],
 ) -> Result<Vec<ExactAgentMessageRow>> {
@@ -1872,6 +1977,7 @@ pub(crate) async fn exact_agent_messages<C: ConnectionTrait>(
                     turn_item::Column::TurnId,
                     turn_item::Column::ItemId,
                     turn_item::Column::Payload,
+                    turn_item::Column::PayloadPayloadId,
                 ])
                 .join(
                     JoinType::InnerJoin,
@@ -1896,11 +2002,35 @@ pub(crate) async fn exact_agent_messages<C: ConnectionTrait>(
                 .context("failed to load exact source messages")?,
         );
     }
+    let holds = rows
+        .iter()
+        .map(|row| {
+            row.payload_payload_id
+                .as_deref()
+                .map(|id| {
+                    super::portable_payload::PayloadReadHold::capture(
+                        id,
+                        super::portable_payload::Family::TurnItem,
+                    )
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (row, hold) in rows.iter_mut().zip(holds) {
+        row.payload = super::portable_payload::hydrate_with_hold(
+            db,
+            super::portable_payload::Family::TurnItem,
+            row.payload_payload_id.as_deref(),
+            std::mem::take(&mut row.payload),
+            hold.as_ref(),
+        )
+        .await?;
+    }
     Ok(rows)
 }
 
-pub async fn list_turn_items_by_ids<C: ConnectionTrait>(
-    db: &C,
+pub async fn list_turn_items_by_ids(
+    db: &pioneer_sqlite::SqliteDatabase,
     turn_id: &str,
     item_ids: &[String],
 ) -> Result<Vec<turn_item::Model>> {
@@ -1908,31 +2038,35 @@ pub async fn list_turn_items_by_ids<C: ConnectionTrait>(
         return Ok(Vec::new());
     }
 
-    turn_item::Entity::find()
-        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(turn_item::Column::ItemId.is_in(item_ids.iter().cloned()))
-        .all(db)
-        .await
-        .context("failed to query turn item rows by id")
+    super::turn_payload::items(
+        db,
+        turn_item::Entity::find()
+            .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+            .filter(turn_item::Column::ItemId.is_in(item_ids.iter().cloned())),
+    )
+    .await
+    .context("failed to query turn item rows by id")
 }
 
-pub async fn list_turn_items_by_type<C: ConnectionTrait>(
-    db: &C,
+pub async fn list_turn_items_by_type(
+    db: &pioneer_sqlite::SqliteDatabase,
     turn_id: &str,
     item_type: &str,
 ) -> Result<Vec<turn_item::Model>> {
-    turn_item::Entity::find()
-        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(turn_item::Column::ItemType.eq(item_type.to_owned()))
-        .order_by_asc(turn_item::Column::CreatedAt)
-        .order_by_asc(turn_item::Column::ItemId)
-        .all(db)
-        .await
-        .context("failed to query turn item rows by type")
+    super::turn_payload::items(
+        db,
+        turn_item::Entity::find()
+            .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+            .filter(turn_item::Column::ItemType.eq(item_type.to_owned()))
+            .order_by_asc(turn_item::Column::CreatedAt)
+            .order_by_asc(turn_item::Column::ItemId),
+    )
+    .await
+    .context("failed to query turn item rows by type")
 }
 
-pub async fn list_turn_items_by_type_for_turns<C: ConnectionTrait>(
-    db: &C,
+pub async fn list_turn_items_by_type_for_turns(
+    db: &pioneer_sqlite::SqliteDatabase,
     turn_ids: &[String],
     item_type: &str,
 ) -> Result<Vec<turn_item::Model>> {
@@ -1940,15 +2074,17 @@ pub async fn list_turn_items_by_type_for_turns<C: ConnectionTrait>(
         return Ok(Vec::new());
     }
 
-    turn_item::Entity::find()
-        .filter(turn_item::Column::TurnId.is_in(turn_ids.iter().cloned()))
-        .filter(turn_item::Column::ItemType.eq(item_type.to_owned()))
-        .order_by_asc(turn_item::Column::TurnId)
-        .order_by_asc(turn_item::Column::CreatedAt)
-        .order_by_asc(turn_item::Column::ItemId)
-        .all(db)
-        .await
-        .context("failed to query turn item rows by type for turns")
+    super::turn_payload::items(
+        db,
+        turn_item::Entity::find()
+            .filter(turn_item::Column::TurnId.is_in(turn_ids.iter().cloned()))
+            .filter(turn_item::Column::ItemType.eq(item_type.to_owned()))
+            .order_by_asc(turn_item::Column::TurnId)
+            .order_by_asc(turn_item::Column::CreatedAt)
+            .order_by_asc(turn_item::Column::ItemId),
+    )
+    .await
+    .context("failed to query turn item rows by type for turns")
 }
 
 pub async fn find_terminal_turns_for_thread<C: ConnectionTrait>(
@@ -2362,19 +2498,21 @@ pub async fn find_turn_inputs_for_turns<C: ConnectionTrait>(
         .context("failed to query turn inputs for turns")
 }
 
-pub async fn find_completed_turn_items<C: ConnectionTrait>(
-    db: &C,
+pub async fn find_completed_turn_items(
+    db: &pioneer_sqlite::SqliteDatabase,
     turn_id: &str,
 ) -> Result<Vec<turn_item::Model>> {
-    turn_item::Entity::find()
-        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(turn_item::Column::ItemType.eq("agent_message"))
-        .filter(turn_item::Column::Status.eq("completed"))
-        .order_by_asc(turn_item::Column::CreatedAt)
-        .order_by_asc(turn_item::Column::ItemId)
-        .all(db)
-        .await
-        .context("failed to query completed turn items")
+    super::turn_payload::items(
+        db,
+        turn_item::Entity::find()
+            .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+            .filter(turn_item::Column::ItemType.eq("agent_message"))
+            .filter(turn_item::Column::Status.eq("completed"))
+            .order_by_asc(turn_item::Column::CreatedAt)
+            .order_by_asc(turn_item::Column::ItemId),
+    )
+    .await
+    .context("failed to query completed turn items")
 }
 
 pub async fn count_completed_turns_for_thread<C: ConnectionTrait>(
@@ -2664,7 +2802,7 @@ mod tests {
             .await
             .expect("turn_item insert should work through sqlite-zstd view");
 
-        let inserted = find_turn_item(&connection, "turn_item_zstd", "item_zstd")
+        let inserted = find_turn_item_metadata(&connection, "turn_item_zstd", "item_zstd")
             .await
             .expect("turn_item query should work")
             .expect("turn_item row should exist");
@@ -2685,7 +2823,7 @@ mod tests {
             .await
             .expect("turn_item update should work through sqlite-zstd view");
 
-        let stored = find_turn_item(&connection, "turn_item_zstd", "item_zstd")
+        let stored = find_turn_item_metadata(&connection, "turn_item_zstd", "item_zstd")
             .await
             .expect("updated turn_item query should work")
             .expect("updated turn_item row should exist");

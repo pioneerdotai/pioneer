@@ -991,7 +991,7 @@ fn prepare_payload_rows(
 // is not evidence that the final event has been projected. A missing stream
 // only admits legacy Turns with no canonical events.
 fn compression_eligibility_sql() -> &'static str {
-    "EXISTS(SELECT 1 FROM turn AS owner WHERE owner.id=target.turn_id \
+    "target.portable_identity='' AND EXISTS(SELECT 1 FROM turn AS owner WHERE owner.id=target.turn_id \
      AND owner.status IN ('completed','failed','interrupted') \
      AND NOT EXISTS(SELECT 1 FROM turn_event AS pending \
        WHERE pending.turn_id=owner.id AND pending.sequence > COALESCE(\
@@ -1846,13 +1846,16 @@ mod tests {
         let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
         options.max_connections(1).sqlx_logging(false);
         let writer = Database::connect(options).await.unwrap();
-        Migrator::up(&writer, None).await.unwrap();
+        Migrator::up(&writer, Some((Migrator::migrations().len() - 1) as u32))
+            .await
+            .unwrap();
         writer
             .execute_unprepared("PRAGMA journal_mode=WAL")
             .await
             .unwrap();
         insert_turn_events(&writer, texts.len() as i64).await;
         insert_turn_items(&writer, texts.len() as i64).await;
+        Migrator::up(&writer, None).await.unwrap();
         let mut options =
             ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
         options
@@ -2978,11 +2981,12 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
+        Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
             .await
             .expect("migrations must succeed");
         insert_turn_events(&connection, 120).await;
 
+        Migrator::up(&connection, None).await.unwrap();
         let store = CrudStore::new(connection.clone());
         let cancellation = tokio_util::sync::CancellationToken::new();
         let summaries = ensure_compression_schema(
@@ -3221,7 +3225,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
+        Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
             .await
             .expect("migrations must succeed");
 
@@ -3233,6 +3237,7 @@ mod tests {
         )
         .await;
 
+        Migrator::up(&connection, None).await.unwrap();
         let store = CrudStore::new(connection.clone());
         let summary = run_startup_once(&store, TURN_EVENT_PAYLOAD, None, 1.0)
             .await
@@ -3304,7 +3309,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
+        Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
             .await
             .expect("migrations must succeed");
 
@@ -3358,6 +3363,7 @@ mod tests {
         assert_eq!(backing_table_after_insert, 0);
 
         insert_turn_events_with_offset(&connection, 120, 1_000).await;
+        Migrator::up(&connection, None).await.unwrap();
         let compression = run_startup_once(&store, TURN_EVENT_PAYLOAD, None, 1.0)
             .await
             .expect("compression should enable after a new database accumulates rows");
@@ -3377,17 +3383,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maintenance_compresses_rows_inserted_after_transparent_enable() {
+    async fn legacy_maintenance_excludes_rows_inserted_after_portable_cutover() {
         pioneer_sqlite::zstd::register_auto_extension_once()
             .expect("sqlite-zstd auto-extension should register");
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
+        Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
             .await
             .expect("migrations must succeed");
 
         insert_turn_events(&connection, 120).await;
+        Migrator::up(&connection, None).await.unwrap();
         let store = CrudStore::new(connection.clone());
         run_startup_once(&store, TURN_EVENT_PAYLOAD, None, 1.0)
             .await
@@ -3403,12 +3410,13 @@ mod tests {
 
         let summary = run_startup_once(&store, TURN_EVENT_PAYLOAD, None, 1.0)
             .await
-            .expect("maintenance should compress later inserts");
+            .expect("legacy maintenance must leave admitted portable rows alone");
 
         assert!(!summary.enabled_now);
         assert!(summary.already_enabled);
-        assert_eq!(summary.pending_before, 20);
+        assert_eq!(summary.pending_before, 0);
         assert_eq!(summary.pending_after, 0);
+        assert_eq!(query_i64(&connection,"SELECT COUNT(*) AS value FROM _turn_event_zstd WHERE portable_identity<>'' AND _payload_dict IS NULL").await,20);
     }
 
     #[tokio::test]
@@ -3419,7 +3427,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
+        Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
             .await
             .expect("migrations must succeed");
 
@@ -3431,6 +3439,7 @@ mod tests {
         )
         .await;
 
+        Migrator::up(&connection, None).await.unwrap();
         let store = CrudStore::new(connection.clone());
         let summary = run_startup_once(&store, TURN_ITEM_PAYLOAD, None, 1.0)
             .await
@@ -3529,11 +3538,12 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
+        Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
             .await
             .expect("migrations must succeed");
         insert_turn_items(&connection, 120).await;
 
+        Migrator::up(&connection, None).await.unwrap();
         let store = CrudStore::new(connection.clone());
         run_startup_once(&store, TURN_ITEM_PAYLOAD, None, 1.0)
             .await
@@ -3629,7 +3639,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
+        Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
             .await
             .expect("migrations must succeed");
 
@@ -3665,12 +3675,6 @@ mod tests {
         assert_eq!(backing_table_count, 0);
 
         insert_turn_items(&connection, 3).await;
-        let item = store
-            .get_turn_item("turn_item_zstd", "item_0")
-            .await
-            .expect("new turn_item should read through CrudStore")
-            .expect("new turn_item should exist");
-        assert!(matches!(item, TurnItem::AgentMessage { .. }));
 
         let backing_table_after_insert = query_i64(
             &connection,
@@ -3680,6 +3684,13 @@ mod tests {
         assert_eq!(backing_table_after_insert, 0);
 
         insert_turn_items_with_offset(&connection, 120, 1_000).await;
+        Migrator::up(&connection, None).await.unwrap();
+        let item = store
+            .get_turn_item("turn_item_zstd", "item_0")
+            .await
+            .expect("new turn_item should read through CrudStore")
+            .expect("new turn_item should exist");
+        assert!(matches!(item, TurnItem::AgentMessage { .. }));
         let compression = run_startup_once(&store, TURN_ITEM_PAYLOAD, None, 1.0)
             .await
             .expect("turn_item compression should enable after enough rows accumulate");
@@ -3705,7 +3716,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
+        Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
             .await
             .expect("migrations must succeed");
 
@@ -3732,6 +3743,7 @@ mod tests {
 
         insert_turn_events(&connection, 120).await;
         insert_turn_items(&connection, 120).await;
+        Migrator::up(&connection, None).await.unwrap();
 
         let outcome = run_periodic_maintenance_once(&store, ZSTD_PAYLOAD_COLUMNS, None, 1.0)
             .await
@@ -3787,11 +3799,12 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
+        Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
             .await
             .expect("migrations must succeed");
         insert_turn_events(&connection, 3).await;
 
+        Migrator::up(&connection, None).await.unwrap();
         let store = CrudStore::new(connection);
         let interactive_store = store.clone();
         let entered = Arc::new(Notify::new());

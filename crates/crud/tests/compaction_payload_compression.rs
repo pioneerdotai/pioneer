@@ -1,7 +1,7 @@
 use migration::Migrator;
 use pioneer_crud::CrudStore;
 use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
 use std::path::{Path, PathBuf};
 
 struct TestFile(PathBuf);
@@ -1668,4 +1668,569 @@ async fn portable_unavailable_history_pages_yield_and_revisit_without_blocking_o
             .history_json,
         history
     );
+}
+
+fn stage_one_completion() -> pioneer_protocol::ItemCompletedNotification {
+    pioneer_protocol::ItemCompletedNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item: pioneer_protocol::TurnItem::SystemEvent {
+            id: "stage-one-item".into(),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "точные portable bytes 🦀\n".repeat(12000),
+            code: Some("stage.one.fixture".into()),
+            details: None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn portable_turn_payload_real_producer_restart_retry_and_corruption() {
+    let (file, store, writer) = fixture().await;
+    // Remove the unrelated noncanonical fixture bodies. The real producer below
+    // owns sequence allocation, item projection, receipts and watermark.
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event; DELETE FROM turn_item")
+        .await
+        .unwrap();
+    let completion = stage_one_completion();
+    store
+        .materialize_item_snapshot_updated(
+            pioneer_protocol::ItemUpdatedNotification {
+                workspace_id: completion.workspace_id.clone(),
+                thread_id: completion.thread_id.clone(),
+                turn_id: completion.turn_id.clone(),
+                item: completion.item.clone(),
+            },
+            1_700_000_099,
+        )
+        .await
+        .unwrap();
+    let mut snapshot = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..5000 {
+        if !snapshot.quantum(&store).await.unwrap() {
+            break;
+        }
+    }
+    // The snapshot producer does not create a canonical event or watermark.
+    // No pending event exists, so this terminal item must still reach PPAY.
+    assert_eq!(scalar(&store, "SELECT count(*) n FROM turn_event").await, 0);
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM turn_item WHERE payload_payload_id IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        store.get_turn_item("turn", "stage-one-item").await.unwrap(),
+        Some(completion.item.clone())
+    );
+    store
+        .materialize_item_completed(completion.clone(), 1_700_000_100)
+        .await
+        .unwrap();
+    store
+        .materialize_item_completed(completion.clone(), 1_700_000_100)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_turn_item("turn", "stage-one-item").await.unwrap(),
+        Some(completion.item.clone())
+    );
+    let mut preparation = pioneer_crud::PortablePayloadProgress::default();
+    let mut staged = false;
+    for _ in 0..500 {
+        preparation.quantum(&store).await.unwrap();
+        if scalar(&store,"SELECT count(*) n FROM portable_payload_block WHERE payload_id IN (SELECT id FROM portable_payload WHERE family IN ('turn.event','turn.item'))").await > 0 { staged=true; break }
+    }
+    assert!(staged, "restart must interrupt real PPAY staging");
+    drop(preparation);
+    drop(store);
+    drop(writer);
+    let (reopened, _writer2) = open(&file.0).await;
+    let mut progress = pioneer_crud::PortablePayloadProgress::default();
+    let mut eof = false;
+    for _ in 0..5000 {
+        if !progress.quantum(&reopened).await.unwrap() {
+            eof = true;
+            break;
+        }
+    }
+    assert!(
+        eof,
+        "bounded portable passes must finish without another event"
+    );
+    assert_eq!(
+        scalar(
+            &reopened,
+            "SELECT count(*) n FROM turn_event WHERE payload_payload_id IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &reopened,
+            "SELECT count(*) n FROM turn_item WHERE payload_payload_id IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        reopened
+            .get_turn_item("turn", "stage-one-item")
+            .await
+            .unwrap(),
+        Some(completion.item.clone())
+    );
+    // Replay must use logical PPAY bytes, not compare an empty source placeholder.
+    reopened
+        .materialize_item_completed(completion.clone(), 1_700_000_100)
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar(&reopened, "SELECT count(*) n FROM turn_event").await,
+        1
+    );
+    assert_eq!(scalar(&reopened,"SELECT count(*) n FROM portable_payload WHERE family IN ('turn.event','turn.item') AND retired=0 AND raw=0").await,2);
+    reopened.database_connection().execute_unprepared("DELETE FROM portable_payload_block WHERE payload_id=(SELECT payload_payload_id FROM turn_item WHERE item_id='stage-one-item') AND ordinal=0").await.unwrap();
+    let error = reopened
+        .get_turn_item("turn", "stage-one-item")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("portable payload block"),
+        "{error:#}"
+    );
+    // Remove that independent fault before testing the event header. Otherwise
+    // a later item preflight could make the next negative control pass falsely.
+    reopened
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_item WHERE item_id='stage-one-item'")
+        .await
+        .unwrap();
+    reopened
+        .materialize_item_completed(completion.clone(), 1_700_000_100)
+        .await
+        .unwrap();
+    reopened.database_connection().execute_unprepared("DELETE FROM portable_payload WHERE id=(SELECT payload_payload_id FROM turn_event LIMIT 1)").await.unwrap();
+    let error = reopened
+        .materialize_item_completed(completion, 1_700_000_100)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("portable"),
+        "missing header lost its portable error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn portable_turn_upgrade_keeps_plain_and_zstd_incarnations_legacy() {
+    use migration::MigratorTrait;
+    for compressed in [false, true] {
+        pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+        let file = TestFile(std::env::temp_dir().join(format!(
+            "pioneer-stage1-upgrade-{}.sqlite",
+            uuid::Uuid::new_v4()
+        )));
+        let (store, writer) = open(&file.0).await;
+        let before_stage = (Migrator::migrations().len() - 1) as u32;
+        writer
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(before_stage))
+            .await
+            .unwrap();
+        for sql in [
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ] {
+            store
+                .database_connection()
+                .execute_unprepared(sql)
+                .await
+                .unwrap();
+        }
+        let completion = stage_one_completion();
+        let event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(completion.clone());
+        let event_json = serde_json::to_string(&event).unwrap();
+        let item_json = serde_json::to_string(&completion.item).unwrap();
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,idempotency_key,created_at) VALUES ('zz-legacy','thread','turn',1,'item/completed',?,?,CURRENT_TIMESTAMP)",
+            [event_json.clone().into(),event.idempotency_key().unwrap().into()])).await.unwrap();
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,active_attempt_number,payload,created_at,updated_at) VALUES ('zz-item','turn','stage-one-item','system_event',NULL,0,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            [item_json.into()])).await.unwrap();
+        if compressed {
+            for table in ["turn_event", "turn_item"] {
+                enable(&store, table).await;
+                compress(&store, table).await;
+            }
+        }
+        writer
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+        // This is an old storage snapshot; reading and metadata UPDATE must
+        // preserve its legacy admission, independently of projection readiness.
+        assert_eq!(
+            store.get_turn_item("turn", "stage-one-item").await.unwrap(),
+            Some(completion.item.clone())
+        );
+        store.database_connection().execute_unprepared("UPDATE turn_event SET payload=payload WHERE id='zz-legacy'; UPDATE turn_item SET updated_at=CURRENT_TIMESTAMP WHERE id='zz-item'").await.unwrap();
+        drop(store);
+        drop(writer);
+        let (reopened, _writer2) = open(&file.0).await;
+        let mut progress = pioneer_crud::PortablePayloadProgress::default();
+        for _ in 0..500 {
+            if !progress.quantum(&reopened).await.unwrap() {
+                break;
+            }
+        }
+        assert_eq!(scalar(&reopened,"SELECT count(*) n FROM turn_event WHERE id='zz-legacy' AND portable_identity='' AND payload_payload_id IS NULL").await,1);
+        assert_eq!(scalar(&reopened,"SELECT count(*) n FROM turn_item WHERE id='zz-item' AND portable_identity='' AND payload_payload_id IS NULL").await,1);
+        assert_eq!(
+            scalar(
+                &reopened,
+                "SELECT count(*) n FROM portable_payload WHERE family IN ('turn.event','turn.item')"
+            )
+            .await,
+            0
+        );
+
+        // A new real producer shares the same upgraded history with the old
+        // snapshot. Its independent Turn lets the actual projector own all
+        // new receipts; no legacy watermark is fabricated by this fixture.
+        reopened.database_connection().execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('new-turn','thread','completed','conversation','user','1900-01-01T00:00:00Z','1900-01-01T00:00:00Z')").await.unwrap();
+        let mut new = stage_one_completion();
+        new.turn_id = "new-turn".into();
+        if let pioneer_protocol::TurnItem::SystemEvent { id, .. } = &mut new.item {
+            *id = "new-portable-item".into();
+        }
+        reopened
+            .materialize_item_completed(new.clone(), 1_700_000_100)
+            .await
+            .unwrap();
+        let mut mixed = pioneer_crud::PortablePayloadProgress::default();
+        for _ in 0..5000 {
+            if !mixed.quantum(&reopened).await.unwrap() {
+                break;
+            }
+        }
+        assert_eq!(scalar(&reopened,"SELECT count(*) n FROM turn_event WHERE turn_id='new-turn' AND payload_payload_id IS NOT NULL").await,1);
+        assert_eq!(
+            reopened
+                .get_turn_item("new-turn", "new-portable-item")
+                .await
+                .unwrap(),
+            Some(new.item)
+        );
+        let history = reopened
+            .get_thread_history("thread", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.events.len(), 2);
+        assert!(history.events.iter().any(|e| e.turn_id == "turn"));
+        assert!(history.events.iter().any(|e| e.turn_id == "new-turn"));
+        assert_eq!(scalar(&reopened,"SELECT count(*) n FROM turn_event WHERE id='zz-legacy' AND portable_identity='' AND payload_payload_id IS NULL").await,1);
+        // An INSERT with an old key is a new incarnation, regardless of timestamp.
+        reopened
+            .database_connection()
+            .execute_unprepared("DELETE FROM turn_event WHERE id='zz-legacy'")
+            .await
+            .unwrap();
+        reopened.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('zz-legacy','thread','turn',1,'item/completed',?,'1900-01-01T00:00:00Z')",[event_json.into()])).await.unwrap();
+        assert_eq!(
+            scalar(
+                &reopened,
+                "SELECT count(*) n FROM turn_event WHERE id='zz-legacy' AND portable_identity<>''"
+            )
+            .await,
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn portable_turn_stale_preparation_cannot_publish_into_reinserted_id() {
+    use pioneer_compaction::SourceRef;
+    let (_file, store, _writer) = fixture().await;
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event; DELETE FROM turn_item")
+        .await
+        .unwrap();
+    let completion = stage_one_completion();
+    store
+        .materialize_item_completed(completion.clone(), 1_700_000_100)
+        .await
+        .unwrap();
+    let source = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT id,portable_identity FROM turn_event LIMIT 1",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let id: String = source.try_get("", "id").unwrap();
+    let old_identity: String = source.try_get("", "portable_identity").unwrap();
+    let mut progress = pioneer_crud::PortablePayloadProgress::default();
+    let mut staged = false;
+    for _ in 0..500 {
+        progress.quantum(&store).await.unwrap();
+        if scalar(
+            &store,
+            "SELECT count(*) n FROM portable_payload WHERE family='turn.event' AND retired=1",
+        )
+        .await
+            > 0
+        {
+            staged = true;
+            break;
+        }
+    }
+    assert!(staged, "race must interrupt a real staged turn event");
+    let mut replacement = completion.clone();
+    if let pioneer_protocol::TurnItem::SystemEvent { message, .. } = &mut replacement.item {
+        *message = "replacement incarnation 🦀 ".repeat(12000);
+    }
+    let payload = serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        replacement,
+    ))
+    .unwrap();
+    let db = store.database_connection();
+    let tx = db.begin().await.unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM turn_event WHERE id=?",
+        [id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',1,'item/completed',?,'1900-01-01T00:00:00Z')",[id.clone().into(),payload.clone().into()])).await.unwrap();
+    tx.commit().await.unwrap();
+    for _ in 0..500 {
+        if !progress.quantum(&store).await.unwrap() {
+            break;
+        }
+    }
+    let current = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT portable_identity,payload_payload_id FROM turn_event WHERE id=?",
+            [id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        current.try_get::<String>("", "portable_identity").unwrap(),
+        old_identity
+    );
+    let mut restarted = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..5000 {
+        if !restarted.quantum(&store).await.unwrap() {
+            break;
+        }
+    }
+    let revision=scalar(&store,"SELECT revision n FROM compaction_event_revision WHERE present=1 ORDER BY revision DESC LIMIT 1").await;
+    assert_eq!(
+        store
+            .compaction_reference_payload(
+                "ws",
+                "thread",
+                &SourceRef {
+                    scope: "event:turn".into(),
+                    id: id.clone(),
+                    version: format!("event-revision:{revision}")
+                }
+            )
+            .await
+            .unwrap(),
+        Some(payload)
+    );
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM portable_payload WHERE family='turn.event' AND retired=1"
+        )
+        .await,
+        0
+    );
+    // A logical replacement of a published item keeps its incarnation, retires
+    // old storage, and reaches terminal raw fallback for a tiny complete value.
+    let identity = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT portable_identity FROM turn_item WHERE item_id='stage-one-item'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "portable_identity")
+        .unwrap();
+    let mut tiny = completion.item.clone();
+    if let pioneer_protocol::TurnItem::SystemEvent { message, code, .. } = &mut tiny {
+        *message = "x".into();
+        *code = None;
+    }
+    store
+        .materialize_item_updated(
+            pioneer_protocol::ItemUpdatedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: tiny.clone(),
+            },
+            1_700_000_101,
+        )
+        .await
+        .unwrap();
+    let mut updated = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..5000 {
+        if !updated.quantum(&store).await.unwrap() {
+            break;
+        }
+    }
+    assert_eq!(
+        store.get_turn_item("turn", "stage-one-item").await.unwrap(),
+        Some(tiny.clone())
+    );
+    let current=db.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT i.portable_identity,p.raw FROM turn_item i JOIN portable_payload p ON p.id=i.payload_payload_id WHERE i.item_id='stage-one-item'")).await.unwrap().unwrap();
+    assert_eq!(
+        current.try_get::<String>("", "portable_identity").unwrap(),
+        identity
+    );
+    assert_eq!(current.try_get::<i64>("", "raw").unwrap(), 1);
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM portable_payload WHERE family='turn.item' AND retired=0"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM portable_payload WHERE family='turn.item' AND retired=1"
+        )
+        .await,
+        0
+    );
+    let raw_source = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT i.id,r.revision,p.id payload_id,p.sha256 FROM turn_item i JOIN compaction_item_revision r ON r.source_id=i.id AND r.turn_id=i.turn_id JOIN portable_payload p ON p.id=i.payload_payload_id WHERE i.item_id='stage-one-item'"
+    )).await.unwrap().unwrap();
+    let raw_reference = SourceRef {
+        scope: "item:turn".into(),
+        id: raw_source.try_get("", "id").unwrap(),
+        version: format!(
+            "item-revision:{}",
+            raw_source.try_get::<i64>("", "revision").unwrap()
+        ),
+    };
+    assert_eq!(
+        store
+            .compaction_reference_fragment("ws", "thread", &raw_reference, 0)
+            .await
+            .unwrap()
+            .unwrap()
+            .text,
+        serde_json::to_string(&tiny).unwrap()
+    );
+    // Raw fallback has no encoded blocks. Its full digest must still be
+    // verified before compaction returns even a small character fragment.
+    let raw_payload_id: String = raw_source.try_get("", "payload_id").unwrap();
+    let raw_sha256: Vec<u8> = raw_source.try_get("", "sha256").unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE portable_payload SET sha256=zeroblob(32) WHERE id=?",
+        [raw_payload_id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let error = store
+        .compaction_reference_fragment("ws", "thread", &raw_reference, 0)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("portable raw payload mismatch"),
+        "{error:#}"
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE portable_payload SET sha256=? WHERE id=?",
+        [raw_sha256.into(), raw_payload_id.into()],
+    ))
+    .await
+    .unwrap();
+    let tx = db.begin().await.unwrap();
+    tx.execute_unprepared(
+        "UPDATE turn_item SET payload='rollback-only' WHERE item_id='stage-one-item'",
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(
+        store
+            .get_turn_item("turn", "stage-one-item")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM portable_payload WHERE family='turn.item' AND retired=0"
+        )
+        .await,
+        1
+    );
+    db.execute_unprepared("DELETE FROM turn_item WHERE item_id='stage-one-item'")
+        .await
+        .unwrap();
+    let mut cleanup = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..500 {
+        if !cleanup.quantum(&store).await.unwrap() {
+            break;
+        }
+    }
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM portable_payload WHERE family='turn.item'"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn logical_tool_summary_keeps_json1_first_label_and_filtered_limit() {
+    let (_file, store, _writer) = fixture().await;
+    let db = store.database_connection();
+    for (id, payload) in [
+        ("0-no-tool", r#"{"success":true}"#),
+        (
+            "1-first",
+            r#"{"toolName":"first\u0000suffix","toolName":"wrong","success":true,"success":false}"#,
+        ),
+        ("2-later", r#"{"toolName":"later","success":false}"#),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,active_attempt_number,payload,created_at,updated_at) VALUES (?,'turn',?,'dynamic_tool_call','completed',1,?,'1900-01-01T00:00:00Z','1900-01-01T00:00:00Z')",
+            [id.into(),id.into(),payload.into()])).await.unwrap();
+    }
+    let summary = store.post_turn_tool_summaries("turn", 1).await.unwrap();
+    assert_eq!(summary.len(), 1);
+    assert_eq!(summary[0].item_id, "1-first");
+    assert_eq!(summary[0].tool_name, "first");
+    assert!(summary[0].success);
 }
