@@ -2981,24 +2981,48 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
                     pioneer_tasks::TaskExecutorRecoveryOutcome::Recovered
                 );
             }
+            // Activation runs asynchronously. Observe the provider start before
+            // polling SQLite so the test does not compete with admission reads.
+            let starts =
+                wait_for_cli_runtime_turn_starts(&harness.cli_session, activations + 1).await;
             let revision_binding = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if let Some(binding) = store
                         .get_cli_runtime_turn_binding(&revised.child_turn_id)
                         .await
                         .unwrap()
-                        && binding.native_turn_id.as_deref() == Some("native-revision-race")
+                        && binding.native_turn_id.is_some()
                     {
                         break binding;
                     }
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             })
-            .await
-            .expect("revision native activation must become durable");
+            .await;
+            let revision_binding = match revision_binding {
+                Ok(binding) => binding,
+                Err(_) => {
+                    let turn = store
+                        .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                        .await
+                        .unwrap()
+                        .map(|(_, turn)| (turn.status, turn.error));
+                    panic!(
+                        "{case}: revision activation was not persisted, provider starts: {} → {}, turn: {turn:?}",
+                        activations,
+                        starts.len(),
+                    );
+                }
+            };
             assert_eq!(
-                harness.cli_session.turn_starts.lock().await.len(),
-                activations + 1
+                revision_binding.native_turn_id.as_deref(),
+                Some("native-revision-race"),
+                "{case}: activation must belong to this revision"
+            );
+            assert_eq!(
+                starts.len(),
+                activations + 1,
+                "{case}: only the winning admission may start the provider"
             );
             assert_eq!(
                 store
