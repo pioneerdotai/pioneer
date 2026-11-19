@@ -54,4 +54,4 @@ jobs:
             --archive-file "$RUNNER_TEMP/nextest/nextest-tests.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
             --test-threads 2 --no-fail-fast --retries 0 --status-level pass --failure-output immediate-final \
-            -E "$case_filter"
+            -E "(package(pioneer-gateway) | package(pioneer-tools)) & ($case_filter)"
