@@ -1728,7 +1728,7 @@ pub(super) async fn seed_legacy_frozen_header(db: &pioneer_sqlite::SqliteDatabas
 }
 
 #[cfg(test)]
-pub(super) async fn seed_compressed_sources(db: &SqliteDatabase) {
+pub(super) async fn seed_compressed_sources(db: &pioneer_sqlite::SqliteDatabase) {
     use pioneer_crud_conversations::{turn_event, turn_item};
     use pioneer_crud_payloads::storage::PreparedPayload;
 
