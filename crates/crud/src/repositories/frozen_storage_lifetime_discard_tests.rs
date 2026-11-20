@@ -124,7 +124,7 @@ async fn later_candidate(store: &CrudStore) {
         owner: row.owner,
         previous: row.previous,
         summary: row.summary,
-        selection: serde_json::from_str(&row.selection).unwrap(),
+        selection: serde_json::from_value(row.selection.clone()).unwrap(),
         coverage: sources
             .into_iter()
             .map(|s| SourceRef {
@@ -176,7 +176,7 @@ async fn unusable_runner_refuses_one_visit_without_hiding_later_work() {
                 // Character length is below 256 KiB; actual UTF-8 bytes exceed it.
                 let json = if bad == "oversize" {
                     let mut terminal_state: RunnerState =
-                        serde_json::from_str(&state.state).unwrap();
+                        serde_json::from_value(state.state.clone()).unwrap();
                     terminal_state.diagnostic =
                         Some(pioneer_compaction::runner::FailureDiagnostic::new(
                             "fixture",
@@ -283,7 +283,7 @@ async fn late_read_uses_current_status_generation_and_binding_and_writer_recheck
                     .await
                     .unwrap()
                     .unwrap();
-                let mut state: RunnerState = serde_json::from_str(&row.state).unwrap();
+                let mut state: RunnerState = serde_json::from_value(row.state).unwrap();
                 if change == "generation" {
                     state.generation += 1;
                 }

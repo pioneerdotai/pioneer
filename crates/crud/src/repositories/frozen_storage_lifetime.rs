@@ -7149,7 +7149,7 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                    let mut state: RunnerState = serde_json::from_str(&row.state).unwrap();
+                    let mut state: RunnerState = serde_json::from_value(row.state).unwrap();
                     state.generation += 1;
                     store.connection.execute_raw(Statement::from_sql_and_values(
                         DbBackend::Sqlite,

@@ -26,12 +26,13 @@ fn event_name(runtime_home: &Path) -> io::Result<Vec<u16>> {
     }
     // Task Scheduler and the interactive CLI may run in different sessions.
     // The descriptor derives from the creating user's Windows token.
-    Ok(
-        format!("Global\\PioneerGatewayShutdown-{:x}", hash.finalize())
-            .encode_utf16()
-            .chain(Some(0))
-            .collect(),
+    Ok(format!(
+        "Global\\PioneerGatewayShutdown-{}",
+        hex::encode(hash.finalize())
     )
+    .encode_utf16()
+    .chain(Some(0))
+    .collect())
 }
 
 pub(crate) struct ShutdownEvent(OwnedHandle);

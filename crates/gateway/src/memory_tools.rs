@@ -1819,6 +1819,16 @@ pub(super) fn classify_memory_manifest_failure(
                 return failure;
             }
             Some(SqlxError::Database(database)) => {
+                if database
+                    .try_downcast_ref::<sea_orm::SqlxPostgresError>()
+                    .is_some_and(|error| {
+                        matches!(error.code().as_bytes(), [b'0', b'8', ..] | b"57P03")
+                            || postgres_memory_write_conflict(error)
+                    })
+                {
+                    failure.class = MemoryManifestFailureClass::StorageTransient;
+                    return failure;
+                }
                 // A numeric code from another backend cannot establish SQLite origin.
                 if let Some(sqlite) =
                     database.try_downcast_ref::<sea_orm::sqlx::sqlite::SqliteError>()
@@ -1848,7 +1858,7 @@ pub(super) fn classify_memory_manifest_failure(
     failure
 }
 
-/// Use typed causes and SQLite result codes, never raw error text.
+/// Use typed database error causes for deciding whether to retry a memory write.
 fn classify_memory_write_failure(error: anyhow::Error) -> pioneer_memory::MemoryWriteFailure {
     use pioneer_memory::MemoryWriteFailure;
     use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr, SqlxError};
@@ -1869,11 +1879,15 @@ fn classify_memory_write_failure(error: anyhow::Error) -> pioneer_memory::Memory
                     return MemoryWriteFailure::StorageTransient;
                 }
                 SqlxError::Database(database) => {
-                    // Extended SQLite codes retain BUSY=5 / LOCKED=6 in the low byte.
+                    use sea_orm::sqlx::error::DatabaseError;
                     if database
-                        .code()
-                        .and_then(|code| code.parse::<i32>().ok())
-                        .is_some_and(sqlite_write_failure_code_is_transient)
+                        .try_downcast_ref::<sea_orm::SqlxPostgresError>()
+                        .is_some_and(postgres_memory_write_conflict)
+                        || database
+                            .try_downcast_ref::<sea_orm::SqlxSqliteError>()
+                            .and_then(|error| error.code())
+                            .and_then(|code| code.parse::<i32>().ok())
+                            .is_some_and(sqlite_write_failure_code_is_transient)
                     {
                         return MemoryWriteFailure::StorageTransient;
                     }
@@ -1883,6 +1897,12 @@ fn classify_memory_write_failure(error: anyhow::Error) -> pioneer_memory::Memory
         }
     }
     MemoryWriteFailure::Unclassified
+}
+
+fn postgres_memory_write_conflict(error: &sea_orm::SqlxPostgresError) -> bool {
+    // These SQLSTATEs reject the statement or transaction, so retrying does
+    // not repeat a write whose commit outcome could be unknown.
+    matches!(error.code(), "40001" | "40P01" | "55P03")
 }
 
 fn sqlite_write_failure_code_is_transient(code: i32) -> bool {

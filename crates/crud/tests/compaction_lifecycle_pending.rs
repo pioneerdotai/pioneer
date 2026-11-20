@@ -1677,7 +1677,17 @@ async fn lifecycle_terminal_repair_uses_saved_event_time_and_matches_canonical_r
         assert_eq!(original.created_at, saved.created_at);
         assert_eq!(original.updated_at, saved.created_at);
         let deliveries = scalar(&store, "SELECT count(*) n FROM turn_event_delivery").await;
-        let event: Event = serde_json::from_str(&saved.payload).unwrap();
+        let event: Event = if let Some(locator) = saved.payload_payload_id {
+            use pioneer_crud_payloads::storage::{Selection, capture};
+
+            let payload = capture(&db, &locator, Selection::Full)
+                .await
+                .unwrap()
+                .expect("lifecycle event payload");
+            serde_json::from_slice(&payload.into_bytes().unwrap()).unwrap()
+        } else {
+            serde_json::from_value(saved.payload.expect("inline lifecycle event payload")).unwrap()
+        };
         let generation = store
             .compaction_runner_state("op")
             .await

@@ -118,13 +118,11 @@ impl TurnMcpProjectionPersistenceError {
         }
     }
 
-    pub fn is_sqlite_lock(&self) -> bool {
-        match self {
-            Self::Storage { source, .. } => {
-                pioneer_sqlite::is_sqlite_lock_message(format!("{source:#}").as_str())
-            }
-            _ => false,
-        }
+    pub fn is_retryable_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::Storage { source, .. } if pioneer_sqlite::is_retryable_database_conflict(source)
+        )
     }
 }
 

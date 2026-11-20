@@ -123,6 +123,41 @@ async fn typed_sqlite_codes_survive_real_wrappers_and_context() {
     assert!(!extended.cause.confirmed_storage());
 }
 
+#[tokio::test]
+async fn postgres_contention_is_classified_from_the_driver_error() -> anyhow::Result<()> {
+    use sea_orm::TransactionTrait;
+
+    pioneer_postgres_test::with_database(async |fixture| {
+        let writer = fixture.connection();
+        writer
+            .execute_unprepared(
+                "CREATE TABLE diagnostic_lock_fixture (id int PRIMARY KEY);
+             INSERT INTO diagnostic_lock_fixture VALUES (1)",
+            )
+            .await?;
+        let lock = writer.begin().await?;
+        lock.execute_unprepared("SELECT id FROM diagnostic_lock_fixture WHERE id = 1 FOR UPDATE")
+            .await?;
+        let contender = fixture.connect().await?;
+        let error = contender
+            .execute_unprepared(
+                "SELECT id FROM diagnostic_lock_fixture WHERE id = 1 FOR UPDATE NOWAIT",
+            )
+            .await
+            .expect_err("another PostgreSQL session holds the row lock");
+        lock.rollback().await?;
+
+        let error = anyhow::Error::new(error).context(CANARY);
+        let diagnostic = Diagnostic::extract(OP, &error);
+        assert_eq!(diagnostic.cause, Cause::PostgresContention);
+        assert!(is_storage_failure(&error));
+        assert_eq!(diagnostic.sqlite_primary_code, None);
+        assert!(!is_storage_failure(&anyhow::anyhow!("SQLSTATE 55P03")));
+        Ok(())
+    })
+    .await
+}
+
 #[derive(Debug)]
 struct OtherBackend;
 impl std::fmt::Display for OtherBackend {

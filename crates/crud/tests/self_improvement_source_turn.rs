@@ -10,23 +10,23 @@ use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, St
 
 const START_AT: i64 = 1_900_000_000;
 
-async fn migrated_store() -> (DatabaseConnection, CrudStore) {
-    let database = Database::connect("sqlite::memory:")
-        .await
-        .expect("in-memory SQLite must open");
-    Migrator::up(&database, None)
-        .await
-        .expect("migrations must apply");
-    database
+async fn migrated_store(
+    fixture: &pioneer_postgres_test::TestDatabase,
+) -> anyhow::Result<(DatabaseConnection, CrudStore)> {
+    let writer = fixture.connection();
+    writer
         .execute_unprepared(
-            "INSERT INTO workspace (id, name, is_active, is_current) VALUES \
-             ('ws_source_a', 'Source A', 1, 1), \
-             ('ws_source_b', 'Source B', 1, 0)",
+            "UPDATE workspace SET is_current = false WHERE is_current;
+         INSERT INTO workspace (id, name, is_active, is_current) VALUES
+            ('ws_source_a', 'Source A', true, true),
+            ('ws_source_b', 'Source B', true, false)",
         )
-        .await
-        .expect("workspace fixtures must insert");
-    let store = CrudStore::new(database.clone());
-    (database, store)
+        .await?;
+    let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+        fixture.connect_read_only().await?,
+        writer.clone(),
+    ));
+    Ok((writer.clone(), store))
 }
 
 fn thread(
@@ -218,16 +218,13 @@ async fn seed_successful_collaborative_delivery(
                 '{child_thread_id}', '{parent_thread_id}', '{parent_thread_id}', 1, 'task_run',
                 '{parent_thread_id}', '{lineage_parent_turn_id}'
             );
-            WITH frozen_root_fixture(
+            INSERT INTO task_run_conversation_snapshot (
                 run_id, task_id, workspace_id, conversation_thread_id, source_turn_id,
-                history_json
-            ) AS (VALUES (
+                history_json, frozen_manifest_id
+            ) VALUES (
                 '{run_id}', '{task_id}', '{workspace_id}', '{parent_thread_id}',
-                '{parent_turn_id}', '[]'
-            )) INSERT INTO task_run_conversation_snapshot(
-                run_id, task_id, workspace_id, conversation_thread_id, source_turn_id,
-                history_json
-            ,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture;
+                '{parent_turn_id}', '[]', NULL
+            );
             INSERT INTO task_run_turn (
                 id, task_id, run_id, thread_id, turn_id, kind, round, sequence, status,
                 completed_at
@@ -304,7 +301,10 @@ async fn materialize_delivery_item(
 
 async fn scalar_i64(database: &DatabaseConnection, sql: impl Into<String>) -> i64 {
     database
-        .query_one_raw(Statement::from_string(DatabaseBackend::Sqlite, sql.into()))
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.into(),
+        ))
         .await
         .expect("query must execute")
         .expect("query must return one row")
@@ -314,7 +314,10 @@ async fn scalar_i64(database: &DatabaseConnection, sql: impl Into<String>) -> i6
 
 async fn scalar_string(database: &DatabaseConnection, sql: impl Into<String>) -> String {
     database
-        .query_one_raw(Statement::from_string(DatabaseBackend::Sqlite, sql.into()))
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.into(),
+        ))
         .await
         .expect("query must execute")
         .expect("query must return one row")
@@ -324,499 +327,521 @@ async fn scalar_string(database: &DatabaseConnection, sql: impl Into<String>) ->
 
 #[tokio::test]
 async fn source_projection_is_exact_idempotent_isolated_and_monotonic() {
-    let (database, store) = migrated_store().await;
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (database, store) = migrated_store(fixture).await?;
 
-    let eligible_thread = thread(
-        "ws_source_a",
-        "thread_eligible_a",
-        ThreadOriginKind::User,
-        START_AT,
-    );
-    let eligible_turn = turn("turn_eligible_a1", TurnKind::Conversation, TurnOrigin::User);
-    start_turn(&store, &eligible_thread, &eligible_turn).await;
-    database
-        .execute_unprepared(
-            "UPDATE thread SET access_class = 'workspace' WHERE id = 'thread_eligible_a'",
-        )
-        .await
-        .expect("shared conversation must participate alongside private conversations");
-    complete_turn(&store, &eligible_thread, eligible_turn, START_AT + 1).await;
+        let eligible_thread = thread(
+            "ws_source_a",
+            "thread_eligible_a",
+            ThreadOriginKind::User,
+            START_AT,
+        );
+        let eligible_turn = turn("turn_eligible_a1", TurnKind::Conversation, TurnOrigin::User);
+        start_turn(&store, &eligible_thread, &eligible_turn).await;
+        database
+            .execute_unprepared(
+                "UPDATE thread SET access_class = 'workspace' WHERE id = 'thread_eligible_a'",
+            )
+            .await
+            .expect("shared conversation must participate alongside private conversations");
+        complete_turn(&store, &eligible_thread, eligible_turn, START_AT + 1).await;
 
-    let mut private_thread = thread(
-        "ws_source_a",
-        "thread_private_source",
-        ThreadOriginKind::User,
-        START_AT + 2,
-    );
-    private_thread.model_provider = "cli_runtime:codex".to_owned();
-    let private_turn = turn(
-        "turn_private_source",
-        TurnKind::Conversation,
-        TurnOrigin::User,
-    );
-    start_turn(&store, &private_thread, &private_turn).await;
-    database
-        .execute_unprepared(
-            "UPDATE thread SET access_class = 'private' \
+        let mut private_thread = thread(
+            "ws_source_a",
+            "thread_private_source",
+            ThreadOriginKind::User,
+            START_AT + 2,
+        );
+        private_thread.model_provider = "cli_runtime:codex".to_owned();
+        let private_turn = turn(
+            "turn_private_source",
+            TurnKind::Conversation,
+            TurnOrigin::User,
+        );
+        start_turn(&store, &private_thread, &private_turn).await;
+        database
+            .execute_unprepared(
+                "UPDATE thread SET access_class = 'private' \
              WHERE id = 'thread_private_source'",
-        )
-        .await
-        .expect("private source fixture must become private before completion");
-    complete_turn(&store, &private_thread, private_turn, START_AT + 3).await;
-    assert_eq!(
-        scalar_i64(
-            &database,
-            "SELECT COUNT(*) AS value FROM self_improvement_source_turn \
+            )
+            .await
+            .expect("private source fixture must become private before completion");
+        complete_turn(&store, &private_thread, private_turn, START_AT + 3).await;
+        assert_eq!(
+            scalar_i64(
+                &database,
+                "SELECT COUNT(*) AS value FROM self_improvement_source_turn \
              WHERE turn_id = 'turn_private_source'",
-        )
-        .await,
-        1,
-        "private conversations must enter the workspace learning source ledger"
-    );
+            )
+            .await,
+            1,
+            "private conversations must enter the workspace learning source ledger"
+        );
 
-    let first = store
-        .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
-        .await
-        .expect("source range must load");
-    assert_eq!(first.len(), 2);
-    assert_eq!(first[1].turn_id, "turn_private_source");
-    assert_eq!(first[0].turn_id, "turn_eligible_a1");
-    assert_eq!(first[0].task_delivery_id, None);
-    assert_eq!(first[0].terminal_at_unix, START_AT + 1);
+        let first = store
+            .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
+            .await
+            .expect("source range must load");
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[1].turn_id, "turn_private_source");
+        assert_eq!(first[0].turn_id, "turn_eligible_a1");
+        assert_eq!(first[0].task_delivery_id, None);
+        assert_eq!(first[0].terminal_at_unix, START_AT + 1);
 
-    database
-        .execute_unprepared(&format!(
-            "UPDATE turn_event_projection_state \
+        database
+            .execute_unprepared(&format!(
+                "UPDATE turn_event_projection_state \
              SET status = 'pending', next_run_at = '1970-01-01 00:00:00+00:00', \
                  claim_token = NULL, claim_expires_at = NULL, projected_at = NULL \
              WHERE event_id = '{}'",
-            first[0].terminal_event_id
-        ))
-        .await
-        .expect("completion projection must be reset for replay");
-    store
-        .replay_due_turn_event_projections(2_000_000_000, 10)
-        .await
-        .expect("terminal event replay must succeed");
-    assert_eq!(
-        store
-            .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
+                first[0].terminal_event_id
+            ))
             .await
-            .expect("source range after replay")
-            .len(),
-        2,
-        "replay must not duplicate the source identity"
-    );
-
-    let ineligible = [
-        (
-            "thread_collaborative_early",
-            "turn_collaborative_early",
-            ThreadOriginKind::Collaborative,
-            TurnKind::Conversation,
-            TurnOrigin::User,
-        ),
-        (
-            "thread_task_origin",
-            "turn_task_origin",
-            ThreadOriginKind::TaskRun,
-            TurnKind::Conversation,
-            TurnOrigin::User,
-        ),
-        (
-            "thread_user_taskturn",
-            "turn_user_taskturn",
-            ThreadOriginKind::User,
-            TurnKind::TaskRun,
-            TurnOrigin::User,
-        ),
-        (
-            "thread_user_sched",
-            "turn_user_sched",
-            ThreadOriginKind::User,
-            TurnKind::Conversation,
-            TurnOrigin::ScheduledTask,
-        ),
-        (
-            "thread_system",
-            "turn_system",
-            ThreadOriginKind::System,
-            TurnKind::Conversation,
-            TurnOrigin::User,
-        ),
-    ];
-    for (index, (thread_id, turn_id, thread_origin, turn_kind, turn_origin)) in
-        ineligible.into_iter().enumerate()
-    {
-        let thread = thread(
-            "ws_source_a",
-            thread_id,
-            thread_origin,
-            START_AT + 10 + index as i64,
+            .expect("completion projection must be reset for replay");
+        store
+            .replay_due_turn_event_projections(2_000_000_000, 10)
+            .await
+            .expect("terminal event replay must succeed");
+        assert_eq!(
+            store
+                .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
+                .await
+                .expect("source range after replay")
+                .len(),
+            2,
+            "replay must not duplicate the source identity"
         );
-        let turn = turn(turn_id, turn_kind, turn_origin);
-        start_turn(&store, &thread, &turn).await;
-        complete_turn(&store, &thread, turn, START_AT + 20 + index as i64).await;
-    }
 
-    let failed_thread = thread(
-        "ws_source_a",
-        "thread_failed",
-        ThreadOriginKind::User,
-        START_AT + 30,
-    );
-    let failed_turn = turn("turn_failed", TurnKind::Conversation, TurnOrigin::User);
-    start_turn(&store, &failed_thread, &failed_turn).await;
-    store
-        .materialize_turn_failed(
-            TurnFailedNotification {
-                workspace_id: "ws_source_a".to_owned(),
-                thread_id: failed_thread.id.clone(),
-                turn: Turn {
-                    status: TurnStatus::Failed,
-                    error: Some("expected test failure".to_owned()),
-                    ..failed_turn
-                },
-            },
-            START_AT + 31,
-        )
-        .await
-        .expect("failed turn must project without becoming evidence");
-
-    let incomplete_thread = thread(
-        "ws_source_a",
-        "thread_incomplete",
-        ThreadOriginKind::User,
-        START_AT + 40,
-    );
-    let incomplete_turn = turn("turn_incomplete", TurnKind::Conversation, TurnOrigin::User);
-    start_turn(&store, &incomplete_thread, &incomplete_turn).await;
-
-    assert_eq!(
-        store
-            .self_improvement_source_head("ws_source_a")
-            .await
-            .expect("workspace A head"),
-        first[1].id,
-        "ineligible, failed, and incomplete turns must not advance the ledger"
-    );
-
-    let workspace_b_thread = thread(
-        "ws_source_b",
-        "thread_eligible_b",
-        ThreadOriginKind::User,
-        START_AT + 50,
-    );
-    let workspace_b_turn = turn("turn_eligible_b", TurnKind::Conversation, TurnOrigin::User);
-    start_turn(&store, &workspace_b_thread, &workspace_b_turn).await;
-    complete_turn(&store, &workspace_b_thread, workspace_b_turn, START_AT + 51).await;
-
-    let second_turn = turn("turn_eligible_a2", TurnKind::Conversation, TurnOrigin::User);
-    let second_thread = thread(
-        "ws_source_a",
-        "thread_eligible_a2",
-        ThreadOriginKind::DirectMessage,
-        START_AT + 60,
-    );
-    start_turn(&store, &second_thread, &second_turn).await;
-    complete_turn(&store, &second_thread, second_turn, START_AT + 61).await;
-
-    let all_a = store
-        .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
-        .await
-        .expect("workspace A source range");
-    assert_eq!(all_a.len(), 3);
-    assert!(all_a[0].id < all_a[1].id);
-    assert!(all_a.iter().all(|row| row.workspace_id == "ws_source_a"));
-    assert_eq!(
-        store
-            .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 1)
-            .await
-            .expect("bounded source range"),
-        vec![all_a[0].clone()]
-    );
-    assert_eq!(
-        store
-            .list_self_improvement_source_turns_after("ws_source_a", all_a[0].id, 0, 10)
-            .await
-            .expect("range after cursor"),
-        vec![all_a[1].clone(), all_a[2].clone()]
-    );
-    assert_eq!(
-        store
-            .list_self_improvement_source_turns_after(
+        let ineligible = [
+            (
+                "thread_collaborative_early",
+                "turn_collaborative_early",
+                ThreadOriginKind::Collaborative,
+                TurnKind::Conversation,
+                TurnOrigin::User,
+            ),
+            (
+                "thread_task_origin",
+                "turn_task_origin",
+                ThreadOriginKind::TaskRun,
+                TurnKind::Conversation,
+                TurnOrigin::User,
+            ),
+            (
+                "thread_user_taskturn",
+                "turn_user_taskturn",
+                ThreadOriginKind::User,
+                TurnKind::TaskRun,
+                TurnOrigin::User,
+            ),
+            (
+                "thread_user_sched",
+                "turn_user_sched",
+                ThreadOriginKind::User,
+                TurnKind::Conversation,
+                TurnOrigin::ScheduledTask,
+            ),
+            (
+                "thread_system",
+                "turn_system",
+                ThreadOriginKind::System,
+                TurnKind::Conversation,
+                TurnOrigin::User,
+            ),
+        ];
+        for (index, (thread_id, turn_id, thread_origin, turn_kind, turn_origin)) in
+            ineligible.into_iter().enumerate()
+        {
+            let thread = thread(
                 "ws_source_a",
-                0,
-                all_a[2].terminal_at_unix + 1,
-                10,
+                thread_id,
+                thread_origin,
+                START_AT + 10 + index as i64,
+            );
+            let turn = turn(turn_id, turn_kind, turn_origin);
+            start_turn(&store, &thread, &turn).await;
+            complete_turn(&store, &thread, turn, START_AT + 20 + index as i64).await;
+        }
+
+        let failed_thread = thread(
+            "ws_source_a",
+            "thread_failed",
+            ThreadOriginKind::User,
+            START_AT + 30,
+        );
+        let failed_turn = turn("turn_failed", TurnKind::Conversation, TurnOrigin::User);
+        start_turn(&store, &failed_thread, &failed_turn).await;
+        store
+            .materialize_turn_failed(
+                TurnFailedNotification {
+                    workspace_id: "ws_source_a".to_owned(),
+                    thread_id: failed_thread.id.clone(),
+                    turn: Turn {
+                        status: TurnStatus::Failed,
+                        error: Some("expected test failure".to_owned()),
+                        ..failed_turn
+                    },
+                },
+                START_AT + 31,
             )
             .await
-            .expect("activation time must not exclude unprocessed history"),
-        all_a
-    );
-    assert_eq!(
-        store
-            .list_self_improvement_source_turns_after("ws_source_b", 0, 0, 10)
+            .expect("failed turn must project without becoming evidence");
+
+        let incomplete_thread = thread(
+            "ws_source_a",
+            "thread_incomplete",
+            ThreadOriginKind::User,
+            START_AT + 40,
+        );
+        let incomplete_turn = turn("turn_incomplete", TurnKind::Conversation, TurnOrigin::User);
+        start_turn(&store, &incomplete_thread, &incomplete_turn).await;
+
+        assert_eq!(
+            store
+                .self_improvement_source_head("ws_source_a")
+                .await
+                .expect("workspace A head"),
+            first[1].id,
+            "ineligible, failed, and incomplete turns must not advance the ledger"
+        );
+
+        let workspace_b_thread = thread(
+            "ws_source_b",
+            "thread_eligible_b",
+            ThreadOriginKind::User,
+            START_AT + 50,
+        );
+        let workspace_b_turn = turn("turn_eligible_b", TurnKind::Conversation, TurnOrigin::User);
+        start_turn(&store, &workspace_b_thread, &workspace_b_turn).await;
+        complete_turn(&store, &workspace_b_thread, workspace_b_turn, START_AT + 51).await;
+
+        let second_turn = turn("turn_eligible_a2", TurnKind::Conversation, TurnOrigin::User);
+        let second_thread = thread(
+            "ws_source_a",
+            "thread_eligible_a2",
+            ThreadOriginKind::DirectMessage,
+            START_AT + 60,
+        );
+        start_turn(&store, &second_thread, &second_turn).await;
+        complete_turn(&store, &second_thread, second_turn, START_AT + 61).await;
+
+        let all_a = store
+            .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
             .await
-            .expect("workspace B source range")
-            .len(),
-        1
-    );
+            .expect("workspace A source range");
+        assert_eq!(all_a.len(), 3);
+        assert!(all_a[0].id < all_a[1].id);
+        assert!(all_a.iter().all(|row| row.workspace_id == "ws_source_a"));
+        assert_eq!(
+            store
+                .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 1)
+                .await
+                .expect("bounded source range"),
+            vec![all_a[0].clone()]
+        );
+        assert_eq!(
+            store
+                .list_self_improvement_source_turns_after("ws_source_a", all_a[0].id, 0, 10)
+                .await
+                .expect("range after cursor"),
+            vec![all_a[1].clone(), all_a[2].clone()]
+        );
+        assert_eq!(
+            store
+                .list_self_improvement_source_turns_after(
+                    "ws_source_a",
+                    0,
+                    all_a[2].terminal_at_unix + 1,
+                    10,
+                )
+                .await
+                .expect("activation time must not exclude unprocessed history"),
+            all_a
+        );
+        assert_eq!(
+            store
+                .list_self_improvement_source_turns_after("ws_source_b", 0, 0, 10)
+                .await
+                .expect("workspace B source range")
+                .len(),
+            1
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn collaborative_source_requires_verified_terminal_delivery_and_is_replay_idempotent() {
-    let (database, store) = migrated_store().await;
-    let parent_thread = thread(
-        "ws_source_a",
-        "thread_collab_parent",
-        ThreadOriginKind::Collaborative,
-        START_AT,
-    );
-    let parent_turn = turn(
-        "turn_collab_parent",
-        TurnKind::Conversation,
-        TurnOrigin::User,
-    );
-    start_turn(&store, &parent_thread, &parent_turn).await;
-    complete_turn(&store, &parent_thread, parent_turn.clone(), START_AT + 1).await;
-    assert_eq!(
-        store
-            .self_improvement_source_head("ws_source_a")
-            .await
-            .expect("source head after admission"),
-        0,
-        "early Collaborative completion must not become evidence"
-    );
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (database, store) = migrated_store(fixture).await?;
+        let parent_thread = thread(
+            "ws_source_a",
+            "thread_collab_parent",
+            ThreadOriginKind::Collaborative,
+            START_AT,
+        );
+        let parent_turn = turn(
+            "turn_collab_parent",
+            TurnKind::Conversation,
+            TurnOrigin::User,
+        );
+        start_turn(&store, &parent_thread, &parent_turn).await;
+        complete_turn(&store, &parent_thread, parent_turn.clone(), START_AT + 1).await;
+        assert_eq!(
+            store
+                .self_improvement_source_head("ws_source_a")
+                .await
+                .expect("source head after admission"),
+            0,
+            "early Collaborative completion must not become evidence"
+        );
 
-    let delivery_id = "delivery_collab_ok";
-    let occurrence_turn = turn(
-        "run_delivery_collab_ok",
-        TurnKind::TaskRun,
-        TurnOrigin::DetachedTask,
-    );
-    start_turn(&store, &parent_thread, &occurrence_turn).await;
-    let item = seed_successful_collaborative_delivery(
-        &database,
-        &store,
-        &parent_thread,
-        &parent_turn,
-        "thread_collab_child",
-        "turn_collab_child",
-        delivery_id,
-        occurrence_turn.id.as_str(),
-        START_AT + 2,
-    )
-    .await;
-    materialize_delivery_item(
-        &store,
-        &parent_thread,
-        &occurrence_turn,
-        item.clone(),
-        START_AT + 4,
-    )
-    .await;
-
-    let first = store
-        .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
-        .await
-        .expect("collaborative source must load");
-    assert_eq!(first.len(), 1);
-    assert_eq!(first[0].thread_id, parent_thread.id);
-    assert_eq!(first[0].turn_id, parent_turn.id);
-    assert_eq!(first[0].task_delivery_id.as_deref(), Some(delivery_id));
-    assert_eq!(
-        scalar_string(
+        let delivery_id = "delivery_collab_ok";
+        let occurrence_turn = turn(
+            "run_delivery_collab_ok",
+            TurnKind::TaskRun,
+            TurnOrigin::DetachedTask,
+        );
+        start_turn(&store, &parent_thread, &occurrence_turn).await;
+        let item = seed_successful_collaborative_delivery(
             &database,
-            format!(
-                "SELECT turn_id AS value FROM turn_event WHERE id = '{}'",
-                first[0].terminal_event_id
-            )
+            &store,
+            &parent_thread,
+            &parent_turn,
+            "thread_collab_child",
+            "turn_collab_child",
+            delivery_id,
+            occurrence_turn.id.as_str(),
+            START_AT + 2,
         )
-        .await,
-        occurrence_turn.id,
-        "the logical source parent and physical owner-delivery occurrence must remain distinct"
-    );
-    let first_boundary = first[0].terminal_event_id.clone();
+        .await;
+        materialize_delivery_item(
+            &store,
+            &parent_thread,
+            &occurrence_turn,
+            item.clone(),
+            START_AT + 4,
+        )
+        .await;
 
-    materialize_delivery_item(&store, &parent_thread, &occurrence_turn, item, START_AT + 6).await;
-    let replayed = store
-        .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
-        .await
-        .expect("replayed collaborative source must load");
-    assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].terminal_event_id, first_boundary);
-
-    store
-        .activate_self_improvement_workspace("ws_source_a", START_AT + 100)
-        .await
-        .unwrap();
-    let restored = store
-        .list_self_improvement_source_turns_after("ws_source_a", 0, START_AT + 100, 10)
-        .await
-        .unwrap();
-    assert_eq!(
-        restored.len(),
-        1,
-        "child and occurrence turns must not become independent sources"
-    );
-    assert_eq!(restored[0].turn_id, parent_turn.id);
-    assert_eq!(restored[0].terminal_event_id, first_boundary);
-    assert_eq!(restored[0].task_delivery_id.as_deref(), Some(delivery_id));
-
-    let forged_thread = thread(
-        "ws_source_a",
-        "thread_collab_forged",
-        ThreadOriginKind::Collaborative,
-        START_AT + 10,
-    );
-    let forged_turn = turn(
-        "turn_collab_forged",
-        TurnKind::Conversation,
-        TurnOrigin::User,
-    );
-    start_turn(&store, &forged_thread, &forged_turn).await;
-    complete_turn(&store, &forged_thread, forged_turn.clone(), START_AT + 11).await;
-    materialize_delivery_item(
-        &store,
-        &forged_thread,
-        &forged_turn,
-        TurnItem::AgentMessage {
-            id: pioneer_protocol::task_delivery_result_item_id("missing_delivery"),
-            text: "Forged result".to_owned(),
-            phase: AgentMessagePhase::FinalAnswer,
-            markdown: None,
-            markdown_version: None,
-        },
-        START_AT + 12,
-    )
-    .await;
-    assert_eq!(
-        store
+        let first = store
             .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
             .await
-            .expect("source range after forged delivery")
-            .len(),
-        1,
-        "an item ID without the durable task chain must not become evidence"
-    );
+            .expect("collaborative source must load");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].thread_id, parent_thread.id);
+        assert_eq!(first[0].turn_id, parent_turn.id);
+        assert_eq!(first[0].task_delivery_id.as_deref(), Some(delivery_id));
+        assert_eq!(
+            scalar_string(
+                &database,
+                format!(
+                    "SELECT turn_id AS value FROM turn_event WHERE id = '{}'",
+                    first[0].terminal_event_id
+                )
+            )
+            .await,
+            occurrence_turn.id,
+            "the logical source parent and physical owner-delivery occurrence must remain distinct"
+        );
+        let first_boundary = first[0].terminal_event_id.clone();
+
+        materialize_delivery_item(&store, &parent_thread, &occurrence_turn, item, START_AT + 6)
+            .await;
+        let replayed = store
+            .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
+            .await
+            .expect("replayed collaborative source must load");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].terminal_event_id, first_boundary);
+
+        store
+            .activate_self_improvement_workspace("ws_source_a", START_AT + 100)
+            .await
+            .unwrap();
+        let restored = store
+            .list_self_improvement_source_turns_after("ws_source_a", 0, START_AT + 100, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.len(),
+            1,
+            "child and occurrence turns must not become independent sources"
+        );
+        assert_eq!(restored[0].turn_id, parent_turn.id);
+        assert_eq!(restored[0].terminal_event_id, first_boundary);
+        assert_eq!(restored[0].task_delivery_id.as_deref(), Some(delivery_id));
+
+        let forged_thread = thread(
+            "ws_source_a",
+            "thread_collab_forged",
+            ThreadOriginKind::Collaborative,
+            START_AT + 10,
+        );
+        let forged_turn = turn(
+            "turn_collab_forged",
+            TurnKind::Conversation,
+            TurnOrigin::User,
+        );
+        start_turn(&store, &forged_thread, &forged_turn).await;
+        complete_turn(&store, &forged_thread, forged_turn.clone(), START_AT + 11).await;
+        materialize_delivery_item(
+            &store,
+            &forged_thread,
+            &forged_turn,
+            TurnItem::AgentMessage {
+                id: pioneer_protocol::task_delivery_result_item_id("missing_delivery"),
+                text: "Forged result".to_owned(),
+                phase: AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+            START_AT + 12,
+        )
+        .await;
+        assert_eq!(
+            store
+                .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
+                .await
+                .expect("source range after forged delivery")
+                .len(),
+            1,
+            "an item ID without the durable task chain must not become evidence"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn collaborative_source_rejects_mismatched_child_lineage() {
-    let (database, store) = migrated_store().await;
-    let parent_thread = thread(
-        "ws_source_a",
-        "thread_bad_lineage",
-        ThreadOriginKind::Collaborative,
-        START_AT,
-    );
-    let parent_turn = turn("turn_bad_lineage", TurnKind::Conversation, TurnOrigin::User);
-    start_turn(&store, &parent_thread, &parent_turn).await;
-    complete_turn(&store, &parent_thread, parent_turn.clone(), START_AT + 1).await;
-    let item = seed_successful_collaborative_delivery(
-        &database,
-        &store,
-        &parent_thread,
-        &parent_turn,
-        "thread_bad_child",
-        "turn_bad_child",
-        "delivery_bad_lineage",
-        "different_parent_turn",
-        START_AT + 2,
-    )
-    .await;
-    materialize_delivery_item(&store, &parent_thread, &parent_turn, item, START_AT + 4).await;
-    assert_eq!(
-        store
-            .self_improvement_source_head("ws_source_a")
-            .await
-            .expect("source head after mismatched lineage"),
-        0
-    );
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (database, store) = migrated_store(fixture).await?;
+        let parent_thread = thread(
+            "ws_source_a",
+            "thread_bad_lineage",
+            ThreadOriginKind::Collaborative,
+            START_AT,
+        );
+        let parent_turn = turn("turn_bad_lineage", TurnKind::Conversation, TurnOrigin::User);
+        start_turn(&store, &parent_thread, &parent_turn).await;
+        complete_turn(&store, &parent_thread, parent_turn.clone(), START_AT + 1).await;
+        let item = seed_successful_collaborative_delivery(
+            &database,
+            &store,
+            &parent_thread,
+            &parent_turn,
+            "thread_bad_child",
+            "turn_bad_child",
+            "delivery_bad_lineage",
+            "different_parent_turn",
+            START_AT + 2,
+        )
+        .await;
+        materialize_delivery_item(&store, &parent_thread, &parent_turn, item, START_AT + 4).await;
+        assert_eq!(
+            store
+                .self_improvement_source_head("ws_source_a")
+                .await
+                .expect("source head after mismatched lineage"),
+            0
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn collaborative_source_requires_one_exact_success_result_snapshot() {
-    let (database, store) = migrated_store().await;
-    let parent_thread = thread(
-        "ws_source_a",
-        "thread_result_mismatch",
-        ThreadOriginKind::Collaborative,
-        START_AT,
-    );
-    let parent_turn = turn(
-        "turn_result_mismatch",
-        TurnKind::Conversation,
-        TurnOrigin::User,
-    );
-    start_turn(&store, &parent_thread, &parent_turn).await;
-    complete_turn(&store, &parent_thread, parent_turn.clone(), START_AT + 1).await;
-    let delivery_id = "delivery_result_mismatch";
-    let item = seed_successful_collaborative_delivery(
-        &database,
-        &store,
-        &parent_thread,
-        &parent_turn,
-        "thread_result_mismatch_child",
-        "turn_result_mismatch_child",
-        delivery_id,
-        parent_turn.id.as_str(),
-        START_AT + 2,
-    )
-    .await;
-    database
-        .execute_unprepared(&format!(
-            "UPDATE task_delivery \
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (database, store) = migrated_store(fixture).await?;
+        let parent_thread = thread(
+            "ws_source_a",
+            "thread_result_mismatch",
+            ThreadOriginKind::Collaborative,
+            START_AT,
+        );
+        let parent_turn = turn(
+            "turn_result_mismatch",
+            TurnKind::Conversation,
+            TurnOrigin::User,
+        );
+        start_turn(&store, &parent_thread, &parent_turn).await;
+        complete_turn(&store, &parent_thread, parent_turn.clone(), START_AT + 1).await;
+        let delivery_id = "delivery_result_mismatch";
+        let item = seed_successful_collaborative_delivery(
+            &database,
+            &store,
+            &parent_thread,
+            &parent_turn,
+            "thread_result_mismatch_child",
+            "turn_result_mismatch_child",
+            delivery_id,
+            parent_turn.id.as_str(),
+            START_AT + 2,
+        )
+        .await;
+        database
+            .execute_unprepared(&format!(
+                "UPDATE task_delivery \
              SET result_snapshot_json = '{{\"summary\":\"different result\",\"artifacts\":[]}}' \
              WHERE id = '{delivery_id}'"
-        ))
-        .await
-        .expect("mismatched delivery result fixture must update");
-
-    materialize_delivery_item(&store, &parent_thread, &parent_turn, item, START_AT + 4).await;
-    assert_eq!(
-        store
-            .self_improvement_source_head("ws_source_a")
+            ))
             .await
-            .expect("source head after mismatched result"),
-        0,
-        "a display item whose durable success snapshots disagree must not become evidence"
-    );
+            .expect("mismatched delivery result fixture must update");
+
+        materialize_delivery_item(&store, &parent_thread, &parent_turn, item, START_AT + 4).await;
+        assert_eq!(
+            store
+                .self_improvement_source_head("ws_source_a")
+                .await
+                .expect("source head after mismatched result"),
+            0,
+            "a display item whose durable success snapshots disagree must not become evidence"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn failed_collaborative_delivery_is_not_a_source_anchor() {
-    let (database, store) = migrated_store().await;
-    let parent_thread = thread(
-        "ws_source_a",
-        "thread_failed_delivery",
-        ThreadOriginKind::Collaborative,
-        START_AT,
-    );
-    let parent_turn = turn(
-        "turn_failed_delivery",
-        TurnKind::Conversation,
-        TurnOrigin::User,
-    );
-    start_turn(&store, &parent_thread, &parent_turn).await;
-    complete_turn(&store, &parent_thread, parent_turn.clone(), START_AT + 1).await;
-    let delivery_id = "delivery_failed";
-    seed_successful_collaborative_delivery(
-        &database,
-        &store,
-        &parent_thread,
-        &parent_turn,
-        "thread_failed_child",
-        "turn_failed_child",
-        delivery_id,
-        parent_turn.id.as_str(),
-        START_AT + 2,
-    )
-    .await;
-    database
-        .execute_unprepared(&format!(
-            "UPDATE task SET status = 'failed', result_json = NULL \
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (database, store) = migrated_store(fixture).await?;
+        let parent_thread = thread(
+            "ws_source_a",
+            "thread_failed_delivery",
+            ThreadOriginKind::Collaborative,
+            START_AT,
+        );
+        let parent_turn = turn(
+            "turn_failed_delivery",
+            TurnKind::Conversation,
+            TurnOrigin::User,
+        );
+        start_turn(&store, &parent_thread, &parent_turn).await;
+        complete_turn(&store, &parent_thread, parent_turn.clone(), START_AT + 1).await;
+        let delivery_id = "delivery_failed";
+        seed_successful_collaborative_delivery(
+            &database,
+            &store,
+            &parent_thread,
+            &parent_turn,
+            "thread_failed_child",
+            "turn_failed_child",
+            delivery_id,
+            parent_turn.id.as_str(),
+            START_AT + 2,
+        )
+        .await;
+        database
+            .execute_unprepared(&format!(
+                "UPDATE task SET status = 'failed', result_json = NULL \
              WHERE id = 'task_{delivery_id}'; \
              UPDATE task_run SET status = 'failed', result_json = NULL \
              WHERE id = 'run_{delivery_id}'; \
@@ -824,37 +849,42 @@ async fn failed_collaborative_delivery_is_not_a_source_anchor() {
              SET result_snapshot_json = NULL, error_snapshot_json = '{{\"code\":\"failed\",\
                  \"message\":\"expected failure\"}}' \
              WHERE id = '{delivery_id}'"
-        ))
-        .await
-        .expect("failed delivery fixture must update");
-
-    materialize_delivery_item(
-        &store,
-        &parent_thread,
-        &parent_turn,
-        TurnItem::SystemEvent {
-            id: pioneer_protocol::task_delivery_result_item_id(delivery_id),
-            level: SystemEventLevel::Error,
-            message: "expected failure".to_owned(),
-            code: Some("failed".to_owned()),
-            details: None,
-        },
-        START_AT + 4,
-    )
-    .await;
-    assert_eq!(
-        store
-            .self_improvement_source_head("ws_source_a")
+            ))
             .await
-            .expect("source head after failed delivery"),
-        0,
-        "failed Collaborative delivery may be bounded context but is never an anchor"
-    );
+            .expect("failed delivery fixture must update");
+
+        materialize_delivery_item(
+            &store,
+            &parent_thread,
+            &parent_turn,
+            TurnItem::SystemEvent {
+                id: pioneer_protocol::task_delivery_result_item_id(delivery_id),
+                level: SystemEventLevel::Error,
+                message: "expected failure".to_owned(),
+                code: Some("failed".to_owned()),
+                details: None,
+            },
+            START_AT + 4,
+        )
+        .await;
+        assert_eq!(
+            store
+                .self_improvement_source_head("ws_source_a")
+                .await
+                .expect("source head after failed delivery"),
+            0,
+            "failed Collaborative delivery may be bounded context but is never an anchor"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn collaborative_source_projection_is_atomic_with_delivery_item_completion() {
-    let (database, store) = migrated_store().await;
+    pioneer_postgres_test::with_database(async |fixture| {
+    let (database, store) = migrated_store(fixture).await?;
     let parent_thread = thread(
         "ws_source_a",
         "thread_delivery_atomic",
@@ -895,9 +925,10 @@ async fn collaborative_source_projection_is_atomic_with_delivery_item_completion
         .expect("delivery item start must project");
     database
         .execute_unprepared(
-            "CREATE TRIGGER fail_collaborative_source_insert \
-             BEFORE INSERT ON self_improvement_source_turn \
-             BEGIN SELECT RAISE(ABORT, 'forced collaborative ledger failure'); END;",
+            "CREATE FUNCTION fail_collaborative_source_insert() RETURNS trigger LANGUAGE plpgsql
+             AS $$ BEGIN RAISE EXCEPTION 'forced collaborative ledger failure'; END; $$;
+             CREATE TRIGGER fail_collaborative_source_insert BEFORE INSERT ON self_improvement_source_turn
+             FOR EACH ROW EXECUTE FUNCTION fail_collaborative_source_insert()",
         )
         .await
         .expect("failure trigger must install");
@@ -936,7 +967,7 @@ async fn collaborative_source_projection_is_atomic_with_delivery_item_completion
     );
 
     database
-        .execute_unprepared("DROP TRIGGER fail_collaborative_source_insert")
+        .execute_unprepared("DROP TRIGGER fail_collaborative_source_insert ON self_improvement_source_turn")
         .await
         .expect("failure trigger must be removed");
     store
@@ -953,18 +984,19 @@ async fn collaborative_source_projection_is_atomic_with_delivery_item_completion
         .await,
         "completed"
     );
-    assert_eq!(
-        store
-            .self_improvement_source_head("ws_source_a")
-            .await
-            .expect("source head after delivery replay"),
-        1
-    );
+    let rows = store.list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10).await?;
+        assert_eq!(rows.len(), 1, "one source after replay");
+        assert_eq!(store.self_improvement_source_head("ws_source_a").await?, rows[0].id);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
-async fn source_cursor_preserves_sqlite_integer_ids_above_i32() {
-    let (database, store) = migrated_store().await;
+async fn source_cursor_preserves_postgres_identity_ids_above_i32() {
+    pioneer_postgres_test::with_database(async |fixture| {
+    let (database, store) = migrated_store(fixture).await?;
     let first_thread = thread(
         "ws_source_a",
         "thread_large_source_one",
@@ -981,8 +1013,7 @@ async fn source_cursor_preserves_sqlite_integer_ids_above_i32() {
 
     database
         .execute_unprepared(
-            "UPDATE sqlite_sequence SET seq = 2147483647 \
-             WHERE name = 'self_improvement_source_turn'",
+            "SELECT setval(pg_get_serial_sequence('self_improvement_source_turn', 'id'), 2147483647)",
         )
         .await
         .expect("source sequence must advance beyond i32");
@@ -1014,11 +1045,16 @@ async fn source_cursor_preserves_sqlite_integer_ids_above_i32() {
             .expect("64-bit source head"),
         i64::from(i32::MAX) + 1
     );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn ledger_failure_rolls_back_completed_projection_and_replay_recovers_it() {
-    let (database, store) = migrated_store().await;
+    pioneer_postgres_test::with_database(async |fixture| {
+    let (database, store) = migrated_store(fixture).await?;
     let thread = thread(
         "ws_source_a",
         "thread_atomic",
@@ -1029,9 +1065,10 @@ async fn ledger_failure_rolls_back_completed_projection_and_replay_recovers_it()
     start_turn(&store, &thread, &turn).await;
     database
         .execute_unprepared(
-            "CREATE TRIGGER fail_self_improvement_source_insert \
-             BEFORE INSERT ON self_improvement_source_turn \
-             BEGIN SELECT RAISE(ABORT, 'forced source ledger failure'); END;",
+            "CREATE FUNCTION fail_self_improvement_source_insert() RETURNS trigger LANGUAGE plpgsql
+             AS $$ BEGIN RAISE EXCEPTION 'forced source ledger failure'; END; $$;
+             CREATE TRIGGER fail_self_improvement_source_insert BEFORE INSERT ON self_improvement_source_turn
+             FOR EACH ROW EXECUTE FUNCTION fail_self_improvement_source_insert()",
         )
         .await
         .expect("failure trigger must install");
@@ -1073,7 +1110,7 @@ async fn ledger_failure_rolls_back_completed_projection_and_replay_recovers_it()
     );
 
     database
-        .execute_unprepared("DROP TRIGGER fail_self_improvement_source_insert")
+        .execute_unprepared("DROP TRIGGER fail_self_improvement_source_insert ON self_improvement_source_turn")
         .await
         .expect("failure trigger must be removed");
     store
@@ -1089,28 +1126,29 @@ async fn ledger_failure_rolls_back_completed_projection_and_replay_recovers_it()
         .await,
         "completed"
     );
-    assert_eq!(
-        store
-            .self_improvement_source_head("ws_source_a")
-            .await
-            .expect("source head after replay"),
-        1
-    );
+    let rows = store.list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10).await?;
+        assert_eq!(rows.len(), 1, "one source after replay");
+        assert_eq!(store.self_improvement_source_head("ws_source_a").await?, rows[0].id);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn installing_the_schema_does_not_backfill_historical_completed_turns() {
-    let database = Database::connect("sqlite::memory:")
-        .await
-        .expect("in-memory SQLite must open");
-    BeforeSelfImprovementMigrator::up(&database, None)
-        .await
-        .expect("baseline migrations must apply");
-    database
-        .execute_unprepared(
-            r#"
+    pioneer_postgres_test::with_empty_database(async |fixture| {
+        let database = fixture.connection();
+        let before_memory = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == "m20261119_000008_memory")
+            .expect("memory migration is registered");
+        Migrator::up(database, Some(u32::try_from(before_memory)?)).await?;
+        database
+            .execute_unprepared(
+                r#"
             INSERT INTO workspace (id, name, is_active, is_current)
-            VALUES ('ws_historical', 'Historical', 1, 1);
+            VALUES ('ws_historical', 'Historical', true, false);
             INSERT INTO thread (
                 id, workspace_id, preview, mode, model, model_provider, status, origin_kind
             ) VALUES (
@@ -1126,20 +1164,24 @@ async fn installing_the_schema_does_not_backfill_historical_completed_turns() {
                 'turn/completed', '{}', CURRENT_TIMESTAMP
             );
             "#,
-        )
-        .await
-        .expect("historical canonical rows must insert");
+            )
+            .await
+            .expect("historical canonical rows must insert");
 
-    Migrator::up(&database, None)
-        .await
-        .expect("self-improvement migration must apply");
-    assert_eq!(
-        scalar_i64(
-            &database,
-            "SELECT COUNT(*) AS value FROM self_improvement_source_turn"
-        )
-        .await,
-        0,
-        "migration must not reinterpret old history as new evidence"
-    );
+        Migrator::up(database, None)
+            .await
+            .expect("self-improvement migration must apply");
+        assert_eq!(
+            scalar_i64(
+                database,
+                "SELECT COUNT(*) AS value FROM self_improvement_source_turn"
+            )
+            .await,
+            0,
+            "migration must not reinterpret old history as new evidence"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }

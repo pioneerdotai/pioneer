@@ -2107,64 +2107,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_turn_item_supports_sqlite_zstd_view() {
-        pioneer_sqlite::zstd::register_auto_extension_once()
-            .expect("sqlite-zstd auto-extension should register");
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        enable_turn_item_payload_zstd(&connection).await;
+    async fn upsert_turn_item_replaces_only_its_portable_payload_version() -> anyhow::Result<()> {
+        use sea_orm::TransactionTrait;
 
-        let created_at = fixed_test_datetime();
-        let first = agent_message_item("item_zstd", "first payload");
-        let first = prepare_turn_item_projection(
-            "turn_item_zstd",
-            &first,
-            Some("running"),
-            created_at,
-            created_at,
-        )
-        .expect("turn_item insert should prepare");
-        upsert_prepared_turn_item(&connection, first)
-            .await
-            .expect("turn_item insert should work through sqlite-zstd view");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let writer = fixture.connection();
+            writer
+                .execute_unprepared(
+                    "INSERT INTO workspace(id, name) VALUES ('ws-item', 'Item fixture');
+                 INSERT INTO thread(id, workspace_id, preview, mode, model, model_provider, status)
+                     VALUES ('thread-item', 'ws-item', '', 'agent', 'fixture', 'fixture', 'active');
+                 INSERT INTO turn(id, thread_id, status)
+                     VALUES ('turn-item', 'thread-item', 'in_progress')",
+                )
+                .await?;
+            let db = pioneer_sqlite::SqliteDatabase::new(
+                fixture.connect_read_only().await?,
+                writer.clone(),
+            );
+            let created_at = fixed_test_datetime();
+            let row_query = || {
+                turn_item::Entity::find()
+                    .filter(turn_item::Column::TurnId.eq("turn-item"))
+                    .filter(turn_item::Column::ItemId.eq("item"))
+            };
 
-        let inserted = find_turn_item_metadata(&connection, "turn_item_zstd", "item_zstd")
-            .await
-            .expect("turn_item query should work")
-            .expect("turn_item row should exist");
-        assert_eq!(inserted.status.as_deref(), Some("running"));
-        assert!(inserted.payload.contains("first payload"));
+            let first = agent_message_item("item", "first payload");
+            let insert = prepare_turn_item_projection(
+                "turn-item",
+                &first,
+                Some("running"),
+                created_at,
+                created_at,
+            )?;
+            let tx = writer.begin().await?;
+            upsert_prepared_turn_item(&tx, insert).await?;
+            tx.commit().await?;
+            let inserted = super::super::turn_payload::items(&db, row_query())
+                .await?
+                .pop()
+                .expect("inserted item");
+            assert_eq!(inserted.status.as_deref(), Some("running"));
+            assert_eq!(super::super::turn_payload::decode_item(&inserted)?, first);
+            let first_locator = inserted
+                .payload_payload_id
+                .expect("inserted portable value");
 
-        let updated_at = fixed_later_test_datetime();
-        let updated = agent_message_item("item_zstd", "updated payload");
-        let updated = prepare_turn_item_projection(
-            "turn_item_zstd",
-            &updated,
-            Some("completed"),
-            created_at,
-            updated_at,
-        )
-        .expect("turn_item update should prepare");
-        upsert_prepared_turn_item(&connection, updated)
-            .await
-            .expect("turn_item update should work through sqlite-zstd view");
+            let updated_at = fixed_later_test_datetime();
+            let updated = agent_message_item("item", "updated payload");
+            let update = prepare_turn_item_projection(
+                "turn-item",
+                &updated,
+                Some("completed"),
+                created_at,
+                updated_at,
+            )?;
+            let tx = writer.begin().await?;
+            upsert_prepared_turn_item(&tx, update).await?;
+            tx.commit().await?;
+            let stored = super::super::turn_payload::items(&db, row_query())
+                .await?
+                .pop()
+                .expect("updated item");
+            assert_eq!(stored.status.as_deref(), Some("completed"));
+            assert_eq!(stored.created_at, created_at);
+            assert_eq!(stored.updated_at, updated_at);
+            assert_eq!(super::super::turn_payload::decode_item(&stored)?, updated);
 
-        let stored = find_turn_item_metadata(&connection, "turn_item_zstd", "item_zstd")
-            .await
-            .expect("updated turn_item query should work")
-            .expect("updated turn_item row should exist");
-        assert_eq!(stored.status.as_deref(), Some("completed"));
-        assert!(stored.payload.contains("updated payload"));
-        assert_eq!(stored.created_at, created_at);
-        assert_eq!(stored.updated_at, updated_at);
-
-        let backing_rows =
-            query_i64(&connection, "SELECT COUNT(*) AS value FROM _turn_item_zstd").await;
-        assert_eq!(backing_rows, 1);
+            let backing_rows = query_i64(
+                writer,
+                "SELECT count(*) AS value FROM portable_payload_value",
+            )
+            .await;
+            assert_eq!(backing_rows, 1);
+            assert!(
+                pioneer_entity::portable_payload_value::Entity::find_by_id(first_locator)
+                    .one(writer)
+                    .await?
+                    .is_none()
+            );
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test]
@@ -2263,23 +2287,6 @@ mod tests {
         assert_eq!(revision.changed_by, actor);
     }
 
-    async fn enable_turn_item_payload_zstd(connection: &DatabaseConnection) {
-        let sqlite_zstd_config = json!({
-            "table": "turn_item",
-            "column": "payload",
-            "compression_level": 19,
-            "dict_chooser": "'turn_item.payload'"
-        });
-        connection
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT zstd_enable_transparent(?) AS value",
-                [sqlite_zstd_config.to_string().into()],
-            ))
-            .await
-            .expect("sqlite-zstd should enable transparent compression");
-    }
-
     fn agent_message_item(item_id: &str, marker: &str) -> TurnItem {
         TurnItem::AgentMessage {
             id: item_id.to_owned(),
@@ -2353,7 +2360,7 @@ mod tests {
 
     async fn query_i64(connection: &DatabaseConnection, sql: &str) -> i64 {
         let row = connection
-            .query_one_raw(Statement::from_string(DbBackend::Sqlite, sql.to_owned()))
+            .query_one_raw(Statement::from_string(DbBackend::Postgres, sql.to_owned()))
             .await
             .expect("query should execute")
             .expect("query should return row");

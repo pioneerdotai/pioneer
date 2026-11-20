@@ -1,9 +1,11 @@
 //! Isolated owner regressions. Written for the closed test gate; not executed.
 use super::super::compaction::FrozenImportRecord;
 use super::*;
+use crate::repositories::html_preview_io_work::find_work;
 use futures_util::FutureExt;
 use migration::Migrator;
 use pioneer_compaction::{SourceRef, frozen::FrozenMessageRef};
+use pioneer_crud_artifacts::html_preview::find_frozen_result;
 use pioneer_sqlite::{
     SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
     SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
@@ -1178,7 +1180,7 @@ async fn io_enqueue_rollback_and_idle_poll_never_claim_writer() {
         .unwrap();
     tx.rollback().await.unwrap();
     assert!(
-        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("rollback-copies"), 0_i64))
+        find_work("copies".to_owned(), io_queue_key("rollback-copies"), 0_i64)
             .one(&f.store.connection)
             .await
             .unwrap()
@@ -1242,7 +1244,7 @@ async fn io_takeover_and_reinsert_reject_stale_worker() {
     assert!(!ack(&tx, &owner).await.unwrap());
     tx.rollback().await.unwrap();
     assert!(
-        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("missing"), 0_i64))
+        find_work("copies".to_owned(), io_queue_key("missing"), 0_i64)
             .one(&f.store.connection)
             .await
             .unwrap()
@@ -1272,7 +1274,7 @@ async fn io_producer_during_claim_preserves_pass_and_ack_keeps_new_request() {
     request(&tx, HtmlPreviewIoFamily::Copies, "late", 0, "ws")
         .await
         .unwrap();
-    let active = work::Entity::find_by_id(("copies".to_owned(), io_queue_key("late"), 0_i64))
+    let active = find_work("copies".to_owned(), io_queue_key("late"), 0_i64)
         .one(&tx)
         .await
         .unwrap()
@@ -1345,12 +1347,11 @@ async fn io_zero_row_copy_cas_keeps_claim_durable() {
             .await
             .unwrap()
     );
-    let row =
-        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("missing-source"), 0_i64))
-            .one(&f.store.connection)
-            .await
-            .unwrap()
-            .unwrap();
+    let row = find_work("copies".to_owned(), io_queue_key("missing-source"), 0_i64)
+        .one(&f.store.connection)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.state, "running");
     assert_eq!(row.claim_token, claim.row.claim_token);
 }
@@ -1377,7 +1378,7 @@ async fn io_seed_continuous_resync_keeps_frontier_and_late_producer() {
             .await
             .unwrap()
     );
-    let first = work::Entity::find_by_id(("seed_copies".to_owned(), String::new(), 0_i64))
+    let first = find_work("seed_copies".to_owned(), String::new(), 0_i64)
         .one(&f.store.connection)
         .await
         .unwrap()
@@ -1401,7 +1402,7 @@ async fn io_seed_continuous_resync_keeps_frontier_and_late_producer() {
                 .await
                 .unwrap()
         );
-        let row = work::Entity::find_by_id(("seed_copies".to_owned(), String::new(), 0_i64))
+        let row = find_work("seed_copies".to_owned(), String::new(), 0_i64)
             .one(&f.store.connection)
             .await
             .unwrap()
@@ -1415,7 +1416,7 @@ async fn io_seed_continuous_resync_keeps_frontier_and_late_producer() {
         assert_eq!(row.pass_revision, first.pass_revision);
     }
     assert!(
-        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("0-behind"), 0_i64))
+        find_work("copies".to_owned(), io_queue_key("0-behind"), 0_i64)
             .one(&f.store.connection)
             .await
             .unwrap()
@@ -1450,7 +1451,7 @@ async fn io_seed_only_enqueues_real_copies() {
         }
     }
     assert!(
-        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("empty"), 0_i64))
+        find_work("copies".to_owned(), io_queue_key("empty"), 0_i64)
             .one(&f.store.connection)
             .await
             .unwrap()
@@ -1520,7 +1521,7 @@ async fn io_poison_quarantine_does_not_block_later_work_and_unknown_outcome_is_d
         .unwrap()
         .unwrap();
     assert_eq!(takeover.source_id(), "b-later");
-    let poison = work::Entity::find_by_id(("witness".to_owned(), io_queue_key("a-poison"), 0_i64))
+    let poison = find_work("witness".to_owned(), io_queue_key("a-poison"), 0_i64)
         .one(&f.store.connection)
         .await
         .unwrap()
@@ -1620,14 +1621,14 @@ async fn io_witness_zero_cas_corrupt_expired_and_unavailable_are_distinct() {
                     .await
                     .unwrap()
             );
-            let poison = work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
+            let poison = find_work("witness".to_owned(), io_queue_key("w"), 0_i64)
                 .one(&f.store.connection)
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(poison.state, "quarantine");
             assert!(poison.due_at.is_none());
-            let retained = frozen_result::Entity::find_by_id(("w".to_owned(), 0_i64))
+            let retained = find_frozen_result("w".to_owned(), 0_i64)
                 .one(&f.store.connection)
                 .await
                 .unwrap()
@@ -1679,12 +1680,11 @@ async fn io_witness_zero_cas_corrupt_expired_and_unavailable_are_distinct() {
                     .await
                     .unwrap()
             );
-            let pending =
-                work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
-                    .one(&f.store.connection)
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let pending = find_work("witness".to_owned(), io_queue_key("w"), 0_i64)
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(pending.state, "timed");
             assert_eq!(pending.due_at, Some(60_000));
             assert!(
@@ -1744,7 +1744,7 @@ async fn io_witness_zero_cas_corrupt_expired_and_unavailable_are_distinct() {
                 "verified replay ACK must stay quiet"
             );
             assert!(
-                work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
+                find_work("witness".to_owned(), io_queue_key("w"), 0_i64)
                     .one(&f.store.connection)
                     .await
                     .unwrap()
@@ -1775,7 +1775,7 @@ async fn io_witness_zero_cas_corrupt_expired_and_unavailable_are_distinct() {
             "legacy callback cannot report zero-row CAS success"
         );
         assert!(
-            work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
+            find_work("witness".to_owned(), io_queue_key("w"), 0_i64)
                 .one(&f.store.connection)
                 .await
                 .unwrap()
@@ -1788,12 +1788,11 @@ async fn io_witness_zero_cas_corrupt_expired_and_unavailable_are_distinct() {
                     .await
                     .unwrap()
             );
-            let pending =
-                work::Entity::find_by_id(("witness".to_owned(), io_queue_key("w"), 0_i64))
-                    .one(&f.store.connection)
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let pending = find_work("witness".to_owned(), io_queue_key("w"), 0_i64)
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(pending.state, "timed");
             assert_eq!(pending.due_at, Some(60_000));
         }
@@ -1824,7 +1823,7 @@ async fn io_repair_updates_workspace_and_reopens_quarantine_without_losing_activ
         .unwrap();
     assert!(ack(&tx, &old).await.unwrap());
     tx.commit().await.unwrap();
-    let current = work::Entity::find_by_id(("copies".to_owned(), io_queue_key("repair"), 0_i64))
+    let current = find_work("copies".to_owned(), io_queue_key("repair"), 0_i64)
         .one(&f.store.connection)
         .await
         .unwrap()
@@ -1942,7 +1941,7 @@ async fn io_copy_cleanup_refuses_sql_nocase_match_after_cooperative_resync() {
         assert_ne!(sql_equal.metadata_json, prepared_from);
         let scope_key = ("seed_copies".to_owned(), scope.key.clone(), 0_i64);
         assert!(
-            work::Entity::find_by_id(scope_key.clone())
+            find_work(&scope_key.0, &scope_key.1, scope_key.2)
                 .one(&f.store.connection)
                 .await
                 .unwrap()
@@ -1961,7 +1960,7 @@ async fn io_copy_cleanup_refuses_sql_nocase_match_after_cooperative_resync() {
             assert!(f.store.html_preview_io_seed_quantum(&seed).await.unwrap());
         }
         let key = ("copies".to_owned(), io_queue_key("nocase"), 0_i64);
-        let renewed = work::Entity::find_by_id(key.clone())
+        let renewed = find_work(&key.0, &key.1, key.2)
             .one(&f.store.connection)
             .await
             .unwrap()
@@ -1988,7 +1987,7 @@ async fn io_copy_cleanup_refuses_sql_nocase_match_after_cooperative_resync() {
                     .is_err()
             );
         }
-        let preserved = work::Entity::find_by_id(key.clone())
+        let preserved = find_work(&key.0, &key.1, key.2)
             .one(&f.store.connection)
             .await
             .unwrap()
@@ -2034,7 +2033,7 @@ async fn io_copy_cleanup_refuses_sql_nocase_match_after_cooperative_resync() {
                 .unwrap()
         );
         assert!(
-            work::Entity::find_by_id(key)
+            find_work(&key.0, &key.1, key.2)
                 .one(&f.store.connection)
                 .await
                 .unwrap()
@@ -2071,7 +2070,7 @@ async fn io_legacy_copy_callback_commits_source_and_ack_atomically() {
             .is_err()
     );
     assert!(
-        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("callback"), 0_i64))
+        find_work("copies".to_owned(), io_queue_key("callback"), 0_i64)
             .one(&f.store.connection)
             .await
             .unwrap()
@@ -2082,7 +2081,7 @@ async fn io_legacy_copy_callback_commits_source_and_ack_atomically() {
         .await
         .unwrap();
     assert!(
-        work::Entity::find_by_id(("copies".to_owned(), io_queue_key("callback"), 0_i64))
+        find_work("copies".to_owned(), io_queue_key("callback"), 0_i64)
             .one(&f.store.connection)
             .await
             .unwrap()
@@ -2385,7 +2384,7 @@ async fn io_witness_seed_ignores_verified_and_expired_history() {
     }
     for (id, expected) in [("pending", true), ("verified", false), ("expired", false)] {
         assert_eq!(
-            work::Entity::find_by_id(("witness".to_owned(), io_queue_key(id), 0_i64))
+            find_work("witness".to_owned(), io_queue_key(id), 0_i64)
                 .one(&f.store.connection)
                 .await
                 .unwrap()
@@ -2550,18 +2549,18 @@ async fn io_index_enqueue_failure_rolls_back_result_and_progress() {
     );
     assert_eq!(f.marker("index-obligation").await, before);
     assert!(
-        frozen_result::Entity::find_by_id(("index-obligation".to_owned(), 0_i64))
+        find_frozen_result("index-obligation".to_owned(), 0_i64)
             .one(&f.store.connection)
             .await
             .unwrap()
             .is_none()
     );
     assert!(
-        work::Entity::find_by_id((
+        find_work(
             "witness".to_owned(),
             io_queue_key("index-obligation"),
             0_i64
-        ))
+        )
         .one(&f.store.connection)
         .await
         .unwrap()
@@ -2575,18 +2574,18 @@ async fn io_index_enqueue_failure_rolls_back_result_and_progress() {
             .unwrap()
     );
     assert!(
-        frozen_result::Entity::find_by_id(("index-obligation".to_owned(), 0_i64))
+        find_frozen_result("index-obligation".to_owned(), 0_i64)
             .one(&f.store.connection)
             .await
             .unwrap()
             .is_some()
     );
     assert!(
-        work::Entity::find_by_id((
+        find_work(
             "witness".to_owned(),
             io_queue_key("index-obligation"),
             0_i64
-        ))
+        )
         .one(&f.store.connection)
         .await
         .unwrap()
@@ -2685,7 +2684,7 @@ async fn io_seed_revision_and_frontier_capture_the_same_committed_request() {
         .unwrap();
     tx.commit().await.unwrap();
     assert!(f.store.html_preview_io_seed_quantum(&claim).await.unwrap());
-    let row = work::Entity::find_by_id(("seed_copies".to_owned(), String::new(), 0_i64))
+    let row = find_work("seed_copies".to_owned(), String::new(), 0_i64)
         .one(&f.store.connection)
         .await
         .unwrap()
@@ -2915,7 +2914,7 @@ async fn blocked_io_recovery_revisits_an_older_row_with_a_growing_suffix() {
         .recover_html_preview_io_blocked_through(&Default::default(), &upper)
         .await
         .unwrap();
-    let row = work::Entity::find_by_id((first.family, first.object_id, first.ordinal))
+    let row = find_work(first.family, first.object_id, first.ordinal)
         .one(&f.store.connection)
         .await
         .unwrap()

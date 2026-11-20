@@ -1,5 +1,7 @@
 //! Plugin ownership and native lifecycle regressions.
-use super::tests::{pack_skill_record, skill_pack_record, test_store_with_workspace};
+use super::tests::{
+    pack_skill_record, postgres_store_with_workspace, skill_pack_record, test_store_with_workspace,
+};
 use super::*;
 
 use sea_orm::ConnectionTrait;

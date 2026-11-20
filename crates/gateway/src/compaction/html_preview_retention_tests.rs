@@ -582,16 +582,16 @@ async fn preview_history_replay(format_version: u32) {
     crate::database::maintenance::html_previews::quantum(&f.store, &service, &mut io_progress)
         .await
         .unwrap();
-    let receipt = pioneer_entity::html_preview_frozen_result::Entity::find_by_id((
-        witness.manifest.clone(),
-        witness.ordinal,
-    ))
-    .one(&db)
-    .await
-    .unwrap()
-    .unwrap();
+    use pioneer_entity::html_preview_frozen_result as archive_result;
+    let archive_receipt = archive_result::Entity::find()
+        .filter(archive_result::Column::ManifestId.eq(&witness.manifest))
+        .filter(archive_result::Column::Ordinal.eq(witness.ordinal))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        receipt.archive_wire_sha256.is_some(),
+        archive_receipt.archive_wire_sha256.is_some(),
         "witness retry must not wait for unrelated activity release"
     );
     assert!(preview_paths.iter().all(|path| path.exists()));

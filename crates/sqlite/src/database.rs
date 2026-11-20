@@ -2,6 +2,7 @@ use crate::query_scope::{
     DiagnosticStream, PoolFutureExt, ScopedFuture, observe_control, open_stream,
 };
 use async_trait::async_trait;
+#[cfg(any(test, feature = "test-support"))]
 use pioneer_observability::portable_payload::{
     Family as PortableFamily, NativeOutcome, NativeRead,
 };
@@ -24,13 +25,11 @@ use crate::writer::{
     SqliteWriteExecutor, SqliteWriteObserver,
 };
 
-/// The private owner of the physical SQLite read pool.
+/// The private owner of the Gateway reader pool.
 ///
-/// The Gateway opens the underlying connections with SQLite's read-only flag
-/// and `PRAGMA query_only = ON`. This wrapper adds an API-level guard:
-/// mutation entry points and non-read statements are rejected before they can
-/// reach the pool. It deliberately never crosses the crate boundary: every
-/// query must carry a typed read class through [`SqliteDatabase`].
+/// The Gateway opens PostgreSQL sessions with read-only transactions. This
+/// wrapper also rejects mutation entry points and routes reads with an explicit
+/// scheduling class through [`SqliteDatabase`].
 #[derive(Clone)]
 struct SqliteReadPool {
     connection: DatabaseConnection,

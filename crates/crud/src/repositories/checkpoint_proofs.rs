@@ -2899,8 +2899,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(null.tool_item_id.0, None);
-        assert_eq!(blank.tool_item_id.0, Some(String::new()));
+        assert_eq!(null.tool_item_id, None);
+        assert_eq!(blank.tool_item_id, Some(String::new()));
         let json = serde_json::to_value(&null).unwrap();
         assert_eq!(
             json.as_object().unwrap().len(),

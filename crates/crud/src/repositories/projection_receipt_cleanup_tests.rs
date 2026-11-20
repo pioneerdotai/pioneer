@@ -3,8 +3,10 @@ use super::{
     turn_event_projection_state as projections, turn_event_projection_stream_state as streams,
 };
 use crate::CrudStore;
-use pioneer_entity::turn_event_projection_state as receipt;
 use pioneer_entity::{turn, turn_event};
+use pioneer_entity::{
+    turn_event_projection_state as receipt, turn_event_projection_stream_state as stream_entity,
+};
 use pioneer_postgres_test::{TestDatabase, with_database};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -38,6 +40,16 @@ async fn store(fixture: &TestDatabase) -> CrudStore {
     open(fixture).await
 }
 
+async fn write_fixture<T>(
+    database: &pioneer_sqlite::SqliteDatabase,
+    operation: impl AsyncFnOnce(&pioneer_sqlite::SqliteTransaction) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let tx = database.begin().await?;
+    let value = operation(&tx).await?;
+    tx.commit().await?;
+    Ok(value)
+}
+
 async fn seed(store: &CrudStore, turn_id: &str, count: i64, watermark: i64) {
     let db = store.database_connection();
     let now = chrono::Utc::now().fixed_offset();
@@ -54,17 +66,22 @@ async fn seed(store: &CrudStore, turn_id: &str, count: i64, watermark: i64) {
     .exec(&db)
     .await
     .unwrap();
-    streams::ensure_healthy(&db, "thread", turn_id, now)
-        .await
-        .unwrap();
+    write_fixture(&db, async |tx| {
+        streams::ensure_healthy(tx, "thread", turn_id, now).await
+    })
+    .await
+    .unwrap();
     for sequence in 1..=count {
         insert_event(store, turn_id, sequence, "projected").await;
     }
     if watermark > 0 {
         assert!(
-            streams::advance_projected_through(&db, turn_id, 0, watermark, now)
-                .await
-                .unwrap()
+            write_fixture(&db, async |tx| streams::advance_projected_through(
+                tx, turn_id, 0, watermark, now
+            )
+            .await)
+            .await
+            .unwrap()
         );
     }
 }
@@ -126,14 +143,17 @@ async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() 
         }
         seed(&store, "history-00000-quarantined", 1, 1).await;
         let db = store.database_connection();
-        streams::quarantine(
-            &db,
-            "thread",
-            "history-00000-quarantined",
-            "blocked",
-            "protected".into(),
-            chrono::Utc::now().fixed_offset(),
-        )
+        write_fixture(&db, async |tx| {
+            streams::quarantine(
+                tx,
+                "thread",
+                "history-00000-quarantined",
+                "blocked",
+                "protected".into(),
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await
+        })
         .await
         .unwrap();
 
@@ -196,9 +216,11 @@ async fn index_membership_follows_projection_cleanup_quarantine_and_restore() {
         assert_eq!(boundary(&store, "turn").await, 0);
 
         let now = chrono::Utc::now().fixed_offset();
-        let claimed = projections::claim_due(&db, now, now + chrono::Duration::minutes(1), 10)
-            .await
-            .unwrap();
+        let claimed = write_fixture(&db, async |tx| {
+            projections::claim_due(tx, now, now + chrono::Duration::minutes(1), 10).await
+        })
+        .await
+        .unwrap();
         assert_eq!(claimed.len(), 1);
         assert!(discovered_turn(&db, None).await.is_none());
         // Projection receipt and watermark roll back together; index membership
@@ -248,12 +270,25 @@ async fn index_membership_follows_projection_cleanup_quarantine_and_restore() {
         assert_eq!(discovered_turn(&db, None).await.as_deref(), Some("turn"));
         insert_event(&store, "turn", 2, "pending").await;
         assert!(
-            streams::quarantine(&db, "thread", "turn", "turn-2", "blocked".into(), now)
-                .await
-                .unwrap()
+            write_fixture(&db, async |tx| streams::quarantine(
+                tx,
+                "thread",
+                "turn",
+                "turn-2",
+                "blocked".into(),
+                now
+            )
+            .await)
+            .await
+            .unwrap()
         );
         assert!(discovered_turn(&db, None).await.is_none());
-        assert!(streams::restore(&db, "turn", "turn-2", now).await.unwrap());
+        assert!(
+            write_fixture(&db, async |tx| streams::restore(tx, "turn", "turn-2", now)
+                .await)
+            .await
+            .unwrap()
+        );
         assert_eq!(discovered_turn(&db, None).await.as_deref(), Some("turn"));
         let cleaned = store
             .cleanup_projection_receipts_quantum(None, None)
@@ -295,9 +330,9 @@ async fn discovery_excludes_invalid_compaction_boundaries_and_preserves_receipts
         seed(&store, "turn", 1, 1).await;
         let db = store.database_connection();
         for floor in [-1_i64, 2] {
-            stream::Entity::update_many()
+            stream_entity::Entity::update_many()
                 .col_expr(
-                    stream::Column::ReceiptsCompactedThroughSequence,
+                    stream_entity::Column::ReceiptsCompactedThroughSequence,
                     Expr::value(floor),
                 )
                 .exec(&db)
@@ -328,7 +363,7 @@ async fn byte_budget_can_end_a_quantum_before_the_row_limit() {
         receipt::Entity::update_many()
             .col_expr(
                 receipt::Column::ProjectionContextJson,
-                Expr::value("x".repeat(128 * 1024)),
+                Expr::value(serde_json::to_string(&"x".repeat(128 * 1024 - 2))?),
             )
             .exec(&store.database_connection())
             .await
@@ -400,11 +435,10 @@ async fn bounded_cleanup_resumes_and_observes_the_retained_suffix() {
         assert!(first.source_bytes <= RECEIPT_CLEANUP_MAX_SOURCE_BYTES as u64);
         assert_eq!(boundary(&store, "turn").await, 128);
         let db = store.database_connection();
-        let observed = projections::backfill_projected_watermark(
-            &db,
-            "turn",
-            chrono::Utc::now().fixed_offset(),
-        )
+        let observed = write_fixture(&db, async |tx| {
+            projections::backfill_projected_watermark(tx, "turn", chrono::Utc::now().fixed_offset())
+                .await
+        })
         .await
         .unwrap();
         assert_eq!(observed.observed_projected_through_sequence, 130);
@@ -427,11 +461,12 @@ async fn bounded_cleanup_resumes_and_observes_the_retained_suffix() {
         assert!(empty.last_turn_id.is_none());
         assert_eq!(boundary(&restarted, "turn").await, 130);
         assert!(
-            projections::backfill_projected_watermark(
-                &db,
+            write_fixture(&db, async |tx| projections::backfill_projected_watermark(
+                tx,
                 "turn",
                 chrono::Utc::now().fixed_offset()
             )
+            .await)
             .await
             .unwrap()
             .matches()
@@ -486,11 +521,10 @@ async fn legacy_gap_is_not_bridged_by_compaction_or_restart_observation() {
                 .unwrap()
                 .is_some()
         );
-        let observation = projections::backfill_projected_watermark(
-            &db,
-            "turn",
-            chrono::Utc::now().fixed_offset(),
-        )
+        let observation = write_fixture(&db, async |tx| {
+            projections::backfill_projected_watermark(tx, "turn", chrono::Utc::now().fixed_offset())
+                .await
+        })
         .await
         .unwrap();
         assert!(observation.matches());
@@ -557,8 +591,8 @@ async fn unfinished_receipts_and_quarantined_streams_survive_without_stalling_ot
         }
         let store = store(fixture).await;
         seed(&store, "quarantined", 1, 1).await;
-        stream::Entity::update_many()
-            .col_expr(stream::Column::Status, Expr::value("quarantined"))
+        stream_entity::Entity::update_many()
+            .col_expr(stream_entity::Column::Status, Expr::value("quarantined"))
             .exec(&store.database_connection())
             .await
             .unwrap();
@@ -593,7 +627,9 @@ async fn oversized_receipt_and_canonical_gap_are_deferred() {
         receipt::Entity::update_many()
             .col_expr(
                 receipt::Column::ProjectionContextJson,
-                Expr::value("x".repeat(RECEIPT_CLEANUP_MAX_SOURCE_BYTES as usize)),
+                Expr::value(serde_json::to_string(
+                    &"x".repeat(RECEIPT_CLEANUP_MAX_SOURCE_BYTES as usize - 2),
+                )?),
             )
             .filter(receipt::Column::EventId.eq("a-1"))
             .exec(&db)
@@ -637,9 +673,16 @@ async fn oversized_receipt_and_canonical_gap_are_deferred() {
         // receipt, so the gap pass must also prove cursor progress to B.
         insert_event(&store, "b", 2, "projected").await;
         assert!(
-            streams::advance_projected_through(&db, "b", 1, 2, chrono::Utc::now().fixed_offset())
-                .await
-                .unwrap()
+            write_fixture(&db, async |tx| streams::advance_projected_through(
+                tx,
+                "b",
+                1,
+                2,
+                chrono::Utc::now().fixed_offset()
+            )
+            .await)
+            .await
+            .unwrap()
         );
         let gap = store
             .cleanup_projection_receipts_quantum(None, None)
@@ -767,9 +810,11 @@ async fn concurrent_projection_and_repeated_preparation_preserve_the_new_suffix(
             .unwrap();
         insert_event(&store, "turn", 3, "pending").await;
         let now = chrono::Utc::now().fixed_offset();
-        let claimed = projections::claim_due(&db, now, now + chrono::Duration::minutes(1), 10)
-            .await
-            .unwrap();
+        let claimed = write_fixture(&db, async |tx| {
+            projections::claim_due(tx, now, now + chrono::Duration::minutes(1), 10).await
+        })
+        .await
+        .unwrap();
         assert_eq!(claimed.len(), 1);
         let transaction = db.begin().await.unwrap();
         assert!(
@@ -847,9 +892,11 @@ async fn new_claims_and_atomic_watermark_updates_continue_after_all_receipts_are
         insert_event(&store, "turn", 4, "pending").await;
         let db = store.database_connection();
         let now = chrono::Utc::now().fixed_offset();
-        let claimed = projections::claim_due(&db, now, now + chrono::Duration::minutes(1), 10)
-            .await
-            .unwrap();
+        let claimed = write_fixture(&db, async |tx| {
+            projections::claim_due(tx, now, now + chrono::Duration::minutes(1), 10).await
+        })
+        .await
+        .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].state.sequence, 3);
         let transaction = db.begin().await.unwrap();
@@ -867,10 +914,13 @@ async fn new_claims_and_atomic_watermark_updates_continue_after_all_receipts_are
         );
         transaction.commit().await.unwrap();
         assert!(
-            projections::backfill_projected_watermark(&db, "turn", now)
-                .await
-                .unwrap()
-                .matches()
+            write_fixture(&db, async |tx| projections::backfill_projected_watermark(
+                tx, "turn", now
+            )
+            .await)
+            .await
+            .unwrap()
+            .matches()
         );
         assert!(
             projections::has_unprojected_event(&db, "turn")
@@ -885,9 +935,11 @@ async fn new_claims_and_atomic_watermark_updates_continue_after_all_receipts_are
                 .rows_deleted,
             1
         );
-        let next = projections::claim_due(&db, now, now + chrono::Duration::minutes(1), 10)
-            .await
-            .unwrap();
+        let next = write_fixture(&db, async |tx| {
+            projections::claim_due(tx, now, now + chrono::Duration::minutes(1), 10).await
+        })
+        .await
+        .unwrap();
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].state.sequence, 4);
         Ok(())
@@ -927,11 +979,12 @@ async fn cleanup_reads_canonical_keys_with_portable_event_bodies() {
         );
         assert_eq!(turn_event::Entity::find().count(&db).await.unwrap(), 3);
         assert!(
-            projections::backfill_projected_watermark(
-                &db,
+            write_fixture(&db, async |tx| projections::backfill_projected_watermark(
+                tx,
                 "turn",
                 chrono::Utc::now().fixed_offset()
             )
+            .await)
             .await
             .unwrap()
             .matches()
@@ -985,8 +1038,8 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
         events.0.lock().unwrap().clear();
         reads.0.lock().unwrap().clear();
 
-        // With only cleaned history, an initial page performs exactly the marker
-        // read and the empty indexed discovery, even while the writer is occupied.
+        // With only cleaned history, the indexed discovery is the only read.
+        // It can finish even while the writer is occupied.
         let empty = tokio::time::timeout(
             Duration::from_secs(1),
             store.cleanup_projection_receipts_quantum(None, None),
@@ -1007,7 +1060,7 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
                     .iter()
                     .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
                     .count(),
-                2
+                1
             );
             assert_eq!(
                 observed
@@ -1021,7 +1074,7 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
                         }
                     ))
                     .count(),
-                2
+                1
             );
             assert_eq!(
                 observed
@@ -1036,12 +1089,12 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
                         }
                     ))
                     .count(),
-                2
+                1
             );
         }
         assert_eq!(receipt::Entity::find().count(&database).await.unwrap(), 0);
         assert_eq!(
-            stream::Entity::find().count(&database).await.unwrap(),
+            stream_entity::Entity::find().count(&database).await.unwrap(),
             COMPACTED_HISTORY_TURNS
         );
         assert_eq!(
@@ -1186,13 +1239,14 @@ async fn addressed_batches_freeze_the_frontier_preserve_other_turns_and_recover_
         insert_event(&store, "a", 131, "projected").await;
         let db = store.database_connection();
         assert!(
-            streams::advance_projected_through(
-                &db,
+            write_fixture(&db, async |tx| streams::advance_projected_through(
+                tx,
                 "a",
                 130,
                 131,
                 chrono::Utc::now().fixed_offset()
             )
+            .await)
             .await
             .unwrap()
         );

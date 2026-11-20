@@ -659,7 +659,7 @@ mod tests {
             item_id: "item_1".to_owned(),
             source_actor_role: "assistant".to_owned(),
             source_runtime_kind: "assistant_turn".to_owned(),
-            source_context_json: serde_json::to_string(
+            source_context_json: serde_json::to_value(
                 &pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleThreadItem,
             )
             .expect("serialize source context"),

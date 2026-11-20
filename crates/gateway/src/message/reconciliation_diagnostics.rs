@@ -1,6 +1,6 @@
 //! Reporting only: no database handles, retry decisions, or error strings live here.
 use sea_orm::sqlx::error::DatabaseError;
-use sea_orm::{ConnAcquireErr, RuntimeErr, SqlxError, SqlxSqliteError};
+use sea_orm::{ConnAcquireErr, RuntimeErr, SqlxError, SqlxPostgresError, SqlxSqliteError};
 use std::time::{Duration, Instant};
 
 const REPORT_WINDOW: Duration = Duration::from_secs(10 * 60);
@@ -32,6 +32,12 @@ enum Cause {
     SqliteCorrupt,
     SqliteNotADatabase,
     SqliteOther,
+    PostgresConnection,
+    PostgresContention,
+    PostgresIo,
+    PostgresFull,
+    PostgresReadOnly,
+    PostgresCorrupt,
     PoolTimeout,
     PoolClosed,
 }
@@ -49,6 +55,12 @@ impl Cause {
             Self::SqliteCorrupt => "sqlite_corrupt",
             Self::SqliteNotADatabase => "sqlite_notadb",
             Self::SqliteOther => "sqlite_other",
+            Self::PostgresConnection => "postgres_connection",
+            Self::PostgresContention => "postgres_contention",
+            Self::PostgresIo => "postgres_io",
+            Self::PostgresFull => "postgres_full",
+            Self::PostgresReadOnly => "postgres_read_only",
+            Self::PostgresCorrupt => "postgres_corrupt",
             Self::PoolTimeout => "pool_timeout",
             Self::PoolClosed => "pool_closed",
         }
@@ -108,11 +120,28 @@ impl Diagnostic {
             sqlite_code: code,
         }
     }
+    fn postgres(operation: Operation, error: &SqlxPostgresError) -> Self {
+        let cause = match error.code().as_bytes() {
+            [b'0', b'8', ..] | b"57P01" | b"57P02" | b"57P03" => Cause::PostgresConnection,
+            b"40001" | b"40P01" | b"55P03" => Cause::PostgresContention,
+            b"58030" => Cause::PostgresIo,
+            b"53100" => Cause::PostgresFull,
+            b"25006" => Cause::PostgresReadOnly,
+            b"XX001" | b"XX002" => Cause::PostgresCorrupt,
+            _ => Cause::Unclassified,
+        };
+        Self::new(operation, cause)
+    }
     fn sqlx(operation: Operation, error: &SqlxError) -> Option<Self> {
         match error {
             SqlxError::Database(database) => database
-                .try_downcast_ref::<SqlxSqliteError>()
-                .map(|error| Self::sqlite(operation, error)),
+                .try_downcast_ref::<SqlxPostgresError>()
+                .map(|error| Self::postgres(operation, error))
+                .or_else(|| {
+                    database
+                        .try_downcast_ref::<SqlxSqliteError>()
+                        .map(|error| Self::sqlite(operation, error))
+                }),
             SqlxError::PoolTimedOut => Some(Self::new(operation, Cause::PoolTimeout)),
             SqlxError::PoolClosed => Some(Self::new(operation, Cause::PoolClosed)),
             _ => None,
@@ -144,6 +173,9 @@ impl Diagnostic {
                 && let Some(diagnostic) = Self::sqlx(operation, error)
             {
                 return diagnostic;
+            }
+            if let Some(error) = source.downcast_ref::<SqlxPostgresError>() {
+                return Self::postgres(operation, error);
             }
             if let Some(error) = source.downcast_ref::<SqlxSqliteError>() {
                 return Self::sqlite(operation, error);

@@ -22,7 +22,7 @@ pub enum HtmlPreviewIoFamily {
     SeedWitness,
     SeedCopies,
 }
-fn find_work(
+pub(super) fn find_work(
     family: impl AsRef<str>,
     object_id: impl AsRef<str>,
     ordinal: i64,

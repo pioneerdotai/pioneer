@@ -1,4 +1,4 @@
-//! R10 primary lifecycle regression. Gate CLOSED; NOT_RUN.
+//! Task child owner recovery from a committed terminal receipt.
 use super::*;
 use crate::events::TurnEventPayload;
 use pioneer_entity::{
@@ -6,6 +6,7 @@ use pioneer_entity::{
     turn_event as event, turn_event_projection_state as receipt,
     turn_event_projection_stream_state as stream,
 };
+use sea_orm::sea_query::ExprTrait;
 
 #[tokio::test]
 async fn owner_only_backfill_revives_parked_child_with_already_covered_terminal_receipt() {
@@ -48,7 +49,11 @@ async fn owner_only_backfill_revives_parked_child_with_already_covered_terminal_
         .await
         .unwrap()
         .unwrap();
-    let mut payload: TurnEventPayload = serde_json::from_str(&diff.payload).unwrap();
+    let mut hydrated = crate::repositories::turn_payload::hydrate_events(&db, vec![diff.clone()])
+        .await
+        .unwrap();
+    let mut payload: TurnEventPayload =
+        serde_json::from_value(hydrated.pop().unwrap().payload.unwrap()).unwrap();
     let TurnEventPayload::ItemCompleted(ref mut item) = payload else {
         panic!("item completion required")
     };
@@ -61,7 +66,11 @@ async fn owner_only_backfill_revives_parked_child_with_already_covered_terminal_
             event::Column::ThreadId,
             Expr::value("legacy_session_thread"),
         )
-        .col_expr(event::Column::Payload, Expr::value(payload_json))
+        .col_expr(
+            event::Column::Payload,
+            Expr::value(payload_json).cast_as("text").cast_as("json"),
+        )
+        .col_expr(event::Column::PayloadPayloadId, Expr::value(None::<String>))
         .col_expr(event::Column::IdempotencyKey, Expr::value(key))
         .filter(event::Column::Id.eq(&diff.id))
         .exec(&tx)

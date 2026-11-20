@@ -3289,11 +3289,13 @@ async fn insert_new_user_thread_for_initial_turn(
         }
     }
 
-    // SQLite writes for one CrudStore already pass through the shared write
-    // coordinator. A concurrent first Message can therefore arrive here only
-    // after another first Message has committed the same runtime draft. Reuse
-    // that exact, already-authorized thread instead of manufacturing a second
-    // coordination layer around turn/start.
+    pioneer_crud_conversations::thread_state::lock_thread_creation(
+        transaction,
+        started.thread.id.as_str(),
+    )
+    .await?;
+    // A competing first Message can reuse the committed draft only after
+    // verifying its immutable creator and access facts.
     if let Some(existing) =
         repositories::thread::find_thread_by_id(transaction, started.thread.id.as_str()).await?
     {
@@ -24736,7 +24738,7 @@ impl CrudStore {
                         .await
                 }
             },
-            TurnMcpProjectionPersistenceError::is_sqlite_lock,
+            TurnMcpProjectionPersistenceError::is_retryable_conflict,
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
         )
@@ -24764,7 +24766,7 @@ impl CrudStore {
                     .await
                 }
             },
-            TurnMcpProjectionPersistenceError::is_sqlite_lock,
+            TurnMcpProjectionPersistenceError::is_retryable_conflict,
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
         )
@@ -39169,7 +39171,30 @@ mod tests {
         transaction.commit().await.unwrap();
     }
 
-    async fn postgres_store_with_workspace(
+    async fn read_fixture_item(
+        db: &pioneer_sqlite::SqliteDatabase,
+        row: pioneer_entity::turn_item::Model,
+    ) -> anyhow::Result<TurnItem> {
+        let mut items = crate::repositories::turn_payload::hydrate_items(db, vec![row]).await?;
+        crate::repositories::turn_payload::decode_item(&items.pop().expect("one item"))
+    }
+
+    async fn read_fixture_event_payload(
+        db: &pioneer_sqlite::SqliteDatabase,
+        row: &pioneer_entity::turn_event::Model,
+    ) -> anyhow::Result<serde_json::Value> {
+        use anyhow::Context;
+
+        let mut events =
+            crate::repositories::turn_payload::hydrate_events(db, vec![row.clone()]).await?;
+        events
+            .pop()
+            .expect("one event")
+            .payload
+            .context("fixture event payload")
+    }
+
+    pub(super) async fn postgres_store_with_workspace(
         fixture: &pioneer_postgres_test::TestDatabase,
         workspace_id: &str,
     ) -> CrudStore {
@@ -45547,7 +45572,8 @@ mod tests {
             .await
             .expect("tool item lookup should succeed")
             .expect("tool item should exist");
-            let item: TurnItem = serde_json::from_str(item.payload.as_str())
+            let item: TurnItem = read_fixture_item(&restarted.connection, item)
+                .await
                 .expect("terminal item payload should decode");
             assert_eq!(tool_call_status(&item), Some(ToolCallStatus::Failed));
             assert!(
@@ -45755,7 +45781,8 @@ mod tests {
         .await
         .expect("tool item lookup should succeed")
         .expect("tool item should exist");
-        let running_item: TurnItem = serde_json::from_str(running_item.payload.as_str())
+        let running_item: TurnItem = read_fixture_item(&store.connection, running_item)
+            .await
             .expect("running item should decode");
         assert_eq!(
             tool_call_status(&running_item),
@@ -47112,6 +47139,7 @@ mod tests {
             message_deleted_at: Set(deleted.then_some(created_at)),
             message_deleted_by_actor_id: Set(None),
             message_deleted_by_actor_kind: Set(None),
+            ..Default::default()
         })
         .exec(&store.connection)
         .await
@@ -49168,6 +49196,7 @@ mod tests {
                     origin_kind: Set(None),
                     created_by_thread_id: Set(None),
                     created_by_turn_id: Set(None),
+                    ..Default::default()
                 }
             })
             .collect::<Vec<_>>();
@@ -57415,8 +57444,9 @@ mod tests {
         assert_eq!(row.status.as_deref(), Some("timed_out"));
         assert_eq!(row.active_attempt_status.as_deref(), Some("timed_out"));
 
-        let payload: TurnItem =
-            serde_json::from_str(row.payload.as_str()).expect("payload should decode");
+        let payload: TurnItem = read_fixture_item(&store.connection, row)
+            .await
+            .expect("payload should decode");
         let TurnItem::WebFetch { status, .. } = payload else {
             panic!("expected web_fetch payload");
         };
@@ -57443,7 +57473,8 @@ mod tests {
                 .expect("restored turn_item row should exist");
         assert_eq!(restored.status.as_deref(), Some("in_progress"));
         assert_eq!(restored.active_attempt_status.as_deref(), Some("running"));
-        let restored_payload: TurnItem = serde_json::from_str(restored.payload.as_str())
+        let restored_payload: TurnItem = read_fixture_item(&store.connection, restored)
+            .await
             .expect("restored payload should decode");
         assert!(matches!(
             restored_payload,
@@ -57541,8 +57572,9 @@ mod tests {
             .expect("turn_item row should exist");
         assert_eq!(row.status.as_deref(), Some("in_progress"));
         assert_eq!(row.active_attempt_status.as_deref(), Some("running"));
-        let payload: TurnItem =
-            serde_json::from_str(row.payload.as_str()).expect("payload should decode");
+        let payload: TurnItem = read_fixture_item(&store.connection, row)
+            .await
+            .expect("payload should decode");
         assert!(matches!(
             payload,
             TurnItem::WebFetch {
@@ -58035,8 +58067,9 @@ mod tests {
         assert_eq!(row.status.as_deref(), Some("failed"));
         assert_eq!(row.active_attempt_status.as_deref(), Some("interrupted"));
 
-        let payload: TurnItem =
-            serde_json::from_str(row.payload.as_str()).expect("payload should decode");
+        let payload: TurnItem = read_fixture_item(&store.connection, row)
+            .await
+            .expect("payload should decode");
         let TurnItem::WebFetch { status, .. } = payload else {
             panic!("expected web_fetch payload");
         };
@@ -58207,9 +58240,9 @@ mod tests {
                 item_id: Set(extra_item_id),
                 item_type: Set("web_fetch".to_owned()),
                 status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
-                payload: Set(
-                    serde_json::to_string(&extra_item).expect("extra item should serialize")
-                ),
+                payload: Set(Some(
+                    serde_json::to_value(&extra_item).expect("extra item should serialize"),
+                )),
                 active_attempt_number: Set(0),
                 active_attempt_status: Set(None),
                 active_attempt_id: Set(None),
@@ -58266,8 +58299,9 @@ mod tests {
             .await
             .expect("turn_item lookup should succeed")
             .expect("turn_item row should exist");
-        let payload: TurnItem =
-            serde_json::from_str(row.payload.as_str()).expect("payload should decode");
+        let payload: TurnItem = read_fixture_item(&store.connection, row)
+            .await
+            .expect("payload should decode");
         let TurnItem::WebFetch { status, .. } = payload else {
             panic!("expected web_fetch payload");
         };
@@ -58298,7 +58332,9 @@ mod tests {
                     item_id: Set(item_id),
                     item_type: Set("web_fetch".to_owned()),
                     status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
-                    payload: Set(serde_json::to_string(&item).expect("turn item should serialize")),
+                    payload: Set(Some(
+                        serde_json::to_value(&item).expect("turn item should serialize"),
+                    )),
                     active_attempt_number: Set(0),
                     active_attempt_status: Set(None),
                     active_attempt_id: Set(None),
@@ -58349,8 +58385,9 @@ mod tests {
                 .await
                 .expect("repaired turn_item should query")
                 .expect("repaired turn_item should exist");
-            let item: TurnItem =
-                serde_json::from_str(row.payload.as_str()).expect("payload should decode");
+            let item: TurnItem = read_fixture_item(&store.connection, row)
+                .await
+                .expect("payload should decode");
             assert_ne!(tool_call_status(&item), Some(ToolCallStatus::InProgress));
         }
 
@@ -58399,7 +58436,7 @@ mod tests {
             item_id: Set("item_repair_version_probe".to_owned()),
             item_type: Set("web_fetch".to_owned()),
             status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
-            payload: Set("{malformed-json".to_owned()),
+            payload: Set(Some(serde_json::json!([]))),
             active_attempt_number: Set(0),
             active_attempt_status: Set(None),
             active_attempt_id: Set(None),
@@ -58460,7 +58497,7 @@ mod tests {
             item_id: Set("item_compressed_repair".to_owned()),
             item_type: Set("web_fetch".to_owned()),
             status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
-            payload: Set(in_progress_payload.clone()),
+            payload: Set(Some(serde_json::from_str(&in_progress_payload).unwrap())),
             active_attempt_number: Set(0),
             active_attempt_status: Set(None),
             active_attempt_id: Set(None),
@@ -58523,8 +58560,9 @@ mod tests {
             .await
             .expect("compressed repaired row should query")
             .expect("compressed repaired row should exist");
-        let repaired_item: TurnItem =
-            serde_json::from_str(repaired.payload.as_str()).expect("payload should decode");
+        let repaired_item: TurnItem = read_fixture_item(&store.connection, repaired)
+            .await
+            .expect("payload should decode");
         assert_ne!(
             tool_call_status(&repaired_item),
             Some(ToolCallStatus::InProgress)
@@ -58548,7 +58586,9 @@ mod tests {
             item_id: Set("item_repair_status_fence".to_owned()),
             item_type: Set("web_fetch".to_owned()),
             status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
-            payload: Set(serde_json::to_string(&item).expect("turn item should serialize")),
+            payload: Set(Some(
+                serde_json::to_value(&item).expect("turn item should serialize"),
+            )),
             active_attempt_number: Set(0),
             active_attempt_status: Set(None),
             active_attempt_id: Set(None),
@@ -62648,9 +62688,12 @@ mod tests {
             .await
             .expect("must query persisted turn/start event")
             .expect("turn/start event should exist");
-        let decoded_event: crate::events::TurnEventPayload =
-            serde_json::from_str(persisted_event.payload.as_str())
-                .expect("persisted turn/start event should decode");
+        let decoded_event: crate::events::TurnEventPayload = serde_json::from_value(
+            read_fixture_event_payload(&store.connection, &persisted_event)
+                .await
+                .unwrap(),
+        )
+        .expect("persisted turn/start event should decode");
         let crate::events::TurnEventPayload::TurnStarted(decoded_started) = decoded_event else {
             panic!("expected persisted turn/start event");
         };
@@ -63241,9 +63284,12 @@ mod tests {
             .await
             .expect("must query turn permission audit events");
         assert_eq!(audit_events.len(), 1);
-        let audit_payload: crate::events::TurnEventPayload =
-            serde_json::from_str(audit_events[0].payload.as_str())
-                .expect("audit event payload should decode");
+        let audit_payload: crate::events::TurnEventPayload = serde_json::from_value(
+            read_fixture_event_payload(&store.connection, &audit_events[0])
+                .await
+                .unwrap(),
+        )
+        .expect("audit event payload should decode");
         let crate::events::TurnEventPayload::TurnPermissionAudit(audit) = audit_payload else {
             panic!("expected turn permission audit event");
         };
@@ -63764,7 +63810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_completed_message_observes_its_thread_created_in_the_same_transaction() {
+    async fn concurrent_first_messages_share_one_thread_and_read_it_in_their_transactions() {
         pioneer_postgres_test::with_database(async |fixture| {
             let store = postgres_store_with_workspace(fixture, "ws_atomic_first_message").await;
             let connection = store.database_connection();
@@ -63838,7 +63884,25 @@ mod tests {
                 cached: false,
             };
 
-            store
+            let second_store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+                fixture.connect_read_only().await?,
+                fixture.connect().await?,
+            ));
+            let blocker = fixture.connection().begin().await?;
+            pioneer_crud_conversations::thread_state::lock_thread_creation(&blocker, &thread.id)
+                .await?;
+            let check = fixture.connect().await?;
+
+            let mut second_started = started.clone();
+            second_started.id = "turn_concurrent_first_message".to_owned();
+            let mut second_completed = second_started.clone();
+            second_completed.status = TurnStatus::Completed;
+            let mut second_thread = thread.clone();
+            second_thread.turns = vec![second_started.clone()];
+            let mut second_audit = audit_event.clone();
+            second_audit.turn_id = second_started.id.clone();
+
+            let first_write = store
                 .materialize_new_superuser_completed_message_turn_with_permission_audit(
                     CompletedMessageTurnWrite {
                         thread: &thread,
@@ -63854,9 +63918,53 @@ mod tests {
                         audit_event,
                     },
                     super::PersistedThreadAccessClass::Workspace,
-                )
-                .await
-                .expect("first Message and its thread should commit atomically");
+                );
+            let second_write = second_store
+                .materialize_new_superuser_completed_message_turn_with_permission_audit(
+                    CompletedMessageTurnWrite {
+                        thread: &second_thread,
+                        sandbox_mode: SandboxMode::FullAccess,
+                        started_turn: &second_started,
+                        input: input.as_slice(),
+                        actor: actor.clone(),
+                        completed: TurnCompletedNotification {
+                            workspace_id: second_thread.workspace_id.clone(),
+                            thread_id: second_thread.id.clone(),
+                            turn: second_completed,
+                        },
+                        audit_event: second_audit,
+                    },
+                    super::PersistedThreadAccessClass::Workspace,
+                );
+            let release_after_both_wait = async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let row = check
+                            .query_one_raw(Statement::from_string(
+                                DatabaseBackend::Postgres,
+                                "SELECT count(*) AS waiters FROM pg_locks
+                             WHERE locktype = 'advisory' AND NOT granted AND database =
+                                 (SELECT oid FROM pg_database WHERE datname = current_database())",
+                            ))
+                            .await?
+                            .expect("one lock count");
+                        if row.try_get::<i64>("", "waiters")? == 2 {
+                            return Ok::<_, sea_orm::DbErr>(());
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await??;
+                blocker.commit().await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            // The two pools reach the same PostgreSQL lock before either can
+            // observe a thread row. Both writes must commit after it is released.
+            let (first, second, released) =
+                tokio::join!(first_write, second_write, release_after_both_wait);
+            released?;
+            first.expect("first Message and thread should commit atomically");
+            second.expect("other first Message should attach to the same thread");
 
             let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.as_str())
                 .one(&connection)
@@ -63871,19 +63979,21 @@ mod tests {
                 persisted_thread.created_by_actor_id.as_deref(),
                 Some(principal_id.as_str())
             );
-            let (_, persisted_turn) = store
-                .get_turn(thread.id.as_str(), started.id.as_str())
-                .await
-                .expect("first Message should load")
-                .expect("first Message should exist");
-            assert_eq!(persisted_turn.status, TurnStatus::Completed);
-            assert_eq!(persisted_turn.author.as_ref(), Some(&author));
-            assert_eq!(
-                crate::find_turn_initiator(&connection, started.id.as_str())
+            for accepted in [&started, &second_started] {
+                let (_, persisted_turn) = store
+                    .get_turn(thread.id.as_str(), accepted.id.as_str())
                     .await
-                    .expect("first Message initiator should load"),
-                Some(actor)
-            );
+                    .expect("committed Message should load")
+                    .expect("committed Message should exist");
+                assert_eq!(persisted_turn.status, TurnStatus::Completed);
+                assert_eq!(persisted_turn.author.as_ref(), Some(&author));
+                assert_eq!(
+                    crate::find_turn_initiator(&connection, accepted.id.as_str())
+                        .await
+                        .expect("Message initiator should load"),
+                    Some(actor.clone())
+                );
+            }
             Ok(())
         })
         .await
@@ -67126,7 +67236,8 @@ mod tests {
                 .expect("terminal event lookup should succeed")
                 .expect("terminal event should exist");
             let mut legacy_json: serde_json::Value =
-                serde_json::from_str(terminal_row.payload.as_str())
+                read_fixture_event_payload(&store.connection, &terminal_row)
+                    .await
                     .expect("canonical payload JSON");
             legacy_json["payload"]["turn"]["prompt_manifest"]["profile"] =
                 serde_json::json!("cli_runtime_codex");

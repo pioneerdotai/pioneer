@@ -1,5 +1,6 @@
 use super::*;
 use migration::{Migrator, MigratorTrait};
+use pioneer_crud_execution::outbox_discovery::discover as discover_agent_action_outbox;
 use sea_orm::{Database, DatabaseBackend, DbErr};
 
 async fn database() -> DatabaseConnection {
@@ -46,12 +47,7 @@ async fn load<C: ConnectionTrait>(db: &C, id: &str) -> agent_action_outbox::Mode
 }
 
 async fn ids<C: ConnectionTrait>(db: &C, now: DateTimeWithTimeZone) -> Vec<String> {
-    discover_agent_action_outbox(db, now, 64)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| row.id)
-        .collect()
+    discover_agent_action_outbox(db, now, 64).await.unwrap()
 }
 
 #[tokio::test]
@@ -105,14 +101,14 @@ async fn action_outbox_ranges_bound_mixed_work_and_share_final_cleanup_budget() 
         assert!(
             inputs
                 .iter()
-                .filter(|row| row.id.starts_with("immediate-"))
+                .filter(|row| row.starts_with("immediate-"))
                 .count()
                 <= 32
         );
         assert!(
             inputs
                 .iter()
-                .filter(|row| row.id.starts_with("timed-"))
+                .filter(|row| row.starts_with("timed-"))
                 .count()
                 <= 32
         );
@@ -197,13 +193,7 @@ async fn action_outbox_plans_exclude_closed_refusals_from_small_and_empty_backlo
     seed(&db, "small-immediate", "pending", 0, now, None).await;
     seed(&db, "small-timed", "failed", 1, now, Some(now)).await;
     let selected = discover_agent_action_outbox(&db, now, 2).await.unwrap();
-    assert_eq!(
-        selected
-            .iter()
-            .map(|row| row.id.as_str())
-            .collect::<Vec<_>>(),
-        ["small-immediate", "small-timed"]
-    );
+    assert_eq!(selected, ["small-immediate", "small-timed"]);
     let claimed = claim_agent_action_outbox_with_clock(&db, 2, &|| now)
         .await
         .unwrap();
@@ -1356,10 +1346,7 @@ async fn action_outbox_concurrent_range_move_does_not_duplicate_an_input() {
     let selected = discover_agent_action_outbox(&concurrent_writer, now, 64)
         .await
         .unwrap();
-    assert_eq!(
-        selected.into_iter().map(|row| row.id).collect::<Vec<_>>(),
-        vec!["moving"]
-    );
+    assert_eq!(selected, vec!["moving"]);
     assert_eq!(load(&db, "moving").await.next_attempt_at, Some(now));
 }
 

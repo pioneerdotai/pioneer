@@ -23,7 +23,7 @@ impl pioneer_sqlite::SqliteReadObserver for ReadObserver {
     }
 }
 
-fn fixture(id: String, status: &str) -> binding::ActiveModel {
+fn binding_fixture(id: String, status: &str) -> binding::ActiveModel {
     let timestamp = unix_to_datetime(1_700_000_000);
     binding::ActiveModel {
         turn_id: Set(id),
@@ -46,7 +46,8 @@ async fn history(store: &CrudStore) {
     // A large terminal prefix must not consume the active row budget.
     for batch in 0..64 {
         binding::Entity::insert_many(
-            (0..128).map(|i| fixture(format!("history_{:05}", batch * 128 + i), "completed")),
+            (0..128)
+                .map(|i| binding_fixture(format!("history_{:05}", batch * 128 + i), "completed")),
         )
         .exec(&store.database_connection())
         .await
@@ -61,7 +62,9 @@ async fn cli_active_binding_pages_bound_ties_status_changes_and_restart() {
         history(&store).await;
         for status in [Starting, Running] {
             binding::Entity::insert_many(
-                (0..145).map(|i| fixture(format!("{}_{i:03}", status.as_str()), status.as_str())),
+                (0..145).map(|i| {
+                    binding_fixture(format!("{}_{i:03}", status.as_str()), status.as_str())
+                }),
             )
             .exec(&store.database_connection())
             .await
@@ -99,7 +102,7 @@ async fn cli_active_binding_pages_bound_ties_status_changes_and_restart() {
             // New suffix pages must not postpone EOF, while an ordinary fresh
             // pass sees them. The captured frontier remains inclusive.
             binding::Entity::insert_many((0..65).map(|i| {
-                let mut row = fixture(
+                let mut row = binding_fixture(
                     format!("{}_suffix_{i:03}", status.as_str()),
                     status.as_str(),
                 );
@@ -135,7 +138,8 @@ async fn cli_active_binding_pages_bound_ties_status_changes_and_restart() {
                 64
             );
 
-            let mut behind = fixture(format!("{}_behind", status.as_str()), status.as_str());
+            let mut behind =
+                binding_fixture(format!("{}_behind", status.as_str()), status.as_str());
             behind.created_at = Set(unix_to_datetime(1_699_999_999));
             binding::Entity::insert(behind)
                 .exec(&store.database_connection())
@@ -679,7 +683,7 @@ async fn cli_control_terminal_guard_fences_mapping_replacement_at_same_timestamp
         .unwrap()
         .unwrap();
     assert!(committed.input_mapping_json.is_empty());
-    assert!(committed.input_mapping_read_hold.is_none());
+    assert!(committed.input_mapping_frame.is_none());
     assert_eq!(
         store
             .get_cli_runtime_turn_binding(&selected.binding.turn_id)

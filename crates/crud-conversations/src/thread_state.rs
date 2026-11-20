@@ -4,8 +4,26 @@ use pioneer_protocol::{PrincipalId, ThreadReadCursor};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait, LockType, OnConflict, Query};
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
+
+const THREAD_CREATION_LOCK_SEED: i64 = 0x7069_6f6e_7468_7264;
+
+/// Lock an initial thread identity before reading it. A draft has no database
+/// row until its first turn is accepted.
+pub async fn lock_thread_creation(tx: &DatabaseTransaction, thread_id: &str) -> Result<()> {
+    // SeaORM row locks require an existing row. PostgreSQL can fence this
+    // draft identity for the duration of the creating transaction.
+    tx.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))",
+        [thread_id.into(), THREAD_CREATION_LOCK_SEED.into()],
+    ))
+    .await
+    .context("lock initial thread identity")?;
+    Ok(())
+}
 
 pub async fn find_thread_read_cursor<C: ConnectionTrait>(
     db: &C,

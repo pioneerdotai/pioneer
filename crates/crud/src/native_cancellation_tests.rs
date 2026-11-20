@@ -1544,7 +1544,7 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
                 turn_id: Set(turn_id.to_owned()),
                 sequence: Set(sequence),
                 event_type: Set(prepared.payload().event_type().to_owned()),
-                payload: Set(serde_json::to_string(prepared.payload()).unwrap()),
+                payload: Set(Some(serde_json::to_value(prepared.payload()).unwrap())),
                 idempotency_key: Set(Some(prepared.payload().idempotency_key().unwrap())),
                 created_at: Set(timestamp),
                 ..Default::default()

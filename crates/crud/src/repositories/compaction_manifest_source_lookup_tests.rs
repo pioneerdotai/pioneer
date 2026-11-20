@@ -1,5 +1,6 @@
 use super::*;
 use crate::CrudStore;
+use crate::compaction::sqlite_specific_sql;
 use crate::repositories::compaction::{
     arm_checkpoint_projection_page_test_hook, checkpoint_projection_page_sizes_statement,
     checkpoint_projection_page_statement, checkpoint_projection_page_test_pause,

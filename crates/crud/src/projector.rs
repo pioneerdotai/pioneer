@@ -613,13 +613,16 @@ impl TurnProjector {
     }
 
     #[cfg(test)]
-    pub async fn project<C: ConnectionTrait + sea_orm::TransactionTrait + Sync>(
+    pub async fn project(
         &self,
-        db: &C,
+        db: impl Into<pioneer_sqlite::SqliteDatabase>,
         event: &AppendedTurnEvent,
     ) -> Result<()> {
+        use sea_orm::TransactionTrait;
+
+        let db = db.into();
         let prepared = self
-            .prepare(db, event.id.as_str(), &event.payload, event.created_at)
+            .prepare(&db, event.id.as_str(), &event.payload, event.created_at)
             .await?;
         let tx = db.begin().await?;
         self.project_prepared(&tx, event, prepared).await?;
