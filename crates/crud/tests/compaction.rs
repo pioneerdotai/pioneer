@@ -10,17 +10,23 @@ async fn store() -> CrudStore {
 type RecordedStatements = std::sync::Arc<std::sync::Mutex<Vec<Statement>>>;
 
 async fn store_recording_statements(statements: Option<RecordedStatements>) -> CrudStore {
-    let mut db = Database::connect("sqlite::memory:").await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let mut writer = fixture.connection().clone();
+    let mut reader = fixture.connect_read_only().await.unwrap();
     if let Some(statements) = statements {
-        db.set_metric_callback(move |info| {
+        let reads = statements.clone();
+        reader.set_metric_callback(move |info| {
+            reads.lock().unwrap().push(info.statement.clone());
+        });
+        writer.set_metric_callback(move |info| {
             statements.lock().unwrap().push(info.statement.clone());
         });
     }
-    let store = CrudStore::new(db).with_maintenance_access();
+    let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(reader, writer))
+        .with_maintenance_access();
     let db = store.database_connection();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,TRUE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
@@ -29,28 +35,14 @@ async fn store_recording_statements(statements: Option<RecordedStatements>) -> C
     store
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn exact_delivery_source_uses_event_keys_instead_of_scanning_revision_history() {
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    for compressed in [false, true] {
+    for portable in [false, true] {
         let statements = RecordedStatements::default();
         let store = store_recording_statements(Some(statements.clone())).await;
         let db = store.database_connection();
-        if compressed {
-            db.query_one_write_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT zstd_enable_transparent(?)",
-                [serde_json::json!({
-                    "table": "turn_event", "column": "payload",
-                    "compression_level": 3, "dict_chooser": "'[nodict]'"
-                })
-                .to_string()
-                .into()],
-            ))
-            .await
-            .unwrap();
-        }
-        source(&store, "ordinary", 1, "ordinary history").await;
+        let wire = format!(r#"{{"text":"{}"}}"#, "ordinary history".repeat(1024));
+        source_with_storage(&store, "ordinary", 1, &wire, portable).await;
         statements.lock().unwrap().clear();
         assert!(
             store
@@ -78,26 +70,22 @@ async fn exact_delivery_source_uses_event_keys_instead_of_scanning_revision_hist
             })
             .expect("failed-delivery fallback must be exercised")
             .clone();
-        statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+        statement.sql = format!("EXPLAIN (COSTS OFF) {}", statement.sql);
         let plan = db
             .query_all_raw(statement)
             .await
             .unwrap()
             .into_iter()
-            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
             .collect::<Vec<_>>();
         assert!(
             plan.iter()
-                .any(|detail| detail.contains("SEARCH r ") && detail.contains("source_id=?")),
+                .any(|detail| detail.contains("compaction_event_revision_pkey")),
             "{plan:#?}"
         );
-        let event_table = if compressed { "_turn_event_zstd" } else { "e" };
         assert!(
-            plan.iter().any(
-                |detail| detail.starts_with(&format!("SEARCH {event_table} "))
-                    && detail.contains("(id=?)")
-            ),
-            "exact source lookup must not scan its entire thread: {plan:#?}"
+            plan.iter().any(|detail| detail.contains("turn_event_pkey")),
+            "{plan:#?}"
         );
         assert!(
             !plan
@@ -108,12 +96,21 @@ async fn exact_delivery_source_uses_event_keys_instead_of_scanning_revision_hist
     }
 }
 
-#[tokio::test]
-async fn history_capture_is_identical_before_and_after_transparent_compression() {
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+#[pioneer_postgres_test::postgres_test]
+async fn history_capture_and_checkpoint_preserve_compressed_event_across_a_fence() {
     let store = store().await;
+    let wire = format!(r#"{{"text":"{}"}}"#, "retained original 🌍".repeat(4096));
+    let source = source_with_storage(&store, "first", 1, &wire, true).await;
     let db = store.database_connection();
-    source(&store, "first", 1, "retained original").await;
+    let backed = db.query_one_raw(Statement::from_string(DbBackend::Postgres,
+        "SELECT p.original_bytes, EXISTS (SELECT 1 FROM portable_payload_part b WHERE b.payload_id=p.id AND b.codec=1) AS compressed
+         FROM turn_event e JOIN portable_payload_value p ON p.id=e.payload_payload_id WHERE e.id='first'"
+    )).await.unwrap().unwrap();
+    assert_eq!(
+        backed.try_get::<i64>("", "original_bytes").unwrap(),
+        wire.len() as i64
+    );
+    assert!(backed.try_get::<bool>("", "compressed").unwrap());
     let first = store
         .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
@@ -127,20 +124,14 @@ async fn history_capture_is_identical_before_and_after_transparent_compression()
         .await
         .unwrap();
     assert_eq!(before.len(), 1);
-    for table in ["turn_item", "turn_event"] {
-        let config = serde_json::json!({
-            "table": table, "column": "payload", "compression_level": 3,
-            "dict_chooser": "'[nodict]'"
-        });
-        db.query_one_write_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT zstd_enable_transparent(?)",
-            [config.to_string().into()],
-        ))
-        .await
-        .unwrap();
-    }
-    source(&store, "later", 2, "after the captured fence").await;
+    source_with_storage(
+        &store,
+        "later",
+        2,
+        r#"{"text":"after the captured fence"}"#,
+        true,
+    )
+    .await;
     let after = store
         .compaction_history_turn_page("ws", "thread", "", &fence)
         .await
@@ -181,18 +172,41 @@ async fn history_capture_is_identical_before_and_after_transparent_compression()
             .unwrap()
             .is_empty()
     );
+    let mut rebuilt = String::new();
+    let mut offset = 0;
+    loop {
+        let page = store
+            .compaction_reference_fragment("ws", "thread", &first, offset)
+            .await
+            .unwrap()
+            .unwrap();
+        rebuilt.push_str(&page.text);
+        match page.next_character {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(rebuilt.as_bytes(), wire.as_bytes());
+    let checkpoint = candidate(&store, "compressed-history", None, &source).await;
     assert_eq!(
         store
-            .compaction_reference_fragment("ws", "thread", &first, 0)
+            .compaction_apply(&checkpoint, None, &[source])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(
+        store
+            .compaction_head(&checkpoint.owner)
             .await
             .unwrap()
             .unwrap()
-            .text,
-        "retained original"
+            .id,
+        checkpoint.id
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_turn_metadata_is_selected_before_boundary_subqueries() {
     let recorded = RecordedStatements::default();
     let store = store_recording_statements(Some(recorded.clone())).await;
@@ -206,9 +220,9 @@ async fn accepted_turn_metadata_is_selected_before_boundary_subqueries() {
     for index in 0..32 {
         for thread in ["thread", "other-thread"] {
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) \
-                 VALUES (?,?,'completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                 VALUES ($1,$2,'completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 [format!("{thread}-tail-{index:02}").into(), thread.into()],
             ))
             .await
@@ -249,13 +263,13 @@ async fn accepted_turn_metadata_is_selected_before_boundary_subqueries() {
         .expect("selected metadata query must be recorded");
     assert!(statement.sql.contains(" IN "), "{statement:?}");
     let mut plan_statement = statement;
-    plan_statement.sql = format!("EXPLAIN QUERY PLAN {}", plan_statement.sql);
+    plan_statement.sql = format!("EXPLAIN (COSTS OFF) {}", plan_statement.sql);
     let plan = db
         .query_all_raw(plan_statement)
         .await
         .unwrap()
         .into_iter()
-        .map(|row| row.try_get::<String>("", "detail").unwrap())
+        .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
         .collect::<Vec<_>>();
     assert!(
         plan.iter()
@@ -295,15 +309,15 @@ async fn accepted_turn_metadata_is_selected_before_boundary_subqueries() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn exact_tool_item_reads_preserve_legacy_rows_and_revisions_with_compression() {
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     for compressed in [false, true] {
         let store = store().await;
         let db = store.database_connection();
         for id in ["untracked", "seeded"] {
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                r#"INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES (?,'turn',?,'command_execution','completed','{"storage":{"kind":"shell"},"output":"retained result"}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"#,
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                r#"INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ($1,'turn',$2,'command_execution','completed','{"storage":{"kind":"shell"},"output":"retained result"}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"#,
                 [id.into(), id.into()])).await.unwrap();
         }
         // Both pre-migration states must remain readable by exact reference:
@@ -316,8 +330,8 @@ async fn exact_tool_item_reads_preserve_legacy_rows_and_revisions_with_compressi
         if compressed {
             let config = serde_json::json!({"table":"turn_item", "column":"payload", "compression_level":3, "dict_chooser":"'[nodict]'"});
             db.query_one_write_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT zstd_enable_transparent(?)",
+                DbBackend::Postgres,
+                "SELECT zstd_enable_transparent($1)",
                 [config.to_string().into()],
             ))
             .await
@@ -340,8 +354,8 @@ async fn exact_tool_item_reads_preserve_legacy_rows_and_revisions_with_compressi
                 );
                 let revisions = db
                     .query_one_raw(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
-                        "SELECT count(*) AS n FROM compaction_item_revision WHERE source_id=?",
+                        DbBackend::Postgres,
+                        "SELECT count(*) AS n FROM compaction_item_revision WHERE source_id=$1",
                         [id.into()],
                     ))
                     .await
@@ -389,8 +403,8 @@ async fn exact_tool_item_reads_preserve_legacy_rows_and_revisions_with_compressi
                         .is_none()
                 );
             }
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "UPDATE turn_item SET payload=json_set(payload,'$.output','changed result') WHERE id=?", [id.into()]
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "UPDATE turn_item SET payload=json_set(payload,'$.output','changed result') WHERE id=$1", [id.into()]
             )).await.unwrap();
             assert!(
                 store
@@ -413,8 +427,8 @@ async fn exact_tool_item_reads_preserve_legacy_rows_and_revisions_with_compressi
             assert!(current.text.contains("changed result"));
             assert_ne!(current.reference.version, reference.version);
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "DELETE FROM turn_item WHERE id=?",
+                DbBackend::Postgres,
+                "DELETE FROM turn_item WHERE id=$1",
                 [id.into()],
             ))
             .await
@@ -430,7 +444,7 @@ async fn exact_tool_item_reads_preserve_legacy_rows_and_revisions_with_compressi
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn history_capture_after_upgrading_an_already_compressed_database() {
     use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
@@ -452,14 +466,14 @@ async fn history_capture_after_upgrading_an_already_compressed_database() {
     let db = store.database_connection();
     let config = serde_json::json!({"table":"turn_item", "column":"payload", "compression_level":3, "dict_chooser":"'[nodict]'"});
     db.query_one_write_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "SELECT zstd_enable_transparent(?)",
+        DbBackend::Postgres,
+        "SELECT zstd_enable_transparent($1)",
         [config.to_string().into()],
     ))
     .await
     .unwrap();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,TRUE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         r#"INSERT INTO turn_item(id,turn_id,item_id,item_type,status,active_attempt_number,payload,created_at,updated_at) VALUES ('legacy','turn','legacy','command_execution','completed',0,'{"storage":{"kind":"shell"},"output":"retained old result"}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"#,
@@ -489,7 +503,7 @@ async fn history_capture_after_upgrading_an_already_compressed_database() {
     );
     let legacy_revisions = db
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_item_revision WHERE source_id='legacy'"
                 .to_owned(),
         ))
@@ -540,14 +554,53 @@ async fn history_capture_after_upgrading_an_already_compressed_database() {
     }
 }
 async fn source(store: &CrudStore, id: &str, sequence: i64, payload: &str) -> SourceAssertion {
-    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,'fixture',?,CURRENT_TIMESTAMP)",
-        [id.into(), sequence.into(), payload.into()])).await.unwrap();
+    source_with_storage(store, id, sequence, payload, false).await
+}
+
+async fn source_with_storage(
+    store: &CrudStore,
+    id: &str,
+    sequence: i64,
+    payload: &str,
+    portable: bool,
+) -> SourceAssertion {
+    let wire = if serde_json::from_str::<serde_json::Value>(payload).is_ok() {
+        payload.to_owned()
+    } else {
+        serde_json::to_string(payload).unwrap()
+    };
+    let db = store.database_connection();
+    if portable {
+        use pioneer_crud_conversations::turn_event;
+        let prepared = pioneer_crud_payloads::storage::PreparedPayload::new(&wire).unwrap();
+        let tx = db.begin().await.unwrap();
+        turn_event::lock_stream(&tx, "turn").await.unwrap();
+        turn_event::insert(
+            &tx,
+            turn_event::NewEvent {
+                id,
+                thread_id: "thread",
+                turn_id: "turn",
+                sequence,
+                event_type: "fixture",
+                idempotency_key: id,
+                created_at: chrono::Utc::now().fixed_offset(),
+            },
+            &prepared,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    } else {
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ($1,'thread','turn',$2,'fixture',$3::text::json,CURRENT_TIMESTAMP)",
+            [id.into(), sequence.into(), wire.clone().into()])).await.unwrap();
+    }
     let revision = store
         .database_connection()
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT revision FROM compaction_event_revision WHERE source_id=?1",
+            DbBackend::Postgres,
+            "SELECT revision FROM compaction_event_revision WHERE source_id=$1",
             [id.into()],
         ))
         .await
@@ -560,7 +613,7 @@ async fn source(store: &CrudStore, id: &str, sequence: i64, payload: &str) -> So
         kind: CanonicalSource::Event,
         turn_id: "turn".into(),
         id: id.into(),
-        payload: payload.into(),
+        payload: wire,
     }
 }
 async fn candidate(
@@ -700,7 +753,7 @@ async fn candidate_admission_fixture(
     };
     checkpoint
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn append_survives_atomic_apply_and_restart_does_not_regenerate_or_reapply() {
     let store = store().await;
     let first = source(&store, "source-a", 1, "original one").await;
@@ -751,7 +804,7 @@ async fn append_survives_atomic_apply_and_restart_does_not_regenerate_or_reapply
         1
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn edits_competing_head_and_stop_reject_candidates_without_losing_summaries() {
     let store = store().await;
     let s = source(&store, "source", 1, "original").await;
@@ -801,7 +854,7 @@ async fn edits_competing_head_and_stop_reject_candidates_without_losing_summarie
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_apply_ignores_coarse_epoch_changes_behind_previous_checkpoint() {
     for delete in [false, true] {
         let store = store().await;
@@ -845,7 +898,7 @@ async fn legacy_apply_ignores_coarse_epoch_changes_behind_previous_checkpoint() 
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_retry_budget_and_exact_candidate_idempotency() {
     let store = store().await;
     let s = source(&store, "source", 1, "original").await;
@@ -899,7 +952,7 @@ async fn durable_retry_budget_and_exact_candidate_idempotency() {
             .unwrap()
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn poison_source_progress_and_scope_are_bounded() {
     let store = store().await;
     source(&store, "huge", 1, &"x".repeat(SOURCE_PAGE_BYTES + 1)).await;
@@ -929,29 +982,19 @@ async fn poison_source_progress_and_scope_are_bounded() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cancellation_releases_writer_and_reader_is_physically_read_only() {
-    use sea_orm::{ConnectOptions, TransactionTrait};
     use std::time::Duration;
-    let directory = std::env::current_dir()
-        .unwrap()
-        .join("target/compaction-tests");
-    std::fs::create_dir_all(&directory).unwrap();
-    let path = directory.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
-    let url = format!("sqlite://{}?mode=rwc", path.display());
-    let mut options = ConnectOptions::new(url);
-    options.max_connections(1).min_connections(1);
-    let writer = Database::connect(options).await.unwrap();
-    Migrator::up(&writer, None).await.unwrap();
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
-    options.max_connections(1).min_connections(1);
-    let reader = Database::connect(options).await.unwrap();
-    reader
-        .execute_unprepared("PRAGMA query_only=ON")
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture
+        .connect_with_options(|options| {
+            options
+                .max_connections(1)
+                .map_sqlx_postgres_opts(|options| {
+                    options.options([("default_transaction_read_only", "on")])
+                });
+        })
         .await
         .unwrap();
     let database = pioneer_sqlite::SqliteDatabase::new(reader, writer);
@@ -981,21 +1024,15 @@ async fn cancellation_releases_writer_and_reader_is_physically_read_only() {
     .unwrap()
     .unwrap();
     assert!(database.reader_query_only_enabled().await.unwrap());
-    drop(store);
-    drop(database);
-    // This file belongs exclusively to this test. No application configuration is used.
-    std::fs::remove_file(&path).unwrap();
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
+    database.close().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn large_canonical_source_reads_are_version_bound_and_cleanup_preserves_original() {
     let store = store().await;
     let text = "🌍漢字abcdef".repeat(40_000);
-    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('large','turn',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)", [text.clone().into()])).await.unwrap();
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('large','turn',1,'tool_result_v2',$1,'{}',CURRENT_TIMESTAMP)", [text.clone().into()])).await.unwrap();
     let mut offset = 0;
     let mut rebuilt = String::new();
     let mut revision = None;
@@ -1053,7 +1090,7 @@ async fn large_canonical_source_reads_are_version_bound_and_cleanup_preserves_or
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn tool_result_lookup_never_crosses_workspace_thread_or_turn() {
     let store = store().await;
     store.database_connection().execute_unprepared("INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('result','turn','call-item',1,'tool_result_v2','{}','{}',CURRENT_TIMESTAMP)").await.unwrap();
@@ -1080,12 +1117,12 @@ async fn tool_result_lookup_never_crosses_workspace_thread_or_turn() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn full_shell_result_reuses_terminal_item_and_binds_revision() {
     let store = store().await;
     let payload = serde_json::json!({"storage":{"kind":"shell","stdout":"🌍漢字".repeat(20_000),"truncated":true}}).to_string();
-    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO turn_item(id,turn_id,item_id,item_type,payload,created_at,updated_at) VALUES ('shell-row','turn','shell-item','command_execution',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [payload.clone().into()])).await.unwrap();
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,payload,created_at,updated_at) VALUES ('shell-row','turn','shell-item','command_execution',$1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [payload.clone().into()])).await.unwrap();
     assert!(
         store
             .compaction_tool_result_id("ws", "thread", "turn", "shell-item")
@@ -1163,11 +1200,11 @@ async fn full_shell_result_reuses_terminal_item_and_binds_revision() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_runner_manifest_candidate_and_state_commit_together() {
     verify_runner_commit_dependency(false).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_runner_admission_preserves_overflow_and_ordinary_allowances() {
     use pioneer_compaction::runner::{AttemptObservation, FailureKind, RunnerPhase, RunnerState};
     let store = store().await;
@@ -1340,7 +1377,7 @@ async fn durable_runner_admission_preserves_overflow_and_ordinary_allowances() {
     assert_eq!(current.cursor, Default::default());
     assert_eq!(current.previous_checkpoint, None);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn selected_source_edit_does_not_invalidate_completed_runner_summary() {
     verify_runner_commit_dependency(true).await;
 }
@@ -1701,7 +1738,7 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn projection_epoch_changes_for_history_edits_without_invalidating_active_parent_appends() {
     let store = store().await;
     let db = store.database_connection();
@@ -1744,7 +1781,7 @@ async fn projection_epoch_changes_for_history_edits_without_invalidating_active_
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn user_input_revisions_bind_edits_and_deletes_without_invalidating_appends() {
     let store = store().await;
     let db = store.database_connection();
@@ -1821,7 +1858,7 @@ async fn user_input_revisions_bind_edits_and_deletes_without_invalidating_append
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn source_high_water_is_scoped_and_append_does_not_move_a_captured_boundary() {
     let store = store().await;
     source(&store, "first", 1, "first payload").await;
@@ -1859,7 +1896,7 @@ async fn source_high_water_is_scoped_and_append_does_not_move_a_captured_boundar
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn history_fence_excludes_late_completion_and_reused_canonical_rowid() {
     let store = store().await;
     source(&store, "before", 1, "before snapshot").await;
@@ -1912,7 +1949,7 @@ async fn history_fence_excludes_late_completion_and_reused_canonical_rowid() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn metadata_projection_keeps_exact_sources_without_loading_covered_payloads() {
     let store = store().await;
     source(&store, "small-metadata", 1, "small body").await;
@@ -1957,7 +1994,7 @@ async fn metadata_projection_keeps_exact_sources_without_loading_covered_payload
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fitting_request_validation_rejects_edited_deleted_and_cross_scope_sources() {
     let store = store().await;
     source(&store, "current-source", 1, "original").await;
@@ -2017,7 +2054,7 @@ async fn fitting_request_validation_rejects_edited_deleted_and_cross_scope_sourc
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn canonical_event_metadata_uses_typed_identity_and_invalidates_on_edit() {
     let store = store().await;
     for item in [
@@ -2064,8 +2101,8 @@ async fn canonical_event_metadata_uses_typed_identity_and_invalidates_on_edit() 
     assert_eq!(reasoning.projection_kind.as_deref(), Some("reasoning"));
     assert_eq!(answer.projection_kind.as_deref(), Some("assistant"));
     assert_ne!(reasoning.reference, answer.reference);
-    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "UPDATE turn_event SET payload=replace(payload,'equal text','edited content') WHERE id=?", [reasoning.reference.id.clone().into()])).await.unwrap();
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "UPDATE turn_event SET payload=replace(payload,'equal text','edited content') WHERE id=$1", [reasoning.reference.id.clone().into()])).await.unwrap();
     let edited = store
         .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
@@ -2080,13 +2117,13 @@ async fn canonical_event_metadata_uses_typed_identity_and_invalidates_on_edit() 
     assert_ne!(invalidated.reference.version, reasoning.reference.version);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn input_projection_uses_accepted_input_order_instead_of_insertion_order() {
     let store = store().await;
     let mut insertion_fence = None;
     for (id, index) in [("later-input", 1_i64), ("first-input", 0_i64)] {
-        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,'turn',?,'text','fixture','{}',CURRENT_TIMESTAMP)", [id.into(),index.into()])).await.unwrap();
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ($1,'turn',$2,'text','fixture','{}',CURRENT_TIMESTAMP)", [id.into(),index.into()])).await.unwrap();
         if index == 1 {
             insertion_fence = Some(store.compaction_history_read_fence().await.unwrap());
         }
@@ -2133,7 +2170,7 @@ async fn input_projection_uses_accepted_input_order_instead_of_insertion_order()
     assert_eq!(next.entries[0].reference.id, "later-input");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
     use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
     let store = store().await;
@@ -2193,8 +2230,8 @@ async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
     let visible = store
         .database_connection()
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT COUNT(*) AS n FROM compaction_frozen_message WHERE manifest_id=?",
+            DbBackend::Postgres,
+            "SELECT COUNT(*) AS n FROM compaction_frozen_message WHERE manifest_id=$1",
             [descriptor.manifest_id.clone().into()],
         ))
         .await
@@ -2323,7 +2360,7 @@ async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn exact_reference_scope_requires_workspace_and_current_revision() {
     let store = store().await;
     source(&store, "lookup-source", 1, "original").await;
@@ -2363,7 +2400,7 @@ async fn exact_reference_scope_requires_workspace_and_current_revision() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn inherited_source_epoch_fences_commit_but_parent_append_does_not() {
     for edited in [false, true] {
         let store = store().await;
@@ -2410,7 +2447,7 @@ async fn inherited_source_epoch_fences_commit_but_parent_append_does_not() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn source_epoch_admission_rejects_changed_missing_and_foreign_scope() {
     let store = store().await;
     let own = source(&store, "own", 1, "completed work").await;
@@ -2456,7 +2493,7 @@ async fn source_epoch_admission_rejects_changed_missing_and_foreign_scope() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn causal_task_boundary_requires_identified_delivery_inside_capture_fence() {
     let store = store().await;
     let db = store.database_connection();
@@ -2620,8 +2657,8 @@ async fn causal_task_boundary_requires_identified_delivery_inside_capture_fence(
     )
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_event_revision SET projection_revision=0 WHERE source_id=?",
+        DbBackend::Postgres,
+        "UPDATE compaction_event_revision SET projection_revision=0 WHERE source_id=$1",
         [result.id.clone().into()],
     ))
     .await
@@ -2678,7 +2715,7 @@ async fn causal_task_boundary_requires_identified_delivery_inside_capture_fence(
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_occurrence_failures_close_command_only_after_canonical_acknowledgement() {
     for status in ["failed", "blocked", "cancelled"] {
         let store = store().await;
@@ -2691,8 +2728,8 @@ async fn task_occurrence_failures_close_command_only_after_canonical_acknowledge
             db.execute_unprepared(sql).await.unwrap();
         }
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE task_run SET status=? WHERE id='run'",
+            DbBackend::Postgres,
+            "UPDATE task_run SET status=$1 WHERE id='run'",
             [status.into()],
         ))
         .await
@@ -2783,7 +2820,7 @@ async fn task_occurrence_failures_close_command_only_after_canonical_acknowledge
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn generic_failed_task_delivery_requires_exact_turn_identity_and_event_fence() {
     let store = store().await;
     let db = store.database_connection();
@@ -2849,8 +2886,8 @@ async fn generic_failed_task_delivery_requires_exact_turn_identity_and_event_fen
             .await
             .unwrap();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE task_delivery SET delivered_turn_id=? WHERE id='delivery'",
+            DbBackend::Postgres,
+            "UPDATE task_delivery SET delivered_turn_id=$1 WHERE id='delivery'",
             [id.clone().into()],
         ))
         .await
@@ -2900,7 +2937,7 @@ async fn generic_failed_task_delivery_requires_exact_turn_identity_and_event_fen
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_basis_scope_requires_exact_execution_snapshot_and_lineage() {
     let store = store().await;
     let db = store.database_connection();
@@ -2971,8 +3008,8 @@ async fn task_basis_scope_requires_exact_execution_snapshot_and_lineage() {
         "история".repeat(50_000)
     );
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='run'",
+        DbBackend::Postgres,
+        "WITH root_replacement(history_json) AS (VALUES ($1)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='run'",
         [large.clone().into()],
     ))
     .await
@@ -3037,7 +3074,7 @@ async fn task_basis_scope_requires_exact_execution_snapshot_and_lineage() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_output_snapshot_is_bound_to_completed_turn_and_never_recaptured() {
     let store = store().await;
     let db = store.database_connection();
@@ -3140,19 +3177,19 @@ async fn delivered_output_fixture(store: &CrudStore, delivery: &str, delivery_tu
     let source_turn = format!("output-turn-{delivery}");
     for (sql, values) in [
         (
-            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,'thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ($1,'thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             vec![source_turn.clone().into()],
         ),
         (
-            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES (?,'ws','thread','thread','thread','turn','agent','completed','Task','fixture')",
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ($1,'ws','thread','thread','thread','turn','agent','completed','Task','fixture')",
             vec![task.clone().into()],
         ),
         (
-            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES (?,?,?,1,1,'succeeded','agent')",
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ($1,$2,$3,1,1,'succeeded','agent')",
             vec![run.clone().into(), task.clone().into(), run.clone().into()],
         ),
         (
-            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES (?,?,?,'thread',?,'initial',0,1,'completed',CURRENT_TIMESTAMP)",
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ($1,$2,$3,'thread',$4,'initial',0,1,'completed',CURRENT_TIMESTAMP)",
             vec![
                 run_turn.clone().into(),
                 task.clone().into(),
@@ -3161,7 +3198,7 @@ async fn delivered_output_fixture(store: &CrudStore, delivery: &str, delivery_tu
             ],
         ),
         (
-            "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES (?,?,?,?,'thread',?,0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ($1,$2,$3,$4,'thread',$5,0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             vec![
                 delivery.into(),
                 task.clone().into(),
@@ -3171,11 +3208,11 @@ async fn delivered_output_fixture(store: &CrudStore, delivery: &str, delivery_tu
             ],
         ),
         (
-            "INSERT OR IGNORE INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,'thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT OR IGNORE INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ($1,'thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             vec![delivery_turn.into()],
         ),
         (
-            "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES (?,'ws',?,?,?,'thread','origin_thread','thread','delivered',1,1,?)",
+            "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ($1,'ws',$2,$3,$4,'thread','origin_thread','thread','delivered',1,1,$5)",
             vec![
                 delivery.into(),
                 task.into(),
@@ -3186,7 +3223,7 @@ async fn delivered_output_fixture(store: &CrudStore, delivery: &str, delivery_tu
         ),
     ] {
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             sql,
             values,
         ))
@@ -3213,8 +3250,8 @@ async fn delivered_output_fixture(store: &CrudStore, delivery: &str, delivery_tu
         .compaction_record_task_output("ws", &run_turn, &history)
         .await
         .unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES (?,?,?)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ($1,$2,$3)",
         [delivery.into(),delivery.into(),run_turn.into()],
     )).await.unwrap();
 }
@@ -3247,8 +3284,8 @@ async fn repeat_delivered_ack(
     id: &str,
     sequence: i64,
 ) {
-    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT ?,e.thread_id,e.turn_id,?,e.event_type,e.payload,CURRENT_TIMESTAMP FROM turn_event e JOIN compaction_event_revision r ON r.source_id=e.id WHERE e.turn_id=? AND r.item_id=? ORDER BY r.capture_order LIMIT 1",
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT $1,e.thread_id,e.turn_id,$2,e.event_type,e.payload,CURRENT_TIMESTAMP FROM turn_event e JOIN compaction_event_revision r ON r.source_id=e.id WHERE e.turn_id=$3 AND r.item_id=$4 ORDER BY r.capture_order LIMIT 1",
         [id.into(),sequence.into(),turn.into(),pioneer_protocol::task_delivery_result_item_id(delivery).into()],
     )).await.unwrap();
     let source = SourceRef {
@@ -3272,16 +3309,16 @@ async fn repeat_delivered_ack(
 
 async fn output_metadata_padding(store: &CrudStore, turn: &str, tag: &str, start: i64, count: i64) {
     for sequence in start..start + count {
-        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread',?,?,'fixture','{}',CURRENT_TIMESTAMP)",
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ($1,'thread',$2,$3,'fixture','{}',CURRENT_TIMESTAMP)",
             [format!("{tag}-{sequence}").into(),turn.into(),sequence.into()],
         )).await.unwrap();
     }
 }
 
 async fn compress_output_events(store: &CrudStore) {
-    store.database_connection().query_one_write_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "SELECT zstd_enable_transparent(?)",
+    store.database_connection().query_one_write_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT zstd_enable_transparent($1)",
         [serde_json::json!({"table":"turn_event","column":"payload","compression_level":3,"dict_chooser":"'[nodict]'"}).to_string().into()],
     )).await.unwrap();
 }
@@ -3364,14 +3401,14 @@ async fn assert_output_discovery_plans(store: &CrudStore, statements: &RecordedS
         assert!(!statement.sql.contains("compaction_event_revision WHERE"));
         assert!(!statement.sql.contains("rowid"));
         assert!(!statement.sql.contains("payload"));
-        statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+        statement.sql = format!("EXPLAIN (COSTS OFF) {}", statement.sql);
         let plan = store
             .database_connection()
             .query_all_raw(statement)
             .await
             .unwrap()
             .into_iter()
-            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
             .collect::<Vec<_>>();
         if event_page {
             if exact_recheck {
@@ -3445,7 +3482,7 @@ async fn assert_output_discovery_plans(store: &CrudStore, statements: &RecordedS
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delivered_output_discovery_without_deliveries_ignores_foreign_history() {
     let statements = RecordedStatements::default();
     let store = store_recording_statements(Some(statements.clone())).await;
@@ -3487,15 +3524,15 @@ async fn delivered_output_discovery_without_deliveries_ignores_foreign_history()
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delivered_output_local_keysets_preserve_sparse_outputs_and_repeated_acks() {
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     for compressed in [false, true] {
         let statements = RecordedStatements::default();
         let store = store_recording_statements(Some(statements.clone())).await;
         if compressed {
-            store.database_connection().query_one_write_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "SELECT zstd_enable_transparent(?)", [serde_json::json!({"table":"turn_event","column":"payload","compression_level":3,"dict_chooser":"'[nodict]'"}).to_string().into()],
+            store.database_connection().query_one_write_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "SELECT zstd_enable_transparent($1)", [serde_json::json!({"table":"turn_event","column":"payload","compression_level":3,"dict_chooser":"'[nodict]'"}).to_string().into()],
             )).await.unwrap();
         }
         for (delivery, turn) in [
@@ -3535,8 +3572,8 @@ async fn delivered_output_local_keysets_preserve_sparse_outputs_and_repeated_ack
         // Put a replay on a different local page; sequence order deliberately
         // disagrees with capture order so first-encountered is invalid.
         for n in 2..=130 {
-            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','z-turn',?,'fixture','{}',CURRENT_TIMESTAMP)",
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ($1,'thread','z-turn',$2,'fixture','{}',CURRENT_TIMESTAMP)",
                 [format!("padding-{n}").into(),n.into()],
             )).await.unwrap();
         }
@@ -3633,14 +3670,14 @@ async fn delivered_output_local_keysets_preserve_sparse_outputs_and_repeated_ack
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delivered_output_exact_full_page_exhausts_without_a_revision_range_seek() {
     let store = store().await;
     delivered_output_fixture(&store, "delivery", "delivery-turn").await;
     delivered_ack(&store, "delivery", "delivery-turn").await;
     for sequence in 2..=127 {
-        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','delivery-turn',?,'fixture','{}',CURRENT_TIMESTAMP)",
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ($1,'thread','delivery-turn',$2,'fixture','{}',CURRENT_TIMESTAMP)",
             [format!("exact-padding-{sequence}").into(),sequence.into()],
         )).await.unwrap();
     }
@@ -3677,7 +3714,7 @@ async fn delivered_output_exact_full_page_exhausts_without_a_revision_range_seek
     assert_eq!(last.selected_turn_rows + last.selected_event_rows, 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delivered_output_cold_metadata_uses_scoped_revision_cas_and_source_freshness() {
     let store = store().await;
     delivered_output_fixture(&store, "delivery", "delivery-turn").await;
@@ -3697,8 +3734,8 @@ async fn delivered_output_cold_metadata_uses_scoped_revision_cas_and_source_fres
         .unwrap();
     let event: pioneer_crud::CanonicalTurnEventPayload = serde_json::from_str(&payload).unwrap();
     for projection in ["NULL", "revision-1"] {
-        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            format!("UPDATE compaction_event_revision SET projection_revision={projection},item_id=NULL,projection_kind=NULL WHERE source_id=?"),
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            format!("UPDATE compaction_event_revision SET projection_revision={projection},item_id=NULL,projection_kind=NULL WHERE source_id=$1"),
             [acknowledgement.id.clone().into()],
         )).await.unwrap();
         let cold = store
@@ -3756,8 +3793,8 @@ async fn delivered_output_cold_metadata_uses_scoped_revision_cas_and_source_fres
     store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE turn_event SET payload=payload||' ' WHERE id=?",
+            DbBackend::Postgres,
+            "UPDATE turn_event SET payload=payload||' ' WHERE id=$1",
             [acknowledgement.id.clone().into()],
         ))
         .await
@@ -3792,8 +3829,8 @@ async fn delivered_output_cold_metadata_uses_scoped_revision_cas_and_source_fres
     store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM turn_event WHERE id=?",
+            DbBackend::Postgres,
+            "DELETE FROM turn_event WHERE id=$1",
             [acknowledgement.id.clone().into()],
         ))
         .await
@@ -3812,7 +3849,7 @@ async fn delivered_output_cold_metadata_uses_scoped_revision_cas_and_source_fres
     assert_eq!(deleted.selected_event_rows, 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delivered_output_fence_terminates_despite_continuous_append_and_new_turns() {
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     for compressed in [false, true] {
@@ -3837,8 +3874,8 @@ async fn delivered_output_fence_terminates_despite_continuous_append_and_new_tur
         store
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE turn_event SET sequence=10000 WHERE id=?",
+                DbBackend::Postgres,
+                "UPDATE turn_event SET sequence=10000 WHERE id=$1",
                 [second_source.id.clone().into()],
             ))
             .await
@@ -3944,7 +3981,7 @@ async fn delivered_output_fence_terminates_despite_continuous_append_and_new_tur
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delivered_output_cold_page_refresh_keeps_exact_sources_across_append_boundaries() {
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     for compressed in [false, true] {
@@ -3968,8 +4005,8 @@ async fn delivered_output_cold_page_refresh_keeps_exact_sources_across_append_bo
                 .await
                 .unwrap();
             let ack = warm.entries[0].acknowledgement.clone();
-            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id=?", [ack.id.clone().into()],
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id=$1", [ack.id.clone().into()],
             )).await.unwrap();
             let cold = store
                 .compaction_delivered_output_page(
@@ -3989,8 +4026,8 @@ async fn delivered_output_cold_page_refresh_keeps_exact_sources_across_append_bo
                 .await;
             // Use the known canonical source key: its item cache is deliberately
             // NULL until CAS, so the replay fixture cannot locate it via cache.
-            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT 'negative-late',thread_id,turn_id,-1,event_type,payload,CURRENT_TIMESTAMP FROM turn_event WHERE id=?",
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT 'negative-late',thread_id,turn_id,-1,event_type,payload,CURRENT_TIMESTAMP FROM turn_event WHERE id=$1",
                 [ack.id.clone().into()],
             )).await.unwrap();
             refresh_output_page(&store, &cold).await;
@@ -4045,7 +4082,7 @@ async fn delivered_output_cold_page_refresh_keeps_exact_sources_across_append_bo
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delivered_output_exact_refresh_rejects_source_and_known_binding_changes() {
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     for compressed in [false, true] {
@@ -4069,8 +4106,8 @@ async fn delivered_output_exact_refresh_rejects_source_and_known_binding_changes
                 .await
                 .unwrap();
             let first = warm.entries[0].acknowledgement.clone();
-            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id=?", [first.id.clone().into()],
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id=$1", [first.id.clone().into()],
             )).await.unwrap();
             let cold = store
                 .compaction_delivered_output_page(
@@ -4099,13 +4136,13 @@ async fn delivered_output_exact_refresh_rejects_source_and_known_binding_changes
                 db.execute_unprepared("UPDATE compaction_delivery_output SET candidate_id='first' WHERE delivery_id='second'").await.unwrap();
             } else {
                 let sql = match mutation {
-                    "edit" => "UPDATE turn_event SET payload=payload||' ' WHERE id=?",
-                    "delete" => "DELETE FROM turn_event WHERE id=?",
-                    "scope" => "UPDATE turn_event SET thread_id='other-thread' WHERE id=?",
+                    "edit" => "UPDATE turn_event SET payload=payload||' ' WHERE id=$1",
+                    "delete" => "DELETE FROM turn_event WHERE id=$1",
+                    "scope" => "UPDATE turn_event SET thread_id='other-thread' WHERE id=$1",
                     _ => unreachable!(),
                 };
                 db.execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
+                    DbBackend::Postgres,
                     sql,
                     [first.id.clone().into()],
                 ))
@@ -4123,7 +4160,7 @@ async fn delivered_output_exact_refresh_rejects_source_and_known_binding_changes
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() {
     use pioneer_sqlite::{
         SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome, SqliteWriteEvent,
@@ -4174,7 +4211,7 @@ async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() 
         .await
         .unwrap();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,TRUE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
@@ -4204,7 +4241,7 @@ async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() 
     let held = maintenance
         .database_connection()
         .stream_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT 1".to_owned(),
         ))
         .await
@@ -4292,7 +4329,7 @@ async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() 
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_own_imports_require_exact_output_membership_and_atomic_publication() {
     let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
@@ -4729,8 +4766,8 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .is_err(),
         "an arbitrary parent manifest is not an accepted Task basis"
     );
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run-c','task','ws','thread',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run-c','task','ws','thread',$1,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [serde_json::to_string(&context).unwrap().into()])).await.unwrap();
     assert!(
         store
@@ -4821,8 +4858,8 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     mixed_op.plan.compact = vec![0, 1];
     mixed_op.plan.coverage = vec![own_source.clone(), inherited.clone()];
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_operation SET snapshot=? WHERE id=?",
+        DbBackend::Postgres,
+        "UPDATE compaction_operation SET snapshot=$1 WHERE id=$2",
         [
             serde_json::to_string(&mixed_op).unwrap().into(),
             mixed_op.id.clone().into(),
@@ -4938,8 +4975,8 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         db.execute_unprepared(statement).await.unwrap();
     }
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run-d','task-d','ws','thread',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
+        DbBackend::Postgres,
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run-d','task-d','ws','thread',$1,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [serde_json::to_string(&context).unwrap().into()],
     ))
     .await
@@ -5100,8 +5137,8 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .unwrap()
     );
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='run-c'",
+        DbBackend::Postgres,
+        "WITH root_replacement(history_json) AS (VALUES ($1)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='run-c'",
         [serde_json::to_string(&context).unwrap().into()],
     ))
     .await
@@ -5274,7 +5311,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     );
     let pinned: String = db
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT imports_sha256 FROM compaction_frozen_history WHERE id='assembled'",
         ))
         .await
@@ -5439,8 +5476,8 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     );
     let stale_forwarded_state = db
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT h.next_import,(SELECT COUNT(*) FROM compaction_frozen_import i WHERE i.manifest_id=h.id) AS stored FROM compaction_frozen_history h WHERE h.id=?",
+            DbBackend::Postgres,
+            "SELECT h.next_import,(SELECT COUNT(*) FROM compaction_frozen_import i WHERE i.manifest_id=h.id) AS stored FROM compaction_frozen_history h WHERE h.id=$1",
             [stale_forwarded_context.manifest_id.clone().into()],
         ))
         .await
@@ -5607,7 +5644,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_own_import_treats_published_summary_as_atomic_output() {
     use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
     use pioneer_compaction::runner::{RunnerState, SourceCursor};
@@ -5658,8 +5695,8 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         raw.plan.compact = vec![0];
         raw.plan.coverage = vec![h.clone()];
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_operation SET snapshot=?2 WHERE id=?1",
+            DbBackend::Postgres,
+            "UPDATE compaction_operation SET snapshot=$2 WHERE id=$1",
             [
                 operation.id.clone().into(),
                 serde_json::to_string(&raw).unwrap().into(),
@@ -5806,8 +5843,8 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         );
         let p_status = db
             .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT status FROM compaction_checkpoint WHERE id=?",
+                DbBackend::Postgres,
+                "SELECT status FROM compaction_checkpoint WHERE id=$1",
                 [p.id.clone().into()],
             ))
             .await
@@ -6053,8 +6090,8 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         target_op.plan.compact = vec![0];
         target_op.plan.coverage = vec![k_source.clone()];
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_operation SET snapshot=? WHERE id=?",
+            DbBackend::Postgres,
+            "UPDATE compaction_operation SET snapshot=$1 WHERE id=$2",
             [
                 serde_json::to_string(&target_op).unwrap().into(),
                 target_op.id.clone().into(),
@@ -6086,8 +6123,8 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         .unwrap();
         db.execute_unprepared("UPDATE compaction_operation SET status='completed' WHERE id='portion-target-operation'").await.unwrap();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('portion-consumer-run','portion-consumer-task','ws','thread',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
+            DbBackend::Postgres,
+            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('portion-consumer-run','portion-consumer-task','ws','thread',$1,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
             [serde_json::to_string(&imported).unwrap().into()],
         ))
         .await
@@ -6222,8 +6259,8 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         );
         let raced_state = db
             .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT next_import,(SELECT COUNT(*) FROM compaction_frozen_import i WHERE i.manifest_id=h.id) AS stored FROM compaction_frozen_history h WHERE h.id=?",
+                DbBackend::Postgres,
+                "SELECT next_import,(SELECT COUNT(*) FROM compaction_frozen_import i WHERE i.manifest_id=h.id) AS stored FROM compaction_frozen_history h WHERE h.id=$1",
                 [raced_target.manifest_id.into()],
             ))
             .await
@@ -6330,8 +6367,8 @@ async fn ready_operation_with_references(
         store
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_operation SET snapshot=?2 WHERE id=?1",
+                DbBackend::Postgres,
+                "UPDATE compaction_operation SET snapshot=$2 WHERE id=$1",
                 [
                     op.clone().into(),
                     serde_json::to_string(&raw).unwrap().into(),
@@ -6415,7 +6452,7 @@ async fn ready_operation_with_references(
     ready
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn runner_commit_treats_published_checkpoint_as_independent_after_admission() {
     for delete in [false, true] {
         let store = store().await;
@@ -6520,7 +6557,7 @@ async fn runner_commit_treats_published_checkpoint_as_independent_after_admissio
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn reference_only_checkpoint_does_not_revalidate_historical_leaves() {
     let store = store().await;
     let mut leaf = source(&store, "reference-leaf", 1, "reference H").await;
@@ -6583,7 +6620,7 @@ async fn reference_only_checkpoint_does_not_revalidate_historical_leaves() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_lifecycle_after_terminal_turn_requires_exact_operation_and_generation() {
     use pioneer_crud::CanonicalTurnEventPayload as Event;
     let store = store().await;
@@ -6776,7 +6813,7 @@ async fn compaction_lifecycle_after_terminal_turn_requires_exact_operation_and_g
         )
         .await
         .unwrap();
-    let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT count(*) AS n FROM turn_event WHERE turn_id='turn' AND event_type IN ('item/started','item/completed')".to_owned())).await.unwrap().unwrap();
+    let row = db.query_one_raw(Statement::from_string(DbBackend::Postgres,"SELECT count(*) AS n FROM turn_event WHERE turn_id='turn' AND event_type IN ('item/started','item/completed')".to_owned())).await.unwrap().unwrap();
     assert_eq!(
         row.try_get::<i64>("", "n").unwrap(),
         3,
@@ -6784,7 +6821,7 @@ async fn compaction_lifecycle_after_terminal_turn_requires_exact_operation_and_g
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late_attempt() {
     use pioneer_compaction::runner::{FailureKind, RunnerPhase};
     let store = store().await;
@@ -6979,7 +7016,7 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_successful_apply_fences_prepared_lifecycle_timeout() {
     use pioneer_entity::compaction_lifecycle_pending as pending;
     use sea_orm::EntityTrait;
@@ -7063,7 +7100,7 @@ async fn compaction_successful_apply_fences_prepared_lifecycle_timeout() {
     ));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_post_terminal_stop_survives_worker_loss_and_fences_new_admission() {
     let store = store().await;
     source(&store, "stop-source", 1, "original source").await;
@@ -7195,7 +7232,7 @@ async fn compaction_post_terminal_stop_survives_worker_loss_and_fences_new_admis
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_task_snapshot_reference_is_bounded_scoped_and_revision_guarded() {
     let store = store().await;
     let db = store.database_connection();
@@ -7206,8 +7243,8 @@ async fn legacy_task_snapshot_reference_is_bounded_scoped_and_revision_guarded()
         db.execute_unprepared(sql).await.unwrap();
     }
     let body = serde_json::to_string(&vec!["память🦀".repeat(9000)]).unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture", [body.clone().into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('run','task','ws','thread','turn',$1,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture", [body.clone().into()])).await.unwrap();
     let source = store
         .compaction_legacy_task_basis_source("ws", "thread", "run")
         .await
@@ -7347,7 +7384,7 @@ async fn publish_history_check_root(store: &CrudStore) {
         .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
     let store = store().await;
     start_history_check_root(&store).await;
@@ -7436,7 +7473,7 @@ async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_timeline_persists_explicit_terminal_status_with_one_item() {
     let store = store().await;
     for terminal in ["completed", "failed", "cancelled"] {
@@ -7462,8 +7499,8 @@ async fn compaction_timeline_persists_explicit_terminal_status_with_one_item() {
             .unwrap();
         let query = || {
             Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT status FROM turn_work_item_projection WHERE item_id=?",
+                DbBackend::Postgres,
+                "SELECT status FROM turn_work_item_projection WHERE item_id=$1",
                 vec![id.clone().into()],
             )
         };
@@ -7498,7 +7535,7 @@ async fn compaction_timeline_persists_explicit_terminal_status_with_one_item() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_reapply() {
     use pioneer_entity::thread as legacy_thread;
     use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
@@ -7516,7 +7553,7 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
         .with_maintenance_access();
     let db = store.database_connection();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,TRUE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         // Durable prefix of an interrupted metadata migration, before its marker.
@@ -7561,7 +7598,7 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
         );
         let row = db
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT state,outcome FROM compaction_history_check WHERE turn_id='turn'",
             ))
             .await
@@ -7574,8 +7611,8 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
         );
         // Re-execute the actual migration, not just Migrator's marker fast path.
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM seaql_migrations WHERE version=?",
+            DbBackend::Postgres,
+            "DELETE FROM seaql_migrations WHERE version=$1",
             [name.into()],
         ))
         .await
@@ -7598,7 +7635,7 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
     assert_eq!(page.entries.len(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrite() {
     use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
@@ -7641,8 +7678,8 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
         })
         .unwrap();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('upgrade-summary','upgrade-operation','upgrade-owner',0,'saved before upgrade','stable-identity',?,0,1,'applied')",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('upgrade-summary','upgrade-operation','upgrade-owner',0,'saved before upgrade','stable-identity',$1,0,1,'applied')",
             [selection.into()],
         ))
         .await
@@ -7685,8 +7722,8 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
             },
         };
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_operation SET snapshot=?1 WHERE id='upgrade-operation'",
+            DbBackend::Postgres,
+            "UPDATE compaction_operation SET snapshot=$1 WHERE id='upgrade-operation'",
             [serde_json::to_string(&raw).unwrap().into()],
         ))
         .await
@@ -7699,8 +7736,8 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
                 "dict_chooser":"'[nodict]'"
             });
             db.query_one_write_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT zstd_enable_transparent(?)",
+                DbBackend::Postgres,
+                "SELECT zstd_enable_transparent($1)",
                 [config.to_string().into()],
             ))
             .await
@@ -7708,8 +7745,8 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
             let payload = b"{}";
             let payload = pioneer_sqlite::zstd::compress_column_value(payload, 3, None).unwrap();
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE _turn_event_zstd SET payload=?,_payload_dict=-1 WHERE id='upgrade-leaf'",
+                DbBackend::Postgres,
+                "UPDATE _turn_event_zstd SET payload=$1,_payload_dict=-1 WHERE id='upgrade-leaf'",
                 [payload.into()],
             ))
             .await
@@ -7725,7 +7762,7 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
         };
         let live_before = db
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT count(*) AS n FROM compaction_live_sources WHERE source_id='upgrade-summary'"
                     .to_owned(),
             ))
@@ -7743,7 +7780,7 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
 
         let live_after = db
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT count(*) AS n FROM compaction_live_sources WHERE source_id='upgrade-summary'"
                     .to_owned(),
             ))
@@ -7789,7 +7826,7 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
     let store = store().await;
     let db = store.database_connection();
@@ -7817,7 +7854,7 @@ async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
         ] {
             assert!(
                 db.execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
+                    DbBackend::Postgres,
                     insert.clone(),
                     [payload.into(), bytes.into()],
                 ))
@@ -7826,7 +7863,7 @@ async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
             );
         }
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             insert.clone(),
             ["я".into(), 2_i64.into()],
         ))
@@ -7834,7 +7871,7 @@ async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
         .unwrap();
         assert!(
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 insert,
                 ["я".into(), 2_i64.into()],
             ))
@@ -7854,7 +7891,7 @@ async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
     ] {
         let row = db
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 format!("SELECT count(*) AS n FROM {table}"),
             ))
             .await
@@ -7868,7 +7905,7 @@ async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
     }
     let previous = db
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT sequence FROM compaction_turn_creation WHERE turn_id='turn'",
         ))
         .await
@@ -7884,7 +7921,7 @@ async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
         .unwrap();
     let next = db
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT sequence FROM compaction_turn_creation WHERE turn_id='turn'",
         ))
         .await
@@ -7898,7 +7935,7 @@ async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn old_summary_is_not_a_canonical_source_or_projection_dependency() {
     let store = store().await;
     let epoch = store
@@ -7919,7 +7956,7 @@ async fn old_summary_is_not_a_canonical_source_or_projection_dependency() {
     let row = store
         .database_connection()
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_live_sources WHERE source_scope LIKE 'legacy:%'",
         ))
         .await
@@ -8039,7 +8076,7 @@ async fn frozen_count(store: &CrudStore, table: &str) -> i64 {
     store
         .database_connection()
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             format!("SELECT count(*) AS n FROM {table}"),
         ))
         .await
@@ -8048,7 +8085,7 @@ async fn frozen_count(store: &CrudStore, table: &str) -> i64 {
         .try_get("", "n")
         .unwrap()
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn shared_frozen_growth_is_linear_and_old_revisions_are_unchanged() {
     let store = store().await;
     let refs = shared_refs(400);
@@ -8062,8 +8099,8 @@ async fn shared_frozen_growth_is_linear_and_old_revisions_are_unchanged() {
     assert_eq!(frozen_count(&store, "compaction_frozen_span").await, 40);
     assert_eq!(shared_read(&store, "s0010").await, refs[..10]);
     assert_eq!(shared_read(&store, "s0400").await, refs);
-    let plan = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,
-        "EXPLAIN QUERY PLAN SELECT reference_json FROM compaction_frozen_message WHERE manifest_id='s0400' AND ordinal>=200 AND ordinal<210 ORDER BY ordinal"))
+    let plan = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Postgres,
+        "EXPLAIN (COSTS OFF) SELECT reference_json FROM compaction_frozen_message WHERE manifest_id='s0400' AND ordinal>=200 AND ordinal<210 ORDER BY ordinal"))
         .await.unwrap().into_iter().map(|row|row.try_get::<String>("","detail").unwrap()).collect::<Vec<_>>();
     assert!(
         !plan.iter().any(|line| line.starts_with("SCAN d")),
@@ -8117,7 +8154,7 @@ async fn shared_frozen_growth_is_linear_and_old_revisions_are_unchanged() {
     );
     assert_eq!(frozen_count(&store, "compaction_frozen_span").await, 0);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_reads() {
     let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     let store = store().await;
@@ -8172,13 +8209,13 @@ async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn old_layout_sizes_and_new_shared_payload_keep_exact_logical_stream() {
     let store = store().await;
     let refs = shared_refs(260);
     shared_capture(&store, "base", &refs, true).await;
     let descriptor = shared_capture(&store, "legacy", &refs, false).await;
-    let sizes = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,"SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
+    let sizes = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Postgres,"SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
     assert_eq!(sizes.len(), refs.len());
     let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     for _ in 0..512 {
@@ -8188,7 +8225,7 @@ async fn old_layout_sizes_and_new_shared_payload_keep_exact_logical_stream() {
             .unwrap();
     }
     assert_eq!(shared_read(&store, "legacy").await, refs);
-    let after = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,"SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
+    let after = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Postgres,"SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
     assert_eq!(
         sizes
             .iter()
@@ -8218,7 +8255,7 @@ async fn old_layout_sizes_and_new_shared_payload_keep_exact_logical_stream() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn duplicate_cleanup_keeps_understated_physical_bytes_and_advances_after_layout_switch() {
     let store = store().await;
     let refs = shared_refs(2);
@@ -8231,7 +8268,7 @@ async fn duplicate_cleanup_keeps_understated_physical_bytes_and_advances_after_l
             .compact_frozen_storage_quantum(&mut progress)
             .await
             .unwrap();
-        let row=store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT active,cleanup_next,cleanup_to FROM compaction_frozen_layout WHERE manifest_id='legacy' AND kind=0")).await.unwrap();
+        let row=store.database_connection().query_one_raw(Statement::from_string(DbBackend::Postgres,"SELECT active,cleanup_next,cleanup_to FROM compaction_frozen_layout WHERE manifest_id='legacy' AND kind=0")).await.unwrap();
         if let Some(row) = row {
             if row.try_get::<i64>("", "active").unwrap() == 1
                 && row.try_get::<i64>("", "cleanup_next").unwrap() == 0
@@ -8253,7 +8290,7 @@ async fn duplicate_cleanup_keeps_understated_physical_bytes_and_advances_after_l
     tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
         .await
         .unwrap();
-    tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=2 WHERE manifest_id='legacy' AND ordinal=0",[corrupted_payload.into()])).await.unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,"UPDATE compaction_frozen_message_data SET reference_json=$1,bytes=2 WHERE manifest_id='legacy' AND ordinal=0",[corrupted_payload.into()])).await.unwrap();
     tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
         .await
         .unwrap();
@@ -8264,7 +8301,7 @@ async fn duplicate_cleanup_keeps_understated_physical_bytes_and_advances_after_l
             .await
             .unwrap()
     );
-    let state = store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,
+    let state = store.database_connection().query_one_raw(Statement::from_string(DbBackend::Postgres,
         "SELECT active,failed,pending,cleanup_next,cleanup_to FROM compaction_frozen_layout WHERE manifest_id='legacy' AND kind=0")).await.unwrap().unwrap();
     assert_eq!(
         (
@@ -8289,7 +8326,7 @@ async fn duplicate_cleanup_keeps_understated_physical_bytes_and_advances_after_l
         }
     }
     assert!(finished, "the poison row must not cause endless retries");
-    let remaining = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,
+    let remaining = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Postgres,
         "SELECT ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
     assert_eq!(remaining.len(), 1, "the healthy duplicate must be deleted");
     assert_eq!(remaining[0].try_get::<i64>("", "ordinal").unwrap(), 0);
@@ -8309,7 +8346,7 @@ async fn duplicate_cleanup_keeps_understated_physical_bytes_and_advances_after_l
     assert_eq!(shared_read(&store, "legacy").await, refs);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn restart_staged_copy_next_does_not_publish_wrong_backing() {
     let store = store().await;
     let refs = shared_refs(2);
@@ -8318,7 +8355,7 @@ async fn restart_staged_copy_next_does_not_publish_wrong_backing() {
     store.database_connection().execute_unprepared("INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending,candidate,compared,copy_to,copy_next) VALUES('staged',0,0,1,'base',2,2,2)").await.unwrap();
     // Plausible old progress with corrupt physical source. Direct rows still
     // exist, so rejecting activation must keep the old logical layout usable.
-    store.database_connection().execute_unprepared("INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('staged',0,0,2,'staged')").await.unwrap();
+    store.database_connection().execute_unprepared("INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('staged',0,0,2,'staged')").await.unwrap();
     let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     let mut rejected = false;
     for _ in 0..128 {
@@ -8332,7 +8369,7 @@ async fn restart_staged_copy_next_does_not_publish_wrong_backing() {
         }
     }
     assert!(rejected);
-    let state=store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT active,failed FROM compaction_frozen_layout WHERE manifest_id='staged' AND kind=0")).await.unwrap().unwrap();
+    let state=store.database_connection().query_one_raw(Statement::from_string(DbBackend::Postgres,"SELECT active,failed FROM compaction_frozen_layout WHERE manifest_id='staged' AND kind=0")).await.unwrap().unwrap();
     assert_eq!(state.try_get::<i64>("", "active").unwrap(), 0);
     assert_eq!(state.try_get::<i64>("", "failed").unwrap(), 1);
     assert!(
@@ -8359,7 +8396,7 @@ async fn restart_staged_copy_next_does_not_publish_wrong_backing() {
     assert_eq!(shared_read(&store, "base").await, refs);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn shared_frozen_append_rollback_and_concurrent_retry_preserve_one_sequence() {
     let store = store().await;
     let refs = shared_refs(25);
@@ -8407,7 +8444,7 @@ async fn shared_frozen_append_rollback_and_concurrent_retry_preserve_one_sequenc
     assert_eq!(frozen_count(&store, "compaction_frozen_span").await, 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history() {
     let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     let store = store().await;
@@ -8475,7 +8512,7 @@ async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn history_check_retries_are_durable_bounded_and_cas_protected() {
     use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
     use pioneer_entity::compaction_history_check as check;
@@ -8661,7 +8698,7 @@ async fn history_check_retries_are_durable_bounded_and_cas_protected() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn history_check_waits_do_not_spend_retries_and_stop_wins_over_stale_results() {
     use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
     use pioneer_entity::compaction_history_check as check;
@@ -8757,7 +8794,7 @@ async fn history_check_waits_do_not_spend_retries_and_stop_wins_over_stale_resul
     assert_eq!(row.outcome.as_deref(), Some("cancelled"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn history_check_legacy_failures_remain_retained_without_optional_admission() {
     use pioneer_entity::compaction_history_check as check;
     use sea_orm::EntityTrait;
@@ -8806,7 +8843,7 @@ async fn history_check_legacy_failures_remain_retained_without_optional_admissio
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn history_check_legacy_pages_do_not_reenter_optional_discovery() {
     use pioneer_entity::compaction_history_check as check;
     use sea_orm::EntityTrait;
@@ -8838,8 +8875,8 @@ async fn checkpoint_proof_version(store: &CrudStore, id: &str) -> i64 {
     store
         .database_connection()
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT proof_version FROM compaction_checkpoint WHERE id=?1",
+            DbBackend::Postgres,
+            "SELECT proof_version FROM compaction_checkpoint WHERE id=$1",
             [id.into()],
         ))
         .await
@@ -8848,7 +8885,7 @@ async fn checkpoint_proof_version(store: &CrudStore, id: &str) -> i64 {
         .try_get("", "proof_version")
         .unwrap()
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn raw_assertion_publication_seals_exact_empty_proofs_and_immutable_ownership() {
     let store = store().await;
     let assertion = source(&store, "raw-proof-source", 1, "original").await;
@@ -8890,8 +8927,8 @@ async fn raw_assertion_publication_seals_exact_empty_proofs_and_immutable_owners
     ] {
         let n: i64 = db
             .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                format!("SELECT count(*) AS n FROM {table} WHERE checkpoint_id=?1"),
+                DbBackend::Postgres,
+                format!("SELECT count(*) AS n FROM {table} WHERE checkpoint_id=$1"),
                 [cp.id.clone().into()],
             ))
             .await
@@ -8902,14 +8939,14 @@ async fn raw_assertion_publication_seals_exact_empty_proofs_and_immutable_owners
         assert_eq!(n, 0, "empty set is proven by marker, not row presence");
     }
     for sql in [
-        "UPDATE compaction_checkpoint SET proof_version=0 WHERE id=?1",
-        "UPDATE compaction_checkpoint SET previous='forged' WHERE id=?1",
-        "DELETE FROM compaction_coverage WHERE checkpoint_id=?1",
-        "INSERT INTO compaction_checkpoint_event_input(checkpoint_id,source_thread,source_scope,source_id,source_version,role) VALUES(?1,'thread','event:turn','forged','event-revision:1','deleted')",
+        "UPDATE compaction_checkpoint SET proof_version=0 WHERE id=$1",
+        "UPDATE compaction_checkpoint SET previous='forged' WHERE id=$1",
+        "DELETE FROM compaction_coverage WHERE checkpoint_id=$1",
+        "INSERT INTO compaction_checkpoint_event_input(checkpoint_id,source_thread,source_scope,source_id,source_version,role) VALUES($1,'thread','event:turn','forged','event-revision:1','deleted')",
     ] {
         assert!(
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 sql,
                 [cp.id.clone().into()]
             ))
@@ -8920,8 +8957,8 @@ async fn raw_assertion_publication_seals_exact_empty_proofs_and_immutable_owners
     }
     assert!(
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM compaction_manifest WHERE operation_id=?1",
+            DbBackend::Postgres,
+            "DELETE FROM compaction_manifest WHERE operation_id=$1",
             [cp.operation_id.clone().into()]
         ))
         .await
@@ -8935,7 +8972,7 @@ async fn raw_assertion_publication_seals_exact_empty_proofs_and_immutable_owners
         CommitOutcome::AlreadyApplied
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publishes() {
     let store = store().await;
     let db = store.database_connection();
@@ -8944,7 +8981,7 @@ async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publish
         .unwrap();
     let foreign_keys: i64 = db
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "PRAGMA foreign_keys",
         ))
         .await
@@ -9080,15 +9117,15 @@ async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publish
     ] {
         let r = b.reference();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,7,7,?2,'thread',?3,?4,?5)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES($1,7,7,$2,'thread',$3,$4,$5)",
             [snapshot.id.clone().into(), role.into(), r.scope.into(), r.id.into(), version.clone().into()],
         )).await.unwrap();
         if role == "0.5" {
             // Valid extrema 0/1 must not conceal an invalid interior value.
             // This unrelated corrupt unclaimed row never enters coverage.
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,8,8,1,'thread','event:turn','unclaimed-role-boundary','event-revision:1')",
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES($1,8,8,1,'thread','event:turn','unclaimed-role-boundary','event-revision:1')",
                 [snapshot.id.clone().into()])).await.unwrap();
         }
         let error = store.compaction_save_candidate(&k1, 1).await.unwrap_err();
@@ -9109,23 +9146,23 @@ async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publish
         assert_eq!(operation.snapshot, admitted.snapshot);
         assert_eq!(operation.next_portion, 1);
         assert_eq!(operation.status, "running");
-        let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "SELECT CAST(reference_only AS TEXT) AS role,source_version FROM compaction_manifest WHERE operation_id=?1 AND ordinal=7",
+        let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT CAST(reference_only AS TEXT) AS role,source_version FROM compaction_manifest WHERE operation_id=$1 AND ordinal=7",
             [snapshot.id.clone().into()])).await.unwrap().unwrap();
         assert_eq!(row.try_get::<String>("", "role").unwrap(), role);
         assert_eq!(
             row.try_get::<String>("", "source_version").unwrap(),
             version
         );
-        let boundary_row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "SELECT 1 FROM compaction_manifest WHERE operation_id=?1 AND ordinal=8 AND unit_ordinal=8 AND reference_only=1 AND source_thread='thread' AND source_scope='event:turn' AND source_id='unclaimed-role-boundary' AND source_version='event-revision:1'",
+        let boundary_row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT 1 FROM compaction_manifest WHERE operation_id=$1 AND ordinal=8 AND unit_ordinal=8 AND reference_only=1 AND source_thread='thread' AND source_scope='event:turn' AND source_id='unclaimed-role-boundary' AND source_version='event-revision:1'",
             [snapshot.id.clone().into()])).await.unwrap();
         assert_eq!(boundary_row.is_some(), role == "0.5");
         // B is not covered by K0; removal of this corrupt unsealed staging
         // row uses the existing permitted path, with all guards still active.
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM compaction_manifest WHERE operation_id=?1 AND ordinal IN (7,8)",
+            DbBackend::Postgres,
+            "DELETE FROM compaction_manifest WHERE operation_id=$1 AND ordinal IN (7,8)",
             [snapshot.id.clone().into()],
         ))
         .await
@@ -9215,8 +9252,8 @@ async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publish
         ] {
             let n: i64 = db
                 .query_one_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    format!("SELECT count(*) AS n FROM {table} WHERE checkpoint_id=?1"),
+                    DbBackend::Postgres,
+                    format!("SELECT count(*) AS n FROM {table} WHERE checkpoint_id=$1"),
                     [cp.id.clone().into()],
                 ))
                 .await
@@ -9229,8 +9266,8 @@ async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publish
     }
     let status: String = db
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT status FROM compaction_checkpoint WHERE id=?1",
+            DbBackend::Postgres,
+            "SELECT status FROM compaction_checkpoint WHERE id=$1",
             [k1.id.clone().into()],
         ))
         .await
@@ -9279,7 +9316,7 @@ async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publish
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn raw_assertion_api_saves_permuted_prebuilt_manifest_and_publishes_exactly() {
     let store = store().await;
     let a1 = source(&store, "A1", 1, "first A").await;
@@ -9421,7 +9458,7 @@ async fn raw_assertion_api_saves_permuted_prebuilt_manifest_and_publishes_exactl
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn raw_candidate_rejects_corrupt_or_missing_prepared_ownership_without_bootstrap() {
     async fn manifest_identity(store: &CrudStore, op: &str) -> Vec<String> {
         let mut rows = store
@@ -9464,7 +9501,7 @@ async fn raw_candidate_rejects_corrupt_or_missing_prepared_ownership_without_boo
                 .unwrap();
             let fk: i64 = db
                 .query_one_raw(Statement::from_string(
-                    DbBackend::Sqlite,
+                    DbBackend::Postgres,
                     "PRAGMA foreign_keys",
                 ))
                 .await
@@ -9597,7 +9634,7 @@ async fn raw_candidate_rejects_corrupt_or_missing_prepared_ownership_without_boo
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn raw_assertion_missing_historical_ownership_is_not_empty_proofs() {
     let store = store().await;
     let assertion = source(&store, "lost-owner-source", 1, "original").await;
@@ -9616,12 +9653,12 @@ async fn raw_assertion_missing_historical_ownership_is_not_empty_proofs() {
     use sha2::{Digest, Sha256};
     let identity = hex::encode(Sha256::digest(serde_json::to_vec(&cp).unwrap()));
     let db = store.database_connection();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES(?1,?2,?3,0,?4,?5,?6,?7,1,'candidate')",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES($1,$2,$3,0,$4,$5,$6,$7,1,'candidate')",
         [cp.id.clone().into(),cp.operation_id.clone().into(),cp.owner.clone().into(),cp.summary.clone().into(),identity.into(),serde_json::to_string(&cp.selection).unwrap().into(),(cp.projection_version as i64).into()])).await.unwrap();
     let r = assertion.reference();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES(?1,?2,?3,?4)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES($1,$2,$3,$4)",
         [cp.id.clone().into(),r.scope.into(),r.id.into(),r.version.into()])).await.unwrap();
     // Candidate retry must not reconstruct a historical node from current
     // assertions, even when neither a runner nor any manifest row survived.
@@ -9642,12 +9679,12 @@ async fn raw_assertion_missing_historical_ownership_is_not_empty_proofs() {
     assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
     assert_eq!(store.compaction_head("owner").await.unwrap(), None);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn extra_staging_evidence_prevents_seal_and_publication_without_overwrite() {
     let store = store().await;
     let assertion = source(&store, "staging-source", 1, "original").await;
     let cp = candidate(&store, "staging-op", None, &assertion).await;
-    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_checkpoint_event_input(checkpoint_id,source_thread,source_scope,source_id,source_version,role) VALUES(?1,'thread','event:turn','poison','event-revision:1','deleted')",[cp.id.clone().into()])).await.unwrap();
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,"INSERT INTO compaction_checkpoint_event_input(checkpoint_id,source_thread,source_scope,source_id,source_version,role) VALUES($1,'thread','event:turn','poison','event-revision:1','deleted')",[cp.id.clone().into()])).await.unwrap();
     for _ in 0..2 {
         assert!(
             store
@@ -9661,8 +9698,8 @@ async fn extra_staging_evidence_prevents_seal_and_publication_without_overwrite(
     let n: i64 = store
         .database_connection()
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT count(*) AS n FROM compaction_checkpoint_event_input WHERE checkpoint_id=?1",
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM compaction_checkpoint_event_input WHERE checkpoint_id=$1",
             [cp.id.into()],
         ))
         .await
@@ -9672,17 +9709,17 @@ async fn extra_staging_evidence_prevents_seal_and_publication_without_overwrite(
         .unwrap();
     assert_eq!(n, 1, "conflicting staging is not silently repaired");
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn checkpoint_alias_null_identity_is_distinct_from_empty_tool_identity() {
     let store = store().await;
     let assertion = source(&store, "alias-source", 1, "original").await;
     let cp = candidate(&store, "alias-op", None, &assertion).await;
-    let sql = "INSERT INTO compaction_checkpoint_replay_alias(checkpoint_id,covered_thread,covered_scope,covered_id,covered_version,replay_thread,replay_scope,replay_id,replay_version,tool_item_id) VALUES(?1,'thread','event:turn','source','event-revision:1','thread','context:turn','replay','revision:1',?2)";
+    let sql = "INSERT INTO compaction_checkpoint_replay_alias(checkpoint_id,covered_thread,covered_scope,covered_id,covered_version,replay_thread,replay_scope,replay_id,replay_version,tool_item_id) VALUES($1,'thread','event:turn','source','event-revision:1','thread','context:turn','replay','revision:1',$2)";
     for tool in [None, Some(String::new())] {
         store
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 sql,
                 [cp.id.clone().into(), tool.into()],
             ))
@@ -9693,7 +9730,7 @@ async fn checkpoint_alias_null_identity_is_distinct_from_empty_tool_identity() {
         store
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 sql,
                 [cp.id.clone().into(), Option::<String>::None.into()]
             ))
@@ -9703,8 +9740,8 @@ async fn checkpoint_alias_null_identity_is_distinct_from_empty_tool_identity() {
     let n: i64 = store
         .database_connection()
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT count(*) AS n FROM compaction_checkpoint_replay_alias WHERE checkpoint_id=?1",
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM compaction_checkpoint_replay_alias WHERE checkpoint_id=$1",
             [cp.id.into()],
         ))
         .await
@@ -9715,7 +9752,7 @@ async fn checkpoint_alias_null_identity_is_distinct_from_empty_tool_identity() {
     assert_eq!(n, 2);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_changing_generation() {
     use pioneer_compaction::runner::{AttemptPurpose, FailureKind, RunnerPhase, RunnerState};
     for phase_name in ["Ready", "Candidate", "Commit"] {
@@ -9776,7 +9813,7 @@ async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_cha
             observation: None,
             diagnostic: None,
         };
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES('resume-op',0,?1)",[serde_json::to_string(&state).unwrap().into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,"INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES('resume-op',0,$1)",[serde_json::to_string(&state).unwrap().into()])).await.unwrap();
         db.execute_unprepared("UPDATE compaction_operation SET status='failed',outcome='deadline',deadline_ms=1000 WHERE id='resume-op'").await.unwrap();
         drop(hold);
         if phase_name == "Commit" {
@@ -9811,7 +9848,7 @@ async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_cha
             terminal.resume_phase = Some(RunnerPhase::Commit {
                 checkpoint: cp.id.clone(),
             });
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_runner_state SET generation=?1,state=?2 WHERE operation_id='resume-op'",[(terminal.generation as i64).into(),serde_json::to_string(&terminal).unwrap().into()])).await.unwrap();
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,"UPDATE compaction_runner_state SET generation=$1,state=$2 WHERE operation_id='resume-op'",[(terminal.generation as i64).into(),serde_json::to_string(&terminal).unwrap().into()])).await.unwrap();
             db.execute_unprepared("UPDATE compaction_operation SET status='failed',outcome='deadline' WHERE id='resume-op'").await.unwrap();
         }
         // Isolated fixture expiry models the durable winner before dispatch.
@@ -9850,7 +9887,7 @@ async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_cha
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_large_raw_admission_and_coverage_are_paged_not_poisoned_by_aggregate_bytes() {
     let recorded: RecordedStatements = Default::default();
     let store = store_recording_statements(Some(recorded.clone())).await;
@@ -9879,7 +9916,7 @@ async fn legacy_large_raw_admission_and_coverage_are_paged_not_poisoned_by_aggre
     let db = store.database_connection();
     let row = db
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT snapshot FROM compaction_operation WHERE id='raw-large-op'",
         ))
         .await
@@ -9893,8 +9930,8 @@ async fn legacy_large_raw_admission_and_coverage_are_paged_not_poisoned_by_aggre
     assert!(json.len() > SOURCE_PAGE_BYTES);
     // Original legacy admission predates the small current admission envelope.
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_operation SET snapshot=?1 WHERE id='raw-large-op'",
+        DbBackend::Postgres,
+        "UPDATE compaction_operation SET snapshot=$1 WHERE id='raw-large-op'",
         [json.into()],
     ))
     .await
