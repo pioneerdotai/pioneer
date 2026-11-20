@@ -2677,6 +2677,9 @@ impl RetiredControlOperationRegistry {
 #[derive(Clone)]
 pub(crate) struct NativeTurnRuntimeSnapshot {
     pub(crate) context_controller: Option<Arc<dyn compaction::controller::NativeContextController>>,
+    /// All in-process attempts of this turn share the last provider input measurement.
+    pub(crate) context_measurement:
+        Arc<std::sync::Mutex<Option<compaction::controller::NativeUsageMeasurement>>>,
     pub(crate) generation: u64,
     pub(crate) tool_loop_config: ToolLoopConfig,
     pub(crate) mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
@@ -2857,6 +2860,7 @@ impl NativeRuntimeDependencies {
         }
         NativeTurnRuntimeSnapshot {
             context_controller: state.context_controller.clone(),
+            context_measurement: Arc::default(),
             generation: state.generation,
             tool_loop_config: state.tool_loop_config.clone(),
             mcp_tool_provider: state.mcp_tool_provider.clone(),
