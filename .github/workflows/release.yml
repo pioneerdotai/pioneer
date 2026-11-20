@@ -189,24 +189,28 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import runpy
           import subprocess
           import tomllib
+          import zipfile
 
           dist = Path('dist')
           catalog_hash = hashlib.sha256(Path('release-model-catalog/catalog.json').read_bytes()).hexdigest()
           version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
           platforms = {
-              'x86_64-unknown-linux-gnu': ('linux-x86_64', 'gz', ['pioneer-linux-x86_64.AppImage']),
-              'aarch64-unknown-linux-gnu': ('linux-aarch64', 'gz', ['pioneer-linux-aarch64.AppImage']),
-              'x86_64-apple-darwin': ('macos-x86_64', 'zip', ['Pioneer-x86_64.dmg', 'Pioneer-x86_64.app.zip']),
-              'aarch64-apple-darwin': ('macos-aarch64', 'gz', ['Pioneer-aarch64.dmg', 'Pioneer-aarch64.app.zip']),
-              'x86_64-pc-windows-msvc': ('windows-x86_64', 'zip', ['Pioneer-x86_64.msi', 'Pioneer-x86_64.exe']),
-              'aarch64-pc-windows-msvc': ('windows-aarch64', 'zip', ['Pioneer-aarch64.msi', 'Pioneer-aarch64.exe']),
+              'x86_64-unknown-linux-gnu': ['pioneer-linux-x86_64.AppImage'],
+              'aarch64-unknown-linux-gnu': ['pioneer-linux-aarch64.AppImage'],
+              'x86_64-apple-darwin': ['Pioneer-x86_64.dmg', 'Pioneer-x86_64.app.zip'],
+              'aarch64-apple-darwin': ['Pioneer-aarch64.dmg', 'Pioneer-aarch64.app.zip'],
+              'x86_64-pc-windows-msvc': ['Pioneer-x86_64.msi', 'Pioneer-x86_64.exe'],
+              'aarch64-pc-windows-msvc': ['Pioneer-aarch64.msi', 'Pioneer-aarch64.exe'],
           }
+          asset_name = runpy.run_path('scripts/packaging/runtime-inputs.py')['asset_name']
+          postgres = runpy.run_path('scripts/packaging/postgres-runtime.py')
           expected = {}
-          for target, (platform, extension, desktop) in platforms.items():
-              expected[f'pioneer-gateway-{platform}.{extension}'] = (target, 'default')
-              expected[f'pioneer-gateway-{platform}-computer-use-package.zip'] = (target, 'computer-use')
+          for target, desktop in platforms.items():
+              for variant in ('default', 'computer-use'):
+                  expected[asset_name(target, variant)] = (target, variant)
               expected.update({name: (target, 'desktop') for name in desktop})
           expected_files = set(expected) | {name + '.provenance.json' for name in expected}
           if {path.name for path in dist.iterdir()} != expected_files:
@@ -226,6 +230,19 @@ jobs:
               if hashlib.sha256(path.read_bytes()).hexdigest() != receipt['sha256']:
                   raise ValueError(f'Asset checksum mismatch: {name}')
               receipts[name] = receipt
+              if variant in ('default', 'computer-use'):
+                  prefix = 'cua/postgres/'
+                  suffix = '.exe' if 'windows' in target else ''
+                  programs = {prefix + f'bin/{program}{suffix}' for program in postgres['PROGRAMS']}
+                  extension = {prefix + 'share/extension/vector.control',
+                               prefix + f"share/extension/vector--{postgres['VECTOR_VERSION']}.sql"}
+                  modules = ('vector.dll',) if suffix else (
+                      ('vector.so', 'vector.dylib') if 'apple-darwin' in target else ('vector.so',))
+                  with zipfile.ZipFile(path) as archive:
+                      members = set(archive.namelist())
+                      missing = (programs | extension) - members
+                      if missing or not any(prefix + 'lib/' + module in members for module in modules):
+                          raise ValueError(f'Incomplete PostgreSQL runtime in {name}: {sorted(missing)}')
               if variant == 'computer-use':
                   subprocess.run(['python3', 'scripts/packaging/cua-driver.py', 'validate', '--target', target,
                                   '--archive', str(path)], check=True)
@@ -247,15 +264,13 @@ jobs:
           cd dist
           rm -f SHA256SUMS
           shopt -s nullglob
-          files=(pioneer-gateway-*.gz pioneer-gateway-*.zip)
+          files=(pioneer-gateway-*.zip)
           if [[ ${#files[@]} -ne 12 ]]; then
             echo "expected all 12 Gateway assets before publication, found ${#files[@]}"
             exit 1
           fi
           for platform in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 windows-x86_64 windows-aarch64; do
-            extension=zip
-            case "$platform" in linux-*|macos-aarch64) extension=gz ;; esac
-            test -f "pioneer-gateway-${platform}.${extension}"
+            test -f "pioneer-gateway-${platform}.zip"
             test -f "pioneer-gateway-${platform}-computer-use-package.zip"
           done
           for file in "${files[@]}"; do
@@ -451,7 +466,6 @@ jobs:
             test -f "dist/Pioneer-${arch}.msi"
           done
           files=(
-            dist/pioneer-gateway-*.gz
             dist/pioneer-gateway-*.zip
             dist/SHA256SUMS
             dist/Pioneer-*.app.zip
