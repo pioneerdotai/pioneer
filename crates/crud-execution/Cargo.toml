@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 pioneer-hooks.workspace = true
 pioneer-entity.workspace = true

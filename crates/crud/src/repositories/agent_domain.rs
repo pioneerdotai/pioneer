@@ -8,8 +8,19 @@
 use crate::GatewayControlConnection;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
-use futures_util::FutureExt;
 use pioneer_crud_execution::agent_queue::load_fair_queued_candidate;
+use pioneer_crud_execution::outbox_claim::{
+    AGENT_ACTION_OUTBOX_LEASE_SECONDS, AGENT_START_TERMINAL_FAILURE_CLASSES,
+    claim_agent_action_outbox_with_clock,
+};
+pub use pioneer_crud_execution::outbox_claim::{
+    AGENT_ACTION_OUTBOX_MAX_ATTEMPTS, AGENT_START_RECONCILIATION_REQUIRED,
+    AgentActionOutboxClaimBatch, AgentActionOutboxFailure,
+};
+#[cfg(test)]
+use pioneer_crud_execution::outbox_claim::{
+    defer_unclaimed_agent_action_outbox, transition_agent_action_outbox,
+};
 use pioneer_entity::{
     actor_nickname_index, agent_action, agent_action_outbox, agent_action_receipt,
     agent_action_timeline_target, agent_delegation_route, agent_delegation_route_event,
@@ -39,7 +50,6 @@ use sea_orm::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::panic::AssertUnwindSafe;
 
 pub const SOURCE_NATIVE_AGENT: &str = "native_agent";
 pub const SOURCE_CLI_RUNTIME_INSTANCE: &str = "cli_runtime_instance";
@@ -50,22 +60,6 @@ pub const NICKNAME_OWNER_AGENT: &str = "agent";
 pub const NICKNAME_OWNER_RESERVED: &str = "reserved";
 pub const NICKNAME_ACTIVE: &str = "active";
 pub const NICKNAME_TOMBSTONED: &str = "tombstoned";
-// The two partial-index predicates pin this policy to 8. Changing the retry
-// budget requires a migration replacing their predicates, plus the queries below.
-pub const AGENT_ACTION_OUTBOX_MAX_ATTEMPTS: i64 = 8;
-const _: () = assert!(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS == 8);
-const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
-const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
-// An exhausted StartAgent still owes outcome reconciliation, never delivery.
-pub const AGENT_START_RECONCILIATION_REQUIRED: &str = "outbox_start_reconciliation_required";
-const AGENT_START_TERMINAL_FAILURE_CLASSES: [&str; 6] = [
-    "outbox_detached_binding_rejected",
-    "outbox_start_integrity_rejected",
-    "outbox_start_authority_denied",
-    "outbox_start_runtime_unavailable",
-    "outbox_foreground_conflict",
-    "outbox_start_outcome_unknown",
-];
 pub const AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS: i64 = 30;
 pub const AGENT_ROUTE_GRAPH_MAX_EDGES: usize = 2_048;
 const AGENT_PROJECTION_BATCH_LIMIT: usize = 200;
@@ -78,7 +72,6 @@ pub(super) const AGENT_WORK_GRAPH_MAX_DEPTH: i64 = 64;
 pub(super) const AGENT_WORK_GRAPH_MAX_FAN_OUT: i64 = 128;
 pub(super) const AGENT_WORK_GRAPH_MAX_TOTAL_NODES: i64 = 4_096;
 const AGENT_ROUTE_EXPIRY_BATCH_SIZE: u64 = 512;
-const AGENT_ACTION_OUTBOX_LEASE_SECONDS: i64 = 30;
 const AGENT_ACTION_OUTBOX_MAX_RETRY_SECONDS: i64 = 30 * 60;
 const AGENT_ACTION_OUTBOX_PERMIT_WAIT_CLASS: &str = "waiting_for_durable_permit";
 const AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS: &str = "waiting_for_native_thread_runtime";
@@ -5253,16 +5246,6 @@ fn is_sha256_hex(value: &str) -> bool {
 
 pub use pioneer_crud_execution::outbox_discovery::next_deadline as next_agent_action_outbox_deadline;
 
-/// Known-committed claims and independent candidate failures from one input quantum.
-#[derive(Debug, Default)]
-pub struct AgentActionOutboxClaimBatch {
-    /// Raw discovered identities before claims, filtering or dispatch failures.
-    /// Either range can fill before the combined 64-row budget is exhausted.
-    pub has_more: bool,
-    pub rows: Vec<agent_action_outbox::Model>,
-    pub errors: Vec<anyhow::Error>,
-}
-
 /// Claim at most 32 immediate and 32 timed inputs. Expired final leases share
 /// this budget with delivery work. Nonzero limits must be 2..=64 so both ranges
 /// receive a share. Dispatch only `rows`, whose commits are known to have succeeded.
@@ -5280,259 +5263,6 @@ pub async fn claim_agent_action_outbox<C: GatewayControlConnection + Transaction
         }
     }
     result
-}
-
-// An immediate clock callback makes writer-admission timing testable without
-// sleeps. It performs no preparation or I/O while the transaction is open.
-async fn claim_agent_action_outbox_with_clock<C: ConnectionTrait + TransactionTrait>(
-    db: &C,
-    limit: u64,
-    clock: &(impl Fn() -> DateTimeWithTimeZone + Sync),
-) -> Result<AgentActionOutboxClaimBatch> {
-    if limit == 0 {
-        return Ok(AgentActionOutboxClaimBatch::default());
-    }
-    if !(2..=AGENT_ACTION_OUTBOX_BATCH_LIMIT).contains(&limit) {
-        bail!("Agent action outbox nonzero batch limit must be 2..=64");
-    }
-    let ids = pioneer_crud_execution::outbox_discovery::discover(db, clock(), limit).await?;
-    let mut batch = AgentActionOutboxClaimBatch {
-        has_more: ids.len() as u64 >= limit / 2,
-        ..Default::default()
-    };
-    for id in ids {
-        // The entire point operation is inside the boundary, including future
-        // creation and polling. Dropping it releases transactions/reservations;
-        // cancellation still drops the owning future rather than becoming Err.
-        let outcome = AssertUnwindSafe(async {
-            let transaction =
-                match db.begin().await {
-                    Ok(transaction) => transaction,
-                    Err(error) => {
-                        batch.errors.push(anyhow::Error::new(error).context(
-                            "failed to begin outbox claim; no snapshot for durable deferral",
-                        ));
-                        return;
-                    }
-                };
-            let now = clock(); // after serialized writer admission, for each row
-            // Original source payload is authoritative. Do not decode it under capacity.
-            let mut candidate =
-                match agent_action_outbox::Entity::find_by_id(id)
-                    .lock_exclusive()
-                    .one(&transaction)
-                    .await
-                {
-                    Ok(Some(candidate)) => candidate,
-                    Ok(None) => {
-                        if let Err(error) = transaction.rollback().await {
-                            batch.errors.push(error.into());
-                        }
-                        return;
-                    }
-                    Err(error) => {
-                        batch.errors.push(anyhow::Error::new(error).context(
-                            "failed to load outbox input; no snapshot for durable deferral",
-                        ));
-                        if let Err(error) = transaction.rollback().await {
-                            batch.errors.push(error.into());
-                        }
-                        return;
-                    }
-                };
-            let row = match transition_agent_action_outbox(&transaction, &mut candidate, now).await
-            {
-                Ok(row) => row,
-                Err(error) => {
-                    batch.errors.push(error);
-                    // Only a known rollback permits a separate snapshot-fenced delay.
-                    match transaction.rollback().await {
-                        Ok(()) => {
-                            match defer_unclaimed_agent_action_outbox(db, &candidate, clock).await {
-                                Ok(true) => {}
-                                Ok(false) => batch.errors.push(anyhow::anyhow!(
-                                    "outbox claim deferral skipped: source snapshot changed"
-                                )),
-                                Err(error) => batch.errors.push(error.context(
-                                    "outbox claim deferral not confirmed; durability unavailable",
-                                )),
-                            }
-                        }
-                        Err(error) => batch.errors.push(
-                            anyhow::Error::new(error)
-                                .context("outbox rollback not confirmed; no claim repair allowed"),
-                        ),
-                    }
-                    return;
-                }
-            };
-            // Unknown commit excludes only this row. Never repair, rediscover or
-            // claim it again here; previously confirmed rows still reach dispatch.
-            match transaction.commit().await {
-                Ok(()) => {
-                    if row {
-                        batch.rows.push(candidate);
-                    }
-                }
-                Err(error) => batch.errors.push(
-                    anyhow::Error::new(error)
-                        .context("agent action outbox claim commit outcome unknown"),
-                ),
-            }
-        })
-        .catch_unwind()
-        .await;
-        if outcome.is_err() {
-            // Unwind is not a commit/rollback acknowledgement. No repair or
-            // same-quantum retry; only prior known commits are dispatchable.
-            batch
-                .errors
-                .push(anyhow!("outbox_claim_panic_outcome_unknown"));
-        }
-    }
-    Ok(batch)
-}
-
-// A failed, rolled-back claim consumes no execution attempt. Preserve status
-// and attempt budget, using the existing 30s lease as a retry delay. The exact
-// original nullable lease fences any new ownership acquired after rollback.
-async fn defer_unclaimed_agent_action_outbox<C: ConnectionTrait + TransactionTrait>(
-    db: &C,
-    snapshot: &agent_action_outbox::Model,
-    clock: &(impl Fn() -> DateTimeWithTimeZone + Sync),
-) -> Result<bool> {
-    let transaction = db.begin().await?;
-    let now = clock();
-    let lease_guard = match snapshot.next_attempt_at {
-        Some(lease) => agent_action_outbox::Column::NextAttemptAt.eq(lease),
-        None => agent_action_outbox::Column::NextAttemptAt.is_null(),
-    };
-    let result = agent_action_outbox::Entity::update_many()
-        .col_expr(
-            agent_action_outbox::Column::NextAttemptAt,
-            sea_orm::sea_query::Expr::value(Some(
-                now + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS),
-            )),
-        )
-        .col_expr(
-            agent_action_outbox::Column::LastError,
-            sea_orm::sea_query::Expr::value(Some(AGENT_ACTION_OUTBOX_FAILURE_CLASS.to_owned())),
-        )
-        .filter(agent_action_outbox::Column::Id.eq(&snapshot.id))
-        .filter(agent_action_outbox::Column::Status.eq(&snapshot.status))
-        .filter(agent_action_outbox::Column::Attempts.eq(snapshot.attempts))
-        .filter(lease_guard)
-        .exec(&transaction)
-        .await?;
-    transaction.commit().await?;
-    Ok(result.rows_affected == 1)
-}
-
-// One bounded point transition. Exact snapshot guards also fence a replaced
-// lease with the same attempt count (e.g. after permit/runtime budget return).
-async fn transition_agent_action_outbox<C: ConnectionTrait>(
-    db: &C,
-    candidate: &mut agent_action_outbox::Model,
-    now: DateTimeWithTimeZone,
-) -> Result<bool> {
-    if !matches!(candidate.status.as_str(), "pending" | "failed")
-        || candidate
-            .next_attempt_at
-            .as_ref()
-            .is_some_and(|due| due > &now)
-    {
-        return Ok(false);
-    }
-    if candidate.status == "failed"
-        && candidate.next_attempt_at.is_none()
-        && candidate.last_error.as_deref()
-            == Some(AgentActionOutboxFailure::InvalidDetachedBinding.safe_name())
-    {
-        return Ok(false);
-    }
-    let exhausted = candidate.attempts >= AGENT_ACTION_OUTBOX_MAX_ATTEMPTS;
-    let reconcile_start = exhausted
-        && agent_action::Entity::find_by_id(candidate.action_id.clone())
-            .one(db)
-            .await?
-            .is_some_and(|action| action.action_kind == "start_agent");
-    // Only locally finalized StartAgent refusals add an early terminal case.
-    // Legacy immediate failures and other action kinds retain their behavior.
-    if !reconcile_start
-        && candidate.status == "failed"
-        && candidate.next_attempt_at.is_none()
-        && candidate
-            .last_error
-            .as_deref()
-            .is_some_and(|cause| AGENT_START_TERMINAL_FAILURE_CLASSES.contains(&cause))
-    {
-        return Ok(false);
-    }
-    if exhausted
-        && !reconcile_start
-        && (candidate.status != "pending" || candidate.next_attempt_at.is_none())
-    {
-        return Ok(false);
-    }
-    let lease_guard = match candidate.next_attempt_at.clone() {
-        Some(lease) => agent_action_outbox::Column::NextAttemptAt.eq(lease),
-        None => agent_action_outbox::Column::NextAttemptAt.is_null(),
-    };
-    let update = agent_action_outbox::Entity::update_many()
-        .filter(agent_action_outbox::Column::Id.eq(candidate.id.clone()))
-        .filter(agent_action_outbox::Column::Status.eq(candidate.status.clone()))
-        .filter(agent_action_outbox::Column::Attempts.eq(candidate.attempts))
-        .filter(lease_guard);
-    let (status, attempts, next_attempt_at, last_error) = if reconcile_start {
-        (
-            "pending",
-            candidate.attempts,
-            Some(now + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS)),
-            Some(AGENT_START_RECONCILIATION_REQUIRED.to_owned()),
-        )
-    } else if exhausted {
-        (
-            "failed",
-            candidate.attempts,
-            None,
-            Some("outbox delivery lease expired after the retry limit".to_owned()),
-        )
-    } else {
-        (
-            "pending",
-            candidate.attempts + 1,
-            Some(now + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS)),
-            None,
-        )
-    };
-    let result = update
-        .col_expr(
-            agent_action_outbox::Column::Status,
-            sea_orm::sea_query::Expr::value(status),
-        )
-        .col_expr(
-            agent_action_outbox::Column::Attempts,
-            sea_orm::sea_query::Expr::value(attempts),
-        )
-        .col_expr(
-            agent_action_outbox::Column::NextAttemptAt,
-            sea_orm::sea_query::Expr::value(next_attempt_at.clone()),
-        )
-        .col_expr(
-            agent_action_outbox::Column::LastError,
-            sea_orm::sea_query::Expr::value(last_error.clone()),
-        )
-        .exec(db)
-        .await
-        .context("failed to transition agent action outbox input")?;
-    if result.rows_affected != 1 || (exhausted && !reconcile_start) {
-        return Ok(false);
-    }
-    candidate.status = status.to_owned();
-    candidate.attempts = attempts;
-    candidate.next_attempt_at = next_attempt_at;
-    candidate.last_error = last_error;
-    Ok(true)
 }
 
 pub async fn mark_agent_action_outbox_delivered<C: GatewayControlConnection>(
@@ -5572,43 +5302,6 @@ pub async fn mark_agent_action_outbox_delivered<C: GatewayControlConnection>(
     }
     result
 }
-
-/// Fixed diagnostics only: provider errors and user payloads never enter the ledger.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentActionOutboxFailure {
-    DeliveryFailed,
-    StorageUnavailable,
-    InvalidStart,
-    InvalidDetachedBinding,
-    AuthorityDenied,
-    RuntimeUnavailable,
-    PreparationUnavailable,
-    ControlUnavailable,
-    OutcomeUnknown,
-    ForegroundConflict,
-}
-impl AgentActionOutboxFailure {
-    pub const fn safe_name(self) -> &'static str {
-        match self {
-            Self::DeliveryFailed => "outbox_delivery_failed",
-            Self::StorageUnavailable => "outbox_storage_unavailable",
-            Self::InvalidStart => "outbox_start_integrity_rejected",
-            Self::InvalidDetachedBinding => "outbox_detached_binding_rejected",
-            Self::AuthorityDenied => "outbox_start_authority_denied",
-            Self::RuntimeUnavailable => "outbox_start_runtime_unavailable",
-            Self::PreparationUnavailable => "outbox_start_preparation_unavailable",
-            Self::ControlUnavailable => "outbox_runtime_control_unavailable",
-            Self::OutcomeUnknown => "outbox_start_outcome_unknown",
-            Self::ForegroundConflict => "outbox_foreground_conflict",
-        }
-    }
-}
-impl std::fmt::Display for AgentActionOutboxFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.safe_name())
-    }
-}
-impl std::error::Error for AgentActionOutboxFailure {}
 
 pub async fn mark_agent_action_outbox_failed<C: GatewayControlConnection>(
     db: &C,
