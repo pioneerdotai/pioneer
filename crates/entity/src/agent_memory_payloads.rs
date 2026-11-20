@@ -7,15 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_memory_payloads")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub scope_kind: String,
-    pub revision: i64,
-    #[sea_orm(column_type = "Text")]
-    pub scope_key_hash: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub memory_id: String,
     #[sea_orm(column_type = "Text")]
+    pub scope_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub scope_key_hash: String,
+    #[sea_orm(column_type = "Text")]
     pub content: String,
+    pub revision: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

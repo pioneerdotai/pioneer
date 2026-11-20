@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub invitation_id: String,
-    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub workspace_id: String,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "invitation_id",

@@ -181,7 +181,7 @@ async fn drain_worker(processor: &MessageProcessor) {
     processor.poll_completed_history_checks().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn published_human_answer_prepares_root_once_and_next_cli_and_native_reuse_checkpoint() {
     let summary = [
         "Goal and constraints",
@@ -396,7 +396,7 @@ async fn published_human_answer_prepares_root_once_and_next_cli_and_native_reuse
     events.shutdown_progress().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn completed_cli_child_keeps_history_without_hypothetical_continuation_warmup() {
     let provider = Arc::new(CaptureSummaryProvider::new("must not run"));
     let harness =
@@ -476,7 +476,7 @@ async fn completed_cli_child_keeps_history_without_hypothetical_continuation_war
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn worker_window_uses_original_activity_and_late_answer_opens_a_fresh_window() {
     // Config owner tests AppConfig layering; this boundary exercises the field
     // in the actual worker with a deterministic millisecond clock.

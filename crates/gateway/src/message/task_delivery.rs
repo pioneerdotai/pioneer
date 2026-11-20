@@ -1774,7 +1774,7 @@ mod historical_grant_delivery_tests {
         Set,
     };
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn historical_result_delivery_and_post_commit_replay_keep_author_receipt_and_originals() {
         for mode in [TaskDeliveryMode::Thread, TaskDeliveryMode::UserNotification] {
             let fixture = historical_task_fixture(mode).await;
@@ -1946,7 +1946,7 @@ mod historical_grant_delivery_tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn historical_delivery_still_rejects_corrupt_snapshots_and_revoked_authority() {
         for corruption in ["outer", "nested", "task", "identity", "route"] {
             let destination_thread_id = if corruption == "route" {

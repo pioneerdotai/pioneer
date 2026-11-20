@@ -14,7 +14,7 @@ async fn producer_store() -> CrudStore {
     store.with_maintenance_access()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn child_task_obligation_rolls_back_with_business_projection() {
     let store = producer_store().await;
     let task = sample_task(AT);
@@ -45,7 +45,7 @@ async fn child_task_obligation_rolls_back_with_business_projection() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_payload_refresh_does_not_invalidate_child_scope() {
     let store = producer_store().await;
     let mut task = sample_task(AT);
@@ -77,7 +77,7 @@ async fn task_payload_refresh_does_not_invalidate_child_scope() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn run_status_projection_durably_invalidates_origin_group() {
     let store = producer_store().await;
     let task = sample_task(AT);
@@ -124,7 +124,7 @@ async fn run_status_projection_durably_invalidates_origin_group() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn moved_link_keeps_new_point_locator_when_it_sorts_before_old() {
     use pioneer_entity::task_child_reconcile_pending as point;
     let store = producer_store().await;
@@ -159,7 +159,7 @@ async fn moved_link_keeps_new_point_locator_when_it_sorts_before_old() {
     assert_eq!(pending.thread_id, link.thread_id);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unknown_commit_response_keeps_business_and_obligation_without_replaying_write() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let store = producer_store().await;

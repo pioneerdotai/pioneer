@@ -155,12 +155,12 @@ impl Fixture {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn held_native_live_replay_releases_dispatcher_and_cannot_reopen_terminal() {
     assert_held_native_replay_terminal_order(false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn held_native_orphan_replay_releases_dispatcher_and_cannot_reopen_terminal() {
     assert_held_native_replay_terminal_order(true).await;
 }
@@ -268,7 +268,7 @@ async fn assert_held_native_replay_terminal_order(orphan: bool) {
     .expect("post-open dispatcher watchdog");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn same_socket_resubscribe_rejects_old_actual_enqueue_and_old_cleanup_preserves_new_owner() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut f = Fixture::new(false).await;
@@ -336,7 +336,7 @@ async fn same_socket_resubscribe_rejects_old_actual_enqueue_and_old_cleanup_pres
     .expect("same-socket replay watchdog");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_reply_handoff_releases_obligation_without_cancelling_durable_request() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut f = Fixture::new(false).await;
@@ -419,12 +419,12 @@ pub(super) async fn renew_same_subject(sessions: &SessionManager, connection: Co
         .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_replay_and_live_terminal_survive_same_socket_renewal_without_lost_cards() {
     assert_native_replay_terminal_across_renewal(false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn orphan_replay_and_live_terminal_survive_same_socket_renewal_without_lost_cards() {
     assert_native_replay_terminal_across_renewal(true).await;
 }
@@ -537,7 +537,7 @@ async fn assert_native_replay_terminal_across_renewal(orphan: bool) {
     .expect("native renewal watchdog");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn renewal_to_denied_role_does_not_reuse_old_execution_authorization() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut f = Fixture::new(false).await;
@@ -594,7 +594,7 @@ async fn renewal_to_denied_role_does_not_reuse_old_execution_authorization() {
     .expect("denied renewal watchdog");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn repeated_rotation_exhausts_bounded_delivery_and_forces_recoverable_socket_teardown() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut f = Fixture::new(false).await;
@@ -771,27 +771,27 @@ async fn assert_native_authorization_unavailable_requires_recovery(orphan: bool,
     .expect("resource authorization replay watchdog");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_authorization_unavailable_at_first_resource_pass_requires_recovery() {
     assert_native_authorization_unavailable_requires_recovery(false, 0).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_authorization_unavailable_at_second_resource_pass_requires_recovery() {
     assert_native_authorization_unavailable_requires_recovery(false, 1).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_authorization_unavailable_at_third_resource_pass_requires_recovery() {
     assert_native_authorization_unavailable_requires_recovery(false, 2).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn orphan_native_authorization_unavailable_requires_recovery() {
     assert_native_authorization_unavailable_requires_recovery(true, 2).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_live_typed_terminal_auth_unavailable_requires_recovery_instead_of_lost_card() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut f = Fixture::new(false).await;
@@ -895,7 +895,7 @@ async fn native_live_typed_terminal_auth_unavailable_requires_recovery_instead_o
     .expect("typed terminal authorization watchdog");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn old_authorization_error_cannot_seal_a_resubscribed_member_socket() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut f = Fixture::new(false).await;
@@ -982,7 +982,7 @@ async fn old_authorization_error_cannot_seal_a_resubscribed_member_socket() {
     .expect("old authorization recovery watchdog");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn opening_reply_ack_and_owned_replay_have_separate_live_boundaries() {
     const NAME: &str = "message::tests::post_open_replay::opening_reply_ack_and_owned_replay_have_separate_live_boundaries";
     const CHILD: &str = "PIONEER_OPENING_REPLAY_OBSERVER_CHILD";

@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_event_fanout_cursor")]
 pub struct Model {
-    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub task_id: String,
-    pub created_at: DateTimeWithTimeZone,
     pub last_sequence: i64,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "task_id",

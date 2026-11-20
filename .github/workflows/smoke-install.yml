@@ -606,6 +606,15 @@ jobs:
             libegl1-mesa-dev \
             libgbm-dev \
             libssl-dev \
+            libasound2-dev \
+            libwebkit2gtk-4.1-dev \
+            libfontconfig-dev \
+            libfreetype6-dev \
+            libxkbcommon-x11-dev \
+            libx11-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libgl1-mesa-dev \
             libpipewire-0.3-dev \
             libwayland-dev \
             libxi-dev \

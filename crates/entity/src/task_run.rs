@@ -7,42 +7,42 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_run")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub parent_run_id: Option<String>,
-    pub lock_expires_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub trigger_input_json: Option<String>,
-    pub heartbeat_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", unique_key = "uidx_task_run_task_number")]
+    pub task_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub trigger_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub retry_of_run_id: Option<String>,
-    #[sea_orm(unique_key = "uidx_task_run_task_number")]
-    pub run_number: i64,
-    pub ready_at: Option<DateTimeWithTimeZone>,
+    pub parent_run_id: Option<String>,
+    #[sea_orm(column_type = "Text", unique_key = "uidx_task_run_group_attempt")]
+    pub run_group_id: String,
     #[sea_orm(unique_key = "uidx_task_run_group_attempt")]
     pub attempt_number: i64,
     #[sea_orm(column_type = "Text", nullable)]
-    pub locked_by: Option<String>,
-    pub inbox_sequence: Option<i64>,
-    #[sea_orm(column_type = "Text", unique_key = "uidx_task_run_group_attempt")]
-    pub run_group_id: String,
-    pub completed_at: Option<DateTimeWithTimeZone>,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub result_json: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub executor_kind: String,
-    #[sea_orm(column_type = "Text", unique_key = "uidx_task_run_task_number")]
-    pub task_id: String,
+    pub retry_of_run_id: Option<String>,
+    pub ready_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(unique_key = "uidx_task_run_task_number")]
+    pub run_number: i64,
     #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text")]
+    pub executor_kind: String,
     pub started_at: Option<DateTimeWithTimeZone>,
+    pub completed_at: Option<DateTimeWithTimeZone>,
+    pub heartbeat_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub locked_by: Option<String>,
+    pub lock_expires_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub result_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub error_json: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    pub inbox_sequence: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub trigger_input_json: Option<String>,
     #[sea_orm(has_many)]
     pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
     #[sea_orm(has_many)]

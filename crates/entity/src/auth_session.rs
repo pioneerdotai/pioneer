@@ -7,36 +7,36 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "auth_session")]
 pub struct Model {
-    pub updated_at: DateTimeWithTimeZone,
-    pub refresh_generation: i64,
-    #[sea_orm(column_type = "Text", unique)]
-    pub token_family_id: String,
-    pub revoked_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub revoke_reason: Option<String>,
-    pub activated_at: Option<DateTimeWithTimeZone>,
-    pub last_refreshed_at: Option<DateTimeWithTimeZone>,
-    pub refresh_expires_at: Option<DateTimeWithTimeZone>,
-    pub activation_expires_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    #[sea_orm(column_type = "Text")]
-    pub gateway_id: String,
-    pub last_seen_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text")]
-    pub device_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
+    pub gateway_id: String,
+    #[sea_orm(column_type = "Text")]
     pub principal_id: String,
-    pub created_at: DateTimeWithTimeZone,
-    pub activation_failed_attempts: i64,
+    #[sea_orm(column_type = "Text")]
+    pub device_id: String,
+    #[sea_orm(column_type = "Text", unique)]
+    pub token_family_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub created_by_session_id: Option<String>,
     #[sea_orm(column_type = "VarBinary(StringLen::None)")]
     pub activation_token_hash: Vec<u8>,
     #[sea_orm(column_type = "VarBinary(StringLen::None)")]
     pub activation_locator_hash: Vec<u8>,
+    pub activation_failed_attempts: i64,
+    pub activation_expires_at: DateTimeWithTimeZone,
+    pub activated_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub refresh_generation: i64,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    pub last_seen_at: Option<DateTimeWithTimeZone>,
+    pub last_refreshed_at: Option<DateTimeWithTimeZone>,
+    pub refresh_expires_at: Option<DateTimeWithTimeZone>,
+    pub revoked_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub created_by_session_id: Option<String>,
+    pub revoke_reason: Option<String>,
     #[sea_orm(has_many)]
     pub audit_events: HasMany<super::audit_event::Entity>,
     #[sea_orm(has_one)]

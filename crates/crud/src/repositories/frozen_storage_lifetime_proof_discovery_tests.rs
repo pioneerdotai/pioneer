@@ -1,4 +1,6 @@
 use super::*;
+use migration::{Migrator, MigratorTrait};
+use sea_orm::Database;
 use std::sync::{Arc, Mutex};
 
 const MIGRATION: &str = "m20261026_000002_frozen_proof_discovery_index";

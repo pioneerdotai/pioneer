@@ -7,26 +7,26 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "package_component")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable, unique)]
-    pub skill_id: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub kind: String,
-    #[sea_orm(column_type = "Text")]
-    pub override_fields_json: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub member_path: Option<String>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub package_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub kind: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub member_key: String,
     #[sea_orm(column_type = "Text", nullable)]
+    pub member_path: Option<String>,
+    #[sea_orm(column_type = "Text", nullable, unique)]
+    pub skill_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable, unique)]
+    pub mcp_installation_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub package_fingerprint: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub diagnostic: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub status: String,
-    #[sea_orm(column_type = "Text", nullable, unique)]
-    pub mcp_installation_id: Option<String>,
+    pub override_fields_json: String,
     #[sea_orm(
         belongs_to,
         from = "mcp_installation_id",

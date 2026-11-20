@@ -22,7 +22,7 @@ use pioneer_crud::{
     upsert_projection_meta_with_config,
 };
 use pioneer_memory::{
-    SqliteThreadEpisodicBackend, ThreadEpisodicEmbeddingProvider, ThreadEpisodicSearchBackend,
+    PostgresThreadEpisodicBackend, ThreadEpisodicEmbeddingProvider, ThreadEpisodicSearchBackend,
     ThreadEpisodicSearchFailureKind, ThreadEpisodicValidationResult,
     ThreadEpisodicWorkspaceOwnership, lock_thread_episodic_workspace,
 };
@@ -1831,7 +1831,7 @@ async fn execute_refill_jobs(
     #[cfg(test)] mut after_claim: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     let backend: Arc<dyn ThreadEpisodicSearchBackend> =
-        Arc::new(SqliteThreadEpisodicBackend::new(crud_store.clone()));
+        Arc::new(PostgresThreadEpisodicBackend::new(crud_store.clone()));
     #[cfg(test)]
     let backend: Arc<dyn ThreadEpisodicSearchBackend> = {
         let gate = REFILL_BLOCKING_TEST_GATES
@@ -3303,7 +3303,7 @@ mod tests {
         .await
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_refill_marker_treats_vector_marker_as_stale_for_lexical_target() {
         let (crud_store, _temp_dir, workspace_id) = setup_store().await;
         let vector_target = ThreadEpisodicWorkspaceProjectionTarget::from_vector_search_config(
@@ -3337,7 +3337,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_refill_marker_invalidates_vector_identity_changes() {
         let (crud_store, _temp_dir, _workspace_id) = setup_store().await;
         let base_config = GatewayThreadEpisodicVectorSearchConfig {
@@ -3384,7 +3384,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_workspace_refill_lock_prevents_duplicate_migration() {
         let (crud_store, temp_dir, _workspace_id) = setup_store().await;
         let _guard = try_acquire_refill_lock(temp_dir.path())
@@ -3420,7 +3420,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_workspace_refill_missing_marker_marks_empty_database_complete() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
 
@@ -3475,7 +3475,7 @@ mod tests {
         assert!(skipped.skipped);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_workspace_refill_retries_failed_backfilling_and_old_versions() {
         for (status, version) in [
             (PROJECTION_META_STATUS_FAILED, 1),
@@ -3509,7 +3509,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_workspace_refill_cleanup_resets_derived_artifacts_rerunnably() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let item = crud_store
@@ -3636,7 +3636,7 @@ mod tests {
         assert_eq!(second.index_jobs_replaced, 0);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_disable_refill_cleans_stale_projection_without_deleting_history()
      {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
@@ -3744,7 +3744,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_refill_indexes_items_with_embedding_identity() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_vector_refill";
@@ -3802,7 +3802,7 @@ mod tests {
         assert_eq!(artifact.vector, vec![0.1, 0.2, 0.3]);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_refill_terminal_embedding_failure_does_not_complete_marker() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_vector_refill_terminal";
@@ -3874,7 +3874,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_refill_retries_transient_embedding_failure_until_success() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_vector_refill_retryable";
@@ -3930,7 +3930,7 @@ mod tests {
         assert!(jobs[0].last_error.is_none());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn refill_embedding_cooldown_survives_resolution_and_failure_persistence() {
         for (retry_after_ms, persistence_fallback) in
             [(60_001, false), (60_001, true), (u64::MAX, false)]
@@ -3996,7 +3996,7 @@ mod tests {
                 let mut summary = ThreadEpisodicWorkspaceRefillSummary::default();
                 execute_claimed_refill_job(
                     store.clone(),
-                    &SqliteThreadEpisodicBackend::new(store.clone()),
+                    &PostgresThreadEpisodicBackend::new(store.clone()),
                     &payload,
                     job.clone(),
                     now,
@@ -4046,7 +4046,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_refill_stops_after_bounded_transient_retries() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_vector_refill_retry_exhausted";
@@ -4104,7 +4104,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
     async fn thread_episodic_vector_refill_reconciles_source_changed_during_provider_failure() {
         let (crud_store, temp_dir, workspace_id) = setup_concurrent_store().await;
         let thread_id = "thread_vector_provider_source_change";
@@ -4205,7 +4205,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_refill_success_commit_rechecks_source_after_resolution() {
         let (crud_store, _temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_refill_atomic_source_check";
@@ -4291,7 +4291,7 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_refill_reconciliation_persistence_recovery_is_bounded() {
         let config = ThreadEpisodicIndexExecutorConfig {
             retry_base_delay_secs: 11,
@@ -4518,7 +4518,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn refill_candidate_unwind_keeps_a_c_success_and_b_durable_running() {
         let (store, _root, workspace) = setup_store().await;
         mark_refill_marker_with_workspace_target(
@@ -4553,7 +4553,7 @@ mod tests {
             .find(|job| job.thread_id == "unwind_refill_b")
             .unwrap()
             .clone();
-        let backend = SqliteThreadEpisodicBackend::new(store.clone());
+        let backend = PostgresThreadEpisodicBackend::new(store.clone());
         let provider = PanickingRefillPreparation {
             inner: StoreThreadEpisodicIndexPayloadProvider::new(store.clone()),
             poison_id: poison.id.clone(),
@@ -4627,7 +4627,7 @@ mod tests {
         assert_eq!(retry[0].id, poison.id);
         assert_eq!(retry[0].attempt_count, 2);
         let provider = StoreThreadEpisodicIndexPayloadProvider::new(store.clone());
-        let backend = SqliteThreadEpisodicBackend::new(store.clone());
+        let backend = PostgresThreadEpisodicBackend::new(store.clone());
         execute_claimed_refill_batch(
             store.clone(),
             &backend,
@@ -4643,7 +4643,7 @@ mod tests {
         assert_eq!(summary.completed_jobs, 3);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_refill_finishes_claimed_batch_before_returning_error() {
         let (crud_store, _temp_dir, workspace_id) = setup_store().await;
         mark_refill_marker_with_workspace_target(
@@ -4683,7 +4683,7 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         let failed_claim = jobs[0].clone();
         let completed_claim = jobs[1].clone();
-        let backend = SqliteThreadEpisodicBackend::new(crud_store.clone());
+        let backend = PostgresThreadEpisodicBackend::new(crud_store.clone());
         let payload_provider = StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone());
         let mut summary = ThreadEpisodicWorkspaceRefillSummary::default();
         let error = execute_claimed_refill_batch(
@@ -4771,7 +4771,7 @@ mod tests {
         assert_eq!(preserved.attempt_count, new_claim.attempt_count);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_refill_does_not_reopen_exhausted_chunked_failure() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         ingest_materialized_user_item(
@@ -4825,7 +4825,7 @@ mod tests {
         assert_eq!(next_provider.calls(), 0);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_refill_restart_finalizes_completed_projection_without_rebuild()
     {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
@@ -4925,7 +4925,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_refill_restart_requeues_interrupted_running_job() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_vector_refill_interrupted";
@@ -4996,7 +4996,7 @@ mod tests {
         assert_eq!(jobs[0].attempt_count, 2);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_model_change_rebuilds_stale_projection() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_vector_model_change";
@@ -5086,7 +5086,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_model_same_config_does_not_rebuild() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let config = vector_search_config(
@@ -5163,7 +5163,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_model_change_openai_to_openrouter_rebuilds_projection() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         ingest_materialized_user_item(
@@ -5236,7 +5236,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_refill_rejects_provider_identity_mismatch() {
         let (crud_store, temp_dir, _workspace_id) = setup_store().await;
         let config = vector_search_config(
@@ -5399,7 +5399,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_workspace_refill_rebuilds_workspace_capsule_from_database() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_a = "thread_refill_a";
@@ -5468,7 +5468,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_fresh_refill_indexes_all_seven_canonical_task_summaries() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_refill_seven_tasks";
@@ -5580,7 +5580,7 @@ mod tests {
         assert_eq!(meta.status, PROJECTION_META_STATUS_COMPLETE);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_fresh_and_resume_preserve_exclusion_and_user_tombstone() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_refill_preserved_controls";
@@ -5766,7 +5766,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_resume_ignores_preexisting_canceled_error_after_user_exclusion() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_resume_excluded_canceled";
@@ -5914,7 +5914,7 @@ mod tests {
             .expect_err("an unrelated genuine terminal error must still fail resume");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn resumed_refill_executes_one_failed_job_without_history_access() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         for index in 0..64 {
@@ -6028,7 +6028,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn complete_marker_executes_later_interrupted_job_without_history() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let target = ThreadEpisodicWorkspaceProjectionTarget::lexical_only();
@@ -6115,7 +6115,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn pending_preparation_is_not_proven_by_one_existing_job() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         ingest_materialized_user_item(
@@ -6173,7 +6173,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn interrupted_model_cleanup_restarts_even_when_config_reverts_to_complete_target() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         ingest_materialized_user_item(
@@ -6315,7 +6315,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn model_replacement_fences_old_identity_and_reset_resume_preserves_backoff() {
         let (crud_store, _, workspace_id) = setup_store().await;
         ingest_materialized_user_item(
@@ -6412,7 +6412,7 @@ mod tests {
         assert_eq!(deferred.next_run_at.timestamp(), now + 600);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn workspace_due_jobs_preserve_backoff_and_terminal_states() {
         let (crud_store, _, workspace_id) = setup_store().await;
         for index in 0..3 {
@@ -6517,28 +6517,11 @@ mod tests {
     }
 
     async fn setup_concurrent_store() -> (Arc<CrudStore>, TempDir, String) {
-        pioneer_sqlite::search::register_auto_extension_once().unwrap();
-        let temp_dir = TempDir::new().expect("temp dir");
-        let database_path = temp_dir.path().join("gateway.sqlite");
-        let mut writer_options =
-            ConnectOptions::new(format!("sqlite://{}?mode=rwc", database_path.display()));
-        writer_options
-            .max_connections(1)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
-        let writer = Database::connect(writer_options)
-            .await
-            .expect("must connect test writer");
-        Migrator::up(&writer, None)
-            .await
-            .expect("migrations must succeed");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let writer = fixture.connect_with_limit(1).await.unwrap();
         bootstrap(&writer)
             .await
             .expect("gateway bootstrap should create default workspace");
-        writer
-            .execute_unprepared("PRAGMA journal_mode=WAL")
-            .await
-            .expect("test database should enable WAL");
         pioneer_entity::workspace::Entity::delete_many()
             .exec(&writer)
             .await
@@ -6551,19 +6534,8 @@ mod tests {
             .await
             .expect("isolated workspace should exist")
             .id;
-        let mut reader_options =
-            ConnectOptions::new(format!("sqlite://{}?mode=ro", database_path.display()));
-        reader_options
-            .max_connections(4)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| {
-                options
-                    .pragma("foreign_keys", "OFF")
-                    .pragma("query_only", "ON")
-            });
-        let reader = Database::connect(reader_options)
-            .await
-            .expect("must connect test reader");
+        let reader = fixture.connect_read_only().await.unwrap();
+        let temp_dir = TempDir::new().expect("temp dir");
         (
             Arc::new(CrudStore::new(SqliteDatabase::new(reader, writer))),
             temp_dir,
@@ -6588,7 +6560,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn unknown_custom_dimension_is_resolved_before_resume_or_replacement() {
         for (dimension, version) in [
             (3, THREAD_EPISODIC_REFILL_VERSION),
@@ -6746,7 +6718,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn exhausted_model_a_gets_fresh_model_b_work_and_old_callback_is_fenced() {
         let (store, root, workspace) = setup_store().await;
         ingest_materialized_user_item(
@@ -6885,7 +6857,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn interrupted_model_reset_does_not_renew_exhausted_new_model_budget() {
         let (store, root, workspace) = setup_store().await;
         ingest_materialized_user_item(
@@ -7028,7 +7000,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn unresolved_provider_failure_preserves_partial_reset_identity_and_prefix_budget() {
         let (store, root, workspace) = setup_store().await;
         for index in 0..34 {
@@ -7293,7 +7265,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn failed_selection_preserves_ready_a_and_provider_free_return_without_history() {
         let (store, root, workspace) = setup_store().await;
         ingest_materialized_user_item(
@@ -7399,7 +7371,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_and_settings_completion_join_real_blocking_capsule_write() {
         use futures_util::poll;
         for entry in ["startup", "global_settings", "workspace_settings"] {
@@ -7593,7 +7565,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn workspace_wrapper_cancel_before_ownership_does_not_join_foreign_write_or_settle() {
         let (store, root, workspace) = setup_store().await;
         ingest_materialized_user_item(
@@ -7664,7 +7636,7 @@ mod tests {
         drop(owner);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn workspace_wrapper_cancel_drops_writer_admission_without_new_settlement() {
         let (store, _database_root, workspace) = setup_concurrent_store().await;
         let root = TempDir::new().unwrap();
@@ -7744,7 +7716,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn exhausted_running_is_terminal_for_startup_settings_and_ordinary_resume() {
         for entry in ["startup", "settings", "ordinary"] {
             let (store, root, workspace) = setup_store().await;
@@ -7813,7 +7785,7 @@ mod tests {
             if entry == "ordinary" {
                 let executor = crate::thread_episodic::ThreadEpisodicIndexExecutor::new(
                     store.clone(),
-                    Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                    Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                     Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                 );
                 executor.apply_config(policy);
@@ -7985,7 +7957,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn refill_cancellation_reopen_spends_only_remaining_budget_and_confirms_durable_result() {
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
         let (store, root, workspace) = setup_store().await;
@@ -8167,7 +8139,7 @@ mod tests {
             } else {
                 let executor = crate::thread_episodic::ThreadEpisodicIndexExecutor::new(
                     store.clone(),
-                    Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                    Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                     Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                 );
                 executor.apply_config(config);
@@ -8205,7 +8177,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn refill_confirmed_prefix_survives_poison_and_unknown_commit_without_replay() {
         use pioneer_crud::{ThreadEpisodicIndexJobStatus, ThreadEpisodicItemStatus};
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
@@ -8534,20 +8506,8 @@ mod tests {
     }
 
     async fn setup_store() -> (Arc<CrudStore>, TempDir, String) {
-        pioneer_sqlite::search::register_auto_extension_once().unwrap();
-        let connection = Database::connect({
-            let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-            options
-                .max_connections(1)
-                .sqlx_logging(false)
-                .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
-            options
-        })
-        .await
-        .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.unwrap();
         bootstrap(&connection)
             .await
             .expect("gateway bootstrap should create default workspace");
@@ -8557,14 +8517,16 @@ mod tests {
             .exec(&connection)
             .await
             .unwrap();
-        let workspace_manager = WorkspaceManager::new(connection.clone());
+        let reader = fixture.connect_read_only().await.unwrap();
+        let database = pioneer_sqlite::SqliteDatabase::new(reader, connection);
+        let workspace_manager = WorkspaceManager::new(database.clone());
         let workspace_id = workspace_manager
             .create_workspace(&pioneer_protocol::generate_id(21), Some("Refill test"))
             .await
             .expect("isolated workspace should exist")
             .id;
         (
-            Arc::new(CrudStore::new(connection)),
+            Arc::new(CrudStore::new(database)),
             TempDir::new().expect("temp dir"),
             workspace_id,
         )
@@ -8717,7 +8679,7 @@ mod tests {
         item: &pioneer_crud::ThreadEpisodicItemRecord,
         expected_text: &str,
     ) {
-        let output = SqliteThreadEpisodicBackend::new(Arc::new(crud_store.clone()))
+        let output = PostgresThreadEpisodicBackend::new(Arc::new(crud_store.clone()))
             .search(ThreadEpisodicSearchRequest {
                 access: pioneer_crud::ThreadEpisodicSearchAccess::default(),
                 workspace_id: item.workspace_id.clone(),
@@ -8850,7 +8812,7 @@ mod tests {
             .expect("item completed should materialize");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn refill_uses_flat_lock_directory_and_releases_workspace_lock_after_cancellation() {
         let (store, root, workspace) = setup_store().await;
         let locks = root.path().join("memory/locks");

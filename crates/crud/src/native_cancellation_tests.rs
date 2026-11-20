@@ -430,7 +430,7 @@ async fn native_cancellation_empty_originating_plan_is_accepted_and_replayed() {
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_cancellation_inherits_operation_scope_and_cancelled_writer_wait_releases_capacity()
 {
     let (store, turn, plan) = fixture("scope").await;
@@ -498,7 +498,7 @@ impl Drop for CancellationDatabasePath {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_cancellation_physical_routes_atomic_event_order_and_cancelled_reservation() {
     use pioneer_sqlite::{
         SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor,
@@ -1207,7 +1207,7 @@ async fn native_cancellation_blocked_lawful_resume_keeps_original_context_and_al
     }).await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_cancellation_owner_change_and_health_restore_cannot_clear_fence() {
     use pioneer_entity::turn_execution as execution;
     let (store, turn, plan) = fixture("owner_change").await;
@@ -2102,7 +2102,7 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_cancellation_production_up_preserves_accepted_context_markers_and_claim() {
     let (store, turn, plan) = fixture("production_repeat_up").await;
     cancel(&store, &turn, &plan, "accepted cancellation")
@@ -2336,7 +2336,7 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_cancellation_migration_down_preserves_context_and_terminal_markers() {
     let (store, turn, plan) = fixture("down_guard").await;
     let original = pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
@@ -2402,7 +2402,7 @@ async fn native_cancellation_migration_down_preserves_context_and_terminal_marke
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_cancellation_task_resume_clears_only_confirmed_blocked_and_rolls_back_conflict() {
     use pioneer_entity::turn_event_projection_stream_state as stream;
     for conflict in [false, true] {
@@ -2582,7 +2582,7 @@ async fn native_cancellation_migration_down_rejects_marker_without_context() {
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_cancellation_migration_down_rejects_duplicate_effect_kinds_atomically() {
     use migration::SchemaManager;
     let (store, thread, turn) = test_store_with_started_turn(
@@ -2690,7 +2690,7 @@ async fn native_cancellation_migration_down_rejects_duplicate_effect_kinds_atomi
     transaction.rollback().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_cancellation_recovery_confirmation_rejects_existing_terminal_context() {
     for status in [TurnStatus::Completed, TurnStatus::Interrupted] {
         let (store, turn, plan) = fixture(&format!("confirmation_{status:?}")).await;
@@ -2727,7 +2727,7 @@ async fn native_cancellation_recovery_confirmation_rejects_existing_terminal_con
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_cancellation_recovery_confirmation_checks_current_owner_and_exact_scope() {
     let (store, turn, plan) = fixture("confirmation_owner").await;
     repositories::turn_execution::insert_immutable(
@@ -2781,7 +2781,7 @@ async fn native_cancellation_recovery_confirmation_checks_current_owner_and_exac
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_recovery_pre_start_and_refusal_share_attempt_owner_and_terminal_fences() {
     use crate::{NewTurnExecution, TurnExecutionStatus, TurnExecutorKind};
     for kind in [TurnExecutorKind::NativeAgent, TurnExecutorKind::ApiProvider] {

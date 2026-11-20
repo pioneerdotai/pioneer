@@ -7,30 +7,30 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "audit_event")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub domain: String,
-    #[sea_orm(column_type = "Text")]
-    pub target_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub target_kind: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub workspace_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub policy_role_key: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub actor_principal_id: Option<String>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub gateway_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub actor_principal_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub actor_session_id: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub gateway_id: String,
-    pub metadata_version: i64,
-    pub created_at: DateTimeWithTimeZone,
-    pub metadata_json: Json,
-    #[sea_orm(column_type = "Text")]
     pub action: String,
+    #[sea_orm(column_type = "Text")]
+    pub domain: String,
+    #[sea_orm(column_type = "Text")]
+    pub target_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub target_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub workspace_id: Option<String>,
+    pub metadata_version: i64,
+    pub metadata_json: Json,
+    pub created_at: DateTimeWithTimeZone,
     pub policy_generation: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub policy_role_key: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub policy_fingerprint: String,
     #[sea_orm(

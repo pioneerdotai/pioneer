@@ -7,21 +7,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_execution_checkpoint")]
 pub struct Model {
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub checkpoint_kind: String,
-    #[sea_orm(column_type = "Text")]
-    pub thread_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub payload_json: String,
-    #[sea_orm(column_type = "Text")]
     pub window_id: String,
     #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub checkpoint_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub payload_json: String,
+    pub created_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

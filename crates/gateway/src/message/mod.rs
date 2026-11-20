@@ -187,7 +187,7 @@ use pioneer_crud::{
     TurnFinalizationReconciliationSummary,
 };
 use pioneer_hooks::{HookRecoveryOptions, HookRuntime};
-use pioneer_memory::{SqliteThreadEpisodicBackend, ThreadEpisodicSearchBackend};
+use pioneer_memory::{PostgresThreadEpisodicBackend, ThreadEpisodicSearchBackend};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ArtifactBindingDirection, ArtifactBindingKind,
     ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactKind, ArtifactRole,
@@ -1243,7 +1243,7 @@ impl MessageProcessor {
             runtime_home.join("artifacts").join("upload_sessions"),
         ));
         let thread_episodic_backend: Arc<dyn ThreadEpisodicSearchBackend> =
-            Arc::new(SqliteThreadEpisodicBackend::new(crud_store.clone()));
+            Arc::new(PostgresThreadEpisodicBackend::new(crud_store.clone()));
         let thread_episodic_embedding_provider_resolver = Arc::new(
             ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
                 provider_registry.clone(),
@@ -3796,31 +3796,6 @@ impl MessageProcessor {
                     let mut terminal_more = false;
                     let mut terminal_failed = false;
                     match crate::database::attribution::scope_database_workload_result(
-                        pioneer_observability::DatabaseWorkload::RecoveryTerminalizationAudit,
-                        pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationAudit,
-                        retry_transient_storage_access(|| {
-                            this.crud_store
-                                .enqueue_missing_recovery_terminalizations(64, now)
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(count) => {
-                            more |= count >= 64;
-                            terminal_more |= count >= 64;
-                        }
-                        Err(error) => {
-                            round_failed = true;
-                            terminal_failed = true;
-                            record_resilience_worker_poll_error(
-                                "recovery terminalization auditor",
-                                &error,
-                                &mut transient_storage_poll_failed,
-                            );
-                        }
-                    }
-
-                    match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::RecoveryTerminalizationApply,
                         pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationApply,
                         retry_transient_storage_access(|| {
@@ -5821,7 +5796,7 @@ impl MessageProcessor {
         let memory_loop_config =
             Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
         let thread_episodic_backend: Arc<dyn ThreadEpisodicSearchBackend> =
-            Arc::new(SqliteThreadEpisodicBackend::new(crud_store.clone()));
+            Arc::new(PostgresThreadEpisodicBackend::new(crud_store.clone()));
         let thread_episodic_lock_root =
             isolated_test_thread_episodic_lock_root(&artifact_runtime_home);
         let thread_episodic_embedding_provider_resolver = Arc::new(

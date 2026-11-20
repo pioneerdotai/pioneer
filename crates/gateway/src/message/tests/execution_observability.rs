@@ -51,7 +51,7 @@ async fn charge(
     call
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn summary_uses_unique_leaf_own_and_authorized_causal_descendant_charges() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -90,7 +90,7 @@ async fn summary_uses_unique_leaf_own_and_authorized_causal_descendant_charges()
     assert_eq!(summary["allocation"]["all_cost_unallocated"], true);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn context_rpc_returns_bounded_content_free_breakdown_and_enforces_thread_acl() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -222,7 +222,7 @@ async fn context_rpc_returns_bounded_content_free_breakdown_and_enforces_thread_
     assert_eq!(error.error.message, "not_found");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fixed_frontier_pages_keep_operation_positions_while_append_and_updates_continue() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -277,7 +277,7 @@ async fn fixed_frontier_pages_keep_operation_positions_while_append_and_updates_
     assert_eq!(attempts, 2);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn overlapping_work_preserves_union_exclusive_time_and_period_unknowns() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -352,7 +352,7 @@ async fn overlapping_work_preserves_union_exclusive_time_and_period_unknowns() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn nested_workspace_journal_usage_remains_visible_in_its_verified_thread_scope() {
     for cli_item in [false, true] {
         let mut h = setup_semantic_timeline_query_harness().await;
@@ -488,7 +488,7 @@ async fn nested_workspace_journal_usage_remains_visible_in_its_verified_thread_s
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn selected_amounts_preserve_reported_zero_currency_scopes_partial_and_unknowns() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -563,7 +563,7 @@ async fn selected_amounts_preserve_reported_zero_currency_scopes_partial_and_unk
     assert_eq!(zero["own_amounts"][0]["basis"], "provider_reported");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_reconciliation_survives_read_overlay_redelivery_and_versioned_refinement() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -812,7 +812,7 @@ async fn legacy_reconciliation_survives_read_overlay_redelivery_and_versioned_re
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn auxiliary_spawned_decoder_body_eof_reaches_the_drain_owner_and_journal() {
     use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

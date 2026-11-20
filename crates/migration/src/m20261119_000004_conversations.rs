@@ -1212,7 +1212,9 @@ impl MigrationTrait for Migration {
                     .col(text_null("native_root_thread_id"))
                     .col(text_null("native_cwd"))
                     .col(text_null("native_model"))
-                    .col(json("resume_cursor_json").default("{}"))
+                    // The CLI uses the complete persisted cursor as its compare-and-swap key.
+                    .col(text("resume_cursor_json").default("{}"))
+                    .check(Expr::cust("resume_cursor_json IS JSON"))
                     .col(text("status"))
                     .col(
                         timestamp_with_time_zone("created_at")

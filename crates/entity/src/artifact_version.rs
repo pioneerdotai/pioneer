@@ -7,35 +7,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "artifact_version")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub created_by_task_run_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub blob_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub metadata_json: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub created_by_task_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub created_by_turn_item_id: Option<String>,
-    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_version_number")]
-    pub workspace_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub created_by_tool_call_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub created_by_message_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub source_path_redacted: Option<String>,
-    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_version_number")]
-    pub artifact_id: String,
-    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_version_number")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_version_number")]
+    pub artifact_id: String,
     #[sea_orm(unique_key = "uidx_artifact_version_number")]
     pub version_number: i64,
+    #[sea_orm(column_type = "Text")]
+    pub blob_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub source_uri: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    pub source_path_redacted: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub created_by_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub created_by_message_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub created_by_turn_item_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub created_by_tool_call_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub created_by_task_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub created_by_task_run_id: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub metadata_json: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

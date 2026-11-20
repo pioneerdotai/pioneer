@@ -7,23 +7,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_history")]
 pub struct Model {
-    pub import_count: i64,
-    pub next_import: i64,
-    #[sea_orm(column_type = "Text")]
-    pub owner_thread: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub owner_thread: String,
+    #[sea_orm(column_type = "Text")]
     pub identity_sha256: String,
+    pub message_count: i64,
     pub next_ordinal: i64,
+    pub import_count: i64,
     #[sea_orm(column_type = "Text")]
     pub imports_sha256: String,
-    pub message_count: i64,
-    #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
-    pub expired: i64,
+    pub next_import: i64,
     pub ready: i64,
     pub storage_registered: i64,
+    pub expired: i64,
     #[sea_orm(has_many)]
     pub compaction_frozen_import_data: HasMany<super::compaction_frozen_import_data::Entity>,
     #[sea_orm(has_many)]

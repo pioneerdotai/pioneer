@@ -6,7 +6,7 @@ mod durable_sweep {
     async fn query(store: &CrudStore, text: &str) -> i64 {
         store
             .connection
-            .query_one_raw(Statement::from_string(DbBackend::Sqlite, text))
+            .query_one_raw(Statement::from_string(DbBackend::Postgres, text))
             .await
             .unwrap()
             .unwrap()
@@ -16,34 +16,23 @@ mod durable_sweep {
     async fn exec(store: &CrudStore, text: &str) {
         store.connection.execute_unprepared(text).await.unwrap();
     }
-    async fn fixture_database(before_work: bool) -> sea_orm::DatabaseConnection {
-        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1).min_connections(1);
-        let db = Database::connect(options).await.unwrap();
-        db.execute_unprepared("PRAGMA foreign_keys=OFF")
-            .await
-            .unwrap();
-        let prefix = Migrator::migrations()
-            .iter()
-            .position(|m| m.name() == "m20261018_000001_frozen_sweep_work")
-            .unwrap();
-        Migrator::up(&db, before_work.then_some(prefix as u32))
-            .await
-            .unwrap();
+    async fn seed_scope(db: &impl ConnectionTrait) {
         db.execute_unprepared(
-            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
-        )
-        .await
-        .unwrap();
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,FALSE)",
+        ).await.unwrap();
         db.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-        db
     }
-    async fn blank(before_work: bool) -> CrudStore {
-        CrudStore::new(fixture_database(before_work).await).with_maintenance_access()
+    async fn blank() -> CrudStore {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let writer = fixture.connection();
+        seed_scope(writer).await;
+        let reader = fixture.connect_read_only().await.unwrap();
+        CrudStore::new(pioneer_sqlite::SqliteDatabase::new(reader, writer.clone()))
+            .with_maintenance_access()
     }
     async fn header(store: &CrudStore, id: &str, count: i64, next: i64, ready: i64) {
-        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready) VALUES(?1,'ws','thread','fixture','fixture',?2,?2,?3,?3,?4)",
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready) VALUES($1,'ws','thread','fixture','fixture',$2,$2,$3,$3,$4)",
             [id.into(),count.into(),next.into(),ready.into()])).await.unwrap();
     }
     async fn header_kind(
@@ -58,20 +47,20 @@ mod durable_sweep {
         let imports = if kind == 1 { count } else { 0 };
         let message_next = if kind == 0 { next } else { 0 };
         let import_next = if kind == 1 { next } else { 0 };
-        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready) VALUES(?1,'ws','thread','fixture','fixture',?2,?3,?4,?5,?6)",
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready) VALUES($1,'ws','thread','fixture','fixture',$2,$3,$4,$5,$6)",
             [id.into(),messages.into(),imports.into(),message_next.into(),import_next.into(),ready.into()])).await.unwrap();
     }
     async fn row(store: &CrudStore, id: &str, kind: i64, ordinal: i64) {
         let text = if kind == 0 {
-            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,?2,'{}',2)"
+            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES($1,$2,'{}',2)"
         } else {
-            "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,?2,0,'event','e-'||?2,'v','thread','{}',2)"
+            "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES($1,$2,0,'event','e-'||$2,'v','thread','{}',2)"
         };
         store
             .connection
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 text,
                 [id.into(), ordinal.into()],
             ))
@@ -79,11 +68,6 @@ mod durable_sweep {
             .unwrap();
     }
     async fn drain_metadata(store: &CrudStore) {
-        for _ in 0..5000 {
-            if !frozen_sweep_work::bootstrap_step(store).await.unwrap() {
-                break;
-            }
-        }
         for _ in 0..5000 {
             if !frozen_sweep_work::fanout_step(store, None).await.unwrap() {
                 return;
@@ -106,8 +90,8 @@ mod durable_sweep {
         let row = store
             .connection
             .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT revision FROM compaction_frozen_sweep_work WHERE manifest_id=?1 AND kind=?2",
+                DbBackend::Postgres,
+                "SELECT revision FROM compaction_frozen_sweep_work WHERE manifest_id=$1 AND kind=$2",
                 [id.into(), kind.into()],
             ))
             .await
@@ -123,8 +107,8 @@ mod durable_sweep {
         store
             .connection
             .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT pending AS n FROM compaction_frozen_sweep_work WHERE manifest_id=?1 AND kind=?2",
+                DbBackend::Postgres,
+                "SELECT pending AS n FROM compaction_frozen_sweep_work WHERE manifest_id=$1 AND kind=$2",
                 [id.into(), kind.into()],
             ))
             .await
@@ -134,139 +118,9 @@ mod durable_sweep {
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn bootstrap_groups_both_kinds_unusual_ids_and_atomic_cursor_restart() {
-        let db = fixture_database(true).await;
-        let store = CrudStore::new(db.clone()).with_maintenance_access();
-        let ids = [
-            "".to_owned(),
-            "a\0'雪".to_owned(),
-            format!("z{}", "x".repeat(4096)),
-        ];
-        // Missing physical headers can have scope inferred from a span endpoint.
-        // Keep the old scope prerequisite without hiding these physical groups.
-        header(&store, "scope-anchor", 3, 3, 0).await;
-        for (start, id) in ids.iter().enumerate() {
-            for kind in [0_i64, 1] {
-                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('scope-anchor',?1,?2,?3,?4)",
-                    [kind.into(),(start as i64).into(),(start as i64+1).into(),id.clone().into()])).await.unwrap();
-            }
-        }
-        for id in &ids {
-            for kind in [0, 1] {
-                for ordinal in [0, 1, 7] {
-                    row(&store, id, kind, ordinal).await;
-                }
-            }
-        }
-        Migrator::up(&db, None).await.unwrap();
-        assert_eq!(
-            query(
-                &store,
-                "SELECT count(*) AS n FROM compaction_frozen_sweep_work"
-            )
-            .await,
-            0
-        );
-        assert!(frozen_sweep_work::bootstrap_step(&store).await.unwrap()); // capture upper
-        exec(&store,"CREATE TRIGGER fixture_enqueue_fault BEFORE INSERT ON compaction_frozen_sweep_work BEGIN SELECT RAISE(ABORT,'enqueue fault'); END").await;
-        assert!(frozen_sweep_work::bootstrap_step(&store).await.is_err());
-        assert_eq!(
-            query(
-                &store,
-                "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE after_manifest IS NOT NULL"
-            )
-            .await,
-            0
-        );
-        exec(&store, "DROP TRIGGER fixture_enqueue_fault").await;
-        assert!(frozen_sweep_work::bootstrap_step(&store).await.unwrap());
-        assert_eq!(
-            query(
-                &store,
-                "SELECT count(*) AS n FROM compaction_frozen_sweep_work"
-            )
-            .await,
-            1
-        );
-        // No RAM cursor is needed to resume, including between the two kinds.
-        while query(
-            &store,
-            "SELECT complete AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=0",
-        )
-        .await
-            == 0
-        {
-            assert!(frozen_sweep_work::bootstrap_step(&store).await.unwrap());
-        }
-        assert_eq!(
-            query(
-                &store,
-                "SELECT started AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=1"
-            )
-            .await,
-            0
-        );
-        drain_metadata(&store).await;
-        assert_eq!(
-            query(
-                &store,
-                "SELECT count(*) AS n FROM compaction_frozen_sweep_work"
-            )
-            .await,
-            6
-        );
-        assert!(!frozen_sweep_work::bootstrap_step(&store).await.unwrap());
-        let mut restarted = FrozenStorageLifetimeProgress::default();
-        drain(&store, &mut restarted).await;
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE pending=1 AND retry_at>unixepoch()").await,6);
-        assert_eq!(
-            query(
-                &store,
-                "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE complete=1"
-            )
-            .await,
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn inserts_on_both_sides_of_bootstrap_and_after_eof_survive() {
-        let db = fixture_database(true).await;
-        let store = CrudStore::new(db.clone()).with_maintenance_access();
-        for id in ["a", "m", "n", "z", "zz", "after-eof"] {
-            header(&store, id, 0, 0, 0).await;
-        }
-        row(&store, "m", 0, 0).await;
-        row(&store, "z", 0, 0).await;
-        Migrator::up(&db, None).await.unwrap();
-        assert!(frozen_sweep_work::bootstrap_step(&store).await.unwrap());
-        assert!(frozen_sweep_work::bootstrap_step(&store).await.unwrap());
-        for (id, kind) in [("a", 0), ("n", 0), ("zz", 0), ("a", 1)] {
-            row(&store, id, kind, 0).await;
-        }
-        row(&store, "m", 0, 1).await;
-        drain_metadata(&store).await;
-        for (id, kind) in [("a", 0), ("m", 0), ("n", 0), ("z", 0), ("zz", 0), ("a", 1)] {
-            assert_eq!(pending(&store, id, kind).await, 1);
-        }
-        row(&store, "after-eof", 1, 0).await;
-        assert!(!frozen_sweep_work::bootstrap_step(&store).await.unwrap());
-        assert_eq!(pending(&store, "after-eof", 1).await, 1);
-        assert_eq!(
-            query(
-                &store,
-                "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='m'"
-            )
-            .await,
-            1
-        );
-    }
-
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn clean_held_restart_and_revisit_do_not_prepare_again() {
-        let store = blank(false).await;
+        let store = blank().await;
         header(&store, "held", 1, 1, 0).await;
         for kind in [0, 1] {
             row(&store, "held", kind, 0).await;
@@ -312,17 +166,17 @@ mod durable_sweep {
         assert_eq!(work(&store, "held", 0).await.revision, revision);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn consumer_fanout_tracks_all_sources_old_new_kind_and_coalesces() {
-        let store = blank(false).await;
+        let store = blank().await;
         for id in ["consumer", "a", "b", "c"] {
             header(&store, id, 3, 3, 0).await;
         }
         for kind in [0, 1] {
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('consumer',?1,0,0)",[kind.into()])).await.unwrap();
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('consumer',?1,0,1,'a'),('consumer',?1,1,2,'b')",[kind.into()])).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('consumer',$1,0,0)",[kind.into()])).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('consumer',$1,0,1,'a'),('consumer',$1,1,2,'b')",[kind.into()])).await.unwrap();
         }
         drain_metadata(&store).await;
         let a = work(&store, "a", 0).await.revision;
@@ -349,7 +203,7 @@ mod durable_sweep {
         let new = work(&store, "c", 1).await.revision;
         // Inactive incomplete layouts permit repair/retarget; ready published
         // fixtures would correctly reject this transition.
-        exec(&store,"UPDATE compaction_frozen_span SET source_manifest='c',kind=1,start=2,end=3 WHERE manifest_id='consumer' AND kind=0 AND start=1").await;
+        exec(&store,"UPDATE compaction_frozen_span SET source_manifest='c',kind=1,start=2,\"end\"=3 WHERE manifest_id='consumer' AND kind=0 AND start=1").await;
         assert!(work(&store, "b", 0).await.revision > old);
         assert!(work(&store, "c", 1).await.revision > new);
         exec(&store,"DELETE FROM compaction_frozen_span WHERE manifest_id='consumer' AND kind=1 AND start=2").await;
@@ -364,7 +218,7 @@ mod durable_sweep {
         );
         // A second consumer shares the same key, without an event journal.
         header(&store, "consumer2", 1, 1, 0).await;
-        exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('consumer2',0,0,1,'a')").await;
+        exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('consumer2',0,0,1,'a')").await;
         drain_metadata(&store).await;
         assert_eq!(
             query(
@@ -376,9 +230,9 @@ mod durable_sweep {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn candidate_without_spans_tracks_old_new_failure_and_removal_both_kinds() {
-        let store = blank(false).await;
+        let store = blank().await;
         for id in ["a", "b"] {
             header(&store, id, 0, 0, 1).await;
         }
@@ -386,25 +240,25 @@ mod durable_sweep {
         drain_metadata(&store).await;
         for kind in [0, 1] {
             let a = work(&store, "a", kind).await.revision;
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_layout(manifest_id,kind,candidate) VALUES('capture',?1,'a')",[kind.into()])).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,candidate) VALUES('capture',$1,'a')",[kind.into()])).await.unwrap();
             assert!(work(&store, "a", kind).await.revision > a);
             let a = work(&store, "a", kind).await.revision;
             let b = work(&store, "b", kind).await.revision;
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "UPDATE compaction_frozen_layout SET candidate='b' WHERE manifest_id='capture' AND kind=?1",[kind.into()])).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "UPDATE compaction_frozen_layout SET candidate='b' WHERE manifest_id='capture' AND kind=$1",[kind.into()])).await.unwrap();
             assert!(work(&store, "a", kind).await.revision > a);
             assert!(work(&store, "b", kind).await.revision > b);
             let b = work(&store, "b", kind).await.revision;
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "UPDATE compaction_frozen_layout SET failed=1 WHERE manifest_id='capture' AND kind=?1",[kind.into()])).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "UPDATE compaction_frozen_layout SET failed=1 WHERE manifest_id='capture' AND kind=$1",[kind.into()])).await.unwrap();
             assert!(work(&store, "b", kind).await.revision > b);
             let b = work(&store, "b", kind).await.revision;
             store
                 .connection
                 .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "DELETE FROM compaction_frozen_layout WHERE manifest_id='capture' AND kind=?1",
+                    DbBackend::Postgres,
+                    "DELETE FROM compaction_frozen_layout WHERE manifest_id='capture' AND kind=$1",
                     [kind.into()],
                 ))
                 .await
@@ -417,17 +271,17 @@ mod durable_sweep {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn redirected_append_tracks_actual_physical_destination_and_rollback() {
         for kind in [0, 1] {
-            let store = blank(false).await;
+            let store = blank().await;
             header_kind(&store, "backing", kind, 1, 1, 1).await;
             header_kind(&store, "capture", kind, 2, 1, 0).await;
             row(&store, "backing", kind, 0).await;
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('capture',?1,0,0)",[kind.into()])).await.unwrap();
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('capture',?1,0,1,'backing')",[kind.into()])).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('capture',$1,0,0)",[kind.into()])).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('capture',$1,0,1,'backing')",[kind.into()])).await.unwrap();
             exec(
                 &store,
                 "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='capture'",
@@ -444,12 +298,12 @@ mod durable_sweep {
                 .unwrap();
                 assert_eq!(source, "backing");
                 let text = if kind == 0 {
-                    "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,1,'{}',2)"
+                    "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES($1,1,'{}',2)"
                 } else {
-                    "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,1,0,'event','tail','v','thread','{}',2)"
+                    "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES($1,1,0,'event','tail','v','thread','{}',2)"
                 };
                 tx.execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
+                    DbBackend::Postgres,
                     text,
                     [source.into()],
                 ))
@@ -485,9 +339,9 @@ mod durable_sweep {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn stale_preparation_and_ack_aba_overflow_and_no_duplicate_active_key() {
-        let store = blank(false).await;
+        let store = blank().await;
         header(&store, "key", 1, 1, 0).await;
         row(&store, "key", 0, 0).await;
         drain_metadata(&store).await;
@@ -546,7 +400,7 @@ mod durable_sweep {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn final_guard_refusal_is_retry_and_mutation_before_ack_stays_pending() {
         let store = batch_fixture(0, 4).await;
         drain_metadata(&store).await;
@@ -595,9 +449,9 @@ mod durable_sweep {
         assert!(batch_ordinals(&store, 0).await.contains(&4));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn addressed_cleanup_and_due_retry_leave_other_containers_pending() {
-        let store = blank(false).await;
+        let store = blank().await;
         let mut progress = FrozenStorageLifetimeProgress::default();
         let mut complete = false;
         for _ in 0..128 {
@@ -649,86 +503,33 @@ mod durable_sweep {
         );
     }
 
-    #[tokio::test]
-    async fn poison_retry_does_not_block_other_keys_or_kind_and_repair_releases_work() {
-        let store = blank(false).await;
-        // This is a per-key post-bootstrap refusal fixture; initial legacy
-        // scope admission is exercised through quantum in correction tests.
-        while frozen_sweep_work::bootstrap_step(&store).await.unwrap() {}
-        row(&store, "a-orphan", 0, 0).await;
-        header(&store, "z-free", 0, 0, 0).await;
-        for kind in [0, 1] {
-            row(&store, "z-free", kind, 0).await;
-        }
-        let mut progress = FrozenStorageLifetimeProgress::default();
-        // Data refusals are normally swallowed by quantum; this focused driver
-        // explicitly keeps driving other queued keys after the refusal.
-        for _ in 0..1000 {
-            if matches!(progress.sweep_quantum(&store).await, Ok(false)) {
-                break;
-            }
-        }
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_message_data WHERE manifest_id='z-free'").await,0);
-        assert_eq!(
-            query(
-                &store,
-                "SELECT count(*) AS n FROM compaction_frozen_import_data WHERE manifest_id='z-free'"
-            )
-            .await,
-            0
-        );
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='a-orphan' AND pending=1 AND retry_at>unixepoch()").await,1);
-        assert!(!progress.sweep_quantum(&store).await.unwrap());
-        header(&store, "a-orphan", 0, 0, 0).await;
-        drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
-        assert_eq!(
-            query(
-                &store,
-                "SELECT count(*) AS n FROM compaction_frozen_message_data"
-            )
-            .await,
-            0
-        );
-        assert_eq!(pending(&store, "a-orphan", 0).await, 0);
-    }
-
-    #[tokio::test]
-    async fn unreadable_physical_bound_is_deferred_without_hiding_later_work() {
-        let store = blank(false).await;
-        header_kind(&store, "a-poison", 0, 0, 0, 0).await;
+    #[pioneer_postgres_test::postgres_test]
+    async fn foreign_keys_and_types_reject_invalid_backings_without_blocking_cleanup() {
+        let store = blank().await;
         header_kind(&store, "z-free", 0, 0, 0, 0).await;
-        row(&store, "a-poison", 0, 0).await;
         row(&store, "z-free", 0, 0).await;
-        // Supported schema admits legacy SQLite affinity poison. Do not disable
-        // constraints/triggers to seed it, or impose a new ID restriction.
-        exec(&store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('a-poison','unreadable-bound','{}',2)").await;
+        for sql in [
+            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('a-orphan',0,'{}',2)",
+            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('z-free','unreadable-bound','{}',2)",
+        ] {
+            assert!(store.connection.execute_unprepared(sql).await.is_err());
+        }
         drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
-        assert_eq!(pending(&store, "a-poison", 0).await, 1);
         assert_eq!(pending(&store, "z-free", 0).await, 0);
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_message_data WHERE manifest_id='z-free'").await,0);
-        exec(&store,"DELETE FROM compaction_frozen_message_data WHERE manifest_id='a-poison' AND ordinal='unreadable-bound'").await;
-        // Deletion does not introduce work; this refused generation already
-        // retains its retry. Simulate its next admission without sleeping.
-        exec(
-            &store,
-            "UPDATE compaction_frozen_sweep_work SET retry_at=0 WHERE manifest_id='a-poison'",
-        )
-        .await;
-        drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
-        assert_eq!(pending(&store, "a-poison", 0).await, 0);
+        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_message_data").await, 0);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn consumer_expiry_releases_previously_clean_shared_backings_both_kinds() {
-        let store = blank(false).await;
+        let store = blank().await;
         header(&store, "backing", 1, 0, 0).await;
         header(&store, "consumer", 1, 1, 1).await;
         for kind in [0, 1] {
             row(&store, "backing", kind, 0).await;
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('consumer',?1,0,0)",[kind.into()])).await.unwrap();
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('consumer',?1,0,1,'backing')",[kind.into()])).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('consumer',$1,0,0)",[kind.into()])).await.unwrap();
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('consumer',$1,0,1,'backing')",[kind.into()])).await.unwrap();
         }
         exec(
             &store,
@@ -769,9 +570,9 @@ mod durable_sweep {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn unknown_scope_refusal_parks_and_repair_rechecks_pending_generation() {
-        let store = blank(false).await;
+        let store = blank().await;
         header(&store, "free", 0, 0, 0).await;
         row(&store, "free", 0, 0).await;
         exec(&store,"INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('owner','ws','thread',1)").await;
@@ -815,7 +616,7 @@ mod durable_sweep {
         assert_eq!(pending(&store, "free", 0).await, 0);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn generation_stays_pending_across_batches_and_new_consumer_preserves_remainder() {
         let store = batch_fixture(0, 601).await;
         header_kind(&store, "prefix", 0, 209, 209, 1).await;
@@ -834,7 +635,7 @@ mod durable_sweep {
         assert_eq!(pending(&store, "batch-physical", 0).await, 1);
         header_kind(&store, "late-consumer", 0, 601, 601, 1).await;
         exec(&store,"INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('late-consumer',0,0,0)").await;
-        exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('late-consumer',0,0,209,'prefix'),('late-consumer',0,209,601,'batch-physical')").await;
+        exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('late-consumer',0,0,209,'prefix'),('late-consumer',0,209,601,'batch-physical')").await;
         exec(
             &store,
             "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='late-consumer'",
@@ -861,7 +662,7 @@ mod durable_sweep {
         assert_eq!(pending(&store, "batch-physical", 0).await, 0);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn durable_boundaries_route_maintenance_cancel_writer_admission_and_rollback_ack() {
         use pioneer_sqlite::{
             SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
@@ -893,34 +694,10 @@ mod durable_sweep {
                 self.reads.lock().unwrap().push(event);
             }
         }
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("durable-boundaries.sqlite");
-        let mut options =
-            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-        options.max_connections(1).min_connections(1);
-        let writer = Database::connect(options).await.unwrap();
-        writer
-            .execute_unprepared("PRAGMA foreign_keys=OFF")
-            .await
-            .unwrap();
-        Migrator::up(&writer, None).await.unwrap();
-        writer
-            .execute_unprepared("PRAGMA journal_mode=WAL")
-            .await
-            .unwrap();
-        writer
-            .execute_unprepared(
-                "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
-            )
-            .await
-            .unwrap();
-        writer.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-        let mut options =
-            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-        options
-            .max_connections(1)
-            .map_sqlx_sqlite_opts(|o| o.pragma("query_only", "ON"));
-        let reader = Database::connect(options).await.unwrap();
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let writer = fixture.connect_with_limit(1).await.unwrap();
+        seed_scope(&writer).await;
+        let reader = fixture.connect_read_only().await.unwrap();
         let observer = Arc::new(Observer::default());
         let database = SqliteDatabase::from_executor_with_read_observer(
             reader,
@@ -928,62 +705,28 @@ mod durable_sweep {
             observer.clone(),
         );
         let store = CrudStore::new(database).with_maintenance_access();
-        let held = store.connection.begin().await.unwrap();
-        observer.armed.store(true, Ordering::SeqCst);
-        {
-            let future = frozen_sweep_work::bootstrap_step(&store);
-            tokio::pin!(future);
-            tokio::select! {
-                result=&mut future=>panic!("writer should be queued: {result:?}"),
-                _=tokio::time::timeout(Duration::from_secs(5),observer.queued.notified())=>{},
-            }
-            // Dropping the future cancels only its queued writer acquisition.
-        }
-        observer.armed.store(false, Ordering::SeqCst);
-        assert!(observer.writes.lock().unwrap().iter().any(|event|matches!(event,SqliteWriteEvent::Cancelled {class:SqliteWriteClass::Maintenance,queue,..} if queue.maintenance==0)));
-        held.rollback().await.unwrap();
-        assert_eq!(
-            query(
-                &store,
-                "SELECT sum(started) AS n FROM compaction_frozen_sweep_bootstrap"
-            )
-            .await,
-            0
-        );
-        // A physical scope can become unknown after reader discovery but
-        // before queued writer admission. The writer must recheck the oracle.
-        header(&store, "scope-race", 0, 0, 0).await;
-        row(&store, "scope-race", 0, 0).await;
-        assert!(frozen_sweep_work::bootstrap_step(&store).await.unwrap());
-        let held = store.connection.begin().await.unwrap();
-        observer.armed.store(true, Ordering::SeqCst);
-        {
-            let future = frozen_sweep_work::bootstrap_step(&store);
-            tokio::pin!(future);
-            tokio::select! {
-                result=&mut future=>panic!("scope commit should be queued: {result:?}"),
-                signal=tokio::time::timeout(Duration::from_secs(5),observer.queued.notified())=>signal.unwrap(),
-            }
-            observer.armed.store(false, Ordering::SeqCst);
-            held.execute_unprepared(
-                "UPDATE compaction_frozen_history SET workspace_id='' WHERE id='scope-race'",
-            )
-            .await
-            .unwrap();
-            held.commit().await.unwrap();
-            let error = future.await.unwrap_err();
-            assert!(error.to_string().contains("scope unknown"));
-        }
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=0 AND started=1 AND after_manifest IS NULL AND complete=0").await,1);
-        exec(
-            &store,
-            "UPDATE compaction_frozen_history SET workspace_id='ws' WHERE id='scope-race'",
-        )
-        .await;
         header(&store, "held", 1, 1, 0).await;
         row(&store, "held", 0, 0).await;
         drain_metadata(&store).await;
-        exec(&store,"CREATE TRIGGER fixture_ack_fault BEFORE UPDATE ON compaction_frozen_sweep_work WHEN NEW.pending=0 BEGIN SELECT RAISE(ABORT,'ack rollback'); END").await;
+        let selected = work(&store, "held", 0).await;
+        let held = store.connection.begin().await.unwrap();
+        observer.armed.store(true, Ordering::SeqCst);
+        {
+            let finish = selected.finish(&store, frozen_sweep_work::Completion::Retry);
+            tokio::pin!(finish);
+            tokio::select! {
+                result = &mut finish => panic!("writer should be queued: {result:?}"),
+                signal = tokio::time::timeout(Duration::from_secs(5), observer.queued.notified()) => signal.unwrap(),
+            }
+        }
+        observer.armed.store(false, Ordering::SeqCst);
+        assert!(observer.writes.lock().unwrap().iter().any(|event| matches!(
+            event, SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. }
+                if queue.maintenance == 0
+        )));
+        held.rollback().await.unwrap();
+        assert_eq!(pending(&store, "held", 0).await, 1);
+        exec(&store,"CREATE FUNCTION fixture_ack_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'ack rollback'; END; $$; CREATE TRIGGER fixture_ack_fault BEFORE UPDATE ON compaction_frozen_sweep_work FOR EACH ROW WHEN (NEW.pending=0) EXECUTE FUNCTION fixture_ack_fault()").await;
         let mut progress = FrozenStorageLifetimeProgress::default();
         let mut failed = false;
         for _ in 0..1000 {
@@ -994,7 +737,7 @@ mod durable_sweep {
         }
         assert!(failed);
         assert_eq!(pending(&store, "held", 0).await, 1);
-        exec(&store, "DROP TRIGGER fixture_ack_fault").await;
+        exec(&store, "DROP TRIGGER fixture_ack_fault ON compaction_frozen_sweep_work").await;
         drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
         assert_eq!(pending(&store, "held", 0).await, 0);
         assert!(store.connection.reader_query_only_enabled().await.unwrap());
@@ -1024,32 +767,28 @@ mod durable_sweep {
         );
     }
 
-    #[tokio::test]
-    async fn empty_physical_queue_does_not_hide_bootstrap_or_interrupted_fanout() {
-        let store = blank(false).await;
+    #[pioneer_postgres_test::postgres_test]
+    async fn empty_physical_queue_does_not_hide_interrupted_fanout() {
+        let store = blank().await;
         assert!(matches!(
             frozen_sweep_work::discover(&store, &[], 0, &mut Default::default(), None, false)
                 .await
                 .unwrap(),
             frozen_sweep_work::Admission::Idle
         ));
-        assert!(
-            FrozenStorageLifetimeProgress::default()
-                .sweep_quantum(&store)
-                .await
-                .unwrap()
-        );
         header(&store, "consumer", 2, 2, 0).await;
         for source in ["a", "b"] {
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('consumer',0,?1,?2,?3)",
+            header(&store, source, 1, 1, 0).await;
+        }
+        for source in ["a", "b"] {
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('consumer',0,$1,$2,$3)",
                 [i64::from(source=="b").into(),(i64::from(source=="b")+1).into(),source.into()])).await.unwrap();
         }
-        while frozen_sweep_work::bootstrap_step(&store).await.unwrap() {}
         let before = work(&store, "b", 0).await.revision;
         assert!(frozen_sweep_work::fanout_step(&store, None).await.unwrap());
         // A failed cursor commit rolls back its enqueue as well.
-        exec(&store,"CREATE TRIGGER fixture_fanout_fault BEFORE UPDATE ON compaction_frozen_sweep_consumer WHEN NEW.after_source='b' BEGIN SELECT RAISE(ABORT,'fanout cursor fault'); END").await;
+        exec(&store,"CREATE FUNCTION fixture_fanout_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fanout cursor fault'; END; $$; CREATE TRIGGER fixture_fanout_fault BEFORE UPDATE ON compaction_frozen_sweep_consumer FOR EACH ROW WHEN (NEW.after_source='b') EXECUTE FUNCTION fixture_fanout_fault()").await;
         let mut failed = false;
         for _ in 0..8 {
             let turn = query(
@@ -1073,7 +812,7 @@ mod durable_sweep {
         }
         assert!(failed);
         assert_eq!(work(&store, "b", 0).await.revision, before);
-        exec(&store, "DROP TRIGGER fixture_fanout_fault").await;
+        exec(&store, "DROP TRIGGER fixture_fanout_fault ON compaction_frozen_sweep_consumer").await;
         drain_metadata(&store).await;
         assert!(work(&store, "b", 0).await.revision > before);
     }

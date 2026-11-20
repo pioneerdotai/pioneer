@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "principal_avatar")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", unique)]
-    pub revision_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub principal_id: String,
+    #[sea_orm(column_type = "Text", unique)]
+    pub revision_id: String,
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,

@@ -63,7 +63,7 @@ async fn has_recovery(store: &CrudStore, id: &str) -> bool {
 // source still needs a second portion; its later clock must not erase the wake.
 // A busy action outbox must also permit fresh timeout/supervision rounds before
 // the outbox empties. The previous test with only a finite CLI tail missed this.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_owner_keeps_deadline_that_matures_between_portions() {
     use pioneer_entity::{agent_action, agent_action_outbox as outbox, agent_identity};
     use sea_orm::Set;
@@ -256,7 +256,7 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
 // Commit after the owner has discovered its deadlines but before it parks.
 // The retained source signal must restore the command and heartbeat it before
 // the already-expired attempt is handed to destructive timeout processing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_owner_restores_command_committed_between_discovery_and_wait() {
     let (processor, _, _rx, workspace, store, session) = cli_runtime_approval_processor().await;
     *session.turn_liveness_probe.lock().await =
@@ -332,7 +332,7 @@ async fn control_owner_restores_command_committed_between_discovery_and_wait() {
     outcome.expect("retained mutation must wake the owner and heartbeat before timeout");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_deadline_parks_terminal_history_and_tracks_active_liveness() {
     let (processor, _, rx, workspace, store, _session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -391,7 +391,7 @@ async fn cli_deadline_parks_terminal_history_and_tracks_active_liveness() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_scan_reaches_stale_after_130_healthy_with_errors_and_wrap() {
     let (processor, _, rx, workspace, store, _session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -542,7 +542,7 @@ async fn cli_active_scan_reaches_stale_after_130_healthy_with_errors_and_wrap() 
     assert_eq!(restarted.processed, 127);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_scan_cancellation_advances_selected_page_and_keeps_runtime_alive() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -848,7 +848,7 @@ async fn pending_for_new_execution(store: &CrudStore, workspace: &str) {
         .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_terminal_snapshot_resume_wins_without_new_execution_effects_and_scan_continues()
 {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
@@ -952,7 +952,7 @@ async fn cli_active_terminal_snapshot_resume_wins_without_new_execution_effects_
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_terminal_commit_serializes_new_admission_until_old_effects_finish() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -1034,7 +1034,7 @@ async fn cli_active_terminal_commit_serializes_new_admission_until_old_effects_f
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_terminal_cancellation_leaves_no_queued_terminal_effect_for_resumed_turn() {
     let (processor, _, rx, _, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -1120,7 +1120,7 @@ async fn cli_terminal_queued_event_keeps_transition_through_cancelled_waiter_and
     assert!(gate.try_lock().is_ok());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_active_scan_defers_busy_session_without_waiting_or_refetching_pages() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -1827,7 +1827,7 @@ async fn cli_blocked_atomic_commit_keeps_queued_consumer_owned_after_publisher_c
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_timeout_and_command_heartbeat_defer_busy_transition_without_timeout_evidence() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -1978,7 +1978,7 @@ async fn cli_common_blocked_reconciliation_retains_consumer_ownership_after_canc
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_timeout_terminal_cleanup_rejects_resume_and_late_effects_after_competing_scan() {
     // Both the direct timeout race and timeout competing with a complete scan
     // use the actual supervisor entry, not the owned cleanup inner helper.
@@ -2131,7 +2131,7 @@ async fn cli_timeout_terminal_cleanup_rejects_resume_and_late_effects_after_comp
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_normal_terminal_consumer_rejects_busy_without_blocking_lane_and_fences_effects() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -2582,7 +2582,7 @@ async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_old_native_failed_producer_cannot_open_recovery_or_cleanup_resumed_attempt() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -4605,7 +4605,7 @@ async fn cli_accepted_recovery_failure_ack_and_authority_change_roll_back_togeth
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_timeout_poll_and_command_heartbeat_prioritize_saved_native_failure() {
     for heartbeat in [false, true] {
         let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
@@ -5293,7 +5293,7 @@ fn control_readiness_preserves_independent_deadlines_and_isolates_failed_turns()
 // Cross the actual worker's error/backoff boundary: one failing watchdog in
 // the first page must not strand an expired watchdog on a later page. Healthy
 // rows emit no events, so partial-success masking cannot make this pass by luck.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_owner_reaches_later_supervision_page_after_persistent_row_failure() {
     use crate::resilience::ProviderFailureCandidate;
     use pioneer_entity::recovery_job;
@@ -5383,7 +5383,7 @@ async fn control_owner_reaches_later_supervision_page_after_persistent_row_failu
     outcome.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn control_activity_is_addressed_for_cli_and_api_without_repairing_foreign_binding() {
     use crate::message::control_work::{ControlWork, Family};
     use pioneer_crud::GatewayControlWake as Wake;

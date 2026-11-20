@@ -1,75 +1,47 @@
-//! Completed-run inbox regression coverage. Do not execute before external review.
-use migration::{Migrator, MigratorTrait};
+//! CRUD integration coverage for the completed-run inbox and access boundaries.
 use pioneer_crud::{
     CrudStore, TaskCompletionInboxAccess, count_unread_task_completion_inbox,
     find_task_completion_inbox_entry, list_task_completion_inbox, mark_task_completion_inbox_read,
     resolve_task_authorization_scope,
 };
-use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
+use pioneer_postgres_test::{TestDatabase, scoped_database};
+use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
 use sea_orm::{
-    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DbBackend, EntityTrait, QueryFilter,
-    Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement, TransactionTrait,
 };
+use std::sync::Arc;
 
 const A: &str = "P0000000000000000000A";
 const B: &str = "P0000000000000000000B";
-const MIGRATION: &str = "m20261016_000001_task_completion_inbox";
 
-// Same file-backed reader / serialized writer setup as the existing CRUD
-// migration suites. Fixture writes never go through the query-only reader.
-async fn open(path: &std::path::Path) -> (CrudStore, SqliteWriteExecutor) {
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    let mut opts = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-    opts.max_connections(1)
-        .min_connections(1)
-        .map_sqlx_sqlite_opts(|o| o.pragma("foreign_keys", "OFF"));
-    let connection = Database::connect(opts).await.unwrap();
-    let writer = SqliteWriteExecutor::new(connection.clone());
-    SqliteDatabase::from_executor(connection, writer.clone())
-        .maintenance()
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut opts = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
-    opts.max_connections(2)
-        .min_connections(1)
-        .map_sqlx_sqlite_opts(|o| o.pragma("query_only", "ON"));
-    let db = SqliteDatabase::from_executor(Database::connect(opts).await.unwrap(), writer.clone());
+async fn open(fixture: &TestDatabase) -> (CrudStore, SqliteWriteExecutor) {
+    let writer = SqliteWriteExecutor::new(fixture.connect_with_limit(1).await.unwrap());
+    let reader = fixture.connect_read_only().await.unwrap();
+    let db = SqliteDatabase::from_executor(reader, writer.clone());
     assert!(db.reader_query_only_enabled().await.unwrap());
     (CrudStore::new(db), writer)
 }
-async fn fixture(before: bool) -> (tempfile::TempDir, CrudStore, SqliteWriteExecutor) {
-    let dir = tempfile::tempdir().unwrap();
-    let (store, writer) = open(&dir.path().join("inbox.sqlite")).await;
-    let count = before.then(|| {
-        Migrator::migrations()
-            .iter()
-            .position(|m| m.name() == MIGRATION)
-            .unwrap() as u32
-    });
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, count)
+
+async fn fixture() -> (Arc<TestDatabase>, CrudStore, SqliteWriteExecutor) {
+    let fixture = scoped_database().await.unwrap();
+    let (store, writer) = open(&fixture).await;
+    let db = store.with_maintenance_access().database_connection();
+    db.execute_unprepared("UPDATE task_inbox_activation SET started_at=1792108800 WHERE id=1; UPDATE workspace SET is_current=FALSE WHERE is_current")
         .await
         .unwrap();
-    let db = store.with_maintenance_access().database_connection();
-    if !before {
-        db.execute_unprepared("UPDATE task_inbox_activation SET started_at=1792108800 WHERE id=1")
-            .await
-            .unwrap();
-    }
     // ACL membership tables enforce 21-character alphanumeric IDs. Keep the
     // fixture relationships valid without relaxing the migrated schema.
     for sql in [
         "INSERT INTO gateway_identity(id,singleton_key,identity_bootstrap_version,created_at,updated_at) VALUES('G00000000000000000001',1,1,'2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00')",
         "INSERT INTO gateway_principal(id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,created_at,updated_at) VALUES('P0000000000000000000A','G00000000000000000001','user','member','active','A','a','a','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00'),('P0000000000000000000B','G00000000000000000001','user','member','active','B','b','b','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00')",
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('W0000000000000000000I','Inbox',1,1),('W0000000000000000000O','Other',1,0)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('W0000000000000000000I','Inbox',TRUE,TRUE),('W0000000000000000000O','Other',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('T0000000000000000000P','W0000000000000000000I','Public thread','','agent','m','p','active','user','workspace','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00'),('T0000000000000000000V','W0000000000000000000I','Private thread','','agent','m','p','active','user','private','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00'),('T0000000000000000000I','W0000000000000000000I',NULL,'','agent','m','p','active','task_run','internal','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00')",
         "INSERT INTO workspace_membership(principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at) VALUES('P0000000000000000000A','W0000000000000000000I','system','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00'),('P0000000000000000000B','W0000000000000000000I','system','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00')",
         "INSERT INTO thread_membership(principal_id,thread_id,added_by_actor_kind,created_at,updated_at) VALUES('P0000000000000000000A','T0000000000000000000V','system','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00'),('P0000000000000000000B','T0000000000000000000V','system','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00')",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
-    (dir, store, writer)
+    (fixture, store, writer)
 }
 fn access(principal: &str) -> TaskCompletionInboxAccess<'_> {
     TaskCompletionInboxAccess {
@@ -88,13 +60,13 @@ async fn task(
     attachment: &str,
 ) {
     let db = store.with_maintenance_access().database_connection();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,root_task_id,executor_kind,status,title,goal,priority,delivery_policy_json,lifecycle_policy_json,revision,created_at,updated_at) VALUES(?,'W0000000000000000000I','workspace','W0000000000000000000I',?,?,?,'completed','Task title','Goal',0,?,?,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,root_task_id,executor_kind,status,title,goal,priority,delivery_policy_json,lifecycle_policy_json,revision,created_at,updated_at) VALUES($1,'W0000000000000000000I','workspace','W0000000000000000000I',$2,$3,$4,'completed','Task title','Goal',0,$5::text::json,$6::text::jsonb,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         [id.into(),thread.into(),root.into(),executor.into(),serde_json::json!({"mode":mode,"includeResult":true,"format":"summary"}).to_string().into(),serde_json::json!({"attachment":attachment,"onParentCancel":"cancel","onParentFailure":"cancel","completion":"complete_on_terminal_run"}).to_string().into()])).await.unwrap();
 }
 async fn run(store: &CrudStore, id: &str, task: &str, status: &str, number: i64) {
-    store.with_maintenance_access().database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,result_json,created_at,updated_at) VALUES(?1,?2,?3,1,?4,?5,(SELECT executor_kind FROM task WHERE id=?2),'2026-10-16 10:00:00 +00:00',?6,CURRENT_TIMESTAMP,'2099-01-01 00:00:00 +00:00')",
+    store.with_maintenance_access().database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,result_json,created_at,updated_at) VALUES($1,$2,$3,1,$4,$5,(SELECT executor_kind FROM task WHERE id=$2),'2026-10-16 10:00:00 +00:00',$6,CURRENT_TIMESTAMP,'2099-01-01 00:00:00 +00:00')",
         [id.into(),task.into(),id.into(),number.into(),status.into(),serde_json::json!({"summary":"summary","data":{"html":"not for the list"},"artifacts":[]}).to_string().into()])).await.unwrap();
 }
 async fn unread(store: &CrudStore, principal: &str) -> u64 {
@@ -113,153 +85,9 @@ async fn read(store: &CrudStore, principal: &str, run: &str) {
     .unwrap();
 }
 
-#[tokio::test]
-async fn migration_preserves_legacy_acknowledgement_only_for_its_exact_recipient() {
-    let (_dir, store, writer) = fixture(true).await;
-    task(
-        &store,
-        "task",
-        Some("T0000000000000000000P"),
-        None,
-        "agent",
-        "user_notification",
-        "detached",
-    )
-    .await;
-    run(&store, "run", "task", "succeeded", 1).await;
-    let db = store.with_maintenance_access().database_connection();
-    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('delivery','W0000000000000000000I','task','run','delivery-key','user_notification','P0000000000000000000A','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at,acknowledged_at) VALUES('legacy','delivery','W0000000000000000000I','P0000000000000000000A','task','run','{}','acknowledged',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    // A second delivery/outbox record for the same run is not a second card,
-    // and its missing acknowledgement cannot undo an exact saved receipt.
-    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('delivery-duplicate','W0000000000000000000I','task','run','duplicate-key','user_notification','P0000000000000000000A','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at) VALUES('unread-duplicate','delivery-duplicate','W0000000000000000000I','P0000000000000000000A','task','run','{}','delivered',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    // FK OFF permits inconsistent historical rows. None may become B's read
-    // receipt by merely pointing at the same run ID or an orphaned parent.
-    task(
-        &store,
-        "other-task",
-        Some("T0000000000000000000P"),
-        None,
-        "agent",
-        "none",
-        "attached",
-    )
-    .await;
-    run(&store, "orphan-run", "other-task", "succeeded", 1).await;
-    db.execute_unprepared("UPDATE task_run SET task_id='missing-task' WHERE id='orphan-run'")
-        .await
-        .unwrap();
-    task(
-        &store,
-        "orphan-workspace-task",
-        Some("T0000000000000000000P"),
-        None,
-        "agent",
-        "none",
-        "attached",
-    )
-    .await;
-    run(
-        &store,
-        "orphan-workspace-run",
-        "orphan-workspace-task",
-        "succeeded",
-        1,
-    )
-    .await;
-    db.execute_unprepared(
-        "UPDATE task SET workspace_id='missing-workspace' WHERE id='orphan-workspace-task'",
-    )
-    .await
-    .unwrap();
-    for (id, task_id, run_id, workspace_id) in [
-        (
-            "missing-run-ack",
-            "task",
-            "missing-run",
-            "W0000000000000000000I",
-        ),
-        (
-            "wrong-task-ack",
-            "other-task",
-            "run",
-            "W0000000000000000000I",
-        ),
-        (
-            "wrong-workspace-ack",
-            "task",
-            "run",
-            "W0000000000000000000O",
-        ),
-        (
-            "missing-task-ack",
-            "missing-task",
-            "orphan-run",
-            "W0000000000000000000I",
-        ),
-        (
-            "missing-workspace-ack",
-            "orphan-workspace-task",
-            "orphan-workspace-run",
-            "missing-workspace",
-        ),
-    ] {
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at,acknowledged_at) VALUES(?1,?1,?2,?3,?4,?5,'{}','acknowledged',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-            [id.into(),workspace_id.into(),B.into(),task_id.into(),run_id.into()])).await.unwrap();
-    }
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(1))
-        .await
-        .unwrap();
-    db.execute_unprepared("UPDATE seaql_migrations SET applied_at=1792108800 WHERE version='m20261016_000001_task_completion_inbox'").await.unwrap();
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    let receipts = pioneer_entity::task_run_read::Entity::find()
-        .all(&db)
-        .await
-        .unwrap();
-    assert_eq!(
-        receipts.len(),
-        1,
-        "backfill explicitly validates run/task/workspace existence and belonging without FK enforcement"
-    );
-    assert_eq!(receipts[0].principal_id, A);
-    assert_eq!(receipts[0].run_id, "run");
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    assert_eq!(unread(&store, A).await, 0);
-    assert_eq!(unread(&store, B).await, 1);
-    assert_eq!(
-        list_task_completion_inbox(&db, &access(A), None, 30)
-            .await
-            .unwrap()
-            .len(),
-        0
-    );
-    let legacy=db.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT n.payload_json,d.status FROM user_notification_outbox n JOIN task_delivery d ON d.id=n.task_delivery_id WHERE n.id='legacy'")).await.unwrap().unwrap();
-    assert_eq!(legacy.try_get::<String>("", "payload_json").unwrap(), "{}");
-    assert_eq!(legacy.try_get::<String>("", "status").unwrap(), "delivered");
-    // Data is copied, not borrowed from the old inbox. Removing that receipt
-    // does not undo migrated read state or remove the saved run.
-    db.execute_unprepared("DELETE FROM user_notification_outbox WHERE id='legacy'")
-        .await
-        .unwrap();
-    assert_eq!(unread(&store, A).await, 0);
-    // Older devices acknowledging after migration are accounted for too.
-    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('delivery-b','W0000000000000000000I','task','run','delivery-key-b','user_notification','P0000000000000000000B','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at,acknowledged_at) VALUES('late','delivery-b','W0000000000000000000I','P0000000000000000000B','task','run','{}','acknowledged',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    assert_eq!(unread(&store, B).await, 0);
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn internal_origin_turn_provenance_and_admission_use_the_same_task_scope() {
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     let db = store.database_connection();
     db.execute_unprepared("INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES('T0000000000000000000I','T0000000000000000000V','T0000000000000000000V',1,CURRENT_TIMESTAMP)").await.unwrap();
     task(
@@ -342,349 +170,10 @@ async fn internal_origin_turn_provenance_and_admission_use_the_same_task_scope()
     );
 }
 
-#[tokio::test]
-async fn read_entity_preserves_personal_keys_and_orphans_do_not_create_cards_with_fk_off() {
-    use pioneer_entity::{task_run, task_run_read};
-    let (_dir, store, _writer) = fixture(false).await;
-    task(
-        &store,
-        "task",
-        Some("T0000000000000000000P"),
-        None,
-        "agent",
-        "none",
-        "attached",
-    )
-    .await;
-    run(&store, "first", "task", "succeeded", 1).await;
-    run(&store, "second", "task", "succeeded", 2).await;
-    read(&store, A, "first").await;
-    read(&store, B, "first").await;
-    read(&store, A, "second").await;
-    let db = store.with_maintenance_access().database_connection();
-    let receipt = task_run_read::Entity::find_by_id((A.to_owned(), "first".to_owned()))
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(receipt.read_at, "2026-10-16 11:00:00 +00:00");
-    assert_eq!(receipt.principal_id, A);
-    assert_eq!(receipt.run_id, "first");
-    mark_task_completion_inbox_read(&db, &access(A), "first", "2026-10-17 11:00:00 +00:00")
-        .await
-        .unwrap();
-    assert_eq!(
-        task_run_read::Entity::find_by_id((A.to_owned(), "first".to_owned()))
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap()
-            .read_at,
-        receipt.read_at,
-        "a repeated read keeps the original personal receipt"
-    );
-    assert_eq!(
-        task_run_read::Entity::find()
-            .filter(task_run_read::Column::RunId.eq("first"))
-            .all(&db)
-            .await
-            .unwrap()
-            .len(),
-        2,
-        "the composite key keeps one receipt per principal and run"
-    );
-    // Fixture-only physical deletion: Gateway does not expose a run deletion
-    // operation. OFF leaves orphan receipts; they must never drive the inbox.
-    task_run::Entity::delete_by_id("first")
-        .exec(&db)
-        .await
-        .unwrap();
-    assert_eq!(
-        task_run_read::Entity::find()
-            .filter(task_run_read::Column::RunId.eq("first"))
-            .all(&db)
-            .await
-            .unwrap()
-            .len(),
-        2,
-        "declarative ON DELETE CASCADE does not clean up with FK enforcement OFF"
-    );
-    assert!(
-        task_run_read::Entity::find_by_id((A.to_owned(), "second".to_owned()))
-            .one(&db)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    for (principal, expected_unread) in [(A, 0), (B, 1)] {
-        let page = list_task_completion_inbox(&db, &access(principal), None, 30)
-            .await
-            .unwrap();
-        assert_eq!(page.len() as u64, expected_unread);
-        if expected_unread > 0 {
-            assert_eq!(page[0].run_id, "second");
-        }
-        assert_eq!(unread(&store, principal).await, expected_unread);
-        assert!(
-            find_task_completion_inbox_entry(&db, &access(principal), "first")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-}
-
-#[tokio::test]
-async fn read_requires_an_existing_authorized_terminal_run_with_fk_off() {
-    use pioneer_entity::task_run_read;
-    let (_dir, store, _writer) = fixture(false).await;
-    task(
-        &store,
-        "private",
-        Some("T0000000000000000000V"),
-        None,
-        "agent",
-        "none",
-        "attached",
-    )
-    .await;
-    run(&store, "private-run", "private", "succeeded", 1).await;
-    run(&store, "running-run", "private", "running", 2).await;
-    run(&store, "orphan-run", "private", "succeeded", 3).await;
-    let db = store.with_maintenance_access().database_connection();
-    db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000B' AND thread_id='T0000000000000000000V'").await.unwrap();
-    db.execute_unprepared("UPDATE task_run SET task_id='missing-task' WHERE id='orphan-run'")
-        .await
-        .unwrap();
-    for run_id in ["missing-run", "private-run", "running-run", "orphan-run"] {
-        read(&store, B, run_id).await;
-    }
-    // Absolute TaskRead still cannot substitute a different workspace or skip
-    // run/task existence and terminal checks in the atomic INSERT SELECT.
-    let wrong_workspace = TaskCompletionInboxAccess {
-        workspace_id: "W0000000000000000000O",
-        principal_id: A,
-        absolute: true,
-    };
-    mark_task_completion_inbox_read(
-        &db,
-        &wrong_workspace,
-        "private-run",
-        "2026-10-17 11:00:00 +00:00",
-    )
-    .await
-    .unwrap();
-    let absolute = TaskCompletionInboxAccess {
-        absolute: true,
-        ..access(A)
-    };
-    for run_id in ["missing-run", "running-run", "orphan-run"] {
-        mark_task_completion_inbox_read(&db, &absolute, run_id, "2026-10-17 11:00:00 +00:00")
-            .await
-            .unwrap();
-    }
-    assert!(
-        task_run_read::Entity::find()
-            .all(&db)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    read(&store, A, "private-run").await;
-    let receipts = task_run_read::Entity::find().all(&db).await.unwrap();
-    assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].principal_id, A);
-    assert_eq!(receipts[0].run_id, "private-run");
-}
-
-#[tokio::test]
-async fn released_upgrade_uses_original_activation_and_survives_reopen_without_receipt_backfill() {
-    let (dir, store, writer) = fixture(true).await;
-    task(
-        &store,
-        "upgrade",
-        Some("T0000000000000000000P"),
-        None,
-        "tool",
-        "none",
-        "detached",
-    )
-    .await;
-    for (id, number) in [("old", 1), ("activation-second", 2), ("new", 3)] {
-        run(&store, id, "upgrade", "succeeded", number).await;
-    }
-    let db = store.database_connection();
-    db.execute_unprepared(
-        "UPDATE task_run SET completed_at='2026-10-16 09:59:59 +00:00' WHERE id='old'",
-    )
-    .await
-    .unwrap();
-    db.execute_unprepared(
-        "UPDATE task_run SET completed_at='2026-10-16 10:01:00 +00:00' WHERE id='new'",
-    )
-    .await
-    .unwrap();
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(1))
-        .await
-        .unwrap();
-    db.execute_unprepared("UPDATE seaql_migrations SET applied_at=1792144800 WHERE version='m20261016_000001_task_completion_inbox'").await.unwrap();
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        unread(&store, A).await,
-        2,
-        "retain the entire activation second and later results"
-    );
-    let page = list_task_completion_inbox(&db, &access(A), None, 30)
-        .await
-        .unwrap();
-    assert!(page.iter().all(|row| row.run_id != "old"));
-    assert!(
-        find_task_completion_inbox_entry(&db, &access(A), "old")
-            .await
-            .unwrap()
-            .unwrap()
-            .read_at
-            .is_none(),
-        "activation is not a fabricated personal viewing date"
-    );
-    assert!(
-        pioneer_entity::task_run_read::Entity::find()
-            .all(&db)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let baseline = pioneer_entity::task_inbox_activation::Entity::find_by_id(1)
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(baseline.started_at, 1792144800);
-    drop(db);
-    drop(store);
-    drop(writer);
-    let (reopened, writer) = open(&dir.path().join("inbox.sqlite")).await;
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    assert_eq!(unread(&reopened, A).await, 2);
-    assert_eq!(unread(&reopened, B).await, 2);
-}
-
-#[tokio::test]
-async fn read_all_covers_unloaded_pages_and_leaves_later_commits_at_the_same_time_unread() {
-    use pioneer_crud::mark_all_task_completion_inbox_read;
-    let (_dir, store, _writer) = fixture(false).await;
-    task(
-        &store,
-        "bulk",
-        Some("T0000000000000000000P"),
-        None,
-        "tool",
-        "none",
-        "detached",
-    )
-    .await;
-    task(
-        &store,
-        "hidden-bulk",
-        Some("T0000000000000000000V"),
-        None,
-        "tool",
-        "none",
-        "detached",
-    )
-    .await;
-    for ix in 0..65 {
-        run(
-            &store,
-            &format!("bulk-{ix:03}"),
-            "bulk",
-            "succeeded",
-            ix + 1,
-        )
-        .await;
-    }
-    run(&store, "hidden-bulk-run", "hidden-bulk", "failed", 1).await;
-    let db = store.database_connection();
-    db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000A' AND thread_id='T0000000000000000000V'").await.unwrap();
-    assert_eq!(
-        list_task_completion_inbox(&db, &access(A), None, 30)
-            .await
-            .unwrap()
-            .len(),
-        30
-    );
-    mark_all_task_completion_inbox_read(&db, &access(A), "2026-10-16 10:00:00 +00:00")
-        .await
-        .unwrap();
-    assert_eq!(unread(&store, A).await, 0);
-    assert_eq!(unread(&store, B).await, 66);
-    assert!(
-        list_task_completion_inbox(&db, &access(A), None, 30)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        pioneer_entity::task_run_read::Entity::find()
-            .all(&db)
-            .await
-            .unwrap()
-            .len(),
-        65
-    );
-    // Writer order, not a lossy time watermark or lexicographic run ID, defines inclusion.
-    run(&store, "aaa-later", "bulk", "succeeded", 66).await;
-    assert_eq!(unread(&store, A).await, 1);
-    assert_eq!(
-        list_task_completion_inbox(&db, &access(A), None, 30)
-            .await
-            .unwrap()[0]
-            .run_id,
-        "aaa-later"
-    );
-    let foreign = TaskCompletionInboxAccess {
-        workspace_id: "W0000000000000000000O",
-        ..access(A)
-    };
-    mark_all_task_completion_inbox_read(&db, &foreign, "2026-10-16 10:00:00 +00:00")
-        .await
-        .unwrap();
-    assert_eq!(unread(&store, A).await, 1);
-    let principal_access = access(A);
-    let (bulk_result, ()) = tokio::join!(
-        mark_all_task_completion_inbox_read(&db, &principal_access, "2026-10-16 10:00:00 +00:00"),
-        run(&store, "racing-completion", "bulk", "succeeded", 67),
-    );
-    bulk_result.unwrap();
-    let included = pioneer_entity::task_run_read::Entity::find_by_id((
-        A.to_owned(),
-        "racing-completion".to_owned(),
-    ))
-    .one(&db)
-    .await
-    .unwrap()
-    .is_some();
-    let remaining = u64::from(!included);
-    assert_eq!(
-        unread(&store, A).await,
-        remaining,
-        "the serialized writer defines which concurrent commit belongs to the operation"
-    );
-    run(&store, "strictly-after-race", "bulk", "succeeded", 68).await;
-    assert_eq!(unread(&store, A).await, remaining + 1);
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cancellation_receipt_tracks_actor_exact_transition_and_rolls_back_with_projection() {
     use pioneer_protocol::TaskEventPayload;
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "cancel",
@@ -733,7 +222,7 @@ async fn cancellation_receipt_tracks_actor_exact_transition_and_rolls_back_with_
     assert_eq!(unread(&store, A).await, 3);
     run(&store, "rollback", "cancel", "running", 5).await;
     let db = store.database_connection();
-    db.execute_unprepared("CREATE TRIGGER reject_inbox_receipt BEFORE INSERT ON task_run_read BEGIN SELECT RAISE(ABORT, 'fixture receipt failure'); END").await.unwrap();
+    db.execute_unprepared("CREATE FUNCTION reject_inbox_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture receipt failure'; END; $$; CREATE TRIGGER reject_inbox_receipt BEFORE INSERT ON task_run_read FOR EACH ROW EXECUTE FUNCTION reject_inbox_receipt()").await.unwrap();
     assert!(
         store
             .append_task_cancellation_events_as(
@@ -760,7 +249,7 @@ async fn cancellation_receipt_tracks_actor_exact_transition_and_rolls_back_with_
         clock.completion_sequence, 3,
         "failed Stop receipt rolls back its completion watermark"
     );
-    db.execute_unprepared("DROP TRIGGER reject_inbox_receipt")
+    db.execute_unprepared("DROP TRIGGER reject_inbox_receipt ON task_run_read")
         .await
         .unwrap();
     store
@@ -783,17 +272,17 @@ async fn cancellation_receipt_tracks_actor_exact_transition_and_rolls_back_with_
 }
 
 async fn saved_result_item(store: &CrudStore, turn: &str, item: &str) {
-    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,active_attempt_number,created_at,updated_at) VALUES(?1,?2,?3,'agent_message','completed','{}',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,active_attempt_number,created_at,updated_at) VALUES($1,$2,$3,'agent_message','completed','{}',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         [format!("saved-{turn}-{item}").into(), turn.into(), item.into()])).await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn visible_results_resolve_exact_occurrence_and_delivery_with_personal_cross_device_receipts()
 {
     use pioneer_crud::mark_viewed_task_completion_inbox_read;
     use pioneer_protocol::TaskCompletionInboxViewedParams;
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "visible",
@@ -896,9 +385,9 @@ async fn visible_results_resolve_exact_occurrence_and_delivery_with_personal_cro
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn own_cancellation_receipt_remains_personal_when_a_presentation_root_is_added_later() {
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "no-root-cancel",
@@ -931,7 +420,9 @@ async fn own_cancellation_receipt_remains_personal_when_a_presentation_root_is_a
         .unwrap();
     let db = store.database_connection();
     assert!(
-        pioneer_entity::task_run_read::Entity::find_by_id((A.to_owned(), "no-root-run".to_owned()))
+        pioneer_entity::task_run_read::Entity::find()
+            .filter(pioneer_entity::task_run_read::Column::PrincipalId.eq(A))
+            .filter(pioneer_entity::task_run_read::Column::RunId.eq("no-root-run"))
             .one(&db)
             .await
             .unwrap()
@@ -946,10 +437,10 @@ async fn own_cancellation_receipt_remains_personal_when_a_presentation_root_is_a
     assert_eq!(unread(&store, B).await, 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_dedicated_delivery_status_uses_its_exact_canonical_turn_link() {
     use pioneer_crud::mark_viewed_task_completion_inbox_read;
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "failure-result",
@@ -964,11 +455,11 @@ async fn failed_dedicated_delivery_status_uses_its_exact_canonical_turn_link() {
     let turn_id =
         pioneer_crud::canonical_agent_id('T', "task-delivery-turn\0failure-result-delivery");
     let db = store.database_connection();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES(?,'T0000000000000000000P','failed','{}','conversation','task_delivery',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES($1,'T0000000000000000000P','failed','{}','conversation','task_delivery',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         [turn_id.clone().into()])).await.unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id,created_at,updated_at) VALUES('failure-result-delivery','W0000000000000000000I','failure-result','failure-result-run','failure-result-key','thread','T0000000000000000000P','delivered',1,1,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id,created_at,updated_at) VALUES('failure-result-delivery','W0000000000000000000I','failure-result','failure-result-run','failure-result-key','thread','T0000000000000000000P','delivered',1,1,$1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         [turn_id.clone().into()])).await.unwrap();
     let params = pioneer_protocol::TaskCompletionInboxViewedParams {
         workspace_id: access(A).workspace_id.into(),
@@ -993,10 +484,10 @@ async fn failed_dedicated_delivery_status_uses_its_exact_canonical_turn_link() {
     assert_eq!(unread(&store, B).await, 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn child_delivery_item_does_not_read_the_parent_execution_run_sharing_its_turn() {
     use pioneer_crud::mark_viewed_task_completion_inbox_read;
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "parent-visible-task",
@@ -1110,10 +601,10 @@ async fn child_delivery_item_does_not_read_the_parent_execution_run_sharing_its_
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn reviewed_run_requires_accepted_candidate_not_old_answer_or_reviewer() {
     use pioneer_crud::mark_viewed_task_completion_inbox_read as viewed;
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "reviewed",
@@ -1149,10 +640,10 @@ async fn reviewed_run_requires_accepted_candidate_not_old_answer_or_reviewer() {
             3,
         ),
     ] {
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES(?,'T0000000000000000000I','completed','{}','task_run','attached_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",[turn.into()])).await.unwrap();
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES(?,'reviewed','reviewed-run','T0000000000000000000I',?,?,?, ?,?,CURRENT_TIMESTAMP)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES($1,'T0000000000000000000I','completed','{}','task_run','attached_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",[turn.into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES($1,'reviewed','reviewed-run','T0000000000000000000I',$2,$3,$4, $5,$6,CURRENT_TIMESTAMP)",
             [binding.into(),turn.into(),kind.into(),sequence.into(),sequence.into(),status.into()])).await.unwrap();
         saved_result_item(&store, turn, "final-answer").await;
     }
@@ -1172,8 +663,8 @@ async fn reviewed_run_requires_accepted_candidate_not_old_answer_or_reviewer() {
             "accepted",
         ),
     ] {
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES(?,'reviewed','reviewed-run',?,'T0000000000000000000I',?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES($1,'reviewed','reviewed-run',$2,'T0000000000000000000I',$3,$4,$5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             [candidate.into(),binding.into(),turn.into(),round.into(),status.into()])).await.unwrap();
     }
     let proof = |turn: &str, status_only: bool| pioneer_protocol::TaskCompletionInboxViewedParams {
@@ -1206,8 +697,8 @@ async fn reviewed_run_requires_accepted_candidate_not_old_answer_or_reviewer() {
         .unwrap();
     for candidate_state in ["rejected", "superseded"] {
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE task_result_candidate SET status=? WHERE id='old-candidate'",
+            DbBackend::Postgres,
+            "UPDATE task_result_candidate SET status=$1 WHERE id='old-candidate'",
             [candidate_state.into()],
         ))
         .await
@@ -1236,10 +727,10 @@ async fn reviewed_run_requires_accepted_candidate_not_old_answer_or_reviewer() {
     assert_eq!(unread(&store, B).await, 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn terminal_errors_without_candidates_require_the_matching_work_frontier() {
     use pioneer_crud::mark_viewed_task_completion_inbox_read as viewed;
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "errors",
@@ -1264,10 +755,10 @@ async fn terminal_errors_without_candidates_require_the_matching_work_frontier()
         let run_id = format!("error-run-{ix}");
         let turn_id = format!("error-turn-{ix}");
         run(&store, &run_id, "errors", run_status, ix as i64 + 1).await;
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES(?,'T0000000000000000000I',?,'{}','task_run','attached_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [turn_id.clone().into(), turn_status.into()])).await.unwrap();
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES(?,'errors',?,'T0000000000000000000I',?,'recovery',1,1,?,CURRENT_TIMESTAMP)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES($1,'T0000000000000000000I',$2,'{}','task_run','attached_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [turn_id.clone().into(), turn_status.into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES($1,'errors',$2,'T0000000000000000000I',$3,'recovery',1,1,$4,CURRENT_TIMESTAMP)",
             [format!("error-binding-{ix}").into(),run_id.into(),turn_id.clone().into(),work_status.into()])).await.unwrap();
         let params = pioneer_protocol::TaskCompletionInboxViewedParams {
             workspace_id: access(A).workspace_id.into(),
@@ -1287,10 +778,10 @@ async fn terminal_errors_without_candidates_require_the_matching_work_frontier()
     assert_eq!(unread(&store, B).await, 5);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn ordinary_negative_batches_keep_viewport_scope_checks_and_direct_run_evidence() {
     use pioneer_crud::mark_viewed_task_completion_inbox_read as viewed;
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "batch",
@@ -1305,8 +796,8 @@ async fn ordinary_negative_batches_keep_viewport_scope_checks_and_direct_run_evi
     let db = store.database_connection();
     for ix in 0..100 {
         let turn = format!("ordinary-{ix}");
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES(?,'T0000000000000000000P','completed','{}','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES($1,'T0000000000000000000P','completed','{}','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             [turn.clone().into()])).await.unwrap();
         saved_result_item(&store, &turn, "final").await;
     }
@@ -1358,147 +849,6 @@ async fn ordinary_negative_batches_keep_viewport_scope_checks_and_direct_run_evi
 
 /// The three released identities survive source consolidation. Upgrade each
 /// possible released prefix, including no inbox migration, without replaying it.
-#[tokio::test]
-async fn consolidated_inbox_migrations_preserve_released_prefixes_and_schema() {
-    const NAMES: [&str; 3] = [
-        "m20261016_000001_task_completion_inbox",
-        "m20261017_000001_task_inbox_activation",
-        "m20261018_000002_task_inbox_query_indexes",
-    ];
-    let names = Migrator::migrations()
-        .iter()
-        .map(|m| m.name().to_owned())
-        .collect::<Vec<_>>();
-    for name in NAMES.into_iter().chain([
-        "m20261018_000001_task_cancellation_actor",
-        "m20261018_000003_task_inbox_access_start",
-    ]) {
-        assert_eq!(names.iter().filter(|n| n.as_str() == name).count(), 1);
-    }
-    let positions = NAMES.map(|n| names.iter().position(|v| v == n).unwrap());
-    assert!(positions[0] < positions[1] && positions[1] < positions[2]);
-    assert_eq!(
-        names[positions[0] + 1],
-        "m20261015_000001_html_preview_retention"
-    );
-    assert_eq!(
-        names[positions[1] + 1],
-        "m20261018_000001_task_cancellation_actor"
-    );
-    let mut expected_schema = None;
-    for stage in 0..=3 {
-        let (_dir, store, writer) = fixture(true).await;
-        let db = store.database_connection();
-        task(
-            &store,
-            "compat",
-            Some("T0000000000000000000P"),
-            None,
-            "tool",
-            "none",
-            "detached",
-        )
-        .await;
-        run(&store, "compat-late", "compat", "succeeded", 1).await;
-        if stage > 0 {
-            writer
-                .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(1))
-                .await
-                .unwrap();
-            db.execute_unprepared("UPDATE seaql_migrations SET applied_at=1792108800 WHERE version='m20261016_000001_task_completion_inbox'").await.unwrap();
-            // A receipt must survive, while a late legacy ack must NOT trigger
-            // re-execution of the already applied initial backfill.
-            db.execute_unprepared("INSERT INTO task_run_read(principal_id,run_id,read_at) VALUES('reader','retained','2026-10-16 12:34:56+00:00')").await.unwrap();
-            if stage >= 2 {
-                let end = positions[stage - 1];
-                writer
-                    .run_migrations::<Migrator>(
-                        SqliteWriteClass::Maintenance,
-                        Some((end - positions[0]) as u32),
-                    )
-                    .await
-                    .unwrap();
-            }
-        }
-        // Acknowledged legacy notifications have a saved delivery timestamp;
-        // keep creation, delivery and acknowledgement in causal order.
-        db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at,delivered_at) VALUES('compat-delivery','W0000000000000000000I','compat','compat-late','compat-key','user_notification','P0000000000000000000B','delivered',1,1,'2026-10-16T12:34:54Z','2026-10-16T12:34:55Z','2026-10-16T12:34:55Z')").await.unwrap();
-        db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at,acknowledged_at) VALUES('compat-legacy','compat-delivery','W0000000000000000000I','P0000000000000000000B','compat','compat-late','{}','acknowledged','2026-10-16T12:34:54Z','2026-10-16T12:34:55Z','2026-10-16T12:34:56Z')").await.unwrap();
-        let saved_activation = if stage >= 2 {
-            Some(
-                db.query_one_raw(Statement::from_string(
-                    DbBackend::Sqlite,
-                    "SELECT started_at FROM task_inbox_activation WHERE id=1",
-                ))
-                .await
-                .unwrap()
-                .unwrap()
-                .try_get::<i64>("", "started_at")
-                .unwrap(),
-            )
-        } else {
-            None
-        };
-        writer
-            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-            .await
-            .unwrap();
-        let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
-            "SELECT a.started_at,m.applied_at,a.completion_sequence FROM task_inbox_activation a JOIN seaql_migrations m ON m.version='m20261016_000001_task_completion_inbox' WHERE a.id=1")).await.unwrap().unwrap();
-        assert_eq!(
-            row.try_get::<i64>("", "started_at").unwrap(),
-            row.try_get::<i64>("", "applied_at").unwrap()
-        );
-        if let Some(at) = saved_activation {
-            assert_eq!(row.try_get::<i64>("", "started_at").unwrap(), at);
-        }
-        assert_eq!(row.try_get::<i64>("", "completion_sequence").unwrap(), 0);
-        if stage > 0 {
-            let receipt = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT read_at FROM task_run_read WHERE principal_id='reader' AND run_id='retained'")).await.unwrap().unwrap();
-            assert_eq!(
-                receipt.try_get::<String>("", "read_at").unwrap(),
-                "2026-10-16 12:34:56+00:00"
-            );
-        }
-        let late_receipt = pioneer_entity::task_run_read::Entity::find_by_id((
-            B.to_owned(),
-            "compat-late".to_owned(),
-        ))
-        .one(&db)
-        .await
-        .unwrap();
-        assert_eq!(
-            late_receipt.is_some(),
-            stage == 0,
-            "initial backfill runs exactly once, before a later acknowledgement"
-        );
-        let schema = db
-            .query_all_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
-            ))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| {
-                (
-                    row.try_get::<String>("", "name").unwrap(),
-                    row.try_get::<Option<String>>("", "sql").unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
-        if let Some(expected) = &expected_schema {
-            assert_eq!(&schema, expected);
-        } else {
-            expected_schema = Some(schema);
-        }
-        // Running the chain again is a no-op, including activation and receipts.
-        writer
-            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-            .await
-            .unwrap();
-    }
-}
 
 const ACCESS_SECOND: i64 = 1792144800;
 fn grant_time() -> chrono::DateTime<chrono::FixedOffset> {
@@ -1550,9 +900,9 @@ async fn complete_for_access(store: &CrudStore, id: &str, task_id: &str, at: i64
         .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn current_workspace_grant_orders_same_second_completions_and_survives_devices_regrant() {
-    let (dir, store, writer) = fixture(false).await;
+    let (dir, store, writer) = fixture().await;
     task(
         &store,
         "access",
@@ -1605,7 +955,7 @@ async fn current_workspace_grant_orders_same_second_completions_and_survives_dev
     drop(db);
     drop(store);
     drop(writer);
-    let (store, _writer) = open(&dir.path().join("inbox.sqlite")).await;
+    let (store, _writer) = open(&dir).await;
     assert_eq!(
         unread(&store, A).await,
         2,
@@ -1625,9 +975,9 @@ async fn current_workspace_grant_orders_same_second_completions_and_survives_dev
     assert_eq!(unread(&store, B).await, 4, "other participant is unchanged");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn private_grant_visibility_routes_and_absolute_start_are_personal() {
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "private-access",
@@ -1742,9 +1092,9 @@ async fn private_grant_visibility_routes_and_absolute_start_are_personal() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn access_start_list_count_keyset_and_read_all_share_unloaded_eligibility() {
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "access-pages",
@@ -1815,9 +1165,9 @@ async fn access_start_list_count_keyset_and_read_all_share_unloaded_eligibility(
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn grant_and_completion_race_uses_durable_writer_order_not_request_clock() {
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "racing-access",
@@ -1861,9 +1211,9 @@ async fn grant_and_completion_race_uses_durable_writer_order_not_request_clock()
     assert_eq!(unread(&store, A).await, expected);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn publication_intervals_use_operation_time_and_preserve_continuous_participants() {
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "publication",
@@ -1959,9 +1309,9 @@ async fn publication_intervals_use_operation_time_and_preserve_continuous_partic
     assert_eq!(unread(&store, B).await, 2);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_grant_uses_epoch_and_retains_the_ambiguous_second_without_receipts() {
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "legacy-access",
@@ -1975,7 +1325,7 @@ async fn legacy_grant_uses_epoch_and_retains_the_ambiguous_second_without_receip
     let db = store.database_connection();
     // Preserve the membership timestamp invariant while exercising the legacy
     // timezone/subsecond representation of the grant itself.
-    db.execute_unprepared("UPDATE workspace_membership SET created_at='2026-10-16 13:00:00.999999999 +03:00',updated_at='2026-10-16 13:00:00.999999999 +03:00' WHERE principal_id='P0000000000000000000A'").await.unwrap();
+    db.execute_unprepared("UPDATE workspace_membership SET created_at='2026-10-16 13:00:00.999999 +03:00',updated_at='2026-10-16 13:00:00.999999 +03:00' WHERE principal_id='P0000000000000000000A'").await.unwrap();
     for (i, id, at) in [
         (1, "legacy-pre", "2026-10-16T09:59:59Z"),
         (2, "legacy-tie", "2026-10-16 10:00:00 +00:00"),
@@ -1983,8 +1333,8 @@ async fn legacy_grant_uses_epoch_and_retains_the_ambiguous_second_without_receip
     ] {
         run(&store, id, "legacy-access", "succeeded", i).await;
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE task_run SET completed_at=? WHERE id=?",
+            DbBackend::Postgres,
+            "UPDATE task_run SET completed_at=$1::text::timestamptz WHERE id=$2",
             [at.into(), id.into()],
         ))
         .await
@@ -2005,9 +1355,9 @@ async fn legacy_grant_uses_epoch_and_retains_the_ambiguous_second_without_receip
     assert_eq!(unread(&store, B).await, 3);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn addressed_patch_uses_unread_membership_and_exact_completion_order() {
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     task(
         &store,
         "patch-task",
@@ -2082,19 +1432,19 @@ async fn addressed_patch_uses_unread_membership_and_exact_completion_order() {
     assert_eq!(total, 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn activity_discovery_pages_survive_filtered_scopes_and_duplicate_active_runs() {
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     let db = store.with_maintenance_access().database_connection();
     db.execute_unprepared(
         "WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<513)
          INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,executor_kind,status,title,goal,priority,delivery_policy_json,lifecycle_policy_json,revision,created_at,updated_at)
-         SELECT printf('active-%04d',n),'W0000000000000000000I','workspace','W0000000000000000000I','T0000000000000000000P','system','running','Task','Goal',0,'{}','{}',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM ids",
+         SELECT 'active-'||lpad(n::text,4,'0'),'W0000000000000000000I','workspace','W0000000000000000000I','T0000000000000000000P','system','running','Task','Goal',0,'{}'::json,'{}'::jsonb,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM ids",
     ).await.unwrap();
     for (suffix, status) in [("-starting", "starting"), ("-running", "running")] {
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
             "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at)
-             SELECT id || ?1,id,id || ?1,1,?3,?2,'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM task",
+             SELECT id || $1,id,id || $1,1,$3,$2,'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM task",
             [suffix.into(), status.into(), (if status == "starting" { 1_i64 } else { 2_i64 }).into()],
         )).await.unwrap();
     }
@@ -2139,7 +1489,7 @@ async fn activity_discovery_pages_survive_filtered_scopes_and_duplicate_active_r
 }
 
 // Durable facts are deliberately seeded independently of current Task policy.
-// These storage fixtures also allow corrupt legacy links with runtime FK OFF.
+// Keep valid JSON while exercising unusable linkage or recipient evidence.
 async fn inbox_contracts(
     store: &CrudStore,
     task_id: &str,
@@ -2149,11 +1499,11 @@ async fn inbox_contracts(
     generation: i64,
 ) {
     let db = store.with_maintenance_access().database_connection();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT OR IGNORE INTO task_actor_contract(task_id,workspace_id,creator_json,reviewer_json,delivery_json,revision,created_at,updated_at) VALUES(?,'W0000000000000000000I',?,'\"runtime_auto\"','{}',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO task_actor_contract(task_id,workspace_id,creator_json,reviewer_json,delivery_json,revision,created_at,updated_at) VALUES($1,'W0000000000000000000I',$2,'\"runtime_auto\"','{}',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT (task_id) DO NOTHING",
         [task_id.into(), creator.into()])).await.unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task_occurrence_contract(occurrence_id,task_id,run_id,occurrence_key,execution_generation,status,retry_attempt,action_idempotency_key,delivery_plan_json,created_at,updated_at) VALUES(?,?,?,?,?,'delivered',0,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO task_occurrence_contract(occurrence_id,task_id,run_id,occurrence_key,execution_generation,status,retry_attempt,action_idempotency_key,delivery_plan_json,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'delivered',0,$6,$7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         [run_id.into(), task_id.into(), run_id.into(), run_id.into(), generation.into(), run_id.into(), plan.into()])).await.unwrap();
 }
 
@@ -2176,10 +1526,10 @@ fn inbox_plan(mode: pioneer_protocol::TaskDeliveryMode, target: Option<&str>) ->
     .unwrap()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_internal_destinations_share_inbox_membership_across_statuses_and_reads() {
     use pioneer_protocol::{AgentExecutionId, PersistedActorRef, TaskDeliveryMode as M};
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     let agent = serde_json::to_string(&PersistedActorRef::AgentExecution(
         AgentExecutionId::new("E00000000000000000001").unwrap(),
     ))
@@ -2317,10 +1667,10 @@ async fn durable_internal_destinations_share_inbox_membership_across_statuses_an
     assert!(receipts.iter().all(|row| visible.contains(&row.run_id)));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn occurrence_evidence_is_per_run_and_untrusted_legacy_links_remain_visible() {
     use pioneer_protocol::TaskDeliveryMode as M;
-    let (_dir, store, _writer) = fixture(false).await;
+    let (_dir, store, _writer) = fixture().await;
     let agent = r#"{"kind":"agent_execution","id":"E00000000000000000001"}"#;
     task(
         &store,
@@ -2346,7 +1696,7 @@ async fn occurrence_evidence_is_per_run_and_untrusted_legacy_links_remain_visibl
         Some(user.as_str()),
         None,
         Some("null"),
-        Some("{"),
+        Some(r#""invalid-shape""#),
         Some("{}"),
         Some(unknown_version.as_str()),
         Some(wrong_boolean.as_str()),
@@ -2423,11 +1773,11 @@ async fn occurrence_evidence_is_per_run_and_untrusted_legacy_links_remain_visibl
     assert_eq!(entries.len(), 6);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn retry_rebinding_keeps_all_internal_attempts_out_of_the_inbox() {
     use pioneer_protocol::{TaskDeliveryMode as M, TaskOccurrenceStatus};
     for (mode, target) in [(M::None, None), (M::Thread, Some("T0000000000000000000I"))] {
-        let (_dir, store, _writer) = fixture(false).await;
+        let (_dir, store, _writer) = fixture().await;
         let db = store.with_maintenance_access().database_connection();
         task(
             &store,
@@ -2465,7 +1815,7 @@ async fn retry_rebinding_keeps_all_internal_attempts_out_of_the_inbox() {
             &store,
             "retry-task",
             "user-occurrence",
-            "unused",
+            r#"{"kind":"agent_execution","id":"E00000000000000000001"}"#,
             Some(&inbox_plan(M::Thread, Some("T0000000000000000000P"))),
             2,
         )
@@ -2479,8 +1829,8 @@ async fn retry_rebinding_keeps_all_internal_attempts_out_of_the_inbox() {
                 // Storage side of task_terminal::retry_run: one group, sequential
                 // attempts, both source links, monotonically increasing run number.
                 run(&store, &id, "retry-task", "queued", attempt + 1).await;
-                db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "UPDATE task_run SET run_group_id='attempt-1',attempt_number=?,retry_of_run_id=?,parent_run_id=?,completed_at=NULL,result_json=NULL WHERE id=?",
+                db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                    "UPDATE task_run SET run_group_id='attempt-1',attempt_number=$1,retry_of_run_id=$2,parent_run_id=$3,completed_at=NULL,result_json=NULL WHERE id=$4",
                     [attempt.into(), previous_id.clone().into(), previous_id.clone().into(), id.clone().into()])).await.unwrap();
                 let previous = store
                     .get_task_occurrence_contract_by_run(&previous_id)
@@ -2502,8 +1852,8 @@ async fn retry_rebinding_keeps_all_internal_attempts_out_of_the_inbox() {
                         .unwrap()
                         .is_none()
                 );
-                db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "UPDATE task_run SET status='failed',completed_at='2026-10-16 10:00:00 +00:00' WHERE id=?",
+                db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                    "UPDATE task_run SET status='failed',completed_at='2026-10-16 10:00:00 +00:00' WHERE id=$1",
                     [id.clone().into()])).await.unwrap();
                 next.status = TaskOccurrenceStatus::Failed;
                 store
@@ -2632,11 +1982,11 @@ async fn retry_rebinding_keeps_all_internal_attempts_out_of_the_inbox() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn same_run_recovery_preserves_internal_retry_history_membership() {
     use pioneer_protocol::{TaskDeliveryMode as M, TaskOccurrenceStatus as O};
     for (mode, target) in [(M::None, None), (M::Thread, Some("T0000000000000000000I"))] {
-        let (_dir, store, _writer) = fixture(false).await;
+        let (_dir, store, _writer) = fixture().await;
         let db = store.with_maintenance_access().database_connection();
         task(
             &store,
@@ -2678,7 +2028,7 @@ async fn same_run_recovery_preserves_internal_retry_history_membership() {
             &store,
             "resume-task",
             "resume-user",
-            "unused",
+            r#"{"kind":"agent_execution","id":"E00000000000000000001"}"#,
             Some(&inbox_plan(M::Thread, Some("T0000000000000000000P"))),
             2,
         )

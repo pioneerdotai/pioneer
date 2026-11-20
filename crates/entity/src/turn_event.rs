@@ -7,32 +7,32 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_event")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable, unique)]
-    pub payload_payload_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text")]
     pub thread_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub portable_identity: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_turn_event_turn_id_idempotency_key"
+    )]
+    pub turn_id: String,
+    #[sea_orm(unique_key = "idx_turn_events_turn_id_sequence")]
+    pub sequence: i64,
     #[sea_orm(column_type = "Text")]
     pub event_type: String,
+    pub payload: Option<Json>,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         column_type = "Text",
         nullable,
         unique_key = "uq_turn_event_turn_id_idempotency_key"
     )]
     pub idempotency_key: Option<String>,
-    pub payload: Option<Json>,
-    #[sea_orm(unique_key = "idx_turn_events_turn_id_sequence")]
-    pub sequence: i64,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uq_turn_event_turn_id_idempotency_key"
-    )]
-    pub turn_id: String,
-    pub created_at: DateTimeWithTimeZone,
     pub portable_revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub portable_identity: String,
+    #[sea_orm(column_type = "Text", nullable, unique)]
+    pub payload_payload_id: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "payload_payload_id",

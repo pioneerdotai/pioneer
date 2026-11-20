@@ -180,7 +180,7 @@ async fn episodic_pending_delivery_survives_real_receipt_cleanup_and_reopen() {
     reopened.database_connection().close().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn episodic_delivery_requires_matching_stream_scope_and_positive_sequence() {
     let (store, thread, turn) =
         test_store_with_started_turn("ws_scope", "thr_scope", "turn_scope").await;
@@ -394,7 +394,7 @@ impl ConnectionTrait for ClaimConnection {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn episodic_guarded_claim_rechecks_watermark_scope_and_unknown_predecessor() {
     for mutation in [
         "UPDATE turn_event_projection_stream_state SET projected_through_sequence = 2 WHERE turn_id = ?",
@@ -472,7 +472,7 @@ async fn episodic_guarded_claim_rechecks_watermark_scope_and_unknown_predecessor
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn episodic_claim_production_sql_uses_unfinished_index_with_large_terminal_history() {
     let store = test_store_with_workspace("ws_plan")
         .await

@@ -7,17 +7,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_mcp_projection")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub resolution_status: String,
-    pub tool_count: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub turn_id: String,
     #[sea_orm(column_type = "Text")]
-    pub manifest_hash: String,
-    pub created_at: DateTimeWithTimeZone,
+    pub workspace_id: String,
     pub projection_version: i64,
+    #[sea_orm(column_type = "Text")]
+    pub manifest_hash: String,
+    #[sea_orm(column_type = "Text")]
+    pub resolution_status: String,
+    pub tool_count: i64,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "turn_id",

@@ -7,23 +7,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_work_resource_scope")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub aggregate_usage_json: String,
-    pub max_fan_out: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub root_execution_id: String,
-    pub max_queue_depth: i64,
-    pub max_total_nodes: i64,
-    pub queue_generation: i64,
-    pub updated_at: DateTimeWithTimeZone,
-    pub max_concurrency: i64,
     pub scope_generation: i64,
+    pub max_concurrency: i64,
+    pub max_queue_depth: i64,
+    pub max_depth: i64,
+    pub max_fan_out: i64,
+    pub max_total_nodes: i64,
+    #[sea_orm(column_type = "Text")]
+    pub aggregate_usage_json: String,
+    pub queue_generation: i64,
     pub last_scheduled_sequence: i64,
+    pub last_scheduled_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text")]
     pub status: String,
-    pub last_scheduled_at: Option<DateTimeWithTimeZone>,
-    pub max_depth: i64,
     pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "root_execution_id",

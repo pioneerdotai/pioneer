@@ -7,29 +7,29 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_memory_event")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub details_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub memory_id: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub item_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub event_kind: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub thread_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub actor_kind: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub workspace_id: Option<String>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text", nullable)]
+    pub memory_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub candidate_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub workspace_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub event_kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub actor_kind: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub actor_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    pub thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub item_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub details_json: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "authorization_change_feed")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub change_kind: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub generation: i64,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub change_kind: String,
     pub affected_scope_json: Json,
+    pub created_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

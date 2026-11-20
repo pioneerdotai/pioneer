@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "self_improvement_workspace_state")]
 pub struct Model {
-    pub updated_at: DateTimeWithTimeZone,
-    pub cursor_source_id: i64,
-    pub effective_enabled_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub workspace_id: String,
     pub activation_epoch: i64,
+    pub cursor_source_id: i64,
+    pub effective_enabled_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "workspace_id",

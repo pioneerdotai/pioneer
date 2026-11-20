@@ -1545,7 +1545,7 @@ async fn dispatch_claim_commits_starting_activity_event_once_and_rolls_back_toge
         .execute_unprepared(
             "CREATE FUNCTION reject_starting() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected activity event failure'; END; $$;
          CREATE TRIGGER reject_starting BEFORE INSERT ON task_event FOR EACH ROW
-         WHEN (NEW.event_type='task/run/starting') EXECUTE FUNCTION reject_starting()",
+         WHEN (NEW.event_type='task/tree/changed' AND NEW.idempotency_key LIKE 'run:%:starting') EXECUTE FUNCTION reject_starting()",
         )
         .await
         .unwrap();

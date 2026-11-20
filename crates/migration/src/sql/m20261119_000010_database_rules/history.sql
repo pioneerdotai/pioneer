@@ -2371,7 +2371,7 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'published span immutable or logical input expired';
     END IF;
 
-    IF (NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=NEW.manifest_id AND h.expired=0) OR (EXISTS(SELECT 1 FROM compaction_frozen_layout l JOIN compaction_frozen_history h ON h.id=l.manifest_id WHERE l.manifest_id=NEW.manifest_id AND l.kind=NEW.kind AND l.active=1 AND h.ready=1) AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=NEW.manifest_id AND s.kind=NEW.kind AND s.start=NEW.start AND s.end=NEW.end AND s.source_manifest=NEW.source_manifest))) IS NOT TRUE THEN
+    IF (NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=NEW.manifest_id AND h.expired=0) OR (EXISTS(SELECT 1 FROM compaction_frozen_layout l JOIN compaction_frozen_history h ON h.id=l.manifest_id WHERE l.manifest_id=NEW.manifest_id AND l.kind=NEW.kind AND l.active=1 AND h.ready=1) AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=NEW.manifest_id AND s.kind=NEW.kind AND s."start"=NEW."start" AND s."end"=NEW."end" AND s.source_manifest=NEW.source_manifest))) IS NOT TRUE THEN
         RETURN NEW;
     END IF;
     RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'published span immutable or logical input expired';
@@ -4039,7 +4039,7 @@ CREATE OR REPLACE FUNCTION "compaction_frozen_sweep_span_update"()
 RETURNS trigger LANGUAGE plpgsql
 AS $trigger$
 BEGIN
-    IF (OLD.manifest_id IS DISTINCT FROM NEW.manifest_id OR OLD.kind IS DISTINCT FROM NEW.kind OR OLD.start IS DISTINCT FROM NEW.start OR OLD.end IS DISTINCT FROM NEW.end OR OLD.source_manifest IS DISTINCT FROM NEW.source_manifest) IS NOT TRUE THEN
+    IF (OLD.manifest_id IS DISTINCT FROM NEW.manifest_id OR OLD.kind IS DISTINCT FROM NEW.kind OR OLD."start" IS DISTINCT FROM NEW."start" OR OLD."end" IS DISTINCT FROM NEW."end" OR OLD.source_manifest IS DISTINCT FROM NEW.source_manifest) IS NOT TRUE THEN
         RETURN NEW;
     END IF;
     INSERT INTO compaction_frozen_sweep_work (manifest_id

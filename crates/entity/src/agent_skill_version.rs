@@ -7,47 +7,47 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_skill_version")]
 pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uq_agent_skill_version_fingerprint"
     )]
     pub skill_id: String,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uq_agent_skill_version_fingerprint"
-    )]
-    pub fingerprint: String,
-    #[sea_orm(column_type = "Text")]
-    pub when_to_use: String,
-    #[sea_orm(column_type = "Text")]
-    pub when_not_to_use: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub parent_version_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub source_turn_ids_json: String,
-    pub evidence_latest_at_unix: Option<i64>,
-    #[sea_orm(column_type = "Text")]
-    pub skill_markdown: String,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uq_agent_skill_version_run_candidate"
-    )]
-    pub candidate_key: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
+    #[sea_orm(unique_key = "uq_agent_skill_version_number")]
+    pub version_number: i64,
     #[sea_orm(
         column_type = "Text",
         nullable,
         unique_key = "uq_agent_skill_version_run_candidate"
     )]
     pub source_run_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub parent_version_id: Option<String>,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_skill_version_run_candidate"
+    )]
+    pub candidate_key: String,
     #[sea_orm(column_type = "Text")]
     pub display_name: String,
     #[sea_orm(column_type = "Text")]
+    pub skill_markdown: String,
+    #[sea_orm(column_type = "Text")]
     pub instruction_body: String,
+    #[sea_orm(column_type = "Text")]
+    pub when_to_use: String,
+    #[sea_orm(column_type = "Text")]
+    pub when_not_to_use: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_skill_version_fingerprint"
+    )]
+    pub fingerprint: String,
+    #[sea_orm(column_type = "Text")]
+    pub source_turn_ids_json: String,
     pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(unique_key = "uq_agent_skill_version_number")]
-    pub version_number: i64,
+    pub evidence_latest_at_unix: Option<i64>,
     #[sea_orm(
         belongs_to,
         from = "skill_id",

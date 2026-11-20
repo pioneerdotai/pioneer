@@ -5,7 +5,7 @@ use crate::tests::authorization::{
     MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID,
 };
 use pioneer_crud::*;
-use pioneer_memory::SqliteThreadEpisodicBackend;
+use pioneer_memory::PostgresThreadEpisodicBackend;
 use pioneer_protocol::{ItemCompletedNotification, TurnItem};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
@@ -757,7 +757,7 @@ async fn configured_provider_failure_keeps_lexical_results_and_reports_incomplet
         resolver.set_active_provider_unavailable_reason("controlled provider outage");
         let service = ThreadEpisodicRecallService::with_embedding_provider_resolver(
             p.crud_store.clone(),
-            Arc::new(SqliteThreadEpisodicBackend::new(p.crud_store.clone())),
+            Arc::new(PostgresThreadEpisodicBackend::new(p.crud_store.clone())),
             Some(resolver),
         );
         service.apply_config(ThreadEpisodicRecallServiceConfig {

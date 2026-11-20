@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "workspace")]
 pub struct Model {
-    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    pub is_current: bool,
-    pub is_active: bool,
     #[sea_orm(column_type = "Text")]
     pub name: String,
+    pub is_active: bool,
+    pub is_current: bool,
     pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(has_many)]
     pub actor_nickname_indices: HasMany<super::actor_nickname_index::Entity>,
     #[sea_orm(has_many)]

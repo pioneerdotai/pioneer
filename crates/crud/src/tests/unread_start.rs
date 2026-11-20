@@ -651,14 +651,13 @@ async fn rollback_retry_and_second_resolution_boundaries() {
         .unwrap();
         tx.rollback().await.unwrap();
         assert!(
-            unread_message_position::Entity::find_by_id((
-                THREAD.to_owned(),
-                "rollback-message".to_owned()
-            ))
-            .one(&f.store.connection)
-            .await
-            .unwrap()
-            .is_none()
+            unread_message_position::Entity::find()
+                .filter(unread_message_position::Column::ThreadId.eq(THREAD))
+                .filter(unread_message_position::Column::BlockId.eq("rollback-message"))
+                .one(&f.store.connection)
+                .await
+                .unwrap()
+                .is_none()
         );
         assert!(
             crate::find_workspace_membership(&f.store.connection, &f.member, WS)
@@ -687,12 +686,13 @@ async fn rollback_retry_and_second_resolution_boundaries() {
             .await
             .unwrap()
             .unwrap();
-        let publication =
-            unread_message_position::Entity::find_by_id((THREAD.to_owned(), raced.block_id))
-                .one(&f.store.connection)
-                .await
-                .unwrap()
-                .unwrap();
+        let publication = unread_message_position::Entity::find()
+            .filter(unread_message_position::Column::ThreadId.eq(THREAD.to_owned()))
+            .filter(unread_message_position::Column::BlockId.eq(raced.block_id))
+            .one(&f.store.connection)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             f.count(&f.member, THREAD).await,
             u64::from(publication.published_at > grant.created_at.timestamp())

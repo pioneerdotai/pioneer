@@ -10,17 +10,17 @@ use futures_util::SinkExt;
 use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn callback_acceptance_frees_same_websocket_for_cancel_during_exchange() {
     oauth_queue_cancellation(false, None, None, None).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn preparing_is_delivered_and_details_does_not_block_cancel_on_same_websocket() {
     oauth_queue_cancellation(true, None, None, None).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn authorized_event_cannot_restart_reinstalled_or_replaced_identity_after_notification_await()
 {
     for state in [
@@ -35,7 +35,7 @@ async fn authorized_event_cannot_restart_reinstalled_or_replaced_identity_after_
 }
 
 // One async worker verifies that the post-put async barrier yields to Cancel.
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 1)]
 async fn same_websocket_terminal_decision_after_durable_put_preserves_cancel_timeout_and_success() {
     use pioneer_mcp_oauth::OAuthState;
     for decision in [
@@ -47,7 +47,7 @@ async fn same_websocket_terminal_decision_after_durable_put_preserves_cancel_tim
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn other_installation_blocking_read_cannot_delay_same_websocket_details_and_cancel() {
     oauth_queue_cancellation_impl(false, None, None, None, true, None).await;
 }
@@ -1662,7 +1662,7 @@ impl Drop for QueueFixtureRelease {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_connections_stale_oauth_rpc_cannot_rebind_or_clear_replacement() {
     for action in ["sign_in", "callback", "cancel", "disconnect"] {
         for new_uuid in [false, true] {
@@ -1872,7 +1872,7 @@ async fn stale_rpc_replacement(
     current_socket.close(None).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn disabled_consent_commits_account_without_starting_runtime() {
     oauth_queue_cancellation(
         false,
@@ -1985,14 +1985,14 @@ impl pioneer_keystore::SecretStore for OtherInstallationRead {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn resolving_clear_failure_preserves_details_and_retry_on_same_websocket() {
     for mode in [1, 2, 3] {
         oauth_queue_cancellation_impl(false, None, None, None, false, Some(mode)).await;
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_management_clients_denied_then_other_consent_clear_delivers_current_cleanup() {
     oauth_queue_cancellation_impl(false, None, None, None, false, Some(4)).await;
 }

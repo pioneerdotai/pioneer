@@ -7,47 +7,48 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_cli_runtime_binding")]
 pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub runtime_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub runtime_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub native_thread_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub native_session_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub native_cwd: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
     pub native_root_thread_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    pub native_cwd: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub native_model: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub resume_cursor_json: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", nullable)]
     pub mcp_adapter_kind: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub runtime_id: String,
-    pub provider_session_last_verified_process_generation: Option<i64>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub thread_id: String,
     #[sea_orm(column_type = "Text", nullable)]
-    pub frozen_manifest_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub runtime_kind: String,
+    pub mcp_manifest_hash: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub mcp_projection_fingerprint: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
-    pub created_at: DateTimeWithTimeZone,
-    pub resume_cursor_json: Json,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_provider_contract_fingerprint: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub mcp_isolation_contract_fingerprint: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub mcp_provider_contract_fingerprint: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
+    pub provider_session_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub provider_session_lifecycle_state: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub provider_session_id: Option<String>,
     pub mcp_session_generation: Option<i64>,
-    #[sea_orm(column_type = "Text")]
-    pub native_thread_id: String,
-    pub updated_at: DateTimeWithTimeZone,
+    pub provider_session_last_verified_process_generation: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub mcp_manifest_hash: Option<String>,
+    pub frozen_manifest_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,17 +7,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_skill")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", unique_key = "uq_agent_skill_workspace_slug")]
-    pub workspace_id: String,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub active_version_id: Option<String>,
-    pub evidence_latest_at_unix: Option<i64>,
+    #[sea_orm(column_type = "Text", unique_key = "uq_agent_skill_workspace_slug")]
+    pub workspace_id: String,
     #[sea_orm(column_type = "Text", unique_key = "uq_agent_skill_workspace_slug")]
     pub slug: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub active_version_id: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    pub evidence_latest_at_unix: Option<i64>,
     #[sea_orm(
         belongs_to,
         from = "active_version_id",

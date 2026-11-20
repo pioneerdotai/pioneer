@@ -44,6 +44,7 @@ members = [
   "crates/migration",
   "crates/postgres",
   "crates/postgres-test",
+  "crates/postgres-test-macros",
   "crates/mcp",
   "crates/mcp-oauth",
   "crates/memory",

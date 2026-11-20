@@ -510,7 +510,7 @@ pub(super) async fn call(
         .unwrap_or_else(|error| panic!("{name} ({id}) failed: {error}"))
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delegated_root_route_survives_creator_completion_and_persisted_descendants() {
     use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
     let (processor, context, tools) = fixture().await;
@@ -592,7 +592,7 @@ async fn delegated_root_route_survives_creator_completion_and_persisted_descenda
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn inherited_configuration_survives_visible_thread_creation_message_and_start_replay() {
     let catalog = Arc::new(std::sync::RwLock::new(ChoiceCatalogResponse::Default));
     let (processor, context, tools) = fixture_with_parent(
@@ -1251,7 +1251,7 @@ async fn delegated_launch_target(
         .unwrap()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn source_at_max_depth_can_start_only_an_independent_root() {
     use sea_orm::PaginatorTrait;
     let (processor, mut context, mut tools) = fixture().await;
@@ -1607,7 +1607,7 @@ async fn source_at_max_depth_can_start_only_an_independent_root() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks() {
     use pioneer_agent::TaskToolProvider;
     for (model_selected, model_ids, second_provider, allowed) in [
@@ -1785,7 +1785,7 @@ async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks()
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn inherited_reasoning_replay_uses_committed_choice_when_catalog_changes() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     for unavailable in [false, true] {
@@ -1916,7 +1916,7 @@ async fn inherited_reasoning_replay_uses_committed_choice_when_catalog_changes()
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn inherited_other_cli_replay_does_not_reselect_a_model() {
     let (processor, context, tools) = fixture_with_parent(
         Default::default(),
@@ -2011,7 +2011,7 @@ async fn inherited_other_cli_replay_does_not_reselect_a_model() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay() {
     use pioneer_agent::TaskToolProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2338,7 +2338,7 @@ async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay()
     assert_eq!(calls.load(Ordering::SeqCst), before_denial);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn identity_models_catalog_exposes_model_reasoning_without_secrets_and_rejects_unavailable_models()
  {
     let (processor, context, tools) = fixture().await;
@@ -2615,7 +2615,7 @@ async fn identity_models_catalog_exposes_model_reasoning_without_secrets_and_rej
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn webhook_task_tools_create_get_and_replay_require_current_task_read() {
     use crate::authorization::ResourceAction;
     use pioneer_agent::TaskToolProvider;
@@ -2818,7 +2818,7 @@ async fn webhook_task_tools_create_get_and_replay_require_current_task_read() {
 
 // This crosses real action admission, canonical persistence, outbox dispatch,
 // native preparation and the recording provider. It never launches a process.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delegated_root_first_dispatch_replay_and_stop_have_an_independent_owner() {
     use sea_orm::{ActiveModelTrait, Set};
     for source_terminal in ["completed", "cancelled"] {
@@ -3068,7 +3068,7 @@ async fn finish_choice_source_foreground(
         .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn delegated_root_foreground_admission_rejects_competing_start_without_persisting_it() {
     use sea_orm::PaginatorTrait;
     for target_label in [
@@ -3276,7 +3276,7 @@ async fn delegated_root_foreground_admission_rejects_competing_start_without_per
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn queued_internal_thread_stop_releases_only_its_child_resources_before_dispatch() {
     use sea_orm::{ActiveModelTrait, Set};
     let probe = Arc::new(ChoiceRuntimeProbe::default());
@@ -3413,7 +3413,7 @@ async fn queued_internal_thread_stop_releases_only_its_child_resources_before_di
     assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn definitive_start_refusal_has_safe_cause_terminal_turn_and_released_resources() {
     use sea_orm::{ActiveModelTrait, Set};
     for denial in ["retired_identity", "suspended_initiator"] {
@@ -3543,7 +3543,7 @@ async fn definitive_start_refusal_has_safe_cause_terminal_turn_and_released_reso
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn persisted_foreground_conflict_refuses_pending_root_and_preserves_other_turn() {
     for target_label in [
         "New delegated root",
@@ -3668,7 +3668,7 @@ async fn persisted_foreground_conflict_refuses_pending_root_and_preserves_other_
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_shared_handler() {
     let (processor, context, tools) = fixture_with_principal_probe(
         Default::default(),
@@ -4125,7 +4125,7 @@ async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_
     assert!(authority.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() {
     use sea_orm::{ActiveModelTrait, Set};
     for (attempts, historical_grant) in [
@@ -4669,7 +4669,7 @@ async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() 
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn start_outbox_waits_for_accepted_terminal_projection_before_acknowledging_runtime() {
     use sea_orm::{ActiveModelTrait, Set};
     for attempts in [1, pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS] {
@@ -4830,7 +4830,7 @@ async fn start_outbox_waits_for_accepted_terminal_projection_before_acknowledgin
 
 // These faults occur at the real storage/activation boundaries. The fixture
 // database is disposable; no result is supplied in place of production dispatch.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or_exhaustion() {
     use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
     for fault in [
@@ -5749,7 +5749,7 @@ fn restart_choice_processor(processor: &Arc<MessageProcessor>) -> Arc<MessagePro
     ))
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn recovery_terminalization_cannot_apply_blocked_over_a_resumed_generation() {
     for resume_first in [true, false] {
         let probe = Arc::new(ChoiceRuntimeProbe::default());
@@ -5955,7 +5955,7 @@ async fn recovery_terminalization_cannot_apply_blocked_over_a_resumed_generation
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn detached_threads_action_recovers_after_commit_without_recreating_or_dispatching_parent() {
     let probe = Arc::new(ChoiceRuntimeProbe::default());
     let (processor, context, tools) = fixture_with_probe(
@@ -6207,7 +6207,7 @@ async fn expire_review_admission(processor: &Arc<MessageProcessor>, turn_id: &st
     owner.update(&db).await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn detached_admission_early_stop_preserves_live_source_graph_on_both_sides_of_task_commit() {
     for accepted in [false, true] {
         let probe = Arc::new(ChoiceRuntimeProbe::default());
@@ -6408,7 +6408,7 @@ async fn detached_admission_early_stop_preserves_live_source_graph_on_both_sides
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fresh_detached_rpc_completes_after_task_commit_when_authority_reload_fails() {
     let probe = Arc::new(ChoiceRuntimeProbe::default());
     let (processor, context, tools) = fixture_with_probe(
@@ -6630,7 +6630,7 @@ async fn fresh_detached_rpc_completes_after_task_commit_when_authority_reload_fa
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn replaced_gateway_resolves_detached_admission_before_commit_and_after_user_task_acceptance()
 {
     for (agent, accepted) in [(true, false), (false, false), (false, true)] {
@@ -6815,7 +6815,7 @@ async fn replaced_gateway_resolves_detached_admission_before_commit_and_after_us
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn terminal_detached_admission_outbox_preserves_outcome_and_acks_even_after_retry_budget() {
     use sea_orm::{ActiveModelTrait, Set};
     for status in [

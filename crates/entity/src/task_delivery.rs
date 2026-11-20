@@ -7,44 +7,44 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_delivery")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub delivered_turn_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub webhook_url_fingerprint: Option<String>,
-    pub next_attempt_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub delivered_notification_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_error: Option<String>,
-    pub delivered_at: Option<DateTimeWithTimeZone>,
-    pub result_snapshot_json: Option<Json>,
-    pub attempt_count: i64,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub task_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub run_id: String,
     #[sea_orm(column_type = "Text", unique)]
     pub delivery_key: String,
     #[sea_orm(column_type = "Text")]
     pub mode: String,
     #[sea_orm(column_type = "Text", nullable)]
+    pub target_thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub target_user_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub task_id: String,
-    pub max_attempts: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub webhook_url: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub target_thread_id: Option<String>,
-    pub error_snapshot_json: Option<Json>,
+    pub webhook_url_fingerprint: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub run_id: String,
+    pub status: String,
+    pub next_attempt_at: Option<DateTimeWithTimeZone>,
+    pub attempt_count: i64,
+    pub max_attempts: i64,
+    pub result_snapshot_json: Option<Json>,
+    pub error_snapshot_json: Option<Json>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub delivered_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub delivered_notification_id: Option<String>,
+    pub delivered_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_error: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", nullable)]
     pub thread_target: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
-    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(has_one)]
     pub compaction_delivery_output: HasOne<super::compaction_delivery_output::Entity>,
     #[sea_orm(has_one)]

@@ -7,24 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "user_notification_outbox")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
-    pub payload_json: Json,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub recipient_principal_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(column_type = "Text")]
-    pub run_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    #[sea_orm(column_type = "Text")]
-    pub task_id: String,
-    pub acknowledged_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", unique)]
     pub task_delivery_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub recipient_principal_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub task_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub run_id: String,
+    pub payload_json: Json,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub created_at: DateTimeWithTimeZone,
     pub delivered_at: DateTimeWithTimeZone,
+    pub acknowledged_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(
         belongs_to,
         from = "task_delivery_id",

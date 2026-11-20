@@ -383,7 +383,7 @@ async fn detached_parent_notifications_and_late_items_reads_preserve_authoritati
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn detached_work_absence_does_not_mask_unprepared_unhealthy_or_database_failures() {
     use pioneer_entity::turn_event_projection_stream_state as stream;
     for fault in [

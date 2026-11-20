@@ -110,7 +110,7 @@ async fn fixture() -> (MessageProcessor, Arc<CrudStore>) {
     (processor, store)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn poison_candidate_does_not_abort_batch_and_all_selected_rows_consume_budget() {
     let (processor, store) = fixture().await;
     let result = processor
@@ -161,7 +161,7 @@ async fn poison_candidate_does_not_abort_batch_and_all_selected_rows_consume_bud
     assert!(repaired.first_error.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn partial_success_is_not_reported_as_recovery_and_diagnostics_are_allowlisted() {
     use sentry::SentryFutureExt;
     use tracing::instrument::WithSubscriber;
@@ -200,7 +200,7 @@ async fn partial_success_is_not_reported_as_recovery_and_diagnostics_are_allowli
     assert!(!serialized.contains("reconciliation recovered after observed failures"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_post_commit_notification_does_not_restore_pending_or_repeat_domain_change() {
     let (processor, store) = fixture().await;
     let candidate = store
@@ -250,7 +250,7 @@ async fn failed_post_commit_notification_does_not_restore_pending_or_repeat_doma
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn transient_retry_classifier_error_does_not_replenish_whole_batch_budget() {
     use sea_orm::ConnectionTrait;
     let (processor, store) = fixture().await;
@@ -337,7 +337,7 @@ async fn transient_retry_classifier_error_does_not_replenish_whole_batch_budget(
     assert_eq!(next.pending, Some(false));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn sixty_four_persistent_claim_refusals_defer_and_allow_candidates_after_budget_to_progress()
 {
     use sea_orm::ConnectionTrait;
@@ -424,7 +424,7 @@ async fn sixty_four_persistent_claim_refusals_defer_and_allow_candidates_after_b
     assert_eq!(repaired.pending, Some(false));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn long_pass_uses_each_claim_reservation_time_instead_of_batch_start() {
     use std::sync::atomic::{AtomicI64, Ordering};
     let (processor, store) = fixture().await;
@@ -456,7 +456,7 @@ async fn long_pass_uses_each_claim_reservation_time_instead_of_batch_start() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn occurrence_reporting_waits_through_idle_backoff_until_background_or_event_repair_resolves_queue()
  {
     use sentry::SentryFutureExt;
@@ -557,7 +557,7 @@ async fn occurrence_reporting_waits_through_idle_backoff_until_background_or_eve
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_pending_observation_and_unknown_state_never_report_occurrence_recovery() {
     use sentry::SentryFutureExt;
     use tracing::instrument::WithSubscriber;
@@ -597,7 +597,7 @@ async fn failed_pending_observation_and_unknown_state_never_report_occurrence_re
     }));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compatibility_audit_failure_keeps_partial_summary_while_healthy_tickets_repair() {
     let (processor, store) = fixture().await;
     let db = store.database_connection();

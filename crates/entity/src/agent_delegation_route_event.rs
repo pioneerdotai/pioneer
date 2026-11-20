@@ -7,19 +7,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_delegation_route_event")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub authority_actor_json: String,
-    #[sea_orm(column_type = "Text", unique_key = "uq_agent_route_event_generation")]
-    pub route_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uq_agent_route_event_generation")]
-    pub route_generation: i64,
-    pub occurred_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", unique_key = "uq_agent_route_event_generation")]
+    pub route_id: String,
     #[sea_orm(column_type = "Text")]
     pub event_kind: String,
+    #[sea_orm(unique_key = "uq_agent_route_event_generation")]
+    pub route_generation: i64,
+    #[sea_orm(column_type = "Text")]
+    pub authority_actor_json: String,
     #[sea_orm(column_type = "Text")]
     pub authority_fingerprint: String,
+    pub occurred_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "route_id",

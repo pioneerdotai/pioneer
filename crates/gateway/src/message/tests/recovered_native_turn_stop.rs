@@ -1572,7 +1572,7 @@ enum InitialStopPhase {
 // Preparation is real admission, including the runtime snapshot and listener.
 // Retiring that actor before dispatch must produce a failure outcome even if
 // the dispatcher's existing recovery path successfully schedules recovery.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn prepared_native_dispatch_reports_retired_actor_instead_of_success() {
     exercise_initial_native_stop(InitialStopPhase::ActorRemovedBeforeDispatch).await;
 }
@@ -1580,72 +1580,72 @@ async fn prepared_native_dispatch_reports_retired_actor_instead_of_success() {
 // These phase tests use one executor thread: observing the control registry's
 // Applied process control observes its synchronous out-of-band cancellation.
 // Registration remains behind the barrier; no sleep or provider race is used.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_native_stop_finishes_actor_admission_before_context_registration() {
     exercise_initial_native_stop(InitialStopPhase::ActorBeforeRegistration).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_native_stop_switches_to_registered_context_when_early_writer_loses_phase() {
     exercise_initial_native_stop(InitialStopPhase::RegistrationWinsEarlyCommit).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_native_stop_follows_actor_appearing_before_registration() {
     exercise_initial_native_stop(InitialStopPhase::ActorAppearsBeforeRegistration).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_native_stop_retains_completion_after_the_process_ack_window() {
     exercise_initial_native_stop(InitialStopPhase::RegistrationAfterControlAckWindow).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_initial_stop_retains_completion_across_a_real_terminal_storage_failure() {
     exercise_initial_native_stop(InitialStopPhase::CanonicalStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_initial_stop_retains_completion_across_registration_storage_failure() {
     exercise_initial_native_stop(InitialStopPhase::RegistrationStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_initial_stop_retains_completion_across_registration_write_failure() {
     exercise_initial_native_stop(InitialStopPhase::RegistrationWriteStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_root_stop_finishes_a_direct_threads_child_after_delayed_registration() {
     exercise_initial_native_stop(InitialStopPhase::DirectChildBeforeRegistration).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_task_cancel_ack_keeps_the_actor_owning_delayed_durable_publication() {
     exercise_initial_native_stop(InitialStopPhase::NativeTaskBeforeRegistration).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_root_stop_rediscovers_unfinished_children_after_a_graph_fence() {
     exercise_initial_native_stop(InitialStopPhase::GraphFenceStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_initial_stop_waits_for_accepted_cancellation_projection() {
     exercise_initial_native_stop(InitialStopPhase::AcceptedProjectionPending).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_initial_stop_retains_actor_after_a_real_projection_failure() {
     exercise_initial_native_stop(InitialStopPhase::ProjectionStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_early_stop_and_repeat_wait_for_real_projection_without_an_actor() {
     exercise_initial_native_stop(InitialStopPhase::BeforeActorProjectionStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_root_stop_retries_a_direct_child_after_real_projection_failure() {
     exercise_initial_native_stop(InitialStopPhase::GraphFenceProjectionUnavailable).await;
 }

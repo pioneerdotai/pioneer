@@ -13941,105 +13941,109 @@ mod tests {
         ] {
             let (_, events) = crate::public_error::test_support::capture_events(|| {
                 tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-                    let mut harness = setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
-                    let thread_id = "backend-admission-thread";
-                    let turn_id = "backend-admission-turn";
-                    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
-                    let security = pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp", 1);
-                    let (sender, receiver) = tokio::sync::oneshot::channel();
-                    let response = TurnStartSuccessResponse::Task {
-                        permission_profile: security.permission_profile.clone(), execution_security_snapshot: security,
-                        continuation_thread_id: thread_id.to_owned(), context_thread_id: thread_id.to_owned(),
-                        task_run_id: "backend-admission-run".to_owned(), execution_id: "backend-admission-execution".to_owned(),
-                        agent_author: None, agent_turn_response: pioneer_crud::AgentTurnResponseInput {
-                            turn_id: turn_id.to_owned(), execution_id: "backend-admission-execution".to_owned(),
-                            presentation_snapshot_id: "backend-admission-presentation".to_owned(), now: pioneer_crud::utc_now(),
-                        }, admitted_outcome: None,
-                        completion: Arc::new(std::sync::Mutex::new(Some(sender))),
-                    };
-                    let request_id = RequestId::new("B".repeat(21)).unwrap();
-                    let config = crate::isolated_test_app_config().unwrap();
-                    let settings_name = crate::settings::normalize_settings_file_name(&config.gateway.settings_file_name).unwrap();
-                    let settings_path = harness.runtime_home.join(&settings_name);
-                    let mut settings = crate::settings::load_or_create_gateway_settings(&settings_path, config.gateway.settings_version, &settings_name).unwrap();
-                    let mut runtimes = settings.effective_cli_runtime_settings(&config.gateway);
-                    let expected_reason = match case {
-                        "manager" => { harness.processor.cli_runtime_manager = None; Some(TaskStartReason::LaunchSourceUnavailable) }
-                        "missing" => Some(TaskStartReason::LaunchSourceUnavailable),
-                        "disabled" => {
-                            runtimes.instances.iter_mut().find(|runtime| runtime.id == harness.runtime_id).unwrap().enabled = false;
-                            settings.set_cli_runtime_settings_for_tests(runtimes.clone()).unwrap();
+                     pioneer_postgres_test::with_test_databases(async {
+                        let mut harness = setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
+                        let thread_id = "backend-admission-thread";
+                        let turn_id = "backend-admission-turn";
+                        seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+                        let security = pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp", 1);
+                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                        let response = TurnStartSuccessResponse::Task {
+                            permission_profile: security.permission_profile.clone(), execution_security_snapshot: security,
+                            continuation_thread_id: thread_id.to_owned(), context_thread_id: thread_id.to_owned(),
+                            task_run_id: "backend-admission-run".to_owned(), execution_id: "backend-admission-execution".to_owned(),
+                            agent_author: None, agent_turn_response: pioneer_crud::AgentTurnResponseInput {
+                                turn_id: turn_id.to_owned(), execution_id: "backend-admission-execution".to_owned(),
+                                presentation_snapshot_id: "backend-admission-presentation".to_owned(), now: pioneer_crud::utc_now(),
+                            }, admitted_outcome: None,
+                            completion: Arc::new(std::sync::Mutex::new(Some(sender))),
+                        };
+                        let request_id = RequestId::new("B".repeat(21)).unwrap();
+                        let config = crate::isolated_test_app_config().unwrap();
+                        let settings_name = crate::settings::normalize_settings_file_name(&config.gateway.settings_file_name).unwrap();
+                        let settings_path = harness.runtime_home.join(&settings_name);
+                        let mut settings = crate::settings::load_or_create_gateway_settings(&settings_path, config.gateway.settings_version, &settings_name).unwrap();
+                        let mut runtimes = settings.effective_cli_runtime_settings(&config.gateway);
+                        let expected_reason = match case {
+                            "manager" => { harness.processor.cli_runtime_manager = None; Some(TaskStartReason::LaunchSourceUnavailable) }
+                            "missing" => Some(TaskStartReason::LaunchSourceUnavailable),
+                            "disabled" => {
+                                runtimes.instances.iter_mut().find(|runtime| runtime.id == harness.runtime_id).unwrap().enabled = false;
+                                settings.set_cli_runtime_settings_for_tests(runtimes.clone()).unwrap();
+                                crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
+                                Some(TaskStartReason::RuntimeNotReady)
+                            }
+                            "kind" => Some(TaskStartReason::CapabilityProjectionInvalid),
+                            "changed" => Some(TaskStartReason::RuntimeNotReady),
+                            "config_error" => {
+                                std::fs::write(&settings_path, b"{ invalid PRIVATE config payload").unwrap(); None
+                            }
+                            _ => unreachable!(),
+                        };
+                        let runtime_id = if case == "missing" { "absent-runtime" } else { &harness.runtime_id };
+                        let runtime_kind = if case == "kind" { CLIAgentRuntimeKind::Claude } else { CLIAgentRuntimeKind::Codex };
+                        let backend = harness.processor.validate_cli_runtime_turn_start_backend(
+                            harness.connection_id, request_id.clone(), runtime_id, runtime_kind, &response, thread_id, turn_id,
+                        ).await;
+                        if case == "changed" {
+                            // Capture the accepted backend, then change its config
+                            // before the remaining preparation phase revalidates it.
+                            let backend = backend.expect("initial backend admission");
+                            runtimes.instances.iter_mut().find(|runtime| runtime.id == harness.runtime_id).unwrap().display_name.push_str(" changed");
+                            settings.set_cli_runtime_settings_for_tests(runtimes).unwrap();
                             crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
-                            Some(TaskStartReason::RuntimeNotReady)
+                            let request: serde_json::Value = serde_json::from_str(&cli_runtime_turn_start_request_with_capabilities(
+                                request_id.as_str(), thread_id, turn_id, &harness.runtime_id, CLIAgentRuntimeKind::Codex, Vec::new(),
+                            )).unwrap();
+                            let params: TurnStartParams = serde_json::from_value(request["params"].clone()).unwrap();
+                            let thread = harness.processor.thread_manager.thread_get(thread_id).await.unwrap();
+                            let failure = harness.processor.prepare_cli_runtime_combined_preflight(
+                                &thread, &params, &harness.runtime_id, CLIAgentRuntimeKind::Codex, &backend,
+                                crate::cli_runtime::skills::partition_cli_runtime_capabilities(&[]).unwrap(), Vec::new(), false, true,
+                            ).await.err().expect("changed config must refuse preparation");
+                            harness.processor.send_turn_start_failure(harness.connection_id, request_id, &response, thread_id, turn_id, failure).await;
+                        } else {
+                            assert!(backend.is_none(), "{case}");
                         }
-                        "kind" => Some(TaskStartReason::CapabilityProjectionInvalid),
-                        "changed" => Some(TaskStartReason::RuntimeNotReady),
-                        "config_error" => {
-                            std::fs::write(&settings_path, b"{ invalid PRIVATE config payload").unwrap(); None
+                        let mut error = receiver.await.unwrap().err().unwrap();
+                        let failure = error.downcast_ref::<TaskStartFailure>().unwrap();
+                        assert_eq!(failure.reporting(), TaskStartReporting::Reported);
+                        assert_eq!(failure.descriptor().stage, TaskStartStage::CliAdmission);
+                        assert_eq!(failure.descriptor().reason, expected_reason);
+                        assert_eq!(failure.descriptor().cause, match case {
+                            "kind" => TaskStartCause::Validation, "config_error" => TaskStartCause::Unclassified, _ => TaskStartCause::Refusal,
+                        });
+                        let public = failure.public_error().unwrap().clone();
+                        assert_eq!(public.code, if case == "changed" { pioneer_protocol::PublicErrorCode::InvalidInput } else { pioneer_protocol::PublicErrorCode::Internal });
+                        assert_eq!(failure.descriptor().correlation_id.as_deref(), Some(public.correlation_id.as_str()));
+                        let descriptor = TaskStartFailure::report_for_scheduler(&mut error);
+                        assert_eq!(TaskStartFailure::report_for_scheduler(&mut error), descriptor);
+                        let saved = descriptor.task_error(Some("backend-admission-run".to_owned()));
+                        let Some(pioneer_protocol::TaskValue::Object(details)) = &saved.details else { panic!("durable safe details"); };
+                        assert_eq!(details.get("stage"), Some(&pioneer_protocol::TaskValue::from("cli_admission")));
+                        assert_eq!(details.get("cause"), Some(&pioneer_protocol::TaskValue::from(match case {
+                            "kind" => "validation", "config_error" => "unclassified", _ => "refusal",
+                        })));
+                        let reason = match case {
+                            "manager" | "missing" => Some("launch_source_unavailable"),
+                            "disabled" | "changed" => Some("runtime_not_ready"),
+                            "kind" => Some("capability_projection_invalid"), _ => None,
+                        };
+                        assert_eq!(details.get("reason"), reason.map(pioneer_protocol::TaskValue::from).as_ref());
+                        let encoded = serde_json::to_string(&saved).unwrap();
+                        assert!(encoded.contains(&public.correlation_id));
+                        assert!(!encoded.contains("PRIVATE"));
+                        assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+                        assert!(harness.crud_store.get_turn(thread_id, turn_id).await.unwrap().is_none());
+                        if case != "config_error" {
+                            // Flush refusal breadcrumbs; this is a test checkpoint,
+                            // not an additional report for the refused launch.
+                            tracing::error!("backend refusal breadcrumb checkpoint");
                         }
-                        _ => unreachable!(),
-                    };
-                    let runtime_id = if case == "missing" { "absent-runtime" } else { &harness.runtime_id };
-                    let runtime_kind = if case == "kind" { CLIAgentRuntimeKind::Claude } else { CLIAgentRuntimeKind::Codex };
-                    let backend = harness.processor.validate_cli_runtime_turn_start_backend(
-                        harness.connection_id, request_id.clone(), runtime_id, runtime_kind, &response, thread_id, turn_id,
-                    ).await;
-                    if case == "changed" {
-                        // Capture the accepted backend, then change its config
-                        // before the remaining preparation phase revalidates it.
-                        let backend = backend.expect("initial backend admission");
-                        runtimes.instances.iter_mut().find(|runtime| runtime.id == harness.runtime_id).unwrap().display_name.push_str(" changed");
-                        settings.set_cli_runtime_settings_for_tests(runtimes).unwrap();
-                        crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
-                        let request: serde_json::Value = serde_json::from_str(&cli_runtime_turn_start_request_with_capabilities(
-                            request_id.as_str(), thread_id, turn_id, &harness.runtime_id, CLIAgentRuntimeKind::Codex, Vec::new(),
-                        )).unwrap();
-                        let params: TurnStartParams = serde_json::from_value(request["params"].clone()).unwrap();
-                        let thread = harness.processor.thread_manager.thread_get(thread_id).await.unwrap();
-                        let failure = harness.processor.prepare_cli_runtime_combined_preflight(
-                            &thread, &params, &harness.runtime_id, CLIAgentRuntimeKind::Codex, &backend,
-                            crate::cli_runtime::skills::partition_cli_runtime_capabilities(&[]).unwrap(), Vec::new(), false, true,
-                        ).await.err().expect("changed config must refuse preparation");
-                        harness.processor.send_turn_start_failure(harness.connection_id, request_id, &response, thread_id, turn_id, failure).await;
-                    } else {
-                        assert!(backend.is_none(), "{case}");
-                    }
-                    let mut error = receiver.await.unwrap().err().unwrap();
-                    let failure = error.downcast_ref::<TaskStartFailure>().unwrap();
-                    assert_eq!(failure.reporting(), TaskStartReporting::Reported);
-                    assert_eq!(failure.descriptor().stage, TaskStartStage::CliAdmission);
-                    assert_eq!(failure.descriptor().reason, expected_reason);
-                    assert_eq!(failure.descriptor().cause, match case {
-                        "kind" => TaskStartCause::Validation, "config_error" => TaskStartCause::Unclassified, _ => TaskStartCause::Refusal,
-                    });
-                    let public = failure.public_error().unwrap().clone();
-                    assert_eq!(public.code, if case == "changed" { pioneer_protocol::PublicErrorCode::InvalidInput } else { pioneer_protocol::PublicErrorCode::Internal });
-                    assert_eq!(failure.descriptor().correlation_id.as_deref(), Some(public.correlation_id.as_str()));
-                    let descriptor = TaskStartFailure::report_for_scheduler(&mut error);
-                    assert_eq!(TaskStartFailure::report_for_scheduler(&mut error), descriptor);
-                    let saved = descriptor.task_error(Some("backend-admission-run".to_owned()));
-                    let Some(pioneer_protocol::TaskValue::Object(details)) = &saved.details else { panic!("durable safe details"); };
-                    assert_eq!(details.get("stage"), Some(&pioneer_protocol::TaskValue::from("cli_admission")));
-                    assert_eq!(details.get("cause"), Some(&pioneer_protocol::TaskValue::from(match case {
-                        "kind" => "validation", "config_error" => "unclassified", _ => "refusal",
-                    })));
-                    let reason = match case {
-                        "manager" | "missing" => Some("launch_source_unavailable"),
-                        "disabled" | "changed" => Some("runtime_not_ready"),
-                        "kind" => Some("capability_projection_invalid"), _ => None,
-                    };
-                    assert_eq!(details.get("reason"), reason.map(pioneer_protocol::TaskValue::from).as_ref());
-                    let encoded = serde_json::to_string(&saved).unwrap();
-                    assert!(encoded.contains(&public.correlation_id));
-                    assert!(!encoded.contains("PRIVATE"));
-                    assert!(harness.cli_session.turn_starts.lock().await.is_empty());
-                    assert!(harness.crud_store.get_turn(thread_id, turn_id).await.unwrap().is_none());
-                    if case != "config_error" {
-                        // Flush refusal breadcrumbs; this is a test checkpoint,
-                        // not an additional report for the refused launch.
-                        tracing::error!("backend refusal breadcrumb checkpoint");
-                    }
-                });
+                     })
+                     .await
+                     .expect("close isolated PostgreSQL test databases")
+                 });
             });
             assert_eq!(events.len(), 1, "{case}");
             if case != "config_error" {

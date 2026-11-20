@@ -191,7 +191,7 @@ async fn cli_active_binding_pages_bound_ties_status_changes_and_restart() {
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_active_binding_plans_seek_both_statuses_and_empty_active_history() {
     let (store, queries) = test_store_with_workspace_and_query_counter("ws_active_page").await;
     history(&store).await;
@@ -387,7 +387,7 @@ async fn cli_active_binding_discovery_uses_query_only_maintenance_reader_and_can
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_active_binding_index_down_and_up_preserve_domain_and_workspace_index() {
     let store = test_store_with_workspace("ws_active_page").await;
     history(&store).await;
@@ -541,7 +541,7 @@ async fn commit_control_guard(
         .await
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_terminal_guard_rejects_starting_activation_terminal_and_canonical_resume() {
     for control_only in [false, true] {
         for change in ["running", "terminal", "resume"] {
@@ -631,7 +631,7 @@ async fn cli_terminal_guard_rejects_starting_activation_terminal_and_canonical_r
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_control_terminal_guard_fences_mapping_replacement_at_same_timestamp() {
     let (store, logical_guard) = terminal_guard_fixture().await;
     store
@@ -705,7 +705,7 @@ async fn cli_control_terminal_guard_fences_mapping_replacement_at_same_timestamp
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_terminal_guard_rejects_same_timestamp_status_aba_with_new_recovery_attempt() {
     let (store, guard) = terminal_guard_fixture().await;
     let (_, next) = store
@@ -741,7 +741,7 @@ async fn cli_terminal_guard_rejects_same_timestamp_status_aba_with_new_recovery_
     assert_eq!(next.status, CliRuntimeTurnAttemptStatus::Starting);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_terminal_guard_repairs_active_projection_atomically_and_rolls_back_on_projection_error()
  {
     let (store, guard) = terminal_guard_fixture().await;
@@ -800,7 +800,7 @@ async fn cli_terminal_guard_repairs_active_projection_atomically_and_rolls_back_
     assert!(commit_guard(&store, &guard).await.unwrap().is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_terminal_guard_rejects_reacquired_execution_owner_at_equal_timestamp() {
     let (store, guard) = terminal_guard_fixture().await;
     let db = store.database_connection();
@@ -865,7 +865,7 @@ async fn cli_terminal_guard_rejects_reacquired_execution_owner_at_equal_timestam
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_terminal_guard_accepts_completed_attempt_after_its_own_starting_running_transitions() {
     let (store, guard) = terminal_guard_fixture().await;
     store
@@ -1019,7 +1019,7 @@ async fn commit_blocked_source(
         .await
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_blocked_atomic_source_guard_rejects_new_attempt_and_changed_recovery_authority() {
     let (store, snapshot, old_guard) = blocked_source_fixture().await;
     let timestamp = snapshot.binding.created_at;
@@ -1140,7 +1140,7 @@ async fn cli_blocked_atomic_source_guard_rejects_new_attempt_and_changed_recover
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_blocked_atomic_source_guard_rejects_execution_generation_aba_at_equal_timestamp() {
     let (store, snapshot, _) = blocked_source_fixture().await;
     let binding = &snapshot.binding;
@@ -1270,7 +1270,7 @@ async fn native_delivery_fixture() -> (
     (store.with_maintenance_access(), source, event)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_native_terminal_source_write_preserves_first_outcome_and_rolls_back_on_storage_failure()
  {
     let (store, source, event) = native_delivery_fixture().await;
@@ -1344,7 +1344,7 @@ async fn cli_native_terminal_source_write_preserves_first_outcome_and_rolls_back
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_native_terminal_source_write_rejects_owner_aba_even_with_same_binding_and_timestamp() {
     let (store, _, event) = native_delivery_fixture().await;
     let timestamp = event.created_at;
@@ -1449,7 +1449,7 @@ async fn cli_native_terminal_source_write_rejects_owner_aba_even_with_same_bindi
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_accepted_outcome_wins_recovery_preparation_writer_and_preserves_sources() {
     let (store, source, mut event) = native_delivery_fixture().await;
     event.id = source.terminal_delivery_id();
@@ -1517,7 +1517,7 @@ async fn cli_accepted_outcome_wins_recovery_preparation_writer_and_preserves_sou
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_task_continuation_rolls_back_and_replays_across_scopes_without_a_new_window() {
     for already_completed in [false, true] {
         let (store, _, mut terminal) = native_delivery_fixture().await;
@@ -1730,7 +1730,7 @@ async fn cli_task_continuation_rolls_back_and_replays_across_scopes_without_a_ne
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_stalled_task_blocked_commits_accepted_outcome_ack_atomically() {
     let (store, mut source, mut terminal) = native_delivery_fixture().await;
     terminal.id = source.terminal_delivery_id();
@@ -1809,17 +1809,11 @@ async fn cli_stalled_task_blocked_commits_accepted_outcome_ack_atomically() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn addressed_timeout_pages_keep_turn_scope_and_revisit_changes_behind_cursor() {
-    let store = test_store_with_zstd_turn_items().await;
-    store
-        .database_connection()
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
     let at = 1_700_000_000;
     let thread = sample_thread("ws_addressed_control", "thread_addressed_control", at);
-    seed_observation_workspace(&store, &thread.workspace_id).await;
+    let store = test_store_with_workspace(&thread.workspace_id).await;
     for turn_id in ["api_addressed", "other_addressed"] {
         store
             .materialize_turn_start(
@@ -1941,7 +1935,7 @@ async fn addressed_timeout_pages_keep_turn_scope_and_revisit_changes_behind_curs
     assert!(commands.iter().all(|row| row.turn_id == "api_addressed"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_ack_replay_keeps_control_quiet_and_reinsert_wakes_its_turn() {
     let (store, source, event) = native_delivery_fixture().await;
     let database = store.database_connection();

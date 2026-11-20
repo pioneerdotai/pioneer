@@ -7,28 +7,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_checkpoint_replay_alias")]
 pub struct Model {
-    #[sea_orm(primary_key)]
-    pub insertion_ordinal: i64,
+    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
+    pub checkpoint_id: String,
+    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
+    pub covered_thread: String,
+    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
+    pub covered_scope: String,
+    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
+    pub covered_id: String,
+    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
+    pub covered_version: String,
     #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
     pub replay_thread: String,
+    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
+    pub replay_scope: String,
     #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
     pub replay_id: String,
     #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
     pub replay_version: String,
-    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
-    pub replay_scope: String,
-    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
-    pub covered_scope: String,
-    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
-    pub checkpoint_id: String,
-    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
-    pub covered_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub tool_item_id: Option<String>,
-    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
-    pub covered_thread: String,
-    #[sea_orm(column_type = "Text", unique_key = "checkpoint_replay_alias_identity")]
-    pub covered_version: String,
+    #[sea_orm(primary_key)]
+    pub insertion_ordinal: i64,
     #[sea_orm(
         belongs_to,
         from = "checkpoint_id",

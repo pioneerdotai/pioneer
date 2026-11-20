@@ -7,15 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_context")]
 pub struct Model {
-    pub format_version: i64,
-    #[sea_orm(column_type = "Text")]
-    pub thread_id: String,
     #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub head: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub owner: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub head: Option<String>,
+    pub format_version: i64,
     #[sea_orm(has_many)]
     pub compaction_operations: HasMany<super::compaction_operation::Entity>,
     #[sea_orm(

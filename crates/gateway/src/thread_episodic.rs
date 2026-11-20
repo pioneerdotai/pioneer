@@ -3948,8 +3948,8 @@ mod tests {
     use pioneer_memory::ThreadEpisodicSearchProfile;
     use pioneer_memory::{
         InMemoryMemoryBackend, MemoryOperationContext, MemoryService, MemoryServiceConfig,
-        SqliteThreadEpisodicBackend, ThreadEpisodicEmbeddingErrorKind, ThreadEpisodicSearchOutput,
-        ThreadEpisodicSearchProfileKind, ThreadEpisodicSearchRequest,
+        PostgresThreadEpisodicBackend, ThreadEpisodicEmbeddingErrorKind,
+        ThreadEpisodicSearchOutput, ThreadEpisodicSearchProfileKind, ThreadEpisodicSearchRequest,
     };
     use pioneer_protocol::ThreadEpisodicSourceActorRole;
     use pioneer_protocol::{AgentMessagePhase, TaskStatus, TaskTurnItem, TurnItem, TurnItemType};
@@ -4323,7 +4323,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_reindex_from_history_creates_missing_pending_job() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_reindex_missing_job";
@@ -4385,7 +4385,7 @@ mod tests {
         assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Queued);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_reindex_from_history_does_not_duplicate_indexed_items() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_reindex_no_duplicate";
@@ -4445,7 +4445,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_reindex_uses_canonical_task_summaries_for_all_discovered_items() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_reindex_canonical_task_summaries";
@@ -4549,7 +4549,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_reindex_reconciles_failed_source_version_and_rejects_late_worker() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_reindex_changed_source";
@@ -4737,7 +4737,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_attempt_token_rejects_delayed_a_result_after_a_b_a() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_attempt_a_b_a";
@@ -4916,7 +4916,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_executor_reconciles_source_changed_during_backend_call() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_source_changes_during_backend";
@@ -5017,7 +5017,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_executor_reconciles_source_changed_before_backend_failure_commit() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_source_changes_before_failure_commit";
@@ -5088,7 +5088,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_executor_reconciles_source_changed_after_enqueue() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_source_changes_after_enqueue";
@@ -5156,7 +5156,7 @@ mod tests {
         assert_eq!(requests[0].text, "current version");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn direct_snapshot_restores_unfinished_a_version_before_next_claim() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let item = |text: &str| TurnItem::UserMessage {
@@ -5236,7 +5236,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn direct_snapshot_of_ready_content_ignores_timestamp_and_markdown_changes() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let item = |markdown: Option<String>| TurnItem::AgentMessage {
@@ -5314,7 +5314,7 @@ mod tests {
         assert_eq!(backend.requests().await.len(), 1);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn ordinary_ingest_restores_completed_superseded_source_without_reindexing() {
         use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
         for (vector, projection_replaced) in
@@ -5613,7 +5613,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn ordinary_ingest_requeues_unfinished_superseded_source_on_return() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_ingest_restore_unfinished";
@@ -5790,7 +5790,7 @@ mod tests {
         assert_eq!(backend.requests().await.len(), 2);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_exclusion_during_backend_rejects_result_and_stops_reindexing() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_excluded_during_backend";
@@ -5879,7 +5879,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_executor_retires_stably_missing_source_without_retry_loop() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let item = seed_thread_episodic_item_with_state(
@@ -5949,7 +5949,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_reconcile_recovers_only_proven_legacy_hash_mismatch() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_legacy_hash_returned";
@@ -6058,7 +6058,7 @@ mod tests {
         assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Completed);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_exclusion_reclassifies_old_canceled_error_for_refill() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let item = seed_pending_thread_episodic_item(
@@ -6230,7 +6230,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_persistence_recovery_obeys_backoff_limit_and_attempt_token() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let item = seed_pending_thread_episodic_item(
@@ -6343,7 +6343,7 @@ mod tests {
         assert_eq!(terminal.attempt_count, second.attempt_count);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_user_tombstone_is_not_reclassified_as_superseded() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_user_tombstone_reconcile";
@@ -6504,7 +6504,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_claim_recovers_legacy_active_item_running_job_boundary() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let item = seed_active_thread_episodic_item(
@@ -6591,7 +6591,7 @@ mod tests {
         assert!(repeated.is_empty());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_many_source_versions_reconcile_in_bounded_quanta() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_many_source_versions";
@@ -6679,7 +6679,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_retirement_repairs_legacy_exclusion_and_deletion_in_quanta() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_legacy_lifecycle_retirement";
@@ -7052,7 +7052,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn durable_memory_forget_does_not_tombstone_thread_episodic_items() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let item = seed_active_thread_episodic_item(
@@ -7312,7 +7312,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn vector_payload_provider_maps_configuration_embedding_failure_terminal() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let item = seed_pending_thread_episodic_item(
@@ -7354,7 +7354,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn ordinary_discovery_is_bounded_and_busy_prefix_cannot_starve_other_workspaces() {
         use sea_orm::{EntityTrait, Set};
         let (store, workspace) = setup_thread_episodic_store().await;
@@ -7372,7 +7372,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let backend = Arc::new(SqliteThreadEpisodicBackend::new(store.clone()));
+        let backend = Arc::new(PostgresThreadEpisodicBackend::new(store.clone()));
         let executor = ThreadEpisodicIndexExecutor::new(
             store.clone(),
             backend,
@@ -7580,7 +7580,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn ordinary_request_identity_change_after_claim_cannot_publish_old_projection() {
         use crate::database::startup::thread_episodic_refill as refill;
         for dimension_b in [3, 4] {
@@ -7645,7 +7645,7 @@ mod tests {
             let executor = Arc::new(
                 ThreadEpisodicIndexExecutor::new(
                     store.clone(),
-                    Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                    Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                     Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                         Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                         resolver.clone(),
@@ -7744,7 +7744,7 @@ mod tests {
             let resumed = Arc::new(
                 ThreadEpisodicIndexExecutor::new(
                     store.clone(),
-                    Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                    Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                     Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                         Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                         resolver.clone(),
@@ -7843,7 +7843,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn ordinary_same_identity_exhaustion_is_provider_free_and_preserves_ready_projection() {
         use crate::database::startup::thread_episodic_refill as refill;
         for status in [
@@ -7923,7 +7923,7 @@ mod tests {
             let executor = Arc::new(
                 ThreadEpisodicIndexExecutor::new(
                     store.clone(),
-                    Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                    Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                     Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                         Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                         resolver.clone(),
@@ -7983,7 +7983,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn settings_cancel_runtime_transition_releases_its_claim_without_renewing_budget() {
         use crate::database::startup::thread_episodic_refill as refill;
         let (store, workspace) = setup_thread_episodic_store().await;
@@ -8042,7 +8042,7 @@ mod tests {
         let executor = Arc::new(
             ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                 Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                     Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                     resolver.clone(),
@@ -8236,7 +8236,7 @@ mod tests {
             let executor = Arc::new(
                 ThreadEpisodicIndexExecutor::new(
                     store.clone(),
-                    Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                    Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                     Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                         Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                         resolver.clone(),
@@ -8376,7 +8376,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn managed_refill_retry_wait_does_not_block_ready_workspace_runner() {
         use crate::database::startup::thread_episodic_refill as refill;
         let (store, a) = setup_thread_episodic_store().await;
@@ -8433,7 +8433,7 @@ mod tests {
         let executor = Arc::new(
             ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                 Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                     Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
                     resolver.clone(),
@@ -8514,7 +8514,7 @@ mod tests {
         let executor = Arc::new(
             ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                 Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store)),
             )
             .with_projection_runtime(
@@ -8567,7 +8567,7 @@ mod tests {
         mark_thread_episodic_workspace_refill_complete_for_test(store, name).await;
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn runner_observes_other_workspace_release_and_future_deadline_while_a_stays_busy() {
         let (store, a) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
@@ -8640,7 +8640,7 @@ mod tests {
         drop(a_owner);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn claim_budget_terminal_write_set_rolls_back_and_rechecks_current_snapshot() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let now = chrono::Utc::now().timestamp();
@@ -8748,7 +8748,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn runner_preserves_same_second_source_wake_across_failed_discovery_page() {
         let (store, first_workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
@@ -8901,7 +8901,7 @@ mod tests {
         drop(owners);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn runner_hands_off_deadline_crossed_between_frozen_round_and_idle() {
         let (store, a) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
@@ -8971,7 +8971,7 @@ mod tests {
         let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
         let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+            Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
             Arc::new(PausedNativePayloadProvider {
                 inner: StoreThreadEpisodicIndexPayloadProvider::new(store.clone()),
                 pause: AsyncMutex::new(Some((claimed_tx, release_rx))),
@@ -9032,7 +9032,7 @@ mod tests {
         resumed.shutdown().await;
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn permanently_rejected_a_settlement_does_not_prohibit_b_c_with_quantum_one() {
         use sea_orm::TransactionTrait;
         let (store, a) = setup_thread_episodic_store().await;
@@ -9170,7 +9170,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn fixed_round_revisits_busy_b_despite_continuously_appended_suffix() {
         let (store, a) = setup_thread_episodic_store().await;
         let b = "round_busy_b";
@@ -9217,7 +9217,7 @@ mod tests {
         executor.shutdown().await;
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn owned_attempts_recover_readiness_failure_and_ambiguous_commit_without_new_wake() {
         for ambiguous in [false, true] {
             let (store, a) = setup_thread_episodic_store().await;
@@ -9269,7 +9269,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn owned_attempt_recovers_both_failed_bookkeeping_paths_and_fences_late_recovery() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
@@ -9387,7 +9387,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn ordinary_candidate_unwinds_preserve_a_c_and_observe_b_before_recovery() {
         use sea_orm::TransactionTrait;
         for stage in ["claim", "creation", "poll", "result", "settlement"] {
@@ -9424,7 +9424,7 @@ mod tests {
                 };
             let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                 payload,
             ));
             executor.use_managed_time_for_test();
@@ -9618,7 +9618,7 @@ mod tests {
         executor
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn native_executor_batches_within_existing_candidate_quantum_and_item_bound() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let backend = Arc::new(RecordingValidationBackend::default());
@@ -9730,7 +9730,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn byte_bound_and_prevalidation_poison_preserve_healthy_native_progress() {
         for case in 0..3 {
             let poison = case == 2;
@@ -9807,7 +9807,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn executor_separates_prepared_vector_identity_and_workspace_capsules() {
         for different_workspace in [false, true] {
             let (store, workspace) = setup_thread_episodic_store().await;
@@ -9863,7 +9863,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn shared_file_failure_and_unknown_commit_never_ack_and_retry_singly() {
         for published in [false, true] {
             let (store, workspace) = setup_thread_episodic_store().await;
@@ -9939,7 +9939,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn partial_db_completion_after_native_batch_commit_replays_only_unacked_job() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let backend = Arc::new(RecordingValidationBackend::default());
@@ -9989,7 +9989,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn committed_batch_keeps_source_exclusion_and_stale_attempt_cas_per_job() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let backend = Arc::new(RecordingValidationBackend::default());
@@ -10096,7 +10096,7 @@ mod tests {
     }
 
     struct BlockingNativeRunnerBackend {
-        native: Arc<SqliteThreadEpisodicBackend>,
+        native: Arc<PostgresThreadEpisodicBackend>,
         barrier: AsyncMutex<
             Option<(
                 tokio::sync::oneshot::Sender<()>,
@@ -10225,13 +10225,13 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
     async fn canceled_quantum_and_canceled_join_keep_every_batch_claim_visible_to_shutdown() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let backend = Arc::new(BlockingNativeRunnerBackend {
-            native: Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+            native: Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
             barrier: AsyncMutex::new(Some((started_tx, release_rx))),
         });
         let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
@@ -10305,13 +10305,13 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
     async fn runner_shutdown_joins_blocking_write_and_rejects_subsequent_wakes() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let backend = Arc::new(BlockingNativeRunnerBackend {
-            native: Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+            native: Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
             barrier: AsyncMutex::new(Some((started_tx, release_rx))),
         });
         let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
@@ -10462,7 +10462,7 @@ mod tests {
         (store, workspace)
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn runner_shutdown_cancels_idle_ownership_writer_and_provider_waits() {
         use sea_orm::TransactionTrait;
         for phase in ["idle", "ownership", "writer", "provider"] {
@@ -10481,7 +10481,7 @@ mod tests {
             });
             let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+                Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
                 payload,
             ));
             let job = if phase == "idle" {
@@ -10586,7 +10586,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn bounded_candidate_claim_rechecks_due_and_never_dispatches_failed_commit() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let root = TempDir::new().unwrap();
@@ -10608,7 +10608,7 @@ mod tests {
         .await;
         let executor = ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+            Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
         );
         store.database_connection().execute_unprepared("CREATE TRIGGER reject_candidate_claim BEFORE UPDATE ON thread_episodic_index_jobs WHEN NEW.status = 'running' BEGIN SELECT RAISE(ABORT, 'controlled claim rollback'); END").await.unwrap();
@@ -10892,7 +10892,7 @@ mod tests {
         let (prepared_tx, prepared_rx) = tokio::sync::oneshot::channel();
         let executor_a = Arc::new(ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+            Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
             Arc::new(PausedIndexPayloadProvider {
                 inner: Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                     Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
@@ -10987,7 +10987,7 @@ mod tests {
             .unwrap();
         let executor_b = ThreadEpisodicIndexExecutor::new(
             store.clone(),
-            Arc::new(SqliteThreadEpisodicBackend::new(store.clone())),
+            Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
             executor_a.payload_provider.clone(),
         );
         // The transition owns this workspace, but canonical source/job writes
@@ -11209,7 +11209,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn late_refill_preserves_live_executor_claim_and_ready_projection() {
         use crate::database::startup::thread_episodic_refill as refill;
         let (store, workspace) = setup_thread_episodic_store().await;
@@ -11453,7 +11453,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn complete_custom_projection_keeps_old_frames_through_preflight_and_retry_errors() {
         use crate::database::startup::thread_episodic_refill as refill;
         use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
@@ -11632,7 +11632,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
     async fn additional_refill_cancellation_after_embedding_claim_keeps_complete_projection() {
         use crate::database::startup::thread_episodic_refill as refill;
         let (store, workspace) = setup_thread_episodic_store().await;
@@ -11834,7 +11834,7 @@ mod tests {
         let mut profile =
             ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
         profile.mode = ThreadEpisodicSearchMode::Lexical;
-        let output = SqliteThreadEpisodicBackend::new(store.clone())
+        let output = PostgresThreadEpisodicBackend::new(store.clone())
             .search(ThreadEpisodicSearchRequest {
                 access: pioneer_crud::ThreadEpisodicSearchAccess::default(),
                 workspace_id: workspace.clone(),
@@ -11861,20 +11861,8 @@ mod tests {
     }
 
     async fn setup_thread_episodic_store() -> (Arc<CrudStore>, String) {
-        pioneer_sqlite::search::register_auto_extension_once().unwrap();
-        let connection = Database::connect({
-            let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-            options
-                .max_connections(1)
-                .sqlx_logging(false)
-                .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
-            options
-        })
-        .await
-        .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.unwrap();
         bootstrap(&connection)
             .await
             .expect("gateway bootstrap should create default workspace");
@@ -11884,13 +11872,15 @@ mod tests {
             .exec(&connection)
             .await
             .unwrap();
-        let workspace_manager = WorkspaceManager::new(connection.clone());
+        let reader = fixture.connect_read_only().await.unwrap();
+        let database = pioneer_sqlite::SqliteDatabase::new(reader, connection);
+        let workspace_manager = WorkspaceManager::new(database.clone());
         let workspace_id = workspace_manager
             .create_workspace(&pioneer_protocol::generate_id(21), Some("Episodic test"))
             .await
             .expect("isolated workspace should exist")
             .id;
-        let crud_store = Arc::new(CrudStore::new(connection));
+        let crud_store = Arc::new(CrudStore::new(database));
         mark_thread_episodic_workspace_refill_complete_for_test(crud_store.as_ref(), &workspace_id)
             .await;
         (crud_store, workspace_id)
@@ -12154,7 +12144,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn index_executor_marks_queued_job_completed_and_item_indexed() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_index_complete";
@@ -12231,7 +12221,7 @@ mod tests {
         assert!(metrics.completed_latency_avg_ms.is_some());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_index_executor_runtime_vector_job_writes_embedding() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_index_runtime_vector";
@@ -12308,7 +12298,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn runtime_vector_provider_reuses_embedding_for_distinct_thread_occurrences() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let parent_item = seed_pending_thread_episodic_item_with_text(
@@ -12397,7 +12387,7 @@ mod tests {
         assert_eq!(artifact.vector, vec![0.4, 0.5, 0.6]);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_index_executor_runtime_vector_provider_failure_is_retryable() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_index_runtime_vector_retryable";
@@ -12670,7 +12660,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn thread_episodic_vector_disable_runtime_writes_lexical_only() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_index_runtime_lexical_disabled_vector";
@@ -12715,7 +12705,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn store_payload_provider_preserves_workspace_and_source_occurrences() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let provider = StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone());
@@ -12813,7 +12803,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_child_initial_input_shares_parent_projection_but_followup_does_not() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let parent_thread_id = "thread_projection_parent";
@@ -12968,7 +12958,7 @@ mod tests {
         assert_ne!(parent.id, child_initial.id);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn store_ingestor_queues_job_due_at_whole_second() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_ingestor_due_second";
@@ -13034,7 +13024,7 @@ mod tests {
         assert_eq!(stored_job.status, ThreadEpisodicIndexJobStatus::Completed);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn index_debug_reports_hidden_item_not_recallable_without_text() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_index_hidden_debug";
@@ -13082,7 +13072,7 @@ mod tests {
         assert!(!rendered.contains("hidden text must not appear in diagnostics"));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn index_executor_records_retryable_failure_with_next_retry() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_index_retryable";
@@ -13163,7 +13153,7 @@ mod tests {
         assert_eq!(retried.index_decision, "queued_for_index");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn index_executor_records_non_retryable_failure_as_terminal() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_index_terminal";
@@ -13210,7 +13200,7 @@ mod tests {
         assert_eq!(stored_item.status, ThreadEpisodicItemStatus::Failed);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn index_executor_persistence_fallback_backs_off_without_accepting_capacity_outcome() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let item = seed_pending_thread_episodic_item(
@@ -13454,7 +13444,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn index_executor_preserves_suppressed_claims_after_legacy_repair_merge() {
         for deleted in [false, true] {
             let (crud_store, workspace_id) = setup_thread_episodic_store().await;
@@ -13603,7 +13593,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn index_executor_reports_unpersisted_failures_after_finishing_claimed_batch() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         for suffix in ["a", "b"] {
@@ -14336,7 +14326,7 @@ mod tests {
             "committedneedle canonical text",
         )
         .await;
-        let backend = SqliteThreadEpisodicBackend::new(store.clone());
+        let backend = PostgresThreadEpisodicBackend::new(store.clone());
         let request = sql_search_request(&workspace, "committedneedle");
         assert!(
             backend
@@ -14559,7 +14549,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn sqlite_plain_text_queries_and_bounded_pages_use_actual_unicode_tokenizer() {
         let (store, workspace) = setup_thread_episodic_store().await;
         for (id, text) in [
@@ -14576,7 +14566,7 @@ mod tests {
                 ThreadEpisodicIndexAttemptOutcome::Applied
             );
         }
-        let backend = SqliteThreadEpisodicBackend::new(store.clone());
+        let backend = PostgresThreadEpisodicBackend::new(store.clone());
         for query in ["AND", "(OR)", "\"NOT\"", "альфа", "東京", "a", "AND:OR-NOT"] {
             let page = backend
                 .search_page(sql_search_request(&workspace, query), 10, None, None)
@@ -14640,7 +14630,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn sqlite_shared_vector_occurrences_keep_stable_rank_ties_across_pages() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let text = "sharedrankneedle same canonical text";
@@ -14747,7 +14737,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
-        let backend = SqliteThreadEpisodicBackend::new(store);
+        let backend = PostgresThreadEpisodicBackend::new(store);
         let embedding = ThreadEpisodicIndexEmbedding::new(
             pioneer_memory::ThreadEpisodicEmbeddingIdentity::new("test", "axis", 3, false),
             vec![2.0, 0.0, 0.0],
@@ -14795,7 +14785,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn sqlite_publication_rechecks_target_even_when_source_and_claim_are_unchanged() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let (item, job, resolved) =
@@ -14854,7 +14844,7 @@ mod tests {
             job
         );
         assert!(item.projection_text(&store).await.is_none());
-        let backend = SqliteThreadEpisodicBackend::new(store.clone());
+        let backend = PostgresThreadEpisodicBackend::new(store.clone());
         assert!(
             backend
                 .search_page(
@@ -14870,7 +14860,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn sqlite_common_retrieval_keeps_lexical_results_and_reports_embedding_failures() {
         use pioneer_memory::ThreadEpisodicRetrievalMode;
         let (store, workspace) = setup_thread_episodic_store().await;
@@ -14887,7 +14877,7 @@ mod tests {
                 .unwrap(),
             ThreadEpisodicIndexAttemptOutcome::Applied
         );
-        let backend = SqliteThreadEpisodicBackend::new(store);
+        let backend = PostgresThreadEpisodicBackend::new(store);
         for (error, warning, retryable) in [
             (
                 ThreadEpisodicEmbeddingError::retryable_provider_failure(
@@ -14935,7 +14925,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn sqlite_maximum_page_keeps_lookahead_and_returns_the_last_source() {
         let (store, workspace) = setup_thread_episodic_store().await;
         for index in 0..257 {
@@ -14953,7 +14943,7 @@ mod tests {
                 ThreadEpisodicIndexAttemptOutcome::Applied
             );
         }
-        let backend = SqliteThreadEpisodicBackend::new(store);
+        let backend = PostgresThreadEpisodicBackend::new(store);
         let request = sql_search_request(&workspace, "maximumpageneedle");
         let first = backend
             .search_page(request.clone(), 256, None, None)
@@ -14976,7 +14966,7 @@ mod tests {
         assert_eq!(ids.len(), 257);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn sqlite_lexical_snippets_keep_short_text_and_late_unicode_context() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let long_text = format!(
@@ -14997,7 +14987,7 @@ mod tests {
             );
             let mut request = sql_search_request(&workspace, query);
             request.profile.snippet_chars = 120;
-            let page = SqliteThreadEpisodicBackend::new(store.clone())
+            let page = PostgresThreadEpisodicBackend::new(store.clone())
                 .search_page(request, 10, None, None)
                 .await
                 .unwrap();
@@ -15018,7 +15008,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn sqlite_directory_count_tracks_publication_retry_rollback_recreation_and_exclusion() {
         use sea_orm::TransactionTrait;
         let (store, workspace) = setup_thread_episodic_store().await;

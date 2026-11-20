@@ -206,15 +206,14 @@ async fn lifecycle_scope_bookkeeping_failure_preserves_independent_pending_quota
     assert!(result.is_err());
     assert_eq!(failed_count(&store).await, 8);
     assert!(
-        pioneer_entity::compaction_lifecycle_scope::Entity::find_by_id((
-            "seed".to_owned(),
-            String::new(),
-            String::new()
-        ))
-        .one(&db)
-        .await
-        .unwrap()
-        .is_some()
+        pioneer_entity::compaction_lifecycle_scope::Entity::find()
+            .filter(pioneer_entity::compaction_lifecycle_scope::Column::Kind.eq("seed"))
+            .filter(pioneer_entity::compaction_lifecycle_scope::Column::Owner.eq(""))
+            .filter(pioneer_entity::compaction_lifecycle_scope::Column::TurnId.eq(""))
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some()
     );
     assert!(
         processor

@@ -2271,7 +2271,6 @@ impl ReadModelRepairTimings {
 }
 
 const READ_MODEL_REPAIR_BATCH_SIZE: u64 = 32;
-const RECOVERY_TERMINALIZATION_BACKFILL_BATCH_SIZE: u64 = 32;
 const TURN_PROJECTION_STREAM_BACKFILL_MAX_BATCH_SIZE: u64 = 32;
 const READ_MODEL_REPAIR_ALGORITHM_VERSION: i64 = 1;
 
@@ -30982,96 +30981,6 @@ impl CrudStore {
         result.map(|(valid, _)| valid)
     }
 
-    /// Backfills terminal recovery outcomes committed by an older Gateway or
-    /// by a process that crashed before the outbox migration became active.
-    /// Selection and insertion are serialized and each row remains protected
-    /// by the outbox primary key.
-    pub async fn enqueue_missing_recovery_terminalizations(
-        &self,
-        limit: u64,
-        now_unix: i64,
-    ) -> Result<u64> {
-        let control_wakes = vec![GatewayControlWake::Terminalization];
-        let control_change = self.control_work_change("gateway.control", &control_wakes);
-        let control_result = async {
-            if limit == 0 {
-                return Ok(0);
-            }
-            let now = unix_to_datetime(now_unix);
-            self.run_serialized_write(|| async {
-                let mut remaining = limit;
-                let mut total_enqueued = 0_u64;
-                while remaining > 0 {
-                    let batch_limit = remaining.min(RECOVERY_TERMINALIZATION_BACKFILL_BATCH_SIZE);
-                    let tx = self
-                        .connection
-                        .begin()
-                        .await
-                        .context("failed to begin recovery terminalization audit batch")?;
-                    let result = async {
-                        use pioneer_entity::{
-                            recovery_job as job, recovery_terminalization_outbox as outbox,
-                        };
-                        let rows = job::Entity::find()
-                            .select_only()
-                            .column(job::Column::Id)
-                            .join(
-                                sea_orm::sea_query::JoinType::LeftJoin,
-                                job::Entity::belongs_to(outbox::Entity)
-                                    .from(job::Column::Id)
-                                    .to(outbox::Column::RecoveryJobId)
-                                    .into(),
-                            )
-                            .filter(job::Column::Status.is_in(["failed", "exhausted", "blocked"]))
-                            .filter(job::Column::ResolutionPending.eq(true))
-                            .filter(outbox::Column::RecoveryJobId.is_null())
-                            .order_by_asc(job::Column::UpdatedAt)
-                            .order_by_asc(job::Column::Id)
-                            .limit(batch_limit)
-                            .into_tuple::<String>()
-                            .all(&tx)
-                            .await
-                            .context("failed to scan terminal recovery jobs missing outbox")?;
-                        let row_count = rows.len() as u64;
-                        for job_id in rows {
-                            enqueue_recovery_terminalization_if_required(&tx, job_id.as_str(), now)
-                                .await?;
-                        }
-                        Ok::<u64, anyhow::Error>(row_count)
-                    }
-                    .await;
-                    let enqueued = match result {
-                        Ok(enqueued) => {
-                            tx.commit()
-                                .await
-                                .context("failed to commit recovery terminalization audit batch")?;
-                            enqueued
-                        }
-                        Err(error) => {
-                            let _ = tx.rollback().await;
-                            return Err(error);
-                        }
-                    };
-                    total_enqueued = total_enqueued.saturating_add(enqueued);
-                    remaining = remaining.saturating_sub(enqueued);
-                    if enqueued < batch_limit {
-                        break;
-                    }
-                    // The next batch must acquire a fresh maintenance reservation;
-                    // queued interactive work is therefore admitted between
-                    // durable batches by the writer executor.
-                }
-                Ok(total_enqueued)
-            })
-            .await
-        }
-        .await;
-        if let Ok(value) = &control_result {
-            control_change.completed(*value > 0);
-        }
-        control_result
-    }
-
     pub async fn fail_recovery_terminalization_claim(
         &self,
         record: &ClaimedRecoveryTerminalizationRecord,
@@ -39158,7 +39067,10 @@ mod tests {
     }
 
     pub(super) async fn test_store_with_workspace(workspace_id: &str) -> CrudStore {
-        test_store_with_workspace_migrator::<Migrator>(workspace_id).await
+        let fixture = pioneer_postgres_test::scoped_database()
+            .await
+            .expect("clone the PostgreSQL CRUD fixture database");
+        postgres_store_with_workspace(&fixture, workspace_id).await
     }
 
     // Empty-input projector fixtures exercise old migration boundaries with
@@ -39192,64 +39104,13 @@ mod tests {
         transaction.commit().await.unwrap();
     }
 
-    async fn test_store_with_workspace_migrator<M: MigratorTrait>(workspace_id: &str) -> CrudStore {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        // Bootstrap through the writer so migrations can own a physical lease
-        // outside an enclosing transaction. No fixture consumer exists yet.
-        pioneer_sqlite::SqliteWriteExecutor::new(connection.clone())
-            .run_migrations::<M>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
-            .await
-            .expect("migrations must succeed");
-
-        let timestamp = unix_to_datetime(1_700_000_000);
-        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
-            id: Set(workspace_id.to_owned()),
-            name: Set("Test Workspace".to_owned()),
-            is_active: Set(true),
-            is_current: Set(true),
-            created_at: Set(timestamp),
-            updated_at: Set(timestamp),
-        })
-        .exec(&connection)
-        .await
-        .expect("workspace insert should succeed");
-
-        CrudStore::new(connection)
-    }
-
     async fn test_store_with_workspace_and_query_counter(
         workspace_id: &str,
     ) -> (CrudStore, Arc<AtomicU64>) {
-        let mut connection = Database::connect("sqlite::memory:")
+        let fixture = pioneer_postgres_test::scoped_database()
             .await
-            .expect("must connect to sqlite memory");
-        let query_count = Arc::new(AtomicU64::new(0));
-        connection.set_metric_callback({
-            let query_count = Arc::clone(&query_count);
-            move |_| {
-                query_count.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-
-        let timestamp = unix_to_datetime(1_700_000_000);
-        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
-            id: Set(workspace_id.to_owned()),
-            name: Set("Test Workspace".to_owned()),
-            is_active: Set(true),
-            is_current: Set(true),
-            created_at: Set(timestamp),
-            updated_at: Set(timestamp),
-        })
-        .exec(&connection)
-        .await
-        .expect("workspace insert should succeed");
-
-        (CrudStore::new(connection), query_count)
+            .expect("clone the PostgreSQL CRUD fixture database");
+        postgres_store_with_workspace_and_query_counter(&fixture, workspace_id).await
     }
 
     async fn postgres_store_with_workspace_and_query_counter(
@@ -39273,32 +39134,6 @@ mod tests {
             CrudStore::new(pioneer_sqlite::SqliteDatabase::new(reader, writer)),
             query_count,
         )
-    }
-
-    async fn test_store_with_zstd_turn_items() -> CrudStore {
-        pioneer_sqlite::zstd::register_auto_extension_once()
-            .expect("sqlite-zstd extension should register");
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let config = serde_json::json!({
-            "table": "turn_item",
-            "column": "payload",
-            "compression_level": 3,
-            "dict_chooser": "'[nodict]'",
-        });
-        connection
-            .query_one_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "SELECT zstd_enable_transparent(?) AS value",
-                [config.to_string().into()],
-            ))
-            .await
-            .expect("turn_item compression should enable");
-        CrudStore::new(connection)
     }
 
     #[tokio::test]
@@ -42328,13 +42163,13 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn later_failed_turn_supersedes_a_prepared_native_finalization() {
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_native_finalization_cancelled";
         let thread_id = "thr_native_finalization_cancelled";
         let turn_id = "turn_native_finalization_cancelled";
-        let store = test_store_with_zstd_turn_items().await;
+        let store = test_store_with_workspace(workspace_id).await;
         let thread = sample_thread(workspace_id, thread_id, timestamp);
         let turn = sample_turn(turn_id);
         store
@@ -45513,21 +45348,6 @@ mod tests {
                     .expect("terminal job and outbox should commit")
             );
 
-            // Model a terminal job written by a pre-outbox Gateway during a
-            // rolling upgrade. The startup/periodic auditor must reconstruct the
-            // missing durable handoff without replaying the tool.
-            pioneer_entity::recovery_terminalization_outbox::Entity::delete_by_id(job.id.clone())
-                .exec(&store.connection)
-                .await
-                .expect("test should remove the outbox row");
-            assert_eq!(
-                store
-                    .enqueue_missing_recovery_terminalizations(10, 1_700_000_004)
-                    .await
-                    .expect("terminalization auditor should backfill the row"),
-                1
-            );
-
             let restarted = CrudStore::new(store.database_connection());
             let claimed = restarted
                 .claim_due_recovery_terminalizations(1_700_000_004, 45, 10)
@@ -48184,6 +48004,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_resume_cursor_compares_and_preserves_exact_json_text() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (store, _, _) =
+                postgres_store_with_started_turn(fixture, "ws_cursor", "thread", "turn").await;
+            let now = unix_to_datetime(1_700_010_001);
+            let original = r#"{ "threadId":"native", "providerOpaque":{"marker":"🧪\u0000"} }"#;
+            let equivalent =
+                serde_json::to_string(&serde_json::from_str::<serde_json::Value>(original)?)?;
+            assert_ne!(original, equivalent);
+            let binding = NewCliRuntimeThreadBinding {
+                thread_id: "thread".into(),
+                workspace_id: "ws_cursor".into(),
+                runtime_id: "codex".into(),
+                runtime_kind: "codex".into(),
+                native_thread_id: "native".into(),
+                native_session_id: None,
+                native_root_thread_id: None,
+                native_cwd: None,
+                native_model: None,
+                resume_cursor_json: original.into(),
+                status: "active".into(),
+                created_at: now,
+                updated_at: now,
+            };
+            let inserted = store.upsert_cli_runtime_thread_binding(binding).await?;
+            assert_eq!(inserted.resume_cursor_json, original);
+            let next = r#"{ "threadId":"native", "sequence":2 }"#;
+            let rejected = store
+                .update_cli_runtime_thread_resume_cursor(
+                    "thread",
+                    "native",
+                    &equivalent,
+                    next.into(),
+                    now,
+                )
+                .await
+                .expect_err("an equivalent JSON spelling must lose the CAS");
+            assert!(
+                rejected
+                    .to_string()
+                    .contains("changed before context receipt")
+            );
+            let saved = store
+                .get_cli_runtime_thread_binding("thread")
+                .await?
+                .expect("the rejected replacement must preserve the binding");
+            assert_eq!(saved.resume_cursor_json, original);
+            let updated = store
+                .update_cli_runtime_thread_resume_cursor(
+                    "thread",
+                    "native",
+                    &saved.resume_cursor_json,
+                    next.into(),
+                    now,
+                )
+                .await?;
+            assert_eq!(updated.resume_cursor_json, next);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn concurrent_cli_fork_intents_have_one_winner_and_stale_cleanup_cannot_delete_it() {
         pioneer_postgres_test::with_database(async |fixture| {
         let store = postgres_store_with_workspace(fixture, "ws_fork_intent_race").await;
@@ -50555,7 +50439,7 @@ mod tests {
         (store, task, run, job, thread_id, turn_id)
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_owned_resume_rejects_a_newer_terminal_successor() {
         let (store, task, run, job, thread_id, turn_id) =
             task_owned_resume_conflict_fixture("ws_task_owned_successor", "successor").await;
@@ -50606,7 +50490,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_owned_resume_rejects_an_overlapping_cross_task_workspace_lock() {
         let (store, task, run, job, thread_id, turn_id) =
             task_owned_resume_conflict_fixture("ws_task_owned_lock", "lock").await;
@@ -54183,7 +54067,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn episodic_model_reset_commits_cursor_with_replacement_and_preserves_budget_on_restart()
     {
         let (store, thread, turn) = test_store_with_started_turn(
@@ -57240,16 +57124,15 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn running_attempt_pages_continue_after_selected_attempt_disappears() {
-        let store = test_store_with_zstd_turn_items().await;
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_running_pages";
         let thread_id = "thr_running_pages";
         let turn_id = "turn_running_pages";
+        let store = test_store_with_workspace(workspace_id).await;
         let thread = sample_thread(workspace_id, thread_id, timestamp);
         let turn = sample_turn(turn_id);
-        seed_observation_workspace(&store, &thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -57319,13 +57202,12 @@ mod tests {
         assert_eq!(seen, ["page-a", "page-b", "page-c"]);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn timeout_pages_continue_past_unchanged_due_inputs_and_removed_candidates() {
-        let store = test_store_with_zstd_turn_items().await;
         let at = 1_700_000_000;
         let thread = sample_thread("ws_timeout_pages", "thr_timeout_pages", at);
         let turn = sample_turn("turn_timeout_pages");
-        seed_observation_workspace(&store, &thread.workspace_id).await;
+        let store = test_store_with_workspace(&thread.workspace_id).await;
         store
             .materialize_turn_start(
                 &thread,
@@ -57420,12 +57302,11 @@ mod tests {
         assert!(fresh.iter().any(|row| row.item_id == "timeout-page-d"));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn timeout_transition_terminalizes_and_runtime_rehydration_restores_source_attempt() {
-        let store = test_store_with_zstd_turn_items().await;
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_timeout_terminalize";
-        seed_observation_workspace(&store, workspace_id).await;
+        let store = test_store_with_workspace(workspace_id).await;
         let thread_id = "thr_timeout_terminalize";
         let turn_id = "turn_timeout_terminalize";
         let item_id = "item_timeout_terminalize";
@@ -57956,22 +57837,11 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn terminal_turn_projection_closes_running_attempts() {
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_turn_terminal_cleanup";
-        let store = test_store_with_zstd_turn_items().await;
-        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
-            id: Set(workspace_id.to_owned()),
-            name: Set("Terminal cleanup test".to_owned()),
-            is_active: Set(true),
-            is_current: Set(true),
-            created_at: Set(unix_to_datetime(timestamp)),
-            updated_at: Set(unix_to_datetime(timestamp)),
-        })
-        .exec(&store.connection)
-        .await
-        .expect("workspace required by terminal projections should exist");
+        let store = test_store_with_workspace(workspace_id).await;
         let thread_id = "thr_turn_terminal_cleanup";
         let turn_id = "turn_turn_terminal_cleanup";
         let item_id = "item_turn_terminal_cleanup";
@@ -64847,7 +64717,9 @@ mod tests {
             1
         );
 
-        let delete_event = events
+        let delete_event = crate::repositories::turn_payload::hydrate_events(&connection, events)
+            .await
+            .expect("load retained event payloads")
             .into_iter()
             .find(|event| {
                 event.event_type == pioneer_protocol::constants::events::TURN_MESSAGE_DELETED
@@ -64858,16 +64730,16 @@ mod tests {
             .expect("delete event should exist");
         connection
             .execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "UPDATE turn SET message_deleted_at=NULL, message_deleted_by_actor_kind=NULL, message_deleted_by_actor_id=NULL WHERE id=?",
+                DatabaseBackend::Postgres,
+                "UPDATE \"turn\" SET message_deleted_at=NULL, message_deleted_by_actor_kind=NULL, message_deleted_by_actor_id=NULL WHERE id=$1",
                 [started.id.clone().into()],
             ))
             .await
             .expect("test should corrupt tombstone projection");
         connection
             .execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "UPDATE thread SET preview=? WHERE id=?",
+                DatabaseBackend::Postgres,
+                "UPDATE thread SET preview=$1 WHERE id=$2",
                 ["edited".into(), thread.id.clone().into()],
             ))
             .await

@@ -13,6 +13,8 @@ import sys
 import tempfile
 import time
 import tomllib
+from urllib.error import URLError
+from urllib.request import urlopen
 import uuid
 
 from websockets.sync.client import connect
@@ -26,14 +28,28 @@ def status(binary, env):
     return json.loads(cli(binary, env, "status", "--json"))
 
 
+def local_address(state):
+    return state["listen_addr"].replace("0.0.0.0:", "127.0.0.1:", 1)
+
+
+def accepts_sessions(state):
+    if not state["service_active"] or not state["gateway_reachable"]:
+        return False
+    try:
+        with urlopen(f"http://{local_address(state)}/ready", timeout=2) as response:
+            return json.load(response)["accepting_new_turns"]
+    except (URLError, TimeoutError):
+        return False
+
+
 def ready(binary, env):
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         state = status(binary, env)
-        if state["service_active"] and state["gateway_reachable"]:
+        if accepts_sessions(state):
             return state
         time.sleep(0.25)
-    raise RuntimeError("Installed Gateway did not become reachable")
+    raise RuntimeError("Installed Gateway did not become ready")
 
 
 def process_info(pid):
@@ -107,7 +123,7 @@ def postmaster(state, gateway, runtime):
 
 
 def rpc(state, secret, method, params):
-    address = state["listen_addr"].replace("0.0.0.0:", "127.0.0.1:", 1)
+    address = local_address(state)
     headers = {"Authorization": "Bearer " + secret, "Pioneer-Protocol-Version": "1"}
     request_id = uuid.uuid4().hex[:21]
     request = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
@@ -220,9 +236,9 @@ def start_from_desktop(binary, desktop, env):
                     install = state.get("install_state") or {}
                     registry_path = Path(state["runtime_home"]) / "gateway-registry.toml"
                     registry = tomllib.loads(registry_path.read_text()) if registry_path.is_file() else {}
-                    if (state["service_active"] and state["gateway_reachable"]
-                            and install.get("managed_by") == "desktop"
-                            and (registry.get("local") or {}).get("session_ref")):
+                    if (install.get("managed_by") == "desktop"
+                            and (registry.get("local") or {}).get("session_ref")
+                            and accepts_sessions(state)):
                         return state
                 if time.monotonic() >= next_click and click_start_local_gateway(desktop_env):
                     # The first run installs the embedded archive and pairs a device.

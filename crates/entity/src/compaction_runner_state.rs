@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_runner_state")]
 pub struct Model {
-    pub generation: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub operation_id: String,
+    pub generation: i64,
     pub state: Json,
     #[sea_orm(
         belongs_to,

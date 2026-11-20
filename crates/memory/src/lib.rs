@@ -69,7 +69,7 @@ pub use quality::{
 pub use service::MemoryService;
 pub use thread_episodic::{
     PioneerAdaptiveCutoff, PioneerAdaptiveCutoffConfig, PioneerAdaptiveCutoffDiagnostics,
-    PioneerAdaptiveCutoffReason, SqliteThreadEpisodicBackend, THREAD_EPISODIC_INDEX_BATCH_BYTES,
+    PioneerAdaptiveCutoffReason, PostgresThreadEpisodicBackend, THREAD_EPISODIC_INDEX_BATCH_BYTES,
     THREAD_EPISODIC_INDEX_BATCH_ITEMS, ThreadEpisodicCandidateSuppression,
     ThreadEpisodicCandidateSuppressionReason, ThreadEpisodicFilteredSearchCandidates,
     ThreadEpisodicIndexDocument, ThreadEpisodicIndexEmbedding, ThreadEpisodicRankedSearchHit,

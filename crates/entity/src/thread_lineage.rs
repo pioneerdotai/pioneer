@@ -7,24 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_lineage")]
 pub struct Model {
-    #[sea_orm(unique)]
-    pub insertion_ordinal: i64,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub child_thread_id: String,
     #[sea_orm(column_type = "Text")]
     pub parent_thread_id: String,
     #[sea_orm(column_type = "Text")]
-    pub publication_xid: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub created_by_thread_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
     pub root_thread_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub child_thread_id: String,
     pub depth: i64,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", nullable)]
     pub origin_kind: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    pub created_by_thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub created_by_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub publication_xid: String,
+    #[sea_orm(unique)]
+    pub insertion_ordinal: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,29 +7,29 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "package_installation")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub package_fingerprint: String,
-    pub allow_implicit_invocation: bool,
-    #[sea_orm(column_type = "Text")]
-    pub state: String,
-    pub enabled: bool,
-    #[sea_orm(column_type = "Text", unique)]
-    pub source_upload_id: String,
-    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
-    pub package_path: String,
-    pub revision: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_error_json: Option<String>,
-    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub pending_json: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", unique)]
+    pub source_upload_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub package_path: String,
     #[sea_orm(column_type = "Text")]
     pub data_path: String,
+    #[sea_orm(column_type = "Text")]
+    pub package_fingerprint: String,
+    pub enabled: bool,
+    pub allow_implicit_invocation: bool,
+    #[sea_orm(column_type = "Text")]
+    pub state: String,
+    pub revision: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub pending_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_error_json: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text")]
     pub kind: String,
     #[sea_orm(has_one)]

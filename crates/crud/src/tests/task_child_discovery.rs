@@ -97,7 +97,7 @@ async fn discovered(store: &CrudStore, limit: u64) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn many_runs_of_one_task_preserve_active_discovery_cases() {
     use TaskRunStatus as R;
     use TaskRunTurnStatus as L;
@@ -154,7 +154,7 @@ async fn many_runs_of_one_task_preserve_active_discovery_cases() {
     assert!(discovered(&store, 64).await.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn discovery_rejects_cross_task_run_and_turn_thread_links() {
     let (store, task) = fixture().await;
     let active = run(&store, &task, 1, TaskRunStatus::Running).await;
@@ -295,7 +295,7 @@ async fn terminal_child(
         .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn discovery_globally_orders_and_limits_active_and_ready_terminal_children() {
     let (store, task) = fixture().await;
     // Insert out of order. The oldest timestamp wins before id; equal
@@ -393,7 +393,7 @@ async fn publish_capsule(store: &CrudStore, id: &str) {
         .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn queued_cleanup_revalidates_late_lineage_receipt_and_capsule_without_self_enqueue() {
     use crate::repositories::turn_event_projection_stream_state as receipt;
     use pioneer_entity::{
@@ -684,7 +684,7 @@ async fn consume_woken_capsule(store: &CrudStore, id: &str) {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn immediate_cleanup_requires_distinct_accepted_source_and_absent_occurrence() {
     use pioneer_protocol::{TaskOccurrenceContract, TaskOccurrenceStatus};
     let (store, task) = fixture().await;
@@ -838,7 +838,7 @@ async fn immediate_cleanup_requires_distinct_accepted_source_and_absent_occurren
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn queue_cutover_requires_seed_completion_and_recognized_producer_generation() {
     use pioneer_entity::task_child_reconcile_pending as point;
     let (store, task) = fixture().await;
@@ -899,7 +899,7 @@ async fn queue_cutover_requires_seed_completion_and_recognized_producer_generati
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn taskrun_parent_terminal_receipt_arriving_after_child_close_releases_capsule() {
     let (store, task) = fixture().await;
     let run = run(&store, &task, 80, TaskRunStatus::Succeeded).await;
@@ -973,7 +973,7 @@ async fn taskrun_parent_terminal_receipt_arriving_after_child_close_releases_cap
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn parked_taskrun_child_wakes_after_parent_thread_workspace_repair() {
     let (store, task) = fixture().await;
     terminal_child(
@@ -1028,7 +1028,7 @@ async fn parked_taskrun_child_wakes_after_parent_thread_workspace_repair() {
 #[path = "task_child_owner_repair.rs"]
 mod owner_repair;
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn shell_control_cleanup_defers_to_the_existing_child_receipt_gate() {
     let (store, task) = fixture().await;
     let active_run = run(&store, &task, 80, TaskRunStatus::Running).await;

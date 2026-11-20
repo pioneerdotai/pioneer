@@ -7,30 +7,30 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_skill_binding")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub fingerprint: String,
-    #[sea_orm(column_type = "Text")]
-    pub resolved_reason: String,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uq_turn_skill_binding_turn_id_skill_id"
-    )]
-    pub skill_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub skill_owner: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub skill_version: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub source_kind: String,
-    #[sea_orm(column_type = "Text")]
-    pub skill_slug: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uq_turn_skill_binding_turn_id_skill_id"
     )]
     pub turn_id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_turn_skill_binding_turn_id_skill_id"
+    )]
+    pub skill_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub skill_owner: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub skill_slug: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub skill_version: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub fingerprint: String,
+    #[sea_orm(column_type = "Text")]
+    pub source_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub resolved_reason: String,
     pub created_at: DateTimeWithTimeZone,
 }
 

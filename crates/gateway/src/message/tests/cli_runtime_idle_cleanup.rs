@@ -12,7 +12,7 @@ async fn elapse(duration: Duration) {
     tokio::time::resume();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_cleanup_preserves_real_admission_silent_turn_terminal_effects_and_continuation() {
     let mut harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Codex)).await;
     let processor = harness.processor.clone();
@@ -210,7 +210,7 @@ async fn idle_cleanup_preserves_real_admission_silent_turn_terminal_effects_and_
     processor.shutdown_cli_runtime_manager().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_cleanup_defers_gates_recovered_continuation_and_activity_lookup_error() {
     use pioneer_entity::turn_cli_runtime_binding as binding;
     use sea_orm::sea_query::Expr;
@@ -300,7 +300,7 @@ impl CLIAgentRuntimeSessionLifecycle for IdleLifecycle {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_worker_continues_after_close_error_and_shutdown_joins_inflight_lifecycle() {
     let (mut processor, _, rx, workspace, _, _) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -387,7 +387,7 @@ async fn idle_worker_continues_after_close_error_and_shutdown_joins_inflight_lif
     assert_eq!(lifecycle.events.lock().await.len(), 7);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_cleanup_keeps_response_generation_pinned_after_lane_removal_through_interrupt() {
     let (processor, connection, mut rx, workspace, store, session) =
         cli_runtime_approval_processor().await;
@@ -558,7 +558,7 @@ async fn idle_cleanup_uses_maintenance_reader_and_releases_capacity_before_proce
     database.close().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_retirement_fences_late_transport_recovery_before_replacement_publication() {
     let harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Codex)).await;
     let key =

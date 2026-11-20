@@ -206,7 +206,7 @@ async fn immutable_frontier_preserves_old_revision_during_append_and_tariff_refr
     database.close().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn owner_conflict_rolls_back_tariff_and_fk_off_thread_cleanup_removes_facts() {
     let store = fixture().await;
     let mut wrong = attempt("wrong", 0, "99");
@@ -262,7 +262,7 @@ async fn owner_conflict_rolls_back_tariff_and_fk_off_thread_cleanup_removes_fact
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn observation_schema_down_and_reapply_uses_registered_migration() {
     let store = fixture().await;
     let migration = Migrator::migrations()
@@ -298,7 +298,7 @@ async fn observation_schema_down_and_reapply_uses_registered_migration() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_cumulative_redelivery_is_one_leaf_and_cannot_roll_back_same_second_usage() {
     let store = fixture().await;
     let operation = "provider:turn_observe:native_item";
@@ -373,7 +373,7 @@ async fn native_cumulative_redelivery_is_one_leaf_and_cannot_roll_back_same_seco
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn monotonic_tool_duration_requires_the_same_process_incarnation() {
     let store = fixture().await;
     for (id, finish_run, expected) in [
@@ -410,7 +410,7 @@ async fn monotonic_tool_duration_requires_the_same_process_incarnation() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn reconciliation_revision_does_not_consume_the_next_producer_revision() {
     let store = fixture().await;
     let initial = attempt("revision_domains", 0, "2");
@@ -466,7 +466,7 @@ async fn reconciliation_revision_does_not_consume_the_next_producer_revision() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn journal_projection_failure_is_atomic_and_redelivery_survives_source_cleanup() {
     let store = fixture().await;
     let record=crate::ProviderUsageObservation {
@@ -546,7 +546,7 @@ async fn journal_projection_failure_is_atomic_and_redelivery_survives_source_cle
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn retained_tool_size_commits_with_source_and_survives_source_cleanup() {
     let store = fixture().await;
     let payload = serde_json::json!({"type":"json","value":{"content":"source 日本語","private":"not in facts"}}).to_string();

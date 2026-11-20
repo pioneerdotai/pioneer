@@ -700,8 +700,8 @@ pub async fn try_lock_thread_episodic_workspace(
         .map(|guard| Arc::new(ThreadEpisodicWorkspaceGuard { guard: Some(guard) }))
 }
 
-mod sqlite;
-pub use sqlite::SqliteThreadEpisodicBackend;
+mod postgres;
+pub use postgres::PostgresThreadEpisodicBackend;
 
 fn finalize_thread_episodic_search_output(
     request: ThreadEpisodicSearchRequest,

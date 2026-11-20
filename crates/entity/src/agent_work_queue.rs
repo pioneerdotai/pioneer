@@ -7,24 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_work_queue")]
 pub struct Model {
-    pub eligible_at: Option<DateTimeWithTimeZone>,
-    pub enqueue_sequence: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uq_agent_work_queue_attempt")]
-    pub attempt_generation: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub claim_token: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub state: String,
-    #[sea_orm(column_type = "Text", unique_key = "uq_agent_work_queue_attempt")]
-    pub execution_id: String,
-    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", unique_key = "uq_agent_work_queue_attempt")]
     pub root_execution_id: String,
-    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", unique_key = "uq_agent_work_queue_attempt")]
+    pub execution_id: String,
+    #[sea_orm(unique_key = "uq_agent_work_queue_attempt")]
+    pub attempt_generation: i64,
     #[sea_orm(column_type = "Text")]
     pub branch_key: String,
+    pub enqueue_sequence: i64,
+    #[sea_orm(column_type = "Text")]
+    pub state: String,
+    pub eligible_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub claim_token: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         relation_enum = "AgentExecution2",

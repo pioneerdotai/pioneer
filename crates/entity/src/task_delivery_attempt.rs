@@ -7,21 +7,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_delivery_attempt")]
 pub struct Model {
-    pub started_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", unique_key = "uidx_task_delivery_attempt_number")]
-    pub delivery_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub response_fingerprint: Option<String>,
-    pub http_status: Option<i64>,
-    #[sea_orm(unique_key = "uidx_task_delivery_attempt_number")]
-    pub attempt_number: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text", unique_key = "uidx_task_delivery_attempt_number")]
+    pub delivery_id: String,
+    #[sea_orm(unique_key = "uidx_task_delivery_attempt_number")]
+    pub attempt_number: i64,
     #[sea_orm(column_type = "Text")]
     pub status: String,
+    pub started_at: DateTimeWithTimeZone,
     pub completed_at: Option<DateTimeWithTimeZone>,
+    pub http_status: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
     pub error: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub response_fingerprint: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -5,16 +5,18 @@ use std::{
     future::Future,
     ops::AsyncFnOnce,
     panic::{AssertUnwindSafe, resume_unwind},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
 use futures_util::FutureExt;
 use migration::{Migrator, MigratorTrait};
+pub use pioneer_postgres_test_macros::postgres_test;
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement,
 };
+use tokio::sync::OnceCell;
 use url::Url;
 use uuid::Uuid;
 
@@ -100,6 +102,15 @@ pub struct TestDatabase {
 }
 
 impl TestDatabase {
+    async fn open(url: Url) -> Result<Self> {
+        let connection = connect(url.clone()).await?;
+        Ok(Self {
+            url,
+            connection,
+            additional_pools: Mutex::new(Vec::new()),
+        })
+    }
+
     /// Open another pool on the same isolated database for concurrent scenarios.
     pub async fn connect(&self) -> Result<DatabaseConnection> {
         self.open_pool(connect_options(&self.url)).await
@@ -148,9 +159,9 @@ impl TestDatabase {
         &self.url
     }
 
-    async fn close(self) -> Result<()> {
-        let mut pools = self.additional_pools.into_inner().unwrap();
-        pools.push(self.connection);
+    async fn close(&self) -> Result<()> {
+        let mut pools = std::mem::take(&mut *self.additional_pools.lock().unwrap());
+        pools.push(self.connection.clone());
         tokio::time::timeout(
             Duration::from_secs(5),
             futures_util::future::try_join_all(pools.into_iter().map(DatabaseConnection::close)),
@@ -161,8 +172,81 @@ impl TestDatabase {
     }
 }
 
+struct ScopedDatabase {
+    name: String,
+    pool: Option<Arc<TestDatabase>>,
+}
+
+struct TestDatabases {
+    admin: OnceCell<Admin>,
+    databases: Mutex<Vec<ScopedDatabase>>,
+}
+
+tokio::task_local! {
+    static TEST_DATABASES: Arc<TestDatabases>;
+}
+
+/// Give a test with multiple fixture builders one cleanup scope. All builders
+/// on the test task can create private databases with [scoped_database].
+pub async fn with_test_databases<T>(test: impl Future<Output = T>) -> Result<T> {
+    let databases = Arc::new(TestDatabases {
+        admin: OnceCell::new(),
+        databases: Mutex::new(Vec::new()),
+    });
+    let outcome = TEST_DATABASES
+        .scope(databases.clone(), AssertUnwindSafe(test).catch_unwind())
+        .await;
+    let Some(admin) = databases.admin.get() else {
+        return finish(outcome.map(Ok), Ok(()));
+    };
+    let pools = std::mem::take(&mut *databases.databases.lock().unwrap());
+    let mut cleanup = Ok(());
+    for entry in pools {
+        if let Some(pool) = entry.pool
+            && let Err(error) = pool.close().await
+        {
+            cleanup = cleanup.and(Err(error));
+        }
+        if let Err(error) = admin.drop_database(&entry.name).await {
+            cleanup = cleanup.and(Err(error));
+        }
+    }
+    finish(outcome.map(Ok), cleanup)
+}
+
+/// Clone the migrated template for one independent fixture inside
+/// [with_test_databases]. Open any other pools for that scenario on the result.
+pub async fn scoped_database() -> Result<Arc<TestDatabase>> {
+    let scope = TEST_DATABASES
+        .try_with(Arc::clone)
+        .context("create the fixture inside with_test_databases")?;
+    let prefix = run_prefix()?.context("run database tests through pioneer-postgres-test")?;
+    let admin = scope.admin.get_or_try_init(Admin::connect).await?;
+    let name = database_name(&prefix);
+    let template = format!("{prefix}template");
+    let index = {
+        let mut databases = scope.databases.lock().unwrap();
+        let index = databases.len();
+        databases.push(ScopedDatabase {
+            name: name.clone(),
+            pool: None,
+        });
+        index
+    };
+    admin.create(&name, &template).await?;
+    let pool = Arc::new(TestDatabase::open(admin.database_url(&name)).await?);
+    scope.databases.lock().unwrap()[index].pool = Some(pool.clone());
+    Ok(pool)
+}
+
 fn new_prefix() -> String {
     format!("pioneer_test_{}_", Uuid::new_v4().simple())
+}
+
+fn database_name(prefix: &str) -> String {
+    // Keep the entire name under the 63-byte PostgreSQL identifier limit.
+    let suffix = Uuid::new_v4().simple().to_string();
+    format!("{prefix}{}", &suffix[..16])
 }
 
 fn run_prefix() -> Result<Option<String>> {
@@ -204,18 +288,10 @@ async fn with_isolated_database<T>(
     test: impl AsyncFnOnce(&TestDatabase) -> Result<T>,
 ) -> Result<T> {
     let admin = Admin::connect().await?;
-    // Keep the entire name under the 63-byte PostgreSQL identifier limit.
-    let suffix = Uuid::new_v4().simple().to_string();
-    let name = format!("{prefix}{}", &suffix[..16]);
+    let name = database_name(prefix);
     admin.create(&name, template).await?;
     let outcome = AssertUnwindSafe(async {
-        let url = admin.database_url(&name);
-        let connection = connect(url.clone()).await?;
-        let database = TestDatabase {
-            url,
-            connection,
-            additional_pools: Mutex::new(Vec::new()),
-        };
+        let database = TestDatabase::open(admin.database_url(&name)).await?;
         let result = AssertUnwindSafe(test(&database)).catch_unwind().await;
         let closed = database.close().await;
         match result {

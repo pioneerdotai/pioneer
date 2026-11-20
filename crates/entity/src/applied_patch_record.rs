@@ -7,42 +7,42 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "applied_patch_record")]
 pub struct Model {
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uq_applied_patch_record_commit_ordinal"
-    )]
-    pub turn_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    pub schema_version: i64,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uq_applied_patch_record_commit_ordinal"
     )]
     pub thread_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub changes_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub provenance: String,
-    #[sea_orm(unique_key = "uq_applied_patch_record_commit_ordinal")]
-    pub commit_ordinal: i64,
-    #[sea_orm(column_type = "Text")]
-    pub authority: String,
-    #[sea_orm(column_type = "Text")]
-    pub environment_id: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub outcome_json: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_applied_patch_record_commit_ordinal"
+    )]
+    pub turn_id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uq_applied_patch_record_invocation"
     )]
     pub invocation_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub environment_id: String,
+    #[sea_orm(unique_key = "uq_applied_patch_record_commit_ordinal")]
+    pub commit_ordinal: i64,
+    #[sea_orm(column_type = "Text")]
+    pub authority: String,
+    #[sea_orm(column_type = "Text")]
+    pub provenance: String,
+    #[sea_orm(column_type = "Text")]
+    pub exactness: String,
     pub committed_at_unix_ms: i64,
     #[sea_orm(column_type = "VarBinary(StringLen::None)")]
     pub plan_fingerprint: Vec<u8>,
     #[sea_orm(column_type = "Text")]
-    pub exactness: String,
-    pub schema_version: i64,
+    pub outcome_json: String,
+    #[sea_orm(column_type = "Text")]
+    pub changes_json: String,
+    pub created_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

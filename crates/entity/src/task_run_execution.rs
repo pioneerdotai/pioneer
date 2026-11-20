@@ -10,25 +10,25 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
-    pub executor_kind: String,
-    pub lease_until: Option<DateTimeWithTimeZone>,
-    pub started_at: Option<DateTimeWithTimeZone>,
-    pub updated_at: DateTimeWithTimeZone,
+    pub task_id: String,
     #[sea_orm(column_type = "Text", unique)]
     pub task_run_id: String,
-    pub heartbeat_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub worker_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub executor_kind: String,
     #[sea_orm(column_type = "Text")]
     pub status: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub task_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub worker_id: Option<String>,
+    pub lease_until: Option<DateTimeWithTimeZone>,
+    pub heartbeat_at: Option<DateTimeWithTimeZone>,
+    pub started_at: Option<DateTimeWithTimeZone>,
     pub completed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub error_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
     pub result_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub error_json: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

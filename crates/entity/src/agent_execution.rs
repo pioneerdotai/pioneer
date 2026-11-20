@@ -9,41 +9,41 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    pub identity_source_revision: i64,
-    #[sea_orm(column_type = "Text")]
-    pub authorization_context_fingerprint: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub parent_task_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub home_root_thread_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub resolved_profile_fingerprint: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub agent_identity_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub parent_thread_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub parent_execution_id: Option<String>,
-    pub finished_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text")]
-    pub identity_source_fingerprint: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub resolved_profile_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub presentation_snapshot_id: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
     #[sea_orm(column_type = "Text")]
+    pub agent_identity_id: String,
+    pub identity_source_revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub identity_source_fingerprint: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub parent_execution_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub parent_task_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub parent_thread_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub home_root_thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub work_graph_root_execution_id: String,
     #[sea_orm(column_type = "Text")]
-    pub requested_profile_selection_json: String,
+    pub requested_identity_selection_json: String,
     #[sea_orm(column_type = "Text")]
-    pub status: String,
+    pub requested_profile_selection_json: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub resolved_profile_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub resolved_profile_fingerprint: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub presentation_snapshot_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub authorization_context_fingerprint: String,
     pub execution_generation: i64,
     #[sea_orm(column_type = "Text")]
-    pub requested_identity_selection_json: String,
+    pub status: String,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    pub finished_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(has_many)]
     pub agent_actions: HasMany<super::agent_action::Entity>,
     #[sea_orm(has_many)]

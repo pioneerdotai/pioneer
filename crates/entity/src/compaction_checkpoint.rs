@@ -7,29 +7,29 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_checkpoint")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "compaction_checkpoint_operation_id_portion_key"
     )]
     pub operation_id: String,
-    pub format_version: i64,
-    pub proof_version: i64,
-    #[sea_orm(unique_key = "compaction_checkpoint_operation_id_portion_key")]
-    pub portion: i64,
-    pub selection: Json,
-    #[sea_orm(column_type = "Text")]
-    pub summary: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub previous: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
     #[sea_orm(column_type = "Text")]
     pub owner: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub previous: Option<String>,
+    #[sea_orm(unique_key = "compaction_checkpoint_operation_id_portion_key")]
+    pub portion: i64,
+    #[sea_orm(column_type = "Text")]
+    pub summary: String,
     #[sea_orm(column_type = "Text")]
     pub identity_sha256: String,
+    pub selection: Json,
     pub projection_version: i64,
+    pub format_version: i64,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub proof_version: i64,
     #[sea_orm(has_many)]
     pub compaction_checkpoint_event_inputs:
         HasMany<super::compaction_checkpoint_event_input::Entity>,

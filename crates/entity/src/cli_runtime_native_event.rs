@@ -7,28 +7,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "cli_runtime_native_event")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub thread_id: Option<String>,
-    pub sequence: i64,
-    #[sea_orm(column_type = "Text")]
-    pub runtime_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub payload_redacted_json: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub workspace_id: Option<String>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
+    pub runtime_id: String,
+    #[sea_orm(column_type = "Text")]
     pub runtime_kind: String,
     #[sea_orm(column_type = "Text", nullable)]
-    pub native_thread_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub native_method: String,
+    pub workspace_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub native_turn_id: Option<String>,
+    pub thread_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub native_thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub native_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub native_method: String,
+    #[sea_orm(column_type = "Text")]
+    pub payload_redacted_json: String,
+    pub sequence: i64,
+    pub created_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

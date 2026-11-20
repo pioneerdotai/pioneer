@@ -9,18 +9,18 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
-    #[sea_orm(column_type = "Text", nullable, unique)]
-    pub task_delivery_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
-    #[sea_orm(column_type = "Text", unique)]
-    pub turn_id: String,
     #[sea_orm(column_type = "Text")]
     pub thread_id: String,
-    pub terminal_at: DateTimeWithTimeZone,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", unique)]
+    pub turn_id: String,
+    #[sea_orm(column_type = "Text", nullable, unique)]
+    pub task_delivery_id: Option<String>,
     #[sea_orm(column_type = "Text", unique)]
     pub terminal_event_id: String,
+    pub terminal_at: DateTimeWithTimeZone,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "workspace_id",

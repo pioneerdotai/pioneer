@@ -7,34 +7,34 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "recovery_terminalization_outbox")]
 pub struct Model {
-    pub next_run_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub quarantine_reason_code: Option<String>,
-    pub quarantined_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_error: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub claim_token: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub turn_id: String,
-    pub created_at: DateTimeWithTimeZone,
-    pub claim_expires_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text")]
-    pub recovery_status: String,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    pub attempt_number: i64,
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub item_type: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub recovery_job_id: String,
     #[sea_orm(column_type = "Text")]
+    pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
     pub item_id: String,
-    pub delivered_at: Option<DateTimeWithTimeZone>,
-    pub attempt_count: i64,
+    #[sea_orm(column_type = "Text")]
+    pub item_type: String,
+    #[sea_orm(column_type = "Text")]
+    pub recovery_status: String,
+    pub attempt_number: i64,
     #[sea_orm(column_type = "Text")]
     pub error_message: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub attempt_count: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_error: Option<String>,
+    pub next_run_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub claim_token: Option<String>,
+    pub claim_expires_at: Option<DateTimeWithTimeZone>,
+    pub delivered_at: Option<DateTimeWithTimeZone>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub quarantine_reason_code: Option<String>,
+    pub quarantined_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(
         belongs_to,
         from = "recovery_job_id",

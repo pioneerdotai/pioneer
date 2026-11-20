@@ -9,67 +9,67 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key)]
     pub sequence: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub process_run_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub resolution_origin: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub start_process_run_id: Option<String>,
-    pub elapsed_ns: Option<i64>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub root_thread_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub thread_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub turn_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub window_id: Option<String>,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "idx_execution_observation_identity"
-    )]
-    pub operation_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    pub recorded_at_ms: i64,
-    #[sea_orm(unique_key = "idx_execution_observation_identity")]
-    pub revision: i64,
-    #[sea_orm(column_type = "Text")]
-    pub owner_id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "idx_execution_observation_identity"
     )]
     pub workspace_id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "idx_execution_observation_identity"
+    )]
+    pub operation_id: String,
+    #[sea_orm(unique_key = "idx_execution_observation_identity")]
+    pub revision: i64,
+    pub source_revision: i64,
     #[sea_orm(column_type = "Text")]
-    pub kind: String,
+    pub resolution_origin: String,
     #[sea_orm(column_type = "Text", nullable)]
-    pub task_execution_id: Option<String>,
+    pub thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub root_thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub turn_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub task_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub tariff_hash: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub parent_operation_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
     pub task_run_id: Option<String>,
-    pub end_mono_ns: Option<i64>,
-    pub start_mono_ns: Option<i64>,
-    pub end_wall_ms: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub provider: Option<String>,
-    pub start_wall_ms: Option<i64>,
-    #[sea_orm(column_type = "Text")]
-    pub facts_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub purpose: String,
-    pub source_revision: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub model: Option<String>,
+    pub task_execution_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub execution_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub window_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub owner_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub owner_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub parent_operation_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub purpose: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub provider: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub model: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub recorded_at_ms: i64,
+    pub start_wall_ms: Option<i64>,
+    pub end_wall_ms: Option<i64>,
+    pub start_mono_ns: Option<i64>,
+    pub end_mono_ns: Option<i64>,
+    pub elapsed_ns: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub process_run_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub start_process_run_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub tariff_hash: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub facts_json: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,25 +7,25 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "principal_avatar_revision")]
 pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uidx_principal_avatar_revision_principal_hash"
     )]
     pub principal_id: String,
-    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
-    pub content: Vec<u8>,
-    pub created_at: DateTimeWithTimeZone,
-    pub width: i64,
-    #[sea_orm(column_type = "Text")]
-    pub media_type: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
     #[sea_orm(
         column_type = "VarBinary(StringLen::None)",
         unique_key = "uidx_principal_avatar_revision_principal_hash"
     )]
     pub content_hash: Vec<u8>,
+    #[sea_orm(column_type = "Text")]
+    pub media_type: String,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub content: Vec<u8>,
+    pub width: i64,
     pub height: i64,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "principal_id",

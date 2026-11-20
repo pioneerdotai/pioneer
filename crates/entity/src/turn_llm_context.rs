@@ -7,35 +7,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_llm_context")]
 pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_turn_llm_context_turn_id_delivery_key"
+    )]
+    pub turn_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub item_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub attempt_id: Option<String>,
+    #[sea_orm(unique_key = "uq_turn_llm_context_turn_id_sequence")]
+    pub sequence: i64,
+    #[sea_orm(column_type = "Text")]
+    pub source: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub tool_name: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub payload: String,
+    #[sea_orm(column_type = "Text")]
+    pub output_policy_snapshot: String,
     pub created_at: DateTimeWithTimeZone,
+    pub expires_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(
         column_type = "Text",
         nullable,
         unique_key = "uq_turn_llm_context_turn_id_delivery_key"
     )]
     pub delivery_key: Option<String>,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uq_turn_llm_context_turn_id_delivery_key"
-    )]
-    pub turn_id: String,
-    pub expires_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(unique_key = "uq_turn_llm_context_turn_id_sequence")]
-    pub sequence: i64,
-    #[sea_orm(column_type = "Text")]
-    pub payload: String,
-    #[sea_orm(column_type = "Text")]
-    pub source: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub attempt_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub output_policy_snapshot: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub tool_name: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub item_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

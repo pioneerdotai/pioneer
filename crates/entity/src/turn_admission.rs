@@ -7,12 +7,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_admission")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", unique_key = "idx_turn_admission_scope")]
-    pub thread_id: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub policy_fingerprint: Option<String>,
-    pub policy_generation: Option<i64>,
     #[sea_orm(
         primary_key,
         auto_increment = false,
@@ -20,12 +14,18 @@ pub struct Model {
         unique_key = "idx_turn_admission_scope"
     )]
     pub turn_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub request_digest: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub role_key: Option<String>,
+    #[sea_orm(column_type = "Text", unique_key = "idx_turn_admission_scope")]
+    pub thread_id: String,
     #[sea_orm(column_type = "Text", unique_key = "idx_turn_admission_scope")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub request_digest: String,
+    pub created_at: DateTimeWithTimeZone,
+    pub policy_generation: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub role_key: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub policy_fingerprint: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "turn_id",

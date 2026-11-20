@@ -10,14 +10,14 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub task_id: String,
     #[sea_orm(column_type = "Text")]
-    pub initiating_principal_id: String,
+    pub workspace_id: String,
     #[sea_orm(column_type = "Text")]
     pub root_thread_id: String,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub initiating_principal_id: String,
     #[sea_orm(column_type = "Text")]
     pub authorization_context_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "task_id",

@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "patch_snapshot_scan_reference")]
 pub struct Model {
-    pub ref_count: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub scan_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub domain_id: String,
     #[sea_orm(
@@ -18,8 +19,7 @@ pub struct Model {
     pub content_hash: Vec<u8>,
     #[sea_orm(primary_key, auto_increment = false)]
     pub byte_len: i64,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub scan_id: String,
+    pub ref_count: i64,
     #[sea_orm(
         belongs_to,
         from = "scan_id",

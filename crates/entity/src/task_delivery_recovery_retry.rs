@@ -7,16 +7,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_delivery_recovery_retry")]
 pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub delivery_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub expected_attempt_id: Option<String>,
+    pub expected_attempt_count: i64,
+    pub expected_updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text")]
     pub retry_token: String,
     pub next_probe_at: i64,
-    pub expected_attempt_count: i64,
     pub attempts: i64,
-    pub expected_updated_at: DateTimeWithTimeZone,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub delivery_id: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

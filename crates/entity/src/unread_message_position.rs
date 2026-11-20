@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "unread_message_position")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub block_id: String,
-    pub published_at: i64,
-    #[sea_orm(column_type = "Text")]
-    pub sort_key: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub thread_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub block_id: String,
     #[sea_orm(column_type = "Text")]
     pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub sort_key: String,
+    pub published_at: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

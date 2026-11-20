@@ -4158,7 +4158,7 @@ fn cli_frozen_reader_catalog_does_not_gain_search_after_upgrade() {
 // Record both legacy and paginated retrieval at the existing backend boundary,
 // while retaining real indexes and source/authorization checks.
 struct RecordingRecallSearchBackend {
-    inner: pioneer_memory::SqliteThreadEpisodicBackend,
+    inner: pioneer_memory::PostgresThreadEpisodicBackend,
     calls: AtomicUsize,
 }
 
@@ -4206,7 +4206,7 @@ fn admitted_cli_prompt_context_does_not_recall_and_keeps_explicit_history_search
         let (_harness, processor, turn_id) =
             start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
         let backend = Arc::new(RecordingRecallSearchBackend {
-            inner: pioneer_memory::SqliteThreadEpisodicBackend::new(processor.crud_store.clone()),
+            inner: pioneer_memory::PostgresThreadEpisodicBackend::new(processor.crud_store.clone()),
             calls: AtomicUsize::new(0),
         });
         let mut configured = processor.as_ref().clone();
@@ -5006,7 +5006,7 @@ async fn start_threads_cli_fixture_with_policy(
     (harness, processor, turn)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn early_public_stop_and_cli_initial_attempt_share_the_exact_writer_fence() {
     for phase in [
         "stop_first",

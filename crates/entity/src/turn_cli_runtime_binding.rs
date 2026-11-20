@@ -7,65 +7,65 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_cli_runtime_binding")]
 pub struct Model {
-    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub runtime_id: String,
     #[sea_orm(column_type = "Text")]
     pub runtime_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub native_thread_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub native_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub request_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub model: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub cwd: Option<String>,
+    pub sandbox_json: Option<Json>,
     #[sea_orm(column_type = "Text", nullable)]
     pub approval_policy: Option<String>,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub input_mapping_json: Vec<u8>,
     pub input_mapping_codec: i16,
-    #[sea_orm(column_type = "Text")]
-    pub continuation_thread_id: String,
+    pub input_mapping_bytes: i64,
+    pub input_mapping_chars: i64,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub input_mapping_sha256: Vec<u8>,
+    pub input_mapping_has_inline_history: bool,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_adapter_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_manifest_hash: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub mcp_projection_fingerprint: Option<String>,
-    pub input_mapping_has_inline_history: bool,
-    pub mcp_session_generation: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
     pub mcp_provider_contract_fingerprint: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub mcp_isolation_contract_fingerprint: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub thread_id: String,
-    pub portable_revision: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub model: Option<String>,
-    pub sandbox_json: Option<Json>,
-    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
-    pub input_mapping_sha256: Vec<u8>,
-    pub input_mapping_chars: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub frozen_manifest_id: Option<String>,
-    pub native_goal_observed_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub cwd: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub turn_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub mcp_adapter_kind: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub runtime_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub mcp_manifest_hash: Option<String>,
-    pub input_mapping_bytes: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub native_turn_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
-    pub input_mapping_json: Vec<u8>,
-    #[sea_orm(column_type = "Text")]
-    pub portable_identity: String,
-    #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
+    pub mcp_session_generation: Option<i64>,
     pub mcp_projection_activation_generation: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub native_goal_turn_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub request_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub native_thread_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
     pub native_goal_status: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub native_goal_turn_id: Option<String>,
+    pub native_goal_observed_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub continuation_thread_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub frozen_manifest_id: Option<String>,
+    pub portable_revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub portable_identity: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

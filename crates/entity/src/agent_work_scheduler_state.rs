@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub scheduler_key: String,
-    pub updated_at: DateTimeWithTimeZone,
     pub schedule_generation: i64,
+    pub updated_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

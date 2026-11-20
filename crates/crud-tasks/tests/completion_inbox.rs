@@ -1,10 +1,14 @@
 use anyhow::Result;
 use pioneer_crud_tasks::completion_inbox::{
     TaskCompletionInboxAccess, count_unread_task_completion_inbox,
-    find_task_completion_inbox_entry, list_task_completion_inbox, mark_task_completion_inbox_read,
+    find_task_completion_inbox_entry, list_task_completion_inbox,
+    mark_all_task_completion_inbox_read, mark_task_completion_inbox_read,
 };
 use pioneer_postgres_test::with_database;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
+    Statement,
+};
 
 const A: &str = "P0000000000000000000A";
 const B: &str = "P0000000000000000000B";
@@ -693,4 +697,263 @@ async fn empty_and_small_workspaces_page_independently_of_large_foreign_history(
         );
         Ok(())
     }).await
+}
+
+#[pioneer_postgres_test::postgres_test]
+async fn read_entity_preserves_personal_keys_and_cascades_only_receipts_for_the_deleted_run() {
+    use pioneer_entity::{task_run, task_run_read};
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let db = fixture.connection();
+    prepare(db).await;
+    task(
+        db,
+        "task",
+        Some("T0000000000000000000P"),
+        None,
+        "agent",
+        "none",
+        "attached",
+    )
+    .await;
+    run(db, "first", "task", "succeeded", 1).await;
+    run(db, "second", "task", "succeeded", 2).await;
+    read(db, A, "first").await;
+    read(db, B, "first").await;
+    read(db, A, "second").await;
+    let receipt = task_run_read::Entity::find()
+        .filter(task_run_read::Column::PrincipalId.eq(A.to_owned()))
+        .filter(task_run_read::Column::RunId.eq("first".to_owned()))
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.read_at, "2026-10-16 11:00:00 +00:00");
+    assert_eq!(receipt.principal_id, A);
+    assert_eq!(receipt.run_id, "first");
+    mark_task_completion_inbox_read(db, &access(A), "first", "2026-10-17 11:00:00 +00:00")
+        .await
+        .unwrap();
+    assert_eq!(
+        task_run_read::Entity::find()
+            .filter(task_run_read::Column::PrincipalId.eq(A))
+            .filter(task_run_read::Column::RunId.eq("first"))
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .read_at,
+        receipt.read_at,
+        "a repeated read keeps the original personal receipt"
+    );
+    assert_eq!(
+        task_run_read::Entity::find()
+            .filter(task_run_read::Column::RunId.eq("first"))
+            .all(db)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the composite key keeps one receipt per principal and run"
+    );
+    // Exercise the installed FK cascade directly.
+    task_run::Entity::delete_by_id("first")
+        .exec(db)
+        .await
+        .unwrap();
+    assert_eq!(
+        task_run_read::Entity::find()
+            .filter(task_run_read::Column::RunId.eq("first"))
+            .all(db)
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "deleting one run cascades its personal receipts"
+    );
+    assert!(
+        task_run_read::Entity::find()
+            .filter(task_run_read::Column::PrincipalId.eq(A))
+            .filter(task_run_read::Column::RunId.eq("second"))
+            .one(db)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    for (principal, expected_unread) in [(A, 0), (B, 1)] {
+        let page = list_task_completion_inbox(db, &access(principal), None, 30)
+            .await
+            .unwrap();
+        assert_eq!(page.len() as u64, expected_unread);
+        if expected_unread > 0 {
+            assert_eq!(page[0].run_id, "second");
+        }
+        assert_eq!(unread(db, principal).await, expected_unread);
+        assert!(
+            find_task_completion_inbox_entry(db, &access(principal), "first")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[pioneer_postgres_test::postgres_test]
+async fn read_requires_an_existing_authorized_terminal_run() {
+    use pioneer_entity::task_run_read;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let db = fixture.connection();
+    prepare(db).await;
+    task(
+        db,
+        "private",
+        Some("T0000000000000000000V"),
+        None,
+        "agent",
+        "none",
+        "attached",
+    )
+    .await;
+    run(db, "private-run", "private", "succeeded", 1).await;
+    run(db, "running-run", "private", "running", 2).await;
+    run(db, "orphan-run", "private", "succeeded", 3).await;
+    db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000B' AND thread_id='T0000000000000000000V'").await.unwrap();
+    db.execute_unprepared("UPDATE task_run SET task_id='missing-task' WHERE id='orphan-run'")
+        .await
+        .unwrap();
+    for run_id in ["missing-run", "private-run", "running-run", "orphan-run"] {
+        read(db, B, run_id).await;
+    }
+    // Absolute TaskRead still cannot substitute a different workspace or skip
+    // run/task existence and terminal checks in the atomic INSERT SELECT.
+    let wrong_workspace = TaskCompletionInboxAccess {
+        workspace_id: "W0000000000000000000O",
+        principal_id: A,
+        absolute: true,
+    };
+    mark_task_completion_inbox_read(
+        db,
+        &wrong_workspace,
+        "private-run",
+        "2026-10-17 11:00:00 +00:00",
+    )
+    .await
+    .unwrap();
+    let absolute = TaskCompletionInboxAccess {
+        absolute: true,
+        ..access(A)
+    };
+    for run_id in ["missing-run", "running-run", "orphan-run"] {
+        mark_task_completion_inbox_read(db, &absolute, run_id, "2026-10-17 11:00:00 +00:00")
+            .await
+            .unwrap();
+    }
+    assert!(
+        task_run_read::Entity::find()
+            .all(db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    read(db, A, "private-run").await;
+    let receipts = task_run_read::Entity::find().all(db).await.unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].principal_id, A);
+    assert_eq!(receipts[0].run_id, "private-run");
+}
+
+#[pioneer_postgres_test::postgres_test]
+async fn read_all_covers_unloaded_pages_and_leaves_later_commits_at_the_same_time_unread() {
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let db = fixture.connection();
+    prepare(db).await;
+    task(
+        db,
+        "bulk",
+        Some("T0000000000000000000P"),
+        None,
+        "tool",
+        "none",
+        "detached",
+    )
+    .await;
+    task(
+        db,
+        "hidden-bulk",
+        Some("T0000000000000000000V"),
+        None,
+        "tool",
+        "none",
+        "detached",
+    )
+    .await;
+    for ix in 0..65 {
+        run(db, &format!("bulk-{ix:03}"), "bulk", "succeeded", ix + 1).await;
+    }
+    run(db, "hidden-bulk-run", "hidden-bulk", "failed", 1).await;
+    db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000A' AND thread_id='T0000000000000000000V'").await.unwrap();
+    assert_eq!(
+        list_task_completion_inbox(db, &access(A), None, 30)
+            .await
+            .unwrap()
+            .len(),
+        30
+    );
+    mark_all_task_completion_inbox_read(db, &access(A), "2026-10-16 10:00:00 +00:00")
+        .await
+        .unwrap();
+    assert_eq!(unread(db, A).await, 0);
+    assert_eq!(unread(db, B).await, 66);
+    assert!(
+        list_task_completion_inbox(db, &access(A), None, 30)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        pioneer_entity::task_run_read::Entity::find()
+            .all(db)
+            .await
+            .unwrap()
+            .len(),
+        65
+    );
+    // The receipt statement observes a snapshot of completed runs.
+    run(db, "aaa-later", "bulk", "succeeded", 66).await;
+    assert_eq!(unread(db, A).await, 1);
+    assert_eq!(
+        list_task_completion_inbox(db, &access(A), None, 30)
+            .await
+            .unwrap()[0]
+            .run_id,
+        "aaa-later"
+    );
+    let foreign = TaskCompletionInboxAccess {
+        workspace_id: "W0000000000000000000O",
+        ..access(A)
+    };
+    mark_all_task_completion_inbox_read(db, &foreign, "2026-10-16 10:00:00 +00:00")
+        .await
+        .unwrap();
+    assert_eq!(unread(db, A).await, 1);
+    let principal_access = access(A);
+    let (bulk_result, ()) = tokio::join!(
+        mark_all_task_completion_inbox_read(db, &principal_access, "2026-10-16 10:00:00 +00:00"),
+        run(db, "racing-completion", "bulk", "succeeded", 67),
+    );
+    bulk_result.unwrap();
+    let included = pioneer_entity::task_run_read::Entity::find()
+        .filter(pioneer_entity::task_run_read::Column::PrincipalId.eq(A.to_owned()))
+        .filter(pioneer_entity::task_run_read::Column::RunId.eq("racing-completion".to_owned()))
+        .one(db)
+        .await
+        .unwrap()
+        .is_some();
+    let remaining = u64::from(!included);
+    assert_eq!(
+        unread(db, A).await,
+        remaining,
+        "the statement snapshot defines which concurrent commit belongs to the operation"
+    );
+    run(db, "strictly-after-race", "bulk", "succeeded", 68).await;
+    assert_eq!(unread(db, A).await, remaining + 1);
 }

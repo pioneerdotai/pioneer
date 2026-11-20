@@ -488,7 +488,7 @@ async fn update_upload_consumption_and_repair_gate_share_one_authorized_write() 
 // B-02: native resolver output is supplied separately from durable bindings.
 // Missing bindings for selected leaves remain a commit failure; exclusions do
 // not turn installed siblings into an all-or-nothing dependency.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings() {
     use pioneer_protocol::{PluginSelectedChild, PluginSelectedParent, PluginSelectionSnapshot};
     let store = test_store_with_workspace("ws").await;
@@ -732,7 +732,7 @@ async fn native_skill_policy_audit_and_ownership_commit_together_without_upload(
     .await
     .unwrap();
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_ownership_insert_rolls_back_native_rows_policies_and_audits() {
     let store = test_store_with_workspace("ws").await;
     store
@@ -893,7 +893,7 @@ async fn foreign_scope_stale_revision_and_native_name_collision_cannot_publish()
     .await
     .unwrap();
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn same_authored_skill_names_do_not_collide_and_child_delete_unlinks_with_fk_off() {
     let store = test_store_with_workspace("ws").await;
     store
@@ -988,7 +988,7 @@ async fn ownership_does_not_reclassify_interactive_or_maintenance_access() {
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn concurrent_interactive_and_maintenance_publication_cannot_share_child() {
     let store = test_store_with_workspace("ws").await;
     store
@@ -1722,7 +1722,7 @@ async fn failed_assets_only_update_preserves_the_last_committed_tree_for_retry()
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_policy_audit_override_and_parent_commit_marker_are_atomic() {
     let store = test_store_with_workspace("ws-c1-policy").await;
     let parent_id = "P".repeat(21);
@@ -1964,7 +1964,7 @@ async fn native_policy_audit_override_and_parent_commit_marker_are_atomic() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn owned_skill_policy_and_user_removal_revalidate_in_the_native_writer() {
     let store = test_store_with_workspace("ws-c1-skill").await;
     let parent_id = "P".repeat(21);

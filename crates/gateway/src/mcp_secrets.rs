@@ -141,7 +141,7 @@ mod tests {
                 id: Set("ws_gc".into()),
                 name: Set("GC fixture".into()),
                 is_active: Set(true),
-                is_current: Set(true),
+                is_current: Set(false),
                 created_at: Set(now),
                 updated_at: Set(now),
             })

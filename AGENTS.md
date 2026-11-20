@@ -208,6 +208,11 @@ PostgreSQL integration tests run under
 The runner applies the Migrator once and closes the template pool before any
 test starts. Use `with_database` for a clone, `with_empty_database` to test
 migrations, and `TestDatabase::connect` for another pool on the same database.
+For a test that calls nested fixture builders, use
+`#[pioneer_postgres_test::postgres_test]` or wrap a custom runtime's test future
+in `with_test_databases`. Each call to `scoped_database` creates an independent
+fixture. Pass that fixture to concurrent workers so they share its database.
+The test scope closes fixture pools and drops each database, including on panic.
 The runner removes its template and any databases left by interrupted tests.
 
 Use `cargo-nextest` for Rust unit and integration tests:

@@ -7,21 +7,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "mcp_server_catalog_snapshot")]
 pub struct Model {
-    pub generated_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text", unique)]
     pub server_installation_id: String,
-    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub catalog_version: String,
+    pub server_info_json: Json,
     #[sea_orm(column_type = "Text", nullable)]
     pub server_instructions_hash: Option<String>,
     pub tools_json: Json,
+    pub resources_json: Json,
     pub resource_templates_json: Json,
     pub prompts_json: Json,
-    pub resources_json: Json,
-    #[sea_orm(column_type = "Text")]
-    pub catalog_version: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
-    pub server_info_json: Json,
+    pub generated_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

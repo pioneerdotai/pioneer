@@ -15,19 +15,6 @@ use sea_orm::{ActiveModelTrait, FromQueryResult, IntoActiveModel};
 
 const NOW: i64 = 4_000_000_000;
 const AT: i64 = 1_700_000_000;
-const MIGRATION: &str = "m20261008_000003_task_occurrence_reconcile";
-
-// Keep this tracker last for rollback/installation checks. The shared helper
-// supplies only orthogonal current TaskEvent storage before the trackers;
-// later irreversible migrations remain excluded.
-struct TrackerMigrator;
-
-impl MigratorTrait for TrackerMigrator {
-    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        migrations_through(MIGRATION)
-    }
-}
-
 // These pre-cutover regression matrices intentionally exercise the released
 // triggers, while task_occurrence_producers_tests owns the typed replacement.
 async fn legacy_tracking_store(workspace: &str) -> CrudStore {
@@ -212,7 +199,7 @@ async fn matches_diagnostic(store: &CrudStore, run_id: &str, expected: bool) {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn literal_predicate_status_executor_and_system_null_binding_matrix() {
     let (store, run, _) = fixture(TaskExecutorKind::System).await;
     for (status, target) in [
@@ -302,7 +289,7 @@ async fn literal_predicate_status_executor_and_system_null_binding_matrix() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn literal_agent_identity_and_null_matrix() {
     let (store, run, id) = fixture(TaskExecutorKind::Agent).await;
     matches_diagnostic(&store, &run.id, true).await;
@@ -379,7 +366,7 @@ async fn literal_agent_identity_and_null_matrix() {
     matches_diagnostic(&store, &run.id, false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn status_repair_and_post_trigger_ack_are_one_commit_and_rollback_together() {
     let (store, run, _) = fixture(TaskExecutorKind::System).await;
     let claimed = claim(&store, &run.id, NOW).await;
@@ -421,7 +408,7 @@ async fn status_repair_and_post_trigger_ack_are_one_commit_and_rollback_together
     assert_eq!(pending_row(&store, &run.id).await.unwrap(), new);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn preparation_mutation_and_task_scope_rebinding_fence_stale_repair() {
     let (store, run, _) = fixture(TaskExecutorKind::System).await;
     let claimed = claim(&store, &run.id, NOW).await;
@@ -467,7 +454,7 @@ async fn preparation_mutation_and_task_scope_rebinding_fence_stale_repair() {
     assert_eq!(pending_row(&store, &run.id).await.unwrap(), newer);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn missing_late_authorities_and_same_id_aba_are_covered() {
     let store = legacy_tracking_store("ws_task").await;
     let task = task(&store, TaskExecutorKind::System).await;
@@ -524,7 +511,7 @@ async fn missing_late_authorities_and_same_id_aba_are_covered() {
     assert_eq!(pending_row(&store, &run.id).await.unwrap(), reinserted);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn late_task_occurrence_and_run_requeue_after_missing_authority_ack() {
     let (store, run, _) = fixture(TaskExecutorKind::System).await;
     let task = pioneer_entity::task::Entity::find_by_id(run.task_id.clone())
@@ -632,7 +619,7 @@ async fn late_task_occurrence_and_run_requeue_after_missing_authority_ack() {
     assert!(pending_row(&store, &run.id).await.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn agent_late_insert_uses_execution_pk_and_does_not_invent_bindings() {
     let (store, run, id) = fixture(TaskExecutorKind::Agent).await;
     let model = agents::Entity::find_by_id(id.clone())
@@ -678,7 +665,7 @@ async fn agent_late_insert_uses_execution_pk_and_does_not_invent_bindings() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn heartbeat_lease_payload_progress_and_identical_upserts_do_not_refresh_dirty() {
     let (store, run, id) = fixture(TaskExecutorKind::System).await;
     let before = pending_row(&store, &run.id).await.unwrap();
@@ -759,7 +746,7 @@ async fn heartbeat_lease_payload_progress_and_identical_upserts_do_not_refresh_d
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn scope_fanout_is_bounded_fenced_and_covers_new_ids_behind_cursor() {
     let store = legacy_tracking_store("ws_task").await;
     let task = task(&store, TaskExecutorKind::System).await;
@@ -870,187 +857,9 @@ async fn scope_fanout_is_bounded_fenced_and_covers_new_ids_behind_cursor() {
     );
 }
 
-#[tokio::test]
-async fn migration_objects_and_marker_rollback_on_trigger_installation_failure() {
-    let store = test_store_with_workspace_migrator::<TrackerMigrator>("ws_task")
-        .await
-        .with_maintenance_access();
-    let tx = store.connection.begin().await.unwrap();
-    TrackerMigrator::down(&*tx, Some(1)).await.unwrap();
-    tx.commit().await.unwrap();
-    store.connection.execute_unprepared("CREATE TRIGGER task_occurrence_reconcile_task_run_update AFTER UPDATE ON task_run WHEN 0 BEGIN SELECT 1; END").await.unwrap();
-    let tx = store.connection.begin().await.unwrap();
-    assert!(TrackerMigrator::up(&*tx, None).await.is_err());
-    tx.rollback().await.unwrap();
-    for query in [
-        "SELECT name FROM sqlite_master WHERE name IN ('task_occurrence_reconcile_pending','task_occurrence_reconcile_scope','task_occurrence_reconcile_seed','task_occurrence_reconcile_sequence','idx_task_occurrence_reconcile_due','idx_task_run_task_id','idx_task_run_status_id','task_occurrence_reconcile_task_run_insert')",
-        "SELECT version FROM seaql_migrations WHERE version='m20261008_000003_task_occurrence_reconcile'",
-    ] {
-        assert!(
-            store
-                .connection
-                .query_all_raw(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    query.to_owned()
-                ))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-    store
-        .connection
-        .execute_unprepared("DROP TRIGGER task_occurrence_reconcile_task_run_update")
-        .await
-        .unwrap();
-    let tx = store.connection.begin().await.unwrap();
-    TrackerMigrator::up(&*tx, None).await.unwrap();
-    tx.commit().await.unwrap();
-    assert!(
-        seed::Entity::find_by_id(1)
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        pending::Entity::find()
-            .all(&store.connection)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-}
-
 // This migration fixture predates webhook payloads. Insert only historical
 // columns and avoid RETURNING the current entity's newer columns.
-async fn legacy_seed_source_run(store: &CrudStore, task: &Task, n: u64, status: TaskRunStatus) {
-    let id = format!("r{n:020}");
-    runs::Entity::insert(runs::ActiveModel {
-        id: Set(id.clone()),
-        task_id: Set(task.id.clone()),
-        run_group_id: Set(id),
-        attempt_number: Set(1),
-        run_number: Set((n + 1).try_into().unwrap()),
-        status: Set(crate::convention::task_run_status_to_db(status).to_owned()),
-        executor_kind: Set(
-            crate::convention::task_executor_kind_to_db(task.executor_kind).to_owned(),
-        ),
-        completed_at: Set(status
-            .is_terminal()
-            .then(|| crate::util::unix_to_datetime(AT + 1))),
-        created_at: Set(crate::util::unix_to_datetime(AT)),
-        updated_at: Set(crate::util::unix_to_datetime(AT)),
-        ..Default::default()
-    })
-    .exec_without_returning(&store.connection)
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn seed_interruption_keeps_fixed_bound_and_accepts_terminal_history() {
-    let store = test_store_with_workspace_migrator::<TrackerMigrator>("ws_task").await;
-    let maintenance = store.with_maintenance_access();
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerMigrator::down(&*tx, Some(1)).await.unwrap();
-    tx.commit().await.unwrap();
-    let task = task(&store, TaskExecutorKind::System).await;
-    for n in 0..40 {
-        legacy_seed_source_run(&store, &task, n, TaskRunStatus::Queued).await;
-    }
-    legacy_seed_source_run(&store, &task, 50, TaskRunStatus::Succeeded).await;
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerMigrator::up(&*tx, None).await.unwrap();
-    tx.commit().await.unwrap();
-    let initial = seed::Entity::find_by_id(1)
-        .one(&store.connection)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(initial.upper_run_id, Some(format!("r{:020}", 39)));
-    assert!(
-        pending::Entity::find()
-            .all(&store.connection)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    store.connection.execute_unprepared("CREATE TRIGGER reject_seed_progress BEFORE UPDATE ON task_occurrence_reconcile_seed BEGIN SELECT RAISE(ABORT,'interrupted'); END").await.unwrap();
-    assert!(
-        store
-            .seed_unfinished_task_occurrences(&|| NOW)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        seed::Entity::find_by_id(1)
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap(),
-        initial
-    );
-    assert!(
-        pending::Entity::find()
-            .all(&store.connection)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    store
-        .connection
-        .execute_unprepared("DROP TRIGGER reject_seed_progress")
-        .await
-        .unwrap();
-    assert_eq!(
-        store
-            .seed_unfinished_task_occurrences(&|| NOW)
-            .await
-            .unwrap(),
-        16
-    );
-    legacy_seed_source_run(&store, &task, 100, TaskRunStatus::Queued).await; // own INSERT, outside fixed seed bound
-    assert!(
-        pending_row(&store, &format!("r{:020}", 100))
-            .await
-            .is_some()
-    );
-    for _ in 0..7 {
-        assert!(
-            store
-                .clone()
-                .seed_unfinished_task_occurrences(&|| NOW)
-                .await
-                .unwrap()
-                <= 16
-        );
-    }
-    let complete = seed::Entity::find_by_id(1)
-        .one(&store.connection)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(complete.status_index, 5);
-    assert_eq!(
-        store
-            .seed_unfinished_task_occurrences(&|| NOW)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        pending::Entity::find()
-            .all(&store.connection)
-            .await
-            .unwrap()
-            .len(),
-        41
-    );
-    assert!(pending_row(&store, &format!("r{:020}", 50)).await.is_none());
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_claim_deferral_fences_null_token_due_count_generation_and_stale_error() {
     let (store, run, _) = fixture(TaskExecutorKind::System).await;
     store.connection.execute_unprepared("CREATE TRIGGER refuse_contract_claim BEFORE UPDATE OF claim_token ON task_occurrence_reconcile_pending WHEN NEW.claim_token IS NOT NULL BEGIN SELECT RAISE(ABORT,'claim refusal'); END").await.unwrap();
@@ -1115,7 +924,7 @@ async fn failed_claim_deferral_fences_null_token_due_count_generation_and_stale_
     assert_eq!(owned.next_attempt_at, NOW + 15);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn resume_retry_rebind_delete_and_monotonic_sequence_overflow() {
     let (store, run, id) = fixture(TaskExecutorKind::System).await;
     let owned = claim(&store, &run.id, NOW).await;
@@ -1201,7 +1010,7 @@ async fn resume_retry_rebind_delete_and_monotonic_sequence_overflow() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn over_budget_poison_claims_and_healthy_rows_share_fair_quanta() {
     let store = legacy_tracking_store("ws_task").await;
     let task = task(&store, TaskExecutorKind::System).await;
@@ -1278,7 +1087,7 @@ async fn over_budget_poison_claims_and_healthy_rows_share_fair_quanta() {
 struct Plan {
     detail: String,
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn due_scope_and_seed_plans_use_covering_keyset_indexes() {
     let store = legacy_tracking_store("ws_task").await;
     let scope = scopes::Model {
@@ -1577,7 +1386,7 @@ async fn claim_clock_is_read_after_admission_and_backoff_survives_reopen() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn m_true_repair_failure_retains_obligation_and_backoff_saturates() {
     let (store, run, _) = fixture(TaskExecutorKind::System).await;
     store.connection.execute_unprepared("CREATE TRIGGER refuse_contract_repair BEFORE UPDATE OF status ON task_occurrence_contract BEGIN SELECT RAISE(ABORT,'repair refused'); END").await.unwrap();
@@ -1602,7 +1411,7 @@ async fn m_true_repair_failure_retains_obligation_and_backoff_saturates() {
     assert!(store.has_pending_task_occurrence_reconcile().await.unwrap());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn source_pk_rebinds_and_deletes_enqueue_old_and_new_locators() {
     let (store, run, _) = fixture(TaskExecutorKind::System).await;
     clear_bookkeeping(&store).await;
@@ -1675,7 +1484,7 @@ async fn source_pk_rebinds_and_deletes_enqueue_old_and_new_locators() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn agent_old_new_keys_use_execution_pk_even_without_occurrence_rows() {
     let (store, _, original_id) = fixture(TaskExecutorKind::Agent).await;
     let task = task(&store, TaskExecutorKind::Agent).await;
@@ -1794,7 +1603,7 @@ async fn scope_generation_refresh_while_waiting_for_writer_rejects_old_prefix() 
     assert!(pending_row(&store, &run.id).await.is_some());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn metadata_repair_does_not_decode_unrelated_payloads() {
     let (store, run, id) = fixture(TaskExecutorKind::System).await;
     sql(&store,"UPDATE task SET metadata_json='invalid JSON',result_json='invalid JSON',error_json='invalid JSON' WHERE id=?",vec![run.task_id.clone().into()]).await;
@@ -1822,7 +1631,7 @@ async fn metadata_repair_does_not_decode_unrelated_payloads() {
     assert!(pending_row(&store, &run.id).await.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn poison_scope_rotates_without_advancing_prefix_and_healthy_scope_progresses() {
     let store = legacy_tracking_store("ws_task").await;
     let a = task(&store, TaskExecutorKind::System).await;

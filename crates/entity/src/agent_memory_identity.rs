@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "agent_memory_identity")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub namespace: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub scope_kind: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub canonical_key: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub scope_key_hash: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub namespace: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub canonical_key: String,
     #[sea_orm(column_type = "Text", unique)]
     pub memory_id: String,
     #[sea_orm(

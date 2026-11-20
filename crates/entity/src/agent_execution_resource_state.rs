@@ -9,30 +9,30 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    pub progress_sequence: i64,
-    pub fenced_at: Option<DateTimeWithTimeZone>,
-    pub last_heartbeat_at: Option<DateTimeWithTimeZone>,
-    pub hard_deadline: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    #[sea_orm(unique_key = "uq_agent_resource_state_attempt")]
-    pub attempt_generation: i64,
-    pub idle_deadline: Option<DateTimeWithTimeZone>,
-    pub last_progress_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text")]
-    pub progress_frontier_json: String,
-    pub fair_order: i64,
-    pub fencing_generation: i64,
     #[sea_orm(column_type = "Text", unique_key = "uq_agent_resource_state_attempt")]
     pub execution_id: String,
+    #[sea_orm(unique_key = "uq_agent_resource_state_attempt")]
+    pub attempt_generation: i64,
+    pub progress_sequence: i64,
+    #[sea_orm(column_type = "Text")]
+    pub progress_frontier_json: String,
+    pub last_progress_at: Option<DateTimeWithTimeZone>,
+    pub last_heartbeat_at: Option<DateTimeWithTimeZone>,
+    pub idle_deadline: Option<DateTimeWithTimeZone>,
+    pub hard_deadline: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text")]
     pub local_usage_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub branch_key: String,
-    pub updated_at: DateTimeWithTimeZone,
-    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", nullable)]
     pub permit_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub branch_key: String,
+    pub fair_order: i64,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub fencing_generation: i64,
+    pub fenced_at: Option<DateTimeWithTimeZone>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "execution_id",

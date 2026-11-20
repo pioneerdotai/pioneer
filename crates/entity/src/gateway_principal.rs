@@ -7,27 +7,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "gateway_principal")]
 pub struct Model {
-    pub inbox_after_sequence: Option<i64>,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    pub removed_at: Option<DateTimeWithTimeZone>,
-    pub authorization_guard: i64,
-    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text", unique_key = "idx_gateway_principal_nickname")]
     pub gateway_id: String,
     #[sea_orm(column_type = "Text")]
     pub kind: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub nickname: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub role_key: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
     #[sea_orm(column_type = "Text")]
     pub display_name: String,
+    #[sea_orm(column_type = "Text")]
+    pub nickname: String,
     #[sea_orm(column_type = "Text", unique_key = "idx_gateway_principal_nickname")]
     pub nickname_key: String,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    pub removed_at: Option<DateTimeWithTimeZone>,
+    pub authorization_guard: i64,
+    pub inbox_after_sequence: Option<i64>,
     #[sea_orm(has_many)]
     pub audit_events: HasMany<super::audit_event::Entity>,
     #[sea_orm(has_many)]

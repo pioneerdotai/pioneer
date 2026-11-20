@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_occurrence_reconcile_pending")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub claim_token: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub run_id: String,
     pub generation: i64,
     pub next_attempt_at: i64,
     pub attempt_count: i64,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub run_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub claim_token: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

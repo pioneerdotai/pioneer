@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "patch_snapshot_scan")]
 pub struct Model {
-    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(has_many)]
     pub patch_snapshot_scan_references: HasMany<super::patch_snapshot_scan_reference::Entity>,
 }

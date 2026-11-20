@@ -7,23 +7,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_layout")]
 pub struct Model {
-    #[sea_orm(unique)]
-    pub insertion_ordinal: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub candidate: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub kind: i64,
-    pub cleanup_next: i64,
-    pub verified_span_revision: Option<i64>,
-    pub failed: i64,
-    pub copy_to: Option<i64>,
-    pub cleanup_to: i64,
-    pub active: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub manifest_id: String,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub kind: i64,
+    pub active: i64,
     pub pending: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub candidate: Option<String>,
     pub compared: i64,
+    pub copy_to: Option<i64>,
     pub copy_next: i64,
+    pub cleanup_to: i64,
+    pub cleanup_next: i64,
+    pub failed: i64,
+    pub verified_span_revision: Option<i64>,
+    #[sea_orm(unique)]
+    pub insertion_ordinal: i64,
     #[sea_orm(
         belongs_to,
         from = "manifest_id",

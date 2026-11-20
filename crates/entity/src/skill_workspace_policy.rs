@@ -7,22 +7,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "skill_workspace_policy")]
 pub struct Model {
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uq_skill_workspace_policy_workspace_skill_id"
-    )]
-    pub skill_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    pub enabled: Option<bool>,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uq_skill_workspace_policy_workspace_skill_id"
     )]
     pub workspace_id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_skill_workspace_policy_workspace_skill_id"
+    )]
+    pub skill_id: String,
+    pub enabled: Option<bool>,
     pub allow_implicit_invocation: Option<bool>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -14,7 +14,7 @@ async fn native_terminal_effect_kick_uses_background_database_scope() {
     assert_native_kick_database_scope(true).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_terminal_effect_kick_defers_coalesced_retry_after_storage_failure() {
     // Observe the existing end-of-quantum warning, rather than assuming a
     // fixed number of scheduler yields means the worker has started its sleep.
@@ -328,7 +328,7 @@ pub(super) fn local_capture() -> (
     (hub, transport, dispatch)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
     let (mut processor, _, _, _, _, _) = setup_workspace_message_processor().await;
     // Keep writer settlement available: closing both pools stops recovery at
@@ -445,7 +445,7 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn real_complete_reconciliation_results_recover_only_their_reporter() {
     let (processor, _, _, _, _, _) = setup_workspace_message_processor().await;
     let processor = Arc::new(processor);
@@ -495,7 +495,7 @@ async fn real_complete_reconciliation_results_recover_only_their_reporter() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn partial_durable_progress_followed_by_real_error_does_not_recover() {
     let (processor, store, workspace_id) =
         setup_execution_window_terminal_turn("diagnostic_thread", "diagnostic_turn").await;

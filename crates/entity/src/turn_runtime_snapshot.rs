@@ -7,32 +7,32 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_runtime_snapshot")]
 pub struct Model {
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub model: String,
-    pub history_json: Json,
-    pub agent_skill_versions_json: Option<Json>,
-    pub resolved_artifacts_json: Json,
-    #[sea_orm(column_type = "Text")]
-    pub thread_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub frozen_manifest_id: Option<String>,
-    pub capabilities_json: Json,
-    pub runtime_environment_json: Json,
-    #[sea_orm(column_type = "Text")]
-    pub mode: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub reasoning_effort: Option<String>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub turn_id: String,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
     #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
-    pub hook_runtime_context_json: Json,
-    pub input_json: Json,
-    pub workspace_skill_policies_json: Json,
+    #[sea_orm(column_type = "Text")]
+    pub mode: String,
+    #[sea_orm(column_type = "Text")]
+    pub model: String,
     #[sea_orm(column_type = "Text")]
     pub provider_name: String,
+    pub hook_runtime_context_json: Json,
+    pub workspace_skill_policies_json: Json,
+    pub input_json: Json,
+    pub capabilities_json: Json,
+    pub resolved_artifacts_json: Json,
+    pub runtime_environment_json: Json,
+    pub history_json: Json,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub reasoning_effort: Option<String>,
+    pub agent_skill_versions_json: Option<Json>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub frozen_manifest_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

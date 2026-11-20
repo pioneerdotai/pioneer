@@ -1,6 +1,6 @@
 use super::*;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_post_turn_extracts_user_memory_through_shared_provider_and_durable_worker() {
     let extracted = json!({"facts": [{
         "semantic": {"intent":"explicit_store", "explicitness":"explicit", "category":"identity",
@@ -115,7 +115,7 @@ fn final_answer(text: &str) -> TurnItem {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_post_turn_tool_summaries_are_bounded_metadata_not_tool_output() {
     let (processor, _, _rx, workspace, store, _) = cli_runtime_approval_processor().await;
     let processor = Arc::new(processor);
@@ -232,7 +232,7 @@ async fn commit_turn(store: &CrudStore, binding: &pioneer_crud::CliRuntimeTurnBi
         .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_post_turn_replay_preserves_first_snapshot_and_executes_once_after_commit() {
     let (processor, _, _rx, _, store, _) = cli_runtime_approval_processor().await;
     let processor = Arc::new(processor);
@@ -302,7 +302,7 @@ async fn cli_post_turn_replay_preserves_first_snapshot_and_executes_once_after_c
     assert!(!value.contains("different"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_post_turn_rejects_obsolete_attempt_and_non_final_item_without_writing() {
     let (processor, _, _rx, _, store, _) = cli_runtime_approval_processor().await;
     let processor = Arc::new(processor);
@@ -342,7 +342,7 @@ async fn cli_post_turn_rejects_obsolete_attempt_and_non_final_item_without_writi
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_post_turn_without_subscribers_is_noop_and_user_preview_is_bounded() {
     let (processor, _, _rx, _, store, _) = cli_runtime_approval_processor().await;
     let binding = store
@@ -375,7 +375,7 @@ async fn cli_post_turn_without_subscribers_is_noop_and_user_preview_is_bounded()
     assert!(!truncated);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker() {
     use pioneer_entity::native_terminal_effect_outbox as effect;
     use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, sea_query::Expr};
@@ -557,7 +557,7 @@ async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker(
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn terminal_effect_single_kick_drains_more_than_one_full_quantum() {
     for (rotation, first_wave) in [(0_i64, 3_usize), (1, 8), (2, 4)] {
         let (processor, _, _rx, workspace, store, _) = cli_runtime_approval_processor().await;
@@ -649,7 +649,7 @@ async fn terminal_effect_single_kick_drains_more_than_one_full_quantum() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn terminal_effect_owner_recovers_an_expired_lease_without_another_kick() {
     let (processor, _, _rx, workspace, store, _) = cli_runtime_approval_processor().await;
     let processor = Arc::new(processor);

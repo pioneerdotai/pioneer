@@ -7,19 +7,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_execution_grant")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub grant_fingerprint: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text")]
     pub execution_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub parent_execution_id: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text")]
     pub child_identity_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub grant_fingerprint: String,
     #[sea_orm(column_type = "Text")]
     pub grant_json: String,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "execution_id",

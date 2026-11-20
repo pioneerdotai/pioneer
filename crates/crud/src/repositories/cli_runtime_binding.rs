@@ -590,7 +590,7 @@ pub async fn upsert_thread_binding<C: ConnectionTrait>(
 ) -> Result<CliRuntimeThreadBindingRecord> {
     root.verify(db, &binding.workspace_id).await?;
     let thread_id = binding.thread_id.clone();
-    thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(binding, root)?)
+    thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(binding, root))
         .on_conflict(
             OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
                 .update_columns([
@@ -629,7 +629,7 @@ pub async fn insert_fork_intent_if_absent<C: ConnectionTrait>(
         "CLI fork intent must be pending"
     );
     let result =
-        thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(pending, root)?)
+        thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(pending, root))
             .on_conflict(
                 OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
                     .do_nothing()
@@ -831,9 +831,7 @@ pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
             active.native_root_thread_id = Set(request.thread_binding.native_root_thread_id);
             active.native_cwd = Set(request.thread_binding.native_cwd);
             active.native_model = Set(request.thread_binding.native_model);
-            active.resume_cursor_json = Set(serde_json::from_str(
-                &request.thread_binding.resume_cursor_json,
-            )?);
+            active.resume_cursor_json = Set(request.thread_binding.resume_cursor_json);
             active.frozen_manifest_id = Set(root.locator());
             active.provider_session_id = Set(Some(proposed_provider_session_id));
             active.provider_session_lifecycle_state = Set(Some(
@@ -878,7 +876,7 @@ pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
     root.verify(db, &request.thread_binding.workspace_id)
         .await?;
     let proposed_provider_session_id = request.proposed_provider_session_id;
-    let mut active = active_thread_binding_from_new(request.thread_binding, root)?;
+    let mut active = active_thread_binding_from_new(request.thread_binding, root);
     active.native_thread_id = Set(proposed_provider_session_id.clone());
     active.native_session_id = Set(Some(proposed_provider_session_id.clone()));
     active.provider_session_id = Set(Some(proposed_provider_session_id));
@@ -2237,6 +2235,11 @@ pub async fn accept_pending_request_response<C: ConnectionTrait>(
             "CLI runtime pending request responder provenance is invalid"
         ));
     }
+    let response_json = response
+        .response_json
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()?;
     let result = cli_runtime_pending_request::Entity::update_many()
         .col_expr(
             cli_runtime_pending_request::Column::Status,
@@ -2248,7 +2251,7 @@ pub async fn accept_pending_request_response<C: ConnectionTrait>(
         )
         .col_expr(
             cli_runtime_pending_request::Column::ResponseJson,
-            sea_orm::sea_query::Expr::value(response.response_json),
+            sea_orm::sea_query::Expr::value(response_json),
         )
         .col_expr(
             cli_runtime_pending_request::Column::RespondingPrincipalId,
@@ -2348,7 +2351,7 @@ pub async fn transition_pending_request_delivery<C: ConnectionTrait>(
         update = update
             .col_expr(
                 cli_runtime_pending_request::Column::ResponseJson,
-                sea_orm::sea_query::Expr::value(Option::<String>::None),
+                sea_orm::sea_query::Expr::value(Option::<serde_json::Value>::None),
             )
             .col_expr(
                 cli_runtime_pending_request::Column::RespondingPrincipalId,
@@ -2584,8 +2587,8 @@ async fn update_pending_request_metadata<C: ConnectionTrait>(
 fn active_thread_binding_from_new(
     binding: NewCliRuntimeThreadBinding,
     root: &crate::frozen_lifetime::PreparedFrozenRoot,
-) -> Result<thread_cli_runtime_binding::ActiveModel> {
-    Ok(thread_cli_runtime_binding::ActiveModel {
+) -> thread_cli_runtime_binding::ActiveModel {
+    thread_cli_runtime_binding::ActiveModel {
         thread_id: Set(binding.thread_id),
         workspace_id: Set(binding.workspace_id),
         runtime_id: Set(binding.runtime_id),
@@ -2595,13 +2598,13 @@ fn active_thread_binding_from_new(
         native_root_thread_id: Set(binding.native_root_thread_id),
         native_cwd: Set(binding.native_cwd),
         native_model: Set(binding.native_model),
-        resume_cursor_json: Set(serde_json::from_str(&binding.resume_cursor_json)?),
+        resume_cursor_json: Set(binding.resume_cursor_json),
         frozen_manifest_id: Set(root.locator()),
         status: Set(binding.status),
         created_at: Set(binding.created_at),
         updated_at: Set(binding.updated_at),
         ..Default::default()
-    })
+    }
 }
 
 fn active_turn_binding_from_new(
@@ -2862,7 +2865,7 @@ fn thread_binding_record_from_model(
         native_root_thread_id: model.native_root_thread_id,
         native_cwd: model.native_cwd,
         native_model: model.native_model,
-        resume_cursor_json: model.resume_cursor_json.to_string(),
+        resume_cursor_json: model.resume_cursor_json,
         status: model.status,
         mcp,
         provider_session,

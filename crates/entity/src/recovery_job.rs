@@ -7,54 +7,54 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "recovery_job")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub action: String,
-    pub resolution_pending: bool,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_failure_attempt_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub diagnostic: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    pub run_count: i64,
-    pub claim_expires_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text")]
-    pub item_type: String,
-    pub claimed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
+    pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
     pub item_id: String,
-    pub provider_attempt_number: i64,
+    #[sea_orm(column_type = "Text")]
+    pub item_type: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub source_attempt_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text")]
+    pub trigger: String,
+    #[sea_orm(column_type = "Text")]
+    pub action: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub reason: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub trigger: String,
+    pub policy: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub error_class: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub transport_stage: Option<String>,
+    pub retry_after_ms: Option<i64>,
+    pub provider_attempt_number: i64,
+    #[sea_orm(column_type = "Text")]
+    pub policy_snapshot: String,
+    pub run_count: i64,
+    pub max_attempts: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_error: Option<String>,
+    pub scheduled_at: DateTimeWithTimeZone,
     pub next_run_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub claim_token: Option<String>,
+    pub claimed_at: Option<DateTimeWithTimeZone>,
+    pub claim_expires_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub active_attempt_id: Option<String>,
     pub active_attempt_started_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub resolution_pending: bool,
     #[sea_orm(column_type = "Text", nullable)]
-    pub error_class: Option<String>,
-    pub max_attempts: i64,
-    #[sea_orm(column_type = "Text")]
-    pub policy: String,
+    pub diagnostic: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub transport_stage: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_error: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub turn_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub policy_snapshot: String,
-    pub retry_after_ms: Option<i64>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub claim_token: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub source_attempt_id: Option<String>,
-    pub scheduled_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub active_attempt_id: Option<String>,
+    pub last_failure_attempt_id: Option<String>,
     #[sea_orm(has_one)]
     pub recovery_terminalization_outbox: HasOne<super::recovery_terminalization_outbox::Entity>,
 }

@@ -1,9 +1,9 @@
 // Included in durable_sweep: same guarded fixtures and actual sweep driver.
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unrelated_continuous_fanout_allows_physical_admission_delete_and_clean_skip() {
     for kind in [0, 1] {
-        let store = blank(false).await;
+        let store = blank().await;
         header_kind(&store, "a-hot", kind, 0, 0, 0).await;
         header_kind(&store, "b-free", kind, 0, 0, 0).await;
         header_kind(&store, "b-held", kind, 1, 1, 0).await;
@@ -19,8 +19,8 @@ async fn unrelated_continuous_fanout_allows_physical_admission_delete_and_clean_
             store
                 .connection
                 .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "UPDATE compaction_frozen_history SET identity_sha256=?1 WHERE id='a-hot'",
+                    DbBackend::Postgres,
+                    "UPDATE compaction_frozen_history SET identity_sha256=$1 WHERE id='a-hot'",
                     [format!("churn-{step}").into()],
                 ))
                 .await
@@ -67,18 +67,18 @@ async fn unrelated_continuous_fanout_allows_physical_admission_delete_and_clean_
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn resetting_low_consumer_cannot_starve_later_sources_or_other_kind() {
-    let store = blank(false).await;
+    let store = blank().await;
     header(&store, "a-hot", 0, 0, 0).await;
     header(&store, "z-consumer", 1, 1, 1).await;
     header(&store, "z-backing", 0, 0, 0).await;
     for kind in [0, 1] {
         row(&store, "z-backing", kind, 0).await;
-        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('z-consumer',?1,0,0)",[kind.into()])).await.unwrap();
-        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('z-consumer',?1,0,1,'z-backing')",[kind.into()])).await.unwrap();
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('z-consumer',$1,0,0)",[kind.into()])).await.unwrap();
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('z-consumer',$1,0,1,'z-backing')",[kind.into()])).await.unwrap();
     }
     exec(
         &store,
@@ -100,8 +100,8 @@ async fn resetting_low_consumer_cannot_starve_later_sources_or_other_kind() {
         store
             .connection
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_frozen_history SET identity_sha256=?1 WHERE id='a-hot'",
+                DbBackend::Postgres,
+                "UPDATE compaction_frozen_history SET identity_sha256=$1 WHERE id='a-hot'",
                 [format!("hot-{step}").into()],
             ))
             .await
@@ -128,8 +128,8 @@ async fn resetting_low_consumer_cannot_starve_later_sources_or_other_kind() {
         store
             .connection
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_frozen_history SET identity_sha256=?1 WHERE id='a-hot'",
+                DbBackend::Postgres,
+                "UPDATE compaction_frozen_history SET identity_sha256=$1 WHERE id='a-hot'",
                 [format!("after-{step}").into()],
             ))
             .await
@@ -150,12 +150,12 @@ async fn resetting_low_consumer_cannot_starve_later_sources_or_other_kind() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn relevant_pending_geometry_blocks_stale_delete_and_ack_before_target_revision_changes() {
     let store = batch_fixture(0, 4).await;
     header_kind(&store, "mutable-consumer", 0, 1, 1, 0).await;
     exec(&store,"INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('mutable-consumer',0,0,0)").await;
-    exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('mutable-consumer',0,0,1,'batch-physical')").await;
+    exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('mutable-consumer',0,0,1,'batch-physical')").await;
     exec(
         &store,
         "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='mutable-consumer'",
@@ -196,215 +196,10 @@ async fn relevant_pending_geometry_blocks_stale_delete_and_ack_before_target_rev
     assert_eq!(pending(&store, "batch-physical", 0).await, 0);
 }
 
-async fn assert_initial_scope_refusal(
-    store: &CrudStore,
-    progress: &mut FrozenStorageLifetimeProgress,
-) {
-    for _ in 0..1000 {
-        match progress.quantum(store).await {
-            Err(error) => {
-                assert!(
-                    error
-                        .to_string()
-                        .contains("legacy frozen dependency scope unknown"),
-                    "{error}"
-                );
-                assert!(!progress.scope.done);
-                assert!(
-                    progress.expiry.is_none()
-                        && progress.sweep.is_none()
-                        && progress.discard.is_none()
-                );
-                assert_eq!(progress.accounting.expired, 0);
-                assert_eq!(
-                    query(
-                        store,
-                        "SELECT expired AS n FROM compaction_frozen_history WHERE id='eligible'"
-                    )
-                    .await,
-                    0
-                );
-                return;
-            }
-            Ok(more) => assert!(more, "unknown legacy scope cannot become global EOF"),
-        }
-    }
-    panic!("legacy orphan must hold initial admission");
-}
-
-async fn drive_lifetime_to_idle(store: &CrudStore, progress: &mut FrozenStorageLifetimeProgress) {
-    for _ in 0..4000 {
-        if !progress.quantum(store).await.unwrap() {
-            return;
-        }
-    }
-    panic!("finite fixture must reach idle");
-}
-
-#[tokio::test]
-async fn initial_physical_scope_refusal_survives_restart_and_repairs_each_kind_before_cleanup() {
-    let db = fixture_database(true).await;
-    let store = CrudStore::new(db.clone()).with_maintenance_access();
-    header(&store, "a-known", 0, 0, 0).await;
-    header(&store, "eligible", 0, 0, 1).await;
-    for kind in [0, 1] {
-        row(&store, "a-known", kind, 0).await;
-    }
-    row(&store, "m-orphan-message", 0, 0).await;
-    row(&store, "m-orphan-import", 1, 0).await;
-    Migrator::up(&db, None).await.unwrap();
-    let mut progress = FrozenStorageLifetimeProgress::default();
-    assert_initial_scope_refusal(&store, &mut progress).await;
-    assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=0 AND after_manifest='a-known' AND complete=0").await,1);
-    // Already checked scope must not be re-inventoried after restart.
-    exec(&store,"CREATE TRIGGER fixture_checked_cursor BEFORE UPDATE ON compaction_frozen_sweep_bootstrap WHEN NEW.kind=0 AND NEW.after_manifest='a-known' BEGIN SELECT RAISE(ABORT,'checked group repeated'); END").await;
-    let mut restart = FrozenStorageLifetimeProgress::default();
-    assert_initial_scope_refusal(&store, &mut restart).await;
-    header(&store, "m-orphan-message", 0, 0, 0).await;
-    assert_initial_scope_refusal(&store, &mut restart).await;
-    assert_eq!(
-        query(
-            &store,
-            "SELECT complete AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=0"
-        )
-        .await,
-        1
-    );
-    assert_eq!(
-        query(
-            &store,
-            "SELECT complete AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=1"
-        )
-        .await,
-        0
-    );
-    exec(&store, "DROP TRIGGER fixture_checked_cursor").await;
-    header(&store, "m-orphan-import", 0, 0, 0).await;
-    let mut repaired = FrozenStorageLifetimeProgress::default();
-    drive_lifetime_to_idle(&store, &mut repaired).await;
-    assert_eq!(
-        query(
-            &store,
-            "SELECT expired AS n FROM compaction_frozen_history WHERE id='eligible'"
-        )
-        .await,
-        1
-    );
-    assert_eq!(
-        query(
-            &store,
-            "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE complete=1"
-        )
-        .await,
-        2
-    );
-    assert_eq!(
-        query(
-            &store,
-            "SELECT count(*) AS n FROM compaction_frozen_message_data"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        query(
-            &store,
-            "SELECT count(*) AS n FROM compaction_frozen_import_data"
-        )
-        .await,
-        0
-    );
-    exec(&store,"CREATE TRIGGER fixture_no_bootstrap_restart BEFORE UPDATE ON compaction_frozen_sweep_bootstrap BEGIN SELECT RAISE(ABORT,'bootstrap restarted'); END").await;
-    drive_lifetime_to_idle(&store, &mut FrozenStorageLifetimeProgress::default()).await;
-}
-
-#[tokio::test]
-async fn initial_physical_scope_uses_both_candidate_and_span_endpoint_directions() {
-    for endpoint in [
-        "own-candidate",
-        "reverse-candidate",
-        "own-span",
-        "reverse-span",
-    ] {
-        let db = fixture_database(true).await;
-        let store = CrudStore::new(db.clone()).with_maintenance_access();
-        header(&store, "anchor", 1, 1, 1).await;
-        header(&store, "orphan", 1, 1, 1).await;
-        header(&store, "eligible", 0, 0, 1).await;
-        for kind in [0, 1] {
-            row(&store, "anchor", kind, 0).await;
-            row(&store, "orphan", kind, 0).await;
-            let text = match endpoint {
-                "own-candidate" => {
-                    "INSERT INTO compaction_frozen_layout(manifest_id,kind,candidate) VALUES('orphan',?1,'anchor')"
-                }
-                "reverse-candidate" => {
-                    "INSERT INTO compaction_frozen_layout(manifest_id,kind,candidate) VALUES('anchor',?1,'orphan')"
-                }
-                "own-span" => {
-                    "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('orphan',?1,0,1,'anchor')"
-                }
-                "reverse-span" => {
-                    "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('anchor',?1,0,1,'orphan')"
-                }
-                _ => unreachable!(),
-            };
-            store
-                .connection
-                .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    text,
-                    [kind.into()],
-                ))
-                .await
-                .unwrap();
-        }
-        // Guarded dependencies were valid at creation. FK OFF legacy removal
-        // leaves a missing physical parent with inferable scope, not unknown.
-        exec(
-            &store,
-            "DELETE FROM compaction_frozen_history WHERE id='orphan'",
-        )
-        .await;
-        Migrator::up(&db, None).await.unwrap();
-        let mut progress = FrozenStorageLifetimeProgress::default();
-        drive_lifetime_to_idle(&store, &mut progress).await;
-        assert!(progress.scope.done, "{endpoint}");
-        assert_eq!(
-            query(
-                &store,
-                "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE complete=1"
-            )
-            .await,
-            2
-        );
-        assert_eq!(
-            query(
-                &store,
-                "SELECT expired AS n FROM compaction_frozen_history WHERE id='eligible'"
-            )
-            .await,
-            1
-        );
-        // Scope inference is not authority to delete missing-parent data.
-        for kind in [0, 1] {
-            let (table, _) = physical_table(kind);
-            assert_eq!(
-                query(
-                    &store,
-                    &format!("SELECT count(*) AS n FROM {table} WHERE manifest_id='orphan'")
-                )
-                .await,
-                1
-            );
-        }
-    }
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn physical_round_serves_behind_cursor_despite_continuous_arrivals_and_redirty() {
     for kind in [0, 1] {
-        let store = blank(false).await;
+        let store = blank().await;
         for id in ["a-behind", "m-cursor", "z-end"] {
             header_kind(&store, id, kind, 0, 0, 0).await;
         }
@@ -529,10 +324,10 @@ async fn physical_round_serves_behind_cursor_despite_continuous_arrivals_and_red
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn physical_round_pages_future_retries_without_false_eof_or_idle_loop() {
     for kind in [0, 1] {
-        let store = blank(false).await;
+        let store = blank().await;
         for index in 0..40 {
             header_kind(&store, &format!("a-future-{index:02}"), kind, 0, 0, 0).await;
         }
@@ -556,8 +351,8 @@ async fn physical_round_pages_future_retries_without_false_eof_or_idle_loop() {
         store
             .connection
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_frozen_sweep_work SET retry_at=1 WHERE manifest_id='z-due' AND kind=?1",
+                DbBackend::Postgres,
+                "UPDATE compaction_frozen_sweep_work SET retry_at=1 WHERE manifest_id='z-due' AND kind=$1",
                 [kind.into()],
             ))
             .await
@@ -596,15 +391,15 @@ async fn physical_round_pages_future_retries_without_false_eof_or_idle_loop() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn physical_round_keeps_generation_and_prefanout_fence_with_or_without_restart() {
     for (kind, restart) in [(0, false), (1, false), (0, true), (1, true)] {
         let store = batch_fixture(kind, 4).await;
         header_kind(&store, "mutable-consumer", kind, 1, 1, 0).await;
-        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('mutable-consumer',?1,0,0)",[kind.into()])).await.unwrap();
-        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('mutable-consumer',?1,0,1,'batch-physical')",[kind.into()])).await.unwrap();
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('mutable-consumer',$1,0,0)",[kind.into()])).await.unwrap();
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('mutable-consumer',$1,0,1,'batch-physical')",[kind.into()])).await.unwrap();
         exec(
             &store,
             "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='mutable-consumer'",
@@ -684,7 +479,7 @@ async fn physical_round_keeps_generation_and_prefanout_fence_with_or_without_res
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fresh_sweep_schema_uses_compaction_names_and_generated_entities() {
     use pioneer_entity::prelude::{
         CompactionFrozenSweepBootstrap, CompactionFrozenSweepConsumer, CompactionFrozenSweepFanout,
@@ -692,7 +487,7 @@ async fn fresh_sweep_schema_uses_compaction_names_and_generated_entities() {
     };
     use sea_orm::EntityName;
 
-    let store = blank(false).await;
+    let store = blank().await;
     let tables = [
         (
             CompactionFrozenSweepBootstrap.table_name().to_owned(),
@@ -731,10 +526,11 @@ async fn fresh_sweep_schema_uses_compaction_names_and_generated_entities() {
     for name in [
         "compaction_frozen_sweep_work_retain",
         "compaction_frozen_sweep_work_identity",
+        "compaction_frozen_sweep_work_allocate",
         "compaction_frozen_sweep_consumer_retain",
         "compaction_frozen_sweep_consumer_identity",
+        "compaction_frozen_sweep_consumer_allocate",
         "compaction_frozen_sweep_consumer_row_identity",
-        "compaction_frozen_sweep_work_row_insert",
         "compaction_frozen_sweep_work_row_identity",
         "compaction_frozen_sweep_message_data_insert",
         "compaction_frozen_sweep_message_data_update",
@@ -756,8 +552,8 @@ async fn fresh_sweep_schema_uses_compaction_names_and_generated_entities() {
     let catalog = store
         .connection
         .query_all_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT type,name FROM sqlite_schema WHERE name GLOB 'compaction_frozen_sweep_*'",
+            DbBackend::Postgres,
+            "SELECT CASE relkind WHEN 'r' THEN 'table' ELSE 'index' END AS type, relname::text AS name FROM pg_class r WHERE r.relnamespace='public'::regnamespace AND r.relkind IN ('r','i') AND starts_with(r.relname::text,'compaction_frozen_sweep_') AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid=r.oid) UNION ALL SELECT 'trigger',t.tgname::text FROM pg_trigger t JOIN pg_class r ON r.oid=t.tgrelid WHERE r.relnamespace='public'::regnamespace AND NOT t.tgisinternal AND starts_with(t.tgname::text,'compaction_frozen_sweep_')",
         ))
         .await
         .unwrap()
@@ -771,7 +567,7 @@ async fn fresh_sweep_schema_uses_compaction_names_and_generated_entities() {
         .collect::<BTreeSet<_>>();
     assert_eq!(catalog, expected);
     // Historical prefixes are negative catalog assertions, never fallback tables.
-    assert_eq!(query(&store, "SELECT count(*) AS n FROM sqlite_schema WHERE name GLOB 'frozen_sweep_*' OR name GLOB 'sweep_compaction_frozen_*' OR name='sweep_cleanup_bounds'").await, 0);
+    assert_eq!(query(&store, "SELECT count(*) AS n FROM (SELECT relname::text AS name FROM pg_class WHERE relnamespace='public'::regnamespace UNION ALL SELECT tgname::text FROM pg_trigger WHERE NOT tgisinternal) objects WHERE starts_with(name,'frozen_sweep_') OR starts_with(name,'sweep_compaction_frozen_') OR name='sweep_cleanup_bounds'").await, 0);
 
     // Fresh installed triggers must deliver physical writes to the same tables
     // the generated entities and the real sweep admission queries now address.
@@ -791,7 +587,7 @@ async fn fresh_sweep_schema_uses_compaction_names_and_generated_entities() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn generated_sweep_entities_preserve_defaults_conflicts_and_null_cursor_delivery() {
     use pioneer_entity::{
         compaction_frozen_sweep_bootstrap as bootstrap,
@@ -799,7 +595,7 @@ async fn generated_sweep_entities_preserve_defaults_conflicts_and_null_cursor_de
         compaction_frozen_sweep_work as queued,
     };
     use sea_orm::sea_query::OnConflict;
-    let store = blank(false).await;
+    let store = blank().await;
     for kind in [0_i64, 1] {
         let row = bootstrap::Entity::find_by_id(kind)
             .one(&store.connection)
@@ -891,7 +687,8 @@ async fn generated_sweep_entities_preserve_defaults_conflicts_and_null_cursor_de
             .is_none()
     );
     header(&store, "null-cursor-consumer", 1, 1, 0).await;
-    exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('null-cursor-consumer',0,0,1,'source')").await;
+    header(&store, "source", 1, 1, 0).await;
+    exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('null-cursor-consumer',0,0,1,'source')").await;
     let initial = consumer::Entity::find()
         .filter(consumer::Column::ManifestId.eq("null-cursor-consumer"))
         .filter(consumer::Column::Kind.eq(0))
@@ -934,10 +731,10 @@ async fn generated_sweep_entities_preserve_defaults_conflicts_and_null_cursor_de
 
 // Primary finite-pass proof: actual protected layouts, actual owner admission,
 // overlapping visits, one committed fanout cause, then no further mutations.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn protected_overlapping_visits_exhaust_one_invalidation_and_reach_eof() {
     for kind in [0, 1] {
-        let store = blank(false).await;
+        let store = blank().await;
         header(&store, "fanout-event", 0, 0, 0).await;
         for index in 0..7 {
             let id = format!("protected-{index}");
@@ -945,8 +742,8 @@ async fn protected_overlapping_visits_exhaust_one_invalidation_and_reach_eof() {
             header_kind(&store, &id, kind, 0, 0, 1).await;
             header_kind(&store, &consumer, kind, 0, 0, 0).await;
             row(&store, &id, kind, 0).await;
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_layout(manifest_id,kind,candidate,active,pending) VALUES(?1,?2,?3,0,1)",
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,candidate,active,pending) VALUES($1,$2,$3,0,1)",
                 [consumer.into(), kind.into(), id.into()])).await.unwrap();
         }
         drain_metadata(&store).await;
@@ -986,7 +783,7 @@ async fn protected_overlapping_visits_exhaust_one_invalidation_and_reach_eof() {
             assert!(delivered);
             assert!(progress.sweep.is_some() || !progress.sweep_pending.is_empty());
             // A failed finish must retain the old visit and its overlap debt.
-            exec(&store, "CREATE TRIGGER fixture_protected_finish_fault BEFORE UPDATE ON compaction_frozen_sweep_work WHEN NEW.manifest_id LIKE 'protected-%' AND NEW.revision=OLD.revision BEGIN SELECT RAISE(ABORT,'finish fault'); END").await;
+            exec(&store, "CREATE FUNCTION fixture_protected_finish_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'finish fault'; END; $$; CREATE TRIGGER fixture_protected_finish_fault BEFORE UPDATE ON compaction_frozen_sweep_work FOR EACH ROW WHEN (NEW.manifest_id LIKE 'protected-%' AND NEW.revision=OLD.revision) EXECUTE FUNCTION fixture_protected_finish_fault()").await;
             let mut failed = false;
             for _ in 0..200 {
                 if progress.sweep_quantum(&store).await.is_err() {
@@ -995,7 +792,7 @@ async fn protected_overlapping_visits_exhaust_one_invalidation_and_reach_eof() {
                 }
             }
             assert!(failed);
-            exec(&store, "DROP TRIGGER fixture_protected_finish_fault").await;
+            exec(&store, "DROP TRIGGER fixture_protected_finish_fault ON compaction_frozen_sweep_work").await;
         }
         drain(&store, &mut progress).await;
         assert!(
@@ -1027,15 +824,15 @@ async fn protected_overlapping_visits_exhaust_one_invalidation_and_reach_eof() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fanout_ack_reopens_blocked_visit_without_another_work_revision() {
     for kind in [0, 1] {
         let store = batch_fixture(kind, 4).await;
         header_kind(&store, "ack-consumer", kind, 1, 1, 0).await;
-        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('ack-consumer',?1,0,0)", [kind.into()])).await.unwrap();
-        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('ack-consumer',?1,0,1,'batch-physical')", [kind.into()])).await.unwrap();
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('ack-consumer',$1,0,0)", [kind.into()])).await.unwrap();
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('ack-consumer',$1,0,1,'batch-physical')", [kind.into()])).await.unwrap();
         exec(
             &store,
             "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='ack-consumer'",
@@ -1043,7 +840,6 @@ async fn fanout_ack_reopens_blocked_visit_without_another_work_revision() {
         .await;
         // Stop after delivery, before ACK. The source Work revision is now the
         // final one; the remaining consumer ACK only removes its fence.
-        while frozen_sweep_work::bootstrap_step(&store).await.unwrap() {}
         for _ in 0..100 {
             assert!(frozen_sweep_work::fanout_step(&store, None).await.unwrap());
             if query(&store, "SELECT count(*) AS n FROM compaction_frozen_sweep_consumer WHERE manifest_id='ack-consumer' AND pending=1 AND after_source='batch-physical'").await == 1 { break; }

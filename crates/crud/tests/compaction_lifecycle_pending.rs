@@ -12,7 +12,8 @@ use pioneer_entity::{
 };
 use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
 use sea_orm::{
-    ConnectOptions, ConnectionTrait, Database, DbBackend, EntityTrait, Statement, TransactionTrait,
+    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DbBackend, EntityTrait, QueryFilter,
+    Statement, TransactionTrait,
 };
 use std::{
     path::{Path, PathBuf},
@@ -878,7 +879,10 @@ async fn lifecycle_scope_and_seed_pages_restart_safe_without_terminal_audit() {
         3
     );
     assert_eq!(scalar(&store,"SELECT count(*) n FROM compaction_lifecycle_pending WHERE operation_id LIKE 'terminal-%'").await,0);
-    let seed = scope::Entity::find_by_id(("seed".to_owned(), String::new(), String::new()))
+    let seed = scope::Entity::find()
+        .filter(scope::Column::Kind.eq("seed".to_owned()))
+        .filter(scope::Column::Owner.eq(String::new()))
+        .filter(scope::Column::TurnId.eq(String::new()))
         .one(&store.with_maintenance_access().database_connection())
         .await
         .unwrap()
@@ -966,7 +970,10 @@ async fn lifecycle_scope_and_seed_pages_restart_safe_without_terminal_audit() {
             .unwrap(),
         4
     );
-    let old = scope::Entity::find_by_id(("turn".to_owned(), String::new(), "turn".to_owned()))
+    let old = scope::Entity::find()
+        .filter(scope::Column::Kind.eq("turn".to_owned()))
+        .filter(scope::Column::Owner.eq(String::new()))
+        .filter(scope::Column::TurnId.eq("turn".to_owned()))
         .one(&db)
         .await
         .unwrap()
@@ -976,7 +983,10 @@ async fn lifecycle_scope_and_seed_pages_restart_safe_without_terminal_audit() {
     )
     .await
     .unwrap();
-    let fresh = scope::Entity::find_by_id(("turn".to_owned(), String::new(), "turn".to_owned()))
+    let fresh = scope::Entity::find()
+        .filter(scope::Column::Kind.eq("turn".to_owned()))
+        .filter(scope::Column::Owner.eq(String::new()))
+        .filter(scope::Column::TurnId.eq("turn".to_owned()))
         .one(&db)
         .await
         .unwrap()
@@ -1020,7 +1030,10 @@ async fn lifecycle_seed_page_rollback_keeps_claim_and_restart_progress() {
         .await,
         0
     );
-    let interrupted = scope::Entity::find_by_id(("seed".to_owned(), String::new(), String::new()))
+    let interrupted = scope::Entity::find()
+        .filter(scope::Column::Kind.eq("seed".to_owned()))
+        .filter(scope::Column::Owner.eq(String::new()))
+        .filter(scope::Column::TurnId.eq(String::new()))
         .one(&db)
         .await
         .unwrap()

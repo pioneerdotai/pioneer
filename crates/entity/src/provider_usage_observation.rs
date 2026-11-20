@@ -7,20 +7,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "provider_usage_observation")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
-    pub owner_id: String,
-    pub started_at: i64,
+    pub workspace_id: String,
     #[sea_orm(column_type = "Text")]
     pub operation_kind: String,
-    pub updated_at: i64,
+    #[sea_orm(column_type = "Text")]
+    pub owner_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
     #[sea_orm(column_type = "Text")]
     pub usage_json: String,
+    pub started_at: i64,
+    pub updated_at: i64,
     #[sea_orm(
         belongs_to,
         from = "workspace_id",

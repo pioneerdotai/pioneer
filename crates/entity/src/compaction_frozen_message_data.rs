@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_message_data")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub reference_json: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub manifest_id: String,
-    pub bytes: i64,
     #[sea_orm(primary_key, auto_increment = false)]
     pub ordinal: i64,
+    #[sea_orm(column_type = "Text")]
+    pub reference_json: String,
+    pub bytes: i64,
     #[sea_orm(
         belongs_to,
         from = "manifest_id",

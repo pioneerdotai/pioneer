@@ -27,9 +27,7 @@ fn entry(id: &str, sequence: i64) -> context::NewTurnLlmContextEntry {
 async fn late_capsule_birth_survives_prior_ack_without_link_or_terminal_status() {
     pioneer_postgres_test::with_database(async |fixture| {
         let store = postgres_store_with_workspace(fixture, "ws_task").await;
-        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-            .await
-            .unwrap();
+
         let db = store.database_connection();
         // No Turn and no Link: publication must retain an obligation even when
         // neither cross-table dependency exists in the source transaction.
@@ -90,9 +88,7 @@ async fn late_capsule_birth_survives_prior_ack_without_link_or_terminal_status()
 async fn stale_advisory_locator_is_revised_before_no_record_ack() {
     pioneer_postgres_test::with_database(async |fixture| {
         let store = postgres_store_with_workspace(fixture, "ws_task").await;
-        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-            .await
-            .unwrap();
+
         let header = sample_thread("ws_task", "canonical-thread", AT);
         store
             .upsert_thread_model(&header, PersistedActorRef::System)
@@ -169,9 +165,7 @@ async fn stale_advisory_locator_is_revised_before_no_record_ack() {
 async fn old_wrong_locator_claim_cannot_rotate_new_canonical_revision_or_lease() {
     pioneer_postgres_test::with_database(async |fixture| {
         let store = postgres_store_with_workspace(fixture, "ws_task").await;
-        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-            .await
-            .unwrap();
+
         let db = store.database_connection();
         for id in ["claim-thread-a", "claim-thread-b"] {
             store
@@ -446,9 +440,7 @@ async fn ambiguous_transport_outcome_is_not_replayed() {
     pioneer_postgres_test::with_database(async |fixture| {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let store = postgres_store_with_workspace(fixture, "ws_task").await;
-        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-            .await
-            .unwrap();
+
         let attempts = AtomicUsize::new(0);
         let result: anyhow::Result<()> =
             store
@@ -513,9 +505,7 @@ async fn mysql_numeric_timeout_rolls_back_entire_transaction_before_replay() {
         // Use the actual owning retry loop, with real driver errors. Its SQLite
         // handle only supplies the retry policy; all remote writes own their Tx.
         let store = postgres_store_with_workspace(fixture, "ws_task").await;
-        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-            .await
-            .unwrap();
+
         store
             .run_serialized_write(|| {
                 let owner = owner.clone();

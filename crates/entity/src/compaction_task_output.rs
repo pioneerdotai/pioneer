@@ -7,20 +7,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_task_output")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub source_thread: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub task_run_turn_id: String,
     #[sea_orm(column_type = "Text")]
     pub task_id: String,
     #[sea_orm(column_type = "Text")]
     pub run_id: String,
     #[sea_orm(column_type = "Text")]
-    pub manifest_id: String,
-    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub task_run_turn_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub source_thread: String,
     #[sea_orm(column_type = "Text")]
     pub source_turn: String,
+    #[sea_orm(column_type = "Text")]
+    pub manifest_id: String,
     #[sea_orm(has_many)]
     pub compaction_delivery_outputs: HasMany<super::compaction_delivery_output::Entity>,
     #[sea_orm(

@@ -7,33 +7,33 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "artifact_upload_session")]
 pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub message_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub display_name: String,
+    pub expected_size_bytes: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
     pub expected_sha256: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub mime_type: Option<String>,
-    pub expected_size_bytes: Option<i64>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub thread_id: Option<String>,
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
-    #[sea_orm(column_type = "Text")]
-    pub metadata_json: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub turn_id: Option<String>,
-    pub received_bytes: i64,
     #[sea_orm(column_type = "Text")]
     pub status: String,
     #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
-    #[sea_orm(column_type = "Text")]
     pub temp_storage_key: String,
+    pub received_bytes: i64,
     pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub message_id: Option<String>,
+    pub updated_at: DateTimeWithTimeZone,
     pub expires_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub metadata_json: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

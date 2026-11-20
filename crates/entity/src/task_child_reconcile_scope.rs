@@ -9,22 +9,22 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub scope_kind: String,
-    #[sea_orm(column_type = "Text")]
-    pub requested_revision: String,
-    pub attempt_count: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub upper_watermark: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub scope_key: String,
     #[sea_orm(column_type = "Text")]
     pub incarnation_token: String,
-    pub next_attempt_at: Option<i64>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub cursor: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub requested_revision: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub pass_revision: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    pub cursor: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub upper_watermark: Option<String>,
+    pub next_attempt_at: Option<i64>,
+    pub attempt_count: i64,
+    #[sea_orm(column_type = "Text", nullable)]
     pub claim_token: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub scope_key: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

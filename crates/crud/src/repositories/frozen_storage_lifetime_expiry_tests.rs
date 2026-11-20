@@ -65,29 +65,16 @@ impl Routes {
     }
 }
 
-// A real query_only reader and separate single writer. No operation projection
-// or checkpoint exists: an empty, finished history can lawfully expire directly.
-async fn observed_fixture() -> (tempfile::TempDir, CrudStore, Arc<Routes>, FrozenHistoryRef) {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("expiry.db");
-    let mut options = sea_orm::ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    writer
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
-    Migrator::up(&writer, None).await.unwrap();
-    let mut options = sea_orm::ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+// A read-only PostgreSQL pool and a writer constrained to one connection
+// expose the admission and release boundaries. The history has no checkpoint.
+async fn observed_fixture() -> (CrudStore, Arc<Routes>, FrozenHistoryRef) {
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_with_options(|options| {
+        options.max_connections(1).map_sqlx_postgres_opts(|options| {
+            options.options([("default_transaction_read_only", "on")])
+        });
+    }).await.unwrap();
     let routes = Arc::new(Routes::default());
     let store = CrudStore::new(SqliteDatabase::from_executor_with_read_observer(
         reader,
@@ -96,9 +83,9 @@ async fn observed_fixture() -> (tempfile::TempDir, CrudStore, Arc<Routes>, Froze
     ));
     assert!(store.connection.reader_query_only_enabled().await.unwrap());
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO turn(id,thread_id,status,created_at,updated_at) VALUES('turn','thread','failed',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn','thread','failed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES('task','ws','thread','thread','agent','failed','fixture','fixture')",
         "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'failed','agent')",
         "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status) VALUES('occurrence','task','run','thread','turn','initial',0,0,'failed')",
@@ -121,7 +108,7 @@ async fn observed_fixture() -> (tempfile::TempDir, CrudStore, Arc<Routes>, Froze
         .unwrap();
     drop(hold);
     routes.clear();
-    (directory, store, routes, descriptor)
+    (store, routes, descriptor)
 }
 
 async fn insert_root(store: &CrudStore, descriptor: &FrozenHistoryRef, kind: usize) {
@@ -147,37 +134,48 @@ async fn insert_root(store: &CrudStore, descriptor: &FrozenHistoryRef, kind: usi
         2 | 3 => Some(PreparedFrozenRoot::cli(&json, kind == 2).unwrap()),
         _ => None,
     };
-    if let Some(prepared) = prepared {
+    if let Some(prepared) = &prepared {
         assert_eq!(prepared.locator(), Some(descriptor.manifest_id.clone()));
-        prepared.verify(&store.connection, "ws").await.unwrap();
+    }
+    if kind == 3 {
+        let now = chrono::Utc::now().fixed_offset();
+        store.upsert_cli_runtime_turn_binding(crate::NewCliRuntimeTurnBinding {
+            turn_id: "turn".into(), thread_id: "thread".into(), continuation_thread_id: "thread".into(),
+            workspace_id: "ws".into(), runtime_id: "runtime".into(), runtime_kind: "claude".into(),
+            native_thread_id: "native".into(), native_turn_id: None, request_id: None, status: "active".into(),
+            model: None, cwd: None, sandbox_json: None, approval_policy: None, input_mapping_json: json,
+            created_at: now, updated_at: now,
+        }).await.unwrap();
+        return;
     }
     let sql = match kind {
         0 => {
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,frozen_manifest_id) VALUES('run','task','ws','thread',?1,?2)"
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,frozen_manifest_id) VALUES('run','task','ws','thread',$1,$2)"
         }
         1 => {
-            "INSERT INTO turn_runtime_snapshot(turn_id,thread_id,workspace_id,mode,model,provider_name,hook_runtime_context_json,workspace_skill_policies_json,input_json,capabilities_json,resolved_artifacts_json,runtime_environment_json,history_json,frozen_manifest_id) VALUES('turn','thread','ws','agent','m','p','{}','{}','[]','{}','[]','{}',?1,?2)"
+            "INSERT INTO turn_runtime_snapshot(turn_id,thread_id,workspace_id,mode,model,provider_name,hook_runtime_context_json,workspace_skill_policies_json,input_json,capabilities_json,resolved_artifacts_json,runtime_environment_json,history_json,frozen_manifest_id) VALUES('turn','thread','ws','agent','m','p','{}','{}','[]','{}','[]','{}',$1::json,$2)"
         }
         2 => {
-            "INSERT INTO thread_cli_runtime_binding(thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,resume_cursor_json,status,frozen_manifest_id) VALUES('thread','ws','runtime','claude','native',?1,'active',?2)"
-        }
-        3 => {
-            "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,input_mapping_json,status,frozen_manifest_id) VALUES('turn','thread','thread','ws','runtime','claude','native',?1,'active',?2)"
+            "INSERT INTO thread_cli_runtime_binding(thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,resume_cursor_json,status,frozen_manifest_id) VALUES('thread','ws','runtime','claude','native',$1,'active',$2)"
         }
         4 => {
-            "INSERT INTO compaction_task_output(task_run_turn_id,task_id,run_id,workspace_id,source_thread,source_turn,manifest_id) SELECT 'occurrence','task','run','ws','thread','turn',?2 WHERE ?1 IS NOT NULL"
+            "INSERT INTO compaction_task_output(task_run_turn_id,task_id,run_id,workspace_id,source_thread,source_turn,manifest_id) SELECT 'occurrence','task','run','ws','thread','turn',$2 WHERE $1::text IS NOT NULL"
         }
         _ => unreachable!(),
     };
-    store
-        .connection
+    let transaction = store.connection.begin().await.unwrap();
+    if let Some(prepared) = prepared {
+        prepared.verify(&transaction, "ws").await.unwrap();
+    }
+    transaction
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             sql,
             [json.into(), descriptor.manifest_id.clone().into()],
         ))
         .await
         .unwrap();
+    transaction.commit().await.unwrap();
 }
 
 fn assert_unprepared(preparation: &ExpiryPreparation) {
@@ -188,45 +186,36 @@ fn assert_unprepared(preparation: &ExpiryPreparation) {
     assert!(preparation.reverse.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn direct_roots_and_task_release_set_match_final_guard_without_preparation_or_writer() {
-    for (kind, status, missing, held) in [
-        (0, "blocked", false, true),
-        (0, "running", false, true),
-        (0, "interrupted", false, true),
-        (0, "completed", false, false),
-        (0, "failed", false, false),
-        (0, "cancelled", false, false),
-        (0, "failed", true, true),
-        (1, "failed", false, true),
-        (2, "failed", false, true),
-        (3, "failed", false, true),
-        (4, "failed", false, true),
+    for (kind, status, held) in [
+        (0, "blocked", true),
+        (0, "running", true),
+        (0, "interrupted", true),
+        (0, "completed", false),
+        (0, "failed", false),
+        (0, "cancelled", false),
+        (1, "failed", true),
+        (2, "failed", true),
+        (3, "failed", true),
+        (4, "failed", true),
     ] {
-        let (_directory, store, routes, descriptor) = observed_fixture().await;
+        let (store, routes, descriptor) = observed_fixture().await;
         insert_root(&store, &descriptor, kind).await;
         if kind == 4 {
-            // FK OFF can retain inconsistent legacy ownership metadata. The
-            // exact direct relation remains a hold in both checks.
-            store.connection.execute_unprepared("UPDATE compaction_task_output SET workspace_id='other',source_thread='other' WHERE task_run_turn_id='occurrence'").await.unwrap();
+            assert!(store.connection.execute_unprepared(
+                "UPDATE compaction_task_output SET workspace_id='missing',source_thread='missing' WHERE task_run_turn_id='occurrence'"
+            ).await.is_err());
         }
         store
             .connection
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE task SET status=?1 WHERE id='task'",
+                DbBackend::Postgres,
+                "UPDATE task SET status=$1 WHERE id='task'",
                 [status.into()],
             ))
             .await
             .unwrap();
-        if missing {
-            // Deliberate FK-OFF orphan: the existing LEFT JOIN retains it.
-            store
-                .connection
-                .execute_unprepared("DELETE FROM task WHERE id='task'")
-                .await
-                .unwrap();
-        }
         let header = history::Entity::find_by_id("origin")
             .one(&store.connection)
             .await
@@ -241,7 +230,7 @@ async fn direct_roots_and_task_release_set_match_final_guard_without_preparation
                 .await
                 .unwrap(),
             held,
-            "kind={kind}, status={status}, missing={missing}"
+            "kind={kind}, status={status}"
         );
         assert!(preparation.roots_checked);
         assert_unprepared(&preparation);
@@ -254,7 +243,7 @@ async fn direct_roots_and_task_release_set_match_final_guard_without_preparation
         assert_eq!(page.len(), 1);
         assert_eq!(
             page[0].held, held,
-            "paged admission: kind={kind}, status={status}, missing={missing}"
+            "paged admission: kind={kind}, status={status}"
         );
         // Independently execute the unchanged final writer guard. Terminal
         // Tasks release an otherwise unreferenced, mature empty history.
@@ -267,10 +256,10 @@ async fn direct_roots_and_task_release_set_match_final_guard_without_preparation
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn negative_page_admission_keeps_final_writer_check_for_late_roots() {
     for late_root in [false, true] {
-        let (_directory, store, routes, descriptor) = observed_fixture().await;
+        let (store, routes, descriptor) = observed_fixture().await;
         let store = store.with_maintenance_access();
         let mut progress = FrozenStorageLifetimeProgress::default();
         assert!(progress.expiry_quantum(&store).await.unwrap());
@@ -317,10 +306,10 @@ async fn negative_page_admission_keeps_final_writer_check_for_late_roots() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn negative_preflight_does_not_bypass_active_reader_hold() {
     use futures_util::FutureExt;
-    let (_directory, store, routes, descriptor) = observed_fixture().await;
+    let (store, routes, descriptor) = observed_fixture().await;
     let store = store.with_maintenance_access();
     let mut preparation = prepared_expiry(&store).await;
     let hold = store
@@ -362,9 +351,9 @@ async fn negative_preflight_does_not_bypass_active_reader_hold() {
     assert!(store.frozen_readers.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_release() {
-    let (_directory, store, routes, descriptor) = observed_fixture().await;
+    let (store, routes, descriptor) = observed_fixture().await;
     insert_root(&store, &descriptor, 1).await;
     let mut progress = FrozenStorageLifetimeProgress::default();
     progress.scope.done = true;
@@ -420,9 +409,9 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn page_root_error_preserves_cursor_and_retries_before_preparation() {
-    let (_directory, store, routes, descriptor) = observed_fixture().await;
+    let (store, routes, descriptor) = observed_fixture().await;
     let mut progress = FrozenStorageLifetimeProgress::default();
     progress.scope.done = true;
     store
@@ -458,9 +447,9 @@ async fn page_root_error_preserves_cursor_and_retries_before_preparation() {
     assert!(store.frozen_readers.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cancelled_paged_preparation_preserves_attempt_and_restart_releases_capacity() {
-    let (_directory, store, routes, _descriptor) = observed_fixture().await;
+    let (store, routes, _descriptor) = observed_fixture().await;
     let mut progress = FrozenStorageLifetimeProgress::default();
     progress.scope.done = true;
     assert!(progress.expiry_quantum(&store).await.unwrap());
@@ -529,36 +518,9 @@ async fn cancelled_paged_preparation_preserves_attempt_and_restart_releases_capa
     assert!(store.frozen_readers.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn negative_preflight_keeps_unknown_legacy_and_concurrent_expiry_availability_guards() {
-    let (store, descriptor) = legacy_locator_fixture().await;
-    let header = history::Entity::find_by_id(&descriptor.manifest_id)
-        .one(&store.connection)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut preparation = ExpiryPreparation::new(header);
-    let mut accounting = SweepAccounting::default();
-    assert!(!preparation.step(&store, &mut accounting).await.unwrap());
-    assert!(preparation.roots_checked);
-    for _ in 0..64 {
-        if preparation.step(&store, &mut accounting).await.unwrap() {
-            break;
-        }
-    }
-    assert_eq!(accounting.held, 1);
-    assert_eq!(accounting.expired, 0);
-    assert_eq!(
-        history::Entity::find_by_id(&descriptor.manifest_id)
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap()
-            .expired,
-        0
-    );
-
-    let (_directory, store, _routes, _descriptor) = observed_fixture().await;
+#[pioneer_postgres_test::postgres_test]
+async fn negative_preflight_keeps_concurrent_expiry_availability_guard() {
+    let (store, _routes, _descriptor) = observed_fixture().await;
     let store = store.with_maintenance_access();
     let mut preparation = prepared_expiry(&store).await;
     // A legal concurrent expiry fails availability revalidation in logical_bounds,
@@ -586,11 +548,11 @@ async fn negative_preflight_keeps_unknown_legacy_and_concurrent_expiry_availabil
     assert!(store.frozen_readers.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn expiry_prefetched_stale_header_cannot_authorize_expiration() {
     use sea_orm::{IntoActiveModel, Set};
 
-    let (_directory, store, _routes, _descriptor) = observed_fixture().await;
+    let (store, _routes, _descriptor) = observed_fixture().await;
     let store = store.with_maintenance_access();
     let mut progress = FrozenStorageLifetimeProgress::default();
     assert!(progress.expiry_quantum(&store).await.unwrap());
@@ -636,20 +598,20 @@ async fn expiry_prefetched_stale_header_cannot_authorize_expiration() {
     assert_eq!(current.owner_thread, "replacement-owner");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn expiry_pages_skip_holds_without_per_header_work_or_writer() {
-    let (_directory, store, routes, _descriptor) = observed_fixture().await;
+    let (store, routes, _descriptor) = observed_fixture().await;
     let store = store.with_maintenance_access();
     for index in 0..17 {
         let id = format!("page-{index:02}");
         store.connection.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) SELECT ?1,workspace_id,owner_thread,identity_sha256,0,0,0,0,imports_sha256,1 FROM compaction_frozen_history WHERE id='origin'",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) SELECT $1,workspace_id,owner_thread,identity_sha256,0,0,0,0,imports_sha256,1 FROM compaction_frozen_history WHERE id='origin'",
             [id.clone().into()],
         )).await.unwrap();
         store.connection.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_task_output(task_run_turn_id,task_id,run_id,workspace_id,source_thread,source_turn,manifest_id) VALUES(?1,'task','run','ws','thread','turn',?1)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_task_output(task_run_turn_id,task_id,run_id,workspace_id,source_thread,source_turn,manifest_id) VALUES($1,'task','run','ws','thread','turn',$1)",
             [id.into()],
         )).await.unwrap();
     }

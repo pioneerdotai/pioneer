@@ -14124,7 +14124,7 @@ mod tests {
         assert!(!diagnostics.is_empty());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn historical_grant_cannot_start_a_task_model_execution() {
         use crate::message::tests::task_launch_continuity::historical_task_fixture;
         use sea_orm::{EntityTrait, PaginatorTrait};
@@ -14169,7 +14169,7 @@ mod tests {
         fixture.assert_no_provider_requests();
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn historical_reviewer_recovery_with_an_existing_in_progress_turn_remains_execution() {
         use crate::message::tests::task_launch_continuity::historical_task_fixture;
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, PaginatorTrait, Set};

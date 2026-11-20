@@ -203,7 +203,7 @@ impl Fixture {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn stalled_start_fanout_allows_rpc_ack_handoff_and_durable_fast_terminal_in_order() {
     let mut f = Fixture::new().await;
     f.processor
@@ -329,7 +329,7 @@ async fn stalled_start_fanout_allows_rpc_ack_handoff_and_durable_fast_terminal_i
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn request_drop_before_preparation_does_not_cancel_the_owned_durable_start() {
     let f = Fixture::new().await;
     f.processor
@@ -355,7 +355,7 @@ async fn request_drop_before_preparation_does_not_cancel_the_owned_durable_start
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn dropping_accepted_response_releases_publication_but_not_execution() {
     let mut f = Fixture::new().await;
     let acceptance = f.accepted(f.start(f.params(TURN)).await).await;
@@ -372,7 +372,7 @@ async fn dropping_accepted_response_releases_publication_but_not_execution() {
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn duplicate_request_joins_publication_and_retains_canonical_ids_without_another_provider() {
     let mut f = Fixture::new().await;
     f.processor
@@ -421,7 +421,7 @@ async fn duplicate_request_joins_publication_and_retains_canonical_ids_without_a
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn startup_count_and_byte_saturation_reject_before_durable_admission() {
     let f = Fixture::new().await;
     let mut obligations = Vec::new();
@@ -457,7 +457,7 @@ async fn startup_count_and_byte_saturation_reject_before_durable_admission() {
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn actor_retirement_after_preparation_reports_failure_with_durable_recovery() {
     let f = Fixture::new().await;
     f.processor
@@ -489,7 +489,7 @@ async fn actor_retirement_after_preparation_reports_failure_with_durable_recover
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fast_terminal_before_running_cas_is_accepted_without_recovery_or_second_start() {
     let f = Fixture::new().await;
     f.processor
@@ -514,7 +514,7 @@ async fn fast_terminal_before_running_cas_is_accepted_without_recovery_or_second
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cancel_before_activation_keeps_canonical_terminal_without_calling_provider() {
     let f = Fixture::new().await;
     f.processor
@@ -542,7 +542,7 @@ async fn cancel_before_activation_keeps_canonical_terminal_without_calling_provi
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn mandatory_turn_snapshot_and_user_lifecycle_failures_never_accept_or_run_provider() {
     for (table, predicate) in [
         ("turn", "1"),
@@ -568,7 +568,7 @@ async fn mandatory_turn_snapshot_and_user_lifecycle_failures_never_accept_or_run
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn ack_enqueue_failure_after_handoff_does_not_cancel_provider() {
     let f = Fixture::new().await;
     f.processor
@@ -604,7 +604,7 @@ async fn ack_enqueue_failure_after_handoff_does_not_cancel_provider() {
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn replacement_ownership_cannot_be_rewritten_by_initial_running_cas() {
     let f = Fixture::new().await;
     f.processor
@@ -663,7 +663,7 @@ async fn replacement_ownership_cannot_be_rewritten_by_initial_running_cas() {
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn direct_progress_and_blocked_share_the_start_dependency_without_waiting_for_it() {
     let mut f = Fixture::new().await;
     f.processor
@@ -737,7 +737,7 @@ async fn direct_progress_and_blocked_share_the_start_dependency_without_waiting_
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn thread_tree_terminal_snapshots_join_start_for_persisted_and_memory_sources() {
     for loaded_memory in [false, true] {
         let mut f = Fixture::new().await;
@@ -872,7 +872,7 @@ async fn thread_tree_terminal_snapshots_join_start_for_persisted_and_memory_sour
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn snapshot_observation_and_shutdown_do_not_allow_a_late_initial_start() {
     let mut f = Fixture::new().await;
     f.processor
@@ -962,7 +962,7 @@ async fn snapshot_observation_and_shutdown_do_not_allow_a_late_initial_start() {
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn a_pending_turn_does_not_occupy_delivery_capacity_for_another_thread() {
     let mut f = Fixture::new().await;
     f.processor
@@ -1042,7 +1042,7 @@ async fn a_pending_turn_does_not_occupy_delivery_capacity_for_another_thread() {
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fresh_processor_replays_the_committed_turn_without_starting_provider_again() {
     let f = Fixture::new().await;
     drop(f.accepted(f.start(f.params(TURN)).await).await);
@@ -1113,7 +1113,7 @@ async fn fresh_processor_replays_the_committed_turn_without_starting_provider_ag
     restored.shutdown_resilience_workers().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn old_failure_settlement_cannot_change_a_claimed_replacement() {
     for mandatory_ready in [false, true] {
         let f = Fixture::new().await;
@@ -1198,7 +1198,7 @@ async fn old_failure_settlement_cannot_change_a_claimed_replacement() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn replacement_before_initial_activation_prevents_stale_provider_work() {
     let f = Fixture::new().await;
     f.processor.arm_completed_history_preparation_barrier(
@@ -1249,7 +1249,7 @@ async fn replacement_before_initial_activation_prevents_stale_provider_work() {
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn stop_after_terminal_precheck_still_prevents_initial_activation() {
     for phase in [
         "__foreground_start_after_terminal_precheck__",
@@ -1332,7 +1332,7 @@ async fn stop_after_terminal_precheck_still_prevents_initial_activation() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn published_start_releases_causality_but_retains_capacity_through_unread_extras() {
     let mut f = Fixture::new().await;
     for n in 0..32 {
@@ -1418,7 +1418,7 @@ async fn published_start_releases_causality_but_retains_capacity_through_unread_
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn stdout_progress_uses_the_actual_target_and_waits_for_start_publication() {
     let mut f = Fixture::new().await;
     f.processor
@@ -1480,7 +1480,7 @@ async fn stdout_progress_uses_the_actual_target_and_waits_for_start_publication(
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn prepared_capture_budget_failure_never_accepts_or_activates_provider() {
     let f = Fixture::new().await;
     let mut thread = f.store.get_thread_model(THREAD).await.unwrap().unwrap();
@@ -1530,7 +1530,7 @@ async fn prepared_capture_budget_failure_never_accepts_or_activates_provider() {
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unfinished_owned_startup_is_discovered_by_a_fresh_process_recovery_owner() {
     let f = Fixture::new().await;
     f.processor
@@ -1623,7 +1623,7 @@ async fn unfinished_owned_startup_is_discovered_by_a_fresh_process_recovery_owne
     f.close().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn timeout_and_synthetic_failed_item_keep_durable_live_obligations_during_startup() {
     for timeout_case in [true, false] {
         let mut f = Fixture::new().await;

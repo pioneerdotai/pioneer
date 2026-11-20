@@ -1602,10 +1602,10 @@ mod tests {
                  ) VALUES(\
                     'S00000000000000000001','G00000000000000000001',\
                     'P00000000000000000001','D00000000000000000001',\
-                    'F00000000000000000001',NULL,randomblob(32),randomblob(32),0,\
-                    datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
+                    'F00000000000000000001',NULL,decode(replace(gen_random_uuid()::text,'-','') || replace(gen_random_uuid()::text,'-',''),'hex'),decode(replace(gen_random_uuid()::text,'-','') || replace(gen_random_uuid()::text,'-',''),'hex'),0,\
+                    CURRENT_TIMESTAMP + INTERVAL '10 minutes',CURRENT_TIMESTAMP,'active',0,\
                     CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                    datetime('now','+90 days'),NULL,NULL\
+                    CURRENT_TIMESTAMP + INTERVAL '90 days',NULL,NULL\
                  );",
             )
             .await

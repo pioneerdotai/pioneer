@@ -14,17 +14,17 @@ pub struct Model {
         unique_key = "portable_payload_part_chars"
     )]
     pub payload_id: String,
-    pub original_bytes: i64,
-    pub codec: i16,
-    #[sea_orm(unique_key = "portable_payload_part_chars")]
-    pub char_offset: i64,
-    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
-    pub body: Vec<u8>,
-    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
-    pub sha256: Vec<u8>,
-    pub original_chars: i64,
     #[sea_orm(primary_key, auto_increment = false)]
     pub byte_offset: i64,
+    #[sea_orm(unique_key = "portable_payload_part_chars")]
+    pub char_offset: i64,
+    pub original_bytes: i64,
+    pub original_chars: i64,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub sha256: Vec<u8>,
+    pub codec: i16,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub body: Vec<u8>,
     #[sea_orm(
         belongs_to,
         from = "payload_id",

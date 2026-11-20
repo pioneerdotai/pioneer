@@ -7,38 +7,38 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_result_candidate")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub final_review_event_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub thread_id: String,
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub extraction_error_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub diagnostics_json: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text")]
     pub task_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub summary: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub result_json: Option<String>,
-    #[sea_orm(unique_key = "uidx_task_result_candidate_run_round")]
-    pub round: i64,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uidx_task_result_candidate_run_round"
     )]
     pub run_id: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
-    pub resolved_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", unique)]
     pub task_run_turn_id: String,
     #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub turn_id: String,
+    #[sea_orm(unique_key = "uidx_task_result_candidate_run_round")]
+    pub round: i64,
     #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub result_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub extraction_error_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub summary: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub diagnostics_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub final_review_event_id: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    pub resolved_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(has_many)]
     pub compaction_delivery_outputs: HasMany<super::compaction_delivery_output::Entity>,
 }

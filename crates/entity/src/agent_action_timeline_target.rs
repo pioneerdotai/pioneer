@@ -7,17 +7,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_action_timeline_target")]
 pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub target_key: String,
     #[sea_orm(column_type = "Text", unique)]
     pub action_id: String,
     #[sea_orm(column_type = "Text")]
-    pub target_kind: String,
-    pub created_at: DateTimeWithTimeZone,
+    pub turn_id: String,
     #[sea_orm(column_type = "Text", nullable, unique)]
     pub turn_item_id: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub target_key: String,
     #[sea_orm(column_type = "Text")]
-    pub turn_id: String,
+    pub target_kind: String,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "action_id",

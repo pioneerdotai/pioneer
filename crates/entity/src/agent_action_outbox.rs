@@ -7,22 +7,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_action_outbox")]
 pub struct Model {
-    pub delivered_at: Option<DateTimeWithTimeZone>,
-    pub attempts: i64,
-    #[sea_orm(column_type = "Text")]
-    pub payload_json: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(column_type = "Text")]
-    pub owner_execution_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_error: Option<String>,
-    pub next_attempt_at: Option<DateTimeWithTimeZone>,
-    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", unique)]
     pub action_id: String,
     #[sea_orm(column_type = "Text")]
+    pub owner_execution_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub payload_json: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    pub attempts: i64,
+    pub next_attempt_at: Option<DateTimeWithTimeZone>,
+    pub delivered_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_error: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "action_id",

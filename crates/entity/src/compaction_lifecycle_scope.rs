@@ -7,21 +7,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_lifecycle_scope")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub cursor_id: Option<String>,
-    pub attempts: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub kind: String,
-    pub generation: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub upper_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub claim_token: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub turn_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub owner: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub turn_id: String,
+    pub generation: i64,
     pub due_at: i64,
+    pub attempts: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub claim_token: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub cursor_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub upper_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

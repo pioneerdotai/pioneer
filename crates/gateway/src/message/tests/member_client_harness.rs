@@ -756,7 +756,7 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_full_access_cli_request_is_capped_before_codex_permissions_adaptation() {
     let member_principal = register_member_principal();
     let mut harness = setup_cli_runtime_security_harness_for_principal(

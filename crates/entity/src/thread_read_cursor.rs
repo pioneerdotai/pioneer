@@ -7,15 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_read_cursor")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub last_read_sort_key: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub principal_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub last_read_sort_key: String,
     #[sea_orm(column_type = "Text")]
     pub last_read_turn_id: String,
     pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub thread_id: String,
     #[sea_orm(
         belongs_to,
         from = "principal_id",

@@ -7,20 +7,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_running_permit")]
 pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text", unique_key = "uq_agent_running_permit_attempt")]
     pub root_execution_id: String,
+    #[sea_orm(column_type = "Text", unique_key = "uq_agent_running_permit_attempt")]
+    pub execution_id: String,
+    #[sea_orm(unique_key = "uq_agent_running_permit_attempt")]
+    pub attempt_generation: i64,
     pub lease_generation: i64,
     #[sea_orm(column_type = "Text")]
     pub status: String,
+    pub acquired_at: DateTimeWithTimeZone,
     pub released_at: Option<DateTimeWithTimeZone>,
     pub fenced_at: Option<DateTimeWithTimeZone>,
-    pub acquired_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", unique_key = "uq_agent_running_permit_attempt")]
-    pub execution_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
-    #[sea_orm(unique_key = "uq_agent_running_permit_attempt")]
-    pub attempt_generation: i64,
     #[sea_orm(
         belongs_to,
         relation_enum = "AgentExecution2",

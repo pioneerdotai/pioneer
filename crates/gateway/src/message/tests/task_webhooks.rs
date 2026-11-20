@@ -7,7 +7,7 @@ use pioneer_protocol::TaskGetParams;
 use std::collections::BTreeSet;
 use tower::ServiceExt as _;
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn webhook_http_admits_distinct_durable_runs_and_create_get_recover_the_same_url() {
     let (processor, sessions, _, _notifications, _, workspace_id) =
         setup_workspace_message_processor().await;

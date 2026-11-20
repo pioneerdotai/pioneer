@@ -125,7 +125,7 @@ fn take_reads(observer: &HistoryReadObserver, class: SqliteReadClass) -> usize {
         .count()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_prepared_event_item_group_saves_metadata_reads_for_both_projections() {
     let (f, observer, references) = scenario().await;
     for maintenance in [false, true] {
@@ -178,7 +178,7 @@ async fn frozen_prepared_event_item_group_saves_metadata_reads_for_both_projecti
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_unprepared_group_keeps_legacy_registration_fallback() {
     let (f, observer, references) = scenario().await;
     let expected = frozen::restore_entries_page_for_test(&f.store, "ws", &references, true)
@@ -217,7 +217,7 @@ async fn frozen_unprepared_group_keeps_legacy_registration_fallback() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_precheck_keeps_exact_reads_and_fallback_rejects_stale_sources() {
     for change in ["edit", "delete-reinsert", "tombstone", "replay"] {
         let (f, observer, references) = scenario().await;
@@ -310,7 +310,7 @@ async fn frozen_precheck_keeps_exact_reads_and_fallback_rejects_stale_sources() 
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_precheck_pause_is_operation_scoped_and_drop_releases_restore() {
     let (f, _, references) = scenario().await;
     let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
@@ -334,7 +334,7 @@ async fn frozen_precheck_pause_is_operation_scoped_and_drop_releases_restore() {
     assert_eq!(restored.unwrap(), other);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_precheck_pause_cancellation_drops_channels_and_leaves_store_usable() {
     let (f, _, references) = scenario().await;
     let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
@@ -360,7 +360,7 @@ async fn frozen_precheck_pause_cancellation_drops_channels_and_leaves_store_usab
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_precheck_does_not_hide_database_errors_or_precheck_malformed_revisions() {
     let (f, observer, mut references) = scenario().await;
     references[0].sources[0].version = "event-revision:01".into();

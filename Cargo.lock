@@ -12171,11 +12171,21 @@ dependencies = [
  "anyhow",
  "futures-util",
  "pioneer-migration",
+ "pioneer-postgres-test-macros",
  "process-wrap",
  "sea-orm",
  "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "pioneer-postgres-test-macros"
+version = "0.73.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

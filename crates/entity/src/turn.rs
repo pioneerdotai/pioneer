@@ -7,76 +7,76 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn")]
 pub struct Model {
-    #[sea_orm(unique)]
-    pub insertion_ordinal: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text")]
     pub thread_id: String,
-    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub error: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub prompt_manifest_json: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub prompt_compiler_version: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub prompt_profile: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub prompt_fingerprint_stable: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub prompt_fingerprint_dynamic: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub prompt_fingerprint_full: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub turn_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub origin: String,
     #[sea_orm(column_type = "Text", nullable)]
-    pub initiated_by_actor_kind: Option<String>,
+    pub reasoning_effort: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub permission_profile_snapshot_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub message_deleted_by_actor_id: Option<String>,
+    pub permission_profile_mode: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub permission_profile_source: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub author_agent_snapshot_json: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    pub permission_profile_snapshot_json: Option<String>,
+    pub execution_security_snapshot_version: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub reply_to_turn_id: Option<String>,
+    pub execution_security_snapshot_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub initiated_by_actor_id: Option<String>,
+    pub execution_authorization_context_json: Option<Json>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub send_mode: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub author_display_name_snapshot: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub author_nickname_snapshot: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub author_avatar_revision_snapshot: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub execution_security_snapshot_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub author_display_name_snapshot: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub message_deleted_by_actor_kind: Option<String>,
-    pub execution_security_snapshot_version: Option<i64>,
-    #[sea_orm(column_type = "Text")]
-    pub publication_xid: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub initiated_by_actor_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub prompt_manifest_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub turn_kind: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub reasoning_effort: Option<String>,
-    pub message_revision: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub prompt_compiler_version: Option<String>,
+    pub reply_to_turn_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub mentions_json: String,
+    pub message_revision: i64,
     pub message_deleted_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub prompt_fingerprint_stable: Option<String>,
+    pub message_deleted_by_actor_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub prompt_profile: Option<String>,
+    pub message_deleted_by_actor_kind: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub prompt_fingerprint_dynamic: Option<String>,
+    pub author_agent_snapshot_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub initiated_by_actor_kind: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub work_owner: String,
-    #[sea_orm(column_type = "Text")]
-    pub origin: String,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    pub execution_authorization_context_json: Option<Json>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub send_mode: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub package_selection_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub error: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub permission_profile_mode: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub publication_xid: String,
+    #[sea_orm(unique)]
+    pub insertion_ordinal: i64,
     #[sea_orm(has_many)]
     pub agent_action_timeline_targets: HasMany<super::agent_action_timeline_target::Entity>,
     #[sea_orm(has_one)]

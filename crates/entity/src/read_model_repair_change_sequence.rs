@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "read_model_repair_change_sequence")]
 pub struct Model {
-    pub generation: i64,
     #[sea_orm(primary_key, auto_increment = false)]
     pub singleton_key: i64,
+    pub generation: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

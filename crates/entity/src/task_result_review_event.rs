@@ -7,43 +7,43 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_result_review_event")]
 pub struct Model {
-    #[sea_orm(column_type = "Double", nullable)]
-    pub confidence: Option<f64>,
-    #[sea_orm(column_type = "Text")]
-    pub task_run_turn_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub feedback_text: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub reviewer_ref_json: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub next_task_run_turn_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub event_kind: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text")]
     pub candidate_id: String,
     #[sea_orm(column_type = "Text")]
-    pub decision: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub reviewer_agent_spec_id: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    pub task_id: String,
     #[sea_orm(column_type = "Text")]
     pub run_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub supersedes_review_event_id: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub feedback_json: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub task_id: String,
+    pub task_run_turn_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub reviewer_kind: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub reviewer_thread_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    pub reviewer_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub reviewer_user_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub reviewer_turn_id: Option<String>,
+    pub reviewer_agent_spec_id: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub reviewer_kind: String,
+    pub event_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub decision: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub feedback_text: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub feedback_json: Option<String>,
+    #[sea_orm(column_type = "Double", nullable)]
+    pub confidence: Option<f64>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub supersedes_review_event_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub next_task_run_turn_id: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub reviewer_ref_json: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

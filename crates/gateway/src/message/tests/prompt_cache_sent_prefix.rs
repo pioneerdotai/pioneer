@@ -190,7 +190,7 @@ async fn transport_with_final(
     )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wires() {
     for responses in [true, false] {
         crate::compaction::load_test_catalog();

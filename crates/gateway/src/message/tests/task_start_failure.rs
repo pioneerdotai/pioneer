@@ -24,7 +24,9 @@ fn capture_task_start<R: Send + 'static>(
                 pioneer_observability::runtime::RuntimeRole::GatewayPatch,
             );
             crate::public_error::test_support::capture_events(|| {
-                _runtime_observer.block_on(&runtime, future)
+                _runtime_observer
+                    .block_on(&runtime, pioneer_postgres_test::with_test_databases(future))
+                    .expect("close isolated PostgreSQL test databases")
             })
         })
         .unwrap()
@@ -3988,7 +3990,7 @@ fn gateway_partial_task_startup_keeps_independent_registrations_and_unknown_fail
     });
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn capsule_delegation_survives_nested_task_binding_recovery_and_revocation() {
     use super::thread_launch_choices::{call, invoke_with_mutation};
     use crate::message::task_agent_executor::materialize_task_agent_action_binding_for_execution;

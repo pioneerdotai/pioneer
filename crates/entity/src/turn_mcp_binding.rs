@@ -9,40 +9,40 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(column_type = "Text")]
-    pub server_name: String,
-    #[sea_orm(column_type = "Text")]
-    pub annotations_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub catalog_version: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub canonical_schema_fingerprint: String,
+    #[sea_orm(column_type = "Text", unique_key = "uq_turn_mcp_binding_turn_callable")]
+    pub turn_id: String,
     #[sea_orm(column_type = "Text")]
     pub server_installation_id: String,
     #[sea_orm(column_type = "Text")]
-    pub fingerprint: String,
+    pub server_name: String,
+    #[sea_orm(column_type = "Text")]
+    pub raw_tool_name: String,
     #[sea_orm(column_type = "Text", unique_key = "uq_turn_mcp_binding_turn_callable")]
     pub callable_name: String,
     #[sea_orm(column_type = "Text")]
-    pub raw_tool_name: String,
+    pub catalog_version: String,
     #[sea_orm(column_type = "Text")]
-    pub provider_callable_name: String,
-    #[sea_orm(column_type = "Text")]
-    pub provider_schema_fingerprint: String,
-    pub runtime_generation: i64,
-    pub projection_activation_generation: i64,
-    #[sea_orm(column_type = "Text", unique_key = "uq_turn_mcp_binding_turn_callable")]
-    pub turn_id: String,
-    pub effective_timeout_ms: i64,
+    pub fingerprint: String,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text")]
     pub selection_reason: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub capability_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub canonical_callable_name: String,
     #[sea_orm(column_type = "Text")]
+    pub provider_callable_name: String,
+    #[sea_orm(column_type = "Text")]
+    pub canonical_schema_fingerprint: String,
+    #[sea_orm(column_type = "Text")]
+    pub provider_schema_fingerprint: String,
+    #[sea_orm(column_type = "Text")]
+    pub annotations_json: String,
+    #[sea_orm(column_type = "Text")]
     pub annotations_digest: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub capability_id: Option<String>,
+    pub effective_timeout_ms: i64,
+    pub runtime_generation: i64,
+    pub projection_activation_generation: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

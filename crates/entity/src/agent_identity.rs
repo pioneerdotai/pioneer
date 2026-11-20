@@ -7,31 +7,31 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_identity")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub source_fingerprint: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uq_agent_identity_workspace_source"
-    )]
-    pub source_kind: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uq_agent_identity_workspace_source"
     )]
-    pub source_id: String,
+    pub workspace_id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uq_agent_identity_workspace_source"
     )]
-    pub workspace_id: String,
-    pub retired_at: Option<DateTimeWithTimeZone>,
+    pub source_kind: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_identity_workspace_source"
+    )]
+    pub source_id: String,
     pub source_revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub source_fingerprint: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    pub retired_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(has_many)]
     pub agent_executions: HasMany<super::agent_execution::Entity>,
     #[sea_orm(has_many)]

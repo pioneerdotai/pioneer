@@ -11,75 +11,6 @@ use sea_orm::IntoActiveModel;
 use sea_orm::sea_query::{ExprTrait, Query};
 
 const NOW: i64 = 4_000_000_000;
-const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
-
-// Event-driven fixture creation needs the cancellation marker columns. Use
-// that prefix with the shared helper's orthogonal TaskEvent storage projection.
-// Storage precedes the tracker, so tracker_rollback_steps still removes only
-// the tracker and its historical successors, without irreversible migrations.
-struct TrackerFixtureMigrator;
-
-impl MigratorTrait for TrackerFixtureMigrator {
-    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        migrations_through("m20261008_000008_native_cancellation_context")
-    }
-}
-
-fn tracker_rollback_steps() -> u32 {
-    (TrackerFixtureMigrator::migrations()
-        .iter()
-        .rev()
-        .position(|migration| migration.name() == MIGRATION)
-        .expect("parent tracker migration is registered")
-        + 1)
-    .try_into()
-    .unwrap()
-}
-
-// Only event-driven fixtures need today's terminal timeline projector. Pure
-// migration tests retain the tracker schema and its exact rollback boundary.
-async fn tracker_projector_store() -> CrudStore {
-    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
-    add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
-    add_thread_unread_column_to_legacy_fixture(&store).await;
-    // Current canonical append atomically persists content-free observations.
-    // Install only its orthogonal tables; preserve the tracker receipt/down boundary.
-    let tx = store.connection.begin().await.unwrap();
-    let schema = migration::SchemaManager::new(&*tx);
-    Migrator::migrations()
-        .into_iter()
-        .find(|m| m.name() == "m20261109_000001_execution_observability")
-        .unwrap()
-        .up(&schema)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let transaction = store.connection.begin().await.unwrap();
-    let schema = migration::SchemaManager::new(&*transaction);
-    schema
-        .alter_table(
-            migration::Table::alter()
-                .table(sea_orm::sea_query::Alias::new("turn_cli_runtime_binding"))
-                .add_column(
-                    migration::ColumnDef::new(sea_orm::sea_query::Alias::new("frozen_manifest_id"))
-                        .text()
-                        .null(),
-                )
-                .to_owned(),
-        )
-        .await
-        .unwrap();
-    // The shared migration helper already installed portable_payload. Install
-    // only the CLI projection without adding a later migration receipt.
-    let projection = Migrator::migrations()
-        .into_iter()
-        .find(|migration| migration.name() == "m20261027_000003_portable_cli_mapping")
-        .unwrap();
-    projection.up(&schema).await.unwrap();
-    transaction.commit().await.unwrap();
-    store
-}
-
 // The existing status/null/generation matrix remains the legacy trigger owner.
 async fn terminal_task_run_occurrence_fixture(
     kind: Option<TurnKind>,
@@ -145,7 +76,7 @@ async fn turn_status(store: &CrudStore, id: &str, status: &str) {
         .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn predicate_matrix_and_unknown_null_semantics_match_original_sql() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     for (run_status_value, target) in [
@@ -209,7 +140,7 @@ async fn predicate_matrix_and_unknown_null_semantics_match_original_sql() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn same_status_error_only_and_noncanonical_or_missing_pairs_do_not_enqueue() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     turn_status(&store, &run.id, "completed").await;
@@ -235,7 +166,7 @@ async fn same_status_error_only_and_noncanonical_or_missing_pairs_do_not_enqueue
     assert!(row(&missing, &run.id).await.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn both_late_inserts_deletes_and_id_moves_track_exact_current_pairs() {
     let (store, thread, run) = terminal_task_run_occurrence_fixture(None).await;
     let occurrence = Turn {
@@ -335,7 +266,7 @@ async fn both_late_inserts_deletes_and_id_moves_track_exact_current_pairs() {
     assert!(row(&store, &run.id).await.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn trigger_updates_preserve_retry_and_ignore_noops_heartbeat_updated_at() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let claim = claimed(&store).await;
@@ -382,7 +313,7 @@ async fn trigger_updates_preserve_retry_and_ignore_noops_heartbeat_updated_at() 
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn one_holder_at_a_time_reclaim_new_token_and_old_holder_cannot_commit() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let candidate = store
@@ -436,7 +367,7 @@ async fn one_holder_at_a_time_reclaim_new_token_and_old_holder_cannot_commit() {
     assert!(row(&store, &run.id).await.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn run_and_turn_freshness_ignores_equal_timestamps_and_checks_all_used_fields() {
     for change in [
         "completed_at",
@@ -562,7 +493,7 @@ async fn run_and_turn_freshness_ignores_equal_timestamps_and_checks_all_used_fie
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     turn_status(&store, &run.id, "completed").await;
@@ -643,7 +574,7 @@ async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
     assert!(row(&store, &run.id).await.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn poison_missing_thread_keeps_backoff_and_allows_later_repair() {
     let (store, thread, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     // Remove the dependency without changing the occurrence's canonical scope.
@@ -701,7 +632,7 @@ async fn poison_missing_thread_keeps_backoff_and_allows_later_repair() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn ordinary_event_driven_repair_can_overtake_claimed_background_work() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let claim = claimed(&store).await;
@@ -724,85 +655,7 @@ async fn ordinary_event_driven_repair_can_overtake_claimed_background_work() {
     assert!(row(&store, &run.id).await.is_none());
 }
 
-#[tokio::test]
-async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_objects() {
-    let store = tracker_projector_store().await;
-    let (store, _, run) =
-        terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
-    let maintenance = store.with_maintenance_access();
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
-    tx.commit().await.unwrap();
-    assert!(
-        row(&store, &run.id).await.is_none(),
-        "no history backfill on install"
-    );
-    assert_eq!(generation(&store).await, 0);
-    // A same-value source update is not a new discrepancy; a later real update
-    // of this pre-install ID is tracked regardless of its creation timestamp.
-    run_status(&store, &run.id, "succeeded").await;
-    assert!(row(&store, &run.id).await.is_none());
-    runs::Entity::update_many()
-        .col_expr(
-            runs::Column::CompletedAt,
-            Expr::val(Some(unix_to_datetime(NOW))),
-        )
-        .filter(runs::Column::Id.eq(&run.id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    assert!(row(&store, &run.id).await.is_some());
-    assert_eq!(
-        pending::Entity::find()
-            .count(&store.connection)
-            .await
-            .unwrap(),
-        1
-    );
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let objects = store
-        .connection
-        .query_all_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT name FROM sqlite_master WHERE name LIKE ?",
-            ["task_run_occurrence_reconcile%".into()],
-        ))
-        .await
-        .unwrap();
-    assert!(objects.is_empty());
-    let indexes = store
-        .connection
-        .query_all_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT name FROM sqlite_master WHERE name=?",
-            ["idx_task_run_occurrence_reconcile_due".into()],
-        ))
-        .await
-        .unwrap();
-    assert!(indexes.is_empty());
-    let migrations = TrackerFixtureMigrator::migrations();
-    let target = migrations.iter().find(|m| m.name() == MIGRATION).unwrap();
-    assert_eq!(target.name(), MIGRATION);
-    assert_eq!(target.use_transaction(), Some(true));
-    assert!(
-        !TrackerFixtureMigrator::get_applied_migrations(&store.connection)
-            .await
-            .unwrap()
-            .iter()
-            .any(|migration| migration.name() == MIGRATION)
-    );
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn generation_overflow_and_missing_singleton_reject_source_write_atomically() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     sequence::Entity::update_many()
@@ -839,7 +692,7 @@ async fn generation_overflow_and_missing_singleton_reject_source_write_atomicall
     assert_eq!(row(&store, &run.id).await.unwrap(), before);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn due_plan_empty_deferred_and_due_backlog_use_covering_index_without_sort() {
     let store = test_store_with_workspace("ws_task").await;
     for phase in ["empty", "deferred", "backlog"] {
@@ -912,7 +765,7 @@ async fn due_plan_empty_deferred_and_due_backlog_use_covering_index_without_sort
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn every_terminal_mapping_commits_through_common_turn_event_projector() {
     for (status, target) in [
         ("succeeded", TurnStatus::Completed),
@@ -1064,7 +917,7 @@ async fn running_occurrence_fixture() -> (CrudStore, Thread, TaskRun) {
     (store, thread, run)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_tracker() {
     let (store, thread, run) = running_occurrence_fixture().await;
     assert!(row(&store, &run.id).await.is_none());
@@ -1205,7 +1058,7 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn resume_of_old_blocked_run_invalidates_claim_then_subsequent_completion_tracks_again() {
     let (store, task, run, job, child_thread, child_turn) =
         task_owned_resume_conflict_fixture("ws_task", "tracker_resume").await;
@@ -1628,75 +1481,7 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
     remove_disk_fixture(store, path).await;
 }
 
-#[tokio::test]
-async fn migration_installation_and_completion_marker_rollback_together() {
-    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task")
-        .await
-        .with_maintenance_access();
-    let tx = store.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    // Deliberately collide with the second installed trigger, after the new
-    // tables/index/seed and first trigger have already been written.
-    store.connection.execute_unprepared("CREATE TRIGGER task_run_occurrence_reconcile_task_run_update AFTER UPDATE ON task_run WHEN 0 BEGIN SELECT 1; END").await.unwrap();
-    let tx = store.connection.begin().await.unwrap();
-    assert!(TrackerFixtureMigrator::up(&*tx, None).await.is_err());
-    tx.rollback().await.unwrap();
-    let query = Query::select()
-        .column("name")
-        .from("sqlite_master")
-        .and_where(Expr::col("name").is_in([
-            "task_run_occurrence_reconcile_pending",
-            "task_run_occurrence_reconcile_sequence",
-            "task_run_occurrence_reconcile_task_run_insert",
-            "idx_task_run_occurrence_reconcile_due",
-        ]))
-        .to_owned();
-    assert!(
-        store
-            .connection
-            .query_all_raw(DatabaseBackend::Sqlite.build(&query))
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let marker = Query::select()
-        .column("version")
-        .from("seaql_migrations")
-        .and_where(Expr::col("version").eq(MIGRATION))
-        .to_owned();
-    assert!(
-        store
-            .connection
-            .query_all_raw(DatabaseBackend::Sqlite.build(&marker))
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    store
-        .connection
-        .execute_unprepared("DROP TRIGGER task_run_occurrence_reconcile_task_run_update")
-        .await
-        .unwrap();
-    let tx = store.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(
-        store
-            .connection
-            .query_all_raw(DatabaseBackend::Sqlite.build(&marker))
-            .await
-            .unwrap()
-            .len(),
-        1,
-        "parent tracker completion marker must be installed"
-    );
-    assert_eq!(generation(&store).await, 0);
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn changed_after_discovery_loses_claim_and_reincarnation_cannot_accept_old_result() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let candidate = store
@@ -1740,7 +1525,7 @@ async fn changed_after_discovery_loses_claim_and_reincarnation_cannot_accept_old
     assert_eq!(row(&store, &run.id).await.unwrap(), current);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let candidate = store
@@ -1768,40 +1553,7 @@ async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
     }
 }
 
-#[tokio::test]
-async fn recovery_completed_at_write_tracks_preinstall_run_without_history_discovery() {
-    let store = tracker_projector_store().await;
-    let (store, _, run) =
-        terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
-    runs::Entity::update_many()
-        .col_expr(
-            runs::Column::CompletedAt,
-            Expr::val(None::<sea_orm::entity::prelude::DateTimeWithTimeZone>),
-        )
-        .filter(runs::Column::Id.eq(&run.id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    let maintenance = store.with_maintenance_access();
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
-    tx.commit().await.unwrap();
-    assert!(row(&store, &run.id).await.is_none());
-    // The existing generic recovery still owns its algorithm. Its actual
-    // completed_at UPDATE, after tracker installation, supplies the work item.
-    maintenance
-        .repair_terminal_runs_missing_completed_at()
-        .await
-        .unwrap();
-    assert!(row(&store, &run.id).await.is_some());
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn auxiliary_native_effect_payload_edit_with_same_hash_timestamp_rolls_back_repair() {
     let (store, thread, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let effect = cleanup_effect_preparation("ws_task", &thread.id, &run.id, "occurrence_effect");
@@ -1876,7 +1628,7 @@ async fn auxiliary_native_effect_payload_edit_with_same_hash_timestamp_rolls_bac
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_claim_deferral_fences_generation_token_due_count_and_ambiguous_success() {
     use crate::{
         TaskRunOccurrenceClaimDeferral as Deferral, TaskRunOccurrenceClaimFailurePhase as Phase,
@@ -1981,7 +1733,7 @@ async fn failed_claim_deferral_fences_generation_token_due_count_and_ambiguous_s
     assert_eq!(row(&store, &run.id).await.unwrap(), current);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unavailable_bookkeeping_is_reported_without_claim_or_durable_backoff_promise() {
     use crate::{
         TaskRunOccurrenceClaimDeferral as Deferral, TaskRunOccurrenceClaimFailure,
@@ -2018,7 +1770,7 @@ async fn unavailable_bookkeeping_is_reported_without_claim_or_durable_backoff_pr
     assert_eq!(failure.deferral, Deferral::NoSnapshot);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn claim_uses_time_after_discovery_instead_of_the_advisory_clock() {
     let (store, _, _) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let clock = std::sync::atomic::AtomicI64::new(NOW);
@@ -2107,7 +1859,7 @@ async fn claim_and_failed_claim_deferral_use_time_after_waiting_for_writer() {
     remove_disk_fixture(store, path).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn background_repair_waits_for_predecessor_then_retries_without_source_pair_change() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let run_before = runs::Entity::find_by_id(&run.id)

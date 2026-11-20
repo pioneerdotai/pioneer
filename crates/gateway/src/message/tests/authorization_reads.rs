@@ -1,7 +1,7 @@
 use super::*;
 use sea_orm::{DatabaseBackend, Statement};
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn projected_binding_keeps_internal_capsule_and_corrupt_lineage_checks() {
     use crate::authorization::ExecutionAuthorizationContext;
     let harness = setup_progress_delta_harness(
@@ -133,7 +133,7 @@ async fn projected_binding_keeps_internal_capsule_and_corrupt_lineage_checks() {
     assert!(format!("{error:#}").contains("creating Turn is missing or outside its parent"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_commit_rereads_envelope_without_an_acl_generation_change() {
     let harness = setup_progress_delta_harness(
         "authprojection",
@@ -158,29 +158,39 @@ async fn durable_commit_rereads_envelope_without_an_acl_generation_change() {
         .unwrap();
     drop(processor.guard_execution_commit(turn_id).await.unwrap());
 
-    // A warm lease must not hide a setter write or corrupt persisted blank,
-    // including JSON that parses but fails the security envelope schema.
-    for encoded in [" \t\n", "malformed", "{}"] {
-        if encoded.trim().is_empty() {
-            pioneer_entity::turn::Entity::update_many()
-                .col_expr(
-                    pioneer_entity::turn::Column::ExecutionAuthorizationContextJson,
-                    Expr::value(encoded),
-                )
-                .filter(pioneer_entity::turn::Column::Id.eq(turn_id))
-                .exec(&store.database_connection())
-                .await
-                .unwrap();
-        } else {
+    // A warm lease must see a missing envelope and valid JSON with an invalid
+    // envelope shape. PostgreSQL rejects malformed JSON before it can persist.
+    assert!(
+        store
+            .set_turn_execution_authorization_context(turn_id, "malformed")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        processor.current_authorization_revision().await.unwrap(),
+        generation
+    );
+    for encoded in [None, Some("{}")] {
+        if let Some(encoded) = encoded {
             assert!(
                 store
                     .set_turn_execution_authorization_context(turn_id, encoded)
                     .await
                     .unwrap()
             );
+        } else {
+            pioneer_entity::turn::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::turn::Column::ExecutionAuthorizationContextJson,
+                    Expr::value(None::<serde_json::Value>),
+                )
+                .filter(pioneer_entity::turn::Column::Id.eq(turn_id))
+                .exec(&store.database_connection())
+                .await
+                .unwrap();
         }
         let error = processor.guard_execution_commit(turn_id).await.unwrap_err();
-        let expected = if encoded.trim().is_empty() {
+        let expected = if encoded.is_none() {
             "no durable authority envelope"
         } else {
             "invalid authority envelope"
@@ -247,8 +257,8 @@ async fn durable_commit_rereads_envelope_without_an_acl_generation_change() {
         store
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "UPDATE turn SET initiated_by_actor_kind=?, initiated_by_actor_id=? WHERE id=?",
+                DatabaseBackend::Postgres,
+                "UPDATE \"turn\" SET initiated_by_actor_kind=$1, initiated_by_actor_id=$2 WHERE id=$3",
                 vec![kind.into(), id.into(), turn_id.into()],
             ))
             .await
@@ -262,17 +272,17 @@ async fn durable_commit_rereads_envelope_without_an_acl_generation_change() {
         );
     }
     store.database_connection().execute_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "UPDATE turn SET initiated_by_actor_kind='principal', initiated_by_actor_id=? WHERE id=?",
+        DatabaseBackend::Postgres,
+        "UPDATE \"turn\" SET initiated_by_actor_kind='principal', initiated_by_actor_id=$1 WHERE id=$2",
         vec![authenticated_test_superuser().principal_id.as_str().into(), turn_id.into()],
     )).await.unwrap();
 
     // Binding reads must ignore corrupt presentation snapshots yet continue
     // to reject mutable terminal status through the real lease guard.
     store.database_connection().execute_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "UPDATE turn SET prompt_manifest_json='broken', permission_profile_snapshot_json='broken', mentions_json='broken' WHERE id=?",
-        [turn_id.into()],
+        DatabaseBackend::Postgres,
+        "UPDATE \"turn\" SET prompt_manifest_json=$1, permission_profile_snapshot_json=$1, mentions_json=$1 WHERE id=$2",
+        [r#""broken""#.into(), turn_id.into()],
     )).await.unwrap();
     drop(processor.guard_execution_commit(turn_id).await.unwrap());
     for status in [TurnStatus::Completed, TurnStatus::Interrupted] {

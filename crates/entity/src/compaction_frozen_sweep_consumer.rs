@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_sweep_consumer")]
 pub struct Model {
-    pub pending: i64,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub consumer_row: i64,
     #[sea_orm(
         column_type = "Text",
         unique_key = "compaction_frozen_sweep_consumer_manifest_id_kind_key"
@@ -15,9 +16,8 @@ pub struct Model {
     pub manifest_id: String,
     #[sea_orm(unique_key = "compaction_frozen_sweep_consumer_manifest_id_kind_key")]
     pub kind: i64,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub consumer_row: i64,
     pub revision: i64,
+    pub pending: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub after_source: Option<String>,
 }

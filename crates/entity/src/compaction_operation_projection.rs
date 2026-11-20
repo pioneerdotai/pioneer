@@ -7,16 +7,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_operation_projection")]
 pub struct Model {
-    pub terminal_generation: Option<i64>,
-    #[sea_orm(column_type = "Text")]
-    pub imports_sha256: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub operation_id: String,
     #[sea_orm(column_type = "Text")]
+    pub manifest_id: String,
+    #[sea_orm(column_type = "Text")]
     pub identity_sha256: String,
     #[sea_orm(column_type = "Text")]
-    pub manifest_id: String,
+    pub imports_sha256: String,
     pub import_count: i64,
+    pub terminal_generation: Option<i64>,
     #[sea_orm(
         belongs_to,
         from = "manifest_id",

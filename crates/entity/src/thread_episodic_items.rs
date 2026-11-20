@@ -7,32 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_episodic_items")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub source_actor_role: String,
-    pub source_context_json: Json,
-    #[sea_orm(column_type = "Text")]
-    pub visibility: String,
-    #[sea_orm(column_type = "Text")]
-    pub source_runtime_kind: String,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uidx_thread_episodic_items_source_hash"
-    )]
-    pub thread_id: String,
-    pub token_estimate: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uidx_thread_episodic_items_source_hash"
-    )]
-    pub turn_id: String,
-    pub deleted_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text")]
-    pub source_text_hash: String,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uidx_thread_episodic_items_source_hash"
@@ -42,22 +18,46 @@ pub struct Model {
         column_type = "Text",
         unique_key = "uidx_thread_episodic_items_source_hash"
     )]
-    pub text_hash: String,
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub embedding_artifact_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub projection_group_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub language_hint: Option<String>,
+    pub thread_id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_thread_episodic_items_source_hash"
+    )]
+    pub turn_id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uidx_thread_episodic_items_source_hash"
     )]
     pub item_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub source_actor_role: String,
+    #[sea_orm(column_type = "Text")]
+    pub source_runtime_kind: String,
+    pub source_context_json: Json,
+    #[sea_orm(column_type = "Text")]
+    pub visibility: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_thread_episodic_items_source_hash"
+    )]
+    pub text_hash: String,
+    #[sea_orm(column_type = "Text")]
+    pub source_text_hash: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub language_hint: Option<String>,
+    pub token_estimate: i64,
+    pub indexed_at: Option<DateTimeWithTimeZone>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    pub deleted_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub projection_group_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub embedding_artifact_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub search_text: Option<String>,
-    pub indexed_at: Option<DateTimeWithTimeZone>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

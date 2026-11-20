@@ -7,54 +7,54 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "native_terminal_effect_outbox")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub payload_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub effect_kind: String,
-    #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    pub claim_expires_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub effect_id: String,
-    pub attempt_count: i64,
-    pub terminal_committed_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text")]
-    pub thread_id: String,
-    pub runtime_generation: i64,
-    pub gate_probe_attempts: i64,
-    #[sea_orm(column_type = "Text")]
-    pub gate_kind: String,
-    pub gate_probe_at: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub gate_probe_token: Option<String>,
-    pub completed_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_error_message: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub handler_checkpoint_sha256: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub claim_token: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub turn_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub accepted_candidate_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub payload_sha256: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub handler_checkpoint_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_error_code: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub batch_id: String,
     #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub turn_id: String,
+    pub runtime_generation: i64,
+    #[sea_orm(column_type = "Text")]
+    pub effect_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub gate_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub payload_json: String,
+    #[sea_orm(column_type = "Text")]
+    pub payload_sha256: String,
+    #[sea_orm(column_type = "Text")]
     pub payload_identity_sha256: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub handler_checkpoint_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub handler_checkpoint_sha256: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub accepted_candidate_id: Option<String>,
+    pub attempt_count: i64,
     pub max_attempts: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_error_code: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_error_message: Option<String>,
+    pub next_run_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub claim_token: Option<String>,
+    pub claim_expires_at: Option<DateTimeWithTimeZone>,
+    pub terminal_committed_at: Option<DateTimeWithTimeZone>,
+    pub completed_at: Option<DateTimeWithTimeZone>,
     pub prepared_at: DateTimeWithTimeZone,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
-    pub next_run_at: Option<DateTimeWithTimeZone>,
+    pub gate_probe_at: i64,
+    pub gate_probe_attempts: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub gate_probe_token: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "turn_id",

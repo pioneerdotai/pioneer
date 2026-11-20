@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "compaction_coverage")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub checkpoint_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub source_scope: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub source_id: String,
     #[sea_orm(column_type = "Text")]
     pub source_version: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub checkpoint_id: String,
     #[sea_orm(
         belongs_to,
         from = "checkpoint_id",

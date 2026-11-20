@@ -7,32 +7,32 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_execution_window")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
-    pub started_at: DateTimeWithTimeZone,
-    pub provider_token_count: i64,
-    #[sea_orm(column_type = "Text")]
-    pub metadata_json: String,
-    #[sea_orm(unique_key = "uidx_turn_execution_window_turn_index")]
-    pub window_index: i64,
-    pub completed_at: Option<DateTimeWithTimeZone>,
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    pub agent_round_count: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub exhaustion_reason: Option<String>,
-    pub tool_call_count: i64,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub thread_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uidx_turn_execution_window_turn_index"
     )]
     pub turn_id: String,
+    #[sea_orm(unique_key = "uidx_turn_execution_window_turn_index")]
+    pub window_index: i64,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub exhaustion_reason: Option<String>,
+    pub agent_round_count: i64,
+    pub tool_call_count: i64,
+    pub provider_token_count: i64,
+    #[sea_orm(column_type = "Text")]
+    pub metadata_json: String,
+    pub started_at: DateTimeWithTimeZone,
+    pub completed_at: Option<DateTimeWithTimeZone>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

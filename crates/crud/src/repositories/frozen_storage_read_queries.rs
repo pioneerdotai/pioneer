@@ -293,7 +293,7 @@ struct DiscardProof {
 
 #[derive(FromQueryResult)]
 struct RootHold {
-    held: i64,
+    held: i32,
 }
 
 // SeaORM 2's Select stores values in its AST and has no rebinding API. Build

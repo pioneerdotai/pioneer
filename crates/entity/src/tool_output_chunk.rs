@@ -9,23 +9,23 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key)]
     pub ordinal: i64,
-    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
-    pub text: Vec<u8>,
-    pub text_original_bytes: i64,
-    pub text_original_chars: i64,
-    pub text_encoding: i16,
+    #[sea_orm(column_type = "Text", unique)]
+    pub id: String,
     #[sea_orm(column_type = "Text")]
     pub turn_id: String,
     #[sea_orm(column_type = "Text")]
     pub item_id: String,
-    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
-    pub text_sha256: Vec<u8>,
-    #[sea_orm(column_type = "Text", unique)]
-    pub id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub metadata: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub stream: Option<String>,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub text: Vec<u8>,
+    pub text_encoding: i16,
+    pub text_original_bytes: i64,
+    pub text_original_chars: i64,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub text_sha256: Vec<u8>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub metadata: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "turn_id",

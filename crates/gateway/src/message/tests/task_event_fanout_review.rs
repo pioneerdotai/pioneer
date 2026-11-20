@@ -226,20 +226,20 @@ async fn competing_small_events(large_size: usize, prior_attempts: i64, restart:
         assert_eq!(summary.errors, 0);
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn oversized_gets_full_quantum_despite_continuous_small_events_and_restart() {
     competing_small_events(BYTES + 4096, 0, true).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn ordinary_full_budget_event_does_not_starve_on_remainder() {
     competing_small_events(BYTES / 2, 0, false).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn budget_deferral_preserves_prior_error_history() {
     competing_small_events(BYTES + 4096, 4, false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn expired_budget_handler_cannot_change_replacement_holder_or_cursor_reset() {
     let (processor, workspace) = fanout_test_processor().await;
     create(&processor, &workspace, "holder-B").await;
@@ -523,7 +523,7 @@ async fn panic_release_preserves_confirmed_prefix_and_dispatcher_continues() {
     panic_candidate_lifecycle(7).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn many_tasks_share_inputs_and_only_one_oversized_event_per_quantum() {
     let (processor, workspace) = fanout_test_processor().await;
     let clock = AtomicI64::new(NOW);

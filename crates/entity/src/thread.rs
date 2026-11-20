@@ -7,46 +7,46 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub origin_kind: String,
-    #[sea_orm(column_type = "Text")]
-    pub model_provider: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub name: Option<String>,
-    pub summary_turn_count: Option<i64>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    pub inbox_workspace_started_at: Option<DateTimeWithTimeZone>,
-    pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub preview: String,
-    pub workspace_unread_started_at: i64,
-    #[sea_orm(column_type = "Text")]
-    pub model: String,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub preview_author_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub summary: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub mode: String,
-    pub inbox_workspace_after_sequence: Option<i64>,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub access_class: String,
-    #[sea_orm(column_type = "Text")]
-    pub sidebar_visibility: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub agent_role: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
     #[sea_orm(column_type = "Text", nullable)]
+    pub name: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub preview: String,
+    #[sea_orm(column_type = "Text")]
+    pub mode: String,
+    #[sea_orm(column_type = "Text")]
+    pub model: String,
+    #[sea_orm(column_type = "Text")]
+    pub model_provider: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text")]
+    pub origin_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub sidebar_visibility: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub agent_nickname: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    pub agent_role: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub summary: Option<String>,
+    pub summary_turn_count: Option<i64>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
     pub created_by_actor_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub access_class: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub preview_author_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub created_by_actor_kind: Option<String>,
+    pub inbox_workspace_after_sequence: Option<i64>,
+    pub inbox_workspace_started_at: Option<DateTimeWithTimeZone>,
+    pub workspace_unread_started_at: i64,
     #[sea_orm(has_many)]
     pub compaction_contexts: HasMany<super::compaction_context::Entity>,
     #[sea_orm(has_many)]

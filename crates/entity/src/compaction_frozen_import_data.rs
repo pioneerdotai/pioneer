@@ -8,27 +8,31 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "compaction_frozen_import_data")]
 pub struct Model {
     #[sea_orm(
-        column_type = "Text",
-        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
-    )]
-    pub source_id: String,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub ordinal: i64,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
-    )]
-    pub source_scope: String,
-    #[sea_orm(
         primary_key,
         auto_increment = false,
         column_type = "Text",
         unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
     )]
     pub manifest_id: String,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub ordinal: i64,
     #[sea_orm(unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key")]
     pub message_ordinal: i64,
-    pub bytes: i64,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
+    )]
+    pub source_scope: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
+    )]
+    pub source_id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
+    )]
+    pub source_version: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
@@ -36,11 +40,7 @@ pub struct Model {
     pub source_thread: String,
     #[sea_orm(column_type = "Text")]
     pub proof_json: String,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
-    )]
-    pub source_version: String,
+    pub bytes: i64,
     #[sea_orm(
         belongs_to,
         from = "manifest_id",

@@ -7,31 +7,31 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "hook_run_attempt")]
 pub struct Model {
-    pub duration_ms: Option<i64>,
-    pub error_retryable: bool,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text", unique_key = "uidx_hook_run_attempt_run_number")]
     pub hook_run_id: String,
-    pub error_safe_for_user: bool,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub error_message_preview: Option<String>,
-    pub started_at: Option<DateTimeWithTimeZone>,
-    pub contribution_count: i64,
-    pub created_at: DateTimeWithTimeZone,
-    pub diagnostic_count: i64,
-    #[sea_orm(column_type = "Text")]
-    pub diagnostic_previews_json: String,
-    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(unique_key = "uidx_hook_run_attempt_run_number")]
     pub attempt_number: i64,
     #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub contribution_count: i64,
+    pub diagnostic_count: i64,
+    #[sea_orm(column_type = "Text")]
     pub contribution_hashes_json: String,
+    #[sea_orm(column_type = "Text")]
+    pub diagnostic_previews_json: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub error_code: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub error_message_preview: Option<String>,
+    pub error_retryable: bool,
+    pub error_safe_for_user: bool,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    pub started_at: Option<DateTimeWithTimeZone>,
     pub completed_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
+    pub duration_ms: Option<i64>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

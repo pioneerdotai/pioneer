@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use migration::{Migrator, MigratorTrait};
-use pioneer_postgres_test::{with_database, with_empty_database};
+use pioneer_postgres_test::{
+    scoped_database, with_database, with_empty_database, with_test_databases,
+};
 use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 
 async fn scalar<T: sea_orm::TryGetable>(
@@ -88,6 +90,49 @@ async fn exhausted_start_candidate_handles_missing_kind_and_nested_nul() -> Resu
                 )
                 .await?,
                 candidate
+            );
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn scoped_fixtures_clone_independently_and_close_after_panic() -> Result<()> {
+    with_database(async |observer| {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let result = tokio::spawn(with_test_databases(async move {
+            let first = scoped_database().await.unwrap();
+            let second = scoped_database().await.unwrap();
+            let reader = first.connect_read_only().await.unwrap();
+            first
+                .connection()
+                .execute_unprepared("INSERT INTO workspace(id,name) VALUES ('scope-check','Test')")
+                .await
+                .unwrap();
+            let query = "SELECT count(*) AS value FROM workspace WHERE id='scope-check'";
+            assert_eq!(scalar::<i64>(&reader, query, []).await.unwrap(), 1);
+            assert_eq!(
+                scalar::<i64>(second.connection(), query, []).await.unwrap(),
+                0
+            );
+            let names = [first.url().path(), second.url().path()]
+                .map(|path| path.trim_start_matches('/').to_owned());
+            send.send((names, reader)).unwrap();
+            panic!("test fixture panic");
+        }))
+        .await;
+        assert!(result.unwrap_err().is_panic());
+        let (names, reader) = receive.await?;
+        assert!(reader.ping().await.is_err());
+        for name in names {
+            assert!(
+                !scalar::<bool>(
+                    observer.connection(),
+                    "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname=$1) AS value",
+                    [name.into()],
+                )
+                .await?
             );
         }
         Ok(())

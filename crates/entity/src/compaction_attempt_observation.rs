@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_attempt_observation")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub attempt: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub operation_id: String,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub attempt: i64,
     pub observation: Json,
     #[sea_orm(
         belongs_to,

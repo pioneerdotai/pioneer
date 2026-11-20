@@ -7,20 +7,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_liveness")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_activity_item_id: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub thread_id: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub turn_id: String,
     #[sea_orm(column_type = "Text")]
-    pub last_activity_kind: String,
-    pub last_activity_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
+    pub thread_id: String,
     pub last_activity_sequence: i64,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub last_activity_kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_activity_item_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub last_activity_item_type: Option<String>,
+    pub last_activity_at: DateTimeWithTimeZone,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

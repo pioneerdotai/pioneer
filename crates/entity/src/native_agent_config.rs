@@ -7,9 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "native_agent_config")]
 pub struct Model {
-    #[sea_orm(column_type = "Text")]
-    pub nickname: String,
-    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uq_native_agent_config_workspace_system_key"
@@ -21,15 +20,16 @@ pub struct Model {
         unique_key = "uq_native_agent_config_workspace_system_key"
     )]
     pub system_key: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub avatar_revision: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub display_name: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub nickname: String,
     pub enabled: bool,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub avatar_revision: Option<String>,
     pub config_revision: i64,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "workspace_id",

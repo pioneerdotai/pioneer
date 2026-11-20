@@ -240,7 +240,7 @@ async fn start_title_user_turn(
     .await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names() {
     for (path, manual, attachment_first) in [
         (TitleCompletion::TerminalOnly, false, false),
@@ -421,7 +421,7 @@ async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names(
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn title_process_exit_recovers_only_after_completion_and_exhausts_its_budget() {
     let thread = "title-process-failure";
     let input = vec![UserInput::Text {
@@ -631,7 +631,7 @@ async fn collaborative_title_recovers_on_hidden_composer_result_delivery_once() 
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn title_recovery_excludes_internal_origins_and_hidden_user_threads() {
     let provider = Arc::new(CaptureSummaryProvider::new("must not generate"));
     let harness =
@@ -701,7 +701,7 @@ async fn title_recovery_excludes_internal_origins_and_hidden_user_threads() {
     assert_eq!(provider.call_count(), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn first_title_user_text_ignores_a_task_occurrence_in_the_same_timestamp_bucket() {
     let harness = setup_phase_13_compaction_harness(test_provider()).await;
     let thread = phase_13_test_thread(

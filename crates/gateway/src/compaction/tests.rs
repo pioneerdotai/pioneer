@@ -423,16 +423,16 @@ async fn raw_layout_publication_preserves_actual_ownership(filtered_empty: bool)
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn raw_interleaved_layout_publishes_without_rewriting_manifest_ordinals() {
     raw_layout_publication_preserves_actual_ownership(false).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn raw_filtered_empty_projection_publishes_with_original_membership() {
     raw_layout_publication_preserves_actual_ownership(true).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn source_creation_order_keeps_child_tool_work_before_later_parent_input() {
     use pioneer_agent::compaction::composition::{AcceptedContextBranch, compose_context};
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef, ProviderToolCall};
@@ -727,7 +727,7 @@ async fn source_creation_order_keeps_child_tool_work_before_later_parent_input()
     assert_eq!(interleaved, expected_interleaved);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn source_creation_order_crosses_mcp_input_copies_between_conversations() {
     use pioneer_protocol::{
         AgentMessagePhase, ItemCompletedNotification, TurnItem, TurnMcpServerCapabilitySummary,
@@ -884,7 +884,7 @@ async fn source_creation_order_crosses_mcp_input_copies_between_conversations() 
     assert_eq!(history, once);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn prepared_history_and_execution_restore_use_source_creation_order() {
     use pioneer_agent::compaction::request::NativeRequestProjection;
 
@@ -1205,7 +1205,7 @@ fn runner_payload_projection_uses_structured_sources_and_preserves_context_verba
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn commentary_phase_reaches_cold_history_and_real_summarizer_input() {
     use pioneer_agent::compaction::request::NativeRequestProjection;
     use pioneer_protocol::{AgentMessagePhase, ItemCompletedNotification, TurnItem};
@@ -1320,7 +1320,7 @@ async fn commentary_phase_reaches_cold_history_and_real_summarizer_input() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn published_summary_stays_frozen_while_uncovered_commentary_uses_new_projection() {
     use pioneer_agent::compaction::controller::NativeContext;
     use pioneer_provider::{ChatMessage, ProviderRegistry};
@@ -1635,7 +1635,7 @@ fn commentary_source_text_keeps_legacy_cursor_representations_exact() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn turn_started_and_edited_payload_projection_matches_history_without_event_envelope() {
     use pioneer_protocol::{PersistedActorRef, SandboxMode, UserInput};
 
@@ -2203,7 +2203,7 @@ fn canonical_agent_message_event_payload(item_id: &str, text: &str) -> String {
     .unwrap()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_source_refresh_checks_unchanged_sources_in_bounded_batches() {
     let f = fixture("short history", vec![], true, false).await;
     for index in 0..24 {
@@ -2263,7 +2263,7 @@ async fn accepted_source_refresh_checks_unchanged_sources_in_bounded_batches() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn completed_history_runner_preserves_its_owner_database_scope() {
     let f = fixture("short history", vec![], true, false).await;
     for (scoped, expected_read, expected_write) in [
@@ -2484,7 +2484,7 @@ fn native_preflight_counts_the_projected_history_that_will_be_sent() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn canonical_command_history_fits_real_foreground_preflight_after_projection() {
     use pioneer_agent::compaction::controller::NativeContext;
     use pioneer_agent::compaction::request::NativeRequestProjection;
@@ -2693,7 +2693,7 @@ async fn canonical_command_history_fits_real_foreground_preflight_after_projecti
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn genuinely_large_command_history_compacts_through_real_foreground_preflight() {
     use pioneer_agent::compaction::controller::NativeContext;
     use pioneer_provider::{ChatMessage, ProviderRegistry};
@@ -2839,7 +2839,7 @@ fn ordinary_active_api_tool_result_is_not_rewritten_by_history_projection() {
     assert_eq!(evaluated.request.messages[1], result);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn runner_keeps_large_compressed_active_payload_while_loading_reference_only_excerpt() {
     let text = "a漢🌍é".repeat(40_000);
     let f = fixture(&text, vec![], true, false).await;
@@ -2959,7 +2959,7 @@ async fn runner_keeps_large_compressed_active_payload_while_loading_reference_on
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn commentary_reference_only_excerpt_uses_the_current_budgeted_projection() {
     let f = fixture("active answer", vec![], true, false).await;
     let payload = serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
@@ -3025,7 +3025,7 @@ async fn commentary_reference_only_excerpt_uses_the_current_budgeted_projection(
     ));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn reference_only_command_event_uses_the_same_deduplicated_projection() {
     for updated in [false, true] {
         let f = fixture("active", vec![], true, false).await;
@@ -3110,7 +3110,7 @@ async fn reference_only_command_event_uses_the_same_deduplicated_projection() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_command_upgrade_is_bound_to_canonical_event_not_message_text() {
     use pioneer_provider::{MessageProvenance, MessageSourceRef};
 
@@ -3407,7 +3407,7 @@ async fn frozen_command_upgrade_is_bound_to_canonical_event_not_message_text() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_frozen_failed_provider_observation_restores_portable_execution_after_hash() {
     use pioneer_provider::{
         CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef,
@@ -3559,7 +3559,7 @@ async fn legacy_frozen_failed_provider_observation_restores_portable_execution_a
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn direct_capture_rejects_excluded_context_before_payload_and_manifest_write() {
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
     let f = fixture("unused", vec![], true, false).await;
@@ -3638,7 +3638,7 @@ async fn direct_capture_rejects_excluded_context_before_payload_and_manifest_wri
     assert_eq!(count().await, before);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn classified_technical_event_does_not_load_its_compressed_payload() {
     let f = fixture("unused", vec![], true, false).await;
     f.store.database_connection().execute_unprepared(
@@ -3676,7 +3676,7 @@ async fn classified_technical_event_does_not_load_its_compressed_payload() {
     assert!(history.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn excluded_context_never_decompresses_its_payload() {
     let f = fixture("visible event", vec![], true, false).await;
     let db = f.store.database_connection();
@@ -3723,7 +3723,7 @@ async fn excluded_context_never_decompresses_its_payload() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn canonical_inputs_and_contexts_release_each_bounded_raw_payload_batch() {
     use pioneer_provider::{
         CanonicalProviderRoundEnvelope, ChatMessage, ProviderCallIdentity, ProviderToolCall,
@@ -3861,13 +3861,15 @@ async fn frozen_recapture_fixture() -> (CrudStore, Vec<pioneer_provider::ChatMes
     // The runner fixture has an unbound legacy plan, which deliberately retains
     // every manifest in its workspace. Capture/GC needs no runner or saved roots.
     super::load_test_catalog();
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-    let store = CrudStore::new(db);
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
+    let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+        reader,
+        fixture.connection().clone(),
+    ));
     let db = store.database_connection();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
@@ -3901,8 +3903,8 @@ async fn frozen_recapture_fixture() -> (CrudStore, Vec<pioneer_provider::ChatMes
         } else {
             format!("source-{index}")
         };
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,?,?,CURRENT_TIMESTAMP)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ($1,'thread','turn',$2,$3,$4::text::json,CURRENT_TIMESTAMP)",
             [id.into(), (index as i64 + 1).into(), canonical.event_type().into(), payload.clone().into()],
         )).await.unwrap();
     }
@@ -3917,7 +3919,7 @@ async fn frozen_recapture_fixture() -> (CrudStore, Vec<pioneer_provider::ChatMes
     (store, messages)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_equivalent_capture_verifies_selected_payloads_once_on_hit_and_miss() {
     let (store, messages) = frozen_recapture_fixture().await;
     let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
@@ -3965,7 +3967,7 @@ async fn frozen_equivalent_capture_verifies_selected_payloads_once_on_hit_and_mi
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_equivalent_capture_rejects_corrupt_stored_references_without_fallback() {
     use sea_orm::TransactionTrait;
 
@@ -4068,7 +4070,7 @@ async fn frozen_equivalent_capture_rejects_corrupt_stored_references_without_fal
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_equivalent_capture_holds_selected_manifest_through_handoff_and_cancellation() {
     async fn sweep(store: &CrudStore) {
         let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
@@ -4319,7 +4321,7 @@ async fn frozen_capture_rejects_foreign_scope_before_legacy_registration() {
 /// Manual end-to-end scenario for the dedicated performance stage. Unlike the
 /// CRUD microbenchmark, this exercises frozen capture, frozen restore and the
 /// real runner. Durations are observations, never test thresholds.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 #[ignore = "manual end-to-end history benchmark; run only in the dedicated benchmark stage"]
 async fn benchmark_frozen_capture_restore_and_compressed_runner() {
     use pioneer_provider::ChatMessage;
@@ -4543,22 +4545,20 @@ async fn fixture_with_canonical_payloads_observer_and_budget(
 ) -> Fixture {
     assert!(!payloads.is_empty());
     super::load_test_catalog();
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-    let store = if let Some(observer) = database_observer {
-        CrudStore::new(
-            pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
-                db.clone(),
-                pioneer_sqlite::SqliteWriteExecutor::with_observer(db, observer.clone()),
-                observer,
-            ),
-        )
-    } else {
-        CrudStore::new(db)
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connection().clone();
+    let reader = fixture.connect_read_only().await.unwrap();
+    let database = match database_observer {
+        Some(observer) => pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            observer,
+        ),
+        None => pioneer_sqlite::SqliteDatabase::new(reader, writer),
     };
+    let store = CrudStore::new(database);
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
@@ -4576,7 +4576,7 @@ async fn fixture_with_canonical_payloads_observer_and_budget(
         } else {
             format!("source-{index}")
         };
-        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,?,?,CURRENT_TIMESTAMP)",[id.into(), i64::try_from(index + 1).unwrap().into(), canonical.event_type().into(), payload.clone().into()])).await.unwrap();
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,"INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ($1,'thread','turn',$2,$3,$4::text::json,CURRENT_TIMESTAMP)",[id.into(), i64::try_from(index + 1).unwrap().into(), canonical.event_type().into(), payload.clone().into()])).await.unwrap();
     }
     let sources = store
         .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
@@ -4745,7 +4745,7 @@ async fn seed_active_manifest_entries(store: &CrudStore, entries: &[ManifestEntr
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn gateway_publishes_completed_summary_after_source_edit_without_retry() {
     let f = fixture("publication source", vec![Reply::Success], true, false).await;
     let mut sleeps = f.clock.subscribe_sleeps();
@@ -4810,7 +4810,7 @@ async fn gateway_publishes_completed_summary_after_source_edit_without_retry() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn gateway_correction_uses_saved_summary_after_source_delete() {
     struct DeleteSourceAfterSummary {
         store: CrudStore,
@@ -4856,7 +4856,7 @@ async fn gateway_correction_uses_saved_summary_after_source_delete() {
     assert!(correction.compact_units.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn gateway_cancellation_still_prevents_publication_of_completed_summary() {
     let f = fixture("publication source", vec![Reply::Success], true, false).await;
     let mut hook =
@@ -4877,7 +4877,7 @@ async fn gateway_cancellation_still_prevents_publication_of_completed_summary() 
     assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn gateway_restart_and_deadline_resume_publish_saved_summary_after_source_delete() {
     for deadline_resume in [false, true] {
         let f = fixture("publication source", vec![Reply::Success], true, false).await;
@@ -4980,7 +4980,7 @@ async fn gateway_restart_and_deadline_resume_publish_saved_summary_after_source_
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn admitted_history_applies_after_real_new_message_materialization() {
     let f = fixture(&"accepted history H ".repeat(4000), vec![], true, false).await;
     let gate = f.provider.pause_next();
@@ -5086,7 +5086,7 @@ async fn wait_backoff(store: &CrudStore) {
     .await
     .unwrap();
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_runner_portions_cover_huge_source_once_and_reuse_committed_result() {
     // Each repetition estimates one token; keep the source larger than several
     // 4096-token requests even before their instructions and summary reserves.
@@ -5185,7 +5185,7 @@ async fn compaction_runner_portions_cover_huge_source_once_and_reuse_committed_r
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_runner_sends_projected_command_event_and_preserves_canonical_payload() {
     for updated in [false, true] {
         let unique = "runner-command-output ".repeat(4_000);
@@ -5269,7 +5269,7 @@ async fn compaction_runner_sends_projected_command_event_and_preserves_canonical
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_runner_durably_finishes_legacy_cursor_before_projecting_next_source() {
     let first_unique = "legacy-cursor-output ".repeat(100);
     let second_unique = "projected-next-source-output ".repeat(4_000);
@@ -5515,7 +5515,7 @@ async fn compaction_runner_durably_finishes_legacy_cursor_before_projecting_next
         second_raw
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_retry_jitter_is_bounded_durable_and_respects_retry_after() {
     let f = fixture("small", vec![], true, false).await;
     let state = f
@@ -5560,7 +5560,7 @@ async fn compaction_retry_jitter_is_bounded_durable_and_respects_retry_after() {
     ));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_runner_retry_after_and_stop_keep_durable_limits() {
     let f = fixture("small", vec![Reply::Transient, Reply::Success], true, false).await;
     let task = tokio::spawn({
@@ -5610,7 +5610,7 @@ async fn compaction_runner_retry_after_and_stop_keep_durable_limits() {
     );
     assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_runner_attempt_and_operation_deadlines_drop_transport() {
     let f = fixture(
         "small",
@@ -5646,7 +5646,7 @@ async fn compaction_runner_attempt_and_operation_deadlines_drop_transport() {
         f.runner.snapshot.admission.deadline_ms
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_runner_corrects_once_and_failed_fingerprint_does_not_regenerate() {
     let f = fixture("small", vec![], false, false).await;
     assert_eq!(
@@ -5662,7 +5662,7 @@ async fn compaction_runner_corrects_once_and_failed_fingerprint_does_not_regener
     assert_eq!(f.provider.calls.lock().unwrap().len(), 2);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn admission_resumes_exact_plan_without_resetting_deadline() {
     let f = fixture("source", vec![], true, false).await;
     let entries = f
@@ -5813,7 +5813,7 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
     assert_eq!(*f.provider.count.borrow(), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn admission_and_runner_remove_technical_compact_and_reference_only_payloads_before_provider()
 {
     let f = fixture("meaningful compact material", vec![], true, false).await;
@@ -5999,7 +5999,7 @@ async fn admission_and_runner_remove_technical_compact_and_reference_only_payloa
     assert_eq!(*f.provider.count.borrow(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn control_reconciliation_preserves_applied_result_after_deadline_and_stop() {
     let f = fixture("source", vec![], true, false).await;
     let applied = f.runner.run(CancellationToken::new()).await.unwrap();
@@ -6041,7 +6041,7 @@ async fn control_reconciliation_preserves_applied_result_after_deadline_and_stop
     assert_eq!(*f.provider.count.borrow(), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn saved_candidate_survives_restart_without_regenerating() {
     struct PausedTarget(tokio::sync::Notify);
     #[async_trait]
@@ -6085,7 +6085,7 @@ async fn saved_candidate_survives_restart_without_regenerating() {
     assert_eq!(*f.provider.count.borrow(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_service_sources_resume_with_cursor_and_reference_material() {
     use pioneer_crud::CanonicalTurnEventPayload as Event;
     use pioneer_protocol::{
@@ -6421,7 +6421,7 @@ async fn accepted_service_sources_resume_with_cursor_and_reference_material() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget() {
     let f = fixture_with_canonical_payloads(
         vec![
@@ -6540,7 +6540,7 @@ async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget()
     assert!(failed.estimated_input_tokens > 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn later_admission_resumes_deadline_progress_without_replaying_saved_portions() {
     for case in ["saved", "legacy", "edited", "stop"] {
         let f = fixture(
@@ -6745,7 +6745,7 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_target_rechecks_complete_request_before_checkpoint_publication() {
     use pioneer_agent::compaction::request::NativeRequestProjection;
     use pioneer_provider::{ChatMessage, CompiledPromptPayload};
@@ -6798,7 +6798,7 @@ async fn native_target_rechecks_complete_request_before_checkpoint_publication()
     assert!(f.store.compaction_head("owner").await.unwrap().is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_small_window_reduces_saved_tool_text_without_losing_call_or_original() {
     use pioneer_agent::compaction::request::NativeRequestProjection;
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef, ProviderToolCall};
@@ -6915,7 +6915,7 @@ async fn compaction_small_window_reduces_saved_tool_text_without_losing_call_or_
     assert_eq!(*f.provider.count.borrow(), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn pending_runtime_origins_resolve_versions_with_scope_and_whole_round_identity() {
     use pioneer_agent::compaction::history::{
         NativeHistoryLayout, PendingOriginKind, pending_origin,
@@ -7182,7 +7182,7 @@ async fn pending_runtime_origins_resolve_versions_with_scope_and_whole_round_ide
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn interrupted_execution_turn_fences_summary_commit_before_service_cancellation() {
     struct Paused(tokio::sync::Notify);
     #[async_trait]
@@ -7244,7 +7244,7 @@ async fn interrupted_execution_turn_fences_summary_commit_before_service_cancell
     assert_eq!(*f.provider.count.borrow(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_message_delivery_evidence_includes_historical_checkpoint_coverage() {
     let f = fixture("covered Message history", vec![], true, false).await;
     let CompactionExit::Applied(head) = f.runner.run(CancellationToken::new()).await.unwrap()
@@ -7277,7 +7277,7 @@ async fn cli_message_delivery_evidence_includes_historical_checkpoint_coverage()
     assert!(!turns.contains(&("thread".into(), "later-unsent-message".into())));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn expected_head_does_not_force_a_projection_basis_after_historical_edit() {
     let f = fixture("old source", vec![], true, false).await;
     let CompactionExit::Applied(head) = f.runner.run(CancellationToken::new()).await.unwrap()
@@ -7414,7 +7414,7 @@ impl Provider for SmallWindowMain {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_discovers_working_context_head_published_after_inherited_snapshot() {
     use pioneer_agent::compaction::controller::NativeContext;
     use pioneer_crud::compaction::{
@@ -10253,12 +10253,12 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_generation() {
     native_preparation_with_context_cap(false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_selected_cap_compacts_fitting_request_and_freezes_summary_admission() {
     native_preparation_with_context_cap(true).await;
 }
@@ -10976,7 +10976,7 @@ async fn native_preparation_with_context_cap(selected_cap: bool) {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn prepared_graph_keeps_published_roots_after_historical_edit_and_delete() {
     let f = fixture("current leaf", vec![], true, false).await;
     f.store.database_connection().execute_unprepared(
@@ -11306,7 +11306,7 @@ async fn prepared_graph_keeps_published_roots_after_historical_edit_and_delete()
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_empty_task_policy_never_reads_unselected_parent_payload() {
     // Empty/Custom context must not materialize a malformed unselected parent.
     let f = fixture("unparseable unselected parent payload", vec![], true, false).await;
@@ -11349,7 +11349,7 @@ async fn compaction_empty_task_policy_never_reads_unselected_parent_payload() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn prepared_empty_manifest_keeps_only_manifest_scopes_and_epochs() {
     let f = fixture("unused", vec![], true, false).await;
     let build_scopes = std::collections::BTreeSet::from([
@@ -11390,7 +11390,7 @@ async fn prepared_empty_manifest_keeps_only_manifest_scopes_and_epochs() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_prepared_history_keeps_captured_epoch_until_admission() {
     use pioneer_agent::compaction::controller::NativeContext;
     use pioneer_protocol::{PersistedActorRef, SandboxMode, UserInput};
@@ -11622,7 +11622,7 @@ async fn native_prepared_history_keeps_captured_epoch_until_admission() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
     use pioneer_crud::NewTurnLlmContextEntry;
     use pioneer_protocol::{
@@ -12116,7 +12116,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
     assert!(f.provider.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_deletion() {
     use pioneer_crud::NewTurnLlmContextEntry;
     use pioneer_protocol::{
@@ -12851,7 +12851,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
     assert!(second_assistant_position < second_tool_position);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn execution_restore_normalizes_covering_and_partial_checkpoint_replacements() {
     use pioneer_provider::ChatMessage;
 
@@ -13417,7 +13417,7 @@ async fn execution_restore_normalizes_covering_and_partial_checkpoint_replacemen
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
     use pioneer_provider::ChatMessage;
@@ -14302,7 +14302,7 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_media_preparation_materializes_full_request_without_main_provider_call() {
     use base64::Engine;
     use pioneer_agent::compaction::controller::NativeContext;
@@ -14403,7 +14403,7 @@ async fn native_media_preparation_materializes_full_request_without_main_provide
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn internal_capsule_lineage_is_not_a_task_history_boundary() {
     let f = fixture("root must not be inherited", vec![], true, false).await;
     let db = f.store.database_connection();
@@ -14490,12 +14490,12 @@ async fn internal_capsule_lineage_is_not_a_task_history_boundary() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn nested_conversation_uses_bounded_history_without_rewriting_task_input() {
     check_nested_task_basis(false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_task_input_replay_is_distinct_from_new_bounded_conversation() {
     check_nested_task_basis(true).await;
 }
@@ -15061,7 +15061,7 @@ async fn check_nested_task_basis(legacy: bool) {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
     use pioneer_provider::ChatMessage;
     use sha2::{Digest, Sha256};
@@ -15306,7 +15306,7 @@ async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_frozen_empty_agent_message_authenticates_wire_then_disappears_from_model_history() {
     use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
     use pioneer_provider::ChatMessage;
@@ -15416,7 +15416,7 @@ async fn legacy_frozen_empty_agent_message_authenticates_wire_then_disappears_fr
     assert_eq!(descriptor.messages, 1, "the source ordinal remains frozen");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_commentary_authenticates_old_wire_before_execution_upgrade() {
     use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
     use pioneer_protocol::AgentMessagePhase;
@@ -15525,7 +15525,7 @@ async fn frozen_commentary_authenticates_old_wire_before_execution_upgrade() {
     assert_eq!(execution.messages[0].reasoning_content, None);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_compatible_input_overlap_keeps_exact_steering_rows_once() {
     let f = fixture("unused seed", vec![], true, false).await;
     let db = f.store.database_connection();
@@ -15612,7 +15612,7 @@ async fn compaction_compatible_input_overlap_keeps_exact_steering_rows_once() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn exact_task_grants_survive_summary_projection_independently_of_new_conversation() {
     use pioneer_agent::compaction::composition::ScopedHistorySource;
     use pioneer_compaction::runner::{RunnerState, SourceCursor};
@@ -16980,7 +16980,7 @@ async fn publish_projection_checkpoint(
 
 /// A terminal output exports OWN only. Its late mixed head becomes usable
 /// only after the recipient composes that output with the accepted parent H.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
     use pioneer_compaction::CoverageDomain;
     use pioneer_protocol::{TaskAgentContextMode, TaskAgentContextPolicy};
@@ -18230,7 +18230,7 @@ async fn contained_checkpoint_fixture(
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_checkpoint_projection_deduplicates_nested_summaries_in_both_owner_orders() {
     for b_thread in ["aaa-b-first", "zzz-b-last"] {
         let scenario = contained_checkpoint_fixture(
@@ -18320,7 +18320,7 @@ async fn accepted_checkpoint_projection_deduplicates_nested_summaries_in_both_ow
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn nested_checkpoint_dedup_keeps_hidden_boundary_ordinal_in_both_owner_orders() {
     for b_thread in ["aaa-hidden-b-first", "zzz-hidden-b-last"] {
         let scenario = contained_checkpoint_fixture(
@@ -18384,7 +18384,7 @@ async fn nested_checkpoint_dedup_keeps_hidden_boundary_ordinal_in_both_owner_ord
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_working_context_projection_deduplicates_nested_summaries_in_both_owner_orders() {
     for b_thread in ["aaa-working-b-first", "zzz-working-b-last"] {
         let scenario = contained_checkpoint_fixture(
@@ -18445,7 +18445,7 @@ async fn accepted_working_context_projection_deduplicates_nested_summaries_in_bo
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_frozen_restore_prefers_contained_working_checkpoint_with_equal_leaves() {
     for child in ["aaa-equal-child", "zzz-equal-child"] {
         let f = fixture("A source", vec![], true, false).await;
@@ -18549,7 +18549,7 @@ async fn accepted_frozen_restore_prefers_contained_working_checkpoint_with_equal
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_frozen_restore_applies_working_checkpoint_containing_inherited_own_summary() {
     let f = fixture("A source", vec![], true, false).await;
     let a_leaf = f
@@ -18777,7 +18777,7 @@ async fn accepted_frozen_restore_applies_working_checkpoint_containing_inherited
     }));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_checkpoint_projection_keeps_partial_and_independent_summaries() {
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
 
@@ -18885,7 +18885,7 @@ async fn accepted_checkpoint_projection_keeps_partial_and_independent_summaries(
     assert_eq!(scenario.initial.last().unwrap().content, "uncovered tail");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn absorbed_checkpoint_still_requires_its_exact_saved_revision() {
     let scenario = contained_checkpoint_fixture(
         "aaa-b-first",
@@ -18978,7 +18978,7 @@ async fn absorbed_checkpoint_still_requires_its_exact_saved_revision() {
     assert_eq!(error.to_string(), "checkpoint source revision changed");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_covering_h() {
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
     use std::collections::BTreeSet;
@@ -19192,7 +19192,7 @@ async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_coverin
     assert_eq!(after_historical_edit, projected);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_reuses_completed_child_head_after_immutable_raw_output_capture() {
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
     use std::collections::BTreeSet;
@@ -19581,7 +19581,7 @@ impl Summarizer for CleanupGateSummarizer {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn service_cleanup_precedes_publication_backoff_and_stop_reconciliation() {
     for scenario in 0..5 {
         let mut f = fixture(
@@ -19659,7 +19659,7 @@ async fn service_cleanup_precedes_publication_backoff_and_stop_reconciliation() 
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn canonical_attachment_metadata_keeps_all_recorded_versions_without_repeating_user_text() {
     use pioneer_protocol::{
         ArtifactKind, ArtifactRef, ArtifactStatus, ItemCompletedNotification, TurnItem,
@@ -19746,7 +19746,7 @@ async fn canonical_attachment_metadata_keeps_all_recorded_versions_without_repea
     assert_eq!(f.provider.count.borrow().clone(), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn persisted_non_artifact_media_remains_typed_through_capture_and_restore() {
     use pioneer_protocol::{
         ArtifactKind, ArtifactRef, ArtifactStatus, ItemCompletedNotification, McpScopeKind,
@@ -20039,7 +20039,7 @@ async fn persisted_non_artifact_media_remains_typed_through_capture_and_restore(
     assert!(legacy_array.direct_sources.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn covered_input_rows_keep_their_mixed_ui_copy_suppressed_across_frozen_roundtrips() {
     use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
     use pioneer_protocol::{
@@ -20662,7 +20662,7 @@ async fn covered_input_rows_keep_their_mixed_ui_copy_suppressed_across_frozen_ro
     }));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn covered_event_input_still_suppresses_its_uncovered_mixed_ui_copy() {
     use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
     use pioneer_protocol::{
@@ -21382,7 +21382,7 @@ async fn covered_event_input_still_suppresses_its_uncovered_mixed_ui_copy() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn message_mutations_suppress_stale_event_copies_without_live_inputs_on_cold_and_warm_reads()
 {
     use pioneer_protocol::{
@@ -21524,7 +21524,7 @@ async fn message_mutations_suppress_stale_event_copies_without_live_inputs_on_co
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn foreground_and_background_token_preflight_share_filtered_meaningful_reasoning_history() {
     let f = fixture("unused", vec![], true, false).await;
     let db = f.store.database_connection();
@@ -21700,7 +21700,7 @@ async fn foreground_and_background_token_preflight_share_filtered_meaningful_rea
     assert_eq!(f.provider.calls.lock().unwrap().len(), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn old_thread_summary_is_ignored_without_originals() {
     let f = fixture("unused", vec![], true, false).await;
     f.store
@@ -21715,7 +21715,7 @@ async fn old_thread_summary_is_ignored_without_originals() {
     assert_eq!(f.provider.count.borrow().clone(), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn old_thread_summary_is_ignored_with_available_originals() {
     let f = fixture("unused", vec![], true, false).await;
     f.store
@@ -21802,7 +21802,7 @@ async fn stopped_compaction_item_is_cancelled_with_the_same_lifecycle_identity()
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_history_is_prepared_before_freezing_a_new_execution_basis() {
     use pioneer_protocol::TurnItem;
     let f = fixture("unused", vec![], true, false).await;
@@ -22249,7 +22249,7 @@ impl Summarizer for RejectedService {
         })
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_failed_attempt_retains_diagnostic_across_restart_and_lifecycle() {
     let mut f = fixture("history", vec![], true, false).await;
     let rejected = Arc::new(RejectedService(f.runner.summarizer.clone()));
@@ -22307,7 +22307,7 @@ impl CompactionTarget for StaleCommitTarget {
         Ok(true)
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_commit_failure_does_not_mislabel_successful_provider_attempt() {
     let mut f = fixture("completed history", vec![Reply::Success], true, false).await;
     Arc::get_mut(&mut f.runner).unwrap().target = Arc::new(StaleCommitTarget(f.store.clone()));
@@ -22331,7 +22331,7 @@ async fn compaction_commit_failure_does_not_mislabel_successful_provider_attempt
     assert_eq!(f.store.compaction_head("owner").await.unwrap(), None);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn completed_task_output_excludes_later_turns_before_decoding_and_survives_compression() {
     let f = fixture("unused", vec![], true, false).await;
     let store = f.store.with_maintenance_access();
@@ -22409,7 +22409,7 @@ async fn completed_task_output_excludes_later_turns_before_decoding_and_survives
     assert!(f.provider.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn new_task_output_ignores_cleanup_context_before_payload_and_aliases() {
     use pioneer_provider::{
         CanonicalProviderRoundEnvelope, ChatMessage, ProviderCallIdentity, ProviderToolCall,
@@ -22598,7 +22598,7 @@ async fn new_task_output_ignores_cleanup_context_before_payload_and_aliases() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn conversation_policy_keeps_own_child_turn_after_bounded_ancestors() {
     let f = fixture("unused", vec![], true, false).await;
     for sql in [
@@ -22817,7 +22817,7 @@ async fn conversation_policy_keeps_own_child_turn_after_bounded_ancestors() {
     assert!(f.provider.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs() {
     use pioneer_provider::MessageSourceAlias;
 
@@ -23937,7 +23937,7 @@ async fn prepare_task_input_checkpoint_runner(
     initial
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distinct_inputs() {
     use pioneer_provider::{ProviderRegistry, Role};
 
@@ -28377,7 +28377,7 @@ fn native_budget_measures_portable_reasoning_and_not_incompatible_replay() {
     assert!(canonical.provider_replay_state.is_some());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn foreground_native_projection_reuses_one_owner_across_model_windows() {
     use pioneer_agent::compaction::controller::NativeContext;
     use pioneer_provider::{
@@ -28581,7 +28581,7 @@ async fn foreground_native_projection_reuses_one_owner_across_model_windows() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_context_cursor_finishes_old_text_before_portable_next_source() {
     use pioneer_provider::{
         CanonicalProviderRoundEnvelope, ChatMessage, ProviderReplayState, ProviderTermination,
@@ -28906,7 +28906,7 @@ fn source_projection_version_switches_only_at_a_source_boundary() {
     assert_eq!(source_text_projection_for_cursor(&state, &command), 4);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn partially_read_portable_context_survives_checkpoint_and_restart() {
     use pioneer_provider::{
         CanonicalProviderRoundEnvelope, ChatMessage, ProviderReplayState, ProviderTermination,
@@ -29124,7 +29124,7 @@ async fn partially_read_portable_context_survives_checkpoint_and_restart() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn partially_read_commentary_source_restarts_with_v4_text_and_exact_coverage() {
     let body = format!("checking result {}", "detail ".repeat(10_000));
     let raw = serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
@@ -29284,7 +29284,7 @@ async fn partially_read_commentary_source_restarts_with_v4_text_and_exact_covera
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn runner_projects_provider_reasoning_for_compact_and_reference_only_without_rewriting_source()
  {
     use pioneer_provider::{
@@ -29409,7 +29409,7 @@ async fn runner_projects_provider_reasoning_for_compact_and_reference_only_witho
     assert_eq!(stored, compact_payload);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn alternating_source_projections_share_one_summarizer_request() {
     use pioneer_provider::{CanonicalProviderRoundEnvelope, ChatMessage, ProviderTermination};
     let f = fixture("event fact", vec![], true, false).await;
@@ -29542,7 +29542,7 @@ async fn alternating_source_projections_share_one_summarizer_request() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_task_basis_compact_and_reference_use_portable_source_text() {
     use pioneer_provider::{ChatMessage, ProviderReplayState};
 
@@ -29914,7 +29914,7 @@ fn service_events_leave_current_summarizer_material() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cold_history_rechecks_old_cached_service_classification() {
     let event = |item| {
         serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
@@ -29966,7 +29966,7 @@ async fn cold_history_rechecks_old_cached_service_classification() {
     assert_eq!(kind, "technical");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn new_admission_omits_service_sources_from_compact_and_reference_only() {
     let event = |item| {
         serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
@@ -30069,7 +30069,7 @@ async fn new_admission_omits_service_sources_from_compact_and_reference_only() {
     assert_eq!(reference[0].ordinal, 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_service_event_authenticates_old_wire_before_execution_omits_it() {
     use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
     use pioneer_provider::ChatMessage;
@@ -30342,7 +30342,7 @@ async fn frozen_service_event_authenticates_old_wire_before_execution_omits_it()
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn published_checkpoint_keeps_coverage_of_newly_hidden_service_event() {
     let f = fixture("meaningful source", vec![], true, false).await;
     let event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(

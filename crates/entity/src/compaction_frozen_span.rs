@@ -7,17 +7,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_span")]
 pub struct Model {
-    #[sea_orm(unique)]
-    pub insertion_ordinal: i64,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub kind: i64,
-    #[sea_orm(column_type = "Text")]
-    pub source_manifest: String,
-    pub end: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub manifest_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
+    pub kind: i64,
+    #[sea_orm(primary_key, auto_increment = false)]
     pub start: i64,
+    pub end: i64,
+    #[sea_orm(column_type = "Text")]
+    pub source_manifest: String,
+    #[sea_orm(unique)]
+    pub insertion_ordinal: i64,
     #[sea_orm(
         belongs_to,
         relation_enum = "CompactionFrozenHistory2",

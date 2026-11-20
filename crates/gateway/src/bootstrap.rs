@@ -57,8 +57,6 @@ pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
             "prepared finalization bootstrap had failures; durable intents retained for runtime retry"
         );
     }
-    let reconciled_recovery_terminalizations =
-        reconcile_recovery_terminalization_outbox(&connection).await?;
     let repaired_completed_turn_rows =
         repair_turns_completed_after_final_agent_message(&connection).await?;
     let repaired_thread_foreground_status_rows =
@@ -84,7 +82,6 @@ pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
             turn_finalization_reconciliation.deferred_by_predecessor,
         superseded_prepared_turn_finalizations =
             turn_finalization_reconciliation.superseded_by_terminal_status,
-        reconciled_recovery_terminalizations,
         repaired_completed_turn_rows,
         repaired_thread_foreground_status_rows,
         repaired_terminal_execution_window_rows,
@@ -177,19 +174,6 @@ async fn repair_patch_history_turn(
         false,
     );
     projection_store.repair_live(&state).await
-}
-
-async fn reconcile_recovery_terminalization_outbox(
-    connection: impl Into<SqliteDatabase>,
-) -> Result<u64> {
-    let store = pioneer_crud::CrudStore::new(connection);
-    store
-        .enqueue_missing_recovery_terminalizations(
-            4096,
-            chrono::Utc::now().fixed_offset().timestamp(),
-        )
-        .await
-        .context("failed to reconcile terminal recovery jobs during bootstrap")
 }
 
 async fn reconcile_prepared_turn_finalizations(

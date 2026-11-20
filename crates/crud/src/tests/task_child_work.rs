@@ -256,9 +256,7 @@ mod child_queue_pass_regressions {
     async fn invalidation_behind_cursor_and_above_upper_finishes_current_pass_before_rescan() {
         pioneer_postgres_test::with_database(async |fixture| {
             let store = postgres_store_with_workspace(fixture, "ws_task").await;
-            pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-                .await
-                .unwrap();
+
             // Historical FK-disabled metadata can be orphaned. Seed must carry its
             // locators without interpreting that as destructive domain authority.
             for n in 0..40 {

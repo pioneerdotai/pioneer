@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "execution_tariff")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub content_hash: String,
-    pub captured_at_ms: i64,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub content_hash: String,
     #[sea_orm(column_type = "Text")]
     pub evidence_json: String,
+    pub captured_at_ms: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

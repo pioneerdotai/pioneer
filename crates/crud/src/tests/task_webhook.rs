@@ -318,7 +318,7 @@ async fn webhook_admission_inherits_request_and_maintenance_classes_with_query_o
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn webhook_occurrence_failure_rolls_back_payload_events_projection_and_fanout() {
     let store = test_store_with_workspace("ws_task").await;
     let (task, trigger) = webhook_fixture(&store).await;
@@ -328,7 +328,7 @@ async fn webhook_occurrence_failure_rolls_back_payload_events_projection_and_fan
         .one(&store.connection)
         .await
         .unwrap();
-    store.connection.execute_unprepared("CREATE TRIGGER webhook_occurrence_failure BEFORE INSERT ON task_occurrence_contract BEGIN SELECT RAISE(ABORT, 'reject webhook occurrence'); END").await.unwrap();
+    store.connection.execute_unprepared("CREATE FUNCTION webhook_occurrence_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject webhook occurrence'; END; $$; CREATE TRIGGER webhook_occurrence_failure BEFORE INSERT ON task_occurrence_contract FOR EACH ROW EXECUTE FUNCTION webhook_occurrence_failure()").await.unwrap();
     assert!(
         store
             .accept_task_webhook(&task, &trigger, &run, occurrence.clone(), events.clone())
@@ -357,7 +357,7 @@ async fn webhook_occurrence_failure_rolls_back_payload_events_projection_and_fan
     );
     store
         .connection
-        .execute_unprepared("DROP TRIGGER webhook_occurrence_failure")
+        .execute_unprepared("DROP TRIGGER webhook_occurrence_failure ON task_occurrence_contract")
         .await
         .unwrap();
     assert!(
@@ -378,7 +378,7 @@ async fn webhook_occurrence_failure_rolls_back_payload_events_projection_and_fan
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn webhook_stale_snapshot_rechecks_pause_cancel_and_finish_before_any_write() {
     for operation in ["pause", "cancel", "finish"] {
         let store = test_store_with_workspace("ws_task").await;
@@ -538,7 +538,7 @@ async fn cancelled_webhook_waiter_releases_writer_queue_and_can_be_admitted_agai
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn webhook_migration_replay_preserves_saved_input_and_trigger_reference() {
     let store = test_store_with_workspace("ws_task").await;
     let (task, trigger) = webhook_fixture(&store).await;

@@ -7,35 +7,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "invitation")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub revoke_reason: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub accepted_device_id: Option<String>,
-    pub updated_at: DateTimeWithTimeZone,
-    pub expired_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text")]
-    pub gateway_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub accepted_principal_id: Option<String>,
-    pub revoked_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(column_type = "Text")]
-    pub target_role_key: String,
-    #[sea_orm(column_type = "Text")]
-    pub created_by_session_id: String,
-    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub accepted_session_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub gateway_id: String,
     #[sea_orm(column_type = "Text")]
     pub created_by_principal_id: String,
-    pub token_format_version: i64,
-    pub accepted_at: Option<DateTimeWithTimeZone>,
-    pub expires_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub created_by_session_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
     #[sea_orm(column_type = "VarBinary(StringLen::None)", nullable, unique)]
     pub token_hash: Option<Vec<u8>>,
+    pub token_format_version: i64,
+    pub expires_at: DateTimeWithTimeZone,
+    pub accepted_at: Option<DateTimeWithTimeZone>,
+    pub revoked_at: Option<DateTimeWithTimeZone>,
+    pub expired_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub accepted_principal_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub accepted_device_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub accepted_session_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub revoke_reason: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub target_role_key: String,
     #[sea_orm(
         belongs_to,
         relation_enum = "AuthSession2",

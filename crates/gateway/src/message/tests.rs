@@ -1684,80 +1684,84 @@ fn fixture_skill_lifecycle_audit(
 #[test]
 fn plugin_turn_normalization_keeps_parent_and_rejects_raw_owned_skill() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let harness = setup_cli_runtime_security_harness(None).await;
-        let parent_id = "P".repeat(21);
-        let fixture = unique_temp_dir("plugin-normalization");
-        let package = fixture.join("package");
-        let member = package.join("skills/bundled");
-        std::fs::create_dir_all(&member).unwrap();
-        std::fs::write(member.join("SKILL.md"), "---\nname: bundled\ndescription: Bundled regression skill\n---\nInstructions\n").unwrap();
-        let now = chrono::Utc::now().fixed_offset();
-        harness.crud_store.insert_plugin_installation(&pioneer_crud::PackageRecord {
-            kind: pioneer_crud::PackageKind::Plugin,
-            app_manifest_json: None,
-            app_localizations_json: None,
-                operation_error_json: None,
-            id: parent_id.clone(), workspace_id: harness.workspace_id.clone(), name: "authoritative-name".into(), version: None, source_upload_id: "upload-plugin".into(), package_path: package.to_string_lossy().into(), data_path: fixture.join("data").to_string_lossy().into(), package_fingerprint: "tree".into(), enabled: true, allow_implicit_invocation: false, state: "installing".into(), revision: 1,
-        display_name: None,
-        short_description: None,
-        description: None,
-        long_description: None,
-        developer_name: None,
-        author_name: None,
-        author_email: None,
-        author_url: None,
-        homepage: None,
-        repository: None,
-        documentation_url: None,
-        support_url: None,
-        privacy_policy_url: None,
-        terms_of_service_url: None,
-        license: None,
-        category: None,
-        brand_color: None,
-        logo_path: None,
-        logo_revision: None,
-        composer_icon_path: None,
-        composer_icon_revision: None, pending_json: None, last_error: None, created_at: now, updated_at: now,
-        }).await.unwrap();
-        let selected = pioneer_protocol::TurnCapability { id: pioneer_protocol::plugin_capability_key(&parent_id), label: Some("untrusted-label".into()), kind: pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id.clone(), expected_revision: 1 } };
-        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.is_err());
-        let skill_id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
-        let child = pioneer_crud::SkillInstallationRecord { skill_id: skill_id.clone(), owner: None, slug: "bundled".into(), version: None, source_kind: "user".into(), scope_key: harness.workspace_id.clone(), source_ref: "plugin".into(), install_path: member.to_string_lossy().into(), trust_level: "community".into(), fingerprint: "member".into(), updated_at_unix: 1, pack_id: None, pack_member_key: None };
-        let policy = pioneer_crud::WorkspaceSkillPolicyRecord { id: "policy-plugin".into(), workspace_id: harness.workspace_id.clone(), skill_id: skill_id.clone(), enabled: Some(true), allow_implicit_invocation: Some(false) };
-        harness.crud_store.install_skill_lifecycle_with_ownership(&child, &policy, &[fixture_skill_lifecycle_audit(&skill_id, "bundled", "install", 1)], None, Some(&pioneer_crud::PluginOwnershipWrite { kind:pioneer_protocol::PackageKind::Plugin, plugin_id: parent_id.clone(), expected_revision: 1, member_key: "bundled".into(), member_path: Some("skills/bundled".into()), package_fingerprint: "member".into(), child_id: skill_id.to_string() }), 1).await.unwrap();
-        harness.crud_store.settle_plugin_installation(&parent_id, 1, "installed", None).await.unwrap();
-        let result = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
-        assert_eq!(result.presentation.len(), 1);
-        assert_eq!(result.presentation[0].label.as_deref(), Some("authoritative-name"));
-        assert!(matches!(result.presentation[0].kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }));
-        assert_eq!(result.execution.len(), 1);
-        assert!(matches!(&result.execution[0].kind, pioneer_protocol::TurnCapabilityKind::Skill { skill_id: id, .. } if id == &skill_id));
-        assert_eq!(result.plugin_selection.unwrap().children[0].id, skill_id.to_string());
-        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &result.execution).await.is_err());
-        let mut stale = selected.clone(); stale.kind = pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id.clone(), expected_revision: 2 };
-        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[stale]).await.is_err());
-        let mut disabled = policy.clone(); disabled.enabled = Some(false);
-        let gate=harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&parent_id,1,"updating",true,"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":false}").await.unwrap();
-        harness.crud_store.upsert_workspace_skill_policy_with_plugin_change(&disabled,Some(&pioneer_crud::PluginNativeWrite {
-            kind: pioneer_protocol::PackageKind::Plugin,
-            plugin_id:parent_id.clone(),expected_revision:gate.revision,member_key:"bundled".into(),child_id:skill_id.to_string(),override_fields_json:"[\"enabled\"]".into(),
-            pending_after:"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":true}".into()
-        }),2).await.unwrap();
-        harness.crud_store.finish_plugin_mutation(&parent_id,gate.revision,"installed",None).await.unwrap();
-        let mut selected=selected; selected.kind=pioneer_protocol::TurnCapabilityKind::Plugin{plugin_id:parent_id,expected_revision:gate.revision};
-        let excluded = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
-        assert_eq!(excluded.presentation.len(), 1);
-        assert!(excluded.execution.is_empty());
-        assert_eq!(excluded.plugin_selection.unwrap().children.len(), 1, "structural candidate identity is retained until native preparation commits");
-        assert!(harness.processor.normalize_turn_skill_capabilities("foreign", &[selected]).await.is_err());
-        std::fs::remove_dir_all(fixture).unwrap();
-    });
+         pioneer_postgres_test::with_test_databases(async {
+            let harness = setup_cli_runtime_security_harness(None).await;
+            let parent_id = "P".repeat(21);
+            let fixture = unique_temp_dir("plugin-normalization");
+            let package = fixture.join("package");
+            let member = package.join("skills/bundled");
+            std::fs::create_dir_all(&member).unwrap();
+            std::fs::write(member.join("SKILL.md"), "---\nname: bundled\ndescription: Bundled regression skill\n---\nInstructions\n").unwrap();
+            let now = chrono::Utc::now().fixed_offset();
+            harness.crud_store.insert_plugin_installation(&pioneer_crud::PackageRecord {
+                kind: pioneer_crud::PackageKind::Plugin,
+                app_manifest_json: None,
+                app_localizations_json: None,
+                    operation_error_json: None,
+                id: parent_id.clone(), workspace_id: harness.workspace_id.clone(), name: "authoritative-name".into(), version: None, source_upload_id: "upload-plugin".into(), package_path: package.to_string_lossy().into(), data_path: fixture.join("data").to_string_lossy().into(), package_fingerprint: "tree".into(), enabled: true, allow_implicit_invocation: false, state: "installing".into(), revision: 1,
+            display_name: None,
+            short_description: None,
+            description: None,
+            long_description: None,
+            developer_name: None,
+            author_name: None,
+            author_email: None,
+            author_url: None,
+            homepage: None,
+            repository: None,
+            documentation_url: None,
+            support_url: None,
+            privacy_policy_url: None,
+            terms_of_service_url: None,
+            license: None,
+            category: None,
+            brand_color: None,
+            logo_path: None,
+            logo_revision: None,
+            composer_icon_path: None,
+            composer_icon_revision: None, pending_json: None, last_error: None, created_at: now, updated_at: now,
+            }).await.unwrap();
+            let selected = pioneer_protocol::TurnCapability { id: pioneer_protocol::plugin_capability_key(&parent_id), label: Some("untrusted-label".into()), kind: pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id.clone(), expected_revision: 1 } };
+            assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.is_err());
+            let skill_id = pioneer_protocol::SkillId::new("S".repeat(21)).unwrap();
+            let child = pioneer_crud::SkillInstallationRecord { skill_id: skill_id.clone(), owner: None, slug: "bundled".into(), version: None, source_kind: "user".into(), scope_key: harness.workspace_id.clone(), source_ref: "plugin".into(), install_path: member.to_string_lossy().into(), trust_level: "community".into(), fingerprint: "member".into(), updated_at_unix: 1, pack_id: None, pack_member_key: None };
+            let policy = pioneer_crud::WorkspaceSkillPolicyRecord { id: "policy-plugin".into(), workspace_id: harness.workspace_id.clone(), skill_id: skill_id.clone(), enabled: Some(true), allow_implicit_invocation: Some(false) };
+            harness.crud_store.install_skill_lifecycle_with_ownership(&child, &policy, &[fixture_skill_lifecycle_audit(&skill_id, "bundled", "install", 1)], None, Some(&pioneer_crud::PluginOwnershipWrite { kind:pioneer_protocol::PackageKind::Plugin, plugin_id: parent_id.clone(), expected_revision: 1, member_key: "bundled".into(), member_path: Some("skills/bundled".into()), package_fingerprint: "member".into(), child_id: skill_id.to_string() }), 1).await.unwrap();
+            harness.crud_store.settle_plugin_installation(&parent_id, 1, "installed", None).await.unwrap();
+            let result = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
+            assert_eq!(result.presentation.len(), 1);
+            assert_eq!(result.presentation[0].label.as_deref(), Some("authoritative-name"));
+            assert!(matches!(result.presentation[0].kind, pioneer_protocol::TurnCapabilityKind::Plugin { .. }));
+            assert_eq!(result.execution.len(), 1);
+            assert!(matches!(&result.execution[0].kind, pioneer_protocol::TurnCapabilityKind::Skill { skill_id: id, .. } if id == &skill_id));
+            assert_eq!(result.plugin_selection.unwrap().children[0].id, skill_id.to_string());
+            assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &result.execution).await.is_err());
+            let mut stale = selected.clone(); stale.kind = pioneer_protocol::TurnCapabilityKind::Plugin { plugin_id: parent_id.clone(), expected_revision: 2 };
+            assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[stale]).await.is_err());
+            let mut disabled = policy.clone(); disabled.enabled = Some(false);
+            let gate=harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&parent_id,1,"updating",true,"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":false}").await.unwrap();
+            harness.crud_store.upsert_workspace_skill_policy_with_plugin_change(&disabled,Some(&pioneer_crud::PluginNativeWrite {
+                kind: pioneer_protocol::PackageKind::Plugin,
+                plugin_id:parent_id.clone(),expected_revision:gate.revision,member_key:"bundled".into(),child_id:skill_id.to_string(),override_fields_json:"[\"enabled\"]".into(),
+                pending_after:"{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":true}".into()
+            }),2).await.unwrap();
+            harness.crud_store.finish_plugin_mutation(&parent_id,gate.revision,"installed",None).await.unwrap();
+            let mut selected=selected; selected.kind=pioneer_protocol::TurnCapabilityKind::Plugin{plugin_id:parent_id,expected_revision:gate.revision};
+            let excluded = harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id, &[selected.clone()]).await.unwrap();
+            assert_eq!(excluded.presentation.len(), 1);
+            assert!(excluded.execution.is_empty());
+            assert_eq!(excluded.plugin_selection.unwrap().children.len(), 1, "structural candidate identity is retained until native preparation commits");
+            assert!(harness.processor.normalize_turn_skill_capabilities("foreign", &[selected]).await.is_err());
+            std::fs::remove_dir_all(fixture).unwrap();
+         })
+         .await
+         .expect("close isolated PostgreSQL test databases")
+     });
 }
 
 // B-03 regression source: real native list projections and both plugin RPCs.
 // Installation records are fixtures, no MCP is started.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn plugins_list_and_details_preserve_native_member_disclosure() {
     use sea_orm::ConnectionTrait;
     let mut harness = setup_cli_runtime_security_harness(None).await;
@@ -2256,315 +2260,318 @@ fn skill_pack_turn_normalization_is_authoritative_ordered_and_fail_closed() {
         .build()
         .expect("skill pack normalization runtime")
         .block_on(async {
-            let harness = setup_cli_runtime_security_harness(None).await;
-            let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("pack id");
-            let other_pack_id =
-                pioneer_protocol::SkillPackId::new("Q".repeat(21)).expect("other pack id");
-            let empty_pack_id =
-                pioneer_protocol::SkillPackId::new("E".repeat(21)).expect("empty pack id");
-            let foreign_pack_id =
-                pioneer_protocol::SkillPackId::new("F".repeat(21)).expect("foreign pack id");
-            for (id, name) in [
-                (other_pack_id.clone(), "other-pack"),
-                (empty_pack_id.clone(), "empty-pack"),
-            ] {
+            pioneer_postgres_test::with_test_databases(async {
+                let harness = setup_cli_runtime_security_harness(None).await;
+                let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("pack id");
+                let other_pack_id =
+                    pioneer_protocol::SkillPackId::new("Q".repeat(21)).expect("other pack id");
+                let empty_pack_id =
+                    pioneer_protocol::SkillPackId::new("E".repeat(21)).expect("empty pack id");
+                let foreign_pack_id =
+                    pioneer_protocol::SkillPackId::new("F".repeat(21)).expect("foreign pack id");
+                for (id, name) in [
+                    (other_pack_id.clone(), "other-pack"),
+                    (empty_pack_id.clone(), "empty-pack"),
+                ] {
+                    harness
+                        .crud_store
+                        .insert_skill_pack_installation(&SkillPackInstallationRecord {
+                            pack_id: id,
+                            name: name.to_owned(),
+                            scope_key: harness.workspace_id.clone(),
+                            source_kind: "user".to_owned(),
+                            created_at_unix: 1,
+                            updated_at_unix: 1,
+                        })
+                        .await
+                        .expect("insert pack");
+                }
                 harness
                     .crud_store
                     .insert_skill_pack_installation(&SkillPackInstallationRecord {
-                        pack_id: id,
-                        name: name.to_owned(),
-                        scope_key: harness.workspace_id.clone(),
+                        pack_id: foreign_pack_id.clone(),
+                        name: "foreign-pack".to_owned(),
+                        scope_key: "workspace_foreign".to_owned(),
                         source_kind: "user".to_owned(),
                         created_at_unix: 1,
                         updated_at_unix: 1,
                     })
                     .await
-                    .expect("insert pack");
-            }
-            harness
-                .crud_store
-                .insert_skill_pack_installation(&SkillPackInstallationRecord {
-                    pack_id: foreign_pack_id.clone(),
-                    name: "foreign-pack".to_owned(),
-                    scope_key: "workspace_foreign".to_owned(),
-                    source_kind: "user".to_owned(),
-                    created_at_unix: 1,
-                    updated_at_unix: 1,
-                })
-                .await
-                .expect("insert foreign pack");
+                    .expect("insert foreign pack");
 
-            let first_id = pioneer_protocol::SkillId::new("A".repeat(21)).expect("first id");
-            let second_id = pioneer_protocol::SkillId::new("B".repeat(21)).expect("second id");
-            let standalone_id =
-                pioneer_protocol::SkillId::new("S".repeat(21)).expect("standalone id");
-            let packed_children = [(first_id.clone(), "zeta"), (second_id.clone(), "alpha")].map(
-                |(skill_id, member_key)| SkillInstallationRecord {
-                    skill_id: skill_id.clone(),
-                    owner: None,
-                    slug: skill_id.to_string(),
-                    version: None,
-                    source_kind: "user".to_owned(),
-                    scope_key: harness.workspace_id.clone(),
-                    source_ref: format!("test:{skill_id}"),
-                    install_path: format!("/tmp/{skill_id}"),
-                    trust_level: "community".to_owned(),
-                    fingerprint: format!("fingerprint:{skill_id}"),
-                    updated_at_unix: 1,
-                    pack_id: Some(pack_id.clone()),
-                    pack_member_key: Some(member_key.to_owned()),
-                },
-            );
-            harness
-                .crud_store
-                .insert_skill_pack_installation_with_children(
-                    &SkillPackInstallationRecord {
-                        pack_id: pack_id.clone(),
-                        name: "writer-pack".to_owned(),
-                        scope_key: harness.workspace_id.clone(),
-                        source_kind: "user".to_owned(),
-                        created_at_unix: 1,
-                        updated_at_unix: 1,
-                    },
-                    &packed_children,
-                )
-                .await
-                .expect("insert pack and children");
-            harness
-                .crud_store
-                .insert_skill_installation(
-                    &SkillInstallationRecord {
-                        skill_id: standalone_id.clone(),
+                let first_id = pioneer_protocol::SkillId::new("A".repeat(21)).expect("first id");
+                let second_id = pioneer_protocol::SkillId::new("B".repeat(21)).expect("second id");
+                let standalone_id =
+                    pioneer_protocol::SkillId::new("S".repeat(21)).expect("standalone id");
+                let packed_children = [(first_id.clone(), "zeta"), (second_id.clone(), "alpha")]
+                    .map(|(skill_id, member_key)| SkillInstallationRecord {
+                        skill_id: skill_id.clone(),
                         owner: None,
-                        slug: standalone_id.to_string(),
+                        slug: skill_id.to_string(),
                         version: None,
                         source_kind: "user".to_owned(),
                         scope_key: harness.workspace_id.clone(),
-                        source_ref: format!("test:{standalone_id}"),
-                        install_path: format!("/tmp/{standalone_id}"),
+                        source_ref: format!("test:{skill_id}"),
+                        install_path: format!("/tmp/{skill_id}"),
                         trust_level: "community".to_owned(),
-                        fingerprint: format!("fingerprint:{standalone_id}"),
+                        fingerprint: format!("fingerprint:{skill_id}"),
                         updated_at_unix: 1,
-                        pack_id: None,
-                        pack_member_key: None,
-                    },
-                    1,
-                )
-                .await
-                .expect("insert standalone skill");
-
-            let full = TurnCapability {
-                id: pioneer_protocol::skill_pack_capability_key(&pack_id),
-                kind: TurnCapabilityKind::SkillPack {
-                    pack_id: pack_id.clone(),
-                },
-                label: Some("client-pack-label".to_owned()),
-            };
-            let standalone = TurnCapability {
-                id: pioneer_protocol::skill_capability_key(&standalone_id),
-                kind: TurnCapabilityKind::Skill {
-                    skill_id: standalone_id.clone(),
-                    pack_id: None,
-                },
-                label: Some("standalone".to_owned()),
-            };
-            let normalized = harness
-                .processor
-                .normalize_turn_skill_capabilities(
-                    harness.workspace_id.as_str(),
-                    &[full.clone(), standalone],
-                )
-                .await
-                .expect("normalize full pack");
-            assert!(matches!(
-                normalized.presentation[0].kind,
-                TurnCapabilityKind::SkillPack { .. }
-            ));
-            let execution_ids = normalized
-                .execution
-                .iter()
-                .filter_map(|capability| match &capability.kind {
-                    TurnCapabilityKind::Skill { skill_id, pack_id } => {
-                        assert!(pack_id.is_none());
-                        Some(skill_id.clone())
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                execution_ids,
-                vec![second_id.clone(), first_id.clone(), standalone_id]
-            );
-            assert_eq!(normalized.execution[0].label, None);
-            assert_eq!(normalized.execution[1].label, None);
-            assert_eq!(normalized.execution[2].label.as_deref(), Some("standalone"));
-            let child_failure = harness
-                .processor
-                .validate_turn_skill_capabilities(
-                    harness.workspace_id.as_str(),
-                    &normalized.execution[..2],
-                )
-                .await;
-            assert!(
-                child_failure.is_err(),
-                "one unavailable child must reject the complete expanded pack"
-            );
-
-            let duplicate_pack = harness
-                .processor
-                .normalize_turn_skill_capabilities(
-                    harness.workspace_id.as_str(),
-                    &[full.clone(), full.clone()],
-                )
-                .await;
-            assert!(duplicate_pack.is_err());
-
-            let duplicate_child = TurnCapability {
-                id: pioneer_protocol::skill_capability_key(&first_id),
-                kind: TurnCapabilityKind::Skill {
-                    skill_id: first_id.clone(),
-                    pack_id: Some(pack_id.clone()),
-                },
-                label: None,
-            };
-            let duplicate_child_result = harness
-                .processor
-                .normalize_turn_skill_capabilities(
-                    harness.workspace_id.as_str(),
-                    &[duplicate_child.clone(), duplicate_child],
-                )
-                .await;
-            assert!(duplicate_child_result.is_err());
-
-            let normalized_child = harness
-                .processor
-                .normalize_turn_skill_capabilities(
-                    harness.workspace_id.as_str(),
-                    &[TurnCapability {
-                        id: pioneer_protocol::skill_capability_key(&first_id),
-                        kind: TurnCapabilityKind::Skill {
-                            skill_id: first_id.clone(),
+                        pack_id: Some(pack_id.clone()),
+                        pack_member_key: Some(member_key.to_owned()),
+                    });
+                harness
+                    .crud_store
+                    .insert_skill_pack_installation_with_children(
+                        &SkillPackInstallationRecord {
+                            pack_id: pack_id.clone(),
+                            name: "writer-pack".to_owned(),
+                            scope_key: harness.workspace_id.clone(),
+                            source_kind: "user".to_owned(),
+                            created_at_unix: 1,
+                            updated_at_unix: 1,
+                        },
+                        &packed_children,
+                    )
+                    .await
+                    .expect("insert pack and children");
+                harness
+                    .crud_store
+                    .insert_skill_installation(
+                        &SkillInstallationRecord {
+                            skill_id: standalone_id.clone(),
+                            owner: None,
+                            slug: standalone_id.to_string(),
+                            version: None,
+                            source_kind: "user".to_owned(),
+                            scope_key: harness.workspace_id.clone(),
+                            source_ref: format!("test:{standalone_id}"),
+                            install_path: format!("/tmp/{standalone_id}"),
+                            trust_level: "community".to_owned(),
+                            fingerprint: format!("fingerprint:{standalone_id}"),
+                            updated_at_unix: 1,
                             pack_id: None,
+                            pack_member_key: None,
                         },
-                        label: None,
-                    }],
-                )
-                .await
-                .expect("normalize legacy packed child");
-            assert!(matches!(
-                &normalized_child.presentation[0].kind,
-                TurnCapabilityKind::Skill {
-                    pack_id: Some(actual),
-                    ..
-                } if actual == &pack_id
-            ));
-            assert_eq!(normalized_child.execution[0].label, None);
+                        1,
+                    )
+                    .await
+                    .expect("insert standalone skill");
 
-            let mismatch = harness
-                .processor
-                .normalize_turn_skill_capabilities(
-                    harness.workspace_id.as_str(),
-                    &[TurnCapability {
-                        id: pioneer_protocol::skill_capability_key(&first_id),
-                        kind: TurnCapabilityKind::Skill {
-                            skill_id: first_id.clone(),
-                            pack_id: Some(other_pack_id),
-                        },
-                        label: None,
-                    }],
-                )
-                .await;
-            assert!(mismatch.is_err());
+                let full = TurnCapability {
+                    id: pioneer_protocol::skill_pack_capability_key(&pack_id),
+                    kind: TurnCapabilityKind::SkillPack {
+                        pack_id: pack_id.clone(),
+                    },
+                    label: Some("client-pack-label".to_owned()),
+                };
+                let standalone = TurnCapability {
+                    id: pioneer_protocol::skill_capability_key(&standalone_id),
+                    kind: TurnCapabilityKind::Skill {
+                        skill_id: standalone_id.clone(),
+                        pack_id: None,
+                    },
+                    label: Some("standalone".to_owned()),
+                };
+                let normalized = harness
+                    .processor
+                    .normalize_turn_skill_capabilities(
+                        harness.workspace_id.as_str(),
+                        &[full.clone(), standalone],
+                    )
+                    .await
+                    .expect("normalize full pack");
+                assert!(matches!(
+                    normalized.presentation[0].kind,
+                    TurnCapabilityKind::SkillPack { .. }
+                ));
+                let execution_ids = normalized
+                    .execution
+                    .iter()
+                    .filter_map(|capability| match &capability.kind {
+                        TurnCapabilityKind::Skill { skill_id, pack_id } => {
+                            assert!(pack_id.is_none());
+                            Some(skill_id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    execution_ids,
+                    vec![second_id.clone(), first_id.clone(), standalone_id]
+                );
+                assert_eq!(normalized.execution[0].label, None);
+                assert_eq!(normalized.execution[1].label, None);
+                assert_eq!(normalized.execution[2].label.as_deref(), Some("standalone"));
+                let child_failure = harness
+                    .processor
+                    .validate_turn_skill_capabilities(
+                        harness.workspace_id.as_str(),
+                        &normalized.execution[..2],
+                    )
+                    .await;
+                assert!(
+                    child_failure.is_err(),
+                    "one unavailable child must reject the complete expanded pack"
+                );
 
-            let mixed = harness
-                .processor
-                .normalize_turn_skill_capabilities(
-                    harness.workspace_id.as_str(),
-                    &[
-                        full,
-                        TurnCapability {
+                let duplicate_pack = harness
+                    .processor
+                    .normalize_turn_skill_capabilities(
+                        harness.workspace_id.as_str(),
+                        &[full.clone(), full.clone()],
+                    )
+                    .await;
+                assert!(duplicate_pack.is_err());
+
+                let duplicate_child = TurnCapability {
+                    id: pioneer_protocol::skill_capability_key(&first_id),
+                    kind: TurnCapabilityKind::Skill {
+                        skill_id: first_id.clone(),
+                        pack_id: Some(pack_id.clone()),
+                    },
+                    label: None,
+                };
+                let duplicate_child_result = harness
+                    .processor
+                    .normalize_turn_skill_capabilities(
+                        harness.workspace_id.as_str(),
+                        &[duplicate_child.clone(), duplicate_child],
+                    )
+                    .await;
+                assert!(duplicate_child_result.is_err());
+
+                let normalized_child = harness
+                    .processor
+                    .normalize_turn_skill_capabilities(
+                        harness.workspace_id.as_str(),
+                        &[TurnCapability {
                             id: pioneer_protocol::skill_capability_key(&first_id),
                             kind: TurnCapabilityKind::Skill {
-                                skill_id: first_id,
-                                pack_id: Some(pack_id.clone()),
+                                skill_id: first_id.clone(),
+                                pack_id: None,
                             },
                             label: None,
-                        },
-                    ],
-                )
-                .await;
-            assert!(mixed.is_err());
-
-            let empty = harness
-                .processor
-                .normalize_turn_skill_capabilities(
-                    harness.workspace_id.as_str(),
-                    &[TurnCapability {
-                        id: pioneer_protocol::skill_pack_capability_key(&empty_pack_id),
-                        kind: TurnCapabilityKind::SkillPack {
-                            pack_id: empty_pack_id,
-                        },
-                        label: None,
-                    }],
-                )
-                .await;
-            assert!(empty.is_err());
-
-            let foreign = harness
-                .processor
-                .normalize_turn_skill_capabilities(
-                    harness.workspace_id.as_str(),
-                    &[TurnCapability {
-                        id: pioneer_protocol::skill_pack_capability_key(&foreign_pack_id),
-                        kind: TurnCapabilityKind::SkillPack {
-                            pack_id: foreign_pack_id,
-                        },
-                        label: None,
-                    }],
-                )
-                .await;
-            assert!(foreign.is_err());
-
-            let write_guard = harness.processor.acquire_skills_write_lock().await;
-            let queued_capabilities = vec![TurnCapability {
-                id: pioneer_protocol::skill_pack_capability_key(&pack_id),
-                kind: TurnCapabilityKind::SkillPack {
-                    pack_id: pack_id.clone(),
-                },
-                label: None,
-            }];
-            let queued_normalization = harness.processor.normalize_turn_skill_capabilities(
-                harness.workspace_id.as_str(),
-                queued_capabilities.as_slice(),
-            );
-            tokio::pin!(queued_normalization);
-            assert!(
-                timeout(Duration::from_millis(50), queued_normalization.as_mut())
+                        }],
+                    )
                     .await
-                    .is_err(),
-                "turn capability normalization must wait for the shared skills write lock"
-            );
-            harness
-                .crud_store
-                .update_skill_pack_installation_name(
+                    .expect("normalize legacy packed child");
+                assert!(matches!(
+                    &normalized_child.presentation[0].kind,
+                    TurnCapabilityKind::Skill {
+                        pack_id: Some(actual),
+                        ..
+                    } if actual == &pack_id
+                ));
+                assert_eq!(normalized_child.execution[0].label, None);
+
+                let mismatch = harness
+                    .processor
+                    .normalize_turn_skill_capabilities(
+                        harness.workspace_id.as_str(),
+                        &[TurnCapability {
+                            id: pioneer_protocol::skill_capability_key(&first_id),
+                            kind: TurnCapabilityKind::Skill {
+                                skill_id: first_id.clone(),
+                                pack_id: Some(other_pack_id),
+                            },
+                            label: None,
+                        }],
+                    )
+                    .await;
+                assert!(mismatch.is_err());
+
+                let mixed = harness
+                    .processor
+                    .normalize_turn_skill_capabilities(
+                        harness.workspace_id.as_str(),
+                        &[
+                            full,
+                            TurnCapability {
+                                id: pioneer_protocol::skill_capability_key(&first_id),
+                                kind: TurnCapabilityKind::Skill {
+                                    skill_id: first_id,
+                                    pack_id: Some(pack_id.clone()),
+                                },
+                                label: None,
+                            },
+                        ],
+                    )
+                    .await;
+                assert!(mixed.is_err());
+
+                let empty = harness
+                    .processor
+                    .normalize_turn_skill_capabilities(
+                        harness.workspace_id.as_str(),
+                        &[TurnCapability {
+                            id: pioneer_protocol::skill_pack_capability_key(&empty_pack_id),
+                            kind: TurnCapabilityKind::SkillPack {
+                                pack_id: empty_pack_id,
+                            },
+                            label: None,
+                        }],
+                    )
+                    .await;
+                assert!(empty.is_err());
+
+                let foreign = harness
+                    .processor
+                    .normalize_turn_skill_capabilities(
+                        harness.workspace_id.as_str(),
+                        &[TurnCapability {
+                            id: pioneer_protocol::skill_pack_capability_key(&foreign_pack_id),
+                            kind: TurnCapabilityKind::SkillPack {
+                                pack_id: foreign_pack_id,
+                            },
+                            label: None,
+                        }],
+                    )
+                    .await;
+                assert!(foreign.is_err());
+
+                let write_guard = harness.processor.acquire_skills_write_lock().await;
+                let queued_capabilities = vec![TurnCapability {
+                    id: pioneer_protocol::skill_pack_capability_key(&pack_id),
+                    kind: TurnCapabilityKind::SkillPack {
+                        pack_id: pack_id.clone(),
+                    },
+                    label: None,
+                }];
+                let queued_normalization = harness.processor.normalize_turn_skill_capabilities(
                     harness.workspace_id.as_str(),
-                    &pack_id,
-                    "authoritative-pack-name",
-                    2,
-                )
-                .await
-                .expect("rename pack while normalization is queued");
-            drop(write_guard);
-            let normalized_after_lock = queued_normalization
-                .await
-                .expect("normalize pack after lifecycle lock release");
-            assert_eq!(
-                normalized_after_lock
-                    .pack_names
-                    .get(&pack_id)
-                    .map(String::as_str),
-                Some("authoritative-pack-name")
-            );
+                    queued_capabilities.as_slice(),
+                );
+                tokio::pin!(queued_normalization);
+                assert!(
+                    timeout(Duration::from_millis(50), queued_normalization.as_mut())
+                        .await
+                        .is_err(),
+                    "turn capability normalization must wait for the shared skills write lock"
+                );
+                harness
+                    .crud_store
+                    .update_skill_pack_installation_name(
+                        harness.workspace_id.as_str(),
+                        &pack_id,
+                        "authoritative-pack-name",
+                        2,
+                    )
+                    .await
+                    .expect("rename pack while normalization is queued");
+                drop(write_guard);
+                let normalized_after_lock = queued_normalization
+                    .await
+                    .expect("normalize pack after lifecycle lock release");
+                assert_eq!(
+                    normalized_after_lock
+                        .pack_names
+                        .get(&pack_id)
+                        .map(String::as_str),
+                    Some("authoritative-pack-name")
+                );
+            })
+            .await
+            .expect("close isolated PostgreSQL test databases")
         });
 }
 
@@ -2591,6 +2598,32 @@ pub(super) struct CliRuntimeSkillPreflightHarness {
 pub(super) async fn setup_cli_runtime_skill_preflight_harness(
     runtime_kind: CLIAgentRuntimeKind,
     native_home_is_file: bool,
+) -> CliRuntimeSkillPreflightHarness {
+    setup_cli_runtime_skill_preflight_harness_with_workspace(
+        runtime_kind,
+        native_home_is_file,
+        setup_workspace_manager().await,
+    )
+    .await
+}
+
+pub(super) async fn setup_postgres_cli_runtime_skill_preflight_harness(
+    fixture: &pioneer_postgres_test::TestDatabase,
+    runtime_kind: CLIAgentRuntimeKind,
+    native_home_is_file: bool,
+) -> CliRuntimeSkillPreflightHarness {
+    setup_cli_runtime_skill_preflight_harness_with_workspace(
+        runtime_kind,
+        native_home_is_file,
+        setup_postgres_workspace_manager(fixture).await,
+    )
+    .await
+}
+
+async fn setup_cli_runtime_skill_preflight_harness_with_workspace(
+    runtime_kind: CLIAgentRuntimeKind,
+    native_home_is_file: bool,
+    workspace: (Arc<WorkspaceManager>, Arc<CrudStore>, String),
 ) -> CliRuntimeSkillPreflightHarness {
     let temp = tempfile::tempdir().unwrap();
     let runtime_home = temp.path().join("gateway-runtime");
@@ -2642,7 +2675,7 @@ pub(super) async fn setup_cli_runtime_skill_preflight_harness(
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let (workspace_manager, crud_store, workspace_id) = workspace;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
@@ -2885,11 +2918,15 @@ where
 {
     let runtime = crate::build_gateway_runtime()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
-    let result = runtime.block_on(async move { tokio::spawn(Box::pin(future)).await });
+    let result = runtime.block_on(async move {
+        tokio::spawn(Box::pin(pioneer_postgres_test::with_test_databases(future))).await
+    });
     // Test futures may leave best-effort blocking index work behind. Give it
     // a bounded grace period instead of waiting indefinitely during shutdown.
     runtime.shutdown_timeout(Duration::from_secs(5));
-    result.unwrap_or_else(|error| panic!("{name} task should finish: {error}"));
+    result
+        .unwrap_or_else(|error| panic!("{name} task should finish: {error}"))
+        .expect("close isolated PostgreSQL test databases");
 }
 
 fn run_large_history_message_test<F>(name: &'static str, future: F)
@@ -2905,7 +2942,9 @@ where
         .spawn(move || {
             let runtime = crate::build_gateway_runtime()
                 .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
-            runtime.block_on(future);
+            runtime
+                .block_on(pioneer_postgres_test::with_test_databases(future))
+                .expect("close isolated PostgreSQL test databases");
             runtime.shutdown_timeout(Duration::from_secs(5));
         })
         .unwrap_or_else(|error| panic!("{name} fixture thread should start: {error}"))
@@ -2919,333 +2958,338 @@ async fn capability_persistence_order_impl() {
         CLIAgentRuntimeKind::Claude,
         CLIAgentRuntimeKind::OpenCode,
     ] {
-        let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
-        let alpha_path = write_test_skill(&harness.user_root, "alpha", "", "# alpha\n");
-        let beta_path = write_test_skill(&harness.registry_root, "beta", "", "# beta\n");
-        let alpha_id = seed_cli_runtime_skill_installation(
-            &harness,
-            "tests/alpha",
-            "user",
-            alpha_path.as_path(),
-        )
-        .await;
-        let beta_id = seed_cli_runtime_skill_installation(
-            &harness,
-            "tests/beta",
-            "registry",
-            beta_path.as_path(),
-        )
-        .await;
-        let thread_id = format!("thread_preflight_{runtime_kind:?}").to_ascii_lowercase();
-        let turn_id = format!("turn_preflight_{runtime_kind:?}").to_ascii_lowercase();
-        seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
-        harness
-            .processor
-            .agent_manager
-            .ensure_thread(&thread_id, &harness.workspace_id)
-            .await
-            .expect("agent thread should be registered for committed subscription");
-        let mut committed_rx = harness
-            .processor
-            .agent_manager
-            .subscribe_committed(&thread_id)
-            .await
-            .expect("committed subscription should exist");
-        let request_id = generate_test_request_id(
-            "p51order",
-            match runtime_kind {
-                CLIAgentRuntimeKind::Codex => "codex",
-                CLIAgentRuntimeKind::Claude => "claude",
-                CLIAgentRuntimeKind::OpenCode => "opencode",
-            },
-        );
-        let request = cli_runtime_turn_start_request_with_capabilities(
-            &request_id,
-            &thread_id,
-            &turn_id,
-            &harness.runtime_id,
-            runtime_kind,
-            vec![
-                cli_runtime_skill_capability("tests/beta", "registry"),
-                cli_runtime_skill_capability("tests/alpha", "user"),
-            ],
-        );
-        harness
-            .processor
-            .process_request_for_connection(harness.connection_id, &request)
+        pioneer_postgres_test::with_database(async |fixture| {
+            let harness = setup_postgres_cli_runtime_skill_preflight_harness(fixture, runtime_kind, false).await;
+            let alpha_path = write_test_skill(&harness.user_root, "alpha", "", "# alpha\n");
+            let beta_path = write_test_skill(&harness.registry_root, "beta", "", "# beta\n");
+            let alpha_id = seed_cli_runtime_skill_installation(
+                &harness,
+                "tests/alpha",
+                "user",
+                alpha_path.as_path(),
+            )
             .await;
-        let native_turn = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
-
-        assert_eq!(
-            harness.event_log.lock().await.as_slice(),
-            [
-                "thread_manager_turn_start",
-                "preflight_complete",
-                "native_thread_start"
-            ]
-        );
-        assert_eq!(
-            std::fs::read(harness.native_home.join("skills/alpha/SKILL.md")).unwrap(),
-            std::fs::read(harness.user_root.join("tests/alpha/SKILL.md")).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(harness.native_home.join("skills/beta/SKILL.md")).unwrap(),
-            std::fs::read(harness.registry_root.join("tests/beta/SKILL.md")).unwrap()
-        );
-        assert!(
+            let beta_id = seed_cli_runtime_skill_installation(
+                &harness,
+                "tests/beta",
+                "registry",
+                beta_path.as_path(),
+            )
+            .await;
+            let thread_id = format!("thread_preflight_{runtime_kind:?}").to_ascii_lowercase();
+            let turn_id = format!("turn_preflight_{runtime_kind:?}").to_ascii_lowercase();
+            seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
             harness
-                .runtime_home
-                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
-                .exists()
-        );
-        assert!(
-            harness
-                .crud_store
-                .get_turn(&thread_id, &turn_id)
+                .processor
+                .agent_manager
+                .ensure_thread(&thread_id, &harness.workspace_id)
                 .await
-                .unwrap()
-                .is_some()
-        );
-        let skill_bindings = harness
-            .crud_store
-            .find_turn_skill_bindings(&turn_id)
-            .await
-            .expect("must read persisted CLI runtime turn skill bindings")
-            .into_iter()
-            .filter(|binding| binding.source_kind != "system")
-            .collect::<Vec<_>>();
-        assert_eq!(skill_bindings.len(), 2);
-        assert_eq!(skill_bindings[0].skill_id, alpha_id);
-        assert_eq!(skill_bindings[0].skill_owner.as_deref(), Some("tests"));
-        assert_eq!(skill_bindings[0].skill_slug, "alpha");
-        assert_eq!(skill_bindings[0].source_kind, "user");
-        assert_eq!(
-            skill_bindings[0].resolved_reason,
-            "explicit_composer_capability"
-        );
-        assert_eq!(skill_bindings[1].skill_id, beta_id);
-        assert_eq!(skill_bindings[1].skill_owner.as_deref(), Some("tests"));
-        assert_eq!(skill_bindings[1].skill_slug, "beta");
-        assert_eq!(skill_bindings[1].source_kind, "registry");
-        assert_eq!(
-            skill_bindings[1].resolved_reason,
-            "explicit_composer_capability"
-        );
-        assert!(
-            skill_bindings
-                .iter()
-                .all(|binding| !binding.fingerprint.is_empty())
-        );
-        let committed_capabilities = timeout(Duration::from_secs(1), committed_rx.recv())
-            .await
-            .expect("committed MCP capability event should arrive")
-            .expect("committed lane should stay open");
-        // This unrestricted turn admits the Threads catalog alongside the
-        // default HTML and task tools, plus CUA when this build enables it.
-        let thread_actions = [
-            "threads_identity_models_list",
-            "thread_create",
-            "thread_message_send",
-            "threads_turn_start",
-        ];
-        let expected_mcp_bindings =
-            2 + if cfg!(feature = "computer-use") {
-                pioneer_protocol::CUA_TOOL_NAMES.len()
-            } else {
-                0
-            } + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
-                .definitions()
-                .len()
-                + crate::turn_mcp::native_tools::NativeToolFamily::Threads
-                    .definitions()
-                    .len();
-        assert!(matches!(
-            committed_capabilities,
-            AgentDurableEvent::TurnCapabilitiesResolved {
-                turn_id: committed_turn_id,
-                accepted,
-                rejected,
-                mcp_bindings,
-                ..
-            } if committed_turn_id == turn_id
-                && accepted.is_empty()
-                && rejected.is_empty()
-                && mcp_bindings.len() == expected_mcp_bindings
-                && mcp_bindings.iter().all(|binding| crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id).is_some())
-                && mcp_bindings.iter().any(|binding| binding.raw_tool_name == "task_wait")
-                && thread_actions.iter().all(|name| mcp_bindings.iter().any(|binding| binding.raw_tool_name == *name))
-        ));
-        let committed_skills = timeout(Duration::from_secs(1), committed_rx.recv())
-            .await
-            .expect("committed skill binding event should arrive")
-            .expect("committed lane should stay open");
-        assert!(matches!(
-            committed_skills,
-            AgentDurableEvent::TurnSkillsResolved {
-                turn_id: committed_turn_id,
-                bindings,
-                ..
-            } if committed_turn_id == turn_id && bindings.len() == 6
-                && bindings.iter().filter(|binding| binding.source_kind == "system").count() == 4
-                && bindings.iter().any(|binding| binding.source_kind == "system" && binding.skill_slug == "html")
-                && bindings.iter().any(|binding| binding.source_kind == "system" && binding.skill_slug == "threads")
-        ));
-        if matches!(
-            runtime_kind,
-            CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
-        ) {
-            // Read the actual dispatch saved before native start, using a fresh
-            // repository handle rather than serializing the helper result.
-            let reopened = CrudStore::new(harness.crud_store.database_connection());
-            let saved = reopened
-                .get_cli_runtime_turn_binding(&turn_id)
+                .expect("agent thread should be registered for committed subscription");
+            let mut committed_rx = harness
+                .processor
+                .agent_manager
+                .subscribe_committed(&thread_id)
                 .await
-                .unwrap()
-                .unwrap();
-            let saved_mapping: JsonValue = serde_json::from_str(&saved.input_mapping_json).unwrap();
-            assert_eq!(saved_mapping["input"], native_turn.input);
-            let required = saved_mapping["input"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|item| item["text"].as_str())
-                .find(|text| text.starts_with("Current required Pioneer skill exports"))
-                .expect("required references must cross dispatch persistence");
-            for name in [
-                "pioneer-system-tasks",
-                "pioneer-system-subagents",
-                "pioneer-system-html",
-                "pioneer-system-threads",
-            ] {
-                assert!(required.contains(name));
-            }
-            assert!(!required.contains("# alpha"));
-            assert!(!required.contains("# beta"));
-            let saved_skills = saved_mapping["input"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|item| item["type"] == "skill")
-                .collect::<Vec<_>>();
-            assert_eq!(
-                saved_skills.len(),
-                2,
-                "required exports must remain references"
+                .expect("committed subscription should exist");
+            let request_id = generate_test_request_id(
+                "p51order",
+                match runtime_kind {
+                    CLIAgentRuntimeKind::Codex => "codex",
+                    CLIAgentRuntimeKind::Claude => "claude",
+                    CLIAgentRuntimeKind::OpenCode => "opencode",
+                },
             );
-            // Duplicate admission must use the persisted logical Turn, without
-            // invoking skills again or rewriting the saved dispatch payload.
-            let starts_before = harness.cli_session.turn_starts.lock().await.len();
+            let request = cli_runtime_turn_start_request_with_capabilities(
+                &request_id,
+                &thread_id,
+                &turn_id,
+                &harness.runtime_id,
+                runtime_kind,
+                vec![
+                    cli_runtime_skill_capability("tests/beta", "registry"),
+                    cli_runtime_skill_capability("tests/alpha", "user"),
+                ],
+            );
             harness
                 .processor
                 .process_request_for_connection(harness.connection_id, &request)
                 .await;
+            let native_turn = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+
             assert_eq!(
-                harness.cli_session.turn_starts.lock().await.len(),
-                starts_before
+                harness.event_log.lock().await.as_slice(),
+                [
+                    "thread_manager_turn_start",
+                    "preflight_complete",
+                    "native_thread_start"
+                ]
             );
             assert_eq!(
-                reopened
+                std::fs::read(harness.native_home.join("skills/alpha/SKILL.md")).unwrap(),
+                std::fs::read(harness.user_root.join("tests/alpha/SKILL.md")).unwrap()
+            );
+            assert_eq!(
+                std::fs::read(harness.native_home.join("skills/beta/SKILL.md")).unwrap(),
+                std::fs::read(harness.registry_root.join("tests/beta/SKILL.md")).unwrap()
+            );
+            assert!(
+                harness
+                    .runtime_home
+                    .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
+                    .exists()
+            );
+            assert!(
+                harness
+                    .crud_store
+                    .get_turn(&thread_id, &turn_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let skill_bindings = harness
+                .crud_store
+                .find_turn_skill_bindings(&turn_id)
+                .await
+                .expect("must read persisted CLI runtime turn skill bindings")
+                .into_iter()
+                .filter(|binding| binding.source_kind != "system")
+                .collect::<Vec<_>>();
+            assert_eq!(skill_bindings.len(), 2);
+            assert_eq!(skill_bindings[0].skill_id, alpha_id);
+            assert_eq!(skill_bindings[0].skill_owner.as_deref(), Some("tests"));
+            assert_eq!(skill_bindings[0].skill_slug, "alpha");
+            assert_eq!(skill_bindings[0].source_kind, "user");
+            assert_eq!(
+                skill_bindings[0].resolved_reason,
+                "explicit_composer_capability"
+            );
+            assert_eq!(skill_bindings[1].skill_id, beta_id);
+            assert_eq!(skill_bindings[1].skill_owner.as_deref(), Some("tests"));
+            assert_eq!(skill_bindings[1].skill_slug, "beta");
+            assert_eq!(skill_bindings[1].source_kind, "registry");
+            assert_eq!(
+                skill_bindings[1].resolved_reason,
+                "explicit_composer_capability"
+            );
+            assert!(
+                skill_bindings
+                    .iter()
+                    .all(|binding| !binding.fingerprint.is_empty())
+            );
+            let committed_capabilities = timeout(Duration::from_secs(1), committed_rx.recv())
+                .await
+                .expect("committed MCP capability event should arrive")
+                .expect("committed lane should stay open");
+            // This unrestricted turn admits the Threads catalog alongside the
+            // default HTML and task tools, plus CUA when this build enables it.
+            let thread_actions = [
+                "threads_identity_models_list",
+                "thread_create",
+                "thread_message_send",
+                "threads_turn_start",
+            ];
+            let expected_mcp_bindings =
+                2 + if cfg!(feature = "computer-use") {
+                    pioneer_protocol::CUA_TOOL_NAMES.len()
+                } else {
+                    0
+                } + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                    .definitions()
+                    .len()
+                    + crate::turn_mcp::native_tools::NativeToolFamily::Threads
+                        .definitions()
+                        .len();
+            assert!(matches!(
+                committed_capabilities,
+                AgentDurableEvent::TurnCapabilitiesResolved {
+                    turn_id: committed_turn_id,
+                    accepted,
+                    rejected,
+                    mcp_bindings,
+                    ..
+                } if committed_turn_id == turn_id
+                    && accepted.is_empty()
+                    && rejected.is_empty()
+                    && mcp_bindings.len() == expected_mcp_bindings
+                    && mcp_bindings.iter().all(|binding| crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id).is_some())
+                    && mcp_bindings.iter().any(|binding| binding.raw_tool_name == "task_wait")
+                    && thread_actions.iter().all(|name| mcp_bindings.iter().any(|binding| binding.raw_tool_name == *name))
+            ));
+            let committed_skills = timeout(Duration::from_secs(1), committed_rx.recv())
+                .await
+                .expect("committed skill binding event should arrive")
+                .expect("committed lane should stay open");
+            assert!(matches!(
+                committed_skills,
+                AgentDurableEvent::TurnSkillsResolved {
+                    turn_id: committed_turn_id,
+                    bindings,
+                    ..
+                } if committed_turn_id == turn_id && bindings.len() == 6
+                    && bindings.iter().filter(|binding| binding.source_kind == "system").count() == 4
+                    && bindings.iter().any(|binding| binding.source_kind == "system" && binding.skill_slug == "html")
+                    && bindings.iter().any(|binding| binding.source_kind == "system" && binding.skill_slug == "threads")
+            ));
+            if matches!(
+                runtime_kind,
+                CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
+            ) {
+                // Read the actual dispatch saved before native start, using a fresh
+                // repository handle rather than serializing the helper result.
+                let reopened = CrudStore::new(harness.crud_store.database_connection());
+                let saved = reopened
                     .get_cli_runtime_turn_binding(&turn_id)
                     .await
                     .unwrap()
+                    .unwrap();
+                let saved_mapping: JsonValue = serde_json::from_str(&saved.input_mapping_json).unwrap();
+                assert_eq!(saved_mapping["input"], native_turn.input);
+                let required = saved_mapping["input"]
+                    .as_array()
                     .unwrap()
-                    .input_mapping_json,
-                saved.input_mapping_json
-            );
-            let input = native_turn.input.as_array().unwrap();
-            let skill_items = input
-                .iter()
-                .filter(|item| {
-                    item["type"] == "skill"
-                        && !matches!(
-                            item["name"].as_str(),
-                            Some(
-                                "pioneer-system-tasks"
-                                    | "pioneer-system-subagents"
-                                    | "pioneer-system-html"
-                                    | "pioneer-system-threads"
-                            )
-                        )
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            assert_eq!(
-                skill_items,
-                vec![
-                    json!({
-                        "type": "skill",
-                        "name": "beta",
-                        "path": harness.native_home.join("skills/beta/SKILL.md")
-                    }),
-                    json!({
-                        "type": "skill",
-                        "name": "alpha",
-                        "path": harness.native_home.join("skills/alpha/SKILL.md")
-                    }),
-                ]
-            );
-            let context = input
-                .first()
-                .and_then(|item| item["text"].as_str())
-                .expect("turn context should precede native user input");
-            let (directive, beta_label, alpha_label, runtime_label) = match runtime_kind {
-                CLIAgentRuntimeKind::Codex => {
-                    ("selected Skill input", "- $beta", "- $alpha", "Codex")
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .find(|text| text.starts_with("Current required Pioneer skill exports"))
+                    .expect("required references must cross dispatch persistence");
+                for name in [
+                    "pioneer-system-tasks",
+                    "pioneer-system-subagents",
+                    "pioneer-system-html",
+                    "pioneer-system-threads",
+                ] {
+                    assert!(required.contains(name));
                 }
-                CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
-                CLIAgentRuntimeKind::Claude => unreachable!(),
-            };
-            assert!(context.contains(directive));
-            assert!(!native_turn.elevated_instructions.text().contains(directive));
-            let beta = context
-                .find(beta_label)
-                .unwrap_or_else(|| panic!("{runtime_label} turn context should include beta"));
-            let alpha = context
-                .find(alpha_label)
-                .unwrap_or_else(|| panic!("{runtime_label} turn context should include alpha"));
-            assert!(
-                beta < alpha,
-                "selected {runtime_label} skill order must be preserved"
-            );
-            assert_eq!(
-                input
+                assert!(!required.contains("# alpha"));
+                assert!(!required.contains("# beta"));
+                let saved_skills = saved_mapping["input"]
+                    .as_array()
+                    .unwrap()
                     .iter()
-                    .filter_map(|item| item["text"].as_str())
-                    .filter(|text| text.contains(directive))
-                    .count(),
-                1,
-                "selected-skill directive should appear once in turn input"
-            );
-        } else {
-            let input = native_turn.input.as_array().unwrap();
-            assert!(input.iter().all(|item| item["type"] != "skill"));
-            let context = input
-                .first()
-                .and_then(|item| item["text"].as_str())
-                .expect("turn context should precede native user input");
-            let directive = "Invoke every selected skill through Claude's native Skill tool";
-            assert!(context.contains(directive));
-            assert!(!native_turn.elevated_instructions.text().contains(directive));
-            let beta = context
-                .find("- beta")
-                .expect("Claude turn context should include beta");
-            let alpha = context
-                .find("- alpha")
-                .expect("Claude turn context should include alpha");
-            assert!(
-                beta < alpha,
-                "selected Claude skill order must be preserved"
-            );
-            assert_eq!(
-                input
+                    .filter(|item| item["type"] == "skill")
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    saved_skills.len(),
+                    2,
+                    "required exports must remain references"
+                );
+                // Duplicate admission must use the persisted logical Turn, without
+                // invoking skills again or rewriting the saved dispatch payload.
+                let starts_before = harness.cli_session.turn_starts.lock().await.len();
+                harness
+                    .processor
+                    .process_request_for_connection(harness.connection_id, &request)
+                    .await;
+                assert_eq!(
+                    harness.cli_session.turn_starts.lock().await.len(),
+                    starts_before
+                );
+                assert_eq!(
+                    reopened
+                        .get_cli_runtime_turn_binding(&turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .input_mapping_json,
+                    saved.input_mapping_json
+                );
+                let input = native_turn.input.as_array().unwrap();
+                let skill_items = input
                     .iter()
-                    .filter_map(|item| item["text"].as_str())
-                    .filter(|text| text.contains(directive))
-                    .count(),
-                1,
-                "selected-skill directive should appear once in turn input"
-            );
-        }
+                    .filter(|item| {
+                        item["type"] == "skill"
+                            && !matches!(
+                                item["name"].as_str(),
+                                Some(
+                                    "pioneer-system-tasks"
+                                        | "pioneer-system-subagents"
+                                        | "pioneer-system-html"
+                                        | "pioneer-system-threads"
+                                )
+                            )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    skill_items,
+                    vec![
+                        json!({
+                            "type": "skill",
+                            "name": "beta",
+                            "path": harness.native_home.join("skills/beta/SKILL.md")
+                        }),
+                        json!({
+                            "type": "skill",
+                            "name": "alpha",
+                            "path": harness.native_home.join("skills/alpha/SKILL.md")
+                        }),
+                    ]
+                );
+                let context = input
+                    .first()
+                    .and_then(|item| item["text"].as_str())
+                    .expect("turn context should precede native user input");
+                let (directive, beta_label, alpha_label, runtime_label) = match runtime_kind {
+                    CLIAgentRuntimeKind::Codex => {
+                        ("selected Skill input", "- $beta", "- $alpha", "Codex")
+                    }
+                    CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
+                    CLIAgentRuntimeKind::Claude => unreachable!(),
+                };
+                assert!(context.contains(directive));
+                assert!(!native_turn.elevated_instructions.text().contains(directive));
+                let beta = context
+                    .find(beta_label)
+                    .unwrap_or_else(|| panic!("{runtime_label} turn context should include beta"));
+                let alpha = context
+                    .find(alpha_label)
+                    .unwrap_or_else(|| panic!("{runtime_label} turn context should include alpha"));
+                assert!(
+                    beta < alpha,
+                    "selected {runtime_label} skill order must be preserved"
+                );
+                assert_eq!(
+                    input
+                        .iter()
+                        .filter_map(|item| item["text"].as_str())
+                        .filter(|text| text.contains(directive))
+                        .count(),
+                    1,
+                    "selected-skill directive should appear once in turn input"
+                );
+            } else {
+                let input = native_turn.input.as_array().unwrap();
+                assert!(input.iter().all(|item| item["type"] != "skill"));
+                let context = input
+                    .first()
+                    .and_then(|item| item["text"].as_str())
+                    .expect("turn context should precede native user input");
+                let directive = "Invoke every selected skill through Claude's native Skill tool";
+                assert!(context.contains(directive));
+                assert!(!native_turn.elevated_instructions.text().contains(directive));
+                let beta = context
+                    .find("- beta")
+                    .expect("Claude turn context should include beta");
+                let alpha = context
+                    .find("- alpha")
+                    .expect("Claude turn context should include alpha");
+                assert!(
+                    beta < alpha,
+                    "selected Claude skill order must be preserved"
+                );
+                assert_eq!(
+                    input
+                        .iter()
+                        .filter_map(|item| item["text"].as_str())
+                        .filter(|text| text.contains(directive))
+                        .count(),
+                    1,
+                    "selected-skill directive should appear once in turn input"
+                );
+            }
+             Ok(())
+         })
+         .await
+         .unwrap();
     }
 }
 
@@ -3263,212 +3307,232 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
         CLIAgentRuntimeKind::Claude,
         CLIAgentRuntimeKind::OpenCode,
     ] {
-        let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
-        let source = write_test_skill(&harness.user_root, "lifecycle", "", "# first\n");
-        let lifecycle_id = seed_cli_runtime_skill_installation(
-            &harness,
-            "tests/lifecycle",
-            "user",
-            source.as_path(),
-        )
-        .await;
-        std::fs::create_dir_all(source.join("references")).unwrap();
-        std::fs::write(source.join("references/guide.txt"), b"guide-v1\n").unwrap();
-        let receipt_path = harness
-            .runtime_home
-            .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
-        let destination = harness.native_home.join("skills/lifecycle");
-        let mut first_receipt_snapshot = None;
-        let mut first_destination_snapshot = None;
+        pioneer_postgres_test::with_database(async |fixture| {
+            let harness =
+                setup_postgres_cli_runtime_skill_preflight_harness(fixture, runtime_kind, false)
+                    .await;
+            let source = write_test_skill(&harness.user_root, "lifecycle", "", "# first\n");
+            let lifecycle_id = seed_cli_runtime_skill_installation(
+                &harness,
+                "tests/lifecycle",
+                "user",
+                source.as_path(),
+            )
+            .await;
+            std::fs::create_dir_all(source.join("references")).unwrap();
+            std::fs::write(source.join("references/guide.txt"), b"guide-v1\n").unwrap();
+            let receipt_path = harness
+                .runtime_home
+                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
+            let destination = harness.native_home.join("skills/lifecycle");
+            let mut first_receipt_snapshot = None;
+            let mut first_destination_snapshot = None;
 
-        for (index, expected_turn_count) in [(1, 1), (2, 2)] {
-            let thread_id = format!("thread_full_turn_{runtime_kind:?}_{index}").to_lowercase();
-            let turn_id = format!("turn_full_turn_{runtime_kind:?}_{index}").to_lowercase();
-            seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
-            let request_id =
-                generate_test_request_id("p51full", format!("{runtime_kind:?}{index}").as_str());
-            let request = cli_runtime_turn_start_request_with_capabilities(
-                &request_id,
-                &thread_id,
-                &turn_id,
+            for (index, expected_turn_count) in [(1, 1), (2, 2)] {
+                let thread_id = format!("thread_full_turn_{runtime_kind:?}_{index}").to_lowercase();
+                let turn_id = format!("turn_full_turn_{runtime_kind:?}_{index}").to_lowercase();
+                seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
+                let request_id = generate_test_request_id(
+                    "p51full",
+                    format!("{runtime_kind:?}{index}").as_str(),
+                );
+                let request = cli_runtime_turn_start_request_with_capabilities(
+                    &request_id,
+                    &thread_id,
+                    &turn_id,
+                    &harness.runtime_id,
+                    runtime_kind,
+                    vec![cli_runtime_skill_capability("tests/lifecycle", "user")],
+                );
+                harness
+                    .processor
+                    .process_request_for_connection(harness.connection_id, &request)
+                    .await;
+                wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, expected_turn_count)
+                    .await;
+                let bindings = harness
+                    .crud_store
+                    .find_turn_skill_bindings(&turn_id)
+                    .await
+                    .expect("must read persisted CLI runtime turn skill bindings")
+                    .into_iter()
+                    .filter(|binding| binding.source_kind != "system")
+                    .collect::<Vec<_>>();
+                assert_eq!(bindings.len(), 1);
+                assert_eq!(bindings[0].skill_id, lifecycle_id);
+                assert_eq!(bindings[0].skill_owner.as_deref(), Some("tests"));
+                assert_eq!(bindings[0].skill_slug, "lifecycle");
+                assert_eq!(bindings[0].source_kind, "user");
+                assert_eq!(bindings[0].resolved_reason, "explicit_composer_capability");
+                assert!(!bindings[0].fingerprint.is_empty());
+                let receipt_snapshot = std::fs::read(&receipt_path).unwrap();
+                let destination_snapshot = std::fs::read(destination.join("SKILL.md")).unwrap();
+                if index == 1 {
+                    first_receipt_snapshot = Some(receipt_snapshot);
+                    first_destination_snapshot = Some(destination_snapshot);
+                } else {
+                    assert_eq!(Some(receipt_snapshot), first_receipt_snapshot);
+                    assert_eq!(Some(destination_snapshot), first_destination_snapshot);
+                }
+            }
+
+            let first_receipt_bytes = first_receipt_snapshot.unwrap();
+            let first_receipt =
+                pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
+            assert_eq!(first_receipt.entries.len(), 5);
+            assert_eq!(first_receipt.entries[0].skill_id, lifecycle_id);
+            assert_eq!(first_receipt.entries[0].owner.as_deref(), Some("tests"));
+            assert_eq!(first_receipt.entries[0].slug, "lifecycle");
+            assert_eq!(first_receipt.entries[0].install_name, "lifecycle");
+            assert_eq!(
+                first_receipt.entries[0].native_skills_root,
+                harness
+                    .native_home
+                    .join("skills")
+                    .to_string_lossy()
+                    .into_owned()
+            );
+            assert_eq!(
+                std::fs::read(destination.join("SKILL.md")).unwrap(),
+                std::fs::read(source.join("SKILL.md")).unwrap()
+            );
+            assert_eq!(
+                std::fs::read(destination.join("references/guide.txt")).unwrap(),
+                b"guide-v1\n"
+            );
+            assert_eq!(std::fs::read(&receipt_path).unwrap(), first_receipt_bytes);
+
+            sleep(Duration::from_millis(2)).await;
+            std::fs::write(
+                source.join("SKILL.md"),
+                b"---\nname: lifecycle\nslug: lifecycle\ndescription: updated\n---\n# updated\n",
+            )
+            .unwrap();
+            std::fs::write(source.join("references/guide.txt"), b"guide-v2\n").unwrap();
+            let update_thread = format!("thread_full_turn_{runtime_kind:?}_3").to_lowercase();
+            let update_turn = format!("turn_full_turn_{runtime_kind:?}_3").to_lowercase();
+            seed_cli_runtime_skill_preflight_thread(&harness, &update_thread).await;
+            let update_request_id = generate_test_request_id("p51full", "update");
+            let update_request = cli_runtime_turn_start_request_with_capabilities(
+                &update_request_id,
+                &update_thread,
+                &update_turn,
                 &harness.runtime_id,
                 runtime_kind,
                 vec![cli_runtime_skill_capability("tests/lifecycle", "user")],
             );
             harness
                 .processor
-                .process_request_for_connection(harness.connection_id, &request)
+                .process_request_for_connection(harness.connection_id, &update_request)
                 .await;
-            wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, expected_turn_count)
-                .await;
-            let bindings = harness
+            wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 3).await;
+            let updated_bindings = harness
                 .crud_store
-                .find_turn_skill_bindings(&turn_id)
+                .find_turn_skill_bindings(&update_turn)
                 .await
-                .expect("must read persisted CLI runtime turn skill bindings")
+                .expect("must read updated CLI runtime turn skill bindings")
                 .into_iter()
                 .filter(|binding| binding.source_kind != "system")
                 .collect::<Vec<_>>();
-            assert_eq!(bindings.len(), 1);
-            assert_eq!(bindings[0].skill_id, lifecycle_id);
-            assert_eq!(bindings[0].skill_owner.as_deref(), Some("tests"));
-            assert_eq!(bindings[0].skill_slug, "lifecycle");
-            assert_eq!(bindings[0].source_kind, "user");
-            assert_eq!(bindings[0].resolved_reason, "explicit_composer_capability");
-            assert!(!bindings[0].fingerprint.is_empty());
-            let receipt_snapshot = std::fs::read(&receipt_path).unwrap();
-            let destination_snapshot = std::fs::read(destination.join("SKILL.md")).unwrap();
-            if index == 1 {
-                first_receipt_snapshot = Some(receipt_snapshot);
-                first_destination_snapshot = Some(destination_snapshot);
-            } else {
-                assert_eq!(Some(receipt_snapshot), first_receipt_snapshot);
-                assert_eq!(Some(destination_snapshot), first_destination_snapshot);
-            }
-        }
+            assert_eq!(updated_bindings.len(), 1);
+            assert_eq!(updated_bindings[0].skill_id, lifecycle_id);
+            assert_eq!(updated_bindings[0].skill_slug, "lifecycle");
 
-        let first_receipt_bytes = first_receipt_snapshot.unwrap();
-        let first_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
-        assert_eq!(first_receipt.entries.len(), 5);
-        assert_eq!(first_receipt.entries[0].skill_id, lifecycle_id);
-        assert_eq!(first_receipt.entries[0].owner.as_deref(), Some("tests"));
-        assert_eq!(first_receipt.entries[0].slug, "lifecycle");
-        assert_eq!(first_receipt.entries[0].install_name, "lifecycle");
-        assert_eq!(
-            first_receipt.entries[0].native_skills_root,
-            harness
-                .native_home
-                .join("skills")
-                .to_string_lossy()
-                .into_owned()
-        );
-        assert_eq!(
-            std::fs::read(destination.join("SKILL.md")).unwrap(),
-            std::fs::read(source.join("SKILL.md")).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(destination.join("references/guide.txt")).unwrap(),
-            b"guide-v1\n"
-        );
-        assert_eq!(std::fs::read(&receipt_path).unwrap(), first_receipt_bytes);
-
-        sleep(Duration::from_millis(2)).await;
-        std::fs::write(
-            source.join("SKILL.md"),
-            b"---\nname: lifecycle\nslug: lifecycle\ndescription: updated\n---\n# updated\n",
-        )
-        .unwrap();
-        std::fs::write(source.join("references/guide.txt"), b"guide-v2\n").unwrap();
-        let update_thread = format!("thread_full_turn_{runtime_kind:?}_3").to_lowercase();
-        let update_turn = format!("turn_full_turn_{runtime_kind:?}_3").to_lowercase();
-        seed_cli_runtime_skill_preflight_thread(&harness, &update_thread).await;
-        let update_request_id = generate_test_request_id("p51full", "update");
-        let update_request = cli_runtime_turn_start_request_with_capabilities(
-            &update_request_id,
-            &update_thread,
-            &update_turn,
-            &harness.runtime_id,
-            runtime_kind,
-            vec![cli_runtime_skill_capability("tests/lifecycle", "user")],
-        );
-        harness
-            .processor
-            .process_request_for_connection(harness.connection_id, &update_request)
-            .await;
-        wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 3).await;
-        let updated_bindings = harness
-            .crud_store
-            .find_turn_skill_bindings(&update_turn)
-            .await
-            .expect("must read updated CLI runtime turn skill bindings")
-            .into_iter()
-            .filter(|binding| binding.source_kind != "system")
-            .collect::<Vec<_>>();
-        assert_eq!(updated_bindings.len(), 1);
-        assert_eq!(updated_bindings[0].skill_id, lifecycle_id);
-        assert_eq!(updated_bindings[0].skill_slug, "lifecycle");
-
-        let updated_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
-        assert_ne!(
-            updated_receipt.entries[0].source_folder_hash,
-            first_receipt.entries[0].source_folder_hash
-        );
-        assert_eq!(
-            std::fs::read(destination.join("SKILL.md")).unwrap(),
-            std::fs::read(source.join("SKILL.md")).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(destination.join("references/guide.txt")).unwrap(),
-            b"guide-v2\n"
-        );
-
-        let receipt_after_update = std::fs::read(&receipt_path).unwrap();
-        let destination_after_update = std::fs::read(destination.join("SKILL.md")).unwrap();
-        let zero_thread = format!("thread_full_turn_{runtime_kind:?}_zero").to_lowercase();
-        let zero_turn = format!("turn_full_turn_{runtime_kind:?}_zero").to_lowercase();
-        seed_cli_runtime_skill_preflight_thread(&harness, &zero_thread).await;
-        let zero_request_id = generate_test_request_id("p51full", "zero");
-        let zero_request = cli_runtime_turn_start_request_with_capabilities(
-            &zero_request_id,
-            &zero_thread,
-            &zero_turn,
-            &harness.runtime_id,
-            runtime_kind,
-            Vec::new(),
-        );
-        harness
-            .processor
-            .process_request_for_connection(harness.connection_id, &zero_request)
-            .await;
-        wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 4).await;
-        let zero_bindings = harness
-            .crud_store
-            .find_turn_skill_bindings(&zero_turn)
-            .await
-            .expect("must read zero-skill CLI runtime turn bindings");
-        assert_eq!(zero_bindings.len(), 4);
-        for slug in ["tasks", "subagents", "html", "threads"] {
-            assert!(
-                zero_bindings
-                    .iter()
-                    .any(|binding| binding.source_kind == "system"
-                        && binding.skill_owner.as_deref() == Some("pioneer")
-                        && binding.skill_slug == slug)
+            let updated_receipt =
+                pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
+            assert_ne!(
+                updated_receipt.entries[0].source_folder_hash,
+                first_receipt.entries[0].source_folder_hash
             );
-        }
-        assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_after_update);
-        assert_eq!(
-            std::fs::read(destination.join("SKILL.md")).unwrap(),
-            destination_after_update
-        );
+            assert_eq!(
+                std::fs::read(destination.join("SKILL.md")).unwrap(),
+                std::fs::read(source.join("SKILL.md")).unwrap()
+            );
+            assert_eq!(
+                std::fs::read(destination.join("references/guide.txt")).unwrap(),
+                b"guide-v2\n"
+            );
+
+            let receipt_after_update = std::fs::read(&receipt_path).unwrap();
+            let destination_after_update = std::fs::read(destination.join("SKILL.md")).unwrap();
+            let zero_thread = format!("thread_full_turn_{runtime_kind:?}_zero").to_lowercase();
+            let zero_turn = format!("turn_full_turn_{runtime_kind:?}_zero").to_lowercase();
+            seed_cli_runtime_skill_preflight_thread(&harness, &zero_thread).await;
+            let zero_request_id = generate_test_request_id("p51full", "zero");
+            let zero_request = cli_runtime_turn_start_request_with_capabilities(
+                &zero_request_id,
+                &zero_thread,
+                &zero_turn,
+                &harness.runtime_id,
+                runtime_kind,
+                Vec::new(),
+            );
+            harness
+                .processor
+                .process_request_for_connection(harness.connection_id, &zero_request)
+                .await;
+            wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 4).await;
+            let zero_bindings = harness
+                .crud_store
+                .find_turn_skill_bindings(&zero_turn)
+                .await
+                .expect("must read zero-skill CLI runtime turn bindings");
+            assert_eq!(zero_bindings.len(), 4);
+            for slug in ["tasks", "subagents", "html", "threads"] {
+                assert!(
+                    zero_bindings
+                        .iter()
+                        .any(|binding| binding.source_kind == "system"
+                            && binding.skill_owner.as_deref() == Some("pioneer")
+                            && binding.skill_slug == slug)
+                );
+            }
+            assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_after_update);
+            assert_eq!(
+                std::fs::read(destination.join("SKILL.md")).unwrap(),
+                destination_after_update
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
 
 #[test]
 fn cli_html_skill_resolves_without_task_tools_or_explicit_attachments() {
     run_standard_stack_message_test("HTML-only CLI skill resolution", async {
-        let harness =
-            setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
-        let resolved = harness
-            .processor
-            .resolve_cli_runtime_skill_attachments(
-                &harness.workspace_id,
-                &[],
-                &pioneer_agent::AgentMcpAvailability::default(),
+        pioneer_postgres_test::with_database(async |fixture| {
+            let harness = setup_postgres_cli_runtime_skill_preflight_harness(
+                fixture,
+                CLIAgentRuntimeKind::Codex,
                 false,
-                false,
-                true,
             )
-            .await
-            .expect("HTML tools alone must require the bundled HTML skill");
-        assert_eq!(resolved.len(), 1);
-        let identity = &resolved[0].definition.identity;
-        assert_eq!(
-            identity.source_kind,
-            pioneer_skills::SkillSourceKind::System
-        );
-        assert_eq!(identity.owner.as_deref(), Some("pioneer"));
-        assert_eq!(identity.slug, "html");
+            .await;
+            let resolved = harness
+                .processor
+                .resolve_cli_runtime_skill_attachments(
+                    &harness.workspace_id,
+                    &[],
+                    &pioneer_agent::AgentMcpAvailability::default(),
+                    false,
+                    false,
+                    true,
+                )
+                .await
+                .expect("HTML tools alone must require the bundled HTML skill");
+            assert_eq!(resolved.len(), 1);
+            let identity = &resolved[0].definition.identity;
+            assert_eq!(
+                identity.source_kind,
+                pioneer_skills::SkillSourceKind::System
+            );
+            assert_eq!(identity.owner.as_deref(), Some("pioneer"));
+            assert_eq!(identity.slug, "html");
+            Ok(())
+        })
+        .await
+        .unwrap();
     });
 }
 
@@ -3481,61 +3545,70 @@ fn cli_runtime_system_skill_rejected_before_write_or_materialization() {
 }
 
 async fn cli_runtime_system_skill_rejected_before_write_or_materialization_impl() {
-    let mut harness =
-        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
-    let skill_path = write_test_skill(
-        &harness.system_root,
-        "memory-like",
-        "implicit-invocation: required",
-        "# system\n",
-    );
-    seed_cli_runtime_skill_installation(
-        &harness,
-        "tests/memory-like",
-        "system",
-        skill_path.as_path(),
-    )
-    .await;
-    let thread_id = "thread_system_preflight";
-    let turn_id = "turn_system_preflight";
-    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
-    let request_id = generate_test_request_id("p51system", "reject");
-    let request = cli_runtime_turn_start_request_with_capabilities(
-        &request_id,
-        thread_id,
-        turn_id,
-        &harness.runtime_id,
-        harness.runtime_kind,
-        vec![cli_runtime_skill_capability("tests/memory-like", "system")],
-    );
-    harness
-        .processor
-        .process_request_for_connection(harness.connection_id, &request)
+    pioneer_postgres_test::with_database(async |fixture| {
+        let mut harness = setup_postgres_cli_runtime_skill_preflight_harness(
+            fixture,
+            CLIAgentRuntimeKind::Codex,
+            false,
+        )
         .await;
-    let error = recv_error_by_id(&mut harness.rx, &request_id).await;
-    assert_public_error(
-        &error,
-        PublicErrorCode::InvalidInput,
-        PublicErrorStage::Admission,
-    );
-    assert!(!harness.native_home.join("skills").exists());
-    assert!(
-        !harness
-            .runtime_home
-            .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
-            .exists()
-    );
-    assert!(harness.cli_session.thread_starts.lock().await.is_empty());
-    assert!(harness.cli_session.turn_starts.lock().await.is_empty());
-    assert!(harness.event_log.lock().await.is_empty());
-    assert!(
+        let skill_path = write_test_skill(
+            &harness.system_root,
+            "memory-like",
+            "implicit-invocation: required",
+            "# system\n",
+        );
+        seed_cli_runtime_skill_installation(
+            &harness,
+            "tests/memory-like",
+            "system",
+            skill_path.as_path(),
+        )
+        .await;
+        let thread_id = "thread_system_preflight";
+        let turn_id = "turn_system_preflight";
+        seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+        let request_id = generate_test_request_id("p51system", "reject");
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &request_id,
+            thread_id,
+            turn_id,
+            &harness.runtime_id,
+            harness.runtime_kind,
+            vec![cli_runtime_skill_capability("tests/memory-like", "system")],
+        );
         harness
-            .crud_store
-            .get_turn(thread_id, turn_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
+            .processor
+            .process_request_for_connection(harness.connection_id, &request)
+            .await;
+        let error = recv_error_by_id(&mut harness.rx, &request_id).await;
+        assert_public_error(
+            &error,
+            PublicErrorCode::InvalidInput,
+            PublicErrorStage::Admission,
+        );
+        assert!(!harness.native_home.join("skills").exists());
+        assert!(
+            !harness
+                .runtime_home
+                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
+                .exists()
+        );
+        assert!(harness.cli_session.thread_starts.lock().await.is_empty());
+        assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+        assert!(harness.event_log.lock().await.is_empty());
+        assert!(
+            harness
+                .crud_store
+                .get_turn(thread_id, turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -3547,61 +3620,70 @@ fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow() {
 }
 
 async fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow_impl() {
-    let mut harness =
-        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
-    let skill_path = write_test_skill(&harness.system_root, "memory-like", "", "# system\n");
-    seed_cli_runtime_skill_installation(
-        &harness,
-        "tests/memory-like",
-        "system",
-        skill_path.as_path(),
-    )
-    .await;
-    let thread_id = "thread_native_system_control";
-    let turn_id = "turn_native_system_control";
-    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
-    let request_id = generate_test_request_id("p51native", "system");
-    let mut request: JsonValue = serde_json::from_str(&cli_runtime_turn_start_request(
-        &request_id,
-        thread_id,
-        turn_id,
-        serde_json::to_value(AgentExecutionBackend::ApiProvider {
-            provider: "openai".to_owned(),
-        })
-        .unwrap(),
-        "full_access",
-        "use selected system skill",
-        None,
-    ))
-    .unwrap();
-    request["params"]["capabilities"] = JsonValue::Array(vec![cli_runtime_skill_capability(
-        "tests/memory-like",
-        "system",
-    )]);
-
-    harness
-        .processor
-        .process_request_for_connection(harness.connection_id, request.to_string().as_str())
+    pioneer_postgres_test::with_database(async |fixture| {
+        let mut harness = setup_postgres_cli_runtime_skill_preflight_harness(
+            fixture,
+            CLIAgentRuntimeKind::Codex,
+            false,
+        )
         .await;
-    let _ = recv_response_by_id(&mut harness.rx, &request_id).await;
+        let skill_path = write_test_skill(&harness.system_root, "memory-like", "", "# system\n");
+        seed_cli_runtime_skill_installation(
+            &harness,
+            "tests/memory-like",
+            "system",
+            skill_path.as_path(),
+        )
+        .await;
+        let thread_id = "thread_native_system_control";
+        let turn_id = "turn_native_system_control";
+        seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+        let request_id = generate_test_request_id("p51native", "system");
+        let mut request: JsonValue = serde_json::from_str(&cli_runtime_turn_start_request(
+            &request_id,
+            thread_id,
+            turn_id,
+            serde_json::to_value(AgentExecutionBackend::ApiProvider {
+                provider: "openai".to_owned(),
+            })
+            .unwrap(),
+            "full_access",
+            "use selected system skill",
+            None,
+        ))
+        .unwrap();
+        request["params"]["capabilities"] = JsonValue::Array(vec![cli_runtime_skill_capability(
+            "tests/memory-like",
+            "system",
+        )]);
 
-    assert!(
         harness
-            .crud_store
-            .get_turn(thread_id, turn_id)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(harness.cli_session.thread_starts.lock().await.is_empty());
-    assert!(harness.cli_session.turn_starts.lock().await.is_empty());
-    assert!(!harness.native_home.join("skills").exists());
-    assert!(
-        !harness
-            .runtime_home
-            .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
-            .exists()
-    );
+            .processor
+            .process_request_for_connection(harness.connection_id, request.to_string().as_str())
+            .await;
+        let _ = recv_response_by_id(&mut harness.rx, &request_id).await;
+
+        assert!(
+            harness
+                .crud_store
+                .get_turn(thread_id, turn_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(harness.cli_session.thread_starts.lock().await.is_empty());
+        assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+        assert!(!harness.native_home.join("skills").exists());
+        assert!(
+            !harness
+                .runtime_home
+                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
+                .exists()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -3613,37 +3695,51 @@ fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
 }
 
 async fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart_impl() {
-    let harness =
-        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
-    let skill_path = write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
-    seed_cli_runtime_skill_installation(&harness, "tests/refresh", "user", skill_path.as_path())
+    pioneer_postgres_test::with_database(async |fixture| {
+        let harness = setup_postgres_cli_runtime_skill_preflight_harness(
+            fixture,
+            CLIAgentRuntimeKind::Codex,
+            false,
+        )
         .await;
-    let thread_id = "thread_codex_skill_refresh";
-    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
-    let session_key = CLIAgentRuntimeSessionKey::new(
-        harness.workspace_id.clone(),
-        harness.runtime_id.clone(),
-        thread_id,
-    )
-    .unwrap();
-    harness.cli_manager.get_or_start(session_key).await.unwrap();
-    sleep(Duration::from_millis(2)).await;
+        let skill_path = write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
+        seed_cli_runtime_skill_installation(
+            &harness,
+            "tests/refresh",
+            "user",
+            skill_path.as_path(),
+        )
+        .await;
+        let thread_id = "thread_codex_skill_refresh";
+        seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+        let session_key = CLIAgentRuntimeSessionKey::new(
+            harness.workspace_id.clone(),
+            harness.runtime_id.clone(),
+            thread_id,
+        )
+        .unwrap();
+        harness.cli_manager.get_or_start(session_key).await.unwrap();
+        sleep(Duration::from_millis(2)).await;
 
-    let request_id = generate_test_request_id("p51refresh", "codex");
-    let request = cli_runtime_turn_start_request_with_capabilities(
-        &request_id,
-        thread_id,
-        "turn_codex_skill_refresh",
-        &harness.runtime_id,
-        harness.runtime_kind,
-        vec![cli_runtime_skill_capability("tests/refresh", "user")],
-    );
-    harness
-        .processor
-        .process_request_for_connection(harness.connection_id, &request)
-        .await;
-    wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
-    assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
+        let request_id = generate_test_request_id("p51refresh", "codex");
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &request_id,
+            thread_id,
+            "turn_codex_skill_refresh",
+            &harness.runtime_id,
+            harness.runtime_kind,
+            vec![cli_runtime_skill_capability("tests/refresh", "user")],
+        );
+        harness
+            .processor
+            .process_request_for_connection(harness.connection_id, &request)
+            .await;
+        wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+        assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -3663,56 +3759,70 @@ fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
 }
 
 async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_impl() {
-    let harness =
-        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Claude, false).await;
-    let skill_path = write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
-    seed_cli_runtime_skill_installation(&harness, "tests/refresh", "user", skill_path.as_path())
+    pioneer_postgres_test::with_database(async |fixture| {
+        let harness = setup_postgres_cli_runtime_skill_preflight_harness(
+            fixture,
+            CLIAgentRuntimeKind::Claude,
+            false,
+        )
         .await;
-    let thread_id = "thread_claude_skill_refresh";
-    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
-    let session_key = CLIAgentRuntimeSessionKey::new(
-        harness.workspace_id.clone(),
-        harness.runtime_id.clone(),
-        thread_id,
-    )
-    .unwrap();
-    harness.cli_manager.get_or_start(session_key).await.unwrap();
-    sleep(Duration::from_millis(2)).await;
+        let skill_path = write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
+        seed_cli_runtime_skill_installation(
+            &harness,
+            "tests/refresh",
+            "user",
+            skill_path.as_path(),
+        )
+        .await;
+        let thread_id = "thread_claude_skill_refresh";
+        seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+        let session_key = CLIAgentRuntimeSessionKey::new(
+            harness.workspace_id.clone(),
+            harness.runtime_id.clone(),
+            thread_id,
+        )
+        .unwrap();
+        harness.cli_manager.get_or_start(session_key).await.unwrap();
+        sleep(Duration::from_millis(2)).await;
 
-    let request_id = generate_test_request_id("p51refresh", "claude");
-    let request = cli_runtime_turn_start_request_with_capabilities(
-        &request_id,
-        thread_id,
-        "turn_claude_skill_refresh",
-        &harness.runtime_id,
-        harness.runtime_kind,
-        vec![cli_runtime_skill_capability("tests/refresh", "user")],
-    );
-    harness
-        .processor
-        .process_request_for_connection(harness.connection_id, &request)
-        .await;
-    let native = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
-    assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
-    let input = native.input.as_array().unwrap();
-    let context = input
-        .first()
-        .and_then(|item| item["text"].as_str())
-        .expect("turn context should precede native user input after session restart");
-    let directive = "Invoke every selected skill through Claude's native Skill tool";
-    assert!(context.contains(directive));
-    assert!(context.contains("- refresh"));
-    assert!(!native.elevated_instructions.text().contains(directive));
-    assert!(!native.elevated_instructions.text().contains("- refresh"));
-    assert_eq!(
-        input
-            .iter()
-            .filter_map(|item| item["text"].as_str())
-            .filter(|text| text.contains(directive))
-            .count(),
-        1,
-        "selected skill should be delivered once after session restart"
-    );
+        let request_id = generate_test_request_id("p51refresh", "claude");
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &request_id,
+            thread_id,
+            "turn_claude_skill_refresh",
+            &harness.runtime_id,
+            harness.runtime_kind,
+            vec![cli_runtime_skill_capability("tests/refresh", "user")],
+        );
+        harness
+            .processor
+            .process_request_for_connection(harness.connection_id, &request)
+            .await;
+        let native = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+        assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
+        let input = native.input.as_array().unwrap();
+        let context = input
+            .first()
+            .and_then(|item| item["text"].as_str())
+            .expect("turn context should precede native user input after session restart");
+        let directive = "Invoke every selected skill through Claude's native Skill tool";
+        assert!(context.contains(directive));
+        assert!(context.contains("- refresh"));
+        assert!(!native.elevated_instructions.text().contains(directive));
+        assert!(!native.elevated_instructions.text().contains("- refresh"));
+        assert_eq!(
+            input
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .filter(|text| text.contains(directive))
+                .count(),
+            1,
+            "selected skill should be delivered once after session restart"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -3724,60 +3834,69 @@ fn claude_skill_not_model_invocable_rejects_before_write_and_native() {
 }
 
 async fn claude_skill_not_model_invocable_rejects_before_write_and_native_impl() {
-    let mut harness =
-        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Claude, false).await;
-    let skill_path = write_test_skill(
-        &harness.user_root,
-        "manual-only",
-        "disable-model-invocation: true",
-        "# manual only\n",
-    );
-    seed_cli_runtime_skill_installation(
-        &harness,
-        "tests/manual-only",
-        "user",
-        skill_path.as_path(),
-    )
-    .await;
-    let thread_id = "thread_claude_manual_skill";
-    let turn_id = "turn_claude_manual_skill";
-    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
-    let request_id = generate_test_request_id("p51claude", "blocked");
-    let request = cli_runtime_turn_start_request_with_capabilities(
-        &request_id,
-        thread_id,
-        turn_id,
-        &harness.runtime_id,
-        harness.runtime_kind,
-        vec![cli_runtime_skill_capability("tests/manual-only", "user")],
-    );
-    harness
-        .processor
-        .process_request_for_connection(harness.connection_id, &request)
+    pioneer_postgres_test::with_database(async |fixture| {
+        let mut harness = setup_postgres_cli_runtime_skill_preflight_harness(
+            fixture,
+            CLIAgentRuntimeKind::Claude,
+            false,
+        )
         .await;
-    let error = recv_error_by_id(&mut harness.rx, &request_id).await;
-    assert_public_error(
-        &error,
-        PublicErrorCode::Internal,
-        PublicErrorStage::Admission,
-    );
-    assert!(!harness.native_home.join("skills").exists());
-    assert!(
-        !harness
-            .runtime_home
-            .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
-            .exists()
-    );
-    assert!(harness.cli_session.thread_starts.lock().await.is_empty());
-    assert!(harness.event_log.lock().await.is_empty());
-    assert!(
+        let skill_path = write_test_skill(
+            &harness.user_root,
+            "manual-only",
+            "disable-model-invocation: true",
+            "# manual only\n",
+        );
+        seed_cli_runtime_skill_installation(
+            &harness,
+            "tests/manual-only",
+            "user",
+            skill_path.as_path(),
+        )
+        .await;
+        let thread_id = "thread_claude_manual_skill";
+        let turn_id = "turn_claude_manual_skill";
+        seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+        let request_id = generate_test_request_id("p51claude", "blocked");
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &request_id,
+            thread_id,
+            turn_id,
+            &harness.runtime_id,
+            harness.runtime_kind,
+            vec![cli_runtime_skill_capability("tests/manual-only", "user")],
+        );
         harness
-            .crud_store
-            .get_turn(thread_id, turn_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
+            .processor
+            .process_request_for_connection(harness.connection_id, &request)
+            .await;
+        let error = recv_error_by_id(&mut harness.rx, &request_id).await;
+        assert_public_error(
+            &error,
+            PublicErrorCode::Internal,
+            PublicErrorStage::Admission,
+        );
+        assert!(!harness.native_home.join("skills").exists());
+        assert!(
+            !harness
+                .runtime_home
+                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
+                .exists()
+        );
+        assert!(harness.cli_session.thread_starts.lock().await.is_empty());
+        assert!(harness.event_log.lock().await.is_empty());
+        assert!(
+            harness
+                .crud_store
+                .get_turn(thread_id, turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -3934,44 +4053,53 @@ async fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_ef
             PublicErrorCode::InvalidInput,
         ),
     ] {
-        let mut harness =
-            setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
-        let thread_id = format!("thread_{suffix}_preflight");
-        let turn_id = format!("turn_{suffix}_preflight");
-        let request_id = generate_test_request_id("p51failure", suffix);
-        seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
-        let request = cli_runtime_turn_start_request_with_capabilities(
-            &request_id,
-            &thread_id,
-            &turn_id,
-            &harness.runtime_id,
-            harness.runtime_kind,
-            capabilities,
-        );
-        harness
-            .processor
-            .process_request_for_connection(harness.connection_id, &request)
+        pioneer_postgres_test::with_database(async |fixture| {
+            let mut harness = setup_postgres_cli_runtime_skill_preflight_harness(
+                fixture,
+                CLIAgentRuntimeKind::Codex,
+                false,
+            )
             .await;
-        let error = recv_error_by_id(&mut harness.rx, &request_id).await;
-        assert_public_error(&error, expected_code, PublicErrorStage::Admission);
-        assert!(harness.cli_session.thread_starts.lock().await.is_empty());
-        assert!(harness.cli_session.turn_starts.lock().await.is_empty());
-        assert!(harness.event_log.lock().await.is_empty());
-        assert!(!harness.native_home.join("skills").exists());
-        assert!(
-            !harness
-                .runtime_home
-                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
-                .exists()
-        );
-        assert!(
+            let thread_id = format!("thread_{suffix}_preflight");
+            let turn_id = format!("turn_{suffix}_preflight");
+            let request_id = generate_test_request_id("p51failure", suffix);
+            seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
+            let request = cli_runtime_turn_start_request_with_capabilities(
+                &request_id,
+                &thread_id,
+                &turn_id,
+                &harness.runtime_id,
+                harness.runtime_kind,
+                capabilities,
+            );
             harness
-                .crud_store
-                .get_turn(&thread_id, &turn_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
+                .processor
+                .process_request_for_connection(harness.connection_id, &request)
+                .await;
+            let error = recv_error_by_id(&mut harness.rx, &request_id).await;
+            assert_public_error(&error, expected_code, PublicErrorStage::Admission);
+            assert!(harness.cli_session.thread_starts.lock().await.is_empty());
+            assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+            assert!(harness.event_log.lock().await.is_empty());
+            assert!(!harness.native_home.join("skills").exists());
+            assert!(
+                !harness
+                    .runtime_home
+                    .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
+                    .exists()
+            );
+            assert!(
+                harness
+                    .crud_store
+                    .get_turn(&thread_id, &turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
 
@@ -6025,7 +6153,7 @@ fn phase_21_message_processor_starts_generic_hook_recovery_worker() {
     });
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_settings_update_reinstalls_memory_hook_runtime() {
     let mut harness = setup_memory_gateway_harness("settings_reinstall_memory_hooks", true).await;
     harness.processor.bind_memory_bridge_if_enabled().await;
@@ -7911,7 +8039,7 @@ async fn setup_provider_api_key_processor(
     )
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn data_notifications_do_not_advance_authorization_generation() {
     let (processor, _, mut rx, _, _, workspace_id, _) =
         setup_provider_api_key_processor("catalog_notifications_policy").await;
@@ -8007,7 +8135,7 @@ async fn data_notifications_do_not_advance_authorization_generation() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     let (
         processor,
@@ -8321,7 +8449,7 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     assert!(delete_openai_payload.deleted);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn provider_configure_and_list_round_trips_custom_base_url() {
     crate::compaction::load_test_catalog();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8537,7 +8665,7 @@ async fn provider_configure_and_list_round_trips_custom_base_url() {
     assert!(openai_summary2.base_url.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn provider_configure_rejects_invalid_or_unsupported_base_url_before_any_write() {
     let (processor, _, mut rx, connection_id, _, workspace_id, _) =
         setup_provider_api_key_processor("provider_invalid_base_url").await;
@@ -8589,7 +8717,7 @@ async fn provider_configure_rejects_invalid_or_unsupported_base_url_before_any_w
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn partial_base_url_write_failure_reconciles_only_its_workspace_authority() {
     let (mut processor, _, mut rx, connection_id, _, workspace_id, _) =
         setup_provider_api_key_processor("partial_base_url_failure").await;
@@ -8704,7 +8832,7 @@ async fn partial_base_url_write_failure_reconciles_only_its_workspace_authority(
     ));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn base_url_only_compatible_provider_is_available_without_authenticating_others() {
     let (processor, _, mut rx, connection_id, _, workspace_id, _) =
         setup_provider_api_key_processor("provider_base_url_only").await;
@@ -8765,7 +8893,7 @@ async fn base_url_only_compatible_provider_is_available_without_authenticating_o
     assert!(!warmup.contains("gemini"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn provider_set_api_key_rejects_empty_key_without_store_write() {
     let (
         processor,
@@ -8802,7 +8930,7 @@ async fn provider_set_api_key_rejects_empty_key_without_store_write() {
     assert!(entries.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn provider_list_transcription_models_covers_success_and_validation_errors() {
     let (
         processor,
@@ -10893,7 +11021,7 @@ fn web_fetch_item(item_id: &str) -> TurnItem {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn service_items_cannot_gain_markdown_from_stream_or_payload() {
     let mut harness =
         setup_progress_delta_harness("markdown_denied", command_execution_item("denied"), true)
@@ -11017,7 +11145,7 @@ async fn service_items_cannot_gain_markdown_from_stream_or_payload() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unknown_and_late_resolved_items_keep_raw_delta_until_a_full_snapshot() {
     let mut harness =
         setup_progress_delta_harness("markdown_late", command_execution_item("known_tool"), true)
@@ -11294,7 +11422,7 @@ fn replay_markdown_requires_an_allowed_snapshot_and_preserves_its_full_source() 
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn markdown_lifecycle_replaces_denied_items_and_isolates_turns_and_missing_prefixes() {
     let harness = setup_progress_delta_harness(
         "markdown_lifecycle",
@@ -11427,7 +11555,7 @@ async fn markdown_lifecycle_replaces_denied_items_and_isolates_turns_and_missing
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn gateway_missing_prefix_fallback_replaces_stale_client_markdown_and_recovers() {
     use pioneer_client::core::{ClientCore, ClientScope};
     use pioneer_client::timeline::item_presentation::TimelineItemPresentation;
@@ -11946,7 +12074,7 @@ async fn gateway_missing_prefix_fallback_replaces_stale_client_markdown_and_reco
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_draft_buffer() {
     let harness = setup_progress_delta_harness(
         "provider_preview",
@@ -12033,7 +12161,7 @@ async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_d
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn assistant_progress_delta_is_live_only_and_completed_item_is_durable() {
     for (case, phase) in [
         (
@@ -12137,7 +12265,7 @@ async fn assistant_progress_delta_is_live_only_and_completed_item_is_durable() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn commentary_completion_does_not_enter_gateway_final_accounting() {
     let harness = setup_progress_delta_harness(
         "commentary_accounting",
@@ -12194,7 +12322,7 @@ async fn commentary_completion_does_not_enter_gateway_final_accounting() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_progress_does_not_write_the_policy_generation_row() {
     let harness = setup_progress_delta_harness(
         "policyhotpath",
@@ -12255,7 +12383,7 @@ async fn repeated_progress_does_not_write_the_policy_generation_row() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn retiring_progress_state_drops_the_item_cache_and_execution_lease() {
     let harness = setup_progress_delta_harness(
         "progressretire",
@@ -12336,7 +12464,7 @@ async fn retiring_progress_state_drops_the_item_cache_and_execution_lease() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn reasoning_and_user_progress_preserve_existing_content_and_heartbeat() {
     for (case, item, prefix) in [
         (
@@ -12436,7 +12564,7 @@ async fn reasoning_and_user_progress_preserve_existing_content_and_heartbeat() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn command_output_is_persisted_before_ack_and_survives_live_progress_cleanup() {
     let mut harness = setup_progress_delta_harness(
         "stdout",
@@ -12583,7 +12711,7 @@ async fn command_output_is_persisted_before_ack_and_survives_live_progress_clean
     assert_eq!(rows.len(), chunks.len());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn command_output_log_read_pages_are_ordered_and_bounded() {
     let harness = setup_progress_delta_harness(
         "paged-output",
@@ -12644,7 +12772,7 @@ async fn command_output_log_read_pages_are_ordered_and_bounded() {
     assert_eq!(values[1]["stream"], "stderr");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn generic_non_shell_tool_progress_delta_is_live_only() {
     let harness = setup_progress_delta_harness(
         "web_fetch",
@@ -13388,26 +13516,6 @@ async fn materialize_loaded_test_thread_for_durable_operation(
 #[path = "tests/composer_history.rs"]
 mod composer_history;
 
-// Production canonical payloads are exposed through sqlite-zstd views. Keep
-// both Composer ingress tests on that schema so hidden-rowid regressions fail
-// at the same admission boundary as installed databases.
-async fn enable_composer_history_compression(store: &CrudStore) {
-    let db = store.with_maintenance_access().database_connection();
-    for table in ["turn_item", "turn_event"] {
-        let config = serde_json::json!({
-            "table": table, "column": "payload", "compression_level": 3,
-            "dict_chooser": "'[nodict]'"
-        });
-        db.query_one_write_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "SELECT zstd_enable_transparent(?)",
-            [config.to_string().into()],
-        ))
-        .await
-        .expect("enable canonical history compression");
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground()
 {
@@ -13431,7 +13539,6 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
         pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
         let (workspace_manager, crud_store, workspace_id) =
             setup_postgres_workspace_manager(fixture).await;
-        enable_composer_history_compression(crud_store.as_ref()).await;
         let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("valid pack id");
         let first_skill_id =
             pioneer_protocol::SkillId::new("A".repeat(21)).expect("first skill id");
@@ -15890,9 +15997,7 @@ async fn detached_composer_live_ordering_impl() {
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let threads = Arc::new(ThreadManager::new("test-model", "openai"));
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     let (workspaces, store, workspace) = setup_workspace_manager().await;
-    enable_composer_history_compression(store.as_ref()).await;
     sessions
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
@@ -18435,8 +18540,8 @@ fn owned_voice_ingress_case(
         if action.starts_with("revocation") {
             crud.database_connection()
                 .execute_raw(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DbBackend::Sqlite,
-                    "DELETE FROM workspace_membership WHERE principal_id=? AND workspace_id=?",
+                    sea_orm::DbBackend::Postgres,
+                    "DELETE FROM workspace_membership WHERE principal_id=$1 AND workspace_id=$2",
                     [
                         TEST_COLLABORATOR_PRINCIPAL_ID.to_owned().into(),
                         workspace_id.clone().into(),
@@ -19232,7 +19337,6 @@ async fn collaborative_voice_composer_admits_detached_task() {
         pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
         let (workspace_manager, crud_store, workspace_id) =
             setup_postgres_workspace_manager(fixture).await;
-        enable_composer_history_compression(crud_store.as_ref()).await;
         let provider = Arc::new(CaptureSummaryProvider::new("must run in child"));
         let processor = Arc::new(
             MessageProcessor::new(
@@ -19431,7 +19535,7 @@ async fn task_run_voice_composer_stays_foreground() {
             vec![],
         ),
         (
-            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task_voice_task_run',?,'thread','thr_voice_task_root','thr_voice_task_root','turn_voice_task_root','agent','completed','Voice child','fixture')",
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task_voice_task_run',$1,'thread','thr_voice_task_root','thr_voice_task_root','turn_voice_task_root','agent','completed','Voice child','fixture')",
             vec![workspace_id.clone().into()],
         ),
         (
@@ -19443,14 +19547,14 @@ async fn task_run_voice_composer_stays_foreground() {
             vec![],
         ),
         (
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) VALUES('run_voice_task_run','task_voice_task_run',?,'thr_voice_task_root','turn_voice_task_root','[]',CURRENT_TIMESTAMP,NULL)",
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) VALUES('run_voice_task_run','task_voice_task_run',$1,'thr_voice_task_root','turn_voice_task_root','[]',CURRENT_TIMESTAMP,NULL)",
             vec![workspace_id.clone().into()],
         ),
     ] {
         crud_store
             .database_connection()
             .execute_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DbBackend::Sqlite,
+                sea_orm::DbBackend::Postgres,
                 sql,
                 values,
             ))
@@ -21272,7 +21376,7 @@ async fn setup_binary_ingress_processor() -> (
     )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn binary_ingress_rejects_unregistered_connections_before_decoding_every_family() {
     let (
         processor,
@@ -24272,7 +24376,7 @@ async fn committed_workspace_revoke_evicts_only_affected_live_state() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn artifact_binary_ingress_is_context_bound_and_rejects_malformed_frames_without_mutation() {
     for overloaded in [false, true] {
         artifact_binary_ingress_case(overloaded).await;
@@ -24430,7 +24534,7 @@ async fn artifact_binary_ingress_case(overloaded: bool) {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn skill_binary_ingress_is_context_bound_and_rejects_malformed_frames_without_mutation() {
     for overloaded in [false, true] {
         skill_binary_ingress_case(overloaded).await;
@@ -24565,7 +24669,7 @@ async fn skill_binary_ingress_case(overloaded: bool) {
     assert_eq!(after_owner.received_bytes, chunk.len() as u64);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn voice_binary_ingress_is_context_bound_and_rejects_malformed_frames_without_mutation() {
     let (
         processor,
@@ -25993,9 +26097,13 @@ where
 {
     let runtime = crate::build_gateway_runtime()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
-    let result = runtime.block_on(async move { tokio::spawn(Box::pin(future)).await });
+    let result = runtime.block_on(async move {
+        tokio::spawn(Box::pin(pioneer_postgres_test::with_test_databases(future))).await
+    });
     runtime.shutdown_timeout(Duration::from_secs(5));
-    result.unwrap_or_else(|error| panic!("{name} task should finish: {error}"));
+    result
+        .unwrap_or_else(|error| panic!("{name} task should finish: {error}"))
+        .expect("close isolated PostgreSQL test databases");
 }
 
 #[test]
@@ -26171,7 +26279,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
     if inject_queue_failure {
         use sea_orm::ConnectionTrait;
         crud_store.database_connection().execute_unprepared(
-            "CREATE TEMP TRIGGER compaction_test_queue_failure AFTER INSERT ON compaction_delivery_output BEGIN SELECT RAISE(ABORT,'injected output queue failure'); END"
+            "CREATE FUNCTION compaction_test_queue_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected output queue failure'; END; $$; CREATE TRIGGER compaction_test_queue_failure AFTER INSERT ON compaction_delivery_output FOR EACH ROW EXECUTE FUNCTION compaction_test_queue_failure()"
         ).await.expect("install temporary writer fault");
         let failed_id = generate_test_request_id("taskaccept", "fault");
         processor.process_request_for_connection(connection_id, &json!({
@@ -26204,7 +26312,9 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
         );
         crud_store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER compaction_test_queue_failure")
+            .execute_unprepared(
+                "DROP TRIGGER compaction_test_queue_failure ON compaction_delivery_output",
+            )
             .await
             .unwrap();
     }
@@ -30720,261 +30830,266 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
     run_large_history_message_test("composer-cli-skill-pack", async {
         for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
             for select_pack in [true, false] {
-                let mut harness =
-                    setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
-                let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).unwrap();
-                let skill_ids =
-                    ["A", "B"].map(|id| pioneer_protocol::SkillId::new(id.repeat(21)).unwrap());
-                let children = skill_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(index, skill_id)| {
-                        let slug = format!("packed-{index}");
-                        let path =
-                            write_test_skill(&harness.user_root, &slug, "", "selected skill body");
-                        SkillInstallationRecord {
-                            skill_id: skill_id.clone(),
-                            owner: Some("tests".to_owned()),
-                            slug: slug.clone(),
-                            version: None,
-                            source_kind: "user".to_owned(),
-                            scope_key: harness.workspace_id.clone(),
-                            source_ref: format!("test:{slug}"),
-                            install_path: path.display().to_string(),
-                            trust_level: "community".to_owned(),
-                            fingerprint: format!("fingerprint:{slug}"),
-                            updated_at_unix: 1,
-                            pack_id: Some(pack_id.clone()),
-                            pack_member_key: Some(slug),
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                harness
-                    .crud_store
-                    .insert_skill_pack_installation_with_children(
-                        &SkillPackInstallationRecord {
-                            pack_id: pack_id.clone(),
-                            name: "Selected Pack".to_owned(),
-                            scope_key: harness.workspace_id.clone(),
-                            source_kind: "user".to_owned(),
-                            created_at_unix: 1,
-                            updated_at_unix: 1,
-                        },
-                        &children,
-                    )
-                    .await
-                    .unwrap();
-                harness
-                    .cli_session
-                    .enable_projected_mcp_metadata(harness.crud_store.clone())
-                    .await;
-                let processor = Arc::new(harness.processor);
-                processor.bind_task_bridge().await;
-                processor.start_task_event_listener().await;
-                let parent = "thr_composer_cli_pack";
-                let source = "turn_composer_cli_pack";
-                let model = match runtime_kind {
-                    CLIAgentRuntimeKind::Codex => "gpt-5",
-                    CLIAgentRuntimeKind::Claude => "claude-sonnet",
-                    CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
-                };
-                let thread = harness
-                    .thread_manager
-                    .thread_start_seeded(
-                        harness.connection_id,
-                        harness.workspace_id.clone(),
-                        ThreadStartParams {
-                            thread_id: parent.to_owned(),
-                            workspace_id: harness.workspace_id.clone(),
-                            name: None,
-                            model: Some(model.to_owned()),
-                            model_provider: Some("openai".to_owned()),
-                            sandbox: Some(SandboxMode::FullAccess),
-                            mode: Some(ThreadMode::Agent),
-                            origin_kind: Some(ThreadOriginKind::Collaborative),
-                            sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
-                            visibility: None,
-                            agent_nickname: None,
-                            agent_role: None,
-                        },
-                        None,
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                harness
-                    .crud_store
-                    .upsert_thread_model(
-                        &thread.response.thread,
-                        pioneer_protocol::PersistedActorRef::System,
-                    )
-                    .await
-                    .unwrap();
-                let capabilities = if select_pack {
-                    vec![TurnCapability {
-                        id: pioneer_protocol::skill_pack_capability_key(&pack_id),
-                        kind: TurnCapabilityKind::SkillPack {
-                            pack_id: pack_id.clone(),
-                        },
-                        label: Some("Selected Pack".to_owned()),
-                    }]
-                } else {
-                    skill_ids
+                pioneer_postgres_test::with_database(async |fixture| {
+                    let mut harness =
+                        setup_postgres_cli_runtime_skill_preflight_harness(fixture, runtime_kind, false).await;
+                    let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).unwrap();
+                    let skill_ids =
+                        ["A", "B"].map(|id| pioneer_protocol::SkillId::new(id.repeat(21)).unwrap());
+                    let children = skill_ids
                         .iter()
-                        .map(|skill_id| TurnCapability {
-                            id: pioneer_protocol::skill_capability_key(skill_id),
-                            kind: TurnCapabilityKind::Skill {
+                        .enumerate()
+                        .map(|(index, skill_id)| {
+                            let slug = format!("packed-{index}");
+                            let path =
+                                write_test_skill(&harness.user_root, &slug, "", "selected skill body");
+                            SkillInstallationRecord {
                                 skill_id: skill_id.clone(),
+                                owner: Some("tests".to_owned()),
+                                slug: slug.clone(),
+                                version: None,
+                                source_kind: "user".to_owned(),
+                                scope_key: harness.workspace_id.clone(),
+                                source_ref: format!("test:{slug}"),
+                                install_path: path.display().to_string(),
+                                trust_level: "community".to_owned(),
+                                fingerprint: format!("fingerprint:{slug}"),
+                                updated_at_unix: 1,
                                 pack_id: Some(pack_id.clone()),
-                            },
-                            label: None,
+                                pack_member_key: Some(slug),
+                            }
                         })
-                        .collect()
-                };
-                let request_id = generate_test_request_id("pack", "composer");
-                harness
-                    .cli_session
-                    .set_next_native_turn_id("native_pack_turn".to_owned())
-                    .await;
-                let context = processor
-                    .session_manager
-                    .connection_context(harness.connection_id)
-                    .await
-                    .unwrap();
-                processor.clone().process_owned_request(context, json!({
-                    "jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":{
-                        "thread_id":parent, "turn_id":source,
-                        "input":[{"type":"text","text":"use selected skills"}],
-                        "capabilities":capabilities, "model":model, "mode":"Agent",
-                        "execution_backend":{"type":"cliAgentRuntime","runtime_id":harness.runtime_id,"runtime_kind":runtime_kind},
-                        "permission_profile":{"mode":"full_access"}
-                    }
-                }).to_string()).await;
-                let response = recv_response_by_id(&mut harness.rx, &request_id).await;
-                let _: pioneer_protocol::TurnStartResponse =
-                    serde_json::from_value(response.result).unwrap();
-                let tasks = processor
-                    .task_runtime
-                    .service()
-                    .list_tasks(pioneer_protocol::TaskListParams {
-                        workspace_id: harness.workspace_id.clone(),
-                        owner_kind: Some(TaskOwnerKind::Thread),
-                        owner_id: Some(parent.to_owned()),
-                        limit: Some(10),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap();
-                assert_eq!(tasks.tasks.len(), 1);
-                let starts = wait_for_cli_runtime_turn_starts(&harness.cli_session, 1).await;
-                let task = harness
-                    .crud_store
-                    .get_task(&tasks.tasks[0].id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    starts.len(),
-                    1,
-                    "{runtime_kind:?} select_pack={select_pack}: task={:?}, run={:?}, turns={:?}",
-                    task.task.error,
-                    task.runs[0].error,
+                        .collect::<Vec<_>>();
                     harness
                         .crud_store
-                        .list_task_run_turns(&task.runs[0].id)
+                        .insert_skill_pack_installation_with_children(
+                            &SkillPackInstallationRecord {
+                                pack_id: pack_id.clone(),
+                                name: "Selected Pack".to_owned(),
+                                scope_key: harness.workspace_id.clone(),
+                                source_kind: "user".to_owned(),
+                                created_at_unix: 1,
+                                updated_at_unix: 1,
+                            },
+                            &children,
+                        )
+                        .await
+                        .unwrap();
+                    harness
+                        .cli_session
+                        .enable_projected_mcp_metadata(harness.crud_store.clone())
+                        .await;
+                    let processor = Arc::new(harness.processor);
+                    processor.bind_task_bridge().await;
+                    processor.start_task_event_listener().await;
+                    let parent = "thr_composer_cli_pack";
+                    let source = "turn_composer_cli_pack";
+                    let model = match runtime_kind {
+                        CLIAgentRuntimeKind::Codex => "gpt-5",
+                        CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                        CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
+                    };
+                    let thread = harness
+                        .thread_manager
+                        .thread_start_seeded(
+                            harness.connection_id,
+                            harness.workspace_id.clone(),
+                            ThreadStartParams {
+                                thread_id: parent.to_owned(),
+                                workspace_id: harness.workspace_id.clone(),
+                                name: None,
+                                model: Some(model.to_owned()),
+                                model_provider: Some("openai".to_owned()),
+                                sandbox: Some(SandboxMode::FullAccess),
+                                mode: Some(ThreadMode::Agent),
+                                origin_kind: Some(ThreadOriginKind::Collaborative),
+                                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                                visibility: None,
+                                agent_nickname: None,
+                                agent_role: None,
+                            },
+                            None,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    harness
+                        .crud_store
+                        .upsert_thread_model(
+                            &thread.response.thread,
+                            pioneer_protocol::PersistedActorRef::System,
+                        )
+                        .await
+                        .unwrap();
+                    let capabilities = if select_pack {
+                        vec![TurnCapability {
+                            id: pioneer_protocol::skill_pack_capability_key(&pack_id),
+                            kind: TurnCapabilityKind::SkillPack {
+                                pack_id: pack_id.clone(),
+                            },
+                            label: Some("Selected Pack".to_owned()),
+                        }]
+                    } else {
+                        skill_ids
+                            .iter()
+                            .map(|skill_id| TurnCapability {
+                                id: pioneer_protocol::skill_capability_key(skill_id),
+                                kind: TurnCapabilityKind::Skill {
+                                    skill_id: skill_id.clone(),
+                                    pack_id: Some(pack_id.clone()),
+                                },
+                                label: None,
+                            })
+                            .collect()
+                    };
+                    let request_id = generate_test_request_id("pack", "composer");
+                    harness
+                        .cli_session
+                        .set_next_native_turn_id("native_pack_turn".to_owned())
+                        .await;
+                    let context = processor
+                        .session_manager
+                        .connection_context(harness.connection_id)
+                        .await
+                        .unwrap();
+                    processor.clone().process_owned_request(context, json!({
+                        "jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":{
+                            "thread_id":parent, "turn_id":source,
+                            "input":[{"type":"text","text":"use selected skills"}],
+                            "capabilities":capabilities, "model":model, "mode":"Agent",
+                            "execution_backend":{"type":"cliAgentRuntime","runtime_id":harness.runtime_id,"runtime_kind":runtime_kind},
+                            "permission_profile":{"mode":"full_access"}
+                        }
+                    }).to_string()).await;
+                    let response = recv_response_by_id(&mut harness.rx, &request_id).await;
+                    let _: pioneer_protocol::TurnStartResponse =
+                        serde_json::from_value(response.result).unwrap();
+                    let tasks = processor
+                        .task_runtime
+                        .service()
+                        .list_tasks(pioneer_protocol::TaskListParams {
+                            workspace_id: harness.workspace_id.clone(),
+                            owner_kind: Some(TaskOwnerKind::Thread),
+                            owner_id: Some(parent.to_owned()),
+                            limit: Some(10),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(tasks.tasks.len(), 1);
+                    let starts = wait_for_cli_runtime_turn_starts(&harness.cli_session, 1).await;
+                    let task = harness
+                        .crud_store
+                        .get_task(&tasks.tasks[0].id)
                         .await
                         .unwrap()
-                );
-                let run = &task.runs[0];
-                let lineage =
-                    wait_for_child_lineage_for_run(harness.crud_store.clone(), &run.id).await;
-                let bindings = harness
-                    .crud_store
-                    .list_turn_skill_bindings(&lineage.child_turn_id)
-                    .await
-                    .unwrap();
-                assert_eq!(bindings.len(), skill_ids.len() + 4);
-                for slug in ["tasks", "subagents", "html", "threads"] {
-                    assert!(bindings.iter().any(|binding| {
-                        binding.source_kind == "system"
-                            && binding.skill_owner.as_deref() == Some("pioneer")
-                            && binding.skill_slug == slug
-                            && binding.resolved_reason == "implicit"
-                    }));
-                }
-                let mut bound_ids = bindings
-                    .into_iter()
-                    .filter(|binding| binding.resolved_reason == "explicit_composer_capability")
-                    .map(|binding| binding.skill_id)
-                    .collect::<Vec<_>>();
-                bound_ids.sort();
-                assert_eq!(
-                    bound_ids,
-                    skill_ids.to_vec(),
-                    "pack and individual selection must bind exactly the same skills"
-                );
-                let authorization = processor
-                    .load_turn_execution_authorization_context(&lineage.child_turn_id)
-                    .await
-                    .expect("child authorization");
-                assert_eq!(
-                    authorization.granted_skill_ids(),
-                    skill_ids
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>(),
-                    "admission must grant the expanded members, not a pack or additional skills"
-                );
-                let events = harness
-                    .crud_store
-                    .get_turn_item_events(&lineage.child_thread_id, &lineage.child_turn_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let attachments = events
-                    .events
-                    .iter()
-                    .find_map(|event| match &event.payload {
-                        TurnItemEventPayload::ItemCompleted {
-                            item: TurnItem::UserMessage { attachments, .. },
-                            ..
-                        } => Some(attachments),
-                        _ => None,
-                    })
-                    .expect("hidden CLI user message");
-                if select_pack {
-                    assert!(
-                        matches!(attachments.as_slice(), [UserMessageAttachment::SkillPack { capability }] if capability.pack_id == pack_id),
-                        "hidden child pack presentation differs: {attachments:?}"
+                        .unwrap();
+                    assert_eq!(
+                        starts.len(),
+                        1,
+                        "{runtime_kind:?} select_pack={select_pack}: task={:?}, run={:?}, turns={:?}",
+                        task.task.error,
+                        task.runs[0].error,
+                        harness
+                            .crud_store
+                            .list_task_run_turns(&task.runs[0].id)
+                            .await
+                            .unwrap()
                     );
-                } else {
-                    assert_eq!(attachments.len(), 2);
-                    assert!(attachments.iter().all(|attachment| matches!(
-                        attachment,
-                        UserMessageAttachment::Skill { .. }
-                    )));
-                }
-                complete_recorded_cli_task_turn(
-                    &processor,
-                    harness.cli_session.as_ref(),
-                    &harness.cli_manager,
-                    &harness.workspace_id,
-                    &harness.runtime_id,
-                    parent,
-                    &starts[0].native_thread_id,
-                    "native_pack_turn",
-                    r#"<task_result>{"summary":"skills completed"}</task_result>"#,
-                )
-                .await;
-                assert_eq!(
-                    wait_for_task_status(
-                        harness.crud_store.clone(),
-                        &task.task.id,
-                        TaskStatus::Completed
+                    let run = &task.runs[0];
+                    let lineage =
+                        wait_for_child_lineage_for_run(harness.crud_store.clone(), &run.id).await;
+                    let bindings = harness
+                        .crud_store
+                        .list_turn_skill_bindings(&lineage.child_turn_id)
+                        .await
+                        .unwrap();
+                    assert_eq!(bindings.len(), skill_ids.len() + 4);
+                    for slug in ["tasks", "subagents", "html", "threads"] {
+                        assert!(bindings.iter().any(|binding| {
+                            binding.source_kind == "system"
+                                && binding.skill_owner.as_deref() == Some("pioneer")
+                                && binding.skill_slug == slug
+                                && binding.resolved_reason == "implicit"
+                        }));
+                    }
+                    let mut bound_ids = bindings
+                        .into_iter()
+                        .filter(|binding| binding.resolved_reason == "explicit_composer_capability")
+                        .map(|binding| binding.skill_id)
+                        .collect::<Vec<_>>();
+                    bound_ids.sort();
+                    assert_eq!(
+                        bound_ids,
+                        skill_ids.to_vec(),
+                        "pack and individual selection must bind exactly the same skills"
+                    );
+                    let authorization = processor
+                        .load_turn_execution_authorization_context(&lineage.child_turn_id)
+                        .await
+                        .expect("child authorization");
+                    assert_eq!(
+                        authorization.granted_skill_ids(),
+                        skill_ids
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>(),
+                        "admission must grant the expanded members, not a pack or additional skills"
+                    );
+                    let events = harness
+                        .crud_store
+                        .get_turn_item_events(&lineage.child_thread_id, &lineage.child_turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let attachments = events
+                        .events
+                        .iter()
+                        .find_map(|event| match &event.payload {
+                            TurnItemEventPayload::ItemCompleted {
+                                item: TurnItem::UserMessage { attachments, .. },
+                                ..
+                            } => Some(attachments),
+                            _ => None,
+                        })
+                        .expect("hidden CLI user message");
+                    if select_pack {
+                        assert!(
+                            matches!(attachments.as_slice(), [UserMessageAttachment::SkillPack { capability }] if capability.pack_id == pack_id),
+                            "hidden child pack presentation differs: {attachments:?}"
+                        );
+                    } else {
+                        assert_eq!(attachments.len(), 2);
+                        assert!(attachments.iter().all(|attachment| matches!(
+                            attachment,
+                            UserMessageAttachment::Skill { .. }
+                        )));
+                    }
+                    complete_recorded_cli_task_turn(
+                        &processor,
+                        harness.cli_session.as_ref(),
+                        &harness.cli_manager,
+                        &harness.workspace_id,
+                        &harness.runtime_id,
+                        parent,
+                        &starts[0].native_thread_id,
+                        "native_pack_turn",
+                        r#"<task_result>{"summary":"skills completed"}</task_result>"#,
                     )
-                    .await,
-                    TaskStatus::Completed
-                );
+                    .await;
+                    assert_eq!(
+                        wait_for_task_status(
+                            harness.crud_store.clone(),
+                            &task.task.id,
+                            TaskStatus::Completed
+                        )
+                        .await,
+                        TaskStatus::Completed
+                    );
+                     Ok(())
+                 })
+                 .await
+                 .unwrap();
             }
         }
     });
@@ -32748,18 +32863,18 @@ async fn cli_transfer_reuses_late_mixed_checkpoint_from_raw_saved_input_aliases_
         .unwrap();
     for (sql, values) in [
         (
-            "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id=$1",
             vec![checkpoint.id.clone().into()],
         ),
         (
-            "UPDATE compaction_context SET head=? WHERE owner=?",
+            "UPDATE compaction_context SET head=$1 WHERE owner=$2",
             vec![checkpoint.id.clone().into(), owner.into()],
         ),
     ] {
         store
             .database_connection()
             .execute_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DbBackend::Sqlite,
+                sea_orm::DbBackend::Postgres,
                 sql,
                 values,
             ))
@@ -33141,7 +33256,9 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             let actor = authenticated_test_superuser().principal_id.to_string();
             let db = store.database_connection();
             assert!(
-                pioneer_entity::task_run_read::Entity::find_by_id((actor.clone(), run.id.clone()))
+                pioneer_entity::task_run_read::Entity::find()
+                    .filter(pioneer_entity::task_run_read::Column::PrincipalId.eq(&actor))
+                    .filter(pioneer_entity::task_run_read::Column::RunId.eq(&run.id))
                     .one(&db)
                     .await
                     .unwrap()
@@ -39185,11 +39302,12 @@ async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
         use sea_orm::EntityTrait;
         let principal = authenticated_test_superuser().principal_id.to_string();
         let db = crud_store.database_connection();
-        let receipt =
-            pioneer_entity::task_run_read::Entity::find_by_id((principal.clone(), run.id.clone()))
-                .one(&db)
-                .await
-                .unwrap();
+        let receipt = pioneer_entity::task_run_read::Entity::find()
+            .filter(pioneer_entity::task_run_read::Column::PrincipalId.eq(principal.clone()))
+            .filter(pioneer_entity::task_run_read::Column::RunId.eq(run.id.clone()))
+            .one(&db)
+            .await
+            .unwrap();
         assert!(
             receipt.is_some(),
             "Composer Stop must suppress the authenticated actor before any viewport read"
@@ -44669,13 +44787,15 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         .expect("cancelled attached child task should have a run");
     {
         use sea_orm::EntityTrait;
-        let receipt = pioneer_entity::task_run_read::Entity::find_by_id((
-            authenticated_test_superuser().principal_id.to_string(),
-            run.id.clone(),
-        ))
-        .one(&crud_store.database_connection())
-        .await
-        .unwrap();
+        let receipt = pioneer_entity::task_run_read::Entity::find()
+            .filter(
+                pioneer_entity::task_run_read::Column::PrincipalId
+                    .eq(authenticated_test_superuser().principal_id.to_string()),
+            )
+            .filter(pioneer_entity::task_run_read::Column::RunId.eq(run.id.clone()))
+            .one(&crud_store.database_connection())
+            .await
+            .unwrap();
         assert!(
             receipt.is_some(),
             "native parent Stop must carry the authenticated actor through work-graph cleanup"
@@ -46426,7 +46546,7 @@ async fn production_episodic_wakes_drain_batches_and_survive_busy_idle_race_and_
         let executor = Arc::new(
             ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(pioneer_memory::SqliteThreadEpisodicBackend::new(
+                Arc::new(pioneer_memory::PostgresThreadEpisodicBackend::new(
                     store.clone(),
                 )),
                 Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
@@ -46629,7 +46749,7 @@ async fn production_snapshot_save_wakes_idle_runner_and_preserves_draft_unchange
     );
     let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
         store.clone(),
-        Arc::new(pioneer_memory::SqliteThreadEpisodicBackend::new(
+        Arc::new(pioneer_memory::PostgresThreadEpisodicBackend::new(
             store.clone(),
         )),
         Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
@@ -46913,7 +47033,7 @@ async fn production_settings_recovery_transitions_projection_before_new_source_p
         let executor = Arc::new(
             ThreadEpisodicIndexExecutor::new(
                 store.clone(),
-                Arc::new(pioneer_memory::SqliteThreadEpisodicBackend::new(
+                Arc::new(pioneer_memory::PostgresThreadEpisodicBackend::new(
                     store.clone(),
                 )),
                 Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
@@ -48231,7 +48351,7 @@ fn apply_patch_completed_notification(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_turn_completion_closes_running_execution_window() {
     let thread_id = "thr_window_terminal_complete";
     let turn_id = "turn_window_terminal_complete";
@@ -48328,7 +48448,7 @@ async fn terminal_turn_completion_closes_running_execution_window() {
     assert_eq!(turn.status, TurnStatus::Completed);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn periodic_native_finalization_reconciliation_updates_loaded_turn_state() {
     let thread_id = "thr_native_finalization_reconcile";
     let turn_id = "turn_native_finalization_reconcile";
@@ -48375,7 +48495,7 @@ async fn periodic_native_finalization_reconciliation_updates_loaded_turn_state()
     assert_eq!(persisted.status, TurnStatus::Completed);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_turn_failed_without_recovery_opens_runtime_recovery() {
     let thread_id = "thr_window_terminal_fail";
     let turn_id = "turn_window_terminal_fail";
@@ -48430,7 +48550,7 @@ async fn agent_turn_failed_without_recovery_opens_runtime_recovery() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_request_provider_failure_is_terminal_without_retry() {
     let thread_id = "thr_provider_terminal_sync";
     let turn_id = "turn_provider_terminal_sync";
@@ -48510,7 +48630,7 @@ async fn invalid_request_provider_failure_is_terminal_without_retry() {
     assert!(!error.contains("bad request"));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_turn_blocked_closes_running_execution_window_without_failure() {
     let thread_id = "thr_window_terminal_blocked";
     let turn_id = "turn_window_terminal_blocked";
@@ -48569,7 +48689,7 @@ async fn terminal_turn_blocked_closes_running_execution_window_without_failure()
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_turn_interruption_closes_running_execution_window() {
     let thread_id = "thr_window_terminal_interrupt";
     let turn_id = "turn_window_terminal_interrupt";
@@ -49021,53 +49141,57 @@ fn thread_start_missing_identifiers_report_the_missing_field() {
     for missing_field in ["thread_id", "workspace_id"] {
         // Keep each request's background workers inside a fresh runtime, as in the original tests.
         let body = async {
-            let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
-            let session_manager = Arc::new(SessionManager::new());
-            let connection_id =
-                register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-            let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-            let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-            let processor = MessageProcessor::new(
-                thread_manager,
-                test_provider(),
-                session_manager,
-                workspace_manager,
-                crud_store,
-                test_gateway_secrets(),
-                test_summary_config(),
-                test_tool_loop_config(),
-            );
-            let mut params = serde_json::Map::from_iter([
-                ("thread_id".to_owned(), json!("thr_000000000000000099")),
-                ("workspace_id".to_owned(), json!(workspace_id)),
-            ]);
-            params.remove(missing_field);
-            let request = json!({
-                "jsonrpc": "2.0",
-                "id": "aaaaaaaaaaaaaaaaaaaaa",
-                "method": "thread/start",
-                "params": params
-            });
-            processor
-                .process_request_for_connection(connection_id, &request.to_string())
-                .await;
-            let response = rx.recv().await.expect("expected error response");
-            let payload = match response {
-                Message::Text(payload) => payload.to_string(),
-                other => panic!("expected text response, got {other:?}"),
-            };
-            let value: serde_json::Value =
-                serde_json::from_str(&payload).expect("json must decode");
-            let message = value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            assert!(
-                message.contains(missing_field),
-                "error should mention missing {missing_field}, got: {message}"
-            );
+            pioneer_postgres_test::with_test_databases(async {
+                let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
+                let session_manager = Arc::new(SessionManager::new());
+                let connection_id =
+                    register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+                let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+                let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+                let processor = MessageProcessor::new(
+                    thread_manager,
+                    test_provider(),
+                    session_manager,
+                    workspace_manager,
+                    crud_store,
+                    test_gateway_secrets(),
+                    test_summary_config(),
+                    test_tool_loop_config(),
+                );
+                let mut params = serde_json::Map::from_iter([
+                    ("thread_id".to_owned(), json!("thr_000000000000000099")),
+                    ("workspace_id".to_owned(), json!(workspace_id)),
+                ]);
+                params.remove(missing_field);
+                let request = json!({
+                    "jsonrpc": "2.0",
+                    "id": "aaaaaaaaaaaaaaaaaaaaa",
+                    "method": "thread/start",
+                    "params": params
+                });
+                processor
+                    .process_request_for_connection(connection_id, &request.to_string())
+                    .await;
+                let response = rx.recv().await.expect("expected error response");
+                let payload = match response {
+                    Message::Text(payload) => payload.to_string(),
+                    other => panic!("expected text response, got {other:?}"),
+                };
+                let value: serde_json::Value =
+                    serde_json::from_str(&payload).expect("json must decode");
+                let message = value
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(
+                    message.contains(missing_field),
+                    "error should mention missing {missing_field}, got: {message}"
+                );
+            })
+            .await
+            .expect("close isolated PostgreSQL test databases")
         };
         tokio::pin!(body);
         let body: ::core::pin::Pin<&mut dyn ::core::future::Future<Output = ()>> = body;
@@ -49269,7 +49393,7 @@ async fn workspace_create_rejects_missing_workspace_id() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_select_returns_workspace_and_sets_session_scope() {
     let (processor, session_manager, connection_id, mut rx, workspace_manager, _) =
         setup_workspace_message_processor().await;
@@ -49305,7 +49429,7 @@ async fn workspace_select_returns_workspace_and_sets_session_scope() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_update_returns_updated_workspace_without_switching_session() {
     let (
         processor,
@@ -49350,7 +49474,7 @@ async fn workspace_update_returns_updated_workspace_without_switching_session() 
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_select_rejects_malformed_params_without_mutating_session_scope() {
     let (processor, session_manager, connection_id, mut rx, _, current_workspace_id) =
         setup_workspace_message_processor().await;
@@ -49450,7 +49574,7 @@ async fn workspace_create_broadcasts_changed_to_other_workspace_connections() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_update_broadcasts_updated_notification() {
     let (processor, _session_manager, connection_id, mut rx, workspace_manager, _) =
         setup_workspace_message_processor().await;
@@ -49486,7 +49610,7 @@ async fn workspace_update_broadcasts_updated_notification() {
     assert_eq!(changed.workspace.name, "After");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_select_broadcasts_current_change_only_when_current_changes() {
     let (processor, _session_manager, connection_id, mut rx, workspace_manager, _) =
         setup_workspace_message_processor().await;
@@ -52060,8 +52184,14 @@ fn turn_start_cli_runtime_uses_default_stack_and_errors_before_provider_dispatch
         .build()
         .expect("default-stack regression runtime should build");
     let result = runtime.block_on(async {
-        tokio::spawn(turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl())
+        pioneer_postgres_test::with_test_databases(async {
+            tokio::spawn(
+                turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl(),
+            )
             .await
+        })
+        .await
+        .expect("close isolated PostgreSQL test databases")
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
     result.expect("default-stack regression task should finish");
@@ -53291,9 +53421,13 @@ fn claude_cli_runtime_supervised_uses_provider_permission_mode() {
         .build()
         .expect("Claude supervised provider-mode test runtime should build")
         .block_on(async {
-            tokio::spawn(claude_cli_runtime_supervised_uses_provider_permission_mode_impl())
-                .await
-                .expect("Claude supervised provider-mode test task should finish");
+            pioneer_postgres_test::with_test_databases(async {
+                tokio::spawn(claude_cli_runtime_supervised_uses_provider_permission_mode_impl())
+                    .await
+                    .expect("Claude supervised provider-mode test task should finish");
+            })
+            .await
+            .expect("close isolated PostgreSQL test databases")
         });
 }
 
@@ -53354,9 +53488,13 @@ fn claude_cli_runtime_ignores_legacy_provider_sandbox_option() {
         .build()
         .expect("Claude legacy sandbox test runtime should build")
         .block_on(async {
-            tokio::spawn(claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl())
-                .await
-                .expect("Claude legacy sandbox test task should finish");
+            pioneer_postgres_test::with_test_databases(async {
+                tokio::spawn(claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl())
+                    .await
+                    .expect("Claude legacy sandbox test task should finish");
+            })
+            .await
+            .expect("close isolated PostgreSQL test databases")
         });
 }
 
@@ -53423,9 +53561,15 @@ fn claude_auto_accept_provider_mode_is_persisted_before_runtime_start() {
         .build()
         .expect("Claude auto-accept security audit test runtime should build")
         .block_on(async {
-            tokio::spawn(claude_auto_accept_provider_mode_is_persisted_before_runtime_start_impl())
+            pioneer_postgres_test::with_test_databases(async {
+                tokio::spawn(
+                    claude_auto_accept_provider_mode_is_persisted_before_runtime_start_impl(),
+                )
                 .await
                 .expect("Claude auto-accept security audit test task should finish");
+            })
+            .await
+            .expect("close isolated PostgreSQL test databases")
         });
 }
 
@@ -57147,15 +57291,17 @@ fn run_interrupted_cli_runtime_turn_recovery_test(
                 .enable_all()
                 .build()
                 .expect("CLI recovery test runtime should build");
-            runtime.block_on(message_future(
-                run_interrupted_cli_runtime_turn_recovery_scenario(
-                    reconcile_from_runtime_observation,
-                    fail_after_confirmation,
-                    detached_child_owner,
-                    invalid_durable_cwd,
-                    None,
-                ),
-            ));
+            runtime
+                .block_on(message_future(pioneer_postgres_test::with_test_databases(
+                    run_interrupted_cli_runtime_turn_recovery_scenario(
+                        reconcile_from_runtime_observation,
+                        fail_after_confirmation,
+                        detached_child_owner,
+                        invalid_durable_cwd,
+                        None,
+                    ),
+                )))
+                .expect("close isolated PostgreSQL test databases");
         })
         .expect("CLI recovery test thread should start");
     thread
@@ -60590,7 +60736,7 @@ async fn native_permission_request_replays_and_accepts_durable_response_after_re
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_request_respond_rejects_stale_request_ids() {
     pioneer_postgres_test::with_database(async |fixture| {
         for (rpc_id, request_id, resolution, configured_runtime) in [
@@ -60764,7 +60910,7 @@ async fn cli_runtime_request_respond_rejects_pending_without_turn_binding() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_command_approval_rejects_legacy_session_scope() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -60836,7 +60982,7 @@ async fn cli_runtime_command_approval_rejects_legacy_session_scope() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_codex_session_approval_is_typed_and_authority_gated() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -60907,7 +61053,7 @@ async fn cli_runtime_codex_session_approval_is_typed_and_authority_gated() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_command_approval_denied_resolves_and_sends_decline() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -60983,7 +61129,7 @@ async fn cli_runtime_command_approval_denied_resolves_and_sends_decline() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_general_permission_approval_prompts_and_returns_exact_bounded_profile() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -61071,7 +61217,7 @@ async fn codex_general_permission_approval_prompts_and_returns_exact_bounded_pro
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_general_permission_approval_cannot_exceed_current_turn_ceiling() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -61143,7 +61289,7 @@ async fn codex_general_permission_approval_cannot_exceed_current_turn_ceiling() 
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn grandchild_cli_runtime_approval_projects_to_root_and_root_denial_reaches_origin_session() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -61647,7 +61793,7 @@ async fn cli_runtime_request_claude_denial_blocks_provider_action() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_command_approval_cancel_sends_cancel_and_interrupts_turn() {
     let (processor, connection_id, mut rx, workspace_id, _crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -61704,7 +61850,7 @@ async fn cli_runtime_command_approval_cancel_sends_cancel_and_interrupts_turn() 
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_file_change_approval_allow_preserves_paths_and_truncates_large_diff() {
     let (processor, connection_id, mut rx, workspace_id, _crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -61785,7 +61931,7 @@ async fn cli_runtime_file_change_approval_allow_preserves_paths_and_truncates_la
     assert_eq!(responses[0].1, json!({"decision": "accept"}));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_file_change_approval_rejects_legacy_session_scope() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -61841,7 +61987,7 @@ async fn cli_runtime_file_change_approval_rejects_legacy_session_scope() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_file_change_approval_deny_resolves_and_sends_decline() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -61912,7 +62058,7 @@ async fn cli_runtime_file_change_approval_deny_resolves_and_sends_decline() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_user_input_request_answer_sends_codex_answers() {
     let (processor, connection_id, mut rx, workspace_id, _crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -61980,7 +62126,7 @@ async fn cli_runtime_user_input_request_answer_sends_codex_answers() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_user_input_request_cancel_sends_empty_answers_and_cancels_local_state() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62037,7 +62183,7 @@ async fn cli_runtime_user_input_request_cancel_sends_empty_answers_and_cancels_l
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_user_input_request_invalid_answers_are_rejected_before_native_send() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62093,7 +62239,7 @@ async fn cli_runtime_user_input_request_invalid_answers_are_rejected_before_nati
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_human_wait_defers_turn_item_timeout_transition() {
     let (processor, _connection_id, mut rx, workspace_id, crud_store, _cli_session) =
         cli_runtime_approval_processor().await;
@@ -62124,7 +62270,7 @@ async fn cli_runtime_human_wait_defers_turn_item_timeout_transition() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_expired_human_wait_returns_control_before_timeout_transition() {
     let (processor, _connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62320,7 +62466,7 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
     }).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_cli_runtime_observation_defers_soft_timeout_into_recovery() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62409,7 +62555,7 @@ async fn unavailable_cli_runtime_observation_defers_soft_timeout_into_recovery()
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_context_compaction_uses_common_recovery_with_configured_grace() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62456,7 +62602,7 @@ async fn unavailable_context_compaction_uses_common_recovery_with_configured_gra
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_compaction_renews_soft_deadlines_only_after_confirmed_activity() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62541,7 +62687,7 @@ async fn context_compaction_renews_soft_deadlines_only_after_confirmed_activity(
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_context_compaction_observation_does_not_disable_hard_deadline() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62576,7 +62722,7 @@ async fn unavailable_context_compaction_observation_does_not_disable_hard_deadli
     }));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_cli_runtime_observation_defers_rolling_hard_deadline() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62626,7 +62772,7 @@ async fn unavailable_cli_runtime_observation_defers_rolling_hard_deadline() {
     assert_eq!(pending_jobs[0].action, RecoveryAction::RehydrateTurnState);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_request_response_renews_running_attempt_deadlines() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, _cli_session) =
         cli_runtime_approval_processor().await;
@@ -62678,7 +62824,7 @@ async fn cli_runtime_request_response_renews_running_attempt_deadlines() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_active_command_heartbeat_renews_rolling_hard_deadline() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62737,7 +62883,7 @@ async fn cli_runtime_active_command_heartbeat_renews_rolling_hard_deadline() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn command_heartbeats_keep_default_policy_alive_for_four_hours() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, _cli_session) =
         cli_runtime_approval_processor().await;
@@ -62805,7 +62951,7 @@ async fn command_heartbeats_keep_default_policy_alive_for_four_hours() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_command_heartbeat_does_not_renew_without_confirmed_runtime_activity() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62853,7 +62999,7 @@ async fn cli_runtime_command_heartbeat_does_not_renew_without_confirmed_runtime_
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_turn() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -62938,7 +63084,7 @@ async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_tur
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_human_wait_defers_stale_turn_scan() {
     let (processor, _connection_id, mut rx, workspace_id, crud_store, _cli_session) =
         cli_runtime_approval_processor().await;
@@ -62977,7 +63123,7 @@ async fn cli_runtime_human_wait_defers_stale_turn_scan() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_human_wait_expires_without_blocking_the_turn() {
     let (processor, _connection_id, mut rx, workspace_id, crud_store, _cli_session) =
         cli_runtime_approval_processor().await;
@@ -63024,7 +63170,7 @@ async fn cli_runtime_human_wait_expires_without_blocking_the_turn() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_request_response_after_deadline_expires_request_without_blocking_turn() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -67336,12 +67482,16 @@ where
         .enable_all()
         .build()
         .expect("test runtime should build");
-    let result = runtime.block_on(async move { tokio::spawn(test()).await });
+    let result = runtime.block_on(async move {
+        tokio::spawn(pioneer_postgres_test::with_test_databases(test())).await
+    });
     // Message tests may leave provider preparation on spawn_blocking.
     // Runtime::drop waits for blocking tasks without a deadline, even after
     // the test future and all of its assertions have completed.
     runtime.shutdown_timeout(Duration::from_secs(5));
-    result.expect("test task should finish");
+    result
+        .expect("test task should finish")
+        .expect("close isolated PostgreSQL test databases");
 }
 
 fn run_thread_agents_doc_rpc_test<F, Fut>(test: F)
@@ -67709,7 +67859,7 @@ async fn thread_history_is_not_a_reachable_timeline_api() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn patch_history_rpc_reads_persisted_steps_records_files_and_diffs() {
     let thread_id = "thr_patch_history_rpc";
     let turn_id = "turn_patch_history_rpc";
@@ -67871,7 +68021,7 @@ async fn patch_history_rpc_reads_persisted_steps_records_files_and_diffs() {
     assert_eq!(foreign.error.code, pioneer_protocol::NOT_FOUND_CODE);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn patch_history_parent_scope_exposes_exact_child_timeline_and_aggregate() {
     let parent_thread_id = "thr_patch_history_parent_scope";
     let parent_turn_id = "turn_patch_history_parent_scope";
@@ -68200,7 +68350,7 @@ async fn patch_history_parent_scope_exposes_exact_child_timeline_and_aggregate()
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn patch_history_rpc_keeps_codex_aggregate_only_provenance() {
     let thread_id = "thr_patch_history_codex";
     let turn_id = "turn_patch_history_codex";
@@ -68383,7 +68533,7 @@ struct LiveSemanticTimelineHarness {
     turn_id: String,
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_timeline_page_returns_semantic_blocks_without_work_flood() {
     let mut harness = setup_semantic_timeline_query_harness().await;
     let request_id = generate_test_request_id("semantic", "top");
@@ -68444,7 +68594,7 @@ async fn thread_timeline_page_returns_semantic_blocks_without_work_flood() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_timeline_page_returns_collapsed_work_and_final_markdown() {
     let mut harness = setup_semantic_timeline_query_harness().await;
     let request_id = generate_test_request_id("semantic", "site");
@@ -68500,7 +68650,7 @@ async fn thread_timeline_page_returns_collapsed_work_and_final_markdown() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_work_page_is_bounded_and_filters_hidden_rows() {
     let mut harness = setup_semantic_timeline_query_harness().await;
     let first_request_id = generate_test_request_id("semantic", "worka");
@@ -68628,7 +68778,7 @@ async fn turn_work_page_is_bounded_and_filters_hidden_rows() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_work_items_get_returns_exact_visible_rows_and_reports_missing_ids() {
     let mut harness = setup_semantic_timeline_query_harness().await;
     let thread_id = harness.sandbox_thread_id.clone();
@@ -68675,7 +68825,7 @@ async fn turn_work_items_get_returns_exact_visible_rows_and_reports_missing_ids(
     assert!(response.projection_updated_at_unix_micros > 0);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn synthetic_large_turn_work_page_remains_bounded() {
     let mut harness = setup_semantic_timeline_query_harness_with_synthetic().await;
     let large_thread_id = harness.synthetic_large_thread_id.clone();
@@ -68781,7 +68931,7 @@ async fn synthetic_large_turn_work_page_remains_bounded() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn synthetic_long_thread_timeline_page_remains_bounded() {
     let mut harness = setup_semantic_timeline_query_harness_with_synthetic().await;
     let long_thread_id = harness.synthetic_long_thread_id.clone();
@@ -68850,7 +69000,7 @@ async fn synthetic_long_thread_timeline_page_remains_bounded() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn semantic_timeline_large_payloads_stay_websocket_safe_at_max_limits() {
     let mut harness = setup_semantic_timeline_query_harness_with_synthetic().await;
     let large_thread_id = harness.synthetic_large_thread_id.clone();
@@ -68937,7 +69087,7 @@ async fn semantic_timeline_large_payloads_stay_websocket_safe_at_max_limits() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn semantic_timeline_rejects_excessive_limits_before_payload_growth() {
     let mut harness = setup_semantic_timeline_query_harness_with_synthetic().await;
     let large_thread_id = harness.synthetic_large_thread_id.clone();
@@ -68998,7 +69148,7 @@ async fn semantic_timeline_rejects_excessive_limits_before_payload_growth() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_thread() {
     use pioneer_client::{
         core::ClientCore,
@@ -69704,7 +69854,7 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejects_commit() {
     let mut harness = setup_live_semantic_timeline_harness("retry_storage_failure").await;
     let manager = test_cli_runtime_manager(Arc::new(RecordingCliRuntimeSession::default()));
@@ -69856,7 +70006,7 @@ async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejec
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_semantic_timeline_projects_running_item_without_backfill() {
     let mut harness = setup_live_semantic_timeline_harness("running").await;
     let item_id = "semantic_live_running_cmd";
@@ -69939,7 +70089,7 @@ async fn live_semantic_timeline_projects_running_item_without_backfill() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_semantic_timeline_final_answer_collapses_work_without_work_flood() {
     let mut harness = setup_live_semantic_timeline_harness("final").await;
     let command_id = "semantic_live_final_cmd";
@@ -70042,7 +70192,7 @@ async fn live_semantic_timeline_final_answer_collapses_work_without_work_flood()
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeline_page_isolates_off_page_bodies_and_keeps_last_final_html() {
     use pioneer_artifacts::{ArtifactBindingTarget, IngestArtifactBytesRequest};
     use pioneer_protocol::{
@@ -70286,7 +70436,7 @@ async fn timeline_page_isolates_off_page_bodies_and_keeps_last_final_html() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
     let harness = setup_live_semantic_timeline_harness("historical_task_snapshot").await;
     let base = super::now_timestamp_secs();
@@ -70567,7 +70717,7 @@ async fn detached_task_wrapper_diagnostics_do_not_persist_parent_work_group() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_semantic_timeline_pending_request_projects_approval_block() {
     let mut harness = setup_live_semantic_timeline_harness("approval").await;
     let now = chrono::Utc::now().fixed_offset();
@@ -70724,7 +70874,7 @@ async fn live_semantic_timeline_pending_request_projects_approval_block() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_semantic_timeline_grandchild_pending_request_projects_to_every_ancestor() {
     let mut harness = setup_live_semantic_timeline_harness("grandchild_approval").await;
     let now = chrono::Utc::now().fixed_offset();
@@ -72418,7 +72568,7 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window() {
     let thread_id = "thr_recovery_blocked_missing_snapshot";
     let turn_id = "turn_recovery_blocked_missing_snapshot";
@@ -72525,7 +72675,7 @@ async fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window() {
     )));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_recovery_blocked_event_surfaces_projection_root_cause() {
     let thread_id = "thr_cli_recovery_blocked_root_cause";
     let turn_id = "turn_cli_recovery_blocked_root_cause";
@@ -72646,7 +72796,7 @@ async fn cli_recovery_blocked_event_surfaces_projection_root_cause() {
     )));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session() {
     let thread_id = "thr_cli_recovery_blocked_cleanup";
     let turn_id = "turn_cli_recovery_blocked_cleanup";
@@ -73466,7 +73616,7 @@ async fn cli_runtime_server_request_without_turn_binding_is_cancelled_without_pe
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_machine_request_unknown_method_receives_exactly_one_error() {
     for (request, expected_id, expected_code, check_pending_requests) in [
         (
@@ -74382,7 +74532,7 @@ async fn cli_runtime_server_request_without_native_thread_does_not_buffer_on_sta
     }).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_event_with_bound_native_turn_but_mismatched_native_thread_is_ignored() {
     let thread_id = "thr_cli_event_mismatched_native_thread";
     let turn_id = "turn_cli_event_mismatched_native_thread";
@@ -74447,7 +74597,7 @@ async fn cli_runtime_event_with_bound_native_turn_but_mismatched_native_thread_i
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_event_with_bound_native_turn_but_missing_native_thread_is_ignored() {
     let thread_id = "thr_cli_event_missing_native_thread_bound";
     let turn_id = "turn_cli_event_missing_native_thread_bound";
@@ -74510,7 +74660,7 @@ async fn cli_runtime_event_with_bound_native_turn_but_missing_native_thread_is_i
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_thread_state_event_without_native_thread_is_ignored() {
     let thread_id = "thr_cli_thread_state_missing_native_thread";
     let turn_id = "turn_cli_thread_state_missing_native_thread";
@@ -74570,7 +74720,7 @@ async fn cli_runtime_thread_state_event_without_native_thread_is_ignored() {
     )));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_event_without_native_thread_does_not_buffer_before_turn_binding() {
     let thread_id = "thr_cli_event_missing_native_thread_before_binding";
     let turn_id = "turn_cli_event_missing_native_thread_before_binding";
@@ -74655,7 +74805,7 @@ async fn cli_runtime_event_without_native_thread_does_not_buffer_before_turn_bin
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
     let thread_id = "thr_cli_terminal_event_expires_pending";
     let turn_id = "turn_cli_terminal_event_expires_pending";
@@ -74779,7 +74929,7 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored() {
     let thread_id = "thr_cli_late_event_after_blocked";
     let turn_id = "turn_cli_late_event_after_blocked";
@@ -81183,11 +81333,10 @@ pub(super) async fn setup_postgres_workspace_manager(
 }
 
 async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
-    pioneer_sqlite::search::register_auto_extension_once().unwrap();
-    let connection = Database::connect("sqlite::memory:")
+    let fixture = pioneer_postgres_test::scoped_database()
         .await
-        .expect("must connect to sqlite memory");
-    setup_workspace_manager_with_connection(connection).await
+        .expect("clone the Gateway fixture database");
+    setup_postgres_workspace_manager(&fixture).await
 }
 
 /// Exercise concurrent preparation with the Gateway reader/writer contour.
@@ -81641,7 +81790,7 @@ impl crate::compaction::CompactionObserver for HistoricalCommandBackgroundObserv
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn completed_command_history_fits_real_background_preflight_after_projection() {
     use pioneer_agent::compaction::request::NativeRequestProjection;
     use pioneer_compaction::{CompactionSettings, ModelBudget, ModelSelection, Transport};
@@ -81823,7 +81972,7 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn genuinely_large_command_history_compacts_through_real_background_preflight() {
     use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
 
@@ -81920,13 +82069,12 @@ async fn genuinely_large_command_history_compacts_through_real_background_prefli
     assert_eq!(compacted.matches(marker).count(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn detached_composer_history_orders_each_delivered_answer_after_its_user_message() {
-    check_detached_composer_history_order(false).await;
-    check_detached_composer_history_order(true).await;
+    check_detached_composer_history_order().await;
 }
 
-async fn check_detached_composer_history_order(legacy: bool) {
+async fn check_detached_composer_history_order() {
     let provider = Arc::new(CaptureSummaryProvider::new("unused"));
     let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
     let thread_id = generate_test_request_id("history", "detached-order");
@@ -82055,15 +82203,6 @@ async fn check_detached_composer_history_order(legacy: bool) {
             .expect("Task occurrence turn should complete");
     }
 
-    if legacy {
-        // Existing turns predate the new creation-order trigger. Their retained
-        // insertion order must still win over arbitrary IDs in the same second.
-        harness.crud_store.database_connection().execute_raw(
-            sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
-                "DELETE FROM compaction_turn_creation WHERE turn_id IN (SELECT id FROM turn WHERE thread_id=?)",
-                [thread_id.clone().into()]),
-        ).await.unwrap();
-    }
     ensure_test_superuser_execution_turn(
         &harness.processor,
         &harness.workspace_id,
@@ -82156,7 +82295,7 @@ async fn check_detached_composer_history_order(legacy: bool) {
 // The former count-based loader's pre-compaction hook tests were retired with
 // that loader. Hook engine policies remain covered in pioneer-hooks; history
 // loading now neither invokes a provider nor grants hooks control over recovery.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_history_loading_ignores_old_summary_without_llm() {
     let provider = Arc::new(CaptureSummaryProvider::new("must not be called"));
     let harness =
@@ -82760,7 +82899,7 @@ async fn execute_memory_tool_error(
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_remember_get_list_roundtrip() {
     let mut harness = setup_memory_gateway_harness("roundtrip", true).await;
     let request_context = harness.request_context().await;
@@ -82856,7 +82995,7 @@ async fn memory_remember_get_list_roundtrip() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_search_returns_sqlite_hits_filtered_by_control_plane() {
     let mut harness = setup_memory_gateway_harness("search_filter", true).await;
     let request_context = harness.request_context().await;
@@ -83005,7 +83144,7 @@ async fn memory_search_returns_sqlite_hits_filtered_by_control_plane() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_search_respects_connection_workspace() {
     let mut harness = setup_memory_gateway_harness("workspace_isolation", true).await;
     let request_context = harness.request_context().await;
@@ -83101,7 +83240,7 @@ async fn memory_search_respects_connection_workspace() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_empty_scopes_use_user_default_and_connection_workspace() {
     let mut harness = setup_memory_gateway_harness("default_scopes", true).await;
     let request_context = harness.request_context().await;
@@ -83177,7 +83316,7 @@ async fn memory_empty_scopes_use_user_default_and_connection_workspace() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_forget_dry_run_does_not_emit_forgotten_notification() {
     let mut harness = setup_memory_gateway_harness("dry_run", true).await;
     let request_context = harness.request_context().await;
@@ -83234,7 +83373,7 @@ async fn memory_forget_dry_run_does_not_emit_forgotten_notification() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_methods_fail_when_runtime_disabled() {
     let mut harness = setup_memory_gateway_harness("disabled", false).await;
     let request_context = harness.request_context().await;
@@ -83266,7 +83405,7 @@ async fn memory_methods_fail_when_runtime_disabled() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_provider_materializes_five_memory_tools_when_runtime_enabled() {
     let harness = setup_memory_gateway_harness("tools_materialize", true).await;
     let materialization =
@@ -83355,7 +83494,7 @@ async fn memory_provider_materializes_five_memory_tools_when_runtime_enabled() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_remember_tool_accepts_recurring_instruction_category() {
     let harness = setup_memory_gateway_harness("tool_recurring_instruction", true).await;
     let tools = built_memory_tools(&harness, "tool_recurring_instruction").await;
@@ -83396,7 +83535,7 @@ async fn memory_remember_tool_accepts_recurring_instruction_category() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_namespace_update_and_cleanup_preserve_the_selected_record() {
     let harness = setup_memory_gateway_harness("namespace_contract", true).await;
     let tools = built_memory_tools(&harness, "namespace_contract").await;
@@ -83514,7 +83653,7 @@ async fn memory_namespace_update_and_cleanup_preserve_the_selected_record() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_provider_disabled_runtime_materializes_no_tools() {
     let harness = setup_memory_gateway_harness("tools_disabled", false).await;
     let materialization =
@@ -83532,7 +83671,7 @@ async fn memory_provider_disabled_runtime_materializes_no_tools() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_bridge_not_bound_when_runtime_disabled() {
     let harness = setup_memory_gateway_harness("bridge_disabled", false).await;
 
@@ -83626,7 +83765,7 @@ async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_owner_facts_survive_a_new_thread() {
     use pioneer_memory::hooks::{AgentMemoryWriteProvider, MemoryManifestRequest};
     let harness = setup_memory_gateway_harness("owner_cross_thread", true).await;
@@ -83717,7 +83856,7 @@ async fn memory_owner_facts_survive_a_new_thread() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_tool_remember_writes_memory_with_turn_provenance() {
     let mut harness = setup_memory_gateway_harness("tool_remember", true).await;
     let tools = built_memory_tools(&harness, "remember").await;
@@ -83791,7 +83930,7 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn supervised_memory_mutations_prompt_before_real_database_side_effects() {
     // Exercise the real approval broker, tools, memory service and SQLite writes.
     // Storage adapter behavior is covered separately; this fixture isolates
@@ -83943,7 +84082,7 @@ async fn supervised_memory_mutations_prompt_before_real_database_side_effects() 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_tool_uses_parent_thread_scope_with_child_provenance() {
     let harness = setup_memory_gateway_harness("effective_parent_scope", true).await;
     let parent_thread_id = "thread_effective_parent";
@@ -84044,7 +84183,7 @@ async fn memory_tool_uses_parent_thread_scope_with_child_provenance() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_task_runtime_context_materializes_all_memory_tools() {
     let harness = setup_memory_gateway_harness("task_runtime_memory_tools", true).await;
     let mut context = memory_tool_context(&harness, "task_runtime_memory_tools");
@@ -84119,7 +84258,7 @@ async fn memory_task_runtime_context_materializes_all_memory_tools() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_tool_search_calls_memory_service_and_returns_filtered_hits() {
     let harness = setup_memory_gateway_harness("tool_search", true).await;
     let tools = built_memory_tools(&harness, "search").await;
@@ -84177,7 +84316,7 @@ async fn memory_tool_search_calls_memory_service_and_returns_filtered_hits() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_tool_addressed_correction_preserves_generated_key_across_turns() {
     let harness = setup_memory_gateway_harness("addressed_correction", true).await;
     let first = built_memory_tools(&harness, "addressed_first").await;
@@ -84233,7 +84372,7 @@ async fn memory_tool_addressed_correction_preserves_generated_key_across_turns()
     assert_eq!(list["records"].as_array().unwrap().len(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_tool_get_returns_exact_record_with_provenance() {
     let harness = setup_memory_gateway_harness("tool_get", true).await;
     let tools = built_memory_tools(&harness, "get").await;
@@ -84296,7 +84435,7 @@ async fn memory_tool_get_returns_exact_record_with_provenance() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_tool_forget_tombstones_memory_and_suppresses_future_search() {
     let mut harness = setup_memory_gateway_harness("tool_forget", true).await;
     let tools = built_memory_tools(&harness, "forget").await;
@@ -84372,7 +84511,7 @@ async fn memory_tool_forget_tombstones_memory_and_suppresses_future_search() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_tool_invalid_args_return_tool_error() {
     let harness = setup_memory_gateway_harness("tool_invalid", true).await;
     let tools = built_memory_tools(&harness, "invalid").await;
@@ -84427,7 +84566,7 @@ async fn memory_tool_invalid_args_return_tool_error() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_tool_duplicate_remember_retry_is_idempotent() {
     let harness = setup_memory_gateway_harness("tool_retry", true).await;
     let tools = built_memory_tools(&harness, "retry").await;
@@ -84472,7 +84611,7 @@ async fn memory_tool_duplicate_remember_retry_is_idempotent() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn memory_candidates_list_and_decide_use_service_boundary() {
     let mut harness = setup_memory_gateway_harness("candidates", true).await;
     let request_context = harness.request_context().await;
@@ -85429,12 +85568,12 @@ async fn compaction_result_reader_pages_exact_source_and_rejects_cross_scope() {
         test_tool_loop_config(),
     );
     let db = store.database_connection();
-    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
-        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('result-thread',?,'','agent','m','echo','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [workspace_id.clone().into()])).await.unwrap();
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('result-thread',$1,'','agent','m','echo','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [workspace_id.clone().into()])).await.unwrap();
     db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('result-turn','result-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     let payload = serde_json::json!({"kind":"json","truncated":false,"value":{"role":"tool","name":"fixture","tool_call_id":"call","content":"🌍漢字\\\"\n".repeat(5000)}}).to_string();
-    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
-        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('result-source','result-turn','result-item',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)", [payload.clone().into()])).await.unwrap();
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('result-source','result-turn','result-item',1,'tool_result_v2',$1,'{}',CURRENT_TIMESTAMP)", [payload.clone().into()])).await.unwrap();
     let mut params = ThreadToolResultReadParams {
         output_log: false,
         workspace_id,
@@ -85490,7 +85629,7 @@ async fn compaction_result_reader_pages_exact_source_and_rejects_cross_scope() {
     }).await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_failed_partial_writer_preserves_event_but_excludes_observation_from_history() {
     let thread = "thr_failed_partial";
     let turn = "turn_failed_partial";
@@ -85680,17 +85819,17 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_native_overflow_twice_retries_main_request_once() {
     Box::pin(check_native_overflow_twice(false, false)).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_native_overflow_twice_never_reexecutes_completed_tool() {
     Box::pin(check_native_overflow_twice(true, false)).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_native_overflow_uses_general_cli_model_and_owned_service() {
     Box::pin(check_native_overflow_twice(false, true)).await;
 }
@@ -87063,7 +87202,7 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
     }).await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverable() {
     use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
 
@@ -87340,7 +87479,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
     context.events.shutdown_progress().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn completed_history_result_write_failure_remains_an_error_with_durable_work() {
     use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
     use pioneer_entity::compaction_history_check as check;
@@ -87502,7 +87641,7 @@ async fn completed_history_result_write_failure_remains_an_error_with_durable_wo
     harness.processor.shutdown_resilience_workers().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_history_descriptor_does_not_overwrite_processing_or_terminal_check() {
     let provider = Arc::new(CaptureSummaryProvider::new("unused summary"));
     let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
@@ -87622,7 +87761,7 @@ async fn native_history_descriptor_does_not_overwrite_processing_or_terminal_che
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_and_cancelled_execution_turn_intents_are_not_worker_eligible() {
     let provider = Arc::new(CaptureSummaryProvider::new("must not run"));
     let harness =
@@ -87672,7 +87811,7 @@ async fn failed_and_cancelled_execution_turn_intents_are_not_worker_eligible() {
     assert_eq!(provider.call_count(), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn history_intents_are_per_execution_turn_for_followups_nested_and_cli() {
     let provider = Arc::new(CaptureSummaryProvider::new("unused summary"));
     let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
@@ -87789,7 +87928,7 @@ async fn history_intents_are_per_execution_turn_for_followups_nested_and_cli() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_history_load_rejects_missing_and_foreign_scope_before_provider_call() {
     let provider = Arc::new(CaptureSummaryProvider::new("must not run"));
     let harness =
@@ -87947,7 +88086,7 @@ async fn seed_filtered_background_preflight(
     .await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn production_background_preflight_ignores_technical_noise_but_budgets_reasoning() {
     struct SilentObserver;
     #[async_trait::async_trait]
@@ -88263,12 +88402,12 @@ async fn production_background_preflight_ignores_technical_noise_but_budgets_rea
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn completed_cli_history_uses_general_api_without_primary_cli_or_new_turns() {
     check_completed_history(false, false, false, false, false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn background_history_preflight_budgets_task_input_copy_once_near_threshold() {
     use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
     use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome};
@@ -88745,12 +88884,12 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
     assert_eq!(wire.matches(marker).count(), 2);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_completed_cli_owner_prepares_history_and_publishes_lifecycle() {
     check_completed_history(true, false, false, false, false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
     use pioneer_agent::compaction::{
         controller::{NativeContext, NativeContextController},
@@ -89188,23 +89327,23 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
         );
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_completed_cli_owner_resumes_same_operation_after_shutdown() {
     check_completed_history(true, true, false, false, false).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_completed_cli_owner_stop_joins_service_and_never_resumes() {
     check_completed_history(true, false, true, false, false).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_completed_cli_owner_recovers_lost_terminal_publication() {
     check_completed_history(true, false, false, true, false).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_completed_native_owner_preserves_fixed_budget_and_resumes() {
     check_completed_history(true, true, false, false, true).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_completed_native_owner_stop_joins_registered_background() {
     check_completed_history(true, false, true, false, true).await;
 }
@@ -89796,7 +89935,7 @@ impl MessageProcessor {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_history_waits_for_changed_settings_without_spending_provider_attempts() {
     use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
     use pioneer_entity::compaction_history_check as check;
@@ -89991,7 +90130,7 @@ async fn compaction_history_waits_for_changed_settings_without_spending_provider
     assert!(diagnostic.context_tokens.unwrap() > 0);
     assert!(diagnostic.operation.is_some() && diagnostic.checkpoint.is_some());
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn background_completed_history_projects_reasoning_before_fit_and_compaction() {
     use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
     use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome};
@@ -90230,7 +90369,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
     assert_eq!(stored, canonical);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn background_deepseek_effort_matches_provider_preflight_and_token_boundary() {
     use pioneer_agent::compaction::request::NativeRequestProjection;
     use pioneer_compaction::{CompactionSettings, ModelBudget, ModelSelection, Transport};
@@ -90800,8 +90939,8 @@ async fn blocked_provider_task_consumers_impl(scenario: &str, path: &str) {
         store
             .database_connection()
             .execute_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "UPDATE recovery_job SET diagnostic = ? WHERE id = ?",
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE recovery_job SET diagnostic = $1 WHERE id = $2",
                 [
                     serde_json::to_string(&stale).unwrap().into(),
                     job.id.clone().into(),
@@ -92147,7 +92286,7 @@ async fn native_snapshot_after_publication(
     .unwrap()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_drained_selected_plugin_task_child_does_not_block_a_new_mutation() {
     for tool_calling in [false, true] {
         failed_drained_selected_plugin_task_child(tool_calling).await;
@@ -92588,7 +92727,7 @@ async fn failed_drained_selected_plugin_task_child(tool_calling: bool) {
         .await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn plugin_mutation_and_final_native_start_share_the_parent_admission_barrier() {
     use sea_orm::ConnectionTrait;
     let (processor, _, _, _rx, _, workspace) = setup_workspace_message_processor().await;
@@ -92779,7 +92918,7 @@ mod plugin_source_tests;
 #[path = "plugin_c2_tests.rs"]
 mod plugin_c2_tests;
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn provider_usage_items_persist_idempotently_without_entering_llm_history() {
     let thread = "thr_usage_ledger";
     let turn = "turn_usage_ledger";
@@ -92853,7 +92992,7 @@ async fn provider_usage_items_persist_idempotently_without_entering_llm_history(
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn auxiliary_usage_journal_is_scoped_idempotent_bounded_and_restart_readable() {
     use pioneer_crud::ProviderUsageObservation;
     let (_, store, workspace) =
@@ -92957,7 +93096,7 @@ async fn auxiliary_usage_journal_is_scoped_idempotent_bounded_and_restart_readab
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
     let (_, store, workspace) =
         setup_execution_window_terminal_turn("thr_aux_chat", "turn_aux_chat").await;
@@ -93009,7 +93148,7 @@ async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
     assert!(!rows[0].usage_json.contains("fixture prompt"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_attempt() {
     use futures_util::StreamExt;
     struct LateUsage {
@@ -93218,7 +93357,7 @@ async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_atte
     assert_eq!(unlabelled[0].status, "completed");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn auxiliary_stream_partial_usage_survives_drop_and_retry_without_holding_database_capacity()
 {
     use futures_util::StreamExt;
@@ -93312,7 +93451,7 @@ async fn auxiliary_stream_partial_usage_survives_drop_and_retry_without_holding_
     assert_ne!(usages[0].physical_attempt_id, usages[1].physical_attempt_id);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_cli() {
     use pioneer_cli_agent_runtime::{
         codex::service::decode_exec_completion, service::ObservedServiceUsage,
@@ -93374,7 +93513,7 @@ async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_c
     assert!(!rows[0].usage_json.contains("no final answer"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn claude_service_optional_statistics_survive_normalization_and_journal_readback() {
     use pioneer_cli_agent_runtime::{
         claude::service::ensure_process_outcome, service::ObservedServiceUsage,
@@ -93464,7 +93603,7 @@ async fn claude_service_optional_statistics_survive_normalization_and_journal_re
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn auxiliary_metadata_only_header_survives_failure_without_inventing_counts() {
     struct MetadataOnly;
     #[async_trait::async_trait]
@@ -93534,7 +93673,7 @@ async fn auxiliary_metadata_only_header_survives_failure_without_inventing_count
     assert!(!rows[0].usage_json.contains("SECRET"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_exit_and_reasoning_evidence_reaches_summary_consumer_and_failed_journal_once() {
     use pioneer_cli_agent_runtime::{
         claude::service::ensure_process_outcome,
@@ -93865,7 +94004,7 @@ async fn fanout_test_append(processor: &MessageProcessor, id: &str, message: &st
         .await
         .unwrap();
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn fanout_quantum_shares_total_event_budget_and_leaves_large_backlogs_ready() {
     let (processor, workspace) = fanout_test_processor().await;
     for n in 0..70 {
@@ -93922,7 +94061,7 @@ async fn fanout_quantum_shares_total_event_budget_and_leaves_large_backlogs_read
             > 128
     );
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn fanout_failure_n_preserves_prefix_and_allows_another_task_to_progress() {
     use pioneer_entity::task_event;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -93988,7 +94127,7 @@ async fn fanout_failure_n_preserves_prefix_and_allows_another_task_to_progress()
         "future poison retry is not true empty"
     );
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn fanout_periodic_dispatcher_recovers_commit_without_any_bus_publication() {
     let (processor, workspace) = fanout_test_processor().await;
     // CrudStore append deliberately has no TaskService bus publication.
@@ -94023,7 +94162,7 @@ async fn fanout_periodic_dispatcher_recovers_commit_without_any_bus_publication(
     assert!(processor.task_event_listener_worker.lock().await.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fanout_lagged_and_duplicate_wakes_do_not_create_competing_emitters() {
     let (processor, workspace) = fanout_test_processor().await;
     let event = processor
@@ -94166,9 +94305,11 @@ fn native_gateway_cancellation_persists_and_processes_hook_cleanup_without_repea
                         .enable_all()
                         .build()
                         .unwrap();
-                    runtime.block_on(assert_turn_cancel_with_optional_busy_native_actor(
-                        true, true, false,
-                    ));
+                    runtime
+                        .block_on(pioneer_postgres_test::with_test_databases(
+                            assert_turn_cancel_with_optional_busy_native_actor(true, true, false),
+                        ))
+                        .expect("close isolated PostgreSQL test databases");
                     runtime.shutdown_timeout(Duration::from_secs(5));
                 });
             });
@@ -94839,7 +94980,7 @@ async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_withou
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_journal_once() {
     use crate::cli_runtime::opencode_session::opencode_summary_result;
     let (_, store, workspace) = setup_execution_window_terminal_turn(
@@ -95165,7 +95306,7 @@ async fn neutral_provider_preparation_and_delivery_survive_registry_and_journal(
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_webhook_url_uses_actual_bind_and_rejects_persisted_disconnected_relay_cache() {
     let directory = tempfile::tempdir().unwrap();
     let config = crate::isolated_test_app_config().unwrap();

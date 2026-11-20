@@ -3025,7 +3025,7 @@ mod tests {
         let invalid_cursor = r#"{"threadId":[]}"#;
         fixture.connection().execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "UPDATE thread_cli_runtime_binding SET resume_cursor_json=$1::text::json WHERE thread_id='thread_cli_bad_cursor' AND frozen_manifest_id IS NULL",
+            "UPDATE thread_cli_runtime_binding SET resume_cursor_json=$1 WHERE thread_id='thread_cli_bad_cursor' AND frozen_manifest_id IS NULL",
             [invalid_cursor.to_owned().into()],
         )).await?;
         let client = FakeCliRuntimeThreadClient::new();

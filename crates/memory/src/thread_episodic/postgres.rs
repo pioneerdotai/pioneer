@@ -1,16 +1,16 @@
-//! SQLite adapter for the existing episodic search contract.
+//! PostgreSQL adapter for episodic search.
 use super::*;
 
-pub struct SqliteThreadEpisodicBackend {
+pub struct PostgresThreadEpisodicBackend {
     store: Arc<pioneer_crud::CrudStore>,
 }
-impl SqliteThreadEpisodicBackend {
+impl PostgresThreadEpisodicBackend {
     pub fn new(store: Arc<pioneer_crud::CrudStore>) -> Self {
         Self { store }
     }
 }
 #[async_trait]
-impl ThreadEpisodicSearchBackend for SqliteThreadEpisodicBackend {
+impl ThreadEpisodicSearchBackend for PostgresThreadEpisodicBackend {
     async fn search_page(
         &self,
         request: ThreadEpisodicSearchRequest,
