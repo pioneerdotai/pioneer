@@ -11,14 +11,10 @@ use sea_orm::IntoActiveModel;
 use sea_orm::sea_query::{ExprTrait, Query};
 
 const NOW: i64 = 4_000_000_000;
-// The existing status/null/generation matrix remains the legacy trigger owner.
 async fn terminal_task_run_occurrence_fixture(
     kind: Option<TurnKind>,
 ) -> (CrudStore, Thread, TaskRun) {
-    // Install legacy producers before the domain births, so this trigger suite
-    // does not inherit conservative tickets from the current typed producers.
     let store = test_store_with_workspace("ws_task").await;
-    restore_legacy_occurrence_tracking(&store).await;
     super::terminal_task_run_occurrence_fixture_with_store(store, kind).await
 }
 
@@ -60,20 +56,52 @@ async fn prepared(store: &CrudStore, id: &str) -> PreparedOccurrence {
     *prepared
 }
 async fn run_status(store: &CrudStore, id: &str, status: &str) {
+    let tx = store.connection.begin().await.unwrap();
+    let before = runs::Entity::find_by_id(id)
+        .lock_exclusive()
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
     runs::Entity::update_many()
         .col_expr(runs::Column::Status, Expr::val(status))
         .filter(runs::Column::Id.eq(id))
-        .exec(&store.connection)
+        .exec(&tx)
         .await
         .unwrap();
+    let after = runs::Entity::find_by_id(id)
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    pioneer_crud_tasks::task_occurrence_producers::run_change(&tx, Some(&before), Some(&after))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }
 async fn turn_status(store: &CrudStore, id: &str, status: &str) {
+    let tx = store.connection.begin().await.unwrap();
+    let before = turns::Entity::find_by_id(id)
+        .lock_exclusive()
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
     turns::Entity::update_many()
         .col_expr(turns::Column::Status, Expr::val(status))
         .filter(turns::Column::Id.eq(id))
-        .exec(&store.connection)
+        .exec(&tx)
         .await
         .unwrap();
+    let after = turns::Entity::find_by_id(id)
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    pioneer_crud_tasks::task_occurrence_producers::turn_change(&tx, Some(&before), Some(&after))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }
 
 #[pioneer_postgres_test::postgres_test]
@@ -131,7 +159,7 @@ async fn predicate_matrix_and_unknown_null_semantics_match_original_sql() {
         assert_eq!(
             store
                 .connection
-                .query_one_raw(DatabaseBackend::Sqlite.build(&query))
+                .query_one_raw(DatabaseBackend::Postgres.build(&query))
                 .await
                 .unwrap()
                 .is_some(),
@@ -524,7 +552,7 @@ async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
         .unwrap();
     // Test-only SQLite trigger: status history is written after the Turn upsert,
     // hence failure rolls back its status and the tracker trigger's deletion.
-    store.connection.execute_unprepared("CREATE TRIGGER reject_occurrence_history BEFORE INSERT ON turn_status_history BEGIN SELECT RAISE(ABORT,'fixture projection blocker'); END").await.unwrap();
+    store.connection.execute_unprepared("CREATE FUNCTION reject_occurrence_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture projection blocker'; END; $$; CREATE TRIGGER reject_occurrence_history BEFORE INSERT ON turn_status_history FOR EACH ROW EXECUTE FUNCTION reject_occurrence_history()").await.unwrap();
     assert!(
         store
             .reconcile_claimed_task_run_occurrence(&claim, NOW)
@@ -550,7 +578,7 @@ async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
     );
     store
         .connection
-        .execute_unprepared("DROP TRIGGER reject_occurrence_history")
+        .execute_unprepared("DROP TRIGGER reject_occurrence_history ON turn_status_history")
         .await
         .unwrap();
     let next = store
@@ -730,28 +758,28 @@ async fn due_plan_empty_deferred_and_due_backlog_use_covering_index_without_sort
                     .unwrap();
             }
         }
-        let statement = queue::due_query(NOW, 64).build(DatabaseBackend::Sqlite);
+        let statement = queue::due_query(NOW, 64).build(DatabaseBackend::Postgres);
         assert!(!statement.sql.contains("task_run "));
         assert!(!statement.sql.contains("JOIN"));
-        // EXPLAIN QUERY PLAN has no SeaQuery builder; preserve builder values.
+        // EXPLAIN (COSTS OFF) has no SeaQuery builder; preserve builder values.
         let explain = Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            format!("EXPLAIN QUERY PLAN {}", statement.sql),
+            DatabaseBackend::Postgres,
+            format!("EXPLAIN (COSTS OFF) {}", statement.sql),
             statement.values.unwrap().0,
         );
         let plan = store.connection.query_all_raw(explain).await.unwrap();
         let details = plan
             .into_iter()
-            .map(|r| r.try_get::<String>("", "detail").unwrap())
+            .map(|r| r.try_get::<String>("", "QUERY PLAN").unwrap())
             .collect::<Vec<_>>();
         assert!(
             details
                 .iter()
-                .any(|d| d.contains("COVERING INDEX idx_task_run_occurrence_reconcile_due")),
+                .any(|d| d.contains("idx_task_run_occurrence_reconcile_due")),
             "{phase}: {details:?}"
         );
         assert!(
-            details.iter().all(|d| !d.contains("TEMP B-TREE")),
+            details.iter().all(|d| !d.contains("Sort")),
             "{phase}: {details:?}"
         );
         assert_eq!(
@@ -1161,31 +1189,22 @@ impl pioneer_sqlite::SqliteWriteObserver for Routes {
         }
     }
 }
-async fn disk_store(path: &std::path::Path, routes: Arc<Routes>) -> CrudStore {
-    let mut options = sea_orm::ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .map_sqlx_sqlite_opts(|o| o.pragma("journal_mode", "WAL"));
-    let writer = Database::connect(options).await.unwrap();
-    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, routes.clone());
-    // Follow startup ordering: migrate through the executor before opening the
-    // physical read-only pool and before any source recovery or replay.
-    executor
-        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
+async fn observed_store(
+    fixture: &pioneer_postgres_test::TestDatabase,
+    routes: Arc<Routes>,
+) -> CrudStore {
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture
+        .connect_with_options(|options| {
+            options
+                .max_connections(1)
+                .map_sqlx_postgres_opts(|options| {
+                    options.options([("default_transaction_read_only", "on")])
+                });
+        })
         .await
         .unwrap();
-    let mut options =
-        sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(path));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .map_sqlx_sqlite_opts(|o| {
-            o.read_only(true)
-                .create_if_missing(false)
-                .pragma("query_only", "ON")
-        });
-    let reader = Database::connect(options).await.unwrap();
+    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, routes.clone());
     CrudStore::new(
         pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(reader, executor, routes),
     )
@@ -1241,27 +1260,16 @@ async fn populate_disk_pair(store: &CrudStore) -> String {
         .unwrap();
     run.id
 }
-async fn remove_disk_fixture(store: CrudStore, path: std::path::PathBuf) {
-    store.connection.close().await.unwrap();
-    std::fs::remove_file(&path).unwrap();
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn reopen_retains_pending_generation_claim_and_backoff_without_completed_log() {
-    let path = std::env::temp_dir().join(format!(
-        "pioneer-occurrence-{}.sqlite",
-        uuid::Uuid::new_v4()
-    ));
-    let store = disk_store(&path, Arc::new(Routes::default())).await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let store = observed_store(&fixture, Arc::new(Routes::default())).await;
     let id = populate_disk_pair(&store).await;
     let claim = claimed(&store).await;
     let before = row(&store, &id).await.unwrap();
     let seq = generation(&store).await;
     store.connection.close().await.unwrap();
-    let store = disk_store(&path, Arc::new(Routes::default())).await;
+    let store = observed_store(&fixture, Arc::new(Routes::default())).await;
     assert_eq!(row(&store, &id).await.unwrap(), before);
     assert_eq!(generation(&store).await, seq);
     assert!(
@@ -1300,19 +1308,16 @@ async fn reopen_retains_pending_generation_claim_and_backoff_without_completed_l
         seq,
         "sequence survives draining the set"
     );
-    remove_disk_fixture(store, path).await;
+    store.connection.close().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_executor() {
     use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass, SqliteWriteEvent};
     use std::time::Duration;
-    let path = std::env::temp_dir().join(format!(
-        "pioneer-occurrence-routing-{}.sqlite",
-        uuid::Uuid::new_v4()
-    ));
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let routes = Arc::new(Routes::default());
-    let store = disk_store(&path, routes.clone()).await;
+    let store = observed_store(&fixture, routes.clone()).await;
     let id = populate_disk_pair(&store).await;
     routes.reads.lock().unwrap().clear();
     routes.writes.lock().unwrap().clear();
@@ -1475,10 +1480,10 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
     )));
     assert!(store.connection.reader_query_only_enabled().await.unwrap());
     // Mutating RETURNING must route to the writer, even through query_one_raw.
-    store.with_maintenance_access().connection.query_one_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "UPDATE task_run_occurrence_reconcile_sequence SET generation=generation WHERE singleton=? RETURNING generation",[1.into()])).await.unwrap().unwrap();
+    store.with_maintenance_access().connection.query_one_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        "UPDATE task_run_occurrence_reconcile_sequence SET generation=generation WHERE singleton=$1 RETURNING generation",[1_i64.into()])).await.unwrap().unwrap();
     assert!(store.connection.reader_query_only_enabled().await.unwrap());
-    remove_disk_fixture(store, path).await;
+    store.connection.close().await.unwrap();
 }
 
 #[pioneer_postgres_test::postgres_test]
@@ -1642,7 +1647,7 @@ async fn failed_claim_deferral_fences_generation_token_due_count_and_ambiguous_s
         .remove(0);
     // SQLite trigger DDL has no SeaQuery builder. This rejects only token SET,
     // preserving ordinary service bookkeeping writes for the same candidate.
-    maintenance.connection.execute_unprepared("CREATE TRIGGER reject_claim BEFORE UPDATE OF claim_token ON task_run_occurrence_reconcile_pending BEGIN SELECT RAISE(ABORT,'individual claim refusal'); END").await.unwrap();
+    maintenance.connection.execute_unprepared("CREATE FUNCTION reject_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'individual claim refusal'; END; $$; CREATE TRIGGER reject_claim BEFORE UPDATE OF claim_token ON task_run_occurrence_reconcile_pending FOR EACH ROW EXECUTE FUNCTION reject_claim()").await.unwrap();
     let failure = match queue::claim(
         &maintenance.connection,
         &candidate,
@@ -1678,7 +1683,7 @@ async fn failed_claim_deferral_fences_generation_token_due_count_and_ambiguous_s
     // attempt's exact snapshot to test its later stale deferral.
     maintenance
         .connection
-        .execute_unprepared("DROP TRIGGER reject_claim")
+        .execute_unprepared("DROP TRIGGER reject_claim ON task_run_occurrence_reconcile_pending")
         .await
         .unwrap();
     // A late result of the same refusal cannot postpone a new generation.
@@ -1748,7 +1753,7 @@ async fn unavailable_bookkeeping_is_reported_without_claim_or_durable_backoff_pr
     let before = row(&store, &run.id).await.unwrap();
     // Reject every service update, including the fallback deferral. Trigger
     // DDL is SQLite-specific; no production invariant is changed by this test.
-    store.connection.execute_unprepared("CREATE TRIGGER reject_bookkeeping BEFORE UPDATE ON task_run_occurrence_reconcile_pending BEGIN SELECT RAISE(ABORT,'bookkeeping unavailable'); END").await.unwrap();
+    store.connection.execute_unprepared("CREATE FUNCTION reject_bookkeeping() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'bookkeeping unavailable'; END; $$; CREATE TRIGGER reject_bookkeeping BEFORE UPDATE ON task_run_occurrence_reconcile_pending FOR EACH ROW EXECUTE FUNCTION reject_bookkeeping()").await.unwrap();
     let failure = store
         .claim_task_run_occurrence_reconcile(&candidate, &|| NOW)
         .await
@@ -1795,15 +1800,12 @@ async fn claim_uses_time_after_discovery_instead_of_the_advisory_clock() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn claim_and_failed_claim_deferral_use_time_after_waiting_for_writer() {
     use std::time::Duration;
-    let path = std::env::temp_dir().join(format!(
-        "pioneer-occurrence-clock-{}.sqlite",
-        uuid::Uuid::new_v4()
-    ));
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let routes = Arc::new(Routes::default());
-    let store = disk_store(&path, routes.clone()).await;
+    let store = observed_store(&fixture, routes.clone()).await;
     let id = populate_disk_pair(&store).await;
     let candidate = store
         .discover_task_run_occurrence_reconcile(NOW, 64)
@@ -1856,7 +1858,7 @@ async fn claim_and_failed_claim_deferral_use_time_after_waiting_for_writer() {
     assert_eq!(row.attempt_count, 2);
     assert_eq!(row.next_attempt_at, NOW + 210);
     assert_eq!(row.claim_token.as_deref(), Some(claim.claim_token.as_str()));
-    remove_disk_fixture(store, path).await;
+    store.connection.close().await.unwrap();
 }
 
 #[pioneer_postgres_test::postgres_test]

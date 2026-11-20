@@ -1,53 +1,27 @@
-//! Isolated future fixtures only. Do not run/compile test targets before review.
-use migration::{Migrator, MigratorTrait};
+//! Frozen storage retention and publication on PostgreSQL.
 use pioneer_compaction::frozen::FrozenHistoryRef;
 use pioneer_crud::{CrudStore, FrozenStorageLifetimeProgress};
 use sea_orm::{
     ConnectionTrait, DbBackend, EntityTrait, IntoActiveModel, Set, Statement, TransactionTrait,
 };
 
-async fn db_fixture(legacy: bool) -> sea_orm::DatabaseConnection {
-    db_fixture_before(legacy.then_some("m20261010_000001_frozen_lifetime")).await
-}
-async fn db_fixture_before(before: Option<&str>) -> sea_orm::DatabaseConnection {
-    let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-    options.max_connections(1).min_connections(1);
-    let db = sea_orm::Database::connect(options).await.unwrap();
-    db.execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
-    let pragma: i64 = db
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "PRAGMA foreign_keys",
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "foreign_keys")
-        .unwrap();
-    assert_eq!(pragma, 0, "production single writer uses FK OFF");
-    // Select an exact historical schema boundary. Later, irreversible
-    // migrations must not turn upgrade fixtures into rollback attempts.
-    let steps = before.map(|name| {
-        Migrator::migrations()
-            .iter()
-            .position(|migration| migration.name() == name)
-            .expect("fixture migration boundary must remain registered") as u32
-    });
-    Migrator::up(&db, steps).await.unwrap();
-    db.execute_unprepared("INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1),('other','other',1,0)").await.unwrap();
-    db.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('other-thread','other','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    db
-}
 async fn fixture() -> CrudStore {
-    CrudStore::new(db_fixture(false).await)
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connection().clone();
+    for sql in [
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,TRUE),('other','other',TRUE,FALSE)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('other-thread','other','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ] {
+        writer.execute_unprepared(sql).await.unwrap();
+    }
+    let reader = fixture.connect_read_only().await.unwrap();
+    CrudStore::new(pioneer_sqlite::SqliteDatabase::new(reader, writer))
 }
 async fn sql(store: &CrudStore, sql: &str, values: Vec<sea_orm::Value>) {
     store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             sql,
             values,
         ))
@@ -58,7 +32,7 @@ async fn n(store: &CrudStore, sql: &str, id: &str) -> i64 {
     store
         .database_connection()
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             sql,
             [id.into()],
         ))
@@ -76,12 +50,12 @@ async fn header(
     messages: i64,
     imports: i64,
 ) -> FrozenHistoryRef {
-    sql(store,"INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES(?1,?2,?3,?4,?5,?5,?6,?6,?4,1)",vec![id.into(),workspace.into(),owner.into(),"a".repeat(64).into(),messages.into(),imports.into()]).await;
+    sql(store,"INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES($1,$2,$3,$4,$5,$5,$6,$6,$4,1)",vec![id.into(),workspace.into(),owner.into(),"a".repeat(64).into(),messages.into(),imports.into()]).await;
     for ordinal in 0..messages {
-        sql(store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,?2,'{}',2)",vec![id.into(),ordinal.into()]).await;
+        sql(store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES($1,$2,'{}',2)",vec![id.into(),ordinal.into()]).await;
     }
     for ordinal in 0..imports {
-        sql(store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,?2,0,'event:turn','e-'||?2,'event-revision:1',?3,'{}',2)",vec![id.into(),ordinal.into(),owner.into()]).await;
+        sql(store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES($1,$2,0,'event:turn','e-'||$2::bigint,'event-revision:1',$3,'{}',2)",vec![id.into(),ordinal.into(),owner.into()]).await;
     }
     FrozenHistoryRef {
         format: 1,
@@ -97,8 +71,10 @@ async fn drive(
 ) -> usize {
     let mut failures = 0;
     for _ in 0..quanta {
-        if progress.quantum(store).await.is_err() {
-            failures += 1;
+        match progress.quantum(store).await {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(_) => failures += 1,
         }
     }
     failures
@@ -106,19 +82,19 @@ async fn drive(
 async fn expired(store: &CrudStore, id: &str) -> i64 {
     n(
         store,
-        "SELECT expired AS n FROM compaction_frozen_history WHERE id=?1",
+        "SELECT expired AS n FROM compaction_frozen_history WHERE id=$1",
         id,
     )
     .await
 }
 async fn physical(store: &CrudStore, id: &str) -> i64 {
-    n(store,"SELECT (SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id=?1)+(SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id=?1) AS n",id).await
+    n(store,"SELECT (SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id=$1)+(SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id=$1) AS n",id).await
 }
 async fn task(store: &CrudStore, id: &str, status: &str) {
-    sql(store,"INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES(?1,'ws','thread','thread','thread','turn','agent',?2,'fixture','fixture')",vec![id.into(),status.into()]).await;
+    sql(store,"INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES($1,'ws','thread','thread','thread','turn','agent',$2,'fixture','fixture')",vec![id.into(),status.into()]).await;
 }
 async fn task_input(store: &CrudStore, task: &str, run: &str, history: &FrozenHistoryRef) {
-    sql(store,"INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES(?1,?2,?1,1,(SELECT COALESCE(MAX(run_number),0)+1 FROM task_run WHERE task_id=?2),'succeeded','agent')",vec![run.into(),task.into()]).await;
+    sql(store,"INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES($1,$2,$1,1,(SELECT COALESCE(MAX(run_number),0)+1 FROM task_run WHERE task_id=$2),'succeeded','agent')",vec![run.into(),task.into()]).await;
     store
         .insert_task_run_conversation_snapshot_if_absent(
             pioneer_crud::NewTaskRunConversationSnapshot {
@@ -156,7 +132,7 @@ fn cursor(h: &FrozenHistoryRef) -> String {
     serde_json::json!({"pioneerContext":{"version":4,"nativeThreadId":"native","acceptedTurnId":"turn","acceptedTurnRevision":1,"acceptedTurnDeleted":false,"contextOwnerThreadId":"thread","contextHistoryJson":serde_json::to_string(h).unwrap()}}).to_string()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_status_controls_every_accepted_run_input_independently_of_run_status() {
     for status in [
         "failed",
@@ -235,7 +211,7 @@ async fn task_status_controls_every_accepted_run_input_independently_of_run_stat
         assert_eq!(
             n(
                 &store,
-                "SELECT count(*) AS n FROM task_run_conversation_snapshot WHERE task_id=?1",
+                "SELECT count(*) AS n FROM task_run_conversation_snapshot WHERE task_id=$1",
                 "task"
             )
             .await,
@@ -244,7 +220,7 @@ async fn task_status_controls_every_accepted_run_input_independently_of_run_stat
         );
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn reader_acquire_root_delete_drop_and_expiry_first_share_scoped_counter() {
     let store = fixture().await;
     let h = header(&store, "input", "ws", "thread", 1, 1).await;
@@ -292,7 +268,7 @@ async fn reader_acquire_root_delete_drop_and_expiry_first_share_scoped_counter()
         "{}"
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cancellation_and_panic_drop_readers_without_async_cleanup() {
     let store = fixture().await;
     let h = header(&store, "input", "ws", "thread", 1, 0).await;
@@ -318,7 +294,7 @@ async fn cancellation_and_panic_drop_readers_without_async_cleanup() {
     drive(&store, &mut p, 1500).await;
     assert_eq!(expired(&store, "input").await, 1);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn root_insert_first_protects_discovered_expiry_and_expiry_first_rejects_root() {
     let store = fixture().await;
     let h = header(&store, "input", "ws", "thread", 1, 0).await;
@@ -348,7 +324,7 @@ async fn root_insert_first_protects_discovered_expiry_and_expiry_first_rejects_r
             .is_err()
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn root_write_rollback_and_terminal_tasks_cannot_reopen_expired_input() {
     let store = fixture().await;
     let h = header(&store, "input", "ws", "thread", 1, 0).await;
@@ -388,7 +364,7 @@ async fn root_write_rollback_and_terminal_tasks_cannot_reopen_expired_input() {
         // Neither terminal-to-terminal updates nor projection upserts acquire a root.
         sql(
             &store,
-            "UPDATE task SET status=?1 WHERE id='task'",
+            "UPDATE task SET status=$1 WHERE id='task'",
             vec![status.into()],
         )
         .await;
@@ -409,8 +385,8 @@ async fn root_write_rollback_and_terminal_tasks_cannot_reopen_expired_input() {
         for retaining in ["running", "blocked"] {
             assert!(
                 db.execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "UPDATE task SET status=?1 WHERE id='task'",
+                    DbBackend::Postgres,
+                    "UPDATE task SET status=$1 WHERE id='task'",
                     [retaining.into()]
                 ))
                 .await
@@ -487,7 +463,7 @@ async fn root_write_rollback_and_terminal_tasks_cannot_reopen_expired_input() {
             .await
             .is_err()
     );
-    assert_eq!(n(&store, "SELECT count(*) AS n FROM task_run_conversation_snapshot WHERE run_id=?1 AND frozen_manifest_id='input'", "run").await, 1);
+    assert_eq!(n(&store, "SELECT count(*) AS n FROM task_run_conversation_snapshot WHERE run_id=$1 AND frozen_manifest_id='input'", "run").await, 1);
 }
 
 async fn operation(
@@ -498,8 +474,8 @@ async fn operation(
     phase: pioneer_compaction::runner::RunnerPhase,
 ) {
     let db = store.database_connection();
-    db.execute_unprepared("INSERT OR IGNORE INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('owner','ws','thread',1)").await.unwrap();
-    sql(store,"INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms,attempts,transient_retries,correction,next_portion) VALUES(?1,'owner',?1,?2,'{}',1000,0,0,0,0)",vec![id.into(),status.into()]).await;
+    db.execute_unprepared("INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('owner','ws','thread',1) ON CONFLICT (owner) DO NOTHING").await.unwrap();
+    sql(store,"INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms,attempts,transient_retries,correction,next_portion) VALUES($1,'owner',$1,$2,'{}',1000,0,0,0,0)",vec![id.into(),status.into()]).await;
     let state = pioneer_compaction::runner::RunnerState {
         generation: 0,
         deadline_ms: 1000,
@@ -520,13 +496,13 @@ async fn operation(
     };
     sql(
         store,
-        "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES(?1,0,?2)",
+        "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES($1,0,$2::text::json)",
         vec![id.into(), serde_json::to_string(&state).unwrap().into()],
     )
     .await;
-    sql(store,"INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT ?1,id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id=?2",vec![id.into(),h.manifest_id.clone().into()]).await;
+    sql(store,"INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT $1,id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id=$2",vec![id.into(),h.manifest_id.clone().into()]).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn every_proven_terminal_projection_can_expire_unknown_or_mismatched_runner_cannot() {
     use pioneer_compaction::runner::{FailureKind, RunnerPhase};
     for (status, phase, can_expire) in [
@@ -597,7 +573,7 @@ async fn every_proven_terminal_projection_can_expire_unknown_or_mismatched_runne
         assert_eq!(
             n(
                 &store,
-                "SELECT count(*) AS n FROM compaction_operation_projection WHERE operation_id=?1",
+                "SELECT count(*) AS n FROM compaction_operation_projection WHERE operation_id=$1",
                 "op"
             )
             .await,
@@ -605,7 +581,7 @@ async fn every_proven_terminal_projection_can_expire_unknown_or_mismatched_runne
         );
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn pre_runner_failures_expire_through_existing_sweep_unless_counter_or_cli_root_holds() {
     use pioneer_compaction::runner::{FailureKind, RunnerPhase};
     for outcome in ["invalid_source_manifest", "deadline"] {
@@ -638,14 +614,14 @@ async fn pre_runner_failures_expire_through_existing_sweep_unless_counter_or_cli
                 // Model accumulated admission failures at worker startup.
                 sql(
                     &store,
-                    "DELETE FROM compaction_runner_state WHERE operation_id=?1",
+                    "DELETE FROM compaction_runner_state WHERE operation_id=$1",
                     vec![id.clone().into()],
                 )
                 .await;
-                sql(&store, "INSERT INTO compaction_runner_plan(operation_id,source_count,reference_count,descriptor,ready) VALUES(?1,1,0,'{}',0)", vec![id.clone().into()]).await;
+                sql(&store, "INSERT INTO compaction_runner_plan(operation_id,source_count,reference_count,descriptor,ready) VALUES($1,1,0,'{}',0)", vec![id.clone().into()]).await;
                 sql(
                     &store,
-                    "UPDATE compaction_operation SET outcome=?1,attempts=?2 WHERE id=?3",
+                    "UPDATE compaction_operation SET outcome=$1,attempts=$2 WHERE id=$3",
                     vec![
                         outcome.into(),
                         i64::from(retention == "attempt").into(),
@@ -654,7 +630,7 @@ async fn pre_runner_failures_expire_through_existing_sweep_unless_counter_or_cli
                 )
                 .await;
             }
-            assert_eq!(n(&store, "SELECT count(*) AS n FROM compaction_operation_projection WHERE manifest_id=?1", "origin").await, bindings);
+            assert_eq!(n(&store, "SELECT count(*) AS n FROM compaction_operation_projection WHERE manifest_id=$1", "origin").await, bindings);
             if retention == "cli" {
                 store
                     .upsert_cli_runtime_thread_binding(binding(cursor(&h)))
@@ -677,18 +653,18 @@ async fn pre_runner_failures_expire_through_existing_sweep_unless_counter_or_cli
             assert_eq!(
                 n(
                     &store,
-                    "SELECT count(*) AS n FROM compaction_runner_state WHERE operation_id=?1",
+                    "SELECT count(*) AS n FROM compaction_runner_state WHERE operation_id=$1",
                     "op"
                 )
                 .await,
                 0
             );
-            assert_eq!(n(&store,"SELECT count(*) AS n FROM compaction_operation_projection WHERE operation_id=?1 AND terminal_generation IS NULL","op").await,1);
+            assert_eq!(n(&store,"SELECT count(*) AS n FROM compaction_operation_projection WHERE operation_id=$1 AND terminal_generation IS NULL","op").await,1);
         }
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn mutation_invalidates_derived_terminal_generation_before_resume_or_state_change() {
     use pioneer_compaction::runner::{FailureKind, RunnerPhase};
     let store = fixture().await;
@@ -711,7 +687,7 @@ async fn mutation_invalidates_derived_terminal_generation_before_resume_or_state
         .unwrap();
     let mut p = FrozenStorageLifetimeProgress::default();
     drive(&store, &mut p, 1500).await;
-    assert_eq!(n(&store,"SELECT terminal_generation AS n FROM compaction_operation_projection WHERE operation_id=?1","op").await,0);
+    assert_eq!(n(&store,"SELECT terminal_generation AS n FROM compaction_operation_projection WHERE operation_id=$1","op").await,0);
     assert_eq!(expired(&store, "origin").await, 0);
     sql(
         &store,
@@ -719,7 +695,7 @@ async fn mutation_invalidates_derived_terminal_generation_before_resume_or_state
         vec![],
     )
     .await;
-    assert_eq!(n(&store,"SELECT count(*) AS n FROM compaction_operation_projection WHERE operation_id=?1 AND terminal_generation IS NULL","op").await,1);
+    assert_eq!(n(&store,"SELECT count(*) AS n FROM compaction_operation_projection WHERE operation_id=$1 AND terminal_generation IS NULL","op").await,1);
     drop(hold);
     drive(&store, &mut p, 1500).await;
     assert_eq!(
@@ -729,7 +705,7 @@ async fn mutation_invalidates_derived_terminal_generation_before_resume_or_state
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn expired_backing_preserves_foreign_messages_and_distinct_import_intervals() {
     let store = fixture().await;
     let p = header(&store, "p", "ws", "thread", 2, 1).await;
@@ -737,13 +713,13 @@ async fn expired_backing_preserves_foreign_messages_and_distinct_import_interval
     task(&store, "task", "cancelled").await;
     task_input(&store, "task", "run", &p).await;
     for ordinal in 2..7 {
-        sql(&store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('p',?1,'{}',2)",vec![ordinal.into()]).await;
+        sql(&store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('p',$1,'{}',2)",vec![ordinal.into()]).await;
     }
     for ordinal in 1..5 {
-        sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',?1,0,'event:turn','e-'||?1,'event-revision:1','thread','{}',2)",vec![ordinal.into()]).await;
+        sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',$1,0,'event:turn','e-'||$1,'event-revision:1','thread','{}',2)",vec![ordinal.into()]).await;
     }
     sql(&store,"INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('h',0,0,1),('h',1,0,1)",vec![]).await;
-    sql(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('h',0,0,5,'p'),('h',1,0,3,'p')",vec![]).await;
+    sql(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('h',0,0,5,'p'),('h',1,0,3,'p')",vec![]).await;
     sql(
         &store,
         "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='h'",
@@ -761,7 +737,7 @@ async fn expired_backing_preserves_foreign_messages_and_distinct_import_interval
     assert_eq!(
         n(
             &store,
-            "SELECT count(*) AS n FROM compaction_frozen_message_data WHERE manifest_id=?1",
+            "SELECT count(*) AS n FROM compaction_frozen_message_data WHERE manifest_id=$1",
             "p"
         )
         .await,
@@ -770,7 +746,7 @@ async fn expired_backing_preserves_foreign_messages_and_distinct_import_interval
     assert_eq!(
         n(
             &store,
-            "SELECT count(*) AS n FROM compaction_frozen_import_data WHERE manifest_id=?1",
+            "SELECT count(*) AS n FROM compaction_frozen_import_data WHERE manifest_id=$1",
             "p"
         )
         .await,
@@ -779,7 +755,7 @@ async fn expired_backing_preserves_foreign_messages_and_distinct_import_interval
     assert_eq!(
         n(
             &store,
-            "SELECT count(*) AS n FROM compaction_frozen_message WHERE manifest_id=?1",
+            "SELECT count(*) AS n FROM compaction_frozen_message WHERE manifest_id=$1",
             "h"
         )
         .await,
@@ -788,7 +764,7 @@ async fn expired_backing_preserves_foreign_messages_and_distinct_import_interval
     assert_eq!(
         n(
             &store,
-            "SELECT count(*) AS n FROM compaction_frozen_import WHERE manifest_id=?1",
+            "SELECT count(*) AS n FROM compaction_frozen_import WHERE manifest_id=$1",
             "h"
         )
         .await,
@@ -820,7 +796,7 @@ async fn expired_backing_preserves_foreign_messages_and_distinct_import_interval
     assert_eq!(
         n(
             &store,
-            "SELECT count(*) AS n FROM compaction_frozen_span WHERE manifest_id=?1",
+            "SELECT count(*) AS n FROM compaction_frozen_span WHERE manifest_id=$1",
             "h"
         )
         .await,
@@ -828,7 +804,7 @@ async fn expired_backing_preserves_foreign_messages_and_distinct_import_interval
         "lineage/layout headers are not GC targets"
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn available_container_keeps_own_prefix_but_not_unreferenced_physical_tail() {
     let store = fixture().await;
     let h = header(&store, "p", "ws", "thread", 2, 1).await;
@@ -843,7 +819,7 @@ async fn available_container_keeps_own_prefix_but_not_unreferenced_physical_tail
     assert_eq!(expired(&store, "p").await, 0);
     assert_eq!(physical(&store, "p").await, 3);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn pending_failed_candidate_holds_known_backing_and_does_not_block_another_workspace() {
     let store = fixture().await;
     header(&store, "base", "ws", "thread", 2, 1).await;
@@ -863,7 +839,7 @@ async fn pending_failed_candidate_holds_known_backing_and_does_not_block_another
     assert_eq!(
         n(
             &store,
-            "SELECT failed AS n FROM compaction_frozen_layout WHERE manifest_id=?1 AND kind=0",
+            "SELECT failed AS n FROM compaction_frozen_layout WHERE manifest_id=$1 AND kind=0",
             "pending"
         )
         .await,
@@ -873,15 +849,15 @@ async fn pending_failed_candidate_holds_known_backing_and_does_not_block_another
     assert_eq!(expired(&store, "free").await, 1);
     assert_eq!(physical(&store, "free").await, 0);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn healthy_incomplete_capture_holds_only_committed_kind_prefix_and_finish_refuses_gap() {
     let store = fixture().await;
-    sql(&store,"INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES('capture','ws','thread',?1,3,1,2,1,?1,0)",vec!["a".repeat(64).into()]).await;
+    sql(&store,"INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES('capture','ws','thread',$1,3,1,2,1,$1,0)",vec!["a".repeat(64).into()]).await;
     for ordinal in 0..3 {
-        sql(&store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('capture',?1,'{}',2)",vec![ordinal.into()]).await;
+        sql(&store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('capture',$1,'{}',2)",vec![ordinal.into()]).await;
     }
     for ordinal in 0..2 {
-        sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('capture',?1,0,'event:turn','e-'||?1,'event-revision:1','thread','{}',2)",vec![ordinal.into()]).await;
+        sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('capture',$1,0,'event:turn','e-'||$1,'event-revision:1','thread','{}',2)",vec![ordinal.into()]).await;
     }
     let h = FrozenHistoryRef {
         format: 1,
@@ -902,14 +878,14 @@ async fn healthy_incomplete_capture_holds_only_committed_kind_prefix_and_finish_
     assert_eq!(
         n(
             &store,
-            "SELECT next_ordinal AS n FROM compaction_frozen_history WHERE id=?1",
+            "SELECT next_ordinal AS n FROM compaction_frozen_history WHERE id=$1",
             "capture"
         )
         .await,
         1
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn understated_payload_bytes_and_early_empty_pages_fail_before_decode() {
     let store = fixture().await;
     header(&store, "corrupt", "ws", "thread", 1, 1).await;
@@ -921,17 +897,21 @@ async fn understated_payload_bytes_and_early_empty_pages_fail_before_decode() {
         // Inject pre-existing corruption only while seeding this isolated DB.
         // Restore CHECK enforcement before exercising the bounded reader.
         let tx = store.database_connection().begin().await.unwrap();
-        tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
-            .await
-            .unwrap();
+        tx.execute_unprepared(&format!(
+            "ALTER TABLE {table} DROP CONSTRAINT {table}_check"
+        ))
+        .await
+        .unwrap();
         tx.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            format!("UPDATE {table} SET {field}=?1 WHERE manifest_id='corrupt'"),
+            DbBackend::Postgres,
+            format!("UPDATE {table} SET {field}=$1 WHERE manifest_id='corrupt'"),
             [oversized.clone().into()],
         ))
         .await
         .unwrap();
-        tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+        tx.execute_unprepared(&format!(
+            "ALTER TABLE {table} ADD CONSTRAINT {table}_check CHECK (bytes BETWEEN 0 AND 262144 AND octet_length({field})=bytes) NOT VALID"
+        ))
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -976,7 +956,7 @@ async fn understated_payload_bytes_and_early_empty_pages_fail_before_decode() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn malformed_physical_keys_are_not_delete_permission() {
     let store = fixture().await;
     header(&store, "p", "ws", "thread", 1, 0).await;
@@ -992,30 +972,35 @@ async fn malformed_physical_keys_are_not_delete_permission() {
     assert_eq!(expired(&store, "p").await, 1);
     assert_eq!(physical(&store, "p").await, 1);
     assert_eq!(
-        n(&store, "SELECT message_ordinal AS n FROM compaction_frozen_import_data WHERE manifest_id=?1 AND ordinal=0", "p").await,
+        n(&store, "SELECT message_ordinal AS n FROM compaction_frozen_import_data WHERE manifest_id=$1 AND ordinal=0", "p").await,
         -1,
         "the malformed key must stay intact while healthy rows are deleted"
     );
     assert_eq!(
         n(
             &store,
-            "SELECT count(*) AS n FROM compaction_frozen_import_data WHERE manifest_id=?1",
+            "SELECT count(*) AS n FROM compaction_frozen_import_data WHERE manifest_id=$1",
             "p"
         )
         .await,
         1
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn expiry_rollback_then_restart_sweep_keeps_identity_headers_and_monotonic_tombstone() {
     let store = fixture().await;
     let h = header(&store, "p", "ws", "thread", 1, 1).await;
-    sql(&store,"CREATE TRIGGER fixture_expiry_fault BEFORE UPDATE OF expired ON compaction_frozen_history BEGIN SELECT RAISE(ABORT,'fixture commit fault'); END",vec![]).await;
+    sql(&store,"CREATE FUNCTION fixture_expiry_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture commit fault'; END; $$; CREATE TRIGGER fixture_expiry_fault BEFORE UPDATE OF expired ON compaction_frozen_history FOR EACH ROW EXECUTE FUNCTION fixture_expiry_fault()",vec![]).await;
     let mut p = FrozenStorageLifetimeProgress::default();
     assert!(drive(&store, &mut p, 1500).await > 0);
     assert_eq!(expired(&store, "p").await, 0);
     assert_eq!(physical(&store, "p").await, 2);
-    sql(&store, "DROP TRIGGER fixture_expiry_fault", vec![]).await;
+    sql(
+        &store,
+        "DROP TRIGGER fixture_expiry_fault ON compaction_frozen_history",
+        vec![],
+    )
+    .await;
     drop(p);
     let mut p = FrozenStorageLifetimeProgress::default();
     drive(&store, &mut p, 2000).await;
@@ -1024,7 +1009,7 @@ async fn expiry_rollback_then_restart_sweep_keeps_identity_headers_and_monotonic
     assert_eq!(
         n(
             &store,
-            "SELECT message_count AS n FROM compaction_frozen_history WHERE id=?1",
+            "SELECT message_count AS n FROM compaction_frozen_history WHERE id=$1",
             "p"
         )
         .await,
@@ -1045,185 +1030,7 @@ async fn expiry_rollback_then_restart_sweep_keeps_identity_headers_and_monotonic
     );
 }
 
-async fn legacy_binding(json: &str) -> CrudStore {
-    let db = db_fixture(true).await;
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO thread_cli_runtime_binding(thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,resume_cursor_json,status) VALUES('thread','ws','runtime','claude','native',?1,'active')",[json.into()])).await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-    CrudStore::new(db)
-}
-#[tokio::test]
-async fn legacy_fragment_cas_replacement_metadata_only_and_delete_recreate_same_timestamp() {
-    let legacy = serde_json::json!({"provider":"claude","padding":"x".repeat(150_000)}).to_string();
-    for replacement in ["metadata", "replace", "recreate"] {
-        let store = legacy_binding(&legacy).await;
-        let mut p = FrozenStorageLifetimeProgress::default();
-        drive(&store, &mut p, 13).await;
-        match replacement {
-            "metadata"=>sql(&store,"UPDATE thread_cli_runtime_binding SET status='active',updated_at=created_at WHERE thread_id='thread'",vec![]).await,
-            "replace"=>{store.upsert_cli_runtime_thread_binding(binding("{}".into())).await.unwrap();},
-            _=>{sql(&store,"DELETE FROM thread_cli_runtime_binding WHERE thread_id='thread'",vec![]).await;store.upsert_cli_runtime_thread_binding(binding("{}".into())).await.unwrap();}
-        }
-        drive(&store, &mut p, 500).await;
-        assert_eq!(n(&store,"SELECT count(*) AS n FROM thread_cli_runtime_binding WHERE thread_id=?1 AND frozen_manifest_id IS NULL","thread").await,1);
-        assert_eq!(
-            store
-                .get_cli_runtime_thread_binding("thread")
-                .await
-                .unwrap()
-                .unwrap()
-                .resume_cursor_json,
-            if replacement == "metadata" {
-                legacy.clone()
-            } else {
-                "{}".into()
-            }
-        );
-    }
-}
-#[tokio::test]
-async fn malformed_legacy_locator_is_scoped_and_reconciliation_continues_after_repair() {
-    let store = legacy_binding("{bad").await;
-    header(&store, "blocked", "ws", "thread", 1, 0).await;
-    header(&store, "free", "other", "other-thread", 1, 0).await;
-    let mut p = FrozenStorageLifetimeProgress::default();
-    assert_eq!(
-        drive(&store, &mut p, 2500).await,
-        0,
-        "an unresolved locator must hold its scope without worker backoff"
-    );
-    assert_eq!(expired(&store, "blocked").await, 0);
-    assert_eq!(physical(&store, "blocked").await, 1);
-    assert_eq!(expired(&store, "free").await, 1);
-    assert_eq!(physical(&store, "free").await, 0);
-    store
-        .upsert_cli_runtime_thread_binding(binding("{}".into()))
-        .await
-        .unwrap();
-    drive(&store, &mut p, 2000).await;
-    assert_eq!(expired(&store, "blocked").await, 1);
-    assert_eq!(physical(&store, "blocked").await, 0);
-}
-
-#[tokio::test]
-async fn oversized_legacy_locator_validates_descriptor_in_tail_without_starving_other_workspace() {
-    // A valid descriptor after >8 MiB of ignored data must be verified, never
-    // guessed absent from a bounded prefix or retained unknown just for size.
-    let descriptor = FrozenHistoryRef {
-        format: 1,
-        manifest_id: "blocked".into(),
-        messages: 1,
-        identity_sha256: "a".repeat(64),
-    };
-    let legacy = serde_json::json!({
-        "padding":"x".repeat(9 * 1024 * 1024),
-        "pioneerContext": {
-            "version":4,"nativeThreadId":"native","acceptedTurnId":"accepted",
-            "acceptedTurnRevision":0,"acceptedTurnDeleted":false,
-            "contextOwnerThreadId":"thread",
-            "contextHistoryJson":serde_json::to_string(&descriptor).unwrap(),
-        }
-    })
-    .to_string();
-    let store = legacy_binding(&legacy).await;
-    header(&store, "blocked", "ws", "thread", 1, 0).await;
-    header(&store, "free", "other", "other-thread", 1, 0).await;
-    let mut progress = FrozenStorageLifetimeProgress::default();
-    assert_eq!(drive(&store, &mut progress, 2500).await, 0);
-    assert_eq!(n(&store, "SELECT count(*) AS n FROM thread_cli_runtime_binding WHERE thread_id=?1 AND frozen_manifest_id='blocked'", "thread").await, 1);
-    assert_eq!(expired(&store, "blocked").await, 0);
-    assert_eq!(physical(&store, "blocked").await, 1);
-    assert_eq!(expired(&store, "free").await, 1);
-    assert_eq!(physical(&store, "free").await, 0);
-    assert_eq!(
-        store
-            .get_cli_runtime_thread_binding("thread")
-            .await
-            .unwrap()
-            .unwrap()
-            .resume_cursor_json,
-        legacy
-    );
-    store
-        .upsert_cli_runtime_thread_binding(binding("{}".into()))
-        .await
-        .unwrap();
-    drive(&store, &mut progress, 2000).await;
-    assert_eq!(expired(&store, "blocked").await, 1);
-    assert_eq!(physical(&store, "blocked").await, 0);
-}
-
-#[tokio::test]
-async fn unknown_task_input_retains_scope_unless_task_itself_releases() {
-    for status in [
-        Some("completed"),
-        Some("failed"),
-        Some("cancelled"),
-        Some("blocked"),
-        Some("unknown_future_status"),
-        None,
-    ] {
-        let db = db_fixture(true).await;
-        if let Some(status) = status {
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','ws','thread','thread','thread','turn','agent',?1,'fixture','fixture')", [status.into()])).await.unwrap();
-        }
-        db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'succeeded','agent')").await.unwrap();
-        db.execute_unprepared("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES('run','task','ws','thread','{bad',CURRENT_TIMESTAMP)").await.unwrap();
-        Migrator::up(&db, None).await.unwrap();
-        let store = CrudStore::new(db);
-        header(&store, "free", "ws", "thread", 1, 0).await;
-        let mut p = FrozenStorageLifetimeProgress::default();
-        drive(&store, &mut p, 2000).await;
-        let releasing = matches!(status, Some("completed" | "failed" | "cancelled"));
-        assert_eq!(
-            expired(&store, "free").await,
-            i64::from(releasing),
-            "{status:?}"
-        );
-        assert_eq!(
-            physical(&store, "free").await,
-            if releasing { 0 } else { 1 }
-        );
-        assert_eq!(n(&store, "SELECT count(*) AS n FROM task_run_conversation_snapshot WHERE run_id=?1 AND frozen_manifest_id=''", "run").await, 1);
-        if releasing {
-            // Unverified legacy input cannot be re-admitted through a status write.
-            assert!(
-                store
-                    .database_connection()
-                    .execute_unprepared("UPDATE task SET status='blocked' WHERE id='task'")
-                    .await
-                    .is_err()
-            );
-        }
-    }
-}
-#[tokio::test]
-async fn terminal_task_legacy_scope_mismatch_is_not_an_independent_input_root() {
-    for status in ["completed", "failed", "cancelled", "blocked"] {
-        let db = db_fixture(true).await;
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','other','thread','thread','thread','turn','agent',?1,'fixture','fixture')", [status.into()])).await.unwrap();
-        db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'succeeded','agent')").await.unwrap();
-        db.execute_unprepared("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES('run','task','ws','thread','{bad',CURRENT_TIMESTAMP)").await.unwrap();
-        Migrator::up(&db, None).await.unwrap();
-        let store = CrudStore::new(db);
-        header(&store, "free", "ws", "thread", 1, 0).await;
-        header(&store, "other-free", "other", "other-thread", 1, 0).await;
-        let mut p = FrozenStorageLifetimeProgress::default();
-        drive(&store, &mut p, 2000).await;
-        for id in ["free", "other-free"] {
-            assert_eq!(
-                expired(&store, id).await,
-                i64::from(status != "blocked"),
-                "{status}: {id}"
-            );
-        }
-    }
-}
-
-// Existing fixtures cover fresh and pre-lifetime schemas. This one also checks
-// an ordinary upgrade with already accepted failed/cancelled inputs, without backfill.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn dense_shared_range_and_reverse_root_query_plans_use_required_indexes() {
     // Future EXPLAIN only on this isolated fixture. Index selection does not
     // assert runtime latency; dense fan-out timing remains a rollout check.
@@ -1232,11 +1039,11 @@ async fn dense_shared_range_and_reverse_root_query_plans_use_required_indexes() 
     for i in 0..512 {
         let id = format!("logical-{i:04}");
         header(&store, &id, "ws", "thread", 1, 0).await;
-        sql(&store,"INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES(?1,0,0,1)",vec![id.clone().into()]).await;
-        sql(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES(?1,0,0,1,'physical')",vec![id.clone().into()]).await;
+        sql(&store,"INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES($1,0,0,1)",vec![id.clone().into()]).await;
+        sql(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES($1,0,0,1,'physical')",vec![id.clone().into()]).await;
         sql(
             &store,
-            "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id=?1",
+            "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id=$1",
             vec![id.into()],
         )
         .await;
@@ -1278,14 +1085,16 @@ async fn dense_shared_range_and_reverse_root_query_plans_use_required_indexes() 
         let plan = store
             .database_connection()
             .query_all_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                format!("EXPLAIN QUERY PLAN {query}"),
+                DbBackend::Postgres,
+                format!("EXPLAIN (COSTS OFF) {query}"),
             ))
             .await
             .unwrap();
         assert!(
-            plan.iter()
-                .any(|r| r.try_get::<String>("", "detail").unwrap().contains(index)),
+            plan.iter().any(|r| r
+                .try_get::<String>("", "QUERY PLAN")
+                .unwrap()
+                .contains(index)),
             "expected indexed reverse lookup {index}"
         );
     }
@@ -1312,7 +1121,7 @@ async fn dense_shared_range_and_reverse_root_query_plans_use_required_indexes() 
     assert_eq!(physical(&store, "physical").await, 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn runtime_root_and_undelivered_task_output_remain_independent_of_terminal_inputs() {
     let store = fixture().await;
     let h = header(&store, "output", "ws", "thread", 1, 0).await;
@@ -1366,7 +1175,7 @@ async fn runtime_root_and_undelivered_task_output_remain_independent_of_terminal
     drive(&store, &mut p, 1500).await;
     assert_eq!(expired(&store, "output").await, 1);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn retry_conflict_winner_keeps_exact_descriptor_and_losing_capture_is_not_a_root() {
     let store = fixture().await;
     task(&store, "task", "running").await;
@@ -1431,23 +1240,4 @@ async fn retry_conflict_winner_keeps_exact_descriptor_and_losing_capture_is_not_
     assert_eq!(expired(&store, "first").await, 0);
     assert_eq!(physical(&store, "first").await, 1);
     assert_eq!(expired(&store, "losing").await, 1);
-}
-#[tokio::test]
-async fn wholly_unscoped_legacy_operation_blocks_cleanup_but_locator_reconciliation_continues() {
-    let store = legacy_binding("{}").await;
-    header(&store, "free", "ws", "thread", 1, 0).await;
-    sql(&store,"INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('unknown','', 'thread',1)",vec![]).await;
-    sql(&store,"INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms,attempts,transient_retries,correction,next_portion) VALUES('unscoped','unknown','unscoped','failed','{}',1,0,0,0,0)",vec![]).await;
-    let mut p = FrozenStorageLifetimeProgress::default();
-    assert!(drive(&store, &mut p, 1500).await > 0);
-    assert_eq!(expired(&store, "free").await, 0);
-    assert_eq!(n(&store,"SELECT count(*) AS n FROM thread_cli_runtime_binding WHERE thread_id=?1 AND frozen_manifest_id IS NULL","thread").await,1);
-    sql(
-        &store,
-        "UPDATE compaction_context SET workspace_id='ws' WHERE owner='unknown'",
-        vec![],
-    )
-    .await;
-    drive(&store, &mut p, 1500).await;
-    assert_eq!(expired(&store, "free").await, 1);
 }

@@ -1,31 +1,24 @@
-//! Future isolated fixtures. Deliberately not executed/compiled before review.
-use migration::{Migrator, MigratorTrait};
+//! Frozen history and CLI root lifetime contracts on PostgreSQL.
 use pioneer_crud::CrudStore;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 async fn fixture() -> CrudStore {
-    let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-    options.max_connections(1).min_connections(1);
-    let db = sea_orm::Database::connect(options).await.unwrap();
-    db.execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
-    let pragma: i64 = db
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "PRAGMA foreign_keys",
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "foreign_keys")
-        .unwrap();
-    assert_eq!(pragma, 0, "production single writer uses FK OFF");
-    Migrator::up(&db, None).await.unwrap();
-    let store = CrudStore::new(db);
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
+    let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+        reader,
+        fixture.connection().clone(),
+    ));
+    assert!(
+        store
+            .database_connection()
+            .reader_query_only_enabled()
+            .await
+            .unwrap()
+    );
     let db = store.database_connection();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,TRUE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
         db.execute_unprepared(sql).await.unwrap();
@@ -36,8 +29,8 @@ async fn count(store: &CrudStore, view: &str, id: &str) -> i64 {
     store
         .database_connection()
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            format!("SELECT COUNT(*) AS n FROM {view} WHERE manifest_id=?"),
+            DbBackend::Postgres,
+            format!("SELECT COUNT(*) AS n FROM {view} WHERE manifest_id=$1"),
             [id.into()],
         ))
         .await
@@ -47,7 +40,7 @@ async fn count(store: &CrudStore, view: &str, id: &str) -> i64 {
         .unwrap()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn physical_source_counts_and_expiry_do_not_clip_foreign_streams() {
     let store = fixture().await;
     let db = store.database_connection();
@@ -56,7 +49,7 @@ async fn physical_source_counts_and_expiry_do_not_clip_foreign_streams() {
         "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('p',0,'m0',2),('p',1,'m1',2),('p',2,'m2',2),('p',3,'m3',2)",
         "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',0,0,'event:turn','e','event-revision:1','thread','i0',2),('p',1,2,'event:turn','e1','event-revision:1','thread','i1',2),('p',2,3,'event:turn','e2','event-revision:1','thread','i2',2)",
         "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('h',0,0,1),('h',1,0,1)",
-        "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('h',0,0,4,'p'),('h',1,0,3,'p')",
+        "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('h',0,0,4,'p'),('h',1,0,3,'p')",
         "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='h'",
     ] {
         db.execute_unprepared(sql).await.unwrap();
@@ -83,7 +76,7 @@ async fn physical_source_counts_and_expiry_do_not_clip_foreign_streams() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn incomplete_streams_expose_only_committed_kind_specific_prefix() {
     let store = fixture().await;
     let db = store.database_connection();
@@ -140,7 +133,7 @@ async fn locator(store: &CrudStore) -> Option<String> {
         .unwrap()
         .frozen_manifest_id
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_root_replacement_and_malformed_write_preserve_exact_locator() {
     let store = fixture().await;
     let descriptor = pioneer_compaction::frozen::FrozenHistoryRef {
@@ -202,7 +195,7 @@ async fn cli_root_replacement_and_malformed_write_preserve_exact_locator() {
     );
     assert_eq!(locator(&store).await, None);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn root_default_unknown_is_rejected_and_metadata_update_preserves_locator() {
     let store = fixture().await;
     let db = store.database_connection();
@@ -222,17 +215,17 @@ async fn root_default_unknown_is_rejected_and_metadata_update_preserves_locator(
     );
     assert_eq!(locator(&store).await, None);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn overlapping_layout_across_page_boundary_is_a_consistency_error() {
     let store = fixture().await;
     let db = store.database_connection();
     db.execute_unprepared("INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,ready) VALUES('spans','ws','thread','digest',260,260,1)").await.unwrap();
     db.execute_unprepared("INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('spans',0,0,1)").await.unwrap();
     for ordinal in 0..130 {
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('spans',0,?1,?2,'spans')", [((ordinal*2) as i64).into(), ((ordinal*2+2) as i64).into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('spans',0,$1,$2,'spans')", [((ordinal*2) as i64).into(), ((ordinal*2+2) as i64).into()])).await.unwrap();
     }
-    db.execute_unprepared("INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('spans',0,255,257,'spans')").await.unwrap();
+    db.execute_unprepared("INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('spans',0,255,257,'spans')").await.unwrap();
     db.execute_unprepared(
         "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='spans'",
     )
@@ -252,7 +245,7 @@ async fn overlapping_layout_across_page_boundary_is_a_consistency_error() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn claude_reuse_force_new_and_provider_switch_keep_verified_root_semantics() {
     use pioneer_crud::PrepareClaudeProviderSessionBinding;
     let store = fixture().await;

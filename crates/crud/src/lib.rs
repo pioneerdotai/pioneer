@@ -38598,22 +38598,6 @@ mod tests {
         migrations
     }
 
-    // These suites own the released trigger-generation contract. Keep current
-    // orthogonal storage, but restore tracking through its normal down method;
-    // typed-cutover regressions use the default Migrator without this helper.
-    async fn restore_legacy_occurrence_tracking(store: &CrudStore) {
-        let tx = store.connection.begin().await.unwrap();
-        let manager = migration::SchemaManager::new(&*tx);
-        let cutover = Migrator::migrations()
-            .into_iter()
-            .find(|migration| {
-                migration.name() == "m20261101_000102_idle_task_occurrence_tracking_cutover"
-            })
-            .unwrap();
-        cutover.down(&manager).await.unwrap();
-        tx.commit().await.unwrap();
-    }
-
     struct PreNativeDeliveryMigrator;
 
     impl MigratorTrait for PreNativeDeliveryMigrator {

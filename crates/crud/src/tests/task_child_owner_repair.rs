@@ -88,10 +88,26 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
             .unwrap()
             .is_none()
     );
-    crate::repositories::task_run::update_run_status(&source, &id, TaskRunStatus::Blocked, now)
+    let error =
+        crate::repositories::task_run::update_run_status(&source, &id, TaskRunStatus::Blocked, now)
+            .await
+            .unwrap_err();
+    assert!(pioneer_sqlite::is_retryable_database_conflict(&error));
+    source.rollback().await.unwrap();
+    assert_eq!(
+        pioneer_entity::task_run::Entity::find_by_id(&id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    let retry = db.begin().await.unwrap();
+    crate::repositories::task_run::update_run_status(&retry, &id, TaskRunStatus::Blocked, now)
         .await
         .unwrap();
-    source.commit().await.unwrap();
+    retry.commit().await.unwrap();
     assert_eq!(
         pioneer_entity::turn::Entity::find_by_id(&id)
             .one(&db)
@@ -201,7 +217,10 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
         Err(error) => {
             // A stale sequence CAS is allowed only by unwinding the entire
             // source transaction; never retry its old RR snapshot in place.
-            assert!(error.downcast_ref::<crate::util::PreflightRace>().is_some());
+            assert!(
+                error.downcast_ref::<crate::util::PreflightRace>().is_some()
+                    || pioneer_sqlite::is_retryable_database_conflict(&error)
+            );
             source.rollback().await.unwrap();
             let retry = db.begin().await.unwrap();
             assert!(
