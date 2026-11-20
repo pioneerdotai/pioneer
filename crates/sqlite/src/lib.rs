@@ -5,8 +5,6 @@ use std::path::{Component, Path};
 use std::pin::Pin;
 use std::time::Duration;
 
-#[cfg(any(test, feature = "test-support"))]
-mod blob_range;
 mod database;
 mod query_scope;
 mod reader;
@@ -17,8 +15,6 @@ pub use work_signal::{WorkChange, WorkSignal, WorkSubscription, wait_for_unix_de
 mod writer_ownership;
 pub use writer_ownership::{WriterBusy, WriterOwnership};
 
-#[cfg(any(test, feature = "test-support"))]
-pub use blob_range::SqliteBlobSource;
 pub use database::{SqliteDatabase, SqliteReadTransaction};
 pub use reader::{
     DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS, SqliteReadClass, SqliteReadEvent, SqliteReadObserver,
