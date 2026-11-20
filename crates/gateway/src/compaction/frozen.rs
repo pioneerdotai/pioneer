@@ -1117,12 +1117,54 @@ async fn prepare_accepted_task_basis_prepared(
             .unwrap_or(&origin.thread_id)
             != thread;
     }
+    let imports = prepare_accepted_task_imports(
+        store,
+        workspace,
+        thread,
+        turn,
+        &basis.parent_thread,
+        &descriptor,
+        &allowed,
+        &restored,
+        &mut graphs,
+    )
+    .await?;
+    let mut prepared = capture_with_imports_prepared(
+        store, workspace, thread, &allowed, &restored, &imports, graphs,
+    )
+    .await?;
+    for (scope, expected) in &epochs {
+        ensure!(
+            store
+                .compaction_projection_version(workspace, scope)
+                .await?
+                == *expected,
+            "accepted Task history changed during preparation"
+        );
+    }
+    prepared.source_epochs = prepared_source_epochs(&prepared.accepted_scopes, &epochs)?;
+    prepared.expected_checkpoint = head;
+    Ok(prepared)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_accepted_task_imports(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    parent_thread: &str,
+    descriptor: &FrozenHistoryRef,
+    allowed: &BTreeSet<String>,
+    messages: &[ChatMessage],
+    graphs: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<BTreeMap<ScopedHistorySource, Vec<PreparedFrozenImport>>> {
     let mut records = Vec::new();
     loop {
         let page = store
             .compaction_frozen_import_page(
                 workspace,
-                &basis.parent_thread,
+                parent_thread,
                 &descriptor.manifest_id,
                 records.len() as u64,
             )
@@ -1133,7 +1175,7 @@ async fn prepare_accepted_task_basis_prepared(
         records.extend(page);
     }
     let mut imports = BTreeMap::<ScopedHistorySource, Vec<PreparedFrozenImport>>::new();
-    for message in &restored {
+    for message in messages {
         let origin = message
             .provenance
             .as_ref()
@@ -1148,7 +1190,7 @@ async fn prepare_accepted_task_basis_prepared(
             };
             if key.source.scope.starts_with("checkpoint:") {
                 let graph = graphs
-                    .resolve(store, workspace, Some(&allowed), &key.source)
+                    .resolve(store, workspace, Some(allowed), &key.source)
                     .await?
                     .context("accepted Task checkpoint disappeared")?;
                 let mut ordinals = Vec::new();
@@ -1206,22 +1248,7 @@ async fn prepare_accepted_task_basis_prepared(
             }
         }
     }
-    let mut prepared = capture_with_imports_prepared(
-        store, workspace, thread, &allowed, &restored, &imports, graphs,
-    )
-    .await?;
-    for (scope, expected) in &epochs {
-        ensure!(
-            store
-                .compaction_projection_version(workspace, scope)
-                .await?
-                == *expected,
-            "accepted Task history changed during preparation"
-        );
-    }
-    prepared.source_epochs = prepared_source_epochs(&prepared.accepted_scopes, &epochs)?;
-    prepared.expected_checkpoint = head;
-    Ok(prepared)
+    Ok(imports)
 }
 
 /// One entry in the existing history reader's working-context traversal.
@@ -3078,6 +3105,49 @@ pub(crate) async fn capture_prepared(
         super::coverage::CheckpointGraphResolver::default(),
     )
     .await
+}
+
+/// Freeze the exact Task history supplied to the runtime and carry forward
+/// only the import grants verified against that execution's accepted basis.
+pub(crate) async fn capture_task_runtime_prepared(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    allowed: &BTreeSet<String>,
+    messages: &[ChatMessage],
+) -> Result<PreparedHistory> {
+    if messages.iter().any(|message| {
+        message
+            .provenance
+            .as_ref()
+            .is_some_and(|origin| !origin.inherited && origin.thread_id != thread)
+    }) && let Some(basis) = store
+        .compaction_task_basis_snapshot(workspace, thread, turn)
+        .await?
+        && !basis.history_json.trim_start().starts_with('[')
+    {
+        let descriptor = serde_json::from_str(&basis.history_json)?;
+        let _hold = acquire_history_json(store, workspace, &basis.history_json).await?;
+        let mut graphs = super::coverage::CheckpointGraphResolver::default();
+        let imports = prepare_accepted_task_imports(
+            store,
+            workspace,
+            thread,
+            turn,
+            &basis.parent_thread,
+            &descriptor,
+            allowed,
+            messages,
+            &mut graphs,
+        )
+        .await?;
+        return capture_with_imports_prepared(
+            store, workspace, thread, allowed, messages, &imports, graphs,
+        )
+        .await;
+    }
+    capture_prepared(store, workspace, thread, allowed, messages).await
 }
 
 struct CaptureRenderer {

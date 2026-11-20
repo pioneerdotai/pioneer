@@ -5316,10 +5316,11 @@ impl MessageProcessor {
                     )
                     .await?
                 };
-            let prepared = crate::compaction::frozen::capture_prepared(
+            let prepared = crate::compaction::frozen::capture_task_runtime_prepared(
                 self.crud_store.as_ref(),
                 workspace_id,
                 thread_id,
+                turn_id,
                 &allowed,
                 history,
             )
